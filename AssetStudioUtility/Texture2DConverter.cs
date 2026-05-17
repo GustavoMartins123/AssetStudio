@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.CompilerServices;
 using Texture2DDecoder;
 
@@ -31,9 +31,33 @@ namespace AssetStudio
             {
                 return false;
             }
+            var minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
+            if (minDataSize > 0 && reader.Size < minDataSize)
+            {
+                Logger.Warning($"Texture data too small for {m_TextureFormat} {m_Width}x{m_Height}: expected at least {minDataSize} bytes, got {reader.Size}");
+                return false;
+            }
             var flag = false;
-            var buff = BigArrayPool<byte>.Shared.Rent(reader.Size);
-            reader.GetData(buff);
+            byte[] buff;
+            try
+            {
+                buff = BigArrayPool<byte>.Shared.Rent(reader.Size);
+            }
+            catch (OutOfMemoryException)
+            {
+                Logger.Warning($"Out of memory allocating {reader.Size} bytes for texture decode");
+                return false;
+            }
+            try
+            {
+                reader.GetData(buff);
+            }
+            catch (Exception ex)
+            {
+                BigArrayPool<byte>.Shared.Return(buff);
+                Logger.Warning($"Failed to read texture data: {ex.Message}");
+                return false;
+            }
             switch (m_TextureFormat)
             {
                 case TextureFormat.Alpha8: //test pass
@@ -700,6 +724,113 @@ namespace AssetStudio
                 return true;
             }
             return false;
+        }
+        private static long GetMinimumDataSize(TextureFormat format, int width, int height)
+        {
+            long pixels = (long)width * height;
+            int bw = (width + 3) / 4;
+            int bh = (height + 3) / 4;
+            long blocks = (long)bw * bh;
+            switch (format)
+            {
+                case TextureFormat.Alpha8:
+                case TextureFormat.R8:
+                    return pixels;
+                case TextureFormat.ARGB4444:
+                case TextureFormat.RGBA4444:
+                case TextureFormat.RGB565:
+                case TextureFormat.R16:
+                case TextureFormat.RG16:
+                    return pixels * 2;
+                case TextureFormat.RGB24:
+                    return pixels * 3;
+                case TextureFormat.RGBA32:
+                case TextureFormat.ARGB32:
+                case TextureFormat.BGRA32:
+                case TextureFormat.RGB9e5Float:
+                case TextureFormat.RG32:
+                    return pixels * 4;
+                case TextureFormat.RGB48:
+                    return pixels * 6;
+                case TextureFormat.RGBAHalf:
+                case TextureFormat.RGBA64:
+                    return pixels * 8;
+                case TextureFormat.RHalf:
+                    return pixels * 2;
+                case TextureFormat.RGHalf:
+                    return pixels * 4;
+                case TextureFormat.RFloat:
+                    return pixels * 4;
+                case TextureFormat.RGFloat:
+                    return pixels * 8;
+                case TextureFormat.RGBAFloat:
+                    return pixels * 16;
+                case TextureFormat.YUY2:
+                    return pixels * 2;
+                case TextureFormat.DXT1:
+                    return blocks * 8;
+                case TextureFormat.DXT5:
+                    return blocks * 16;
+                case TextureFormat.BC4:
+                    return blocks * 8;
+                case TextureFormat.BC5:
+                case TextureFormat.BC6H:
+                case TextureFormat.BC7:
+                    return blocks * 16;
+                case TextureFormat.ETC_RGB4:
+                case TextureFormat.ETC_RGB4_3DS:
+                case TextureFormat.ETC2_RGB:
+                case TextureFormat.ETC2_RGBA1:
+                case TextureFormat.EAC_R:
+                case TextureFormat.EAC_R_SIGNED:
+                    return blocks * 8;
+                case TextureFormat.ETC2_RGBA8:
+                case TextureFormat.ETC_RGBA8_3DS:
+                case TextureFormat.EAC_RG:
+                case TextureFormat.EAC_RG_SIGNED:
+                    return blocks * 16;
+                case TextureFormat.ASTC_RGB_4x4:
+                case TextureFormat.ASTC_RGBA_4x4:
+                case TextureFormat.ASTC_HDR_4x4:
+                    return (long)((width + 3) / 4) * ((height + 3) / 4) * 16;
+                case TextureFormat.ASTC_RGB_5x5:
+                case TextureFormat.ASTC_RGBA_5x5:
+                case TextureFormat.ASTC_HDR_5x5:
+                    return (long)((width + 4) / 5) * ((height + 4) / 5) * 16;
+                case TextureFormat.ASTC_RGB_6x6:
+                case TextureFormat.ASTC_RGBA_6x6:
+                case TextureFormat.ASTC_HDR_6x6:
+                    return (long)((width + 5) / 6) * ((height + 5) / 6) * 16;
+                case TextureFormat.ASTC_RGB_8x8:
+                case TextureFormat.ASTC_RGBA_8x8:
+                case TextureFormat.ASTC_HDR_8x8:
+                    return (long)((width + 7) / 8) * ((height + 7) / 8) * 16;
+                case TextureFormat.ASTC_RGB_10x10:
+                case TextureFormat.ASTC_RGBA_10x10:
+                case TextureFormat.ASTC_HDR_10x10:
+                    return (long)((width + 9) / 10) * ((height + 9) / 10) * 16;
+                case TextureFormat.ASTC_RGB_12x12:
+                case TextureFormat.ASTC_RGBA_12x12:
+                case TextureFormat.ASTC_HDR_12x12:
+                    return (long)((width + 11) / 12) * ((height + 11) / 12) * 16;
+                case TextureFormat.PVRTC_RGB2:
+                case TextureFormat.PVRTC_RGBA2:
+                    return Math.Max(pixels / 4, 2);
+                case TextureFormat.PVRTC_RGB4:
+                case TextureFormat.PVRTC_RGBA4:
+                    return Math.Max(pixels / 2, 2);
+                case TextureFormat.ATC_RGB4:
+                    return blocks * 8;
+                case TextureFormat.ATC_RGBA8:
+                    return blocks * 16;
+                case TextureFormat.DXT1Crunched:
+                case TextureFormat.DXT5Crunched:
+                case TextureFormat.ETC_RGB4Crunched:
+                case TextureFormat.ETC2_RGBA8Crunched:
+                    return 0;
+                default:
+                    return 0;
+            }
         }
     }
 }

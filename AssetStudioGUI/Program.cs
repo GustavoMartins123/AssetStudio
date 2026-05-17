@@ -11,6 +11,7 @@ namespace AssetStudioGUI
     static class Program
     {
         private static string logPath;
+        private static string localLogPath;
         private static bool closedNormally;
 
         /// <summary>
@@ -20,6 +21,10 @@ namespace AssetStudioGUI
         static void Main()
         {
             logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "session.log");
+            localLogPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio",
+                "session.log");
             WriteSessionLog("Started");
 
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -66,14 +71,14 @@ namespace AssetStudioGUI
         {
             try
             {
-                var crashLogPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log");
                 var sb = new StringBuilder();
                 sb.AppendLine("AssetStudio crash report");
                 sb.AppendLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 sb.AppendLine(title);
                 sb.AppendLine(exception?.ToString() ?? "No managed exception object was available.");
                 sb.AppendLine(new string('=', 80));
-                File.AppendAllText(crashLogPath, sb.ToString(), Encoding.UTF8);
+                AppendAllTextSafe(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), sb.ToString());
+                AppendAllTextSafe(Path.Combine(Path.GetDirectoryName(localLogPath), "crash.log"), sb.ToString());
             }
             catch
             {
@@ -86,12 +91,19 @@ namespace AssetStudioGUI
             try
             {
                 var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}";
-                File.AppendAllText(logPath, line, Encoding.UTF8);
+                AppendAllTextSafe(logPath, line);
+                AppendAllTextSafe(localLogPath, line);
             }
             catch
             {
                 // Session logging is diagnostic only.
             }
+        }
+
+        private static void AppendAllTextSafe(string path, string text)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.AppendAllText(path, text, Encoding.UTF8);
         }
     }
 }

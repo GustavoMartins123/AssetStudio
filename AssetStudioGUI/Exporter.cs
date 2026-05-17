@@ -131,79 +131,83 @@ namespace AssetStudioGUI
                 return false;
             if (!TryExportFile(exportPath, item, ".obj", out var exportFullPath))
                 return false;
-            var sb = new StringBuilder();
-            sb.AppendLine("g " + m_Mesh.m_Name);
-            #region Vertices
             if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
             {
                 return false;
             }
-            int c = 3;
-            if (m_Mesh.m_Vertices.Length == m_Mesh.m_VertexCount * 4)
+            using (var writer = new StreamWriter(exportFullPath, false, Encoding.UTF8))
             {
-                c = 4;
-            }
-            for (int v = 0; v < m_Mesh.m_VertexCount; v++)
-            {
-                sb.AppendFormat("v {0} {1} {2}\r\n", -m_Mesh.m_Vertices[v * c], m_Mesh.m_Vertices[v * c + 1], m_Mesh.m_Vertices[v * c + 2]);
-            }
-            #endregion
-
-            #region UV
-            if (m_Mesh.m_UV0?.Length > 0)
-            {
-                c = 4;
-                if (m_Mesh.m_UV0.Length == m_Mesh.m_VertexCount * 2)
-                {
-                    c = 2;
-                }
-                else if (m_Mesh.m_UV0.Length == m_Mesh.m_VertexCount * 3)
-                {
-                    c = 3;
-                }
-                for (int v = 0; v < m_Mesh.m_VertexCount; v++)
-                {
-                    sb.AppendFormat("vt {0} {1}\r\n", m_Mesh.m_UV0[v * c], m_Mesh.m_UV0[v * c + 1]);
-                }
-            }
-            #endregion
-
-            #region Normals
-            if (m_Mesh.m_Normals?.Length > 0)
-            {
-                if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 3)
-                {
-                    c = 3;
-                }
-                else if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 4)
+                writer.WriteLine("g " + m_Mesh.m_Name);
+                #region Vertices
+                int c = 3;
+                if (m_Mesh.m_Vertices.Length == m_Mesh.m_VertexCount * 4)
                 {
                     c = 4;
                 }
                 for (int v = 0; v < m_Mesh.m_VertexCount; v++)
                 {
-                    sb.AppendFormat("vn {0} {1} {2}\r\n", -m_Mesh.m_Normals[v * c], m_Mesh.m_Normals[v * c + 1], m_Mesh.m_Normals[v * c + 2]);
+                    writer.WriteLine("v {0} {1} {2}", CleanFloat(-m_Mesh.m_Vertices[v * c]), CleanFloat(m_Mesh.m_Vertices[v * c + 1]), CleanFloat(m_Mesh.m_Vertices[v * c + 2]));
                 }
-            }
-            #endregion
+                #endregion
 
-            #region Face
-            int sum = 0;
-            for (var i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
-            {
-                sb.AppendLine($"g {m_Mesh.m_Name}_{i}");
-                int indexCount = (int)m_Mesh.m_SubMeshes[i].indexCount;
-                var end = sum + indexCount / 3;
-                for (int f = sum; f < end; f++)
+                #region UV
+                if (m_Mesh.m_UV0?.Length > 0)
                 {
-                    sb.AppendFormat("f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\r\n", m_Mesh.m_Indices[f * 3 + 2] + 1, m_Mesh.m_Indices[f * 3 + 1] + 1, m_Mesh.m_Indices[f * 3] + 1);
+                    c = 4;
+                    if (m_Mesh.m_UV0.Length == m_Mesh.m_VertexCount * 2)
+                    {
+                        c = 2;
+                    }
+                    else if (m_Mesh.m_UV0.Length == m_Mesh.m_VertexCount * 3)
+                    {
+                        c = 3;
+                    }
+                    for (int v = 0; v < m_Mesh.m_VertexCount; v++)
+                    {
+                        writer.WriteLine("vt {0} {1}", CleanFloat(m_Mesh.m_UV0[v * c]), CleanFloat(m_Mesh.m_UV0[v * c + 1]));
+                    }
                 }
-                sum = end;
-            }
-            #endregion
+                #endregion
 
-            sb.Replace("NaN", "0");
-            File.WriteAllText(exportFullPath, sb.ToString());
+                #region Normals
+                if (m_Mesh.m_Normals?.Length > 0)
+                {
+                    if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 3)
+                    {
+                        c = 3;
+                    }
+                    else if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 4)
+                    {
+                        c = 4;
+                    }
+                    for (int v = 0; v < m_Mesh.m_VertexCount; v++)
+                    {
+                        writer.WriteLine("vn {0} {1} {2}", CleanFloat(-m_Mesh.m_Normals[v * c]), CleanFloat(m_Mesh.m_Normals[v * c + 1]), CleanFloat(m_Mesh.m_Normals[v * c + 2]));
+                    }
+                }
+                #endregion
+
+                #region Face
+                int sum = 0;
+                for (var i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
+                {
+                    writer.WriteLine($"g {m_Mesh.m_Name}_{i}");
+                    int indexCount = (int)m_Mesh.m_SubMeshes[i].indexCount;
+                    var end = sum + indexCount / 3;
+                    for (int f = sum; f < end; f++)
+                    {
+                        writer.WriteLine("f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}", m_Mesh.m_Indices[f * 3 + 2] + 1, m_Mesh.m_Indices[f * 3 + 1] + 1, m_Mesh.m_Indices[f * 3] + 1);
+                    }
+                    sum = end;
+                }
+                #endregion
+            }
             return true;
+        }
+
+        private static string CleanFloat(float value)
+        {
+            return float.IsNaN(value) || float.IsInfinity(value) ? "0" : value.ToString();
         }
 
         public static bool ExportVideoClip(AssetItem item, string exportPath)

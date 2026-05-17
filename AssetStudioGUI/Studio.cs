@@ -386,8 +386,10 @@ namespace AssetStudioGUI
                 Progress.Reset();
                 foreach (var asset in toExportAssets)
                 {
+                    var currentExportPath = Path.Combine(savePath, "export-current.txt");
                     try
                     {
+                        WriteCurrentExport(currentExportPath, asset, i + 1, toExportCount);
                         string exportPath;
                         switch (Properties.Settings.Default.assetGroupOption)
                         {
@@ -452,6 +454,7 @@ namespace AssetStudioGUI
 
                     Progress.Report(++i, toExportCount);
                 }
+                ClearCurrentExport(savePath);
 
                 var statusText = exportedCount == 0 ? "Nothing exported." : $"Finished exporting {exportedCount} assets.";
                 var errorReportPath = WriteErrorReport(savePath, exportErrors);
@@ -521,6 +524,39 @@ namespace AssetStudioGUI
             }
 
             return errorReportPath;
+        }
+
+        private static void WriteCurrentExport(string path, AssetItem asset, int index, int count)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(path,
+                    $"Exporting {index}/{count}{Environment.NewLine}" +
+                    $"Type: {asset.TypeString}{Environment.NewLine}" +
+                    $"Name: {asset.Text}{Environment.NewLine}" +
+                    $"PathID: {asset.m_PathID}{Environment.NewLine}" +
+                    $"Source: {asset.SourceFile?.originalPath ?? asset.SourceFile?.fullName ?? asset.SourceFile?.fileName}{Environment.NewLine}",
+                    Encoding.UTF8);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ClearCurrentExport(string savePath)
+        {
+            try
+            {
+                var path = Path.Combine(savePath, "export-current.txt");
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+            }
         }
 
         public static void ExportAssetsList(string savePath, List<AssetItem> toExportAssets, ExportListType exportListType)
