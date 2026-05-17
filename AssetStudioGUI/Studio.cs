@@ -500,7 +500,7 @@ namespace AssetStudioGUI
 
                 if (loadErrors.Length > 0)
                 {
-                    writer.WriteLine($"Load errors ({loadErrors.Length})");
+                    writer.WriteLine($"Logged errors ({loadErrors.Length})");
                     writer.WriteLine(new string('=', 80));
                     for (int i = 0; i < loadErrors.Length; i++)
                     {
@@ -651,6 +651,10 @@ namespace AssetStudioGUI
                         catch (Exception ex)
                         {
                             Logger.Error($"Export GameObject:{j.Text} error", ex);
+                            WriteErrorReport(targetPath, new List<string>
+                            {
+                                $"Export GameObject:{j.Text} error{Environment.NewLine}{ex}"
+                            });
                             StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                         }
 
@@ -694,6 +698,10 @@ namespace AssetStudioGUI
                 catch (Exception ex)
                 {
                     Logger.Error($"Export Animator:{animator.Text} error", ex);
+                    WriteErrorReport(exportPath, new List<string>
+                    {
+                        $"Export Animator:{animator.Text} error{Environment.NewLine}{ex}"
+                    });
                     StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                 }
             });
@@ -721,6 +729,10 @@ namespace AssetStudioGUI
                         catch (Exception ex)
                         {
                             Logger.Error($"Export GameObject:{gameObject.m_Name} error", ex);
+                            WriteErrorReport(exportPath, new List<string>
+                            {
+                                $"Export GameObject:{gameObject.m_Name} error{Environment.NewLine}{ex}"
+                            });
                             StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                         }
 
@@ -754,6 +766,11 @@ namespace AssetStudioGUI
                 catch (Exception ex)
                 {
                     Logger.Error($"Export Model:{name} error", ex);
+                    var reportPath = Path.GetDirectoryName(exportPath) ?? exportPath;
+                    WriteErrorReport(reportPath, new List<string>
+                    {
+                        $"Export Model:{name} error{Environment.NewLine}{ex}"
+                    });
                     StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                 }
                 if (Properties.Settings.Default.openAfterExport)

@@ -1335,6 +1335,7 @@ namespace AssetStudioGUI
         {
             AssetItem animator = null;
             List<AssetItem> animationList = new List<AssetItem>();
+            var selectedGameObjects = new List<GameObject>();
             var selectedAssets = GetSelectedAssets();
             foreach (var assetPreloadData in selectedAssets)
             {
@@ -1346,6 +1347,14 @@ namespace AssetStudioGUI
                 {
                     animationList.Add(assetPreloadData);
                 }
+
+                if (assetPreloadData.Type != ClassIDType.AnimationClip && assetPreloadData.TreeNode is GameObjectTreeNode gameObjectTreeNode)
+                {
+                    if (!selectedGameObjects.Contains(gameObjectTreeNode.gameObject))
+                    {
+                        selectedGameObjects.Add(gameObjectTreeNode.gameObject);
+                    }
+                }
             }
 
             if (animator != null)
@@ -1356,7 +1365,16 @@ namespace AssetStudioGUI
                 {
                     SetExportFolder(saveFolderDialog.Folder);
                     var exportPath = Path.Combine(saveFolderDialog.Folder, "Animator") + Path.DirectorySeparatorChar;
-                    ExportAnimatorWithAnimationClip(animator, animationList, exportPath);
+                    if (selectedGameObjects.Count > 0)
+                    {
+                        Directory.CreateDirectory(exportPath);
+                        var exportFile = Path.Combine(exportPath, Exporter.FixFileName(animator.Text) + ".fbx");
+                        ExportObjectsMergeWithAnimationClip(exportFile, selectedGameObjects, animationList);
+                    }
+                    else
+                    {
+                        ExportAnimatorWithAnimationClip(animator, animationList, exportPath);
+                    }
                 }
             }
         }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using UkooLabs.FbxSharpie;
 using UkooLabs.FbxSharpie.Tokens;
 using UkooLabs.FbxSharpie.Tokens.Value;
@@ -17,20 +18,49 @@ namespace AssetStudio
         private long _nextId = 1000;
         private float _scaleFactor;
         private bool _isAscii;
+        private bool _exportSkins;
+        private bool _exportAnimations;
+        private bool _exportBlendShape;
+        private bool _castToBone;
+        private float _boneSize;
+        private string _exportDirectory;
+        private ImportedFrame _rootFrame;
         private Dictionary<string, long> _frameIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _materialIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _meshIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _blendShapeChannelMap = new Dictionary<string, long>();
+        private Dictionary<string, long> _textureIdMap = new Dictionary<string, long>();
+        private Dictionary<string, long> _videoIdMap = new Dictionary<string, long>();
+        private HashSet<string> _bonePathSet = new HashSet<string>();
+        private List<(string Name, long Start, long Stop)> _takes = new List<(string Name, long Start, long Stop)>();
+        private int _exportedFrameCount;
+        private int _exportedBoneCount;
+        private int _exportedMeshCount;
+        private int _exportedSkinCount;
+        private int _exportedClusterCount;
+        private int _exportedMaterialCount;
+        private int _exportedTextureCount;
+        private int _exportedAnimationStackCount;
+        private int _exportedAnimationTrackCount;
+        private int _exportedAnimationCurveCount;
+        private int _missingAnimationTrackCount;
 
-        public FbxSharpieExporter(string fileName, float scaleFactor, int versionIndex, bool isAscii, bool is60Fps)
+        public FbxSharpieExporter(string fileName, float scaleFactor, int versionIndex, bool isAscii, bool is60Fps,
+            bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f)
         {
             _scaleFactor = scaleFactor;
             _isAscii = isAscii;
+            _exportSkins = exportSkins;
+            _exportAnimations = exportAnimations;
+            _exportBlendShape = exportBlendShape;
+            _castToBone = castToBone;
+            _boneSize = boneSize;
             _document = new FbxDocument();
             _document.Version = FbxVersion.v7_4;
 
             BuildHeader();
             BuildGlobalSettings(scaleFactor);
+            BuildDefinitions();
 
             _objects = N("Objects");
             _document.AddNode(_objects);
@@ -41,13 +71,20 @@ namespace AssetStudio
 
         public void Export(IImported convert, string exportPath)
         {
+            _rootFrame = convert.RootFrame;
+            _exportDirectory = Path.GetDirectoryName(exportPath);
+            if (!string.IsNullOrEmpty(_exportDirectory))
+                Directory.CreateDirectory(_exportDirectory);
+
+            BuildBonePathSet(convert);
+
             if (convert.RootFrame != null)
                 ExportFrame(convert.RootFrame, 0);
 
             if (convert.MaterialList != null)
             {
                 foreach (var mat in convert.MaterialList)
-                    ExportMaterial(mat);
+                    ExportMaterial(mat, convert);
             }
 
             if (convert.MeshList != null)
@@ -56,34 +93,36 @@ namespace AssetStudio
                     ExportMesh(mesh, convert);
             }
 
-            if (convert.MorphList != null)
+            if (_exportBlendShape && convert.MorphList != null)
             {
                 foreach (var morph in convert.MorphList)
                     ExportMorph(morph);
             }
 
-            if (convert.AnimationList != null)
+            if (_exportAnimations && convert.AnimationList != null)
             {
                 foreach (var anim in convert.AnimationList)
                     ExportAnimation(anim);
             }
 
-            var dir = Path.GetDirectoryName(exportPath);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-
+            BuildTakes();
+            WriteExportReport(exportPath, convert);
             FbxIO.WriteAscii(_document, exportPath);
         }
 
         private void ExportFrame(ImportedFrame frame, long parentId)
         {
             var id = GenId();
-            _frameIdMap[frame.Path] = id;
+            _exportedFrameCount++;
+            var normalizedPath = NormalizeFramePath(frame.Path);
+            _frameIdMap[normalizedPath] = id;
+            var isBone = IsBonePath(normalizedPath);
+            var modelType = isBone ? "LimbNode" : "Null";
 
             var model = N("Model");
             model.AddProperty(new LongToken(id));
             model.AddProperty(new StringToken($"Model::{frame.Name}"));
-            model.AddProperty(new StringToken("Null"));
+            model.AddProperty(new StringToken(modelType));
 
             var props = N("Properties70");
             props.AddNode(MakeP("Lcl Translation", "Lcl Translation", "", "A+",
@@ -97,8 +136,37 @@ namespace AssetStudio
             _objects.AddNode(model);
             Connect(id, parentId);
 
+            if (isBone)
+            {
+                _exportedBoneCount++;
+                ExportSkeletonAttribute(frame.Name, id);
+            }
+
             for (int i = 0; i < frame.Count; i++)
                 ExportFrame(frame[i], id);
+        }
+
+        private void ExportSkeletonAttribute(string name, long modelId)
+        {
+            var attrId = GenId();
+            var attr = N("NodeAttribute");
+            attr.AddProperty(new LongToken(attrId));
+            attr.AddProperty(new StringToken($"NodeAttribute::{name}"));
+            attr.AddProperty(new StringToken("LimbNode"));
+            AddSimpleNode(attr, "TypeFlags", "Skeleton");
+
+            var props = N("Properties70");
+            var size = N("P");
+            size.AddProperty(new StringToken("Size"));
+            size.AddProperty(new StringToken("double"));
+            size.AddProperty(new StringToken("Number"));
+            size.AddProperty(new StringToken(""));
+            size.AddProperty(new DoubleToken(_boneSize));
+            props.AddNode(size);
+            attr.AddNode(props);
+
+            _objects.AddNode(attr);
+            Connect(attrId, modelId);
         }
 
         private void ExportMesh(ImportedMesh mesh, IImported convert)
@@ -107,10 +175,11 @@ namespace AssetStudio
                 return;
 
             long modelId = 0;
-            if (mesh.Path != null && _frameIdMap.ContainsKey(mesh.Path))
-                modelId = _frameIdMap[mesh.Path];
+            if (mesh.Path != null && TryGetFrameId(mesh.Path, out var meshModelId))
+                modelId = meshModelId;
 
             var geoId = GenId();
+            _exportedMeshCount++;
             if (mesh.Path != null)
                 _meshIdMap[mesh.Path] = geoId;
 
@@ -148,7 +217,7 @@ namespace AssetStudio
 
             ConnectMaterialsToModel(mesh, modelId, convert);
 
-            if (mesh.BoneList != null && mesh.BoneList.Count > 0)
+            if (_exportSkins && mesh.BoneList != null && mesh.BoneList.Count > 0)
                 ExportSkin(mesh, geoId);
         }
 
@@ -353,6 +422,7 @@ namespace AssetStudio
         private void ExportSkin(ImportedMesh mesh, long geoId)
         {
             var skinId = GenId();
+            _exportedSkinCount++;
             var skin = N("Deformer");
             skin.AddProperty(new LongToken(skinId));
             skin.AddProperty(new StringToken("Deformer::Skin"));
@@ -368,6 +438,7 @@ namespace AssetStudio
                     continue;
 
                 var clusterId = GenId();
+                _exportedClusterCount++;
                 var cluster = N("Deformer");
                 cluster.AddProperty(new LongToken(clusterId));
                 cluster.AddProperty(new StringToken($"SubDeformer::{bone.Path}"));
@@ -425,14 +496,15 @@ namespace AssetStudio
                 _objects.AddNode(cluster);
                 Connect(clusterId, skinId);
 
-                if (_frameIdMap.TryGetValue(bone.Path, out var boneModelId))
+                if (TryGetFrameId(bone.Path, out var boneModelId))
                     Connect(boneModelId, clusterId);
             }
         }
 
-        private void ExportMaterial(ImportedMaterial mat)
+        private void ExportMaterial(ImportedMaterial mat, IImported convert)
         {
             var id = GenId();
+            _exportedMaterialCount++;
             _materialIdMap[mat.Name] = id;
 
             var matNode = N("Material");
@@ -459,6 +531,98 @@ namespace AssetStudio
 
             matNode.AddNode(props);
             _objects.AddNode(matNode);
+
+            ExportMaterialTextures(mat, id, convert);
+        }
+
+        private void ExportMaterialTextures(ImportedMaterial mat, long materialId, IImported convert)
+        {
+            if (mat.Textures == null || convert.TextureList == null)
+                return;
+
+            foreach (var matTex in mat.Textures)
+            {
+                if (string.IsNullOrEmpty(matTex.Name))
+                    continue;
+
+                var texture = ImportedHelpers.FindTexture(matTex.Name, convert.TextureList);
+                if (texture == null)
+                {
+                    Logger.Warning($"Material '{mat.Name}' references texture '{matTex.Name}', but it was not converted.");
+                    continue;
+                }
+
+                var textureId = ExportTexture(texture);
+                ConnectProperty(textureId, materialId, GetMaterialTextureProperty(matTex.Dest));
+            }
+        }
+
+        private long ExportTexture(ImportedTexture texture)
+        {
+            if (_textureIdMap.TryGetValue(texture.Name, out var existingTextureId))
+                return existingTextureId;
+
+            var textureId = GenId();
+            var videoId = GenId();
+            _textureIdMap[texture.Name] = textureId;
+            _videoIdMap[texture.Name] = videoId;
+
+            var relativeFileName = FixTextureFileName(texture.Name);
+            var fileName = string.IsNullOrEmpty(_exportDirectory)
+                ? relativeFileName
+                : Path.Combine(_exportDirectory, relativeFileName);
+
+            if (texture.Data != null)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(fileName) ?? ".");
+                File.WriteAllBytes(fileName, texture.Data);
+            }
+
+            var texNode = N("Texture");
+            texNode.AddProperty(new LongToken(textureId));
+            texNode.AddProperty(new StringToken($"Texture::{texture.Name}"));
+            texNode.AddProperty(new StringToken(""));
+            AddSimpleNode(texNode, "Type", "TextureVideoClip");
+            AddSimpleNode(texNode, "Version", 202);
+            AddSimpleNode(texNode, "TextureName", $"Texture::{texture.Name}");
+            AddSimpleNode(texNode, "Media", $"Video::{texture.Name}");
+            AddSimpleNode(texNode, "FileName", fileName);
+            AddSimpleNode(texNode, "RelativeFilename", relativeFileName);
+            _objects.AddNode(texNode);
+
+            var videoNode = N("Video");
+            videoNode.AddProperty(new LongToken(videoId));
+            videoNode.AddProperty(new StringToken($"Video::{texture.Name}"));
+            videoNode.AddProperty(new StringToken("Clip"));
+            AddSimpleNode(videoNode, "Type", "Clip");
+            AddSimpleNode(videoNode, "UseMipMap", 0);
+            AddSimpleNode(videoNode, "Filename", fileName);
+            AddSimpleNode(videoNode, "RelativeFilename", relativeFileName);
+            _objects.AddNode(videoNode);
+
+            _exportedTextureCount++;
+            Connect(videoId, textureId);
+            return textureId;
+        }
+
+        private static string FixTextureFileName(string name)
+        {
+            return Path.GetInvalidFileNameChars().Aggregate(name, (current, c) => current.Replace(c, '_'));
+        }
+
+        private static string GetMaterialTextureProperty(int dest)
+        {
+            switch (dest)
+            {
+                case 1:
+                    return "NormalMap";
+                case 2:
+                    return "SpecularColor";
+                case 3:
+                    return "Bump";
+                default:
+                    return "DiffuseColor";
+            }
         }
 
         private void ExportAnimation(ImportedKeyframedAnimation anim)
@@ -467,6 +631,7 @@ namespace AssetStudio
                 return;
 
             var stackId = GenId();
+            _exportedAnimationStackCount++;
             var stack = N("AnimationStack");
             stack.AddProperty(new LongToken(stackId));
             stack.AddProperty(new StringToken($"AnimStack::{anim.Name}"));
@@ -479,8 +644,20 @@ namespace AssetStudio
                 foreach (var k in track.Translations) if (k.time > maxTime) maxTime = k.time;
                 foreach (var k in track.Rotations) if (k.time > maxTime) maxTime = k.time;
                 foreach (var k in track.Scalings) if (k.time > maxTime) maxTime = k.time;
+                if (track.BlendShape != null)
+                {
+                    foreach (var k in track.BlendShape.Keyframes) if (k.time > maxTime) maxTime = k.time;
+                }
             }
             var fbxTime = (long)(maxTime * 46186158000L);
+            _takes.Add((anim.Name, 0, fbxTime));
+            var localStart = N("P");
+            localStart.AddProperty(new StringToken("LocalStart"));
+            localStart.AddProperty(new StringToken("KTime"));
+            localStart.AddProperty(new StringToken("Time"));
+            localStart.AddProperty(new StringToken(""));
+            localStart.AddProperty(new LongToken(0));
+            stackProps.AddNode(localStart);
             var localStop = N("P");
             localStop.AddProperty(new StringToken("LocalStop"));
             localStop.AddProperty(new StringToken("KTime"));
@@ -500,25 +677,162 @@ namespace AssetStudio
             _objects.AddNode(layer);
             Connect(layerId, stackId);
 
+            var exportedTrackCount = 0;
+            var missingTrackCount = 0;
             foreach (var track in anim.TrackList)
             {
                 if (track.Path == null) continue;
-                if (!_frameIdMap.TryGetValue(track.Path, out var modelId)) continue;
+                if (!TryGetFrameId(track.Path, out var modelId))
+                {
+                    missingTrackCount++;
+                    _missingAnimationTrackCount++;
+                    continue;
+                }
 
+                var exportedTrack = false;
                 if (track.Translations.Count > 0)
+                {
                     ExportCurveNode(layerId, modelId, "T", "Lcl Translation", track.Translations);
+                    exportedTrack = true;
+                }
                 if (track.Rotations.Count > 0)
+                {
                     ExportCurveNode(layerId, modelId, "R", "Lcl Rotation", track.Rotations);
+                    exportedTrack = true;
+                }
                 if (track.Scalings.Count > 0)
+                {
                     ExportCurveNode(layerId, modelId, "S", "Lcl Scaling", track.Scalings);
+                    exportedTrack = true;
+                }
 
                 if (track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)
                 {
                     var mapKey = track.Path + "::" + track.BlendShape.ChannelName;
                     if (_blendShapeChannelMap.TryGetValue(mapKey, out var bsChannelId))
+                    {
                         ExportCurveNode1D(layerId, bsChannelId, track.BlendShape.ChannelName, "DeformPercent", track.BlendShape.Keyframes);
+                        exportedTrack = true;
+                    }
+                }
+
+                if (exportedTrack)
+                {
+                    _exportedAnimationTrackCount++;
+                    exportedTrackCount++;
                 }
             }
+
+            if (exportedTrackCount == 0)
+                Logger.Warning($"Animation '{anim.Name}' has {anim.TrackList.Count} tracks, but none matched the exported frame hierarchy.");
+            else if (missingTrackCount > 0)
+                Logger.Warning($"Animation '{anim.Name}' exported {exportedTrackCount} tracks; {missingTrackCount} track paths did not match the exported frame hierarchy.");
+        }
+
+        private bool TryGetFrameId(string path, out long modelId)
+        {
+            modelId = 0;
+            var normalizedPath = NormalizeFramePath(path);
+            if (string.IsNullOrEmpty(normalizedPath))
+                return false;
+
+            if (_frameIdMap.TryGetValue(normalizedPath, out modelId))
+                return true;
+
+            var rootMatch = _rootFrame?.FindFrameByPath(normalizedPath);
+            if (rootMatch != null && _frameIdMap.TryGetValue(NormalizeFramePath(rootMatch.Path), out modelId))
+                return true;
+
+            var suffix = "/" + normalizedPath;
+            var matchCount = 0;
+            foreach (var item in _frameIdMap)
+            {
+                if (!item.Key.EndsWith(suffix, StringComparison.Ordinal))
+                    continue;
+
+                modelId = item.Value;
+                matchCount++;
+                if (matchCount > 1)
+                {
+                    modelId = 0;
+                    return false;
+                }
+            }
+
+            return matchCount == 1;
+        }
+
+        private void BuildBonePathSet(IImported convert)
+        {
+            _bonePathSet.Clear();
+            if (convert.MeshList == null)
+                return;
+
+            foreach (var mesh in convert.MeshList)
+            {
+                if (mesh.BoneList == null)
+                    continue;
+
+                foreach (var bone in mesh.BoneList)
+                {
+                    var normalizedPath = NormalizeFramePath(bone.Path);
+                    if (string.IsNullOrEmpty(normalizedPath))
+                        continue;
+
+                    var frame = _rootFrame?.FindFrameByPath(normalizedPath);
+                    AddBonePathWithAncestors(NormalizeFramePath(frame?.Path ?? normalizedPath));
+                }
+            }
+
+            if (!_exportAnimations || convert.AnimationList == null)
+                return;
+
+            foreach (var anim in convert.AnimationList)
+            {
+                if (anim.TrackList == null)
+                    continue;
+
+                foreach (var track in anim.TrackList)
+                {
+                    var normalizedPath = NormalizeFramePath(track.Path);
+                    if (string.IsNullOrEmpty(normalizedPath))
+                        continue;
+
+                    var frame = _rootFrame?.FindFrameByPath(normalizedPath);
+                    AddBonePathWithAncestors(NormalizeFramePath(frame?.Path ?? normalizedPath));
+                }
+            }
+        }
+
+        private void AddBonePathWithAncestors(string normalizedPath)
+        {
+            if (string.IsNullOrEmpty(normalizedPath))
+                return;
+
+            var parts = normalizedPath.Split('/');
+            var path = parts[0];
+            _bonePathSet.Add(path);
+            for (int i = 1; i < parts.Length; i++)
+            {
+                path += "/" + parts[i];
+                _bonePathSet.Add(path);
+            }
+        }
+
+        private bool IsBonePath(string normalizedPath)
+        {
+            if (_castToBone)
+                return true;
+
+            if (string.IsNullOrEmpty(normalizedPath))
+                return false;
+
+            return _bonePathSet.Contains(normalizedPath);
+        }
+
+        private static string NormalizeFramePath(string path)
+        {
+            return path?.Replace('\\', '/').Trim('/');
         }
 
         private void ExportCurveNode1D(long layerId, long targetId, string channelName, string propName, List<ImportedKeyframe<float>> keyframes)
@@ -585,6 +899,7 @@ namespace AssetStudio
         private void ExportCurve(long curveNodeId, string channel, long[] times, double[] values)
         {
             var curveId = GenId();
+            _exportedAnimationCurveCount++;
             var curve = N("AnimationCurve");
             curve.AddProperty(new LongToken(curveId));
             curve.AddProperty(new StringToken($"AnimCurve::"));
@@ -603,6 +918,32 @@ namespace AssetStudio
                 floatValues[i] = (float)values[i];
             keyValueFloat.AddProperty(new FloatArrayToken(floatValues));
             curve.AddNode(keyValueFloat);
+
+            var keyAttrFlags = N("KeyAttrFlags");
+            var flags = new int[values.Length];
+            for (int i = 0; i < flags.Length; i++)
+                flags[i] = 24840;
+            keyAttrFlags.AddProperty(new IntegerArrayToken(flags));
+            curve.AddNode(keyAttrFlags);
+
+            var keyAttrDataFloat = N("KeyAttrDataFloat");
+            var attrData = new float[values.Length * 4];
+            for (int i = 0; i < values.Length; i++)
+            {
+                attrData[i * 4] = 0;
+                attrData[i * 4 + 1] = 0;
+                attrData[i * 4 + 2] = 9.419963E-30f;
+                attrData[i * 4 + 3] = 0;
+            }
+            keyAttrDataFloat.AddProperty(new FloatArrayToken(attrData));
+            curve.AddNode(keyAttrDataFloat);
+
+            var keyAttrRefCount = N("KeyAttrRefCount");
+            var refCounts = new int[values.Length];
+            for (int i = 0; i < refCounts.Length; i++)
+                refCounts[i] = 1;
+            keyAttrRefCount.AddProperty(new IntegerArrayToken(refCounts));
+            curve.AddNode(keyAttrRefCount);
 
             _objects.AddNode(curve);
             ConnectProperty(curveId, curveNodeId, channel);
@@ -721,6 +1062,110 @@ namespace AssetStudio
             header.AddNode(ts);
 
             _document.AddNode(header);
+        }
+
+        private void BuildDefinitions()
+        {
+            var definitions = N("Definitions");
+            AddSimpleNode(definitions, "Version", 100);
+            AddSimpleNode(definitions, "Count", 12);
+
+            AddObjectType(definitions, "GlobalSettings");
+            AddObjectType(definitions, "Model");
+            AddObjectType(definitions, "Geometry");
+            AddObjectType(definitions, "Material");
+            AddObjectType(definitions, "Texture");
+            AddObjectType(definitions, "Video");
+            AddObjectType(definitions, "NodeAttribute");
+            AddObjectType(definitions, "Deformer");
+            AddObjectType(definitions, "AnimationStack");
+            AddObjectType(definitions, "AnimationLayer");
+            AddObjectType(definitions, "AnimationCurveNode");
+            AddObjectType(definitions, "AnimationCurve");
+
+            _document.AddNode(definitions);
+        }
+
+        private void AddObjectType(FbxNode definitions, string typeName)
+        {
+            var objectType = N("ObjectType");
+            objectType.AddProperty(new StringToken(typeName));
+            AddSimpleNode(objectType, "Count", 0);
+            definitions.AddNode(objectType);
+        }
+
+        private void BuildTakes()
+        {
+            if (_takes.Count == 0)
+                return;
+
+            var takes = N("Takes");
+            AddSimpleNode(takes, "Current", _takes[0].Name);
+            foreach (var takeInfo in _takes)
+            {
+                var take = N("Take");
+                take.AddProperty(new StringToken(takeInfo.Name));
+
+                var fileName = N("FileName");
+                fileName.AddProperty(new StringToken($"{takeInfo.Name}.tak"));
+                take.AddNode(fileName);
+
+                var localTime = N("LocalTime");
+                localTime.AddProperty(new LongToken(takeInfo.Start));
+                localTime.AddProperty(new LongToken(takeInfo.Stop));
+                take.AddNode(localTime);
+
+                var referenceTime = N("ReferenceTime");
+                referenceTime.AddProperty(new LongToken(takeInfo.Start));
+                referenceTime.AddProperty(new LongToken(takeInfo.Stop));
+                take.AddNode(referenceTime);
+
+                takes.AddNode(take);
+            }
+
+            _document.AddNode(takes);
+        }
+
+        private void WriteExportReport(string exportPath, IImported convert)
+        {
+            if (string.IsNullOrEmpty(_exportDirectory))
+                return;
+
+            var reportPath = Path.Combine(_exportDirectory, Path.GetFileNameWithoutExtension(exportPath) + ".fbx-export-report.txt");
+            using (var writer = new StreamWriter(reportPath, false, Encoding.UTF8))
+            {
+                writer.WriteLine("AssetStudio FBX export report");
+                writer.WriteLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                writer.WriteLine();
+                writer.WriteLine($"Source frames: {CountFrames(convert.RootFrame)}");
+                writer.WriteLine($"Source meshes: {convert.MeshList?.Count ?? 0}");
+                writer.WriteLine($"Source materials: {convert.MaterialList?.Count ?? 0}");
+                writer.WriteLine($"Source textures: {convert.TextureList?.Count ?? 0}");
+                writer.WriteLine($"Source animations: {convert.AnimationList?.Count ?? 0}");
+                writer.WriteLine();
+                writer.WriteLine($"Exported frames: {_exportedFrameCount}");
+                writer.WriteLine($"Exported bone models: {_exportedBoneCount}");
+                writer.WriteLine($"Exported meshes: {_exportedMeshCount}");
+                writer.WriteLine($"Exported skins: {_exportedSkinCount}");
+                writer.WriteLine($"Exported skin clusters: {_exportedClusterCount}");
+                writer.WriteLine($"Exported materials: {_exportedMaterialCount}");
+                writer.WriteLine($"Exported textures: {_exportedTextureCount}");
+                writer.WriteLine($"Exported animation stacks: {_exportedAnimationStackCount}");
+                writer.WriteLine($"Exported animation tracks: {_exportedAnimationTrackCount}");
+                writer.WriteLine($"Exported animation curves: {_exportedAnimationCurveCount}");
+                writer.WriteLine($"Missing animation track targets: {_missingAnimationTrackCount}");
+            }
+        }
+
+        private int CountFrames(ImportedFrame frame)
+        {
+            if (frame == null)
+                return 0;
+
+            var count = 1;
+            for (int i = 0; i < frame.Count; i++)
+                count += CountFrames(frame[i]);
+            return count;
         }
 
         private void BuildGlobalSettings(float scaleFactor)

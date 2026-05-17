@@ -218,8 +218,13 @@ namespace AssetStudio
 
         private ImportedFrame ConvertTransform(Transform trans)
         {
+            if (transformDictionary.TryGetValue(trans, out var existingFrame))
+            {
+                return existingFrame;
+            }
+
             var frame = new ImportedFrame(trans.m_Children.Length);
-            transformDictionary.Add(trans, frame);
+            transformDictionary[trans] = frame;
             trans.m_GameObject.TryGet(out var m_GameObject);
             frame.Name = m_GameObject.m_Name;
             SetFrame(frame, trans.m_LocalPosition, trans.m_LocalRotation, trans.m_LocalScale);
@@ -276,6 +281,11 @@ namespace AssetStudio
 
         private void ConvertTransforms(Transform trans, ImportedFrame parent)
         {
+            if (transformDictionary.ContainsKey(trans))
+            {
+                return;
+            }
+
             var frame = ConvertTransform(trans);
             if (parent == null)
             {
@@ -642,15 +652,18 @@ namespace AssetStudio
         {
             if (boundAnimationPathDic.TryGetValue(m_AnimationClip, out var basePath))
             {
-                path = basePath + "/" + path;
+                path = string.IsNullOrEmpty(path) ? basePath : basePath + "/" + path;
             }
             return FixBonePath(path);
         }
 
         private string FixBonePath(string path)
         {
+            if (string.IsNullOrEmpty(path))
+                return RootFrame?.Path;
+
             var frame = RootFrame.FindFrameByPath(path);
-            return frame?.Path;
+            return frame?.Path ?? path;
         }
 
         private static string GetTransformPathByFather(Transform transform)
