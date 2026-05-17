@@ -1,6 +1,7 @@
 using AssetStudio;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace AssetStudioGUI
@@ -9,8 +10,8 @@ namespace AssetStudioGUI
     {
         public bool ShowErrorMessage;
         private readonly Action<string> action;
-        private readonly List<string> errors = new List<string>();
-        private readonly object errorsLock = new object();
+        private readonly List<(LoggerEvent Event, string Message)> messages = new List<(LoggerEvent Event, string Message)>();
+        private readonly object messagesLock = new object();
 
         public GUILogger(Action<string> action)
         {
@@ -22,10 +23,7 @@ namespace AssetStudioGUI
             switch (loggerEvent)
             {
                 case LoggerEvent.Error:
-                    lock (errorsLock)
-                    {
-                        errors.Add(message);
-                    }
+                    AddMessage(loggerEvent, message);
                     if (ShowErrorMessage)
                     {
                         MessageBox.Show(message);
@@ -35,25 +33,40 @@ namespace AssetStudioGUI
                         action("Error logged. Export errors.txt to inspect details.");
                     }
                     break;
+                case LoggerEvent.Warning:
+                    AddMessage(loggerEvent, message);
+                    action(message);
+                    break;
                 default:
                     action(message);
                     break;
             }
         }
 
-        public string[] GetErrors()
+        private void AddMessage(LoggerEvent loggerEvent, string message)
         {
-            lock (errorsLock)
+            lock (messagesLock)
             {
-                return errors.ToArray();
+                messages.Add((loggerEvent, message));
+            }
+        }
+
+        public string[] GetMessages(params LoggerEvent[] loggerEvents)
+        {
+            lock (messagesLock)
+            {
+                return messages
+                    .Where(x => loggerEvents.Contains(x.Event))
+                    .Select(x => x.Message)
+                    .ToArray();
             }
         }
 
         public void ClearErrors()
         {
-            lock (errorsLock)
+            lock (messagesLock)
             {
-                errors.Clear();
+                messages.Clear();
             }
         }
     }

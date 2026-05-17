@@ -53,7 +53,7 @@ namespace AssetStudio.PInvoke
                     var errorCode = Marshal.GetLastWin32Error();
                     var exception = new Win32Exception(errorCode);
 
-                    throw new DllNotFoundException(exception.Message, exception);
+                    throw new DllNotFoundException($"Failed to load native library '{directedDllPath}'. Build the native projects and copy the DLL into the platform folder beside the executable. {exception.Message}", exception);
                 }
             }
 

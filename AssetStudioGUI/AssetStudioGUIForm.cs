@@ -461,6 +461,18 @@ namespace AssetStudioGUI
             exportOpt.ShowDialog(this);
         }
 
+        private void setProjectRootToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            var openFolderDialog = new OpenFolderDialog();
+            openFolderDialog.Title = "Select project root";
+            openFolderDialog.InitialFolder = assetsManager.ProjectRoot ?? openDirectoryBackup;
+            if (openFolderDialog.ShowDialog(this) == DialogResult.OK)
+            {
+                assetsManager.ProjectRoot = openFolderDialog.Folder;
+                StatusStripUpdate($"Project root set to: {assetsManager.ProjectRoot}");
+            }
+        }
+
         private void assetListView_RetrieveVirtualItem(object sender, RetrieveVirtualItemEventArgs e)
         {
             e.Item = visibleAssets[e.ItemIndex];

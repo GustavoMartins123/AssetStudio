@@ -481,7 +481,7 @@ namespace AssetStudioGUI
 
         private static string WriteErrorReport(string savePath, List<string> exportErrors)
         {
-            var loadErrors = Logger.Default is GUILogger logger ? logger.GetErrors() : new string[0];
+            var loadErrors = Logger.Default is GUILogger logger ? logger.GetMessages(LoggerEvent.Error) : new string[0];
             if (loadErrors.Length == 0 && exportErrors.Count == 0)
             {
                 return null;

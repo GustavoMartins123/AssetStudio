@@ -49,6 +49,15 @@ namespace AssetStudio
                         resourceFilePath = findFiles[0];
                     }
                 }
+                if (!File.Exists(resourceFilePath) && !string.IsNullOrEmpty(assetsFile.assetsManager.ProjectRoot))
+                {
+                    var projectRoot = assetsFile.assetsManager.ProjectRoot;
+                    var findFiles = Directory.GetFiles(projectRoot, resourceFileName, SearchOption.AllDirectories);
+                    if (findFiles.Length > 0)
+                    {
+                        resourceFilePath = findFiles[0];
+                    }
+                }
                 if (File.Exists(resourceFilePath))
                 {
                     needSearch = false;

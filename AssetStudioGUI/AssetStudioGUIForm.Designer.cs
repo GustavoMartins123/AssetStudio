@@ -41,6 +41,7 @@
             this.displayAll = new System.Windows.Forms.ToolStripMenuItem();
             this.enablePreview = new System.Windows.Forms.ToolStripMenuItem();
             this.displayInfo = new System.Windows.Forms.ToolStripMenuItem();
+            this.setProjectRootToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.toolStripMenuItem14 = new System.Windows.Forms.ToolStripMenuItem();
             this.specifyUnityVersion = new System.Windows.Forms.ToolStripTextBox();
             this.showExpOpt = new System.Windows.Forms.ToolStripMenuItem();
@@ -213,6 +214,7 @@
             this.displayAll,
             this.enablePreview,
             this.displayInfo,
+            this.setProjectRootToolStripMenuItem,
             this.toolStripMenuItem14,
             this.showExpOpt});
             this.optionsToolStripMenuItem.Name = "optionsToolStripMenuItem";
@@ -252,6 +254,15 @@
             this.displayInfo.ToolTipText = "Toggle the overlay that shows information about each asset, eg. image size, forma" +
     "t, audio bitrate, etc.";
             this.displayInfo.CheckedChanged += new System.EventHandler(this.displayAssetInfo_Check);
+            // 
+            // setProjectRootToolStripMenuItem
+            // 
+            this.setProjectRootToolStripMenuItem.Name = "setProjectRootToolStripMenuItem";
+            this.setProjectRootToolStripMenuItem.Size = new System.Drawing.Size(223, 22);
+            this.setProjectRootToolStripMenuItem.Text = "Set project root...";
+            this.setProjectRootToolStripMenuItem.ToolTipText = "Set a root folder used only to search external dependencies such as streamed text" +
+    "ures and meshes.";
+            this.setProjectRootToolStripMenuItem.Click += new System.EventHandler(this.setProjectRootToolStripMenuItem_Click);
             // 
             // toolStripMenuItem14
             // 
@@ -1153,6 +1164,7 @@
         private System.Windows.Forms.ToolStripMenuItem displayAll;
         private System.Windows.Forms.ToolStripMenuItem enablePreview;
         private System.Windows.Forms.ToolStripMenuItem displayInfo;
+        private System.Windows.Forms.ToolStripMenuItem setProjectRootToolStripMenuItem;
         private System.Windows.Forms.ToolStripSeparator toolStripMenuItem1;
         private System.Windows.Forms.ToolStripMenuItem extractFileToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem extractFolderToolStripMenuItem;

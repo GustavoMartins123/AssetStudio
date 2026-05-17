@@ -11,6 +11,7 @@ namespace AssetStudio
     public class AssetsManager
     {
         public string SpecifyUnityVersion;
+        public string ProjectRoot;
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
 
         internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -24,6 +25,10 @@ namespace AssetStudio
         public void LoadFiles(params string[] files)
         {
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
+            if (string.IsNullOrEmpty(ProjectRoot))
+            {
+                ProjectRoot = path;
+            }
             MergeSplitAssets(path);
             var toReadFile = ProcessingSplitFiles(files.ToList());
             Load(toReadFile);
@@ -31,6 +36,10 @@ namespace AssetStudio
 
         public void LoadFolder(string path)
         {
+            if (string.IsNullOrEmpty(ProjectRoot))
+            {
+                ProjectRoot = Path.GetFullPath(path);
+            }
             MergeSplitAssets(path, true);
             var files = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories).ToList();
             var toReadFile = ProcessingSplitFiles(files);

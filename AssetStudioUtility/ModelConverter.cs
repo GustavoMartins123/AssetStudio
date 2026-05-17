@@ -692,6 +692,10 @@ namespace AssetStudio
                 {
                     if (!texEnv.Value.m_Texture.TryGet<Texture2D>(out var m_Texture2D)) //TODO other Texture
                     {
+                        if (!texEnv.Value.m_Texture.IsNull)
+                        {
+                            Logger.Warning($"Unable to resolve texture reference for material {mat.m_Name}, property {texEnv.Key}, PathID {texEnv.Value.m_Texture.m_PathID}.");
+                        }
                         continue;
                     }
 
@@ -736,7 +740,7 @@ namespace AssetStudio
 
                     texture.Offset = texEnv.Value.m_Offset;
                     texture.Scale = texEnv.Value.m_Scale;
-                    ConvertTexture2D(m_Texture2D, texture.Name);
+                    ConvertTexture2D(m_Texture2D, texture.Name, mat.m_Name, texEnv.Key);
                 }
 
                 MaterialList.Add(iMat);
@@ -748,7 +752,7 @@ namespace AssetStudio
             return iMat;
         }
 
-        private void ConvertTexture2D(Texture2D m_Texture2D, string name)
+        private void ConvertTexture2D(Texture2D m_Texture2D, string name, string materialName, string propertyName)
         {
             var iTex = ImportedHelpers.FindTexture(name, TextureList);
             if (iTex != null)
@@ -757,13 +761,16 @@ namespace AssetStudio
             }
 
             var stream = m_Texture2D.ConvertToStream(imageFormat, true);
-            if (stream != null)
+            if (stream == null)
             {
-                using (stream)
-                {
-                    iTex = new ImportedTexture(stream, name);
-                    TextureList.Add(iTex);
-                }
+                Logger.Warning($"Unable to convert texture {m_Texture2D.m_Name} for material {materialName}, property {propertyName}.");
+                return;
+            }
+
+            using (stream)
+            {
+                iTex = new ImportedTexture(stream, name);
+                TextureList.Add(iTex);
             }
         }
 
