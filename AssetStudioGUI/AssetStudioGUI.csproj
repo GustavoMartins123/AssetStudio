@@ -75,15 +75,11 @@
 	</ItemGroup>
 
 	<Target Name="CopyExtraFiles" AfterTargets="AfterBuild">
-		<Copy SourceFiles="$(RepoRoot)AssetStudioFBXNative\bin\Win32\$(Configuration)\AssetStudioFBXNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)AssetStudioFBXNative\bin\Win32\$(Configuration)\AssetStudioFBXNative.dll')" />
-		<Copy SourceFiles="$(RepoRoot)AssetStudioFBXNative\bin\x64\$(Configuration)\AssetStudioFBXNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)AssetStudioFBXNative\bin\x64\$(Configuration)\AssetStudioFBXNative.dll')" />
 		<Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll')" />
 		<Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll')" />
 	</Target>
 
 	<Target Name="PublishExtraFiles" AfterTargets="Publish">
-		<Copy SourceFiles="$(TargetDir)x86\AssetStudioFBXNative.dll" DestinationFolder="$(PublishDir)x86" Condition="Exists('$(TargetDir)x86\AssetStudioFBXNative.dll')" />
-		<Copy SourceFiles="$(TargetDir)x64\AssetStudioFBXNative.dll" DestinationFolder="$(PublishDir)x64" Condition="Exists('$(TargetDir)x64\AssetStudioFBXNative.dll')" />
 		<Copy SourceFiles="$(TargetDir)x86\Texture2DDecoderNative.dll" DestinationFolder="$(PublishDir)x86" Condition="Exists('$(TargetDir)x86\Texture2DDecoderNative.dll')" />
 		<Copy SourceFiles="$(TargetDir)x64\Texture2DDecoderNative.dll" DestinationFolder="$(PublishDir)x64" Condition="Exists('$(TargetDir)x64\Texture2DDecoderNative.dll')" />
 	</Target>

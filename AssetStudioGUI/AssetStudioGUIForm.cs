@@ -103,6 +103,8 @@ namespace AssetStudioGUI
             displayAll.Checked = Properties.Settings.Default.displayAll;
             displayInfo.Checked = Properties.Settings.Default.displayInfo;
             enablePreview.Checked = Properties.Settings.Default.enablePreview;
+            openDirectoryBackup = GetExistingFolder(Properties.Settings.Default.loadFolderPath);
+            saveDirectoryBackup = GetExistingFolder(Properties.Settings.Default.exportFolderPath);
             FMODinit();
 
             logger = new GUILogger(StatusStripUpdate);
@@ -110,6 +112,25 @@ namespace AssetStudioGUI
             toolStripMenuItem15.Checked = false;
             Progress.Default = new Progress<int>(SetProgressBarValue);
             Studio.StatusStripUpdate = StatusStripUpdate;
+        }
+
+        private static string GetExistingFolder(string path)
+        {
+            return !string.IsNullOrEmpty(path) && Directory.Exists(path) ? path : string.Empty;
+        }
+
+        private void SetLoadFolder(string path)
+        {
+            openDirectoryBackup = GetExistingFolder(path);
+            Properties.Settings.Default.loadFolderPath = openDirectoryBackup;
+            Properties.Settings.Default.Save();
+        }
+
+        private void SetExportFolder(string path)
+        {
+            saveDirectoryBackup = GetExistingFolder(path);
+            Properties.Settings.Default.exportFolderPath = saveDirectoryBackup;
+            Properties.Settings.Default.Save();
         }
 
         private void AssetStudioGUIForm_DragEnter(object sender, DragEventArgs e)
@@ -145,7 +166,7 @@ namespace AssetStudioGUI
             if (openFileDialog1.ShowDialog(this) == DialogResult.OK)
             {
                 ResetForm();
-                openDirectoryBackup = Path.GetDirectoryName(openFileDialog1.FileNames[0]);
+                SetLoadFolder(Path.GetDirectoryName(openFileDialog1.FileNames[0]));
                 assetsManager.SpecifyUnityVersion = specifyUnityVersion.Text;
                 await Task.Run(() => assetsManager.LoadFiles(openFileDialog1.FileNames));
                 BuildAssetStructures();
@@ -159,7 +180,7 @@ namespace AssetStudioGUI
             if (openFolderDialog.ShowDialog(this) == DialogResult.OK)
             {
                 ResetForm();
-                openDirectoryBackup = openFolderDialog.Folder;
+                SetLoadFolder(openFolderDialog.Folder);
                 assetsManager.SpecifyUnityVersion = specifyUnityVersion.Text;
                 await Task.Run(() => assetsManager.LoadFolder(openFolderDialog.Folder));
                 BuildAssetStructures();
@@ -1333,7 +1354,7 @@ namespace AssetStudioGUI
                 saveFolderDialog.InitialFolder = saveDirectoryBackup;
                 if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
                 {
-                    saveDirectoryBackup = saveFolderDialog.Folder;
+                    SetExportFolder(saveFolderDialog.Folder);
                     var exportPath = Path.Combine(saveFolderDialog.Folder, "Animator") + Path.DirectorySeparatorChar;
                     ExportAnimatorWithAnimationClip(animator, animationList, exportPath);
                 }
@@ -1358,7 +1379,7 @@ namespace AssetStudioGUI
                 saveFolderDialog.InitialFolder = saveDirectoryBackup;
                 if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
                 {
-                    saveDirectoryBackup = saveFolderDialog.Folder;
+                    SetExportFolder(saveFolderDialog.Folder);
                     var exportPath = Path.Combine(saveFolderDialog.Folder, "GameObject") + Path.DirectorySeparatorChar;
                     List<AssetItem> animationList = null;
                     if (animation)
@@ -1403,7 +1424,7 @@ namespace AssetStudioGUI
                     saveFileDialog.InitialDirectory = saveDirectoryBackup;
                     if (saveFileDialog.ShowDialog(this) == DialogResult.OK)
                     {
-                        saveDirectoryBackup = Path.GetDirectoryName(saveFileDialog.FileName);
+                        SetExportFolder(Path.GetDirectoryName(saveFileDialog.FileName));
                         var exportPath = saveFileDialog.FileName;
                         List<AssetItem> animationList = null;
                         if (animation)
@@ -1502,7 +1523,7 @@ namespace AssetStudioGUI
                 saveFolderDialog.InitialFolder = saveDirectoryBackup;
                 if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
                 {
-                    saveDirectoryBackup = saveFolderDialog.Folder;
+                    SetExportFolder(saveFolderDialog.Folder);
                     var savePath = saveFolderDialog.Folder + Path.DirectorySeparatorChar;
                     ExportSplitObjects(savePath, sceneTreeView.Nodes);
                 }
@@ -1565,7 +1586,7 @@ namespace AssetStudioGUI
                 if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
                 {
                     timer.Stop();
-                    saveDirectoryBackup = saveFolderDialog.Folder;
+                    SetExportFolder(saveFolderDialog.Folder);
                     List<AssetItem> toExportAssets = null;
                     switch (type)
                     {
@@ -1599,7 +1620,7 @@ namespace AssetStudioGUI
                 if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
                 {
                     timer.Stop();
-                    saveDirectoryBackup = saveFolderDialog.Folder;
+                    SetExportFolder(saveFolderDialog.Folder);
                     List<AssetItem> toExportAssets = null;
                     switch (type)
                     {

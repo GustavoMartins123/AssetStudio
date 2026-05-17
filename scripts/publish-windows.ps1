@@ -12,9 +12,7 @@ param(
 
     [string]$OutputDir,
 
-    [switch]$SkipNative,
-
-    [switch]$SkipFbxNative
+    [switch]$SkipNative
 )
 
 $ErrorActionPreference = "Stop"
@@ -138,27 +136,6 @@ function Copy-NativeDll {
     return $false
 }
 
-function Copy-FbxSdkRuntime {
-    $nativeTargetDir = Join-Path $PublishDir $RuntimeFolder
-    $sdkArch = if ($Platform -eq "x64") { "x64" } else { "x86" }
-    $configName = $Configuration.ToLowerInvariant()
-
-    $candidates = @(
-        (Join-Path $RepoRoot "AssetStudioFBXNative\bin\$NativePlatform\$Configuration\libfbxsdk.dll"),
-        "C:\Program Files\Autodesk\FBX\FBX SDK\2020.2.1\lib\vs2019\$sdkArch\$configName\libfbxsdk.dll",
-        "C:\Program Files\Autodesk\FBX\FBX SDK\2020.2.1\lib\vs2022\$sdkArch\$configName\libfbxsdk.dll"
-    )
-
-    foreach ($candidate in $candidates) {
-        if (Test-Path $candidate) {
-            Copy-IfExists $candidate $nativeTargetDir | Out-Null
-            return
-        }
-    }
-
-    Write-Warning "libfbxsdk.dll was not found. FBX export needs it beside AssetStudioFBXNative.dll."
-}
-
 Write-Host "Publishing AssetStudioGUI ($Configuration, $Framework, $Runtime, self-contained=$SelfContained)"
 Assert-OutputExecutableIsNotRunning
 
@@ -172,15 +149,6 @@ if (-not $SkipNative) {
         "/p:Configuration=$Configuration",
         "/p:Platform=$NativePlatform"
     )
-
-    if (-not $SkipFbxNative) {
-        Invoke-Checked $msbuild @(
-            (Join-Path $RepoRoot "AssetStudioFBXNative\AssetStudioFBXNative.vcxproj"),
-            "/m",
-            "/p:Configuration=$Configuration",
-            "/p:Platform=$NativePlatform"
-        )
-    }
 }
 
 $publishArgs = @(
@@ -203,12 +171,6 @@ if (-not $SkipNative) {
         throw "Texture2DDecoderNative.dll is required for texture export. Build Texture2DDecoderNative or rerun with -SkipNative to publish the managed app only."
     }
 
-    if (-not $SkipFbxNative) {
-        if (-not (Copy-NativeDll "AssetStudioFBXNative" "AssetStudioFBXNative.dll")) {
-            throw "AssetStudioFBXNative.dll is required for FBX export. Install/configure Autodesk FBX SDK or rerun with -SkipFbxNative."
-        }
-        Copy-FbxSdkRuntime
-    }
 }
 
 Write-Host ""

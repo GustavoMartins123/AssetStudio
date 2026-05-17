@@ -274,5 +274,29 @@ namespace AssetStudioGUI.Properties {
                 this["exportAllUvsAsDiffuseMaps"] = value;
             }
         }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string loadFolderPath {
+            get {
+                return ((string)(this["loadFolderPath"]));
+            }
+            set {
+                this["loadFolderPath"] = value;
+            }
+        }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string exportFolderPath {
+            get {
+                return ((string)(this["exportFolderPath"]));
+            }
+            set {
+                this["exportFolderPath"] = value;
+            }
+        }
     }
 }

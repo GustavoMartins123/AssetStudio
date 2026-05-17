@@ -79,7 +79,6 @@ First, use my another program [Il2CppDumper](https://github.com/Perfare/Il2CppDu
 ## Build
 
 * Visual Studio 2022 or newer
-* **AssetStudioFBXNative** uses [FBX SDK 2020.2.1](https://www.autodesk.com/developer-network/platform-technologies/fbx-sdk-2020-2-1), before building, you need to install the FBX SDK and modify the project file, change include directory and library directory to point to the FBX SDK directory
 
 ### One-command Windows publish
 
@@ -111,28 +110,20 @@ dotnet publish AssetStudioGUI\AssetStudioGUI.csproj -f net10.0-windows -c Releas
 
 and then copying the native DLLs into the publish folder.
 
-If you only need texture export and do not have the Autodesk FBX SDK installed yet, skip the FBX native project:
-
-```powershell
-.\scripts\publish-windows.ps1 -Configuration Release -Platform x64 -SkipFbxNative
-```
-
-The script requires Visual Studio with the C++ workload for native builds. Use `-SkipNative` only when you want to publish the managed app without texture decoder or FBX native support. Use `-OutputDir <path>` only when you intentionally want a custom publish folder.
+The script requires Visual Studio with the C++ workload for native texture builds. Use `-SkipNative` only when you want to publish the managed app without texture decoder native support. Use `-OutputDir <path>` only when you intentionally want a custom publish folder.
 
 ### Native Dependencies
 
-Texture conversion and FBX export depend on native DLLs. The managed application can build without them, but those features will fail at runtime if the DLLs are missing.
+Compressed texture conversion depends on a native DLL. The managed application can build without it, but compressed texture export will fail at runtime if the DLL is missing.
 
 Expected runtime layout on 64-bit Windows:
 
 ```text
 AssetStudioGUI.exe
 x64\Texture2DDecoderNative.dll
-x64\AssetStudioFBXNative.dll
-x64\libfbxsdk.dll
 ```
 
-`Texture2DDecoderNative.dll` is required for compressed texture formats such as DXT, BC, ETC, PVRTC, ASTC and Crunch. `AssetStudioFBXNative.dll` and `libfbxsdk.dll` are required for FBX export.
+`Texture2DDecoderNative.dll` is required for compressed texture formats such as DXT, BC, ETC, PVRTC, ASTC and Crunch.
 
 ## Open source libraries used
 
