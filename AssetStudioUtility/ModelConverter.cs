@@ -51,7 +51,7 @@ namespace AssetStudio
         public ModelConverter(string rootName, List<GameObject> m_GameObjects, ImageFormat imageFormat, AnimationClip[] animationList = null)
         {
             this.imageFormat = imageFormat;
-            RootFrame = CreateFrame(rootName, Vector3.Zero, new Quaternion(0, 0, 0, 0), Vector3.One);
+            RootFrame = CreateFrame(rootName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
             foreach (var m_GameObject in m_GameObjects)
             {
                 if (m_GameObject.m_Animator != null && animationList == null)
@@ -253,6 +253,20 @@ namespace AssetStudio
             float sqy = q.Y * q.Y;
             float sqz = q.Z * q.Z;
             float unit = sqx + sqy + sqz + sqw;
+            if (unit <= float.Epsilon || float.IsNaN(unit) || float.IsInfinity(unit))
+            {
+                return Vector3.Zero;
+            }
+            var magnitude = (float)Math.Sqrt(unit);
+            q.X /= magnitude;
+            q.Y /= magnitude;
+            q.Z /= magnitude;
+            q.W /= magnitude;
+            sqw = q.W * q.W;
+            sqx = q.X * q.X;
+            sqy = q.Y * q.Y;
+            sqz = q.Z * q.Z;
+            unit = 1f;
             float test = q.X * q.Y + q.Z * q.W;
 
             float yaw, pitch, roll;
@@ -272,7 +286,7 @@ namespace AssetStudio
             else
             {
                 yaw = (float)Math.Atan2(2f * q.Y * q.W - 2f * q.X * q.Z, sqx - sqy - sqz + sqw);
-                pitch = (float)Math.Asin(2f * test / unit);
+                pitch = (float)Math.Asin(Math.Max(-1f, Math.Min(1f, 2f * test / unit)));
                 roll = (float)Math.Atan2(2f * q.X * q.W - 2f * q.Y * q.Z, -sqx + sqy - sqz + sqw);
             }
 

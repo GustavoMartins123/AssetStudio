@@ -31,6 +31,7 @@ namespace AssetStudio
         private Dictionary<string, long> _blendShapeChannelMap = new Dictionary<string, long>();
         private Dictionary<string, long> _textureIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _videoIdMap = new Dictionary<string, long>();
+        private Dictionary<string, int> _fbxNameCounts = new Dictionary<string, int>();
         private HashSet<string> _bonePathSet = new HashSet<string>();
         private List<(string Name, long Start, long Stop)> _takes = new List<(string Name, long Start, long Stop)>();
         private int _exportedFrameCount;
@@ -118,10 +119,11 @@ namespace AssetStudio
             _frameIdMap[normalizedPath] = id;
             var isBone = IsBonePath(normalizedPath);
             var modelType = isBone ? "LimbNode" : "Null";
+            var fbxName = GetUniqueFbxName(frame.Name);
 
             var model = N("Model");
             model.AddProperty(new LongToken(id));
-            model.AddProperty(new StringToken($"Model::{frame.Name}"));
+            model.AddProperty(new StringToken($"Model::{fbxName}"));
             model.AddProperty(new StringToken(modelType));
 
             var props = N("Properties70");
@@ -139,7 +141,7 @@ namespace AssetStudio
             if (isBone)
             {
                 _exportedBoneCount++;
-                ExportSkeletonAttribute(frame.Name, id);
+                ExportSkeletonAttribute(fbxName, id);
             }
 
             for (int i = 0; i < frame.Count; i++)
@@ -476,12 +478,13 @@ namespace AssetStudio
 
                 var transform = new double[16];
                 var transformLink = new double[16];
+                var bindMatrix = InvertMatrix(bone.Matrix);
                 for (int r = 0; r < 4; r++)
                 {
                     for (int c = 0; c < 4; c++)
                     {
                         transform[r * 4 + c] = (r == c) ? 1.0 : 0.0;
-                        transformLink[r * 4 + c] = bone.Matrix[r, c];
+                        transformLink[r * 4 + c] = SanitizeDouble(bindMatrix[r, c]);
                     }
                 }
 
@@ -625,6 +628,21 @@ namespace AssetStudio
             }
         }
 
+        private string GetUniqueFbxName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                name = "Node";
+
+            if (!_fbxNameCounts.TryGetValue(name, out var count))
+            {
+                _fbxNameCounts[name] = 1;
+                return name;
+            }
+
+            _fbxNameCounts[name] = count + 1;
+            return $"{name}_{count}";
+        }
+
         private void ExportAnimation(ImportedKeyframedAnimation anim)
         {
             if (anim.TrackList == null || anim.TrackList.Count == 0)
@@ -760,6 +778,29 @@ namespace AssetStudio
             }
 
             return matchCount == 1;
+        }
+
+        private static Matrix4x4 InvertMatrix(Matrix4x4 matrix)
+        {
+            var numericMatrix = new System.Numerics.Matrix4x4(
+                matrix[0, 0], matrix[0, 1], matrix[0, 2], matrix[0, 3],
+                matrix[1, 0], matrix[1, 1], matrix[1, 2], matrix[1, 3],
+                matrix[2, 0], matrix[2, 1], matrix[2, 2], matrix[2, 3],
+                matrix[3, 0], matrix[3, 1], matrix[3, 2], matrix[3, 3]);
+
+            if (!System.Numerics.Matrix4x4.Invert(numericMatrix, out var inverted))
+            {
+                Logger.Warning("Unable to invert bone bind pose matrix while exporting FBX skin cluster.");
+                return matrix;
+            }
+
+            return new Matrix4x4(new[]
+            {
+                inverted.M11, inverted.M21, inverted.M31, inverted.M41,
+                inverted.M12, inverted.M22, inverted.M32, inverted.M42,
+                inverted.M13, inverted.M23, inverted.M33, inverted.M43,
+                inverted.M14, inverted.M24, inverted.M34, inverted.M44
+            });
         }
 
         private void BuildBonePathSet(IImported convert)
@@ -915,7 +956,7 @@ namespace AssetStudio
             var keyValueFloat = N("KeyValueFloat");
             var floatValues = new float[values.Length];
             for (int i = 0; i < values.Length; i++)
-                floatValues[i] = (float)values[i];
+                floatValues[i] = (float)SanitizeDouble(values[i]);
             keyValueFloat.AddProperty(new FloatArrayToken(floatValues));
             curve.AddNode(keyValueFloat);
 
@@ -1236,9 +1277,9 @@ namespace AssetStudio
             p.AddProperty(new StringToken(type1));
             p.AddProperty(new StringToken(type2));
             p.AddProperty(new StringToken(flags));
-            p.AddProperty(new DoubleToken(x));
-            p.AddProperty(new DoubleToken(y));
-            p.AddProperty(new DoubleToken(z));
+            p.AddProperty(new DoubleToken(SanitizeDouble(x)));
+            p.AddProperty(new DoubleToken(SanitizeDouble(y)));
+            p.AddProperty(new DoubleToken(SanitizeDouble(z)));
             return p;
         }
 
@@ -1253,6 +1294,17 @@ namespace AssetStudio
             p.AddProperty(new DoubleToken(color.G));
             p.AddProperty(new DoubleToken(color.B));
             return p;
+        }
+
+        private static double SanitizeDouble(double value)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+                return 0;
+
+            if (Math.Abs(value) < 1e-12)
+                return 0;
+
+            return value;
         }
 
         private FbxNode MakeIntP(string name, int value)

@@ -1356,6 +1356,7 @@ namespace AssetStudioGUI
                     }
                 }
             }
+            selectedGameObjects = GetTopLevelSelectedGameObjects(selectedGameObjects);
 
             if (animator != null)
             {
@@ -1377,6 +1378,27 @@ namespace AssetStudioGUI
                     }
                 }
             }
+        }
+
+        private static List<GameObject> GetTopLevelSelectedGameObjects(List<GameObject> gameObjects)
+        {
+            return gameObjects
+                .Where(gameObject => !gameObjects.Any(other => other != gameObject && IsDescendantOf(gameObject, other)))
+                .ToList();
+        }
+
+        private static bool IsDescendantOf(GameObject child, GameObject possibleParent)
+        {
+            var transform = child.m_Transform;
+            while (transform != null && transform.m_Father.TryGet(out var father))
+            {
+                if (father.m_GameObject.TryGet(out var fatherGameObject) && fatherGameObject == possibleParent)
+                {
+                    return true;
+                }
+                transform = father;
+            }
+            return false;
         }
 
         private void exportSelectedObjectsToolStripMenuItem_Click(object sender, EventArgs e)

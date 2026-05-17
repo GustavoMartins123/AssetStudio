@@ -304,10 +304,20 @@ namespace AssetStudioGUI
 
         public static void ExportGameObjectMerge(List<GameObject> gameObject, string exportPath, List<AssetItem> animationList = null)
         {
-            var rootName = Path.GetFileNameWithoutExtension(exportPath);
-            var convert = animationList != null
-                ? new ModelConverter(rootName, gameObject, Properties.Settings.Default.convertType, animationList.Select(x => (AnimationClip)x.Asset).ToArray())
-                : new ModelConverter(rootName, gameObject, Properties.Settings.Default.convertType);
+            IImported convert;
+            if (gameObject.Count == 1)
+            {
+                convert = animationList != null
+                    ? new ModelConverter(gameObject[0], Properties.Settings.Default.convertType, animationList.Select(x => (AnimationClip)x.Asset).ToArray())
+                    : new ModelConverter(gameObject[0], Properties.Settings.Default.convertType);
+            }
+            else
+            {
+                var rootName = Path.GetFileNameWithoutExtension(exportPath);
+                convert = animationList != null
+                    ? new ModelConverter(rootName, gameObject, Properties.Settings.Default.convertType, animationList.Select(x => (AnimationClip)x.Asset).ToArray())
+                    : new ModelConverter(rootName, gameObject, Properties.Settings.Default.convertType);
+            }
             ExportFbx(convert, exportPath);
         }
 
