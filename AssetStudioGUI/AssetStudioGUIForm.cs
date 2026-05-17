@@ -107,6 +107,7 @@ namespace AssetStudioGUI
 
             logger = new GUILogger(StatusStripUpdate);
             Logger.Default = logger;
+            toolStripMenuItem15.Checked = false;
             Progress.Default = new Progress<int>(SetProgressBarValue);
             Studio.StatusStripUpdate = StatusStripUpdate;
         }
@@ -1220,6 +1221,7 @@ namespace AssetStudioGUI
             Text = $"AssetStudioGUI v{Application.ProductVersion}";
             assetsManager.Clear();
             assemblyLoader.Clear();
+            logger.ClearErrors();
             exportableAssets.Clear();
             visibleAssets.Clear();
             sceneTreeView.Nodes.Clear();

@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using System.Xml.Linq;
@@ -379,44 +380,46 @@ namespace AssetStudioGUI
 
                 int toExportCount = toExportAssets.Count;
                 int exportedCount = 0;
+                int failedCount = 0;
+                var exportErrors = new List<string>();
                 int i = 0;
                 Progress.Reset();
                 foreach (var asset in toExportAssets)
                 {
-                    string exportPath;
-                    switch (Properties.Settings.Default.assetGroupOption)
-                    {
-                        case 0: //type name
-                            exportPath = Path.Combine(savePath, asset.TypeString);
-                            break;
-                        case 1: //container path
-                            if (!string.IsNullOrEmpty(asset.Container))
-                            {
-                                exportPath = Path.Combine(savePath, Path.GetDirectoryName(asset.Container));
-                            }
-                            else
-                            {
-                                exportPath = savePath;
-                            }
-                            break;
-                        case 2: //source file
-                            if (string.IsNullOrEmpty(asset.SourceFile.originalPath))
-                            {
-                                exportPath = Path.Combine(savePath, asset.SourceFile.fileName + "_export");
-                            }
-                            else
-                            {
-                                exportPath = Path.Combine(savePath, Path.GetFileName(asset.SourceFile.originalPath) + "_export", asset.SourceFile.fileName);
-                            }
-                            break;
-                        default:
-                            exportPath = savePath;
-                            break;
-                    }
-                    exportPath += Path.DirectorySeparatorChar;
-                    StatusStripUpdate($"[{exportedCount}/{toExportCount}] Exporting {asset.TypeString}: {asset.Text}");
                     try
                     {
+                        string exportPath;
+                        switch (Properties.Settings.Default.assetGroupOption)
+                        {
+                            case 0: //type name
+                                exportPath = Path.Combine(savePath, asset.TypeString);
+                                break;
+                            case 1: //container path
+                                if (!string.IsNullOrEmpty(asset.Container))
+                                {
+                                    exportPath = Path.Combine(savePath, Path.GetDirectoryName(asset.Container));
+                                }
+                                else
+                                {
+                                    exportPath = savePath;
+                                }
+                                break;
+                            case 2: //source file
+                                if (string.IsNullOrEmpty(asset.SourceFile.originalPath))
+                                {
+                                    exportPath = Path.Combine(savePath, asset.SourceFile.fileName + "_export");
+                                }
+                                else
+                                {
+                                    exportPath = Path.Combine(savePath, Path.GetFileName(asset.SourceFile.originalPath) + "_export", asset.SourceFile.fileName);
+                                }
+                                break;
+                            default:
+                                exportPath = savePath;
+                                break;
+                        }
+                        exportPath += Path.DirectorySeparatorChar;
+                        StatusStripUpdate($"[{exportedCount}/{toExportCount}] Exporting {asset.TypeString}: {asset.Text}");
                         switch (exportType)
                         {
                             case ExportType.Raw:
@@ -441,17 +444,30 @@ namespace AssetStudioGUI
                     }
                     catch (Exception ex)
                     {
-                        MessageBox.Show($"Export {asset.Type}:{asset.Text} error\r\n{ex.Message}\r\n{ex.StackTrace}");
+                        failedCount++;
+                        var error = $"Failed to export {asset.TypeString}: {asset.Text} (PathID: {asset.m_PathID})";
+                        exportErrors.Add($"{error}{Environment.NewLine}{ex}");
+                        Logger.Warning($"{error}: {ex.Message}");
                     }
 
                     Progress.Report(++i, toExportCount);
                 }
 
                 var statusText = exportedCount == 0 ? "Nothing exported." : $"Finished exporting {exportedCount} assets.";
+                var errorReportPath = WriteErrorReport(savePath, exportErrors);
 
-                if (toExportCount > exportedCount)
+                var skippedCount = toExportCount - exportedCount - failedCount;
+                if (skippedCount > 0)
                 {
-                    statusText += $" {toExportCount - exportedCount} assets skipped (not extractable or files already exist)";
+                    statusText += $" {skippedCount} assets skipped (not extractable or files already exist).";
+                }
+                if (failedCount > 0)
+                {
+                    statusText += $" {failedCount} assets failed; see the log/status output for details.";
+                }
+                if (errorReportPath != null)
+                {
+                    statusText += $" Error report: {Path.GetFileName(errorReportPath)}.";
                 }
 
                 StatusStripUpdate(statusText);
@@ -461,6 +477,50 @@ namespace AssetStudioGUI
                     OpenFolderInExplorer(savePath);
                 }
             });
+        }
+
+        private static string WriteErrorReport(string savePath, List<string> exportErrors)
+        {
+            var loadErrors = Logger.Default is GUILogger logger ? logger.GetErrors() : new string[0];
+            if (loadErrors.Length == 0 && exportErrors.Count == 0)
+            {
+                return null;
+            }
+
+            Directory.CreateDirectory(savePath);
+            var errorReportPath = Path.Combine(savePath, "errors.txt");
+            using (var writer = new StreamWriter(errorReportPath, false, Encoding.UTF8))
+            {
+                writer.WriteLine("AssetStudio error report");
+                writer.WriteLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                writer.WriteLine();
+
+                if (loadErrors.Length > 0)
+                {
+                    writer.WriteLine($"Load errors ({loadErrors.Length})");
+                    writer.WriteLine(new string('=', 80));
+                    for (int i = 0; i < loadErrors.Length; i++)
+                    {
+                        writer.WriteLine($"[{i + 1}]");
+                        writer.WriteLine(loadErrors[i]);
+                        writer.WriteLine();
+                    }
+                }
+
+                if (exportErrors.Count > 0)
+                {
+                    writer.WriteLine($"Export errors ({exportErrors.Count})");
+                    writer.WriteLine(new string('=', 80));
+                    for (int i = 0; i < exportErrors.Count; i++)
+                    {
+                        writer.WriteLine($"[{i + 1}]");
+                        writer.WriteLine(exportErrors[i]);
+                        writer.WriteLine();
+                    }
+                }
+            }
+
+            return errorReportPath;
         }
 
         public static void ExportAssetsList(string savePath, List<AssetItem> toExportAssets, ExportListType exportListType)

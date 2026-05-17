@@ -509,9 +509,7 @@
             // 
             // toolStripMenuItem15
             // 
-            this.toolStripMenuItem15.Checked = true;
             this.toolStripMenuItem15.CheckOnClick = true;
-            this.toolStripMenuItem15.CheckState = System.Windows.Forms.CheckState.Checked;
             this.toolStripMenuItem15.Name = "toolStripMenuItem15";
             this.toolStripMenuItem15.Size = new System.Drawing.Size(207, 22);
             this.toolStripMenuItem15.Text = "Show error message";
