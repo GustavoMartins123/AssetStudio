@@ -1,4 +1,6 @@
-﻿using System.IO;
+using System;
+using System.IO;
+using System.Linq;
 
 namespace AssetStudio
 {
@@ -34,38 +36,35 @@ namespace AssetStudio
             if (needSearch)
             {
                 var resourceFileName = Path.GetFileName(path);
-                if (assetsFile.assetsManager.resourceFileReaders.TryGetValue(resourceFileName, out reader))
+                var normalizedPath = NormalizePath(path);
+                if (assetsFile.assetsManager.resourceFileReaders.TryGetValue(normalizedPath, out reader) && CanReadRange(reader))
                 {
                     needSearch = false;
                     return reader;
                 }
-                var assetsFileDirectory = Path.GetDirectoryName(assetsFile.fullName);
-                var resourceFilePath = Path.Combine(assetsFileDirectory, resourceFileName);
-                if (!File.Exists(resourceFilePath))
+                if (!HasDirectory(path)
+                    && assetsFile.assetsManager.resourceFileReaders.TryGetValue(resourceFileName, out reader)
+                    && CanReadRange(reader))
                 {
-                    var findFiles = Directory.GetFiles(assetsFileDirectory, resourceFileName, SearchOption.AllDirectories);
-                    if (findFiles.Length > 0)
-                    {
-                        resourceFilePath = findFiles[0];
-                    }
+                    needSearch = false;
+                    return reader;
                 }
-                if (!File.Exists(resourceFilePath) && !string.IsNullOrEmpty(assetsFile.assetsManager.ProjectRoot))
+
+                var resourceFilePath = ResolveResourceFilePath(resourceFileName, normalizedPath);
+                if (resourceFilePath != null)
                 {
-                    var projectRoot = assetsFile.assetsManager.ProjectRoot;
-                    var findFiles = Directory.GetFiles(projectRoot, resourceFileName, SearchOption.AllDirectories);
-                    if (findFiles.Length > 0)
-                    {
-                        resourceFilePath = findFiles[0];
-                    }
-                }
-                if (File.Exists(resourceFilePath))
-                {
+                    var resolvedKey = NormalizePath(Path.GetFullPath(resourceFilePath));
                     needSearch = false;
                     reader = new BinaryReader(File.OpenRead(resourceFilePath));
-                    assetsFile.assetsManager.resourceFileReaders.Add(resourceFileName, reader);
+                    assetsFile.assetsManager.resourceFileReaders[normalizedPath] = reader;
+                    assetsFile.assetsManager.resourceFileReaders[resolvedKey] = reader;
+                    if (!HasDirectory(path) && !assetsFile.assetsManager.resourceFileReaders.ContainsKey(resourceFileName))
+                    {
+                        assetsFile.assetsManager.resourceFileReaders[resourceFileName] = reader;
+                    }
                     return reader;
                 }
-                throw new FileNotFoundException($"Can't find the resource file {resourceFileName}");
+                throw new FileNotFoundException($"Can't find the resource file {path}");
             }
             else
             {
@@ -73,18 +72,99 @@ namespace AssetStudio
             }
         }
 
+        private string ResolveResourceFilePath(string resourceFileName, string normalizedPath)
+        {
+            if (Path.IsPathRooted(path) && File.Exists(path))
+            {
+                return path;
+            }
+
+            foreach (var root in GetSearchRoots())
+            {
+                var directPath = Path.Combine(root, path);
+                if (File.Exists(directPath))
+                {
+                    return directPath;
+                }
+
+                var resourceFilePath = Path.Combine(root, resourceFileName);
+                if (File.Exists(resourceFilePath))
+                {
+                    return resourceFilePath;
+                }
+
+                var findFiles = Directory.GetFiles(root, resourceFileName, SearchOption.AllDirectories);
+                var suffixMatches = findFiles
+                    .Where(x => NormalizePath(x).EndsWith(normalizedPath, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (suffixMatches.Length == 1)
+                {
+                    return suffixMatches[0];
+                }
+                if (suffixMatches.Length > 1)
+                {
+                    throw new IOException($"Found multiple resource files matching {path}");
+                }
+                if (findFiles.Length == 1)
+                {
+                    return findFiles[0];
+                }
+            }
+
+            return null;
+        }
+
+        private string[] GetSearchRoots()
+        {
+            var assetsFileDirectory = Path.GetDirectoryName(assetsFile.fullName);
+            if (!string.IsNullOrEmpty(assetsFile.assetsManager.ProjectRoot))
+            {
+                return new[] { assetsFileDirectory, assetsFile.assetsManager.ProjectRoot }
+                    .Where(x => !string.IsNullOrEmpty(x) && Directory.Exists(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+            }
+            return new[] { assetsFileDirectory }
+                .Where(x => !string.IsNullOrEmpty(x) && Directory.Exists(x))
+                .ToArray();
+        }
+
+        private static string NormalizePath(string value)
+        {
+            return value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        }
+
+        private static bool HasDirectory(string value)
+        {
+            return !string.IsNullOrEmpty(Path.GetDirectoryName(value));
+        }
+
+        private bool CanReadRange(BinaryReader binaryReader)
+        {
+            return offset >= 0 && size >= 0 && binaryReader.BaseStream.Length >= offset + size;
+        }
+
         public byte[] GetData()
         {
             var binaryReader = GetReader();
             binaryReader.BaseStream.Position = offset;
-            return binaryReader.ReadBytes((int)size);
+            var data = binaryReader.ReadBytes((int)size);
+            if (data.Length != size)
+            {
+                throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {data.Length} bytes.");
+            }
+            return data;
         }
 
         public void GetData(byte[] buff)
         {
             var binaryReader = GetReader();
             binaryReader.BaseStream.Position = offset;
-            binaryReader.Read(buff, 0, (int)size);
+            var read = binaryReader.Read(buff, 0, (int)size);
+            if (read != size)
+            {
+                throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {read} bytes.");
+            }
         }
 
         public void WriteData(string path)

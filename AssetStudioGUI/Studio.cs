@@ -614,7 +614,8 @@ namespace AssetStudioGUI
                         }
                         catch (Exception ex)
                         {
-                            MessageBox.Show($"Export GameObject:{j.Text} error\r\n{ex.Message}\r\n{ex.StackTrace}");
+                            Logger.Error($"Export GameObject:{j.Text} error", ex);
+                            StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                         }
 
                         Progress.Report(++k, count);
@@ -656,8 +657,8 @@ namespace AssetStudioGUI
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"Export Animator:{animator.Text} error\r\n{ex.Message}\r\n{ex.StackTrace}");
-                    StatusStripUpdate("Error in export");
+                    Logger.Error($"Export Animator:{animator.Text} error", ex);
+                    StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                 }
             });
         }
@@ -683,8 +684,8 @@ namespace AssetStudioGUI
                         }
                         catch (Exception ex)
                         {
-                            MessageBox.Show($"Export GameObject:{gameObject.m_Name} error\r\n{ex.Message}\r\n{ex.StackTrace}");
-                            StatusStripUpdate("Error in export");
+                            Logger.Error($"Export GameObject:{gameObject.m_Name} error", ex);
+                            StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                         }
 
                         Progress.Report(++i, count);
@@ -716,8 +717,8 @@ namespace AssetStudioGUI
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"Export Model:{name} error\r\n{ex.Message}\r\n{ex.StackTrace}");
-                    StatusStripUpdate("Error in export");
+                    Logger.Error($"Export Model:{name} error", ex);
+                    StatusStripUpdate("Error in export; see errors.txt or crash.log.");
                 }
                 if (Properties.Settings.Default.openAfterExport)
                 {
