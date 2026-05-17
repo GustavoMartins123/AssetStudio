@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -23,6 +23,26 @@ namespace AssetStudio.PInvoke
             {
                 Posix.LoadDll(dllDir, dllName);
             }
+        }
+
+        public static bool IsDllAvailable(string dllName)
+        {
+            var dllDir = GetDirectedDllDirectory();
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return File.Exists(Path.Combine(dllDir, $"{dllName}.dll"));
+            }
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                return File.Exists(Path.Combine(dllDir, $"lib{dllName}.so"));
+            }
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                return File.Exists(Path.Combine(dllDir, $"lib{dllName}.dylib"));
+            }
+
+            return false;
         }
 
         private static string GetDirectedDllDirectory()

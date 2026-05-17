@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace AssetStudio
 {
@@ -126,19 +126,23 @@ namespace AssetStudio
                 reader.AlignStream();
             }
             var image_data_size = reader.ReadInt32();
-            if (image_data_size == 0 && ((version[0] == 5 && version[1] >= 3) || version[0] > 5))//5.3.0 and up
+            if ((version[0] == 5 && version[1] >= 3) || version[0] > 5)//5.3.0 and up
             {
                 m_StreamData = new StreamingInfo(reader);
             }
 
             ResourceReader resourceReader;
-            if (!string.IsNullOrEmpty(m_StreamData?.path))
+            if (!string.IsNullOrEmpty(m_StreamData?.path) && m_StreamData.size > 0)
             {
                 resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size);
             }
-            else
+            else if (image_data_size > 0)
             {
                 resourceReader = new ResourceReader(reader, reader.BaseStream.Position, image_data_size);
+            }
+            else
+            {
+                resourceReader = new ResourceReader(reader, reader.BaseStream.Position, 0);
             }
             image_data = resourceReader;
         }

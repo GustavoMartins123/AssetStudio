@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -237,8 +237,41 @@ namespace AssetStudio
         private static void SetFrame(ImportedFrame frame, Vector3 t, Quaternion q, Vector3 s)
         {
             frame.LocalPosition = new Vector3(-t.X, t.Y, t.Z);
-            frame.LocalRotation = Fbx.QuaternionToEuler(new Quaternion(q.X, -q.Y, -q.Z, q.W));
+            frame.LocalRotation = QuaternionToEuler(new Quaternion(q.X, -q.Y, -q.Z, q.W));
             frame.LocalScale = s;
+        }
+
+        private static Vector3 QuaternionToEuler(Quaternion q)
+        {
+            float sqw = q.W * q.W;
+            float sqx = q.X * q.X;
+            float sqy = q.Y * q.Y;
+            float sqz = q.Z * q.Z;
+            float unit = sqx + sqy + sqz + sqw;
+            float test = q.X * q.Y + q.Z * q.W;
+
+            float yaw, pitch, roll;
+
+            if (test > 0.499f * unit)
+            {
+                yaw = 2f * (float)Math.Atan2(q.X, q.W);
+                pitch = (float)Math.PI / 2f;
+                roll = 0f;
+            }
+            else if (test < -0.499f * unit)
+            {
+                yaw = -2f * (float)Math.Atan2(q.X, q.W);
+                pitch = -(float)Math.PI / 2f;
+                roll = 0f;
+            }
+            else
+            {
+                yaw = (float)Math.Atan2(2f * q.Y * q.W - 2f * q.X * q.Z, sqx - sqy - sqz + sqw);
+                pitch = (float)Math.Asin(2f * test / unit);
+                roll = (float)Math.Atan2(2f * q.X * q.W - 2f * q.Y * q.Z, -sqx + sqy - sqz + sqw);
+            }
+
+            return new Vector3(roll * 180f / (float)Math.PI, pitch * 180f / (float)Math.PI, yaw * 180f / (float)Math.PI);
         }
 
         private void ConvertTransforms(Transform trans, ImportedFrame parent)
@@ -816,7 +849,7 @@ namespace AssetStudio
                         for (int i = 0; i < numKeys; i++)
                         {
                             var quat = quats[i];
-                            var value = Fbx.QuaternionToEuler(new Quaternion(quat.X, -quat.Y, -quat.Z, quat.W));
+                            var value = QuaternionToEuler(new Quaternion(quat.X, -quat.Y, -quat.Z, quat.W));
                             track.Rotations.Add(new ImportedKeyframe<Vector3>(times[i], value));
                         }
                     }
@@ -825,7 +858,7 @@ namespace AssetStudio
                         var track = iAnim.FindTrack(FixBonePath(animationClip, m_RotationCurve.path));
                         foreach (var m_Curve in m_RotationCurve.curve.m_Curve)
                         {
-                            var value = Fbx.QuaternionToEuler(new Quaternion(m_Curve.value.X, -m_Curve.value.Y, -m_Curve.value.Z, m_Curve.value.W));
+                            var value = QuaternionToEuler(new Quaternion(m_Curve.value.X, -m_Curve.value.Y, -m_Curve.value.Z, m_Curve.value.W));
                             track.Rotations.Add(new ImportedKeyframe<Vector3>(m_Curve.time, value));
                         }
                     }
@@ -970,7 +1003,7 @@ namespace AssetStudio
                         )));
                         break;
                     case 2:
-                        var value = Fbx.QuaternionToEuler(new Quaternion
+                        var value = QuaternionToEuler(new Quaternion
                         (
                             data[curveIndex++ + offset],
                             -data[curveIndex++ + offset],

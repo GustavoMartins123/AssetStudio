@@ -13,11 +13,11 @@
     <PackageReference Include="Mono.Cecil" Version="0.11.3" />
     <PackageReference Include="SixLabors.ImageSharp" Version="2.1.13" />
     <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="1.0.0" />
+    <PackageReference Include="UkooLabs.FbxSharpie" Version="1.0.99" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\AssetStudio.PInvoke\AssetStudio.PInvoke.csproj" />
-    <ProjectReference Include="..\AssetStudioFBXWrapper\AssetStudioFBXWrapper.csproj" />
     <ProjectReference Include="..\AssetStudio\AssetStudio.csproj" />
     <ProjectReference Include="..\Texture2DDecoderWrapper\Texture2DDecoderWrapper.csproj" />
   </ItemGroup>

@@ -32,20 +32,31 @@ namespace AssetStudio
                 return false;
             }
             var minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
-            if (minDataSize > 0 && reader.Size < minDataSize)
+            var truncated = minDataSize > 0 && reader.Size < minDataSize;
+            if (truncated)
             {
-                Logger.Warning($"Texture data too small for {m_TextureFormat} {m_Width}x{m_Height}: expected at least {minDataSize} bytes, got {reader.Size}");
-                return false;
+                var ratio = (double)reader.Size / minDataSize;
+                if (ratio < 0.1)
+                {
+                    Logger.Warning($"Texture data essentially absent for {m_TextureFormat} {m_Width}x{m_Height}: expected {minDataSize} bytes, got {reader.Size}. Skipping.");
+                    return false;
+                }
+                Logger.Warning($"Texture data truncated for {m_TextureFormat} {m_Width}x{m_Height}: expected {minDataSize} bytes, got {reader.Size}. Padding with zeros.");
             }
             var flag = false;
+            var allocSize = truncated ? (int)minDataSize : reader.Size;
             byte[] buff;
             try
             {
-                buff = BigArrayPool<byte>.Shared.Rent(reader.Size);
+                buff = BigArrayPool<byte>.Shared.Rent(allocSize);
+                if (truncated)
+                {
+                    Array.Clear(buff, 0, allocSize);
+                }
             }
             catch (OutOfMemoryException)
             {
-                Logger.Warning($"Out of memory allocating {reader.Size} bytes for texture decode");
+                Logger.Warning($"Out of memory allocating {allocSize} bytes for texture decode");
                 return false;
             }
             try
