@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);**\bin\**;**\Bin\**;**\obj\**;**\Obj\**;**\.codex-bin\**;**\.codex-obj\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="**\bin\**;**\Bin\**;**\obj\**;**\Obj\**;**\.codex-bin\**;**\.codex-obj\**" />
+    <EmbeddedResource Remove="**\bin\**;**\Bin\**;**\obj\**;**\Obj\**;**\.codex-bin\**;**\.codex-obj\**" />
+    <None Remove="**\bin\**;**\Bin\**;**\obj\**;**\Obj\**;**\.codex-bin\**;**\.codex-obj\**" />
+  </ItemGroup>
+</Project>
