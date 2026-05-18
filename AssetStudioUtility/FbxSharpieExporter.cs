@@ -26,6 +26,7 @@ namespace AssetStudio
         private string _exportDirectory;
         private ImportedFrame _rootFrame;
         private Dictionary<string, long> _frameIdMap = new Dictionary<string, long>();
+        private Dictionary<string, System.Numerics.Matrix4x4> _frameGlobalMatrixMap = new Dictionary<string, System.Numerics.Matrix4x4>();
         private Dictionary<string, long> _materialIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _meshIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _blendShapeChannelMap = new Dictionary<string, long>();
@@ -80,7 +81,7 @@ namespace AssetStudio
             BuildBonePathSet(convert);
 
             if (convert.RootFrame != null)
-                ExportFrame(convert.RootFrame, 0);
+                ExportFrame(convert.RootFrame, 0, System.Numerics.Matrix4x4.Identity);
 
             if (convert.MaterialList != null)
             {
@@ -111,12 +112,14 @@ namespace AssetStudio
             FbxIO.WriteAscii(_document, exportPath);
         }
 
-        private void ExportFrame(ImportedFrame frame, long parentId)
+        private void ExportFrame(ImportedFrame frame, long parentId, System.Numerics.Matrix4x4 parentGlobal)
         {
             var id = GenId();
             _exportedFrameCount++;
             var normalizedPath = NormalizeFramePath(frame.Path);
             _frameIdMap[normalizedPath] = id;
+            var globalMatrix = BuildLocalMatrix(frame) * parentGlobal;
+            _frameGlobalMatrixMap[normalizedPath] = globalMatrix;
             var isBone = IsBonePath(normalizedPath);
             var modelType = isBone ? "LimbNode" : "Null";
             var fbxName = GetUniqueFbxName(frame.Name);
@@ -145,7 +148,7 @@ namespace AssetStudio
             }
 
             for (int i = 0; i < frame.Count; i++)
-                ExportFrame(frame[i], id);
+                ExportFrame(frame[i], id, globalMatrix);
         }
 
         private void ExportSkeletonAttribute(string name, long modelId)
@@ -476,17 +479,10 @@ namespace AssetStudio
                     cluster.AddNode(wNode);
                 }
 
-                var transform = new double[16];
-                var transformLink = new double[16];
+                var transform = GetFrameMatrixArray(mesh.Path, System.Numerics.Matrix4x4.Identity);
                 var bindMatrix = InvertMatrix(bone.Matrix);
-                for (int r = 0; r < 4; r++)
-                {
-                    for (int c = 0; c < 4; c++)
-                    {
-                        transform[r * 4 + c] = (r == c) ? 1.0 : 0.0;
-                        transformLink[r * 4 + c] = SanitizeDouble(bindMatrix[r, c]);
-                    }
-                }
+                var fallbackBoneMatrix = ToNumericsMatrix(bindMatrix);
+                var transformLink = GetFrameMatrixArray(bone.Path, fallbackBoneMatrix);
 
                 var tNode = N("Transform");
                 tNode.AddProperty(new DoubleArrayToken(transform));
@@ -801,6 +797,78 @@ namespace AssetStudio
                 inverted.M13, inverted.M23, inverted.M33, inverted.M43,
                 inverted.M14, inverted.M24, inverted.M34, inverted.M44
             });
+        }
+
+        private static System.Numerics.Matrix4x4 ToNumericsMatrix(Matrix4x4 matrix)
+        {
+            return new System.Numerics.Matrix4x4(
+                matrix[0, 0], matrix[0, 1], matrix[0, 2], matrix[0, 3],
+                matrix[1, 0], matrix[1, 1], matrix[1, 2], matrix[1, 3],
+                matrix[2, 0], matrix[2, 1], matrix[2, 2], matrix[2, 3],
+                matrix[3, 0], matrix[3, 1], matrix[3, 2], matrix[3, 3]);
+        }
+
+        private double[] GetFrameMatrixArray(string path, System.Numerics.Matrix4x4 fallback)
+        {
+            var normalizedPath = NormalizeFramePath(path);
+            if (!string.IsNullOrEmpty(normalizedPath))
+            {
+                if (_frameGlobalMatrixMap.TryGetValue(normalizedPath, out var matrix))
+                    return ToFbxMatrixArray(matrix);
+
+                var suffix = "/" + normalizedPath;
+                var matchCount = 0;
+                var match = fallback;
+                foreach (var item in _frameGlobalMatrixMap)
+                {
+                    if (!item.Key.EndsWith(suffix, StringComparison.Ordinal))
+                        continue;
+
+                    match = item.Value;
+                    matchCount++;
+                    if (matchCount > 1)
+                        return ToFbxMatrixArray(fallback);
+                }
+
+                if (matchCount == 1)
+                    return ToFbxMatrixArray(match);
+            }
+
+            return ToFbxMatrixArray(fallback);
+        }
+
+        private static System.Numerics.Matrix4x4 BuildLocalMatrix(ImportedFrame frame)
+        {
+            var scale = System.Numerics.Matrix4x4.CreateScale(
+                (float)SanitizeDouble(frame.LocalScale.X),
+                (float)SanitizeDouble(frame.LocalScale.Y),
+                (float)SanitizeDouble(frame.LocalScale.Z));
+            var rotation =
+                System.Numerics.Matrix4x4.CreateRotationX(ToRadians(frame.LocalRotation.X)) *
+                System.Numerics.Matrix4x4.CreateRotationY(ToRadians(frame.LocalRotation.Y)) *
+                System.Numerics.Matrix4x4.CreateRotationZ(ToRadians(frame.LocalRotation.Z));
+            var translation = System.Numerics.Matrix4x4.CreateTranslation(
+                (float)SanitizeDouble(frame.LocalPosition.X),
+                (float)SanitizeDouble(frame.LocalPosition.Y),
+                (float)SanitizeDouble(frame.LocalPosition.Z));
+
+            return scale * rotation * translation;
+        }
+
+        private static float ToRadians(float degrees)
+        {
+            return (float)(SanitizeDouble(degrees) * Math.PI / 180.0);
+        }
+
+        private static double[] ToFbxMatrixArray(System.Numerics.Matrix4x4 matrix)
+        {
+            return new[]
+            {
+                SanitizeDouble(matrix.M11), SanitizeDouble(matrix.M12), SanitizeDouble(matrix.M13), SanitizeDouble(matrix.M14),
+                SanitizeDouble(matrix.M21), SanitizeDouble(matrix.M22), SanitizeDouble(matrix.M23), SanitizeDouble(matrix.M24),
+                SanitizeDouble(matrix.M31), SanitizeDouble(matrix.M32), SanitizeDouble(matrix.M33), SanitizeDouble(matrix.M34),
+                SanitizeDouble(matrix.M41), SanitizeDouble(matrix.M42), SanitizeDouble(matrix.M43), SanitizeDouble(matrix.M44)
+            };
         }
 
         private void BuildBonePathSet(IImported convert)

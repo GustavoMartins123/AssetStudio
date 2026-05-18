@@ -1,6 +1,12 @@
 # AssetStudio
 [![Build status](https://ci.appveyor.com/api/projects/status/rnu7l90422pdewx4?svg=true)](https://ci.appveyor.com/project/Perfare/assetstudio/branch/master/artifacts)
 
+## Attribution and maintenance note
+
+This project is based on [Perfare/AssetStudio](https://github.com/Perfare/AssetStudio), originally created and maintained by Perfare. The original repository was archived by its owner on January 21, 2023 and remains the upstream source and credit for AssetStudio.
+
+This update is an independent community maintenance effort. Its purpose is to keep AssetStudio usable on newer .NET versions, reduce crashes during load/export, and experiment with exporter fixes. It is not an official continuation by Perfare, and it does not claim ownership of the original project.
+
 **None of the repo, the tool, nor the repo owner is affiliated with, or sponsored or authorized by, Unity Technologies or its affiliates.**
 
 AssetStudio is a tool for exploring, extracting and exporting assets and assetbundles.
