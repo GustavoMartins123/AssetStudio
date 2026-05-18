@@ -34,6 +34,8 @@ namespace AssetStudio
         private Dictionary<string, long> _videoIdMap = new Dictionary<string, long>();
         private Dictionary<string, int> _fbxNameCounts = new Dictionary<string, int>();
         private HashSet<string> _bonePathSet = new HashSet<string>();
+        private HashSet<string> _skinBonePathSet = new HashSet<string>();
+        private HashSet<string> _meshPathSet = new HashSet<string>();
         private List<(string Name, long Start, long Stop)> _takes = new List<(string Name, long Start, long Stop)>();
         private int _exportedFrameCount;
         private int _exportedBoneCount;
@@ -81,7 +83,10 @@ namespace AssetStudio
             BuildBonePathSet(convert);
 
             if (convert.RootFrame != null)
+            {
                 ExportFrame(convert.RootFrame, 0, System.Numerics.Matrix4x4.Identity);
+                ExportBindPose();
+            }
 
             if (convert.MaterialList != null)
             {
@@ -121,6 +126,7 @@ namespace AssetStudio
             var globalMatrix = BuildLocalMatrix(frame) * parentGlobal;
             _frameGlobalMatrixMap[normalizedPath] = globalMatrix;
             var isBone = IsBonePath(normalizedPath);
+            var zeroTransform = ShouldZeroBoneTransform(normalizedPath);
             var modelType = isBone ? "LimbNode" : "Null";
             var fbxName = GetUniqueFbxName(frame.Name);
 
@@ -131,9 +137,13 @@ namespace AssetStudio
 
             var props = N("Properties70");
             props.AddNode(MakeP("Lcl Translation", "Lcl Translation", "", "A+",
-                (double)frame.LocalPosition.X, (double)frame.LocalPosition.Y, (double)frame.LocalPosition.Z));
+                zeroTransform ? 0 : (double)frame.LocalPosition.X,
+                zeroTransform ? 0 : (double)frame.LocalPosition.Y,
+                zeroTransform ? 0 : (double)frame.LocalPosition.Z));
             props.AddNode(MakeP("Lcl Rotation", "Lcl Rotation", "", "A+",
-                (double)frame.LocalRotation.X, (double)frame.LocalRotation.Y, (double)frame.LocalRotation.Z));
+                zeroTransform ? 0 : (double)frame.LocalRotation.X,
+                zeroTransform ? 0 : (double)frame.LocalRotation.Y,
+                zeroTransform ? 0 : (double)frame.LocalRotation.Z));
             props.AddNode(MakeP("Lcl Scaling", "Lcl Scaling", "", "A+",
                 (double)frame.LocalScale.X, (double)frame.LocalScale.Y, (double)frame.LocalScale.Z));
             model.AddNode(props);
@@ -172,6 +182,40 @@ namespace AssetStudio
 
             _objects.AddNode(attr);
             Connect(attrId, modelId);
+        }
+
+        private void ExportBindPose()
+        {
+            if (_frameIdMap.Count == 0)
+                return;
+
+            var pose = N("Pose");
+            pose.AddProperty(new LongToken(GenId()));
+            pose.AddProperty(new StringToken("Pose::BindPose"));
+            pose.AddProperty(new StringToken("BindPose"));
+            AddSimpleNode(pose, "Type", "BindPose");
+            AddSimpleNode(pose, "Version", 100);
+            AddSimpleNode(pose, "NbPoseNodes", _frameIdMap.Count);
+
+            foreach (var item in _frameIdMap)
+            {
+                if (!_frameGlobalMatrixMap.TryGetValue(item.Key, out var matrix))
+                    continue;
+
+                var poseNode = N("PoseNode");
+
+                var node = N("Node");
+                node.AddProperty(new LongToken(item.Value));
+                poseNode.AddNode(node);
+
+                var matrixNode = N("Matrix");
+                matrixNode.AddProperty(new DoubleArrayToken(ToFbxMatrixArray(matrix)));
+                poseNode.AddNode(matrixNode);
+
+                pose.AddNode(poseNode);
+            }
+
+            _objects.AddNode(pose);
         }
 
         private void ExportMesh(ImportedMesh mesh, IImported convert)
@@ -437,8 +481,12 @@ namespace AssetStudio
             _objects.AddNode(skin);
             Connect(skinId, geoId);
 
-            foreach (var bone in mesh.BoneList)
+            var meshBindMatrix = GetFrameMatrix(mesh.Path, System.Numerics.Matrix4x4.Identity);
+            var transform = ToFbxMatrixArray(meshBindMatrix);
+
+            for (int boneIdx = 0; boneIdx < mesh.BoneList.Count; boneIdx++)
             {
+                var bone = mesh.BoneList[boneIdx];
                 if (bone.Path == null)
                     continue;
 
@@ -449,9 +497,9 @@ namespace AssetStudio
                 cluster.AddProperty(new StringToken($"SubDeformer::{bone.Path}"));
                 cluster.AddProperty(new StringToken("Cluster"));
                 AddSimpleNode(cluster, "Version", 100);
+                AddSimpleNode(cluster, "Mode", "TotalOne");
                 AddSimpleNode(cluster, "UserData", "");
 
-                var boneIdx = mesh.BoneList.IndexOf(bone);
                 var indices = new List<int>();
                 var weights = new List<double>();
                 for (int v = 0; v < mesh.VertexList.Count; v++)
@@ -479,10 +527,7 @@ namespace AssetStudio
                     cluster.AddNode(wNode);
                 }
 
-                var transform = GetFrameMatrixArray(mesh.Path, System.Numerics.Matrix4x4.Identity);
-                var bindMatrix = InvertMatrix(bone.Matrix);
-                var fallbackBoneMatrix = ToNumericsMatrix(bindMatrix);
-                var transformLink = GetFrameMatrixArray(bone.Path, fallbackBoneMatrix);
+                var transformLink = ToFbxMatrixArray(GetBindPoseLinkMatrix(meshBindMatrix, bone));
 
                 var tNode = N("Transform");
                 tNode.AddProperty(new DoubleArrayToken(transform));
@@ -665,28 +710,18 @@ namespace AssetStudio
             }
             var fbxTime = (long)(maxTime * 46186158000L);
             _takes.Add((anim.Name, 0, fbxTime));
-            var localStart = N("P");
-            localStart.AddProperty(new StringToken("LocalStart"));
-            localStart.AddProperty(new StringToken("KTime"));
-            localStart.AddProperty(new StringToken("Time"));
-            localStart.AddProperty(new StringToken(""));
-            localStart.AddProperty(new LongToken(0));
-            stackProps.AddNode(localStart);
-            var localStop = N("P");
-            localStop.AddProperty(new StringToken("LocalStop"));
-            localStop.AddProperty(new StringToken("KTime"));
-            localStop.AddProperty(new StringToken("Time"));
-            localStop.AddProperty(new StringToken(""));
-            localStop.AddProperty(new LongToken(fbxTime));
-            stackProps.AddNode(localStop);
+            stackProps.AddNode(MakeStringP("Description", ""));
+            stackProps.AddNode(MakeTimeP("LocalStart", 0));
+            stackProps.AddNode(MakeTimeP("LocalStop", fbxTime));
+            stackProps.AddNode(MakeTimeP("ReferenceStart", 0));
+            stackProps.AddNode(MakeTimeP("ReferenceStop", fbxTime));
             stack.AddNode(stackProps);
             _objects.AddNode(stack);
-            Connect(stackId, 0);
 
             var layerId = GenId();
             var layer = N("AnimationLayer");
             layer.AddProperty(new LongToken(layerId));
-            layer.AddProperty(new StringToken($"AnimLayer::{anim.Name}"));
+            layer.AddProperty(new StringToken("AnimLayer::Base Layer"));
             layer.AddProperty(new StringToken(""));
             _objects.AddNode(layer);
             Connect(layerId, stackId);
@@ -776,45 +811,44 @@ namespace AssetStudio
             return matchCount == 1;
         }
 
-        private static Matrix4x4 InvertMatrix(Matrix4x4 matrix)
+        private System.Numerics.Matrix4x4 GetBindPoseLinkMatrix(System.Numerics.Matrix4x4 meshBindMatrix, ImportedBone bone)
         {
-            var numericMatrix = new System.Numerics.Matrix4x4(
-                matrix[0, 0], matrix[0, 1], matrix[0, 2], matrix[0, 3],
-                matrix[1, 0], matrix[1, 1], matrix[1, 2], matrix[1, 3],
-                matrix[2, 0], matrix[2, 1], matrix[2, 2], matrix[2, 3],
-                matrix[3, 0], matrix[3, 1], matrix[3, 2], matrix[3, 3]);
-
-            if (!System.Numerics.Matrix4x4.Invert(numericMatrix, out var inverted))
+            if (TryGetInverseBindPoseMatrix(bone.Matrix, out var inverseBindPose))
             {
-                Logger.Warning("Unable to invert bone bind pose matrix while exporting FBX skin cluster.");
-                return matrix;
+                // Unity stores bind poses as bone^-1 * mesh; FBX clusters need the bone global matrix at bind time.
+                return meshBindMatrix * inverseBindPose;
             }
 
-            return new Matrix4x4(new[]
-            {
-                inverted.M11, inverted.M21, inverted.M31, inverted.M41,
-                inverted.M12, inverted.M22, inverted.M32, inverted.M42,
-                inverted.M13, inverted.M23, inverted.M33, inverted.M43,
-                inverted.M14, inverted.M24, inverted.M34, inverted.M44
-            });
+            Logger.Warning($"Unable to invert bind pose for bone '{bone.Path}' while exporting FBX skin cluster; using frame transform.");
+            return GetFrameMatrix(bone.Path, System.Numerics.Matrix4x4.Identity);
         }
 
-        private static System.Numerics.Matrix4x4 ToNumericsMatrix(Matrix4x4 matrix)
+        private static bool TryGetInverseBindPoseMatrix(Matrix4x4 matrix, out System.Numerics.Matrix4x4 inverseBindPose)
+        {
+            return System.Numerics.Matrix4x4.Invert(ToFbxMatrix(matrix), out inverseBindPose);
+        }
+
+        private static System.Numerics.Matrix4x4 ToFbxMatrix(Matrix4x4 matrix)
         {
             return new System.Numerics.Matrix4x4(
-                matrix[0, 0], matrix[0, 1], matrix[0, 2], matrix[0, 3],
-                matrix[1, 0], matrix[1, 1], matrix[1, 2], matrix[1, 3],
-                matrix[2, 0], matrix[2, 1], matrix[2, 2], matrix[2, 3],
-                matrix[3, 0], matrix[3, 1], matrix[3, 2], matrix[3, 3]);
+                matrix[0, 0], matrix[1, 0], matrix[2, 0], matrix[3, 0],
+                matrix[0, 1], matrix[1, 1], matrix[2, 1], matrix[3, 1],
+                matrix[0, 2], matrix[1, 2], matrix[2, 2], matrix[3, 2],
+                matrix[0, 3], matrix[1, 3], matrix[2, 3], matrix[3, 3]);
         }
 
         private double[] GetFrameMatrixArray(string path, System.Numerics.Matrix4x4 fallback)
+        {
+            return ToFbxMatrixArray(GetFrameMatrix(path, fallback));
+        }
+
+        private System.Numerics.Matrix4x4 GetFrameMatrix(string path, System.Numerics.Matrix4x4 fallback)
         {
             var normalizedPath = NormalizeFramePath(path);
             if (!string.IsNullOrEmpty(normalizedPath))
             {
                 if (_frameGlobalMatrixMap.TryGetValue(normalizedPath, out var matrix))
-                    return ToFbxMatrixArray(matrix);
+                    return matrix;
 
                 var suffix = "/" + normalizedPath;
                 var matchCount = 0;
@@ -827,14 +861,14 @@ namespace AssetStudio
                     match = item.Value;
                     matchCount++;
                     if (matchCount > 1)
-                        return ToFbxMatrixArray(fallback);
+                        return fallback;
                 }
 
                 if (matchCount == 1)
-                    return ToFbxMatrixArray(match);
+                    return match;
             }
 
-            return ToFbxMatrixArray(fallback);
+            return fallback;
         }
 
         private static System.Numerics.Matrix4x4 BuildLocalMatrix(ImportedFrame frame)
@@ -874,6 +908,19 @@ namespace AssetStudio
         private void BuildBonePathSet(IImported convert)
         {
             _bonePathSet.Clear();
+            _skinBonePathSet.Clear();
+            _meshPathSet.Clear();
+
+            if (convert.MeshList != null)
+            {
+                foreach (var mesh in convert.MeshList)
+                {
+                    var meshPath = NormalizeFramePath(mesh.Path);
+                    if (!string.IsNullOrEmpty(meshPath))
+                        _meshPathSet.Add(meshPath);
+                }
+            }
+
             if (convert.MeshList == null)
                 return;
 
@@ -889,43 +936,25 @@ namespace AssetStudio
                         continue;
 
                     var frame = _rootFrame?.FindFrameByPath(normalizedPath);
-                    AddBonePathWithAncestors(NormalizeFramePath(frame?.Path ?? normalizedPath));
-                }
-            }
-
-            if (!_exportAnimations || convert.AnimationList == null)
-                return;
-
-            foreach (var anim in convert.AnimationList)
-            {
-                if (anim.TrackList == null)
-                    continue;
-
-                foreach (var track in anim.TrackList)
-                {
-                    var normalizedPath = NormalizeFramePath(track.Path);
-                    if (string.IsNullOrEmpty(normalizedPath))
-                        continue;
-
-                    var frame = _rootFrame?.FindFrameByPath(normalizedPath);
-                    AddBonePathWithAncestors(NormalizeFramePath(frame?.Path ?? normalizedPath));
+                    var resolvedPath = NormalizeFramePath(frame?.Path ?? normalizedPath);
+                    if (!string.IsNullOrEmpty(resolvedPath))
+                        _skinBonePathSet.Add(resolvedPath);
+                    AddBonePathWithParent(frame, normalizedPath);
                 }
             }
         }
 
-        private void AddBonePathWithAncestors(string normalizedPath)
+        private void AddBonePathWithParent(ImportedFrame frame, string fallbackPath)
         {
+            var normalizedPath = NormalizeFramePath(frame?.Path ?? fallbackPath);
             if (string.IsNullOrEmpty(normalizedPath))
                 return;
 
-            var parts = normalizedPath.Split('/');
-            var path = parts[0];
-            _bonePathSet.Add(path);
-            for (int i = 1; i < parts.Length; i++)
-            {
-                path += "/" + parts[i];
-                _bonePathSet.Add(path);
-            }
+            _bonePathSet.Add(normalizedPath);
+
+            var parentPath = NormalizeFramePath(frame?.Parent?.Path);
+            if (!string.IsNullOrEmpty(parentPath))
+                _bonePathSet.Add(parentPath);
         }
 
         private bool IsBonePath(string normalizedPath)
@@ -937,6 +966,17 @@ namespace AssetStudio
                 return false;
 
             return _bonePathSet.Contains(normalizedPath);
+        }
+
+        private bool ShouldZeroBoneTransform(string normalizedPath)
+        {
+            if (string.IsNullOrEmpty(normalizedPath))
+                return false;
+
+            if (_meshPathSet.Contains(normalizedPath))
+                return false;
+
+            return _bonePathSet.Contains(normalizedPath) || _skinBonePathSet.Contains(normalizedPath);
         }
 
         private static string NormalizeFramePath(string path)
@@ -952,7 +992,7 @@ namespace AssetStudio
             curveNode.AddProperty(new StringToken($"AnimCurveNode::{channelName}"));
             curveNode.AddProperty(new StringToken(""));
             var props = N("Properties70");
-            props.AddNode(MakeP("d", "Number", "", "A", 0, 0, 0));
+            props.AddNode(MakeNumberP("d", keyframes.Count > 0 ? keyframes[0].value : 0));
             curveNode.AddNode(props);
             _objects.AddNode(curveNode);
 
@@ -979,9 +1019,11 @@ namespace AssetStudio
             curveNode.AddProperty(new StringToken(""));
 
             var props = N("Properties70");
-            props.AddNode(MakeP("d|X", "Number", "", "A", 0, 0, 0));
-            props.AddNode(MakeP("d|Y", "Number", "", "A", 0, 0, 0));
-            props.AddNode(MakeP("d|Z", "Number", "", "A", 0, 0, 0));
+            var defaultValue = keyframes.Count > 0 ? keyframes[0].value : Vector3.Zero;
+            props.AddNode(MakeCompoundP("d"));
+            props.AddNode(MakeNumberP("d|X", defaultValue.X));
+            props.AddNode(MakeNumberP("d|Y", defaultValue.Y));
+            props.AddNode(MakeNumberP("d|Z", defaultValue.Z));
             curveNode.AddNode(props);
             _objects.AddNode(curveNode);
 
@@ -1029,29 +1071,15 @@ namespace AssetStudio
             curve.AddNode(keyValueFloat);
 
             var keyAttrFlags = N("KeyAttrFlags");
-            var flags = new int[values.Length];
-            for (int i = 0; i < flags.Length; i++)
-                flags[i] = 24840;
-            keyAttrFlags.AddProperty(new IntegerArrayToken(flags));
+            keyAttrFlags.AddProperty(new IntegerArrayToken(new[] { 24840 }));
             curve.AddNode(keyAttrFlags);
 
             var keyAttrDataFloat = N("KeyAttrDataFloat");
-            var attrData = new float[values.Length * 4];
-            for (int i = 0; i < values.Length; i++)
-            {
-                attrData[i * 4] = 0;
-                attrData[i * 4 + 1] = 0;
-                attrData[i * 4 + 2] = 9.419963E-30f;
-                attrData[i * 4 + 3] = 0;
-            }
-            keyAttrDataFloat.AddProperty(new FloatArrayToken(attrData));
+            keyAttrDataFloat.AddProperty(new FloatArrayToken(new[] { 0f, 0f, 9.419963E-30f, 0f }));
             curve.AddNode(keyAttrDataFloat);
 
             var keyAttrRefCount = N("KeyAttrRefCount");
-            var refCounts = new int[values.Length];
-            for (int i = 0; i < refCounts.Length; i++)
-                refCounts[i] = 1;
-            keyAttrRefCount.AddProperty(new IntegerArrayToken(refCounts));
+            keyAttrRefCount.AddProperty(new IntegerArrayToken(new[] { values.Length }));
             curve.AddNode(keyAttrRefCount);
 
             _objects.AddNode(curve);
@@ -1177,7 +1205,7 @@ namespace AssetStudio
         {
             var definitions = N("Definitions");
             AddSimpleNode(definitions, "Version", 100);
-            AddSimpleNode(definitions, "Count", 12);
+            AddSimpleNode(definitions, "Count", 13);
 
             AddObjectType(definitions, "GlobalSettings");
             AddObjectType(definitions, "Model");
@@ -1187,6 +1215,7 @@ namespace AssetStudio
             AddObjectType(definitions, "Video");
             AddObjectType(definitions, "NodeAttribute");
             AddObjectType(definitions, "Deformer");
+            AddObjectType(definitions, "Pose");
             AddObjectType(definitions, "AnimationStack");
             AddObjectType(definitions, "AnimationLayer");
             AddObjectType(definitions, "AnimationCurveNode");
@@ -1348,6 +1377,49 @@ namespace AssetStudio
             p.AddProperty(new DoubleToken(SanitizeDouble(x)));
             p.AddProperty(new DoubleToken(SanitizeDouble(y)));
             p.AddProperty(new DoubleToken(SanitizeDouble(z)));
+            return p;
+        }
+
+        private FbxNode MakeCompoundP(string name)
+        {
+            var p = N("P");
+            p.AddProperty(new StringToken(name));
+            p.AddProperty(new StringToken("Compound"));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new StringToken(""));
+            return p;
+        }
+
+        private FbxNode MakeNumberP(string name, double value)
+        {
+            var p = N("P");
+            p.AddProperty(new StringToken(name));
+            p.AddProperty(new StringToken("Number"));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new StringToken("A"));
+            p.AddProperty(new DoubleToken(SanitizeDouble(value)));
+            return p;
+        }
+
+        private FbxNode MakeStringP(string name, string value)
+        {
+            var p = N("P");
+            p.AddProperty(new StringToken(name));
+            p.AddProperty(new StringToken("KString"));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new StringToken(value));
+            return p;
+        }
+
+        private FbxNode MakeTimeP(string name, long value)
+        {
+            var p = N("P");
+            p.AddProperty(new StringToken(name));
+            p.AddProperty(new StringToken("KTime"));
+            p.AddProperty(new StringToken("Time"));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new LongToken(value));
             return p;
         }
 
