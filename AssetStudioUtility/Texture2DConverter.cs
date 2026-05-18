@@ -87,9 +87,15 @@ namespace AssetStudio
                 case TextureFormat.ARGB32: //test pass
                     flag = DecodeARGB32(buff, bytes);
                     break;
+                case TextureFormat.ARGBFloat:
+                    flag = DecodeARGBFloat(buff, bytes);
+                    break;
                 case TextureFormat.RGB565: //test pass
                     SwapBytesForXbox(buff);
                     flag = DecodeRGB565(buff, bytes);
+                    break;
+                case TextureFormat.BGR24:
+                    flag = DecodeBGR24(buff, bytes);
                     break;
                 case TextureFormat.R16: //test pass
                     flag = DecodeR16(buff, bytes);
@@ -127,6 +133,9 @@ namespace AssetStudio
                     break;
                 case TextureFormat.RGBAFloat:
                     flag = DecodeRGBAFloat(buff, bytes);
+                    break;
+                case TextureFormat.RGBFloat:
+                    flag = DecodeRGBFloat(buff, bytes);
                     break;
                 case TextureFormat.YUY2: //test pass
                     flag = DecodeYUY2(buff, bytes);
@@ -328,6 +337,18 @@ namespace AssetStudio
             return true;
         }
 
+        private bool DecodeARGBFloat(byte[] image_data, byte[] buff)
+        {
+            for (var i = 0; i < outPutSize; i += 4)
+            {
+                buff[i] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 12));
+                buff[i + 1] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 8));
+                buff[i + 2] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 4));
+                buff[i + 3] = FloatToByte(BitConverter.ToSingle(image_data, i * 4));
+            }
+            return true;
+        }
+
         private bool DecodeRGB565(byte[] image_data, byte[] buff)
         {
             var size = m_Width * m_Height;
@@ -337,6 +358,19 @@ namespace AssetStudio
                 buff[i * 4] = (byte)((p << 3) | (p >> 2 & 7));
                 buff[i * 4 + 1] = (byte)((p >> 3 & 0xfc) | (p >> 9 & 3));
                 buff[i * 4 + 2] = (byte)((p >> 8 & 0xf8) | (p >> 13));
+                buff[i * 4 + 3] = 255;
+            }
+            return true;
+        }
+
+        private bool DecodeBGR24(byte[] image_data, byte[] buff)
+        {
+            var size = m_Width * m_Height;
+            for (var i = 0; i < size; i++)
+            {
+                buff[i * 4] = image_data[i * 3];
+                buff[i * 4 + 1] = image_data[i * 3 + 1];
+                buff[i * 4 + 2] = image_data[i * 3 + 2];
                 buff[i * 4 + 3] = 255;
             }
             return true;
@@ -459,10 +493,25 @@ namespace AssetStudio
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = (byte)Math.Round(BitConverter.ToSingle(image_data, i * 4 + 8) * 255f);
-                buff[i + 1] = (byte)Math.Round(BitConverter.ToSingle(image_data, i * 4 + 4) * 255f);
-                buff[i + 2] = (byte)Math.Round(BitConverter.ToSingle(image_data, i * 4) * 255f);
-                buff[i + 3] = (byte)Math.Round(BitConverter.ToSingle(image_data, i * 4 + 12) * 255f);
+                buff[i] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 8));
+                buff[i + 1] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 4));
+                buff[i + 2] = FloatToByte(BitConverter.ToSingle(image_data, i * 4));
+                buff[i + 3] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 12));
+            }
+            return true;
+        }
+
+        private bool DecodeRGBFloat(byte[] image_data, byte[] buff)
+        {
+            var size = m_Width * m_Height;
+            for (var i = 0; i < size; i++)
+            {
+                var input = i * 12;
+                var output = i * 4;
+                buff[output] = FloatToByte(BitConverter.ToSingle(image_data, input + 8));
+                buff[output + 1] = FloatToByte(BitConverter.ToSingle(image_data, input + 4));
+                buff[output + 2] = FloatToByte(BitConverter.ToSingle(image_data, input));
+                buff[output + 3] = 255;
             }
             return true;
         }
@@ -471,6 +520,12 @@ namespace AssetStudio
         private static byte ClampByte(int x)
         {
             return (byte)(byte.MaxValue < x ? byte.MaxValue : (x > byte.MinValue ? x : byte.MinValue));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static byte FloatToByte(float value)
+        {
+            return ClampByte((int)Math.Round(value * 255f));
         }
 
         private bool DecodeYUY2(byte[] image_data, byte[] buff)

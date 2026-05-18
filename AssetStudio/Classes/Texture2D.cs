@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Specialized;
+using System.Linq;
 
 namespace AssetStudio
 {
@@ -7,6 +9,8 @@ namespace AssetStudio
         public long offset; //ulong
         public uint size;
         public string path;
+
+        public StreamingInfo() { }
 
         public StreamingInfo(ObjectReader reader)
         {
@@ -42,6 +46,8 @@ namespace AssetStudio
         public float m_MipBias;
         public int m_WrapMode;
 
+        public GLTextureSettings() { }
+
         public GLTextureSettings(ObjectReader reader)
         {
             var version = reader.version;
@@ -75,6 +81,11 @@ namespace AssetStudio
 
         public Texture2D(ObjectReader reader) : base(reader)
         {
+            if (TryReadFromTypeTree())
+            {
+                return;
+            }
+
             m_Width = reader.ReadInt32();
             m_Height = reader.ReadInt32();
             var m_CompleteImageSize = reader.ReadInt32();
@@ -176,6 +187,144 @@ namespace AssetStudio
                 resourceReader = new ResourceReader(reader, reader.BaseStream.Position, 0);
             }
             image_data = resourceReader;
+        }
+
+        private bool TryReadFromTypeTree()
+        {
+            if (serializedType?.m_Type == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var obj = ToType();
+                if (obj == null)
+                {
+                    ResetForManualParsing();
+                    return false;
+                }
+
+                var width = GetInt32(obj, "m_Width");
+                var height = GetInt32(obj, "m_Height");
+                var format = GetInt32(obj, "m_TextureFormat");
+                if (width <= 0 || height <= 0 || !Enum.IsDefined(typeof(TextureFormat), format))
+                {
+                    ResetForManualParsing();
+                    return false;
+                }
+
+                m_Width = width;
+                m_Height = height;
+                m_TextureFormat = (TextureFormat)format;
+                m_MipMap = GetBoolean(obj, "m_MipMap");
+                m_MipCount = GetInt32(obj, "m_MipCount");
+                m_TextureSettings = ReadTextureSettings(GetObject(obj, "m_TextureSettings"));
+
+                var streamData = GetObject(obj, "m_StreamData");
+                if (streamData != null)
+                {
+                    m_StreamData = new StreamingInfo
+                    {
+                        offset = GetInt64(streamData, "offset"),
+                        size = GetUInt32(streamData, "size"),
+                        path = GetString(streamData, "path")
+                    };
+                }
+
+                ResourceReader resourceReader = null;
+                if (!string.IsNullOrEmpty(m_StreamData?.path) && m_StreamData.size > 0)
+                {
+                    resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size);
+                }
+                else if (GetByteArray(obj, "image data") is byte[] data && data.Length > 0)
+                {
+                    resourceReader = new ResourceReader(data);
+                }
+                else if (GetByteArray(obj, "image_data") is byte[] imageData && imageData.Length > 0)
+                {
+                    resourceReader = new ResourceReader(imageData);
+                }
+
+                if (resourceReader == null)
+                {
+                    ResetForManualParsing();
+                    return false;
+                }
+
+                image_data = resourceReader;
+                return true;
+            }
+            catch
+            {
+                ResetForManualParsing();
+                return false;
+            }
+        }
+
+        private void ResetForManualParsing()
+        {
+            reader.Reset();
+            if (platform == BuildTarget.NoTarget)
+            {
+                var m_ObjectHideFlags = reader.ReadUInt32();
+            }
+        }
+
+        private static GLTextureSettings ReadTextureSettings(OrderedDictionary obj)
+        {
+            if (obj == null)
+            {
+                return new GLTextureSettings();
+            }
+
+            return new GLTextureSettings
+            {
+                m_FilterMode = GetInt32(obj, "m_FilterMode"),
+                m_Aniso = GetInt32(obj, "m_Aniso"),
+                m_MipBias = GetSingle(obj, "m_MipBias"),
+                m_WrapMode = obj.Contains("m_WrapMode") ? GetInt32(obj, "m_WrapMode") : GetInt32(obj, "m_WrapU")
+            };
+        }
+
+        private static OrderedDictionary GetObject(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? obj[name] as OrderedDictionary : null;
+        }
+
+        private static byte[] GetByteArray(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? obj[name] as byte[] : null;
+        }
+
+        private static string GetString(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? obj[name] as string ?? string.Empty : string.Empty;
+        }
+
+        private static bool GetBoolean(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) && Convert.ToBoolean(obj[name]);
+        }
+
+        private static int GetInt32(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? Convert.ToInt32(obj[name]) : 0;
+        }
+
+        private static long GetInt64(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? Convert.ToInt64(obj[name]) : 0;
+        }
+
+        private static uint GetUInt32(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? Convert.ToUInt32(obj[name]) : 0;
+        }
+
+        private static float GetSingle(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? Convert.ToSingle(obj[name]) : 0;
         }
     }
 

@@ -18,10 +18,17 @@ namespace AssetStudio
         public ResourceReader(string path, SerializedFile assetsFile, long offset, long size)
         {
             needSearch = true;
-            this.path = path;
+            this.path = NormalizeResourcePath(path);
             this.assetsFile = assetsFile;
             this.offset = offset;
             this.size = size;
+        }
+
+        public ResourceReader(byte[] data)
+        {
+            reader = new BinaryReader(new MemoryStream(data));
+            offset = 0;
+            size = data.Length;
         }
 
         public ResourceReader(BinaryReader reader, long offset, long size)
@@ -132,6 +139,27 @@ namespace AssetStudio
         private static string NormalizePath(string value)
         {
             return value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        }
+
+        private static string NormalizeResourcePath(string value)
+        {
+            if (value == null)
+            {
+                return null;
+            }
+
+            const string archivePrefix = "archive:/";
+            if (value.StartsWith(archivePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                value = value.Substring(archivePrefix.Length);
+                var slash = value.IndexOf('/');
+                if (slash >= 0)
+                {
+                    value = value.Substring(slash + 1);
+                }
+            }
+
+            return value;
         }
 
         private static bool HasDirectory(string value)
