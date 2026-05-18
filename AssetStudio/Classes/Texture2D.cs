@@ -15,12 +15,22 @@ namespace AssetStudio
             if (version[0] >= 2020) //2020.1 and up
             {
                 offset = reader.ReadInt64();
+                size = reader.ReadUInt32();
             }
             else
             {
                 offset = reader.ReadUInt32();
+                size = reader.ReadUInt32();
+
+                // Heurística genérica: Se o tamanho for 0 e o offset for > 0, 
+                // é muito provável que o offset original seja na verdade um Int64 (8 bytes).
+                // O que aconteceu foi que lemos a metade inferior como offset, e a metade superior (0) como size.
+                // Sendo assim, o tamanho real está nos próximos 4 bytes!
+                if (size == 0 && offset > 0)
+                {
+                    size = reader.ReadUInt32();
+                }
             }
-            size = reader.ReadUInt32();
             path = reader.ReadAlignedString();
         }
     }
@@ -125,10 +135,31 @@ namespace AssetStudio
                 var m_PlatformBlob = reader.ReadUInt8Array();
                 reader.AlignStream();
             }
-            var image_data_size = reader.ReadInt32();
-            if ((version[0] == 5 && version[1] >= 3) || version[0] > 5)//5.3.0 and up
+            
+            long posBeforeImageData = reader.BaseStream.Position;
+            var image_data_size = 0;
+            try
             {
-                m_StreamData = new StreamingInfo(reader);
+                image_data_size = reader.ReadInt32();
+                if ((version[0] == 5 && version[1] >= 3) || version[0] > 5)//5.3.0 and up
+                {
+                    m_StreamData = new StreamingInfo(reader);
+                    // Validação genérica: se o path lido do StreamingInfo for um lixo de memória, é certeza que há um desalinhamento.
+                    if (!string.IsNullOrEmpty(m_StreamData.path) && (m_StreamData.path.Length > 260 || m_StreamData.path.Any(c => char.IsControl(c))))
+                    {
+                        throw new Exception("Invalid stream path - trying with extra u32 padding");
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback para forks que adicionam um padding u32 antes do tamanho da imagem
+                reader.BaseStream.Position = posBeforeImageData + 4; // Pula 4 bytes
+                image_data_size = reader.ReadInt32();
+                if ((version[0] == 5 && version[1] >= 3) || version[0] > 5)
+                {
+                    m_StreamData = new StreamingInfo(reader);
+                }
             }
 
             ResourceReader resourceReader;

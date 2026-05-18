@@ -1321,6 +1321,10 @@ namespace AssetStudio
             props.AddNode(MakeIntP("OriginalUpAxis", -1));
             props.AddNode(MakeIntP("OriginalUpAxisSign", 1));
 
+            props.AddNode(MakeStringP("source", "Unity3D"));
+            props.AddNode(MakeStringP("platform", "Windows"));
+
+
             var unitScale = N("P");
             unitScale.AddProperty(new StringToken("UnitScaleFactor"));
             unitScale.AddProperty(new StringToken("double"));

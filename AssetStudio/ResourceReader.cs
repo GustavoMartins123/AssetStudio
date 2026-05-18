@@ -153,6 +153,25 @@ namespace AssetStudio
             {
                 throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {data.Length} bytes.");
             }
+
+            // Testa se a maioria dos bytes é 0x01 (indicativo de XOR)
+            int sampleSize = Math.Min(data.Length, 1024);
+            int count01 = 0;
+            for (int i = 0; i < sampleSize; i++)
+            {
+                if (data[i] == 0x01)
+                    count01++;
+            }
+
+            // Se for criptografado com XOR
+            if (sampleSize > 0 && count01 > sampleSize * 0.5)
+            {
+                for (int i = 0; i < data.Length; i++)
+                {
+                    data[i] ^= 0xFF;
+                }
+            }
+
             return data;
         }
 
@@ -164,6 +183,22 @@ namespace AssetStudio
             if (read != size)
             {
                 throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {read} bytes.");
+            }
+
+            int sampleSize = Math.Min(buff.Length, 1024);
+            int count01 = 0;
+            for (int i = 0; i < sampleSize; i++)
+            {
+                if (buff[i] == 0x01)
+                    count01++;
+            }
+
+            if (sampleSize > 0 && count01 > sampleSize * 0.5)
+            {
+                for (int i = 0; i < buff.Length; i++)
+                {
+                    buff[i] ^= 0xFF;
+                }
             }
         }
 
