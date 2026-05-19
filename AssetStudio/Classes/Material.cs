@@ -69,6 +69,7 @@ namespace AssetStudio
     public sealed class Material : NamedObject
     {
         public PPtr<Shader> m_Shader;
+        public PPtr<Material> m_Parent;
         public UnityPropertySheet m_SavedProperties;
 
         public Material(ObjectReader reader) : base(reader)
@@ -84,7 +85,7 @@ namespace AssetStudio
 
             if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2))
             {
-                var m_Parent = new PPtr<Material>(reader);
+                m_Parent = new PPtr<Material>(reader);
                 var m_ModifiedSerializedProperties = reader.ReadBoolean();
                 reader.AlignStream();
             }
@@ -163,6 +164,7 @@ namespace AssetStudio
                 }
 
                 m_Shader = ReadPPtr<Shader>(GetObject(obj, "m_Shader"), reader.assetsFile);
+                m_Parent = ReadPPtr<Material>(GetObject(obj, "m_Parent"), reader.assetsFile);
                 m_SavedProperties = new UnityPropertySheet
                 {
                     m_TexEnvs = ReadTexEnvs(savedProperties, reader.assetsFile),

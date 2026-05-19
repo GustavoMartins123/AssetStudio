@@ -255,7 +255,7 @@ namespace AssetStudio
             if (mesh.hasColor)
                 BuildLayerElementColor(geo, mesh);
 
-            if (mesh.SubmeshList.Count > 0)
+            if (GetMeshMaterialNames(mesh).Count > 0)
                 BuildLayerElementMaterial(geo, mesh);
 
             BuildLayer(geo, mesh);
@@ -403,15 +403,41 @@ namespace AssetStudio
 
         private void BuildLayerElementMaterial(FbxNode geo, ImportedMesh mesh)
         {
+            var materialNames = GetMeshMaterialNames(mesh);
+            if (materialNames.Count == 0)
+                return;
+
             var layer = N("LayerElementMaterial");
             layer.AddProperty(new IntegerToken(0));
             AddSimpleNode(layer, "Version", 101);
             AddSimpleNode(layer, "Name", "");
-            AddSimpleNode(layer, "MappingInformationType", "AllSame");
+            AddSimpleNode(layer, "MappingInformationType", materialNames.Count == 1 ? "AllSame" : "ByPolygon");
             AddSimpleNode(layer, "ReferenceInformationType", "IndexToDirect");
 
             var matIdx = N("Materials");
-            matIdx.AddProperty(new IntegerArrayToken(new[] { 0 }));
+            if (materialNames.Count == 1)
+            {
+                matIdx.AddProperty(new IntegerArrayToken(new[] { 0 }));
+            }
+            else
+            {
+                var indices = new List<int>();
+                foreach (var submesh in mesh.SubmeshList)
+                {
+                    var materialIndex = materialNames.IndexOf(submesh.Material);
+                    if (materialIndex < 0)
+                    {
+                        materialIndex = 0;
+                    }
+
+                    for (var i = 0; i < submesh.FaceList.Count; i++)
+                    {
+                        indices.Add(materialIndex);
+                    }
+                }
+
+                matIdx.AddProperty(new IntegerArrayToken(indices.ToArray()));
+            }
             layer.AddNode(matIdx);
             geo.AddNode(layer);
         }
@@ -436,7 +462,7 @@ namespace AssetStudio
                 AddLayerRef(layer, "LayerElementTangent");
             if (mesh.hasColor)
                 AddLayerRef(layer, "LayerElementColor");
-            if (mesh.SubmeshList.Count > 0)
+            if (GetMeshMaterialNames(mesh).Count > 0)
                 AddLayerRef(layer, "LayerElementMaterial");
 
             geo.AddNode(layer);
@@ -456,16 +482,30 @@ namespace AssetStudio
             if (modelId == 0 || convert.MaterialList == null)
                 return;
 
-            var connectedMats = new HashSet<string>();
-            foreach (var sub in mesh.SubmeshList)
+            foreach (var materialName in GetMeshMaterialNames(mesh))
             {
-                if (sub.Material != null && !connectedMats.Contains(sub.Material))
-                {
-                    connectedMats.Add(sub.Material);
-                    if (_materialIdMap.TryGetValue(sub.Material, out var matId))
-                        Connect(matId, modelId);
-                }
+                if (_materialIdMap.TryGetValue(materialName, out var matId))
+                    Connect(matId, modelId);
             }
+        }
+
+        private List<string> GetMeshMaterialNames(ImportedMesh mesh)
+        {
+            var materialNames = new List<string>();
+            if (mesh?.SubmeshList == null)
+                return materialNames;
+
+            foreach (var submesh in mesh.SubmeshList)
+            {
+                var materialName = submesh.Material;
+                if (string.IsNullOrEmpty(materialName) || !_materialIdMap.ContainsKey(materialName))
+                    continue;
+
+                if (!materialNames.Contains(materialName))
+                    materialNames.Add(materialName);
+            }
+
+            return materialNames;
         }
 
         private void ExportSkin(ImportedMesh mesh, long geoId)
@@ -1300,6 +1340,39 @@ namespace AssetStudio
                 writer.WriteLine($"Exported animation tracks: {_exportedAnimationTrackCount}");
                 writer.WriteLine($"Exported animation curves: {_exportedAnimationCurveCount}");
                 writer.WriteLine($"Missing animation track targets: {_missingAnimationTrackCount}");
+
+                writer.WriteLine();
+                writer.WriteLine("Materials:");
+                if (convert.MaterialList?.Count > 0)
+                {
+                    foreach (var material in convert.MaterialList)
+                    {
+                        writer.WriteLine($"  {material.Name} ({material.Textures?.Count ?? 0} textures)");
+                    }
+                }
+                else
+                {
+                    writer.WriteLine("  <none>");
+                }
+
+                writer.WriteLine();
+                writer.WriteLine("Mesh material assignments:");
+                if (convert.MeshList?.Count > 0)
+                {
+                    foreach (var mesh in convert.MeshList)
+                    {
+                        writer.WriteLine($"  Mesh: {mesh.Path ?? "<no path>"}");
+                        for (var i = 0; i < mesh.SubmeshList.Count; i++)
+                        {
+                            var submesh = mesh.SubmeshList[i];
+                            writer.WriteLine($"    Submesh {i}: {submesh.Material ?? "<none>"} ({submesh.FaceList?.Count ?? 0} faces)");
+                        }
+                    }
+                }
+                else
+                {
+                    writer.WriteLine("  <none>");
+                }
             }
         }
 

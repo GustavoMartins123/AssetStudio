@@ -789,9 +789,14 @@ namespace AssetStudioGUI
 
         private void PreviewMaterial(AssetItem assetItem, Material m_Material)
         {
+            var displayMaterial = ResolveMaterialForPreview(m_Material) ?? m_Material;
             var sb = new StringBuilder();
             sb.AppendLine($"Material: {m_Material.m_Name}");
-            if (m_Material.m_Shader.TryGet(out var shader))
+            if (!ReferenceEquals(displayMaterial, m_Material))
+            {
+                sb.AppendLine($"Parent material: {displayMaterial.m_Name}");
+            }
+            if (displayMaterial.m_Shader.TryGet(out var shader))
             {
                 sb.AppendLine($"Shader: {shader.m_ParsedForm?.m_Name ?? shader.m_Name}");
             }
@@ -799,13 +804,14 @@ namespace AssetStudioGUI
             sb.AppendLine("Texture slots:");
 
             Texture2D previewTexture = null;
-            foreach (var texEnv in m_Material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+            foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
             {
                 sb.Append($"  {texEnv.Key}: ");
-                if (texEnv.Value.m_Texture.TryGet<Texture2D>(out var texture))
+                var textureRef = texEnv.Value?.m_Texture;
+                if (textureRef != null && textureRef.TryGet<Texture2D>(out var texture))
                 {
                     sb.AppendLine($"{texture.m_Name} ({texture.m_Width}x{texture.m_Height}, {texture.m_TextureFormat})");
-                    sb.AppendLine($"    FileID: {texEnv.Value.m_Texture.m_FileID}, PathID: {texEnv.Value.m_Texture.m_PathID}");
+                    sb.AppendLine($"    FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID}");
                     sb.AppendLine($"    Scale: {texEnv.Value.m_Scale.X}, {texEnv.Value.m_Scale.Y}");
                     sb.AppendLine($"    Offset: {texEnv.Value.m_Offset.X}, {texEnv.Value.m_Offset.Y}");
                     if (previewTexture == null && IsPreferredMaterialPreviewSlot(texEnv.Key))
@@ -815,16 +821,16 @@ namespace AssetStudioGUI
                 }
                 else
                 {
-                    sb.AppendLine(texEnv.Value.m_Texture.IsNull
+                    sb.AppendLine(textureRef == null || textureRef.IsNull
                         ? "null"
-                        : $"missing (FileID: {texEnv.Value.m_Texture.m_FileID}, PathID: {texEnv.Value.m_Texture.m_PathID})");
+                        : $"missing (FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID})");
                 }
             }
 
             if (previewTexture == null)
             {
-                previewTexture = (m_Material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
-                    .Select(x => x.Value.m_Texture.TryGet<Texture2D>(out var texture) ? texture : null)
+                previewTexture = (displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+                    .Select(x => x.Value?.m_Texture != null && x.Value.m_Texture.TryGet<Texture2D>(out var texture) ? texture : null)
                     .FirstOrDefault(x => x != null);
             }
 
@@ -844,6 +850,30 @@ namespace AssetStudioGUI
 
             PreviewText(sb.ToString());
             StatusStripUpdate("Material preview loaded.");
+        }
+
+        private static Material ResolveMaterialForPreview(Material material)
+        {
+            var visited = new HashSet<Material>();
+            while (material != null && visited.Add(material))
+            {
+                var hasTextureReference = (material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+                    .Any(x => x.Value?.m_Texture != null && !x.Value.m_Texture.IsNull);
+                if (hasTextureReference)
+                {
+                    return material;
+                }
+
+                if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
+                {
+                    material = parent;
+                    continue;
+                }
+
+                break;
+            }
+
+            return null;
         }
 
         private static bool IsPreferredMaterialPreviewSlot(string propertyName)
@@ -1732,7 +1762,7 @@ namespace AssetStudioGUI
         private static List<AssetItem> OrderConvertedAssetsForExport(List<AssetItem> assets)
         {
             return assets
-                .OrderBy(x => x.Type == ClassIDType.Texture2D ? 0 : x.Type == ClassIDType.Material ? 2 : 1)
+                .OrderBy(x => x.Type == ClassIDType.Texture2D ? 0 : x.Type == ClassIDType.Material ? 1 : 2)
                 .ToList();
         }
 

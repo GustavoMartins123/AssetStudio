@@ -43,10 +43,11 @@ namespace AssetStudio
                 {
                     var m_External = assetsFile.m_Externals[m_FileID - 1];
                     var name = m_External.fileName;
-                    if (!assetsFileIndexCache.TryGetValue(name, out index))
+                    var cacheKey = name + "|" + m_External.pathName;
+                    if (!assetsFileIndexCache.TryGetValue(cacheKey, out index))
                     {
-                        index = assetsFileList.FindIndex(x => x.fileName.Equals(name, StringComparison.OrdinalIgnoreCase));
-                        assetsFileIndexCache.Add(name, index);
+                        index = assetsFileList.FindIndex(x => IsExternalFileMatch(x, m_External));
+                        assetsFileIndexCache.Add(cacheKey, index);
                     }
                 }
 
@@ -64,15 +65,12 @@ namespace AssetStudio
         {
             if (TryGetAssetsFile(out var sourceFile))
             {
-                if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj))
-                {
-                    if (obj is T variable)
-                    {
-                        result = variable;
-                        return true;
-                    }
-                }
+                if (TryGetObject(sourceFile, out result))
+                    return true;
             }
+
+            if (TryGetObjectFromLoadedFiles(out result))
+                return true;
 
             result = null;
             return false;
@@ -82,18 +80,100 @@ namespace AssetStudio
         {
             if (TryGetAssetsFile(out var sourceFile))
             {
-                if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj))
-                {
-                    if (obj is T2 variable)
-                    {
-                        result = variable;
-                        return true;
-                    }
-                }
+                if (TryGetObject(sourceFile, out result))
+                    return true;
+            }
+
+            if (TryGetObjectFromLoadedFiles(out result))
+                return true;
+
+            result = null;
+            return false;
+        }
+
+        private bool TryGetObject<TObject>(SerializedFile sourceFile, out TObject result) where TObject : Object
+        {
+            if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj) && obj is TObject variable)
+            {
+                result = variable;
+                return true;
             }
 
             result = null;
             return false;
+        }
+
+        private bool TryGetObjectFromLoadedFiles<TObject>(out TObject result) where TObject : Object
+        {
+            result = null;
+            if (m_FileID <= 0)
+            {
+                return false;
+            }
+
+            TObject match = null;
+            foreach (var sourceFile in assetsFile.assetsManager.assetsFileList)
+            {
+                if (sourceFile == assetsFile)
+                {
+                    continue;
+                }
+
+                if (!TryGetObject(sourceFile, out TObject variable))
+                {
+                    continue;
+                }
+
+                if (match != null)
+                {
+                    return false;
+                }
+
+                match = variable;
+            }
+
+            if (match == null)
+            {
+                return false;
+            }
+
+            result = match;
+            return true;
+        }
+
+        private static bool IsExternalFileMatch(SerializedFile candidate, FileIdentifier external)
+        {
+            var externalFileName = NormalizeFileName(external.fileName);
+            if (!string.IsNullOrEmpty(externalFileName)
+                && (EqualsIgnoreCase(NormalizeFileName(candidate.fileName), externalFileName)
+                    || EqualsIgnoreCase(NormalizeFileName(candidate.originalPath), externalFileName)
+                    || EqualsIgnoreCase(NormalizeFileName(candidate.fullName), externalFileName)))
+            {
+                return true;
+            }
+
+            var externalPathFileName = NormalizeFileName(external.pathName);
+            return !string.IsNullOrEmpty(externalPathFileName)
+                && (EqualsIgnoreCase(NormalizeFileName(candidate.fileName), externalPathFileName)
+                    || EqualsIgnoreCase(NormalizeFileName(candidate.originalPath), externalPathFileName)
+                    || EqualsIgnoreCase(NormalizeFileName(candidate.fullName), externalPathFileName));
+        }
+
+        private static string NormalizeFileName(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return path;
+            }
+
+            var normalized = path.Replace('\\', '/').TrimEnd('/');
+            var slash = normalized.LastIndexOf('/');
+            return slash >= 0 ? normalized.Substring(slash + 1) : normalized;
+        }
+
+        private static bool EqualsIgnoreCase(string left, string right)
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
         }
 
         public void Set(T m_Object)

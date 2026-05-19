@@ -45,12 +45,61 @@ namespace AssetStudioGUI
         public static bool ExportMaterial(AssetItem item, string exportPath)
         {
             var material = (Material)item.Asset;
+            var exportMaterial = ResolveMaterialForExport(material) ?? material;
+            var exportName = string.IsNullOrEmpty(exportMaterial.m_Name) ? item.Text : exportMaterial.m_Name;
             Directory.CreateDirectory(exportPath);
             File.WriteAllText(
-                Path.Combine(exportPath, FixFileName(item.Text) + ".mat"),
-                BuildUnityMaterial(material, item.Text, exportPath),
+                Path.Combine(exportPath, FixFileName(exportName) + ".mat"),
+                BuildUnityMaterial(exportMaterial, exportName, exportPath),
                 Encoding.UTF8);
             return true;
+        }
+
+        private static Material ResolveMaterialForExport(Material material)
+        {
+            var visited = new HashSet<Material>();
+            while (material != null && visited.Add(material))
+            {
+                if (HasMaterialProperties(material))
+                {
+                    return material;
+                }
+
+                if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
+                {
+                    material = parent;
+                    continue;
+                }
+
+                break;
+            }
+
+            return null;
+        }
+
+        private static bool HasMaterialProperties(Material material)
+        {
+            if (material == null || string.IsNullOrEmpty(material.m_Name))
+            {
+                return false;
+            }
+
+            var properties = material.m_SavedProperties;
+            if (properties == null)
+            {
+                return true;
+            }
+
+            var texEnvs = properties.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>();
+            if (texEnvs.Length > 0)
+            {
+                return texEnvs.Any(x => x.Value?.m_Texture != null && !x.Value.m_Texture.IsNull);
+            }
+
+            return properties.m_Ints?.Length > 0
+                || properties.m_Floats?.Length > 0
+                || properties.m_Colors?.Length > 0
+                || material.m_Shader != null && !material.m_Shader.IsNull;
         }
 
         private static string BuildUnityMaterial(Material material, string materialName, string exportPath)
@@ -570,6 +619,18 @@ TextureImporter:
 
         public static bool ExportMesh(AssetItem item, string exportPath)
         {
+            if (item.TreeNode is GameObjectTreeNode gameObjectTreeNode)
+            {
+                var fbxPath = Path.Combine(exportPath, FixFileName(item.Text) + ".fbx");
+                if (File.Exists(fbxPath))
+                {
+                    fbxPath = Path.Combine(exportPath, FixFileName(item.Text) + item.UniqueID + ".fbx");
+                }
+                var convert = new ModelConverter(gameObjectTreeNode.gameObject, Properties.Settings.Default.convertType);
+                ExportFbx(convert, fbxPath);
+                return true;
+            }
+
             var m_Mesh = (Mesh)item.Asset;
             if (m_Mesh.m_VertexCount <= 0)
                 return false;
