@@ -168,7 +168,12 @@ namespace AssetStudioGUI
         {
             var shaderName = material.m_Shader.TryGet(out var shader)
                 ? shader.m_ParsedForm?.m_Name ?? shader.m_Name
-                : null;
+                : InferShaderName(material);
+
+            if (shaderName == "Standard")
+            {
+                return "{fileID: 46, guid: 0000000000000000f0000000000000000, type: 0}";
+            }
 
             if (TryGetShaderGuid(exportPath, shaderName, out var guid))
             {
@@ -176,6 +181,30 @@ namespace AssetStudioGUI
             }
 
             return "{fileID: 0}";
+        }
+
+        private static string InferShaderName(Material material)
+        {
+            var texEnvNames = material.m_SavedProperties?.m_TexEnvs?.Select(x => x.Key) ?? Enumerable.Empty<string>();
+            var floatNames = material.m_SavedProperties?.m_Floats?.Select(x => x.Key) ?? Enumerable.Empty<string>();
+            var colorNames = material.m_SavedProperties?.m_Colors?.Select(x => x.Key) ?? Enumerable.Empty<string>();
+            var names = new HashSet<string>(texEnvNames.Concat(floatNames).Concat(colorNames));
+
+            if (names.Contains("_BaseMap")
+                && (names.Contains("_WorkflowMode")
+                    || names.Contains("_MetallicGlossMap")
+                    || names.Contains("_SpecGlossMap")
+                    || names.Contains("_BumpMap")))
+            {
+                return "Universal Render Pipeline/Lit";
+            }
+
+            if (names.Contains("_MainTex") || names.Contains("_Color"))
+            {
+                return "Standard";
+            }
+
+            return null;
         }
 
         private static bool TryGetShaderGuid(string exportPath, string shaderName, out string guid)
