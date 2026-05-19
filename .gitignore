@@ -329,6 +329,16 @@ ASALocalRun/
 # MSBuild Binary and Structured Log
 *.binlog
 
+# Avalonia/.NET local generated output
+**/publish/
+**/[Pp]ublish/
+**/.avalonia/
+**/Avalonia.DesignerSupport/
+**/AvaloniaPreviewer/
+
+# Native build output
+Texture2DDecoderNative/build/
+
 # NVidia Nsight GPU debugger configuration file
 *.nvuser
 

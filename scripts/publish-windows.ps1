@@ -6,7 +6,7 @@ param(
     [ValidateSet("x64", "x86")]
     [string]$Platform = "x64",
 
-    [string]$Framework = "net10.0-windows",
+    [string]$Framework = "net10.0",
 
     [bool]$SelfContained = $true,
 
@@ -21,8 +21,8 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Runtime = if ($Platform -eq "x64") { "win-x64" } else { "win-x86" }
 $NativePlatform = if ($Platform -eq "x64") { "x64" } else { "Win32" }
 $RuntimeFolder = if ($Platform -eq "x64") { "x64" } else { "x86" }
-$RuntimeOutputDir = Join-Path $RepoRoot "AssetStudioGUI\bin\$Configuration\$Framework\$Runtime"
-$DefaultPublishDir = Join-Path $RepoRoot "AssetStudioGUI\bin\$Configuration\$Framework\$Runtime\publish"
+$RuntimeOutputDir = Join-Path $RepoRoot "AssetStudio.Avalonia\bin\$Configuration\$Framework\$Runtime"
+$DefaultPublishDir = Join-Path $RepoRoot "AssetStudio.Avalonia\bin\$Configuration\$Framework\$Runtime\publish"
 $PublishDir = if ($OutputDir) { $OutputDir } else { $DefaultPublishDir }
 
 function Find-MSBuild {
@@ -78,7 +78,7 @@ function Assert-OutputExecutableIsNotRunning {
         $outputRoots += $RuntimeOutputDir
     }
 
-    $runningProcesses = Get-Process -Name "AssetStudioGUI" -ErrorAction SilentlyContinue
+    $runningProcesses = Get-Process -Name "AssetStudio.Avalonia" -ErrorAction SilentlyContinue
     foreach ($process in $runningProcesses) {
         try {
             $processPath = $process.MainModule.FileName
@@ -90,7 +90,7 @@ function Assert-OutputExecutableIsNotRunning {
         foreach ($outputRoot in $outputRoots) {
             $resolvedOutputRoot = [System.IO.Path]::GetFullPath($outputRoot).TrimEnd('\') + '\'
             if ($processPath.StartsWith($resolvedOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Close AssetStudioGUI.exe before publishing. Running process $($process.Id) is using '$processPath'."
+                throw "Close AssetStudio.Avalonia.exe before publishing. Running process $($process.Id) is using '$processPath'."
             }
         }
     }
@@ -136,7 +136,7 @@ function Copy-NativeDll {
     return $false
 }
 
-Write-Host "Publishing AssetStudioGUI ($Configuration, $Framework, $Runtime, self-contained=$SelfContained)"
+Write-Host "Publishing AssetStudio.Avalonia ($Configuration, $Framework, $Runtime, self-contained=$SelfContained)"
 Assert-OutputExecutableIsNotRunning
 
 if (-not $SkipNative) {
@@ -153,7 +153,7 @@ if (-not $SkipNative) {
 
 $publishArgs = @(
     "publish",
-    (Join-Path $RepoRoot "AssetStudioGUI\AssetStudioGUI.csproj"),
+    (Join-Path $RepoRoot "AssetStudio.Avalonia\AssetStudio.Avalonia.csproj"),
     "-c", $Configuration,
     "-f", $Framework,
     "-r", $Runtime,

@@ -1,0 +1,132 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="using:AssetStudio.Avalonia"
+        mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
+        x:Class="AssetStudio.Avalonia.MainWindow"
+        Title="AssetStudio (Avalonia Linux Port)"
+        Width="1264" Height="681"
+        WindowStartupLocation="CenterScreen">
+    
+    <DockPanel>
+        <Menu DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem Header="Load file" Click="LoadFile_Click" />
+                <MenuItem Header="Load folder" Click="LoadFolder_Click" />
+                <Separator />
+                <MenuItem Header="Extract file" Click="ExtractFile_Click" />
+                <MenuItem Header="Extract folder" Click="ExtractFolder_Click" />
+            </MenuItem>
+            <MenuItem Header="_Options">
+                <MenuItem x:Name="displayAll" Header="Display all assets" ToggleType="CheckBox" />
+                <MenuItem x:Name="enablePreview" Header="Enable preview" ToggleType="CheckBox" IsChecked="True" />
+                <MenuItem x:Name="displayInfo" Header="Display asset information" ToggleType="CheckBox" IsChecked="True" />
+                <MenuItem Header="Set project root..." />
+                <MenuItem Header="Specify Unity version" />
+                <MenuItem Header="Export options" />
+            </MenuItem>
+            <MenuItem Header="_Model">
+                <MenuItem Header="Export all objects (split)" />
+                <MenuItem Header="Export selected objects (split)" />
+                <MenuItem Header="Export selected objects (split) + selected AnimationClips" />
+                <Separator />
+                <MenuItem Header="Export selected objects (merge)" />
+                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" />
+            </MenuItem>
+            <MenuItem Header="_Export">
+                <MenuItem Header="All assets" Click="ExportAllAssets_Click" />
+                <MenuItem Header="Selected assets" Click="ExportSelectedAssets_Click" />
+                <MenuItem Header="Filtered assets" Click="ExportFilteredAssets_Click" />
+                <Separator />
+                <MenuItem Header="Animator + selected AnimationClips" />
+                <Separator />
+                <MenuItem Header="Raw">
+                    <MenuItem Header="All assets" Click="ExportAllAssetsRaw_Click" />
+                    <MenuItem Header="Selected assets" Click="ExportSelectedAssetsRaw_Click" />
+                    <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsRaw_Click" />
+                </MenuItem>
+                <MenuItem Header="Dump">
+                    <MenuItem Header="All assets" Click="ExportAllAssetsDump_Click" />
+                    <MenuItem Header="Selected assets" Click="ExportSelectedAssetsDump_Click" />
+                    <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsDump_Click" />
+                </MenuItem>
+                <Separator />
+                <MenuItem Header="Asset list to XML">
+                    <MenuItem Header="All assets" />
+                    <MenuItem Header="Selected assets" />
+                    <MenuItem Header="Filtered assets" />
+                </MenuItem>
+            </MenuItem>
+            <MenuItem Header="Filter _Type">
+                <MenuItem Header="All" ToggleType="CheckBox" IsChecked="True" />
+            </MenuItem>
+            <MenuItem Header="_Debug">
+                <MenuItem Header="Show error message" ToggleType="CheckBox" />
+                <MenuItem Header="Export class structures" />
+            </MenuItem>
+        </Menu>
+
+        <Grid DockPanel.Dock="Bottom" ColumnDefinitions="*, Auto" Height="24" Margin="2,0">
+            <ProgressBar x:Name="progressBar" Grid.Column="0" Height="20" Minimum="0" Maximum="100" Value="0" />
+            <TextBlock x:Name="statusLabel" Grid.Column="1" VerticalAlignment="Center" Margin="6,0,4,0" Text="Ready" />
+        </Grid>
+
+        <Grid ColumnDefinitions="3*, 5, 7*">
+            
+            <TabControl Grid.Column="0" Margin="2">
+                <TabItem Header="Scene Hierarchy">
+                    <Grid RowDefinitions="Auto, *">
+                        <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2"/>
+                        <TreeView x:Name="SceneTreeView" Grid.Row="1">
+                            <TreeView.ItemTemplate>
+                                <TreeDataTemplate ItemsSource="{Binding Children}" x:DataType="local:GameObjectNode">
+                                    <TextBlock Text="{Binding Name}" />
+                                </TreeDataTemplate>
+                            </TreeView.ItemTemplate>
+                        </TreeView>
+                    </Grid>
+                </TabItem>
+                
+                <TabItem Header="Asset List">
+                    <Grid RowDefinitions="Auto, *">
+                        <TextBox x:Name="listSearch" Grid.Row="0" PlaceholderText=" Filter " Margin="0,0,0,2" TextChanged="ListSearch_TextChanged"/>
+                        <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetListDataGrid_SelectionChanged" CanUserResizeColumns="True" HorizontalScrollBarVisibility="Auto">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="220" MinWidth="90" />
+                                <DataGridTextColumn Header="Container" Binding="{Binding Container}" Width="220" MinWidth="90" />
+                                <DataGridTextColumn Header="Type" Binding="{Binding TypeString}" Width="130" MinWidth="80" />
+                                <DataGridTextColumn Header="PathID" Binding="{Binding PathID}" Width="210" MinWidth="120" />
+                                <DataGridTextColumn Header="Size" Binding="{Binding Size}" Width="90" MinWidth="70" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Asset Classes">
+                    <DataGrid AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Name" Width="3*" />
+                            <DataGridTextColumn Header="ID" Width="1*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </TabItem>
+            </TabControl>
+
+            <GridSplitter Grid.Column="1" Background="#444" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
+
+            <TabControl Grid.Column="2" Margin="2">
+                <TabItem Header="Preview">
+                    <Panel Background="#222">
+                        <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
+                        <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="White" />
+                    </Panel>
+                </TabItem>
+                <TabItem Header="Dump">
+                    <TextBox x:Name="DumpTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" FontFamily="Monospace" />
+                </TabItem>
+            </TabControl>
+
+        </Grid>
+    </DockPanel>
+</Window>
