@@ -3,10 +3,12 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
+using System.Diagnostics;
 using AssetStudio;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -21,6 +23,11 @@ public partial class MainWindow : Window
     private AssetsManager assetsManager = new AssetsManager();
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private List<AssetItem> visibleAssets = new List<AssetItem>();
+    private ObservableCollection<GameObjectNode> sceneTreeNodes = new ObservableCollection<GameObjectNode>();
+    private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
+    private readonly ExportOptionsState exportOptions = new();
+    private int nextGameObjectSearchIndex;
+    private bool updatingFilterTypeMenu;
 
     public MainWindow()
     {
@@ -47,6 +54,9 @@ public partial class MainWindow : Window
         exportableAssets.Clear();
         visibleAssets.Clear();
         AssetListDataGrid.ItemsSource = null;
+        sceneTreeNodes.Clear();
+        treeSearchResults.Clear();
+        nextGameObjectSearchIndex = 0;
         SceneTreeView.ItemsSource = null;
         DumpTextBox.Text = string.Empty;
         TextPreviewBox.Text = string.Empty;
@@ -54,7 +64,212 @@ public partial class MainWindow : Window
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
         progressBar.Value = 0;
+        ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
+    }
+
+    private void ApplyUnityVersionOption()
+    {
+        assetsManager.SpecifyUnityVersion = SpecifyUnityVersionTextBox.Text?.Trim() ?? string.Empty;
+    }
+
+    private void ClearPreview(string message = "[Preview Panel]")
+    {
+        TextPreviewBox.Text = string.Empty;
+        TextPreviewBox.IsVisible = false;
+        PreviewLabel.Text = message;
+        PreviewLabel.IsVisible = true;
+    }
+
+    private void TreeSearch_TextChanged(object? sender, TextChangedEventArgs e)
+    {
+        treeSearchResults.Clear();
+        nextGameObjectSearchIndex = 0;
+    }
+
+    private void TreeSearch_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        var searchText = treeSearch.Text?.Trim();
+        if (string.IsNullOrEmpty(searchText))
+        {
+            return;
+        }
+
+        if (treeSearchResults.Count == 0)
+        {
+            foreach (var node in sceneTreeNodes)
+            {
+                TreeNodeSearch(node, searchText);
+            }
+        }
+
+        if (treeSearchResults.Count == 0)
+        {
+            StatusStripUpdate($"No scene hierarchy match for '{searchText}'.");
+            return;
+        }
+
+        if (nextGameObjectSearchIndex >= treeSearchResults.Count)
+        {
+            nextGameObjectSearchIndex = 0;
+        }
+
+        var selectedNode = treeSearchResults[nextGameObjectSearchIndex];
+        selectedNode.ExpandAncestors();
+        SceneTreeView.SelectedItem = selectedNode;
+        SceneTreeView.Focus();
+        nextGameObjectSearchIndex++;
+        StatusStripUpdate($"Scene hierarchy match {nextGameObjectSearchIndex}/{treeSearchResults.Count}: {selectedNode.Name}");
+    }
+
+    private void TreeNodeSearch(GameObjectNode node, string searchText)
+    {
+        if (node.Name.Contains(searchText, StringComparison.OrdinalIgnoreCase))
+        {
+            treeSearchResults.Add(node);
+        }
+
+        foreach (var child in node.Children)
+        {
+            TreeNodeSearch(child, searchText);
+        }
+    }
+
+    private void DisplayAll_Click(object? sender, RoutedEventArgs e)
+    {
+        if (assetsManager.assetsFileList.Count > 0)
+        {
+            BuildAssetStructures();
+        }
+    }
+
+    private void EnablePreview_Click(object? sender, RoutedEventArgs e)
+    {
+        if (enablePreview.IsChecked != true)
+        {
+            ClearPreview("Preview disabled");
+        }
+        else if (AssetListDataGrid.SelectedItem is AssetItem selected)
+        {
+            PreviewAsset(selected);
+        }
+    }
+
+    private void DisplayInfo_Click(object? sender, RoutedEventArgs e)
+    {
+        if (AssetListDataGrid.SelectedItem is AssetItem selected)
+        {
+            PreviewLabel.Text = displayInfo.IsChecked == true
+                ? $"{selected.TypeString}: {selected.Name}"
+                : string.Empty;
+            PreviewLabel.IsVisible = displayInfo.IsChecked == true && !TextPreviewBox.IsVisible;
+        }
+    }
+
+    private async void SetProjectRoot_Click(object? sender, RoutedEventArgs e)
+    {
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = "Select project root",
+            AllowMultiple = false
+        });
+        if (folders == null || folders.Count == 0) return;
+
+        assetsManager.ProjectRoot = folders[0].Path.LocalPath;
+        StatusStripUpdate($"Project root set to: {assetsManager.ProjectRoot}");
+    }
+
+    private async void ShowExportOptions_Click(object? sender, RoutedEventArgs e)
+    {
+        var dialog = new ExportOptionsWindow(exportOptions.Clone());
+        var result = await dialog.ShowDialog<ExportOptionsState?>(this);
+        if (result == null) return;
+
+        exportOptions.CopyFrom(result);
+        StatusStripUpdate("Export options updated.");
+    }
+
+    private void ResetFilterTypeMenu()
+    {
+        updatingFilterTypeMenu = true;
+        while (filterTypeMenu.Items.Count > 1)
+        {
+            filterTypeMenu.Items.RemoveAt(1);
+        }
+        filterTypeAll.IsChecked = true;
+        updatingFilterTypeMenu = false;
+    }
+
+    private void BuildFilterTypeMenu()
+    {
+        updatingFilterTypeMenu = true;
+        while (filterTypeMenu.Items.Count > 1)
+        {
+            filterTypeMenu.Items.RemoveAt(1);
+        }
+
+        var types = exportableAssets
+            .Select(x => x.Type)
+            .Distinct()
+            .OrderBy(x => x.ToString());
+
+        foreach (var type in types)
+        {
+            var item = new MenuItem
+            {
+                Header = type.ToString(),
+                ToggleType = MenuItemToggleType.CheckBox,
+                IsChecked = false,
+                Tag = type
+            };
+            item.Click += FilterType_Click;
+            filterTypeMenu.Items.Add(item);
+        }
+
+        filterTypeAll.IsChecked = true;
+        updatingFilterTypeMenu = false;
+    }
+
+    private void FilterTypeAll_Click(object? sender, RoutedEventArgs e)
+    {
+        if (updatingFilterTypeMenu) return;
+
+        updatingFilterTypeMenu = true;
+        if (filterTypeAll.IsChecked == true)
+        {
+            foreach (var item in GetFilterTypeItems())
+            {
+                item.IsChecked = false;
+            }
+        }
+        updatingFilterTypeMenu = false;
+        FilterAssetList();
+    }
+
+    private void FilterType_Click(object? sender, RoutedEventArgs e)
+    {
+        if (updatingFilterTypeMenu) return;
+
+        updatingFilterTypeMenu = true;
+        filterTypeAll.IsChecked = !GetFilterTypeItems().Any(x => x.IsChecked == true);
+        updatingFilterTypeMenu = false;
+        FilterAssetList();
+    }
+
+    private IEnumerable<MenuItem> GetFilterTypeItems()
+    {
+        return filterTypeMenu.Items
+            .OfType<MenuItem>()
+            .Where(x => x.Tag is ClassIDType);
     }
 
     private async void LoadFile_Click(object? sender, RoutedEventArgs e)
@@ -73,6 +288,7 @@ public partial class MainWindow : Window
             ResetForm();
             StatusStripUpdate("Loading files...");
             assetsManager.Clear();
+            ApplyUnityVersionOption();
             await Task.Run(() => assetsManager.LoadFiles(filePaths));
             BuildAssetStructures();
         }
@@ -94,6 +310,7 @@ public partial class MainWindow : Window
             ResetForm();
             StatusStripUpdate("Loading folder...");
             assetsManager.Clear();
+            ApplyUnityVersionOption();
             await Task.Run(() => assetsManager.LoadFolder(folderPath));
             BuildAssetStructures();
         }
@@ -175,6 +392,7 @@ public partial class MainWindow : Window
     {
         ResetForm();
         assetsManager.Clear();
+        ApplyUnityVersionOption();
         StatusStripUpdate("Loading dropped files...");
 
         if (paths.Length == 1 && Directory.Exists(paths[0]))
@@ -292,7 +510,9 @@ public partial class MainWindow : Window
         }
 
         exportableAssets.Clear();
-        var treeNodeCollection = new ObservableCollection<GameObjectNode>();
+        sceneTreeNodes = new ObservableCollection<GameObjectNode>();
+        treeSearchResults.Clear();
+        nextGameObjectSearchIndex = 0;
         var treeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
         var containers = new List<(PPtr<Object>, string)>();
 
@@ -335,6 +555,7 @@ public partial class MainWindow : Window
                             }
                         }
 
+                        currentNode.Parent = parentNode;
                         parentNode.Children.Add(currentNode);
                         break;
 
@@ -426,7 +647,7 @@ public partial class MainWindow : Window
 
             if (fileNode.Children.Count > 0)
             {
-                treeNodeCollection.Add(fileNode);
+                sceneTreeNodes.Add(fileNode);
             }
         }
 
@@ -442,8 +663,9 @@ public partial class MainWindow : Window
         objectAssetItemDic.Clear();
 
         visibleAssets = new List<AssetItem>(exportableAssets);
-        AssetListDataGrid.ItemsSource = visibleAssets;
-        SceneTreeView.ItemsSource = treeNodeCollection;
+        BuildFilterTypeMenu();
+        FilterAssetList();
+        SceneTreeView.ItemsSource = sceneTreeNodes;
 
         var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {exportableAssets.Count} exportable assets";
         var m_ObjectsCount = assetsManager.assetsFileList.Sum(x => x.m_Objects.Count);
@@ -461,52 +683,62 @@ public partial class MainWindow : Window
     {
         if (AssetListDataGrid.SelectedItem is AssetItem assetItem)
         {
-            var dumpStr = assetItem.Asset.Dump();
-            DumpTextBox.Text = dumpStr ?? "No Dump Available";
+            DumpTextBox.Text = assetItem.Asset.Dump() ?? "No Dump Available";
+            PreviewAsset(assetItem);
+        }
+    }
 
-            TextPreviewBox.IsVisible = false;
-            PreviewLabel.IsVisible = true;
-            PreviewLabel.Text = $"{assetItem.TypeString}: {assetItem.Name}";
+    private void PreviewAsset(AssetItem assetItem)
+    {
+        if (enablePreview.IsChecked != true)
+        {
+            ClearPreview("Preview disabled");
+            return;
+        }
 
-            switch (assetItem.Asset)
-            {
-                case TextAsset m_TextAsset:
-                    TextPreviewBox.Text = Encoding.UTF8.GetString(m_TextAsset.m_Script);
+        TextPreviewBox.IsVisible = false;
+        PreviewLabel.IsVisible = displayInfo.IsChecked == true;
+        PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.TypeString}: {assetItem.Name}" : string.Empty;
+        var dumpStr = assetItem.Asset.Dump();
+
+        switch (assetItem.Asset)
+        {
+            case TextAsset m_TextAsset:
+                TextPreviewBox.Text = Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty);
+                TextPreviewBox.IsVisible = true;
+                PreviewLabel.IsVisible = false;
+                break;
+            case Shader m_Shader:
+                TextPreviewBox.Text = m_Shader.Convert() ?? "Serialized Shader can't be read";
+                TextPreviewBox.IsVisible = true;
+                PreviewLabel.IsVisible = false;
+                break;
+            case MonoBehaviour:
+                if (dumpStr != null)
+                {
+                    TextPreviewBox.Text = dumpStr;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
-                    break;
-                case Shader m_Shader:
-                    TextPreviewBox.Text = m_Shader.m_Script != null ? Encoding.UTF8.GetString(m_Shader.m_Script) : "No shader script";
+                }
+                break;
+            case VideoClip _:
+            case MovieTexture _:
+                StatusStripUpdate("Only supported export.");
+                break;
+            case Animator _:
+                StatusStripUpdate("Can be exported to FBX file.");
+                break;
+            case AnimationClip _:
+                StatusStripUpdate("Can be exported with Animator or Objects");
+                break;
+            default:
+                if (dumpStr != null)
+                {
+                    TextPreviewBox.Text = dumpStr;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
-                    break;
-                case MonoBehaviour:
-                    if (dumpStr != null)
-                    {
-                        TextPreviewBox.Text = dumpStr;
-                        TextPreviewBox.IsVisible = true;
-                        PreviewLabel.IsVisible = false;
-                    }
-                    break;
-                case VideoClip _:
-                case MovieTexture _:
-                    StatusStripUpdate("Only supported export.");
-                    break;
-                case Animator _:
-                    StatusStripUpdate("Can be exported to FBX file.");
-                    break;
-                case AnimationClip _:
-                    StatusStripUpdate("Can be exported with Animator or Objects");
-                    break;
-                default:
-                    if (dumpStr != null)
-                    {
-                        TextPreviewBox.Text = dumpStr;
-                        TextPreviewBox.IsVisible = true;
-                        PreviewLabel.IsVisible = false;
-                    }
-                    break;
-            }
+                }
+                break;
         }
     }
 
@@ -517,19 +749,31 @@ public partial class MainWindow : Window
 
     private void FilterAssetList()
     {
-        var filterText = listSearch?.Text?.Trim();
-        if (string.IsNullOrEmpty(filterText))
+        IEnumerable<AssetItem> assets = exportableAssets;
+
+        if (filterTypeAll.IsChecked != true)
         {
-            visibleAssets = new List<AssetItem>(exportableAssets);
+            var selectedTypes = GetFilterTypeItems()
+                .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+                .Select(x => (ClassIDType)x.Tag!)
+                .ToHashSet();
+
+            assets = selectedTypes.Count == 0
+                ? Enumerable.Empty<AssetItem>()
+                : assets.Where(x => selectedTypes.Contains(x.Type));
         }
-        else
+
+        var filterText = listSearch?.Text?.Trim();
+        if (!string.IsNullOrEmpty(filterText))
         {
-            visibleAssets = exportableAssets.Where(x =>
+            assets = assets.Where(x =>
                 x.Name.Contains(filterText, StringComparison.OrdinalIgnoreCase) ||
                 x.Container.Contains(filterText, StringComparison.OrdinalIgnoreCase) ||
-                x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase)
-            ).ToList();
+                x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase) ||
+                x.PathID.ToString(CultureInfo.InvariantCulture).Contains(filterText, StringComparison.OrdinalIgnoreCase));
         }
+
+        visibleAssets = assets.ToList();
         AssetListDataGrid.ItemsSource = visibleAssets;
         StatusStripUpdate($"Showing {visibleAssets.Count} assets");
     }
@@ -586,15 +830,15 @@ public partial class MainWindow : Window
                 var asset = toExport[j];
                 try
                 {
-                    var typePath = Path.Combine(savePath, asset.TypeString);
-                    Directory.CreateDirectory(typePath);
+                    var exportPath = GetExportPath(savePath, asset);
+                    Directory.CreateDirectory(exportPath);
                     var fileName = FixFileName(asset.Name);
-                    var filePath = Path.Combine(typePath, fileName);
+                    var filePath = Path.Combine(exportPath, fileName);
 
                     switch (mode)
                     {
                         case ExportMode.Raw:
-                            filePath += ".dat";
+                            filePath += GetRawExtension(asset);
                             if (!File.Exists(filePath))
                             {
                                 File.WriteAllBytes(filePath, asset.Asset.GetRawData());
@@ -611,7 +855,7 @@ public partial class MainWindow : Window
                             }
                             break;
                         case ExportMode.Convert:
-                            if (ExportConvertFile(asset, typePath))
+                            if (ExportConvertFile(asset, exportPath))
                                 exported++;
                             break;
                     }
@@ -630,6 +874,50 @@ public partial class MainWindow : Window
         var status = exported == 0 ? "Nothing exported." : $"Finished exporting {exported} assets.";
         if (failed > 0) status += $" {failed} failed.";
         StatusStripUpdate(status);
+
+        if (exportOptions.OpenAfterExport && exported > 0)
+        {
+            OpenFolder(savePath);
+        }
+    }
+
+    private string GetExportPath(string savePath, AssetItem asset)
+    {
+        return exportOptions.AssetGrouping switch
+        {
+            AssetGroupOption.Container when !string.IsNullOrEmpty(asset.Container) => Path.Combine(savePath, Path.GetDirectoryName(asset.Container) ?? string.Empty),
+            AssetGroupOption.SourceFile => Path.Combine(savePath, asset.Asset.assetsFile.fileName + "_export"),
+            AssetGroupOption.TypeName => Path.Combine(savePath, asset.TypeString),
+            _ => savePath
+        };
+    }
+
+    private string GetRawExtension(AssetItem asset)
+    {
+        if (!exportOptions.RestoreExtensionName) return ".dat";
+        return asset.Asset switch
+        {
+            Texture2D => ".tex",
+            TextAsset => ".txt",
+            Shader => ".shader",
+            Font m_Font when m_Font.m_FontData?.Length >= 4 && m_Font.m_FontData[0] == 79 && m_Font.m_FontData[1] == 84 && m_Font.m_FontData[2] == 84 && m_Font.m_FontData[3] == 79 => ".otf",
+            Font => ".ttf",
+            MovieTexture => ".ogv",
+            VideoClip m_VideoClip when !string.IsNullOrEmpty(m_VideoClip.m_OriginalPath) => Path.GetExtension(m_VideoClip.m_OriginalPath),
+            AudioClip m_AudioClip => new AudioClipConverter(m_AudioClip).GetExtensionName(),
+            _ => ".dat"
+        };
+    }
+
+    private static void OpenFolder(string path)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch
+        {
+        }
     }
 
     private bool ExportConvertFile(AssetItem item, string exportPath)
@@ -641,15 +929,26 @@ public partial class MainWindow : Window
         {
             case Texture2D m_Texture2D:
             {
+                if (!exportOptions.ConvertTexture)
+                {
+                    var rawPath = Path.Combine(exportPath, fileName + ".tex");
+                    if (File.Exists(rawPath)) return false;
+                    File.WriteAllBytes(rawPath, m_Texture2D.image_data.GetData());
+                    AssetExportHelper.WriteTextureMetaIfMissing(rawPath);
+                    return true;
+                }
+
                 var image = m_Texture2D.ConvertToImage(true);
                 if (image == null) return false;
-                var filePath = Path.Combine(exportPath, fileName + ".png");
+                var extension = "." + exportOptions.ConvertTextureFormat.ToString().ToLowerInvariant();
+                var filePath = Path.Combine(exportPath, fileName + extension);
                 if (File.Exists(filePath)) return false;
                 using (image)
                 using (var file = File.OpenWrite(filePath))
                 {
-                    image.WriteToStream(file, ImageFormat.Png);
+                    image.WriteToStream(file, exportOptions.ConvertTextureFormat);
                 }
+                AssetExportHelper.WriteTextureMetaIfMissing(filePath);
                 return true;
             }
             case AudioClip m_AudioClip:
@@ -657,7 +956,7 @@ public partial class MainWindow : Window
                 var m_AudioData = m_AudioClip.m_AudioData.GetData();
                 if (m_AudioData == null || m_AudioData.Length == 0) return false;
                 var converter = new AudioClipConverter(m_AudioClip);
-                if (converter.IsSupport)
+                if (exportOptions.ConvertAudio && converter.IsSupport)
                 {
                     var filePath = Path.Combine(exportPath, fileName + ".wav");
                     if (File.Exists(filePath)) return false;
@@ -672,6 +971,10 @@ public partial class MainWindow : Window
                     File.WriteAllBytes(filePath, m_AudioData);
                 }
                 return true;
+            }
+            case Material m_Material:
+            {
+                return AssetExportHelper.ExportMaterial(m_Material, item.Name, exportPath, exportOptions.ConvertTextureFormat);
             }
             case TextAsset m_TextAsset:
             {
@@ -748,11 +1051,73 @@ public partial class MainWindow : Window
     }
 }
 
-public class GameObjectNode
+public class GameObjectNode : INotifyPropertyChanged
 {
+    private bool isChecked;
+    private bool isExpanded;
+    private bool updatingChildren;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
     public string Name { get; set; } = string.Empty;
     public GameObject? GameObject { get; set; }
+    public GameObjectNode? Parent { get; set; }
     public ObservableCollection<GameObjectNode> Children { get; } = new ObservableCollection<GameObjectNode>();
+
+    public bool IsChecked
+    {
+        get => isChecked;
+        set
+        {
+            if (isChecked == value) return;
+            isChecked = value;
+            OnPropertyChanged(nameof(IsChecked));
+
+            if (updatingChildren) return;
+            foreach (var child in Children)
+            {
+                child.SetCheckedFromParent(value);
+            }
+        }
+    }
+
+    public bool IsExpanded
+    {
+        get => isExpanded;
+        set
+        {
+            if (isExpanded == value) return;
+            isExpanded = value;
+            OnPropertyChanged(nameof(IsExpanded));
+        }
+    }
+
+    public void ExpandAncestors()
+    {
+        var node = Parent;
+        while (node != null)
+        {
+            node.IsExpanded = true;
+            node = node.Parent;
+        }
+    }
+
+    private void SetCheckedFromParent(bool value)
+    {
+        updatingChildren = true;
+        IsChecked = value;
+        updatingChildren = false;
+
+        foreach (var child in Children)
+        {
+            child.SetCheckedFromParent(value);
+        }
+    }
+
+    private void OnPropertyChanged(string propertyName)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 }
 
 public class AssetItem
@@ -761,6 +1126,7 @@ public class AssetItem
     public string Name { get; set; } = string.Empty;
     public string Container { get; set; } = string.Empty;
     public string TypeString { get; set; }
+    public string DisplayType => GetDisplayType();
     public string UniqueID { get; set; } = string.Empty;
     public long PathID { get; set; }
     public long Size { get; set; }
@@ -775,6 +1141,22 @@ public class AssetItem
         PathID = asset.m_PathID;
         Size = asset.byteSize;
         FullSize = asset.byteSize;
+    }
+
+    private string GetDisplayType()
+    {
+        if (IsFbxSubAsset())
+        {
+            return $"{TypeString} (FBX sub-asset)";
+        }
+
+        return TypeString;
+    }
+
+    private bool IsFbxSubAsset()
+    {
+        return !string.IsNullOrEmpty(Container)
+            && string.Equals(Path.GetExtension(Container), ".fbx", StringComparison.OrdinalIgnoreCase);
     }
 }
 
