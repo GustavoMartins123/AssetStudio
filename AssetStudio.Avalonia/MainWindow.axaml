@@ -76,21 +76,21 @@
 
         <Grid ColumnDefinitions="3*, 5, 7*">
             
-            <TabControl Grid.Column="0" Margin="2">
+            <TabControl x:Name="LeftTabControl" Grid.Column="0" Margin="2">
                 <TabItem Header="Scene Hierarchy">
                     <Grid RowDefinitions="Auto, *">
                         <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2" TextChanged="TreeSearch_TextChanged" KeyDown="TreeSearch_KeyDown"/>
-                        <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False">
+                        <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False" AutoScrollToSelectedItem="True">
                             <TreeView.Styles>
                                 <Style Selector="TreeViewItem">
                                     <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
                                 </Style>
                             </TreeView.Styles>
                             <TreeView.ItemTemplate>
-                                <TreeDataTemplate ItemsSource="{Binding Children}" x:DataType="local:GameObjectNode">
+                                <TreeDataTemplate ItemsSource="{Binding Children, Mode=OneTime}" x:DataType="local:GameObjectNode" x:CompileBindings="True">
                                     <StackPanel Orientation="Horizontal" Spacing="4">
-                                        <CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" VerticalAlignment="Center" />
-                                        <TextBlock Text="{Binding Name}" VerticalAlignment="Center" />
+                                        <CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Focusable="False" VerticalAlignment="Center" />
+                                        <TextBlock Text="{Binding Name, Mode=OneTime}" VerticalAlignment="Center" />
                                     </StackPanel>
                                 </TreeDataTemplate>
                             </TreeView.ItemTemplate>
@@ -101,13 +101,22 @@
                 <TabItem Header="Asset List">
                     <Grid RowDefinitions="Auto, *">
                         <TextBox x:Name="listSearch" Grid.Row="0" PlaceholderText=" Filter " Margin="0,0,0,2" TextChanged="ListSearch_TextChanged"/>
-                        <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetListDataGrid_SelectionChanged" CanUserResizeColumns="True" HorizontalScrollBarVisibility="Auto">
+                        <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetListDataGrid_SelectionChanged" CellPointerPressed="AssetListDataGrid_CellPointerPressed" Sorting="AssetListDataGrid_Sorting" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto" SelectionMode="Extended">
+                            <DataGrid.ContextMenu>
+                                <ContextMenu Opened="AssetListContextMenu_Opened">
+                                    <MenuItem Header="Copy text" Click="CopyAssetCellText_Click" />
+                                    <MenuItem Header="Export selected assets" Click="ExportSelectedAssetsContext_Click" />
+                                    <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click" />
+                                    <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Click="GoToSceneHierarchy_Click" />
+                                    <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Click="ShowOriginalFile_Click" />
+                                </ContextMenu>
+                            </DataGrid.ContextMenu>
                             <DataGrid.Columns>
-                                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="220" MinWidth="90" />
-                                <DataGridTextColumn Header="Container" Binding="{Binding Container}" Width="220" MinWidth="90" />
-                                <DataGridTextColumn Header="Type" Binding="{Binding DisplayType}" Width="130" MinWidth="80" />
-                                <DataGridTextColumn Header="PathID" Binding="{Binding PathID}" Width="210" MinWidth="120" />
-                                <DataGridTextColumn Header="Size" Binding="{Binding Size}" Width="90" MinWidth="70" />
+                                <DataGridTextColumn Header="Name" Binding="{Binding Name}" SortMemberPath="Name" Width="220" MinWidth="90" />
+                                <DataGridTextColumn Header="Container" Binding="{Binding Container}" SortMemberPath="Container" Width="220" MinWidth="90" />
+                                <DataGridTextColumn Header="Type" Binding="{Binding DisplayType}" SortMemberPath="DisplayType" Width="130" MinWidth="80" />
+                                <DataGridTextColumn Header="PathID" Binding="{Binding PathID}" SortMemberPath="PathID" Width="210" MinWidth="120" />
+                                <DataGridTextColumn Header="Size" Binding="{Binding FullSize}" SortMemberPath="FullSize" Width="90" MinWidth="70" />
                             </DataGrid.Columns>
                         </DataGrid>
                     </Grid>
@@ -125,7 +134,7 @@
 
             <GridSplitter Grid.Column="1" Background="#444" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
 
-            <TabControl Grid.Column="2" Margin="2">
+            <TabControl x:Name="RightTabControl" Grid.Column="2" Margin="2" SelectionChanged="RightTabControl_SelectionChanged">
                 <TabItem Header="Preview">
                     <Panel Background="#222">
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />

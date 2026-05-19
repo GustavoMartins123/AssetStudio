@@ -1,5 +1,6 @@
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
@@ -7,12 +8,12 @@ using System.Diagnostics;
 using AssetStudio;
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -23,10 +24,17 @@ public partial class MainWindow : Window
     private AssetsManager assetsManager = new AssetsManager();
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private List<AssetItem> visibleAssets = new List<AssetItem>();
-    private ObservableCollection<GameObjectNode> sceneTreeNodes = new ObservableCollection<GameObjectNode>();
+    private List<GameObjectNode> sceneTreeNodes = new List<GameObjectNode>();
     private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
     private readonly ExportOptionsState exportOptions = new();
+    private readonly AvaloniaAppSettings appSettings = AvaloniaAppSettings.Load();
+    private readonly AssemblyLoader assemblyLoader = new AssemblyLoader();
+    private CancellationTokenSource? listSearchDebounce;
+    private string? assetListSortMember;
+    private string assetContextCellText = string.Empty;
+    private AssetItem? assetContextItem;
     private int nextGameObjectSearchIndex;
+    private bool assetListSortDescending;
     private bool updatingFilterTypeMenu;
 
     public MainWindow()
@@ -56,6 +64,12 @@ public partial class MainWindow : Window
         AssetListDataGrid.ItemsSource = null;
         sceneTreeNodes.Clear();
         treeSearchResults.Clear();
+        listSearchDebounce?.Cancel();
+        assetListSortMember = null;
+        assetListSortDescending = false;
+        assetContextCellText = string.Empty;
+        assetContextItem = null;
+        assemblyLoader.Clear();
         nextGameObjectSearchIndex = 0;
         SceneTreeView.ItemsSource = null;
         DumpTextBox.Text = string.Empty;
@@ -79,6 +93,74 @@ public partial class MainWindow : Window
         TextPreviewBox.IsVisible = false;
         PreviewLabel.Text = message;
         PreviewLabel.IsVisible = true;
+    }
+
+    private async Task<IStorageFolder?> TryGetFolder(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
+        {
+            return null;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return await topLevel.StorageProvider.TryGetFolderFromPathAsync(new Uri(path));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<FilePickerOpenOptions> CreateOpenFileOptions(string title, bool allowMultiple)
+    {
+        return new FilePickerOpenOptions
+        {
+            Title = title,
+            AllowMultiple = allowMultiple,
+            SuggestedStartLocation = await TryGetFolder(appSettings.LoadFolderPath)
+        };
+    }
+
+    private async Task<FolderPickerOpenOptions> CreateLoadFolderOptions(string title, bool allowMultiple = false)
+    {
+        return new FolderPickerOpenOptions
+        {
+            Title = title,
+            AllowMultiple = allowMultiple,
+            SuggestedStartLocation = await TryGetFolder(appSettings.LoadFolderPath)
+        };
+    }
+
+    private async Task<FolderPickerOpenOptions> CreateExportFolderOptions(string title, bool allowMultiple = false)
+    {
+        return new FolderPickerOpenOptions
+        {
+            Title = title,
+            AllowMultiple = allowMultiple,
+            SuggestedStartLocation = await TryGetFolder(appSettings.ExportFolderPath)
+        };
+    }
+
+    private void SaveLoadFolder(string path)
+    {
+        var folder = Directory.Exists(path) ? path : Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return;
+        appSettings.LoadFolderPath = folder;
+        appSettings.Save();
+    }
+
+    private void SaveExportFolder(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return;
+        appSettings.ExportFolderPath = path;
+        appSettings.Save();
     }
 
     private void TreeSearch_TextChanged(object? sender, TextChangedEventArgs e)
@@ -123,7 +205,6 @@ public partial class MainWindow : Window
         var selectedNode = treeSearchResults[nextGameObjectSearchIndex];
         selectedNode.ExpandAncestors();
         SceneTreeView.SelectedItem = selectedNode;
-        SceneTreeView.Focus();
         nextGameObjectSearchIndex++;
         StatusStripUpdate($"Scene hierarchy match {nextGameObjectSearchIndex}/{treeSearchResults.Count}: {selectedNode.Name}");
     }
@@ -177,14 +258,11 @@ public partial class MainWindow : Window
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select project root",
-            AllowMultiple = false
-        });
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select project root"));
         if (folders == null || folders.Count == 0) return;
 
         assetsManager.ProjectRoot = folders[0].Path.LocalPath;
+        SaveLoadFolder(assetsManager.ProjectRoot);
         StatusStripUpdate($"Project root set to: {assetsManager.ProjectRoot}");
     }
 
@@ -276,15 +354,12 @@ public partial class MainWindow : Window
     {
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
-        var files = await topLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-        {
-            Title = "Select Game File",
-            AllowMultiple = true
-        });
+        var files = await topLevel.StorageProvider.OpenFilePickerAsync(await CreateOpenFileOptions("Select Game File", true));
 
         if (files != null && files.Count > 0)
         {
             var filePaths = files.Select(f => f.Path.LocalPath).ToArray();
+            SaveLoadFolder(filePaths[0]);
             ResetForm();
             StatusStripUpdate("Loading files...");
             assetsManager.Clear();
@@ -298,15 +373,12 @@ public partial class MainWindow : Window
     {
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select Game Folder",
-            AllowMultiple = false
-        });
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Game Folder"));
 
         if (folders != null && folders.Count > 0)
         {
             var folderPath = folders[0].Path.LocalPath;
+            SaveLoadFolder(folderPath);
             ResetForm();
             StatusStripUpdate("Loading folder...");
             assetsManager.Clear();
@@ -321,22 +393,16 @@ public partial class MainWindow : Window
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        var files = await topLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-        {
-            Title = "Select bundle or web file",
-            AllowMultiple = true
-        });
+        var files = await topLevel.StorageProvider.OpenFilePickerAsync(await CreateOpenFileOptions("Select bundle or web file", true));
         if (files == null || files.Count == 0) return;
 
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select the save folder",
-            AllowMultiple = false
-        });
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
         if (folders == null || folders.Count == 0) return;
 
         var filePaths = files.Select(x => x.Path.LocalPath).Where(File.Exists).ToArray();
+        SaveLoadFolder(filePaths.FirstOrDefault() ?? string.Empty);
         var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
         StatusStripUpdate("Extracting files...");
         var extractedCount = await Task.Run(() => ExtractFiles(filePaths, savePath));
         StatusStripUpdate($"Finished extracting {extractedCount} files.");
@@ -347,22 +413,16 @@ public partial class MainWindow : Window
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        var sourceFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select folder to extract",
-            AllowMultiple = false
-        });
+        var sourceFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select folder to extract"));
         if (sourceFolders == null || sourceFolders.Count == 0) return;
 
-        var saveFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select the save folder",
-            AllowMultiple = false
-        });
+        var saveFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
         if (saveFolders == null || saveFolders.Count == 0) return;
 
         var sourcePath = sourceFolders[0].Path.LocalPath;
+        SaveLoadFolder(sourcePath);
         var savePath = saveFolders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
         StatusStripUpdate("Extracting folder...");
         var extractedCount = await Task.Run(() => ExtractFolder(sourcePath, savePath));
         StatusStripUpdate($"Finished extracting {extractedCount} files.");
@@ -510,14 +570,15 @@ public partial class MainWindow : Window
         }
 
         exportableAssets.Clear();
-        sceneTreeNodes = new ObservableCollection<GameObjectNode>();
+        sceneTreeNodes = new List<GameObjectNode>();
         treeSearchResults.Clear();
         nextGameObjectSearchIndex = 0;
+        var objectCount = assetsManager.assetsFileList.Sum(x => x.Objects.Count);
         var treeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
+        var objectAssetItemDic = new Dictionary<Object, AssetItem>(objectCount);
         var containers = new List<(PPtr<Object>, string)>();
 
         int i = 0;
-        var objectCount = assetsManager.assetsFileList.Sum(x => x.Objects.Count);
 
         foreach (var assetsFile in assetsManager.assetsFileList)
         {
@@ -527,6 +588,7 @@ public partial class MainWindow : Window
             {
                 var assetItem = new AssetItem(asset);
                 assetItem.UniqueID = " #" + i;
+                objectAssetItemDic[asset] = assetItem;
                 var exportable = false;
 
                 switch (asset)
@@ -555,8 +617,7 @@ public partial class MainWindow : Window
                             }
                         }
 
-                        currentNode.Parent = parentNode;
-                        parentNode.Children.Add(currentNode);
+                        parentNode.AddChild(currentNode);
                         break;
 
                     case Texture2D m_Texture2D:
@@ -645,13 +706,13 @@ public partial class MainWindow : Window
                 i++;
             }
 
-            if (fileNode.Children.Count > 0)
+            if (fileNode.ChildCount > 0)
             {
                 sceneTreeNodes.Add(fileNode);
             }
         }
 
-        var objectAssetItemDic = exportableAssets.ToDictionary(x => x.Asset);
+        LinkAssetItemsToSceneNodes(treeNodeDictionary, objectAssetItemDic);
         foreach ((var pptr, var container) in containers)
         {
             if (pptr.TryGet(out var obj) && objectAssetItemDic.TryGetValue(obj, out var item))
@@ -679,13 +740,132 @@ public partial class MainWindow : Window
         Title = $"AssetStudio - {assetsManager.assetsFileList[0].unityVersion} - {assetsManager.assetsFileList[0].m_TargetPlatform}";
     }
 
-    private void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    private void LinkAssetItemsToSceneNodes(Dictionary<GameObject, GameObjectNode> treeNodeDictionary, Dictionary<Object, AssetItem> objectAssetItemDic)
+    {
+        foreach (var assetsFile in assetsManager.assetsFileList)
+        {
+            foreach (var asset in assetsFile.Objects)
+            {
+                if (asset is not GameObject gameObject || !treeNodeDictionary.TryGetValue(gameObject, out var node))
+                {
+                    continue;
+                }
+
+                if (objectAssetItemDic.TryGetValue(gameObject, out var gameObjectItem))
+                {
+                    gameObjectItem.TreeNode = node;
+                }
+
+                foreach (var pptr in gameObject.m_Components)
+                {
+                    if (!pptr.TryGet(out var component))
+                    {
+                        continue;
+                    }
+
+                    if (objectAssetItemDic.TryGetValue(component, out var componentItem))
+                    {
+                        componentItem.TreeNode = node;
+                    }
+
+                    if (component is MeshFilter meshFilter
+                        && meshFilter.m_Mesh.TryGet(out var mesh)
+                        && objectAssetItemDic.TryGetValue(mesh, out var meshItem))
+                    {
+                        meshItem.TreeNode = node;
+                    }
+                    else if (component is SkinnedMeshRenderer skinnedMeshRenderer
+                        && skinnedMeshRenderer.m_Mesh.TryGet(out var skinnedMesh)
+                        && objectAssetItemDic.TryGetValue(skinnedMesh, out var skinnedMeshItem))
+                    {
+                        skinnedMeshItem.TreeNode = node;
+                    }
+                }
+            }
+        }
+    }
+
+    private async void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         if (AssetListDataGrid.SelectedItem is AssetItem assetItem)
         {
-            DumpTextBox.Text = assetItem.Asset.Dump() ?? "No Dump Available";
+            if (RightTabControl.SelectedIndex == 1)
+            {
+                await UpdateDumpForSelectedAsset();
+            }
             PreviewAsset(assetItem);
         }
+        else
+        {
+            DumpTextBox.Text = string.Empty;
+        }
+    }
+
+    private async void RightTabControl_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (e.Source == RightTabControl && RightTabControl.SelectedIndex == 1)
+        {
+            await UpdateDumpForSelectedAsset();
+        }
+    }
+
+    private async Task UpdateDumpForSelectedAsset()
+    {
+        if (AssetListDataGrid.SelectedItem is not AssetItem assetItem)
+        {
+            DumpTextBox.Text = string.Empty;
+            return;
+        }
+
+        DumpTextBox.Text = "Loading dump...";
+        try
+        {
+            var dump = await DumpAsset(assetItem.Asset);
+            DumpTextBox.Text = dump ?? "No Dump Available";
+        }
+        catch (Exception ex)
+        {
+            DumpTextBox.Text = $"Dump {assetItem.Type}:{assetItem.Name} error{Environment.NewLine}{ex.Message}{Environment.NewLine}{ex.StackTrace}";
+        }
+    }
+
+    private async Task<string?> DumpAsset(Object asset)
+    {
+        var dump = asset.Dump();
+        if (dump == null && asset is MonoBehaviour monoBehaviour)
+        {
+            var typeTree = await MonoBehaviourToTypeTree(monoBehaviour);
+            dump = monoBehaviour.Dump(typeTree);
+        }
+        return dump;
+    }
+
+    private async Task<TypeTree> MonoBehaviourToTypeTree(MonoBehaviour monoBehaviour)
+    {
+        if (!assemblyLoader.Loaded)
+        {
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel != null)
+            {
+                var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
+
+                if (folders != null && folders.Count > 0)
+                {
+                    SaveLoadFolder(folders[0].Path.LocalPath);
+                    assemblyLoader.Load(folders[0].Path.LocalPath);
+                }
+                else
+                {
+                    assemblyLoader.Loaded = true;
+                }
+            }
+            else
+            {
+                assemblyLoader.Loaded = true;
+            }
+        }
+
+        return monoBehaviour.ConvertToTypeTree(assemblyLoader);
     }
 
     private void PreviewAsset(AssetItem assetItem)
@@ -742,9 +922,119 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ListSearch_TextChanged(object? sender, TextChangedEventArgs e)
+    private async void ListSearch_TextChanged(object? sender, TextChangedEventArgs e)
     {
-        FilterAssetList();
+        listSearchDebounce?.Cancel();
+        var debounce = new CancellationTokenSource();
+        listSearchDebounce = debounce;
+
+        try
+        {
+            await Task.Delay(800, debounce.Token);
+            if (!debounce.IsCancellationRequested)
+            {
+                FilterAssetList();
+            }
+        }
+        catch (TaskCanceledException)
+        {
+        }
+    }
+
+    private void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
+    {
+        var sortMember = e.Column.SortMemberPath ?? e.Column.Header?.ToString();
+        if (string.IsNullOrEmpty(sortMember)) return;
+
+        if (assetListSortMember == sortMember)
+        {
+            assetListSortDescending = !assetListSortDescending;
+        }
+        else
+        {
+            assetListSortMember = sortMember;
+            assetListSortDescending = false;
+        }
+
+        e.Column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
+        ApplyAssetListSort();
+    }
+
+    private void AssetListDataGrid_CellPointerPressed(object? sender, DataGridCellPointerPressedEventArgs e)
+    {
+        if (e.Row.DataContext is not AssetItem item)
+        {
+            return;
+        }
+
+        assetContextItem = item;
+        assetContextCellText = GetAssetCellText(item, e.Column.SortMemberPath ?? e.Column.Header?.ToString());
+
+        if (e.PointerPressedEventArgs.GetCurrentPoint(AssetListDataGrid).Properties.IsRightButtonPressed
+            && !AssetListDataGrid.SelectedItems.Contains(item))
+        {
+            AssetListDataGrid.SelectedItem = item;
+        }
+    }
+
+    private void AssetListContextMenu_Opened(object? sender, RoutedEventArgs e)
+    {
+        var selectedAssets = GetSelectedAssets();
+        var singleSelected = selectedAssets.Count == 1;
+        var hasAnimatorWithClips = selectedAssets.Any(x => x.Type == ClassIDType.Animator)
+            && selectedAssets.Any(x => x.Type == ClassIDType.AnimationClip);
+
+        goToSceneHierarchyMenuItem.IsVisible = singleSelected && selectedAssets[0].TreeNode != null;
+        showOriginalFileMenuItem.IsVisible = singleSelected;
+        exportAnimatorWithSelectedAnimationClipMenuItem.IsVisible = hasAnimatorWithClips;
+    }
+
+    private async void CopyAssetCellText_Click(object? sender, RoutedEventArgs e)
+    {
+        var text = assetContextCellText;
+        if (string.IsNullOrEmpty(text) && AssetListDataGrid.SelectedItem is AssetItem item)
+        {
+            text = item.Name;
+        }
+
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard != null)
+        {
+            await clipboard.SetTextAsync(text);
+            StatusStripUpdate("Copied asset cell text.");
+        }
+    }
+
+    private async void ExportSelectedAssetsContext_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
+    }
+
+    private void GoToSceneHierarchy_Click(object? sender, RoutedEventArgs e)
+    {
+        var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;
+        if (item?.TreeNode == null)
+        {
+            StatusStripUpdate("Selected asset has no scene hierarchy node.");
+            return;
+        }
+
+        item.TreeNode.ExpandAncestors();
+        LeftTabControl.SelectedIndex = 0;
+        SceneTreeView.SelectedItem = item.TreeNode;
+        SceneTreeView.Focus();
+    }
+
+    private void ShowOriginalFile_Click(object? sender, RoutedEventArgs e)
+    {
+        var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;
+        if (item == null) return;
+        ShowOriginalFile(item);
+    }
+
+    private async void ExportAnimatorWithSelectedAnimationClip_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportAnimatorWithSelectedAnimationClips(GetSelectedAssets());
     }
 
     private void FilterAssetList()
@@ -774,8 +1064,50 @@ public partial class MainWindow : Window
         }
 
         visibleAssets = assets.ToList();
+        ApplyAssetListSort();
+    }
+
+    private void ApplyAssetListSort()
+    {
+        visibleAssets = SortAssetList(visibleAssets).ToList();
         AssetListDataGrid.ItemsSource = visibleAssets;
         StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+    }
+
+    private IEnumerable<AssetItem> SortAssetList(IEnumerable<AssetItem> assets)
+    {
+        return assetListSortMember switch
+        {
+            "PathID" => assetListSortDescending
+                ? assets.OrderByDescending(x => x.PathID)
+                : assets.OrderBy(x => x.PathID),
+            "FullSize" or "Size" => assetListSortDescending
+                ? assets.OrderByDescending(x => x.FullSize)
+                : assets.OrderBy(x => x.FullSize),
+            "Container" => SortByString(assets, x => x.Container),
+            "DisplayType" or "Type" => SortByString(assets, x => x.DisplayType),
+            "Name" => SortByString(assets, x => x.Name),
+            _ => assets
+        };
+    }
+
+    private IEnumerable<AssetItem> SortByString(IEnumerable<AssetItem> assets, Func<AssetItem, string> selector)
+    {
+        return assetListSortDescending
+            ? assets.OrderByDescending(selector, StringComparer.OrdinalIgnoreCase)
+            : assets.OrderBy(selector, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string GetAssetCellText(AssetItem item, string? member)
+    {
+        return member switch
+        {
+            "Container" => item.Container,
+            "DisplayType" or "Type" => item.DisplayType,
+            "PathID" => item.PathID.ToString(CultureInfo.InvariantCulture),
+            "FullSize" or "Size" => item.FullSize.ToString(CultureInfo.InvariantCulture),
+            _ => item.Name
+        };
     }
 
     private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets, ExportMode.Convert);
@@ -809,14 +1141,17 @@ public partial class MainWindow : Window
 
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select the save folder"
-        });
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
 
         if (folders == null || folders.Count == 0) return;
 
         var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+        if (mode == ExportMode.Convert)
+        {
+            toExport = OrderConvertedAssetsForExport(toExport);
+        }
+
         int total = toExport.Count;
         int exported = 0;
         int failed = 0;
@@ -878,6 +1213,128 @@ public partial class MainWindow : Window
         if (exportOptions.OpenAfterExport && exported > 0)
         {
             OpenFolder(savePath);
+        }
+    }
+
+    private static List<AssetItem> OrderConvertedAssetsForExport(List<AssetItem> assets)
+    {
+        return assets
+            .OrderBy(x => x.Type == ClassIDType.Texture2D ? 0 : x.Type == ClassIDType.Material ? 1 : 2)
+            .ToList();
+    }
+
+    private async Task ExportAnimatorWithSelectedAnimationClips(List<AssetItem> selectedAssets)
+    {
+        var animator = selectedAssets.FirstOrDefault(x => x.Type == ClassIDType.Animator);
+        var animationList = selectedAssets.Where(x => x.Type == ClassIDType.AnimationClip).ToList();
+        if (animator == null || animationList.Count == 0)
+        {
+            StatusStripUpdate("Select one Animator and one or more AnimationClips.");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (folders == null || folders.Count == 0) return;
+
+        var selectedExportRoot = folders[0].Path.LocalPath;
+        SaveExportFolder(selectedExportRoot);
+        var exportPath = Path.Combine(selectedExportRoot, "Animator");
+        Directory.CreateDirectory(exportPath);
+        var exportFile = Path.Combine(exportPath, FixFileName(animator.Name) + ".fbx");
+        var clips = animationList.Select(x => (AnimationClip)x.Asset).ToArray();
+        var selectedGameObjects = GetTopLevelSelectedGameObjects(selectedAssets
+            .Where(x => x.Type != ClassIDType.AnimationClip && x.TreeNode?.GameObject != null)
+            .Select(x => x.TreeNode!.GameObject!)
+            .Distinct()
+            .ToList());
+
+        StatusStripUpdate($"Exporting {animator.Name}...");
+        await Task.Run(() =>
+        {
+            IImported convert = selectedGameObjects.Count > 0
+                ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
+                : new ModelConverter((Animator)animator.Asset, exportOptions.ConvertTextureFormat, clips);
+            ModelExporter.ExportFbx(exportFile, convert,
+                exportOptions.EulerFilter,
+                (float)exportOptions.FilterPrecision,
+                exportOptions.ExportAllNodes,
+                exportOptions.ExportSkins,
+                exportOptions.ExportAnimations,
+                exportOptions.ExportBlendShape,
+                exportOptions.CastToBone,
+                (float)exportOptions.BoneSize,
+                exportOptions.ExportAllUvsAsDiffuseMaps,
+                (float)exportOptions.ScaleFactor,
+                exportOptions.FbxVersion,
+                exportOptions.FbxFormat == 1);
+        });
+
+        if (exportOptions.OpenAfterExport)
+        {
+            OpenFolder(exportPath);
+        }
+        StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+    }
+
+    private static List<GameObject> GetTopLevelSelectedGameObjects(List<GameObject> gameObjects)
+    {
+        return gameObjects
+            .Where(gameObject => !gameObjects.Any(other => other != gameObject && IsDescendantOf(gameObject, other)))
+            .ToList();
+    }
+
+    private static bool IsDescendantOf(GameObject child, GameObject possibleParent)
+    {
+        var transform = child.m_Transform;
+        while (transform != null && transform.m_Father.TryGet(out var father))
+        {
+            if (father.m_GameObject.TryGet(out var fatherGameObject) && fatherGameObject == possibleParent)
+            {
+                return true;
+            }
+            transform = father;
+        }
+        return false;
+    }
+
+    private void ShowOriginalFile(AssetItem item)
+    {
+        var sourcePath = !string.IsNullOrEmpty(item.SourceFile.originalPath)
+            ? item.SourceFile.originalPath
+            : item.SourceFile.fullName;
+        if (string.IsNullOrEmpty(sourcePath))
+        {
+            StatusStripUpdate("Original file path is unavailable.");
+            return;
+        }
+
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{sourcePath}\"") { UseShellExecute = true });
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                var startInfo = new ProcessStartInfo("open") { UseShellExecute = false };
+                startInfo.ArgumentList.Add("-R");
+                startInfo.ArgumentList.Add(sourcePath);
+                Process.Start(startInfo);
+            }
+            else
+            {
+                var folder = Directory.Exists(sourcePath) ? sourcePath : Path.GetDirectoryName(sourcePath);
+                if (string.IsNullOrEmpty(folder)) return;
+                var startInfo = new ProcessStartInfo("xdg-open") { UseShellExecute = false };
+                startInfo.ArgumentList.Add(folder);
+                Process.Start(startInfo);
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Unable to show original file: {ex.Message}");
         }
     }
 
@@ -1051,8 +1508,53 @@ public partial class MainWindow : Window
     }
 }
 
+public sealed class AvaloniaAppSettings
+{
+    private static readonly string SettingsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "AssetStudio",
+        "avalonia-settings.json");
+
+    public string LoadFolderPath { get; set; } = string.Empty;
+    public string ExportFolderPath { get; set; } = string.Empty;
+
+    public static AvaloniaAppSettings Load()
+    {
+        try
+        {
+            if (File.Exists(SettingsPath))
+            {
+                return JsonSerializer.Deserialize<AvaloniaAppSettings>(File.ReadAllText(SettingsPath)) ?? new AvaloniaAppSettings();
+            }
+        }
+        catch
+        {
+        }
+
+        return new AvaloniaAppSettings();
+    }
+
+    public void Save()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(SettingsPath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch
+        {
+        }
+    }
+}
+
 public class GameObjectNode : INotifyPropertyChanged
 {
+    private static readonly IReadOnlyList<GameObjectNode> EmptyChildren = Array.Empty<GameObjectNode>();
+    private List<GameObjectNode>? children;
     private bool isChecked;
     private bool isExpanded;
     private bool updatingChildren;
@@ -1061,8 +1563,9 @@ public class GameObjectNode : INotifyPropertyChanged
 
     public string Name { get; set; } = string.Empty;
     public GameObject? GameObject { get; set; }
-    public GameObjectNode? Parent { get; set; }
-    public ObservableCollection<GameObjectNode> Children { get; } = new ObservableCollection<GameObjectNode>();
+    public GameObjectNode? Parent { get; private set; }
+    public IReadOnlyList<GameObjectNode> Children => children ?? EmptyChildren;
+    public int ChildCount => children?.Count ?? 0;
 
     public bool IsChecked
     {
@@ -1073,8 +1576,8 @@ public class GameObjectNode : INotifyPropertyChanged
             isChecked = value;
             OnPropertyChanged(nameof(IsChecked));
 
-            if (updatingChildren) return;
-            foreach (var child in Children)
+            if (updatingChildren || children == null) return;
+            foreach (var child in children)
             {
                 child.SetCheckedFromParent(value);
             }
@@ -1090,6 +1593,13 @@ public class GameObjectNode : INotifyPropertyChanged
             isExpanded = value;
             OnPropertyChanged(nameof(IsExpanded));
         }
+    }
+
+    public void AddChild(GameObjectNode child)
+    {
+        children ??= new List<GameObjectNode>();
+        child.Parent = this;
+        children.Add(child);
     }
 
     public void ExpandAncestors()
@@ -1108,7 +1618,8 @@ public class GameObjectNode : INotifyPropertyChanged
         IsChecked = value;
         updatingChildren = false;
 
-        foreach (var child in Children)
+        if (children == null) return;
+        foreach (var child in children)
         {
             child.SetCheckedFromParent(value);
         }
@@ -1123,6 +1634,8 @@ public class GameObjectNode : INotifyPropertyChanged
 public class AssetItem
 {
     public Object Asset { get; set; }
+    public SerializedFile SourceFile { get; set; }
+    public GameObjectNode? TreeNode { get; set; }
     public string Name { get; set; } = string.Empty;
     public string Container { get; set; } = string.Empty;
     public string TypeString { get; set; }
@@ -1136,6 +1649,7 @@ public class AssetItem
     public AssetItem(Object asset)
     {
         Asset = asset;
+        SourceFile = asset.assetsFile;
         TypeString = asset.type.ToString();
         Type = asset.type;
         PathID = asset.m_PathID;
