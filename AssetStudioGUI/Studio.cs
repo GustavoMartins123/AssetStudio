@@ -179,6 +179,7 @@ namespace AssetStudioGUI
                             exportable = true;
                             break;
                         case Mesh _:
+                        case Material _:
                         case TextAsset _:
                         case AnimationClip _:
                         case Font _:
@@ -247,6 +248,14 @@ namespace AssetStudioGUI
                 if (pptr.TryGet(out var obj))
                 {
                     objectAssetItemDic[obj].Container = container;
+                    if (obj is Material material && string.IsNullOrEmpty(material.m_Name))
+                    {
+                        var name = Path.GetFileNameWithoutExtension(container);
+                        if (!string.IsNullOrEmpty(name))
+                        {
+                            objectAssetItemDic[obj].Text = name;
+                        }
+                    }
                 }
             }
             foreach (var tmp in exportableAssets)

@@ -663,7 +663,15 @@ namespace AssetStudio
                 case 2:
                     return "SpecularColor";
                 case 3:
+                    return "SpecularFactor";
+                case 4:
+                    return "EmissiveColor";
+                case 5:
+                    return "AmbientColor";
+                case 6:
                     return "Bump";
+                case 7:
+                    return "DiffuseFactor";
                 default:
                     return "DiffuseColor";
             }

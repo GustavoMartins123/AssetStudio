@@ -10,6 +10,13 @@ namespace AssetStudio
         private SerializedFile assetsFile;
         private int index = -2; //-2 - Prepare, -1 - Missing
 
+        public PPtr(int fileID, long pathID, SerializedFile assetsFile)
+        {
+            m_FileID = fileID;
+            m_PathID = pathID;
+            this.assetsFile = assetsFile;
+        }
+
         public PPtr(ObjectReader reader)
         {
             m_FileID = reader.ReadInt32();

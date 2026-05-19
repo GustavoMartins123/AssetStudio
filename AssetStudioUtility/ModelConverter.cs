@@ -762,17 +762,7 @@ namespace AssetStudio
                     var texture = new ImportedMaterialTexture();
                     iMat.Textures.Add(texture);
 
-                    int dest = -1;
-                    if (texEnv.Key == "_MainTex")
-                        dest = 0;
-                    else if (texEnv.Key == "_BumpMap")
-                        dest = 3;
-                    else if (texEnv.Key.Contains("Specular"))
-                        dest = 2;
-                    else if (texEnv.Key.Contains("Normal"))
-                        dest = 1;
-
-                    texture.Dest = dest;
+                    texture.Dest = GetTextureDestination(texEnv.Key);
 
                     var ext = $".{imageFormat.ToString().ToLower()}";
                     if (textureNameDictionary.TryGetValue(m_Texture2D, out var textureName))
@@ -832,6 +822,66 @@ namespace AssetStudio
                 iTex = new ImportedTexture(stream, name);
                 TextureList.Add(iTex);
             }
+        }
+
+        private static int GetTextureDestination(string propertyName)
+        {
+            switch (propertyName)
+            {
+                case "_BaseMap":
+                case "_MainTex":
+                case "_BaseColorMap":
+                case "_BaseColorTexture":
+                    return 0;
+                case "_BumpMap":
+                case "_NormalMap":
+                case "_DetailNormalMap":
+                    return 1;
+                case "_SpecGlossMap":
+                case "_SpecularMap":
+                    return 2;
+                case "_MetallicGlossMap":
+                case "_MetallicMap":
+                    return 3;
+                case "_EmissionMap":
+                    return 4;
+                case "_OcclusionMap":
+                    return 5;
+                case "_ParallaxMap":
+                case "_HeightMap":
+                    return 6;
+                case "_DetailAlbedoMap":
+                    return 7;
+            }
+
+            if (propertyName.IndexOf("Normal", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Bump", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 1;
+            }
+            if (propertyName.IndexOf("Spec", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 2;
+            }
+            if (propertyName.IndexOf("Metal", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 3;
+            }
+            if (propertyName.IndexOf("Emission", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 4;
+            }
+            if (propertyName.IndexOf("Occlusion", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 5;
+            }
+            if (propertyName.IndexOf("Height", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Parallax", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 6;
+            }
+
+            return 0;
         }
 
         private void ConvertAnimations()

@@ -743,6 +743,9 @@ namespace AssetStudioGUI
                     case Shader m_Shader:
                         PreviewShader(m_Shader);
                         break;
+                    case Material m_Material:
+                        PreviewMaterial(assetItem, m_Material);
+                        break;
                     case TextAsset m_TextAsset:
                         PreviewTextAsset(m_TextAsset);
                         break;
@@ -781,6 +784,79 @@ namespace AssetStudioGUI
             catch (Exception e)
             {
                 MessageBox.Show($"Preview {assetItem.Type}:{assetItem.Text} error\r\n{e.Message}\r\n{e.StackTrace}");
+            }
+        }
+
+        private void PreviewMaterial(AssetItem assetItem, Material m_Material)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"Material: {m_Material.m_Name}");
+            if (m_Material.m_Shader.TryGet(out var shader))
+            {
+                sb.AppendLine($"Shader: {shader.m_ParsedForm?.m_Name ?? shader.m_Name}");
+            }
+            sb.AppendLine();
+            sb.AppendLine("Texture slots:");
+
+            Texture2D previewTexture = null;
+            foreach (var texEnv in m_Material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+            {
+                sb.Append($"  {texEnv.Key}: ");
+                if (texEnv.Value.m_Texture.TryGet<Texture2D>(out var texture))
+                {
+                    sb.AppendLine($"{texture.m_Name} ({texture.m_Width}x{texture.m_Height}, {texture.m_TextureFormat})");
+                    sb.AppendLine($"    FileID: {texEnv.Value.m_Texture.m_FileID}, PathID: {texEnv.Value.m_Texture.m_PathID}");
+                    sb.AppendLine($"    Scale: {texEnv.Value.m_Scale.X}, {texEnv.Value.m_Scale.Y}");
+                    sb.AppendLine($"    Offset: {texEnv.Value.m_Offset.X}, {texEnv.Value.m_Offset.Y}");
+                    if (previewTexture == null && IsPreferredMaterialPreviewSlot(texEnv.Key))
+                    {
+                        previewTexture = texture;
+                    }
+                }
+                else
+                {
+                    sb.AppendLine(texEnv.Value.m_Texture.IsNull
+                        ? "null"
+                        : $"missing (FileID: {texEnv.Value.m_Texture.m_FileID}, PathID: {texEnv.Value.m_Texture.m_PathID})");
+                }
+            }
+
+            if (previewTexture == null)
+            {
+                previewTexture = (m_Material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+                    .Select(x => x.Value.m_Texture.TryGet<Texture2D>(out var texture) ? texture : null)
+                    .FirstOrDefault(x => x != null);
+            }
+
+            assetItem.InfoText = sb.ToString();
+            if (previewTexture != null)
+            {
+                var image = previewTexture.ConvertToImage(true);
+                if (image != null)
+                {
+                    var bitmap = new DirectBitmap(image.ConvertToBytes(), previewTexture.m_Width, previewTexture.m_Height);
+                    image.Dispose();
+                    PreviewTexture(bitmap);
+                    StatusStripUpdate($"Material preview: {previewTexture.m_Name}");
+                    return;
+                }
+            }
+
+            PreviewText(sb.ToString());
+            StatusStripUpdate("Material preview loaded.");
+        }
+
+        private static bool IsPreferredMaterialPreviewSlot(string propertyName)
+        {
+            switch (propertyName)
+            {
+                case "_BaseMap":
+                case "_MainTex":
+                case "_BaseColorMap":
+                case "_BaseColorTexture":
+                    return true;
+                default:
+                    return false;
             }
         }
 
@@ -1640,6 +1716,10 @@ namespace AssetStudioGUI
                             toExportAssets = visibleAssets;
                             break;
                     }
+                    if (exportType == ExportType.Convert)
+                    {
+                        toExportAssets = OrderConvertedAssetsForExport(toExportAssets);
+                    }
                     Studio.ExportAssets(saveFolderDialog.Folder, toExportAssets, exportType);
                 }
             }
@@ -1647,6 +1727,13 @@ namespace AssetStudioGUI
             {
                 StatusStripUpdate("No exportable assets loaded");
             }
+        }
+
+        private static List<AssetItem> OrderConvertedAssetsForExport(List<AssetItem> assets)
+        {
+            return assets
+                .OrderBy(x => x.Type == ClassIDType.Texture2D ? 0 : x.Type == ClassIDType.Material ? 2 : 1)
+                .ToList();
         }
 
         private void ExportAssetsList(ExportFilter type)

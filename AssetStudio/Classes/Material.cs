@@ -1,5 +1,7 @@
 ﻿using System.Collections.Generic;
 
+using System.Collections.Specialized;
+
 namespace AssetStudio
 {
     public class UnityTexEnv
@@ -7,6 +9,8 @@ namespace AssetStudio
         public PPtr<Texture> m_Texture;
         public Vector2 m_Scale;
         public Vector2 m_Offset;
+
+        public UnityTexEnv() { }
 
         public UnityTexEnv(ObjectReader reader)
         {
@@ -22,6 +26,8 @@ namespace AssetStudio
         public KeyValuePair<string, int>[] m_Ints;
         public KeyValuePair<string, float>[] m_Floats;
         public KeyValuePair<string, Color>[] m_Colors;
+
+        public UnityPropertySheet() { }
 
         public UnityPropertySheet(ObjectReader reader)
         {
@@ -67,7 +73,21 @@ namespace AssetStudio
 
         public Material(ObjectReader reader) : base(reader)
         {
+            var position = reader.Position;
+            if (TryReadFromTypeTree(reader))
+            {
+                return;
+            }
+            reader.Position = position;
+
             m_Shader = new PPtr<Shader>(reader);
+
+            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2))
+            {
+                var m_Parent = new PPtr<Material>(reader);
+                var m_ModifiedSerializedProperties = reader.ReadBoolean();
+                reader.AlignStream();
+            }
 
             if (version[0] == 4 && version[1] >= 1) //4.x
             {
@@ -116,9 +136,154 @@ namespace AssetStudio
                 var disabledShaderPasses = reader.ReadStringArray();
             }
 
+            if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 2))
+            {
+                var m_LockedProperties = reader.ReadAlignedString();
+            }
+
             m_SavedProperties = new UnityPropertySheet(reader);
 
             //vector m_BuildTextureStacks 2020 and up
+        }
+
+        private bool TryReadFromTypeTree(ObjectReader reader)
+        {
+            if (serializedType?.m_Type == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var obj = ToType();
+                var savedProperties = GetObject(obj, "m_SavedProperties");
+                if (savedProperties == null)
+                {
+                    return false;
+                }
+
+                m_Shader = ReadPPtr<Shader>(GetObject(obj, "m_Shader"), reader.assetsFile);
+                m_SavedProperties = new UnityPropertySheet
+                {
+                    m_TexEnvs = ReadTexEnvs(savedProperties, reader.assetsFile),
+                    m_Ints = ReadIntMap(savedProperties, "m_Ints"),
+                    m_Floats = ReadFloatMap(savedProperties, "m_Floats"),
+                    m_Colors = ReadColorMap(savedProperties, "m_Colors")
+                };
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static KeyValuePair<string, UnityTexEnv>[] ReadTexEnvs(OrderedDictionary savedProperties, SerializedFile assetsFile)
+        {
+            if (!(savedProperties["m_TexEnvs"] is List<KeyValuePair<object, object>> map))
+            {
+                return new KeyValuePair<string, UnityTexEnv>[0];
+            }
+
+            var result = new List<KeyValuePair<string, UnityTexEnv>>(map.Count);
+            foreach (var item in map)
+            {
+                if (!(item.Value is OrderedDictionary value))
+                {
+                    continue;
+                }
+
+                result.Add(new KeyValuePair<string, UnityTexEnv>(
+                    item.Key as string ?? string.Empty,
+                    new UnityTexEnv
+                    {
+                        m_Texture = ReadPPtr<Texture>(GetObject(value, "m_Texture"), assetsFile),
+                        m_Scale = ReadVector2(GetObject(value, "m_Scale")),
+                        m_Offset = ReadVector2(GetObject(value, "m_Offset"))
+                    }));
+            }
+            return result.ToArray();
+        }
+
+        private static KeyValuePair<string, int>[] ReadIntMap(OrderedDictionary obj, string name)
+        {
+            if (!(obj[name] is List<KeyValuePair<object, object>> map))
+            {
+                return new KeyValuePair<string, int>[0];
+            }
+            var result = new List<KeyValuePair<string, int>>(map.Count);
+            foreach (var item in map)
+            {
+                result.Add(new KeyValuePair<string, int>(item.Key as string ?? string.Empty, System.Convert.ToInt32(item.Value)));
+            }
+            return result.ToArray();
+        }
+
+        private static KeyValuePair<string, float>[] ReadFloatMap(OrderedDictionary obj, string name)
+        {
+            if (!(obj[name] is List<KeyValuePair<object, object>> map))
+            {
+                return new KeyValuePair<string, float>[0];
+            }
+            var result = new List<KeyValuePair<string, float>>(map.Count);
+            foreach (var item in map)
+            {
+                result.Add(new KeyValuePair<string, float>(item.Key as string ?? string.Empty, System.Convert.ToSingle(item.Value)));
+            }
+            return result.ToArray();
+        }
+
+        private static KeyValuePair<string, Color>[] ReadColorMap(OrderedDictionary obj, string name)
+        {
+            if (!(obj[name] is List<KeyValuePair<object, object>> map))
+            {
+                return new KeyValuePair<string, Color>[0];
+            }
+            var result = new List<KeyValuePair<string, Color>>(map.Count);
+            foreach (var item in map)
+            {
+                result.Add(new KeyValuePair<string, Color>(item.Key as string ?? string.Empty, ReadColor(item.Value as OrderedDictionary)));
+            }
+            return result.ToArray();
+        }
+
+        private static PPtr<T> ReadPPtr<T>(OrderedDictionary obj, SerializedFile assetsFile) where T : Object
+        {
+            if (obj == null)
+            {
+                return new PPtr<T>(0, 0, assetsFile);
+            }
+            return new PPtr<T>(ReadInt32(obj, "m_FileID"), ReadInt64(obj, "m_PathID"), assetsFile);
+        }
+
+        private static Vector2 ReadVector2(OrderedDictionary obj)
+        {
+            return obj == null ? Vector2.Zero : new Vector2(ReadSingle(obj, "x"), ReadSingle(obj, "y"));
+        }
+
+        private static Color ReadColor(OrderedDictionary obj)
+        {
+            return obj == null ? new Color() : new Color(ReadSingle(obj, "r"), ReadSingle(obj, "g"), ReadSingle(obj, "b"), ReadSingle(obj, "a"));
+        }
+
+        private static OrderedDictionary GetObject(OrderedDictionary obj, string name)
+        {
+            return obj != null && obj.Contains(name) ? obj[name] as OrderedDictionary : null;
+        }
+
+        private static int ReadInt32(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? System.Convert.ToInt32(obj[name]) : 0;
+        }
+
+        private static long ReadInt64(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? System.Convert.ToInt64(obj[name]) : 0;
+        }
+
+        private static float ReadSingle(OrderedDictionary obj, string name)
+        {
+            return obj.Contains(name) ? System.Convert.ToSingle(obj[name]) : 0;
         }
     }
 }
