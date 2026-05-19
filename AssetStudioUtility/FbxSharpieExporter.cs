@@ -114,7 +114,7 @@ namespace AssetStudio
 
             BuildTakes();
             WriteExportReport(exportPath, convert);
-            FbxIO.WriteAscii(_document, exportPath);
+            if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else FbxIO.WriteBinary(_document, exportPath);
         }
 
         private void ExportFrame(ImportedFrame frame, long parentId, System.Numerics.Matrix4x4 parentGlobal)

@@ -1,4 +1,4 @@
-﻿using AssetStudio;
+using AssetStudio;
 using Newtonsoft.Json;
 using OpenTK;
 using OpenTK.Graphics.OpenGL;
@@ -19,9 +19,11 @@ using System.Windows.Forms;
 using static AssetStudioGUI.Studio;
 using Font = AssetStudio.Font;
 #if NET472
+using Vector2 = OpenTK.Vector2;
 using Vector3 = OpenTK.Vector3;
 using Vector4 = OpenTK.Vector4;
 #else
+using Vector2 = OpenTK.Mathematics.Vector2;
 using Vector3 = OpenTK.Mathematics.Vector3;
 using Vector4 = OpenTK.Mathematics.Vector4;
 using Matrix4 = OpenTK.Mathematics.Matrix4;
@@ -72,6 +74,12 @@ namespace AssetStudioGUI
         private int shadeMode;
         private int normalMode;
         #endregion
+        private int pgmTexID;
+        private int attributeTexCoord;
+        private int uniformTexture;
+        private Vector2[] uvData;
+        private int previewTextureId = -1;
+        private bool previewMaterialMode = false;
 
         //asset list sorting
         private int sortColumn = -1;
@@ -842,7 +850,23 @@ namespace AssetStudioGUI
                 {
                     var bitmap = new DirectBitmap(image.ConvertToBytes(), previewTexture.m_Width, previewTexture.m_Height);
                     image.Dispose();
-                    PreviewTexture(bitmap);
+                    
+                    GenerateSphere(32, 32);
+                    previewMaterialMode = true;
+                    glControl1.Visible = true;
+                    glControl1.MakeCurrent();
+                    
+                    if (previewTextureId != -1) GL.DeleteTexture(previewTextureId);
+                    previewTextureId = GL.GenTexture();
+                    GL.BindTexture(TextureTarget.Texture2D, previewTextureId);
+                    var bmpData = bitmap.Bitmap.LockBits(new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, bitmap.Width, bitmap.Height, 0, OpenTK.Graphics.OpenGL.PixelFormat.Bgra, PixelType.UnsignedByte, bmpData.Scan0);
+                    bitmap.Bitmap.UnlockBits(bmpData);
+                    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+                    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+                    
+                    CreateVAO();
+                    
                     StatusStripUpdate($"Material preview: {previewTexture.m_Name}");
                     return;
                 }
@@ -1149,8 +1173,65 @@ namespace AssetStudioGUI
             StatusStripUpdate("Unsupported font for preview. Try to export.");
         }
 
+        private void GenerateSphere(int latitudes, int longitudes)
+        {
+            var vertices = new List<Vector3>();
+            var normals = new List<Vector3>();
+            var uvs = new List<Vector2>();
+            var indices = new List<int>();
+
+            for (int lat = 0; lat <= latitudes; lat++)
+            {
+                float theta = lat * (float)Math.PI / latitudes;
+                float sinTheta = (float)Math.Sin(theta);
+                float cosTheta = (float)Math.Cos(theta);
+
+                for (int lon = 0; lon <= longitudes; lon++)
+                {
+                    float phi = lon * 2 * (float)Math.PI / longitudes;
+                    float sinPhi = (float)Math.Sin(phi);
+                    float cosPhi = (float)Math.Cos(phi);
+
+                    Vector3 normal = new Vector3(cosPhi * sinTheta, cosTheta, sinPhi * sinTheta);
+                    vertices.Add(normal);
+                    normals.Add(normal);
+                    uvs.Add(new Vector2((float)lon / longitudes, 1f - (float)lat / latitudes));
+                }
+            }
+
+            for (int lat = 0; lat < latitudes; lat++)
+            {
+                for (int lon = 0; lon < longitudes; lon++)
+                {
+                    int first = (lat * (longitudes + 1)) + lon;
+                    int second = first + longitudes + 1;
+
+                    indices.Add(first);
+                    indices.Add(second);
+                    indices.Add(first + 1);
+
+                    indices.Add(second);
+                    indices.Add(second + 1);
+                    indices.Add(first + 1);
+                }
+            }
+
+            vertexData = vertices.ToArray();
+            normal2Data = normals.ToArray();
+            normalData = normals.ToArray();
+            uvData = uvs.ToArray();
+            indiceData = indices.ToArray();
+
+            colorData = new Vector4[vertexData.Length];
+            for (int i = 0; i < vertexData.Length; i++) colorData[i] = new Vector4(1, 1, 1, 1);
+
+            viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
+            modelMatrixData = Matrix4.CreateScale(0.8f);
+        }
+
         private void PreviewMesh(Mesh m_Mesh)
         {
+            previewMaterialMode = false;
             if (m_Mesh.m_VertexCount > 0)
             {
                 viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
@@ -2096,6 +2177,42 @@ namespace AssetStudioGUI
             uniformModelMatrix = GL.GetUniformLocation(pgmID, "modelMatrix");
             uniformViewMatrix = GL.GetUniformLocation(pgmID, "viewMatrix");
             uniformProjMatrix = GL.GetUniformLocation(pgmID, "projMatrix");
+            pgmTexID = GL.CreateProgram();
+            LoadShaderFromString(@"#version 140
+in vec3 vertexPosition;
+in vec3 normalDirection;
+in vec2 vertexTexCoord;
+uniform mat4 modelMatrix;
+uniform mat4 viewMatrix;
+uniform mat4 projMatrix;
+out vec3 normal;
+out vec2 texCoord;
+void main()
+{
+	gl_Position = projMatrix * viewMatrix * modelMatrix * vec4(vertexPosition, 1.0);
+	normal = normalDirection;
+	texCoord = vec2(vertexTexCoord.x, 1.0 - vertexTexCoord.y); 
+}", ShaderType.VertexShader, pgmTexID, out vsID);
+            LoadShaderFromString(@"#version 140
+in vec3 normal;
+in vec2 texCoord;
+out vec4 outputColor;
+uniform sampler2D mainTex;
+void main()
+{
+	vec3 unitNormal = normalize(normal);
+	float nDotProduct = clamp(dot(unitNormal, vec3(0.707, 0, 0.707)), 0, 1);
+	vec2 ContributionWeightsSqrt = vec2(0.5, 0.5) + vec2(0.5, -0.5) * unitNormal.y;
+	vec2 ContributionWeights = ContributionWeightsSqrt * ContributionWeightsSqrt;
+	vec3 lightColor = nDotProduct * vec3(1, 0.957, 0.839) / 3.14159;
+	lightColor += vec3(0.779, 0.716, 0.453) * ContributionWeights.y;
+	lightColor += vec3(0.368, 0.477, 0.735) * ContributionWeights.x;
+	vec4 texColor = texture(mainTex, texCoord);
+	outputColor = vec4(texColor.rgb * lightColor, texColor.a);
+}", ShaderType.FragmentShader, pgmTexID, out fsID);
+            GL.LinkProgram(pgmTexID);
+            attributeTexCoord = GL.GetAttribLocation(pgmTexID, "vertexTexCoord");
+            uniformTexture = GL.GetUniformLocation(pgmTexID, "mainTex");
         }
 
         private static void LoadShader(string filename, ShaderType type, int program, out int address)
@@ -2106,6 +2223,28 @@ namespace AssetStudioGUI
             GL.CompileShader(address);
             GL.AttachShader(program, address);
             GL.DeleteShader(address);
+        }
+
+        private static void LoadShaderFromString(string str, ShaderType type, int program, out int address)
+        {
+            address = GL.CreateShader(type);
+            GL.ShaderSource(address, str);
+            GL.CompileShader(address);
+            GL.AttachShader(program, address);
+            GL.DeleteShader(address);
+        }
+
+        private static void CreateVBO(out int vboAddress, Vector2[] data, int address)
+        {
+            if (address < 0 || data == null) { vboAddress = 0; return; }
+            GL.GenBuffers(1, out vboAddress);
+            GL.BindBuffer(BufferTarget.ArrayBuffer, vboAddress);
+            GL.BufferData(BufferTarget.ArrayBuffer,
+                                    (IntPtr)(data.Length * 8), // 2 floats * 4 bytes
+                                    data,
+                                    BufferUsageHint.StaticDraw);
+            GL.VertexAttribPointer(address, 2, VertexAttribPointerType.Float, false, 0, 0);
+            GL.EnableVertexAttribArray(address);
         }
 
         private static void CreateVBO(out int vboAddress, Vector3[] data, int address)
@@ -2163,7 +2302,14 @@ namespace AssetStudioGUI
                 if (normalData != null)
                     CreateVBO(out var vboNormals, normalData, attributeNormalDirection);
             }
-            CreateVBO(out var vboColors, colorData, attributeVertexColor);
+            if (previewMaterialMode && uvData != null)
+            {
+                CreateVBO(out var vboUV, uvData, attributeTexCoord);
+            }
+            else
+            {
+                CreateVBO(out var vboColors, colorData, attributeVertexColor);
+            }
             CreateVBO(out var vboModelMatrix, modelMatrixData, uniformModelMatrix);
             CreateVBO(out var vboViewMatrix, viewMatrixData, uniformViewMatrix);
             CreateVBO(out var vboProjMatrix, projMatrixData, uniformProjMatrix);
@@ -2203,10 +2349,11 @@ namespace AssetStudioGUI
             GL.BindVertexArray(vao);
             if (wireFrameMode == 0 || wireFrameMode == 2)
             {
-                GL.UseProgram(shadeMode == 0 ? pgmID : pgmColorID);
+                if(previewMaterialMode){GL.UseProgram(pgmTexID);GL.ActiveTexture(TextureUnit.Texture0);GL.BindTexture(TextureTarget.Texture2D,previewTextureId);GL.Uniform1(uniformTexture,0);GL.UniformMatrix4(GL.GetUniformLocation(pgmTexID,"modelMatrix"),false,ref modelMatrixData);GL.UniformMatrix4(GL.GetUniformLocation(pgmTexID,"viewMatrix"),false,ref viewMatrixData);GL.UniformMatrix4(GL.GetUniformLocation(pgmTexID,"projMatrix"),false,ref projMatrixData);}else{GL.UseProgram(shadeMode == 0 ? pgmID : pgmColorID);
                 GL.UniformMatrix4(uniformModelMatrix, false, ref modelMatrixData);
                 GL.UniformMatrix4(uniformViewMatrix, false, ref viewMatrixData);
                 GL.UniformMatrix4(uniformProjMatrix, false, ref projMatrixData);
+                }
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
                 GL.DrawElements(BeginMode.Triangles, indiceData.Length, DrawElementsType.UnsignedInt, 0);
             }
