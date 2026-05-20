@@ -49,6 +49,31 @@ namespace AssetStudio
         private int _exportedAnimationCurveCount;
         private int _missingAnimationTrackCount;
 
+        private class MeshDiagnosticInfo
+        {
+            public string Path { get; set; }
+            public int VertexCount { get; set; }
+            public int PolygonCount { get; set; }
+            public int MaxIndex { get; set; } = -1;
+            public int MinIndex { get; set; } = int.MaxValue;
+            public int SkippedFaces { get; set; }
+            public List<SubmeshDiagnosticInfo> Submeshes { get; set; } = new List<SubmeshDiagnosticInfo>();
+        }
+
+        private class SubmeshDiagnosticInfo
+        {
+            public int Index { get; set; }
+            public int FirstVertex { get; set; } = int.MaxValue;
+            public int BaseVertex { get; set; }
+            public int VertexCount { get; set; }
+            public int IndexCount { get; set; }
+            public string Material { get; set; }
+            public int MinIndex { get; set; } = int.MaxValue;
+            public int MaxIndex { get; set; } = -1;
+        }
+
+        private List<MeshDiagnosticInfo> _meshDiagnostics = new List<MeshDiagnosticInfo>();
+
         public FbxSharpieExporter(string fileName, float scaleFactor, int versionIndex, bool isAscii, bool is60Fps,
             bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f)
         {
@@ -289,8 +314,24 @@ namespace AssetStudio
         {
             var indices = new List<int>();
             var skippedFaces = 0;
-            foreach (var sub in mesh.SubmeshList)
+            var meshDiag = new MeshDiagnosticInfo
             {
+                Path = mesh.Path ?? "<no path>",
+                VertexCount = mesh.VertexList.Count,
+                PolygonCount = 0
+            };
+
+            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
+            {
+                var sub = mesh.SubmeshList[subIdx];
+                var subDiag = new SubmeshDiagnosticInfo
+                {
+                    Index = subIdx,
+                    BaseVertex = sub.BaseVertex,
+                    Material = sub.Material ?? "<none>",
+                    IndexCount = sub.FaceList.Count * 3
+                };
+
                 foreach (var face in sub.FaceList)
                 {
                     if (!TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
@@ -302,8 +343,45 @@ namespace AssetStudio
                     indices.Add(index0);
                     indices.Add(index1);
                     indices.Add(~index2);
+
+                    meshDiag.PolygonCount++;
+
+                    // Update submesh indices
+                    if (index0 < subDiag.MinIndex) subDiag.MinIndex = index0;
+                    if (index1 < subDiag.MinIndex) subDiag.MinIndex = index1;
+                    if (index2 < subDiag.MinIndex) subDiag.MinIndex = index2;
+
+                    if (index0 > subDiag.MaxIndex) subDiag.MaxIndex = index0;
+                    if (index1 > subDiag.MaxIndex) subDiag.MaxIndex = index1;
+                    if (index2 > subDiag.MaxIndex) subDiag.MaxIndex = index2;
+
+                    // Update mesh indices
+                    if (index0 < meshDiag.MinIndex) meshDiag.MinIndex = index0;
+                    if (index1 < meshDiag.MinIndex) meshDiag.MinIndex = index1;
+                    if (index2 < meshDiag.MinIndex) meshDiag.MinIndex = index2;
+
+                    if (index0 > meshDiag.MaxIndex) meshDiag.MaxIndex = index0;
+                    if (index1 > meshDiag.MaxIndex) meshDiag.MaxIndex = index1;
+                    if (index2 > meshDiag.MaxIndex) meshDiag.MaxIndex = index2;
                 }
+
+                if (subDiag.MaxIndex >= subDiag.MinIndex)
+                {
+                    subDiag.FirstVertex = subDiag.MinIndex;
+                    subDiag.VertexCount = subDiag.MaxIndex - subDiag.MinIndex + 1;
+                }
+                else
+                {
+                    subDiag.FirstVertex = 0;
+                    subDiag.VertexCount = 0;
+                }
+
+                meshDiag.Submeshes.Add(subDiag);
             }
+
+            meshDiag.SkippedFaces = skippedFaces;
+            _meshDiagnostics.Add(meshDiag);
+
             if (skippedFaces > 0)
                 Logger.Warning($"Mesh '{mesh.Path}' skipped {skippedFaces} FBX faces because their vertex indices were outside the exported vertex buffer.");
 
@@ -1384,6 +1462,36 @@ namespace AssetStudio
                         {
                             var submesh = mesh.SubmeshList[i];
                             writer.WriteLine($"    Submesh {i}: {submesh.Material ?? "<none>"} ({submesh.FaceList?.Count ?? 0} faces)");
+                        }
+                    }
+                }
+                else
+                {
+                    writer.WriteLine("  <none>");
+                }
+
+                writer.WriteLine();
+                writer.WriteLine("Mesh Diagnostics & Statistics:");
+                if (_meshDiagnostics.Count > 0)
+                {
+                    foreach (var mDiag in _meshDiagnostics)
+                    {
+                        writer.WriteLine($"  Mesh: {mDiag.Path}");
+                        writer.WriteLine($"    Vertex Count: {mDiag.VertexCount}");
+                        writer.WriteLine($"    Polygon Count (written): {mDiag.PolygonCount}");
+                        writer.WriteLine($"    Min Index Written: {(mDiag.MinIndex == int.MaxValue ? -1 : mDiag.MinIndex)}");
+                        writer.WriteLine($"    Max Index Written: {mDiag.MaxIndex}");
+                        writer.WriteLine($"    Skipped Faces Count (out of range): {mDiag.SkippedFaces}");
+                        writer.WriteLine("    Submeshes:");
+                        foreach (var sDiag in mDiag.Submeshes)
+                        {
+                            writer.WriteLine($"      Submesh {sDiag.Index}:");
+                            writer.WriteLine($"        Material: {sDiag.Material}");
+                            writer.WriteLine($"        Base Vertex: {sDiag.BaseVertex}");
+                            writer.WriteLine($"        First Vertex (Min Index): {(sDiag.FirstVertex == int.MaxValue ? -1 : sDiag.FirstVertex)}");
+                            writer.WriteLine($"        Vertex Count (Index range length): {sDiag.VertexCount}");
+                            writer.WriteLine($"        Index Count: {sDiag.IndexCount}");
+                            writer.WriteLine($"        Index Range: {(sDiag.MinIndex == int.MaxValue ? -1 : sDiag.MinIndex)} to {sDiag.MaxIndex}");
                         }
                     }
                 }

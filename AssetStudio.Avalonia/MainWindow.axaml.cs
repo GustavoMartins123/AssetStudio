@@ -129,6 +129,10 @@ public partial class MainWindow : Window
             ImagePreviewBox.Source = null;
             ImagePreviewBox.IsVisible = false;
         }
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.IsVisible = false;
+        }
         if (PreviewInfoBorder != null)
         {
             PreviewInfoBorder.IsVisible = false;
@@ -1155,6 +1159,10 @@ public partial class MainWindow : Window
             ImagePreviewBox.Source = null;
             ImagePreviewBox.IsVisible = false;
         }
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.IsVisible = false;
+        }
         if (PreviewInfoBorder != null)
         {
             PreviewInfoBorder.IsVisible = false;
@@ -1187,6 +1195,9 @@ public partial class MainWindow : Window
             case AssetStudio.Font m_Font:
                 PreviewFont(assetItem, m_Font);
                 break;
+            case Material m_Material:
+                PreviewMaterial(assetItem, m_Material);
+                break;
             case TextAsset m_TextAsset:
                 TextPreviewBox.Text = fbxHeader + Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty);
                 TextPreviewBox.IsVisible = true;
@@ -1197,18 +1208,23 @@ public partial class MainWindow : Window
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
-            case MonoBehaviour:
-                if (dumpStr != null)
-                {
-                    TextPreviewBox.Text = fbxHeader + dumpStr;
-                    TextPreviewBox.IsVisible = true;
-                    PreviewLabel.IsVisible = false;
-                }
+            case MonoBehaviour m_MonoBehaviour:
+                PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader, dumpStr);
                 break;
             case Mesh m_Mesh:
-                TextPreviewBox.Text = fbxHeader + FormatMeshPreview(m_Mesh, assetItem);
-                TextPreviewBox.IsVisible = true;
+                if (GLPreviewControl != null)
+                {
+                    GLPreviewControl.SetMesh(m_Mesh);
+                    GLPreviewControl.IsVisible = true;
+                    GLPreviewControl.Focus();
+                }
+                if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                {
+                    PreviewInfoOverlay.Text = FormatMeshPreview(m_Mesh, assetItem);
+                    PreviewInfoBorder.IsVisible = true;
+                }
                 PreviewLabel.IsVisible = false;
+                StatusStripUpdate("Using OpenGL: OpenTK Core | 'Mouse Left'=Rotate | 'Mouse Right'=Move | 'Mouse Wheel'=Zoom | 'Ctrl W'=Wireframe | 'Ctrl S'=Shade | 'Ctrl N'=ReNormal");
                 break;
             case Object obj when obj.type == ClassIDType.PrefabInstance:
                 TextPreviewBox.Text = fbxHeader + FormatPrefab(obj);
@@ -1353,6 +1369,256 @@ public partial class MainWindow : Window
                 });
             }
         });
+    }
+
+    private void PreviewMaterial(AssetItem assetItem, Material m_Material)
+    {
+        var displayMaterial = ResolveMaterialForPreview(m_Material) ?? m_Material;
+        var sb = new StringBuilder();
+        sb.AppendLine($"Material: {m_Material.m_Name}");
+        if (!ReferenceEquals(displayMaterial, m_Material))
+        {
+            sb.AppendLine($"Parent material: {displayMaterial.m_Name}");
+        }
+        if (displayMaterial.m_Shader.TryGet(out var shader))
+        {
+            sb.AppendLine($"Shader: {shader.m_ParsedForm?.m_Name ?? shader.m_Name}");
+        }
+        sb.AppendLine();
+        sb.AppendLine("Texture slots:");
+
+        Texture2D? previewTexture = null;
+        foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+        {
+            sb.Append($"  {texEnv.Key}: ");
+            var texEnvValue = texEnv.Value;
+            var textureRef = texEnvValue?.m_Texture;
+            if (texEnvValue != null && textureRef != null && textureRef.TryGet<Texture2D>(out var texture))
+            {
+                sb.AppendLine($"{texture.m_Name} ({texture.m_Width}x{texture.m_Height}, {texture.m_TextureFormat})");
+                sb.AppendLine($"    FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID}");
+                sb.AppendLine($"    Scale: {texEnvValue.m_Scale.X}, {texEnvValue.m_Scale.Y}");
+                sb.AppendLine($"    Offset: {texEnvValue.m_Offset.X}, {texEnvValue.m_Offset.Y}");
+                if (previewTexture == null && IsPreferredMaterialPreviewSlot(texEnv.Key))
+                {
+                    previewTexture = texture;
+                }
+            }
+            else
+            {
+                sb.AppendLine(textureRef == null || textureRef.IsNull
+                    ? "null"
+                    : $"missing (FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID})");
+            }
+        }
+
+        if (previewTexture == null)
+        {
+            previewTexture = (displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+                .Select(x => x.Value?.m_Texture != null && x.Value.m_Texture.TryGet<Texture2D>(out var texture) ? texture : null)
+                .FirstOrDefault(x => x != null);
+        }
+
+        string infoText = sb.ToString();
+
+        if (previewTexture != null)
+        {
+            currentPreviewTexture = previewTexture;
+            long currentId = ++texturePreviewIdCounter;
+            StatusStripUpdate("Loading material texture preview...");
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    var image = previewTexture.ConvertToImage(true);
+                    if (image == null)
+                    {
+                        Dispatcher.UIThread.Post(() =>
+                        {
+                            if (currentId == texturePreviewIdCounter)
+                            {
+                                TextPreviewBox.Text = infoText;
+                                TextPreviewBox.IsVisible = true;
+                                ImagePreviewBox.IsVisible = false;
+                                PreviewInfoBorder.IsVisible = false;
+                                if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                                StatusStripUpdate("Material loaded (no preview texture support).");
+                            }
+                        });
+                        return;
+                    }
+
+                    int validChannel = 0;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (textureChannels[i])
+                        {
+                            validChannel++;
+                        }
+                    }
+
+                    if (validChannel != 4)
+                    {
+                        image.ProcessPixelRows(accessor =>
+                        {
+                            for (int y = 0; y < accessor.Height; y++)
+                            {
+                                var row = accessor.GetRowSpan(y);
+                                for (int x = 0; x < accessor.Width; x++)
+                                {
+                                    ref Bgra32 pixel = ref row[x];
+                                    pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                    pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                    pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                    pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
+                                }
+                            }
+                        });
+                    }
+
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            if (GLPreviewControl != null)
+                            {
+                                GLPreviewControl.SetMaterialTexture(image);
+                                GLPreviewControl.IsVisible = true;
+                                GLPreviewControl.Focus();
+                            }
+                            else
+                            {
+                                image.Dispose();
+                            }
+
+                            ImagePreviewBox.IsVisible = false;
+                            TextPreviewBox.IsVisible = false;
+                            PreviewLabel.IsVisible = false;
+
+                            if (displayInfo.IsChecked == true)
+                            {
+                                PreviewInfoOverlay.Text = infoText;
+                                PreviewInfoBorder.IsVisible = true;
+                            }
+                            else
+                            {
+                                PreviewInfoBorder.IsVisible = false;
+                            }
+                            StatusStripUpdate($"Material preview loaded: {previewTexture.m_Name}");
+                        }
+                        else
+                        {
+                            image.Dispose();
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            TextPreviewBox.Text = infoText + "\n[Error loading preview texture: " + ex.Message + "]";
+                            TextPreviewBox.IsVisible = true;
+                            ImagePreviewBox.IsVisible = false;
+                            PreviewInfoBorder.IsVisible = false;
+                            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                            StatusStripUpdate($"Material loaded with preview texture error.");
+                        }
+                    });
+                }
+            });
+        }
+        else
+        {
+            TextPreviewBox.Text = infoText;
+            TextPreviewBox.IsVisible = true;
+            ImagePreviewBox.IsVisible = false;
+            PreviewInfoBorder.IsVisible = false;
+            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+            StatusStripUpdate("Material loaded (no texture).");
+        }
+    }
+
+    private static Material? ResolveMaterialForPreview(Material material)
+    {
+        var visited = new HashSet<Material>();
+        while (material != null && visited.Add(material))
+        {
+            var hasTextureReference = (material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+                .Any(x => x.Value?.m_Texture != null && !x.Value.m_Texture.IsNull);
+            if (hasTextureReference)
+            {
+                return material;
+            }
+
+            if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
+            {
+                material = parent;
+                continue;
+            }
+
+            break;
+        }
+
+        return null;
+    }
+
+    private static bool IsPreferredMaterialPreviewSlot(string propertyName)
+    {
+        switch (propertyName)
+        {
+            case "_BaseMap":
+            case "_MainTex":
+            case "_BaseColorMap":
+            case "_BaseColorTexture":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
+    {
+        try
+        {
+            object? obj = m_MonoBehaviour.ToType();
+            if (obj == null && assemblyLoader.Loaded)
+            {
+                var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                if (typeTree != null)
+                {
+                    obj = m_MonoBehaviour.ToType(typeTree);
+                }
+            }
+
+            if (obj != null)
+            {
+                var str = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
+                TextPreviewBox.Text = fbxHeader + str;
+                TextPreviewBox.IsVisible = true;
+                PreviewLabel.IsVisible = false;
+                StatusStripUpdate("MonoBehaviour preview loaded (JSON format).");
+                return;
+            }
+        }
+        catch
+        {
+            // Fallback
+        }
+
+        if (dumpStr != null)
+        {
+            TextPreviewBox.Text = fbxHeader + dumpStr;
+            TextPreviewBox.IsVisible = true;
+            PreviewLabel.IsVisible = false;
+            StatusStripUpdate("MonoBehaviour loaded (text dump).");
+        }
+        else
+        {
+            StatusStripUpdate("MonoBehaviour loaded (no dump/types available).");
+        }
     }
 
     private void UpdateImagePreview()
@@ -1517,6 +1783,31 @@ public partial class MainWindow : Window
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+
+        if (e.KeyModifiers == KeyModifiers.Control && GLPreviewControl != null && GLPreviewControl.IsVisible)
+        {
+            bool handled = false;
+            switch (e.Key)
+            {
+                case Key.W:
+                    GLPreviewControl.WireframeMode = (GLPreviewControl.WireframeMode + 1) % 3;
+                    handled = true;
+                    break;
+                case Key.S:
+                    GLPreviewControl.ShadeMode = GLPreviewControl.ShadeMode == 0 ? 1 : 0;
+                    handled = true;
+                    break;
+                case Key.N:
+                    GLPreviewControl.NormalMode = GLPreviewControl.NormalMode == 0 ? 1 : 0;
+                    handled = true;
+                    break;
+            }
+            if (handled)
+            {
+                e.Handled = true;
+                return;
+            }
+        }
 
         if (e.KeyModifiers == KeyModifiers.Control && (currentPreviewTexture != null || currentPreviewSprite != null))
         {
@@ -1752,6 +2043,62 @@ public partial class MainWindow : Window
     private async void ExportAllAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets, ExportMode.Dump);
     private async void ExportSelectedAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Dump);
     private async void ExportFilteredAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets, ExportMode.Dump);
+    private async void ExportAllAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(exportableAssets);
+    private async void ExportSelectedAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(GetSelectedAssets());
+    private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(visibleAssets);
+
+    private async Task ExportAssetsList(List<AssetItem> toExport)
+    {
+        if (toExport.Count == 0)
+        {
+            StatusStripUpdate("No assets to export.");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (folders == null || folders.Count == 0) return;
+
+        var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+
+        StatusStripUpdate("Exporting asset list to XML...");
+        await Task.Run(() =>
+        {
+            try
+            {
+                var filename = Path.Combine(savePath, "assets.xml");
+                var doc = new System.Xml.Linq.XDocument(
+                    new System.Xml.Linq.XElement("Assets",
+                        new System.Xml.Linq.XAttribute("filename", filename),
+                        new System.Xml.Linq.XAttribute("createdAt", DateTime.UtcNow.ToString("s")),
+                        toExport.Select(asset => new System.Xml.Linq.XElement("Asset",
+                            new System.Xml.Linq.XElement("Name", asset.Name),
+                            new System.Xml.Linq.XElement("Container", asset.Container),
+                            new System.Xml.Linq.XElement("Type", new System.Xml.Linq.XAttribute("id", (int)asset.Type), asset.DisplayType),
+                            new System.Xml.Linq.XElement("PathID", asset.PathID),
+                            new System.Xml.Linq.XElement("Source", asset.SourceFile?.fullName ?? ""),
+                            new System.Xml.Linq.XElement("Size", asset.FullSize)
+                        ))
+                    )
+                );
+
+                doc.Save(filename);
+
+                StatusStripUpdate($"Finished exporting asset list to XML with {toExport.Count} items.");
+                if (exportOptions.OpenAfterExport)
+                {
+                    OpenFolder(savePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Error exporting asset list to XML", ex);
+                StatusStripUpdate($"Error exporting asset list to XML: {ex.Message}");
+            }
+        });
+    }
 
     private List<AssetItem> GetSelectedAssets()
     {
@@ -2651,6 +2998,57 @@ public partial class MainWindow : Window
                 var filePath = Path.Combine(exportPath, fileName + ".ogv");
                 if (File.Exists(filePath)) return false;
                 File.WriteAllBytes(filePath, m_MovieTexture.m_MovieData);
+                return true;
+            }
+            case MonoBehaviour m_MonoBehaviour:
+            {
+                var filePath = Path.Combine(exportPath, fileName + ".json");
+                if (File.Exists(filePath)) return false;
+
+                object? obj = m_MonoBehaviour.ToType();
+                if (obj == null && assemblyLoader.Loaded)
+                {
+                    var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                    if (typeTree != null)
+                    {
+                        obj = m_MonoBehaviour.ToType(typeTree);
+                    }
+                }
+
+                if (obj != null)
+                {
+                    var str = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
+                    File.WriteAllText(filePath, str);
+                    return true;
+                }
+
+                // Fallback to text asset dump
+                var dumpStr = m_MonoBehaviour.Dump();
+                if (dumpStr == null && assemblyLoader.Loaded)
+                {
+                    var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                    if (typeTree != null)
+                    {
+                        dumpStr = m_MonoBehaviour.Dump(typeTree);
+                    }
+                }
+
+                if (dumpStr != null)
+                {
+                    var dumpPath = Path.Combine(exportPath, fileName + ".txt");
+                    if (File.Exists(dumpPath)) return false;
+                    File.WriteAllText(dumpPath, dumpStr);
+                    return true;
+                }
+
+                return false;
+            }
+            case Object obj when obj.type == ClassIDType.PrefabInstance:
+            {
+                var filePath = Path.Combine(exportPath, fileName + "_prefab_report.txt");
+                if (File.Exists(filePath)) return false;
+                var report = FormatPrefab(obj);
+                File.WriteAllText(filePath, report);
                 return true;
             }
             default:

@@ -56,9 +56,9 @@
                 </MenuItem>
                 <Separator />
                 <MenuItem Header="Asset list to XML">
-                    <MenuItem Header="All assets" />
-                    <MenuItem Header="Selected assets" />
-                    <MenuItem Header="Filtered assets" />
+                    <MenuItem Header="All assets" Click="ExportAllAssetsXML_Click" />
+                    <MenuItem Header="Selected assets" Click="ExportSelectedAssetsXML_Click" />
+                    <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsXML_Click" />
                 </MenuItem>
             </MenuItem>
             <MenuItem x:Name="filterTypeMenu" Header="Filter _Type">
@@ -157,6 +157,7 @@
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
                         <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="White" />
                         <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
+                        <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True" />
                         <Border x:Name="PreviewInfoBorder" Background="#90000000" CornerRadius="4" Padding="8" Margin="10" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="False">
                             <TextBlock x:Name="PreviewInfoOverlay" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" />
                         </Border>
