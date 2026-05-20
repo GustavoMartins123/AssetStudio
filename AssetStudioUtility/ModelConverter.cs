@@ -378,7 +378,7 @@ namespace AssetStudio
                 }
                 ImportedMaterial iMat = ConvertMaterial(mat);
                 iSubmesh.Material = iMat.Name;
-                iSubmesh.BaseVertex = (int)mesh.m_SubMeshes[i].firstVertex;
+                iSubmesh.BaseVertex = checked((int)(mesh.m_SubMeshes[i].firstVertex + mesh.m_SubMeshes[i].baseVertex));
 
                 //Face
                 iSubmesh.FaceList = new List<ImportedFace>(numFaces);

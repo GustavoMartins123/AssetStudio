@@ -101,7 +101,10 @@
                 
                 <TabItem Header="Asset List">
                     <Grid RowDefinitions="Auto, *">
-                        <TextBox x:Name="listSearch" Grid.Row="0" PlaceholderText=" Filter " Margin="0,0,0,2" TextChanged="ListSearch_TextChanged"/>
+                        <DockPanel Grid.Row="0" Margin="0,0,0,2">
+                            <Button x:Name="ClearClassFilterButton" Content="Clear Class Filter" Click="ClearClassFilter_Click" IsVisible="False" DockPanel.Dock="Right" Margin="4,0,0,0" Padding="6,2"/>
+                            <TextBox x:Name="listSearch" PlaceholderText=" Filter " TextChanged="ListSearch_TextChanged"/>
+                        </DockPanel>
                         <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetListDataGrid_SelectionChanged" CellPointerPressed="AssetListDataGrid_CellPointerPressed" Sorting="AssetListDataGrid_Sorting" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto" SelectionMode="Extended">
                             <DataGrid.ContextMenu>
                                 <ContextMenu Opened="AssetListContextMenu_Opened">
@@ -124,12 +127,25 @@
                 </TabItem>
 
                 <TabItem Header="Asset Classes">
-                    <DataGrid AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All">
-                        <DataGrid.Columns>
-                            <DataGridTextColumn Header="Name" Width="3*" />
-                            <DataGridTextColumn Header="ID" Width="1*" />
-                        </DataGrid.Columns>
-                    </DataGrid>
+                    <Grid RowDefinitions="Auto, *">
+                        <TextBox x:Name="classSearch" Grid.Row="0" PlaceholderText=" Filter classes " Margin="0,0,0,2" TextChanged="ClassSearch_TextChanged" />
+                        <DataGrid x:Name="AssetClassesDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetClassesDataGrid_SelectionChanged" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto">
+                            <DataGrid.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="Show instances in Asset List" Click="ShowClassInstances_Click" />
+                                </ContextMenu>
+                            </DataGrid.ContextMenu>
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="ID" Binding="{Binding ClassID}" SortMemberPath="ClassID" Width="70" MinWidth="55" />
+                                <DataGridTextColumn Header="Name" Binding="{Binding Name}" SortMemberPath="Name" Width="180" MinWidth="90" />
+                                <DataGridTextColumn Header="Namespace" Binding="{Binding Namespace}" SortMemberPath="Namespace" Width="150" MinWidth="80" />
+                                <DataGridTextColumn Header="Assembly" Binding="{Binding Assembly}" SortMemberPath="Assembly" Width="160" MinWidth="90" />
+                                <DataGridTextColumn Header="Unity" Binding="{Binding UnityVersion}" SortMemberPath="UnityVersion" Width="110" MinWidth="80" />
+                                <DataGridTextColumn Header="Objects" Binding="{Binding ObjectCount}" SortMemberPath="ObjectCount" Width="80" MinWidth="65" />
+                                <DataGridTextColumn Header="Source" Binding="{Binding SourceKind}" SortMemberPath="SourceKind" Width="130" MinWidth="90" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
                 </TabItem>
             </TabControl>
 

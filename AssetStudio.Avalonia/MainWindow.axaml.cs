@@ -24,6 +24,9 @@ public partial class MainWindow : Window
     private AssetsManager assetsManager = new AssetsManager();
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private List<AssetItem> visibleAssets = new List<AssetItem>();
+    private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
+    private List<AssetClassItem> visibleAssetClassItems = new List<AssetClassItem>();
+    private AssetClassItem? classFilterOverride;
     private List<GameObjectNode> sceneTreeNodes = new List<GameObjectNode>();
     private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
     private readonly ExportOptionsState exportOptions = new();
@@ -61,7 +64,15 @@ public partial class MainWindow : Window
     {
         exportableAssets.Clear();
         visibleAssets.Clear();
+        assetClassItems.Clear();
+        visibleAssetClassItems.Clear();
+        classFilterOverride = null;
+        if (ClearClassFilterButton != null)
+        {
+            ClearClassFilterButton.IsVisible = false;
+        }
         AssetListDataGrid.ItemsSource = null;
+        AssetClassesDataGrid.ItemsSource = null;
         sceneTreeNodes.Clear();
         treeSearchResults.Clear();
         listSearchDebounce?.Cancel();
@@ -75,6 +86,7 @@ public partial class MainWindow : Window
         DumpTextBox.Text = string.Empty;
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
+        classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
         progressBar.Value = 0;
@@ -359,6 +371,174 @@ public partial class MainWindow : Window
         filterTypeAll.IsChecked = !GetFilterTypeItems().Any(x => x.IsChecked == true);
         updatingFilterTypeMenu = false;
         FilterAssetList();
+    }
+
+    private void ClassSearch_TextChanged(object? sender, TextChangedEventArgs e)
+    {
+        FilterAssetClasses();
+    }
+
+    private void BuildAssetClasses()
+    {
+        assetClassItems.Clear();
+
+        var objectCounts = assetsManager.assetsFileList
+            .SelectMany(file => file.Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.type }))
+            .GroupBy(x => (x.unityVersion, x.ClassID))
+            .ToDictionary(x => x.Key, x => x.Count());
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var assetsFile in assetsManager.assetsFileList)
+        {
+            AddSerializedTypes(assetsFile, assetsFile.m_Types, "Native", objectCounts, seen);
+            AddSerializedTypes(assetsFile, assetsFile.m_RefTypes, "Reference", objectCounts, seen);
+        }
+
+        assetClassItems = assetClassItems
+            .OrderBy(x => x.UnityVersion, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.ClassID)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        FilterAssetClasses();
+    }
+
+    private void AddSerializedTypes(SerializedFile assetsFile, IEnumerable<SerializedType>? types, string sourceKind,
+        Dictionary<(string UnityVersion, int ClassID), int> objectCounts, HashSet<string> seen)
+    {
+        if (types == null)
+            return;
+
+        foreach (var type in types)
+        {
+            var name = GetSerializedTypeName(type);
+            var ns = type.m_NameSpace ?? string.Empty;
+            var asm = type.m_AsmName ?? string.Empty;
+            var key = string.Join("\u001f", assetsFile.unityVersion, type.classID.ToString(CultureInfo.InvariantCulture), name, ns, asm, sourceKind);
+            if (!seen.Add(key))
+                continue;
+
+            objectCounts.TryGetValue((assetsFile.unityVersion, type.classID), out var objectCount);
+            assetClassItems.Add(new AssetClassItem
+            {
+                ClassID = type.classID,
+                Name = name,
+                Namespace = ns,
+                Assembly = asm,
+                UnityVersion = assetsFile.unityVersion,
+                SourceFile = assetsFile.fileName,
+                ObjectCount = objectCount,
+                SourceKind = type.m_IsStrippedType ? $"{sourceKind} stripped" : sourceKind,
+                SerializedType = type
+            });
+        }
+    }
+
+    private static string GetSerializedTypeName(SerializedType type)
+    {
+        if (!string.IsNullOrEmpty(type.m_KlassName))
+            return type.m_KlassName;
+
+        var rootNode = type.m_Type?.m_Nodes?.FirstOrDefault();
+        if (!string.IsNullOrEmpty(rootNode?.m_Type))
+            return rootNode.m_Type;
+
+        return Enum.IsDefined(typeof(ClassIDType), type.classID)
+            ? ((ClassIDType)type.classID).ToString()
+            : $"Class {type.classID}";
+    }
+
+    private void FilterAssetClasses()
+    {
+        var filter = classSearch.Text?.Trim();
+        IEnumerable<AssetClassItem> classes = assetClassItems;
+        if (!string.IsNullOrEmpty(filter))
+        {
+            classes = classes.Where(x =>
+                x.ClassID.ToString(CultureInfo.InvariantCulture).Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || x.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || x.Namespace.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || x.Assembly.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || x.SourceKind.Contains(filter, StringComparison.OrdinalIgnoreCase));
+        }
+
+        visibleAssetClassItems = classes.ToList();
+        AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
+    }
+
+    private void AssetClassesDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (AssetClassesDataGrid.SelectedItem is not AssetClassItem item)
+            return;
+
+        ShowAssetClassPreview(item);
+    }
+
+    private void ShowAssetClassPreview(AssetClassItem item)
+    {
+        RightTabControl.SelectedIndex = 0;
+        TextPreviewBox.Text = FormatAssetClass(item);
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate($"Asset class {item.ClassID}: {item.Name} ({item.ObjectCount} objects)");
+    }
+
+    private static string FormatAssetClass(AssetClassItem item)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"ClassID: {item.ClassID}");
+        sb.AppendLine($"Name: {item.Name}");
+        if (!string.IsNullOrEmpty(item.Namespace))
+            sb.AppendLine($"Namespace: {item.Namespace}");
+        if (!string.IsNullOrEmpty(item.Assembly))
+            sb.AppendLine($"Assembly: {item.Assembly}");
+        sb.AppendLine($"Unity version: {item.UnityVersion}");
+        sb.AppendLine($"Source file: {item.SourceFile}");
+        sb.AppendLine($"Source kind: {item.SourceKind}");
+        sb.AppendLine($"Loaded objects: {item.ObjectCount}");
+        sb.AppendLine();
+
+        sb.AppendLine("──────────────────────────────────────────────────");
+        sb.AppendLine("NOTE: Serialization Class vs Composite Asset");
+        sb.AppendLine("- Serialization Class: Defines the raw binary layout structure (TypeTree)");
+        sb.AppendLine("  for a Unity ClassIDType. It represents how objects are serialized in files.");
+        sb.AppendLine("- Composite Asset (e.g. Prefab, FBX): These are logical assemblies of multiple");
+        sb.AppendLine("  assets/GameObjects. A Prefab contains references (PPtrs) to other components");
+        sb.AppendLine("  and structures; it is not a simple asset (like a Mesh or Texture) but a graph.");
+        sb.AppendLine("──────────────────────────────────────────────────");
+        sb.AppendLine();
+
+        var nodes = item.SerializedType.m_Type?.m_Nodes;
+        if (nodes == null || nodes.Count == 0)
+        {
+            sb.AppendLine("No TypeTree available for this class.");
+            return sb.ToString();
+        }
+
+        sb.AppendLine($"TypeTree nodes: {nodes.Count}");
+        sb.AppendLine("Level  Type  Name  ByteSize  Index  Version  MetaFlag");
+        foreach (var node in nodes)
+        {
+            var indent = new string(' ', Math.Max(0, node.m_Level) * 2);
+            sb.Append(indent);
+            sb.Append(node.m_Type);
+            if (!string.IsNullOrEmpty(node.m_Name))
+            {
+                sb.Append(' ');
+                sb.Append(node.m_Name);
+            }
+            sb.Append("  [");
+            sb.Append("size=");
+            sb.Append(node.m_ByteSize.ToString(CultureInfo.InvariantCulture));
+            sb.Append(", index=");
+            sb.Append(node.m_Index.ToString(CultureInfo.InvariantCulture));
+            sb.Append(", version=");
+            sb.Append(node.m_Version.ToString(CultureInfo.InvariantCulture));
+            sb.Append(", meta=0x");
+            sb.Append(node.m_MetaFlag.ToString("X", CultureInfo.InvariantCulture));
+            sb.AppendLine("]");
+        }
+
+        return sb.ToString();
     }
 
     private IEnumerable<MenuItem> GetFilterTypeItems()
@@ -753,6 +933,7 @@ public partial class MainWindow : Window
         visibleAssets = new List<AssetItem>(exportableAssets);
         BuildFilterTypeMenu();
         FilterAssetList();
+        BuildAssetClasses();
         SceneTreeView.ItemsSource = sceneTreeNodes;
 
         var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {exportableAssets.Count} exportable assets";
@@ -905,28 +1086,48 @@ public partial class MainWindow : Window
 
         TextPreviewBox.IsVisible = false;
         PreviewLabel.IsVisible = displayInfo.IsChecked == true;
-        PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.TypeString}: {assetItem.Name}" : string.Empty;
+        PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
         var dumpStr = assetItem.Asset.Dump();
+
+        string fbxHeader = string.Empty;
+        if (assetItem.DisplayType.Contains("FBX sub-asset"))
+        {
+            var fbxNodeName = assetItem.TreeNode != null ? assetItem.TreeNode.Name : "[None]";
+            fbxHeader = $"[FBX Sub-Asset Container: {Path.GetFileName(assetItem.Container)}]" + Environment.NewLine +
+                        $"Associated Scene Hierarchy Node: {fbxNodeName}" + Environment.NewLine +
+                        $"(Right-click this item and choose 'Go to scene hierarchy' to view context)" + Environment.NewLine +
+                        $"--------------------------------------------------" + Environment.NewLine + Environment.NewLine;
+        }
 
         switch (assetItem.Asset)
         {
             case TextAsset m_TextAsset:
-                TextPreviewBox.Text = Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty);
+                TextPreviewBox.Text = fbxHeader + Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty);
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
             case Shader m_Shader:
-                TextPreviewBox.Text = m_Shader.Convert() ?? "Serialized Shader can't be read";
+                TextPreviewBox.Text = fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read");
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
             case MonoBehaviour:
                 if (dumpStr != null)
                 {
-                    TextPreviewBox.Text = dumpStr;
+                    TextPreviewBox.Text = fbxHeader + dumpStr;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
                 }
+                break;
+            case Mesh m_Mesh:
+                TextPreviewBox.Text = fbxHeader + FormatMeshPreview(m_Mesh, assetItem);
+                TextPreviewBox.IsVisible = true;
+                PreviewLabel.IsVisible = false;
+                break;
+            case Object obj when obj.type == ClassIDType.PrefabInstance:
+                TextPreviewBox.Text = fbxHeader + FormatPrefab(obj);
+                TextPreviewBox.IsVisible = true;
+                PreviewLabel.IsVisible = false;
                 break;
             case VideoClip _:
             case MovieTexture _:
@@ -941,7 +1142,7 @@ public partial class MainWindow : Window
             default:
                 if (dumpStr != null)
                 {
-                    TextPreviewBox.Text = dumpStr;
+                    TextPreviewBox.Text = fbxHeader + dumpStr;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
                 }
@@ -1068,7 +1269,13 @@ public partial class MainWindow : Window
     {
         IEnumerable<AssetItem> assets = exportableAssets;
 
-        if (filterTypeAll.IsChecked != true)
+        if (classFilterOverride != null)
+        {
+            assets = assets.Where(x => 
+                (int)x.Type == classFilterOverride.ClassID && 
+                x.SourceFile.unityVersion == classFilterOverride.UnityVersion);
+        }
+        else if (filterTypeAll.IsChecked != true)
         {
             var selectedTypes = GetFilterTypeItems()
                 .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
@@ -2010,6 +2217,362 @@ public partial class MainWindow : Window
         }
         return name;
     }
+
+    private void ShowClassInstances_Click(object? sender, RoutedEventArgs e)
+    {
+        if (AssetClassesDataGrid.SelectedItem is not AssetClassItem item)
+        {
+            return;
+        }
+
+        classFilterOverride = item;
+        ClearClassFilterButton.Content = $"Clear Class Filter ({item.Name} v{item.UnityVersion})";
+        ClearClassFilterButton.IsVisible = true;
+
+        LeftTabControl.SelectedIndex = 1;
+        FilterAssetList();
+    }
+
+    private void ClearClassFilter_Click(object? sender, RoutedEventArgs e)
+    {
+        classFilterOverride = null;
+        ClearClassFilterButton.IsVisible = false;
+        FilterAssetList();
+    }
+
+    private Object? ResolvePPtr(object? pptrObj, SerializedFile file)
+    {
+        if (pptrObj is System.Collections.Specialized.OrderedDictionary dict)
+        {
+            if (dict.Contains("m_FileID") && dict.Contains("m_PathID"))
+            {
+                var fileIDObj = dict["m_FileID"];
+                var pathIDObj = dict["m_PathID"];
+                if (fileIDObj != null && pathIDObj != null)
+                {
+                    int fileID = Convert.ToInt32(fileIDObj);
+                    long pathID = Convert.ToInt64(pathIDObj);
+                    if (pathID != 0)
+                    {
+                        var pptr = new PPtr<Object>(fileID, pathID, file);
+                        if (pptr.TryGet(out var target))
+                        {
+                            return target;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private void FindAllPPtrs(object? obj, List<System.Collections.Specialized.OrderedDictionary> pptrs)
+    {
+        if (obj == null) return;
+        if (obj is System.Collections.Specialized.OrderedDictionary dict)
+        {
+            if (dict.Contains("m_FileID") && dict.Contains("m_PathID"))
+            {
+                pptrs.Add(dict);
+            }
+            else
+            {
+                foreach (System.Collections.DictionaryEntry entry in dict)
+                {
+                    FindAllPPtrs(entry.Value, pptrs);
+                }
+            }
+        }
+        else if (obj is System.Collections.IEnumerable list && !(obj is string))
+        {
+            foreach (var item in list)
+            {
+                FindAllPPtrs(item, pptrs);
+            }
+        }
+    }
+
+    private void TraverseGameObject(GameObject go, List<GameObject> gameObjects, List<Component> components)
+    {
+        if (go == null || gameObjects.Contains(go)) return;
+        gameObjects.Add(go);
+
+        if (go.m_Components != null)
+        {
+            foreach (var pptrComp in go.m_Components)
+            {
+                if (pptrComp.TryGet(out var comp))
+                {
+                    components.Add(comp);
+                    if (comp is Transform t)
+                    {
+                        if (t.m_Children != null)
+                        {
+                            foreach (var childPtr in t.m_Children)
+                            {
+                                if (childPtr.TryGet(out var childTransform))
+                                {
+                                    if (childTransform.m_GameObject.TryGet(out var childGo))
+                                    {
+                                        TraverseGameObject(childGo, gameObjects, components);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private string FormatPrefab(Object prefab)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Prefab Instance Asset: {prefab.assetsFile.fileName} (PathID: {prefab.m_PathID})");
+        sb.AppendLine("NOTE: This is a Composite/Referential Asset (Prefab).");
+        sb.AppendLine("It is a logical layout composing GameObjects, Components, and PPtr references.");
+        sb.AppendLine("It is not a raw geometry mesh. Its sub-assets (Meshes, Materials, etc.) are");
+        sb.AppendLine("represented by their individual items in the hierarchy and asset lists.");
+        sb.AppendLine("==================================================");
+
+        Object? rootGameObject = null;
+        Object? sourcePrefab = null;
+        var dict = prefab.ToType();
+        if (dict != null)
+        {
+            if (dict.Contains("m_RootGameObject"))
+            {
+                rootGameObject = ResolvePPtr(dict["m_RootGameObject"], prefab.assetsFile);
+            }
+            if (dict.Contains("m_SourcePrefab"))
+            {
+                sourcePrefab = ResolvePPtr(dict["m_SourcePrefab"], prefab.assetsFile);
+            }
+        }
+
+        if (rootGameObject != null)
+        {
+            sb.AppendLine($"Root GameObject: {((GameObject)rootGameObject).m_Name} (PathID: {rootGameObject.m_PathID})");
+        }
+        else
+        {
+            sb.AppendLine("Root GameObject: [Not Resolved]");
+        }
+
+        if (sourcePrefab != null)
+        {
+            sb.AppendLine($"Source Prefab: {sourcePrefab.m_PathID} (Type: {sourcePrefab.type})");
+        }
+
+        sb.AppendLine();
+
+        var gameObjects = new List<GameObject>();
+        var components = new List<Component>();
+
+        if (rootGameObject is GameObject rootGo)
+        {
+            TraverseGameObject(rootGo, gameObjects, components);
+        }
+
+        sb.AppendLine($"GameObjects in Hierarchy ({gameObjects.Count}):");
+        foreach (var go in gameObjects)
+        {
+            sb.AppendLine($"  - Name: \"{go.m_Name}\" (PathID: {go.m_PathID})");
+        }
+        sb.AppendLine();
+
+        sb.AppendLine($"Components attached to GameObjects ({components.Count}):");
+        foreach (var comp in components)
+        {
+            var goName = "";
+            if (comp.m_GameObject.TryGet(out var compGo))
+            {
+                goName = $" on GameObject \"{compGo.m_Name}\"";
+            }
+            sb.AppendLine($"  - Type: {comp.type} (PathID: {comp.m_PathID}){goName}");
+        }
+        sb.AppendLine();
+
+        var allPPtrDicts = new List<System.Collections.Specialized.OrderedDictionary>();
+        FindAllPPtrs(dict, allPPtrDicts);
+
+        var resolvedObjects = new List<Object>();
+        var unresolvedPPtrs = new List<string>();
+        foreach (var pptrDict in allPPtrDicts)
+        {
+            var resolved = ResolvePPtr(pptrDict, prefab.assetsFile);
+            if (resolved != null)
+            {
+                if (!gameObjects.Contains(resolved) && !components.Contains(resolved) && resolved != prefab)
+                {
+                    resolvedObjects.Add(resolved);
+                }
+            }
+            else
+            {
+                var fileID = pptrDict["m_FileID"];
+                var pathID = pptrDict["m_PathID"];
+                if (Convert.ToInt64(pathID) != 0)
+                {
+                    unresolvedPPtrs.Add($"FileID: {fileID}, PathID: {pathID}");
+                }
+            }
+        }
+
+        if (resolvedObjects.Count > 0)
+        {
+            sb.AppendLine($"Other Resolved Referenced Assets ({resolvedObjects.Count}):");
+            foreach (var resObj in resolvedObjects.Distinct())
+            {
+                sb.AppendLine($"  - Type: {resObj.type} (PathID: {resObj.m_PathID})");
+            }
+            sb.AppendLine();
+        }
+
+        if (unresolvedPPtrs.Count > 0)
+        {
+            sb.AppendLine($"Unresolved PPtr References ({unresolvedPPtrs.Count}):");
+            foreach (var unres in unresolvedPPtrs.Distinct())
+            {
+                sb.AppendLine($"  - {unres}");
+            }
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    private List<Material> FindMaterialsForMesh(Mesh mesh)
+    {
+        var materials = new List<Material>();
+        foreach (var file in assetsManager.assetsFileList)
+        {
+            foreach (var obj in file.Objects)
+            {
+                if (obj is SkinnedMeshRenderer smr)
+                {
+                    if (smr.m_Mesh.TryGet(out var m) && m == mesh)
+                    {
+                        if (smr.m_Materials != null)
+                        {
+                            foreach (var matPtr in smr.m_Materials)
+                            {
+                                if (matPtr.TryGet(out var mat))
+                                {
+                                    materials.Add(mat);
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (obj is MeshRenderer mr)
+                {
+                    if (mr.m_GameObject.TryGet(out var go))
+                    {
+                        foreach (var compPtr in go.m_Components)
+                        {
+                            if (compPtr.TryGet(out var comp) && comp is MeshFilter mf)
+                            {
+                                if (mf.m_Mesh.TryGet(out var m) && m == mesh)
+                                {
+                                    if (mr.m_Materials != null)
+                                    {
+                                        foreach (var matPtr in mr.m_Materials)
+                                        {
+                                            if (matPtr.TryGet(out var mat))
+                                            {
+                                                materials.Add(mat);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return materials.Distinct().ToList();
+    }
+
+    private string FormatMeshPreview(Mesh mesh, AssetItem item)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Mesh Asset: {mesh.m_Name} (PathID: {mesh.m_PathID})");
+        sb.AppendLine("==================================================");
+        sb.AppendLine($"Vertex Count: {mesh.m_VertexCount}");
+        sb.AppendLine($"Submesh Count: {mesh.m_SubMeshes?.Length ?? 0}");
+        sb.AppendLine($"Index Count: {mesh.m_Indices?.Count ?? 0}");
+
+        bool isFbx = item.Container.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+            .Any(part => string.Equals(Path.GetExtension(part), ".fbx", StringComparison.OrdinalIgnoreCase));
+        sb.AppendLine($"From FBX Container: {(isFbx ? "Yes" : "No")}");
+        if (isFbx)
+        {
+            sb.AppendLine($"FBX Path: {item.Container}");
+        }
+
+        bool usedBySkinnedMesh = false;
+        bool usedByMeshFilter = false;
+        var associatedRenderers = new List<string>();
+        foreach (var file in assetsManager.assetsFileList)
+        {
+            foreach (var obj in file.Objects)
+            {
+                if (obj is SkinnedMeshRenderer smr)
+                {
+                    if (smr.m_Mesh.TryGet(out var m) && m == mesh)
+                    {
+                        usedBySkinnedMesh = true;
+                        if (smr.m_GameObject.TryGet(out var go))
+                            associatedRenderers.Add($"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})");
+                    }
+                }
+                else if (obj is MeshFilter mf)
+                {
+                    if (mf.m_Mesh.TryGet(out var m) && m == mesh)
+                    {
+                        usedByMeshFilter = true;
+                        if (mf.m_GameObject.TryGet(out var go))
+                            associatedRenderers.Add($"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
+                    }
+                }
+            }
+        }
+
+        var sourceTypes = new List<string>();
+        if (usedBySkinnedMesh) sourceTypes.Add("SkinnedMeshRenderer");
+        if (usedByMeshFilter) sourceTypes.Add("MeshFilter");
+        sb.AppendLine($"Referenced By: {(sourceTypes.Count > 0 ? string.Join(", ", sourceTypes) : "None (Orphaned Mesh)")}");
+
+        var materials = FindMaterialsForMesh(mesh);
+        sb.AppendLine($"Associated Materials ({materials.Count}):");
+        foreach (var mat in materials)
+        {
+            sb.AppendLine($"  - {mat.m_Name} (PathID: {mat.m_PathID})");
+        }
+
+        if (associatedRenderers.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Associated Renderers / Filters:");
+            foreach (var ar in associatedRenderers.Distinct())
+            {
+                sb.AppendLine($"  - {ar}");
+            }
+        }
+
+        sb.AppendLine();
+        var dump = mesh.Dump();
+        if (dump != null)
+        {
+            sb.AppendLine("Mesh Serialization Structure:");
+            sb.AppendLine(dump);
+        }
+
+        return sb.ToString();
+    }
 }
 
 public sealed class AvaloniaAppSettings
@@ -2163,12 +2726,52 @@ public class AssetItem
 
     private string GetDisplayType()
     {
-        if (IsFbxSubAsset())
+        var display = TypeString;
+        if (Type == ClassIDType.PrefabInstance)
         {
-            return $"{TypeString} (FBX sub-asset)";
+            display = "Prefab (Composite)";
+        }
+        else if (Type == ClassIDType.GameObject)
+        {
+            display = "GameObject (Hierarchy Node)";
+        }
+        else if (Type == ClassIDType.MonoBehaviour)
+        {
+            display = "MonoBehaviour (Script Instance)";
+        }
+        else if (Type == ClassIDType.Mesh)
+        {
+            display = "Mesh (Geometry)";
+        }
+        else if (Type == ClassIDType.Material)
+        {
+            display = "Material (Shader Settings)";
+        }
+        else if (IsComponentType(Type))
+        {
+            display = $"{TypeString} (Component)";
         }
 
-        return TypeString;
+        if (IsFbxSubAsset())
+        {
+            return $"{display} (FBX sub-asset)";
+        }
+
+        return display;
+    }
+
+    private bool IsComponentType(ClassIDType type)
+    {
+        return type == ClassIDType.Transform ||
+               type == ClassIDType.MeshRenderer ||
+               type == ClassIDType.MeshFilter ||
+               type == ClassIDType.SkinnedMeshRenderer ||
+               type == ClassIDType.Animator ||
+               type == ClassIDType.Animation ||
+               type == ClassIDType.Component ||
+               type == ClassIDType.RectTransform ||
+               type == ClassIDType.Behaviour ||
+               type == ClassIDType.MonoBehaviour;
     }
 
     private bool IsFbxSubAsset()
@@ -2182,6 +2785,19 @@ public class AssetItem
             .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
             .Any(part => string.Equals(Path.GetExtension(part), ".fbx", StringComparison.OrdinalIgnoreCase));
     }
+}
+
+public class AssetClassItem
+{
+    public int ClassID { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string Namespace { get; set; } = string.Empty;
+    public string Assembly { get; set; } = string.Empty;
+    public string UnityVersion { get; set; } = string.Empty;
+    public string SourceFile { get; set; } = string.Empty;
+    public string SourceKind { get; set; } = string.Empty;
+    public int ObjectCount { get; set; }
+    public SerializedType SerializedType { get; set; } = null!;
 }
 
 public enum ExportMode

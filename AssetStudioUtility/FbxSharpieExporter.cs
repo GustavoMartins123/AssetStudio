@@ -256,7 +256,7 @@ namespace AssetStudio
                 BuildLayerElementColor(geo, mesh);
 
             if (mesh.SubmeshList.Count > 0)
-                BuildLayerElementMaterial(geo, mesh);
+                BuildLayerElementMaterial(geo, mesh, GetMeshMaterialOrder(mesh));
 
             BuildLayer(geo, mesh);
             _objects.AddNode(geo);
@@ -288,18 +288,25 @@ namespace AssetStudio
         private void BuildPolygonVertexIndex(FbxNode geo, ImportedMesh mesh)
         {
             var indices = new List<int>();
+            var skippedFaces = 0;
             foreach (var sub in mesh.SubmeshList)
             {
                 foreach (var face in sub.FaceList)
                 {
                     if (!TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                    {
+                        skippedFaces++;
                         continue;
+                    }
 
                     indices.Add(index0);
                     indices.Add(index1);
                     indices.Add(~index2);
                 }
             }
+            if (skippedFaces > 0)
+                Logger.Warning($"Mesh '{mesh.Path}' skipped {skippedFaces} FBX faces because their vertex indices were outside the exported vertex buffer.");
+
             var n = N("PolygonVertexIndex");
             n.AddProperty(new IntegerArrayToken(indices.ToArray()));
             geo.AddNode(n);
@@ -427,17 +434,32 @@ namespace AssetStudio
             geo.AddNode(layer);
         }
 
-        private void BuildLayerElementMaterial(FbxNode geo, ImportedMesh mesh)
+        private void BuildLayerElementMaterial(FbxNode geo, ImportedMesh mesh, List<string> materialOrder)
         {
             var layer = N("LayerElementMaterial");
             layer.AddProperty(new IntegerToken(0));
             AddSimpleNode(layer, "Version", 101);
             AddSimpleNode(layer, "Name", "");
-            AddSimpleNode(layer, "MappingInformationType", "AllSame");
+            AddSimpleNode(layer, "MappingInformationType", "ByPolygon");
             AddSimpleNode(layer, "ReferenceInformationType", "IndexToDirect");
 
+            var materialIndexByName = new Dictionary<string, int>();
+            for (var i = 0; i < materialOrder.Count; i++)
+                materialIndexByName[materialOrder[i]] = i;
+
+            var materialIndices = new List<int>();
+            foreach (var sub in mesh.SubmeshList)
+            {
+                var materialIndex = 0;
+                if (!string.IsNullOrEmpty(sub.Material) && materialIndexByName.TryGetValue(sub.Material, out var index))
+                    materialIndex = index;
+
+                for (var i = 0; i < sub.FaceList.Count; i++)
+                    materialIndices.Add(materialIndex);
+            }
+
             var matIdx = N("Materials");
-            matIdx.AddProperty(new IntegerArrayToken(new[] { 0 }));
+            matIdx.AddProperty(new IntegerArrayToken(materialIndices.ToArray()));
             layer.AddNode(matIdx);
             geo.AddNode(layer);
         }
@@ -482,16 +504,26 @@ namespace AssetStudio
             if (modelId == 0 || convert.MaterialList == null)
                 return;
 
-            var connectedMats = new HashSet<string>();
+            foreach (var material in GetMeshMaterialOrder(mesh))
+            {
+                if (_materialIdMap.TryGetValue(material, out var matId))
+                    Connect(matId, modelId);
+            }
+        }
+
+        private static List<string> GetMeshMaterialOrder(ImportedMesh mesh)
+        {
+            var materials = new List<string>();
+            var seen = new HashSet<string>();
             foreach (var sub in mesh.SubmeshList)
             {
-                if (sub.Material != null && !connectedMats.Contains(sub.Material))
-                {
-                    connectedMats.Add(sub.Material);
-                    if (_materialIdMap.TryGetValue(sub.Material, out var matId))
-                        Connect(matId, modelId);
-                }
+                if (string.IsNullOrEmpty(sub.Material) || !seen.Add(sub.Material))
+                    continue;
+
+                materials.Add(sub.Material);
             }
+
+            return materials;
         }
 
         private void ExportSkin(ImportedMesh mesh, long geoId)
