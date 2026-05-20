@@ -65,8 +65,8 @@
                 <MenuItem x:Name="filterTypeAll" Header="All" ToggleType="CheckBox" IsChecked="True" Click="FilterTypeAll_Click" />
             </MenuItem>
             <MenuItem Header="_Debug">
-                <MenuItem Header="Show error message" ToggleType="CheckBox" />
-                <MenuItem Header="Export class structures" />
+                <MenuItem x:Name="showErrorMessageMenu" Header="Show error message" ToggleType="CheckBox" Click="ShowErrorMessage_Click" />
+                <MenuItem x:Name="exportClassStructuresMenu" Header="Export class structures" Click="ExportClassStructures_Click" />
             </MenuItem>
         </Menu>
 
@@ -156,6 +156,10 @@
                     <Panel Background="#222">
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
                         <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="White" />
+                        <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
+                        <Border x:Name="PreviewInfoBorder" Background="#90000000" CornerRadius="4" Padding="8" Margin="10" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="False">
+                            <TextBlock x:Name="PreviewInfoOverlay" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" />
+                        </Border>
                     </Panel>
                 </TabItem>
                 <TabItem Header="Dump">

@@ -13,6 +13,37 @@ namespace AssetStudio.PInvoke
         {
             var dllDir = GetDirectedDllDirectory();
 
+#if !NETFRAMEWORK && !NETSTANDARD
+            string dllExtension;
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                dllExtension = ".dll";
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                dllExtension = ".so";
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                dllExtension = ".dylib";
+            }
+            else
+            {
+                throw new NotSupportedException();
+            }
+
+            var dllFileName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? $"{dllName}{dllExtension}" : $"lib{dllName}{dllExtension}";
+            var directedDllPath = Path.Combine(dllDir, dllFileName);
+
+            try
+            {
+                NativeLibrary.Load(directedDllPath);
+            }
+            catch (Exception ex)
+            {
+                throw new DllNotFoundException($"Failed to load native library '{directedDllPath}'. Build the native projects and copy the library into the platform folder beside the executable. {ex.Message}", ex);
+            }
+#else
             // Not using OperatingSystem.Platform.
             // See: https://www.mono-project.com/docs/faq/technical/#how-to-detect-the-execution-platform
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -23,6 +54,7 @@ namespace AssetStudio.PInvoke
             {
                 Posix.LoadDll(dllDir, dllName);
             }
+#endif
         }
 
         public static bool IsDllAvailable(string dllName)

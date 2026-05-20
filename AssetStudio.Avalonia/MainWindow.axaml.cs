@@ -16,6 +16,11 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
+using SixLabors.Fonts;
+using SixLabors.ImageSharp.Drawing.Processing;
 
 namespace AssetStudio.Avalonia;
 
@@ -23,6 +28,10 @@ public partial class MainWindow : Window
 {
     private AssetsManager assetsManager = new AssetsManager();
     private List<AssetItem> exportableAssets = new List<AssetItem>();
+    private Texture2D? currentPreviewTexture;
+    private Sprite? currentPreviewSprite;
+    private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
+    private long texturePreviewIdCounter;
     private List<AssetItem> visibleAssets = new List<AssetItem>();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private List<AssetClassItem> visibleAssetClassItems = new List<AssetClassItem>();
@@ -32,6 +41,7 @@ public partial class MainWindow : Window
     private readonly ExportOptionsState exportOptions = new();
     private readonly AvaloniaAppSettings appSettings = AvaloniaAppSettings.Load();
     private readonly AssemblyLoader assemblyLoader = new AssemblyLoader();
+    private readonly GUILogger logger;
     private CancellationTokenSource? listSearchDebounce;
     private string? assetListSortMember;
     private string assetContextCellText = string.Empty;
@@ -44,10 +54,17 @@ public partial class MainWindow : Window
     {
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
+        logger = new GUILogger(StatusStripUpdate, this);
+        logger.ShowErrorMessage = appSettings.ShowErrorMessage;
+        Logger.Default = logger;
+        showErrorMessageMenu.IsChecked = appSettings.ShowErrorMessage;
         Progress.Default = new Progress<int>(SetProgressBarValue);
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
         AddHandler(DragDrop.DropEvent, Window_Drop);
+
+        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+        Title = $"AssetStudio v{version}";
     }
 
     private void StatusStripUpdate(string text)
@@ -62,6 +79,7 @@ public partial class MainWindow : Window
 
     private void ResetForm()
     {
+        logger.ClearErrors();
         exportableAssets.Clear();
         visibleAssets.Clear();
         assetClassItems.Clear();
@@ -92,6 +110,9 @@ public partial class MainWindow : Window
         progressBar.Value = 0;
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
+
+        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+        Title = $"AssetStudio v{version}";
     }
 
     private void ApplyUnityVersionOption()
@@ -103,6 +124,26 @@ public partial class MainWindow : Window
     {
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
+        if (ImagePreviewBox != null)
+        {
+            ImagePreviewBox.Source = null;
+            ImagePreviewBox.IsVisible = false;
+        }
+        if (PreviewInfoBorder != null)
+        {
+            PreviewInfoBorder.IsVisible = false;
+        }
+        if (PreviewInfoOverlay != null)
+        {
+            PreviewInfoOverlay.Text = string.Empty;
+        }
+        currentPreviewTexture = null;
+        currentPreviewSprite = null;
+        texturePreviewIdCounter++; // Cancel any running background image decoding task
+        for (int i = 0; i < 4; i++)
+        {
+            textureChannels[i] = true;
+        }
         PreviewLabel.Text = message;
         PreviewLabel.IsVisible = true;
     }
@@ -279,7 +320,11 @@ public partial class MainWindow : Window
             PreviewLabel.Text = displayInfo.IsChecked == true
                 ? $"{selected.TypeString}: {selected.Name}"
                 : string.Empty;
-            PreviewLabel.IsVisible = displayInfo.IsChecked == true && !TextPreviewBox.IsVisible;
+            PreviewLabel.IsVisible = displayInfo.IsChecked == true && !TextPreviewBox.IsVisible && (ImagePreviewBox == null || !ImagePreviewBox.IsVisible);
+            if (PreviewInfoBorder != null)
+            {
+                PreviewInfoBorder.IsVisible = displayInfo.IsChecked == true && (currentPreviewTexture != null || currentPreviewSprite != null);
+            }
         }
     }
 
@@ -767,6 +812,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        string? productName = null;
         exportableAssets.Clear();
         sceneTreeNodes = new List<GameObjectNode>();
         treeSearchResults.Clear();
@@ -887,6 +933,9 @@ public partial class MainWindow : Window
                             containers.Add((m_Container.Value, m_Container.Key));
                         }
                         break;
+                    case PlayerSettings m_PlayerSettings:
+                        productName = m_PlayerSettings.productName;
+                        break;
                     case NamedObject m_NamedObject:
                         assetItem.Name = m_NamedObject.m_Name;
                         break;
@@ -945,7 +994,23 @@ public partial class MainWindow : Window
         }
         StatusStripUpdate(log);
 
-        Title = $"AssetStudio - {assetsManager.assetsFileList[0].unityVersion} - {assetsManager.assetsFileList[0].m_TargetPlatform}";
+        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+        if (assetsManager.assetsFileList.Count > 0)
+        {
+            var firstFile = assetsManager.assetsFileList[0];
+            if (!string.IsNullOrEmpty(productName))
+            {
+                Title = $"AssetStudio v{version} - {productName} - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
+            }
+            else
+            {
+                Title = $"AssetStudio v{version} - no productName - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
+            }
+        }
+        else
+        {
+            Title = $"AssetStudio v{version}";
+        }
     }
 
     private void LinkAssetItemsToSceneNodes(Dictionary<GameObject, GameObjectNode> treeNodeDictionary, Dictionary<Object, AssetItem> objectAssetItemDic)
@@ -1085,6 +1150,18 @@ public partial class MainWindow : Window
         }
 
         TextPreviewBox.IsVisible = false;
+        if (ImagePreviewBox != null)
+        {
+            ImagePreviewBox.Source = null;
+            ImagePreviewBox.IsVisible = false;
+        }
+        if (PreviewInfoBorder != null)
+        {
+            PreviewInfoBorder.IsVisible = false;
+        }
+        currentPreviewTexture = null;
+        currentPreviewSprite = null;
+
         PreviewLabel.IsVisible = displayInfo.IsChecked == true;
         PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
         var dumpStr = assetItem.Asset.Dump();
@@ -1101,6 +1178,15 @@ public partial class MainWindow : Window
 
         switch (assetItem.Asset)
         {
+            case Texture2D m_Texture2D:
+                PreviewTexture2D(assetItem, m_Texture2D);
+                break;
+            case Sprite m_Sprite:
+                PreviewSprite(assetItem, m_Sprite);
+                break;
+            case AssetStudio.Font m_Font:
+                PreviewFont(assetItem, m_Font);
+                break;
             case TextAsset m_TextAsset:
                 TextPreviewBox.Text = fbxHeader + Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty);
                 TextPreviewBox.IsVisible = true;
@@ -1147,6 +1233,319 @@ public partial class MainWindow : Window
                     PreviewLabel.IsVisible = false;
                 }
                 break;
+        }
+    }
+
+    private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
+    {
+        currentPreviewTexture = m_Texture2D;
+        UpdateImagePreview();
+    }
+
+    private void PreviewSprite(AssetItem assetItem, Sprite m_Sprite)
+    {
+        currentPreviewSprite = m_Sprite;
+        UpdateImagePreview();
+    }
+
+    private void PreviewFont(AssetItem assetItem, AssetStudio.Font m_Font)
+    {
+        if (m_Font.m_FontData == null || m_Font.m_FontData.Length == 0)
+        {
+            StatusStripUpdate("Unsupported or empty font data.");
+            ClearPreview("Unsupported font");
+            return;
+        }
+
+        long currentId = ++texturePreviewIdCounter;
+        StatusStripUpdate("Rendering font preview...");
+
+        Task.Run(() =>
+        {
+            try
+            {
+                var fontCollection = new FontCollection();
+                FontFamily family;
+                using (var ms = new MemoryStream(m_Font.m_FontData))
+                {
+                    family = fontCollection.Add(ms);
+                }
+
+                var sampleText = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789";
+                var lines = new List<(string text, SixLabors.Fonts.Font font)>
+                {
+                    ($"Font: {m_Font.m_Name}", family.CreateFont(20, SixLabors.Fonts.FontStyle.Bold)),
+                    ($"Size 12: {sampleText}", family.CreateFont(12, SixLabors.Fonts.FontStyle.Regular)),
+                    ($"Size 18: {sampleText}", family.CreateFont(18, SixLabors.Fonts.FontStyle.Regular)),
+                    ($"Size 24: {sampleText}", family.CreateFont(24, SixLabors.Fonts.FontStyle.Regular)),
+                    ($"Size 36: {sampleText}", family.CreateFont(36, SixLabors.Fonts.FontStyle.Regular)),
+                    ($"Size 48: {sampleText}", family.CreateFont(48, SixLabors.Fonts.FontStyle.Regular)),
+                    ($"Size 60: Pack My Box With Five Dozen Liquor Jugs", family.CreateFont(60, SixLabors.Fonts.FontStyle.Regular)),
+                    ($"Size 72: Pack My Box With Five Dozen Liquor Jugs", family.CreateFont(72, SixLabors.Fonts.FontStyle.Regular))
+                };
+
+                float maxWidth = 800;
+                float totalHeight = 40;
+                var lineLayouts = new List<(string text, SixLabors.Fonts.Font font, float yOffset, float height)>();
+
+                foreach (var line in lines)
+                {
+                    var size = TextMeasurer.MeasureSize(line.text, new TextOptions(line.font));
+                    if (size.Width + 60 > maxWidth)
+                    {
+                        maxWidth = size.Width + 60;
+                    }
+                    lineLayouts.Add((line.text, line.font, totalHeight, size.Height));
+                    totalHeight += size.Height + 20;
+                }
+                totalHeight += 40;
+
+                if (maxWidth > 4096)
+                {
+                    maxWidth = 4096;
+                }
+
+                using (var image = new Image<Bgra32>((int)maxWidth, (int)totalHeight))
+                {
+                    image.Mutate(ctx => ctx.Clear(SixLabors.ImageSharp.Color.FromRgb(245, 245, 245)));
+
+                    foreach (var layout in lineLayouts)
+                    {
+                        image.Mutate(ctx => ctx.DrawText(
+                            layout.text,
+                            layout.font,
+                            SixLabors.ImageSharp.Color.Black,
+                            new PointF(30, layout.yOffset)
+                        ));
+                    }
+
+                    using (var outMs = new MemoryStream())
+                    {
+                        image.SaveAsPng(outMs);
+                        outMs.Position = 0;
+                        var bitmap = new global::Avalonia.Media.Imaging.Bitmap(outMs);
+
+                        Dispatcher.UIThread.Post(() =>
+                        {
+                            if (currentId == texturePreviewIdCounter)
+                            {
+                                ImagePreviewBox.Source = bitmap;
+                                ImagePreviewBox.IsVisible = true;
+                                TextPreviewBox.IsVisible = false;
+                                PreviewLabel.IsVisible = false;
+                                PreviewInfoBorder.IsVisible = false;
+                                StatusStripUpdate($"Font loaded: {m_Font.m_Name}");
+                            }
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentId == texturePreviewIdCounter)
+                    {
+                        StatusStripUpdate($"Error rendering font preview: {ex.Message}");
+                        ImagePreviewBox.IsVisible = false;
+                        PreviewInfoBorder.IsVisible = false;
+                    }
+                });
+            }
+        });
+    }
+
+    private void UpdateImagePreview()
+    {
+        if (currentPreviewTexture == null && currentPreviewSprite == null)
+            return;
+
+        long currentId = ++texturePreviewIdCounter;
+        StatusStripUpdate("Loading preview...");
+
+        Task.Run(() =>
+        {
+            try
+            {
+                Image<Bgra32>? image = null;
+                string infoText = string.Empty;
+                bool isTexture = currentPreviewTexture != null;
+
+                if (currentPreviewTexture != null)
+                {
+                    image = currentPreviewTexture.ConvertToImage(true);
+                    if (image != null)
+                    {
+                        infoText = $"Width: {currentPreviewTexture.m_Width}\nHeight: {currentPreviewTexture.m_Height}\nFormat: {currentPreviewTexture.m_TextureFormat}";
+                        switch (currentPreviewTexture.m_TextureSettings.m_FilterMode)
+                        {
+                            case 0: infoText += "\nFilter Mode: Point "; break;
+                            case 1: infoText += "\nFilter Mode: Bilinear "; break;
+                            case 2: infoText += "\nFilter Mode: Trilinear "; break;
+                        }
+                        infoText += $"\nAnisotropic level: {currentPreviewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {currentPreviewTexture.m_TextureSettings.m_MipBias}";
+                        switch (currentPreviewTexture.m_TextureSettings.m_WrapMode)
+                        {
+                            case 0: infoText += "\nWrap mode: Repeat"; break;
+                            case 1: infoText += "\nWrap mode: Clamp"; break;
+                        }
+                    }
+                }
+                else if (currentPreviewSprite != null)
+                {
+                    image = currentPreviewSprite.GetImage();
+                    if (image != null)
+                    {
+                        infoText = $"Width: {image.Width}\nHeight: {image.Height}\n";
+                    }
+                }
+
+                if (image == null)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            StatusStripUpdate("Unsupported image for preview");
+                            ImagePreviewBox.IsVisible = false;
+                            PreviewInfoBorder.IsVisible = false;
+                        }
+                    });
+                    return;
+                }
+
+                int validChannel = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    if (textureChannels[i])
+                    {
+                        validChannel++;
+                    }
+                }
+
+                if (validChannel != 4)
+                {
+                    image.ProcessPixelRows(accessor =>
+                    {
+                        for (int y = 0; y < accessor.Height; y++)
+                        {
+                            var row = accessor.GetRowSpan(y);
+                            for (int x = 0; x < accessor.Width; x++)
+                            {
+                                ref Bgra32 pixel = ref row[x];
+                                pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
+                            }
+                        }
+                    });
+                }
+
+                using (var ms = new MemoryStream())
+                {
+                    image.SaveAsPng(ms);
+                    ms.Position = 0;
+                    var bitmap = new global::Avalonia.Media.Imaging.Bitmap(ms);
+
+                    infoText += "\nChannels: ";
+                    if (validChannel == 0)
+                    {
+                        infoText += "None";
+                    }
+                    else
+                    {
+                        var channelNames = new string[4] { "R", "G", "B", "A" };
+                        var activeList = new List<string>();
+                        for (int i = 0; i < 4; i++)
+                        {
+                            if (textureChannels[i])
+                                activeList.Add(channelNames[i]);
+                        }
+                        infoText += string.Join(" ", activeList);
+                    }
+
+                    image.Dispose();
+
+                    string finalInfoText = infoText;
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            ImagePreviewBox.Source = bitmap;
+                            ImagePreviewBox.IsVisible = true;
+                            TextPreviewBox.IsVisible = false;
+                            PreviewLabel.IsVisible = false;
+
+                            if (displayInfo.IsChecked == true)
+                            {
+                                PreviewInfoOverlay.Text = finalInfoText;
+                                PreviewInfoBorder.IsVisible = true;
+                            }
+                            else
+                            {
+                                PreviewInfoBorder.IsVisible = false;
+                            }
+
+                            if (isTexture)
+                            {
+                                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle");
+                            }
+                            else
+                            {
+                                StatusStripUpdate(string.Empty);
+                            }
+                        }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentId == texturePreviewIdCounter)
+                    {
+                        StatusStripUpdate($"Error generating preview: {ex.Message}");
+                        ImagePreviewBox.IsVisible = false;
+                        PreviewInfoBorder.IsVisible = false;
+                    }
+                });
+            }
+        });
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+
+        if (e.KeyModifiers == KeyModifiers.Control && (currentPreviewTexture != null || currentPreviewSprite != null))
+        {
+            bool handled = false;
+            switch (e.Key)
+            {
+                case Key.R:
+                    textureChannels[0] = !textureChannels[0];
+                    handled = true;
+                    break;
+                case Key.G:
+                    textureChannels[1] = !textureChannels[1];
+                    handled = true;
+                    break;
+                case Key.B:
+                    textureChannels[2] = !textureChannels[2];
+                    handled = true;
+                    break;
+                case Key.A:
+                    textureChannels[3] = !textureChannels[3];
+                    handled = true;
+                    break;
+            }
+
+            if (handled)
+            {
+                UpdateImagePreview();
+                e.Handled = true;
+            }
         }
     }
 
@@ -1389,16 +1788,19 @@ public partial class MainWindow : Window
         int total = toExport.Count;
         int exported = 0;
         int failed = 0;
+        var exportErrors = new List<string>();
 
         StatusStripUpdate($"Exporting {total} assets...");
 
         await Task.Run(() =>
         {
+            var currentExportPath = Path.Combine(savePath, "export-current.txt");
             for (int j = 0; j < total; j++)
             {
                 var asset = toExport[j];
                 try
                 {
+                    WriteCurrentExport(currentExportPath, asset, j + 1, total);
                     var exportPath = GetExportPath(savePath, asset);
                     Directory.CreateDirectory(exportPath);
                     var fileName = FixFileName(asset.Name);
@@ -1432,16 +1834,22 @@ public partial class MainWindow : Window
                 catch (Exception ex)
                 {
                     failed++;
+                    var error = $"Failed to export {asset.TypeString}: {asset.Name} (PathID: {asset.PathID})";
+                    exportErrors.Add($"{error}{Environment.NewLine}{ex}");
                     StatusStripUpdate($"Error exporting {asset.Name}: {ex.Message}");
                 }
 
                 var progress = (int)((j + 1.0) / total * 100);
                 Dispatcher.UIThread.Post(() => progressBar.Value = progress);
             }
+            ClearCurrentExport(savePath);
         });
+
+        var errorReportPath = WriteErrorReport(savePath, exportErrors, logger);
 
         var status = exported == 0 ? "Nothing exported." : $"Finished exporting {exported} assets.";
         if (failed > 0) status += $" {failed} failed.";
+        if (errorReportPath != null) status += $" Error report: {Path.GetFileName(errorReportPath)}.";
         StatusStripUpdate(status);
 
         if (exportOptions.OpenAfterExport && exported > 0)
@@ -1485,19 +1893,49 @@ public partial class MainWindow : Window
             .ToList());
 
         StatusStripUpdate($"Exporting {animator.Name}...");
+        var exportErrors = new List<string>();
+        var currentExportPath = Path.Combine(exportPath, "export-current.txt");
+        bool success = false;
         await Task.Run(() =>
         {
-            IImported convert = selectedGameObjects.Count > 0
-                ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
-                : new ModelConverter((Animator)animator.Asset, exportOptions.ConvertTextureFormat, clips);
-            ExportFbx(convert, exportFile);
+            try
+            {
+                WriteCurrentExport(currentExportPath, animator, 1, 1);
+                IImported convert = selectedGameObjects.Count > 0
+                    ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
+                    : new ModelConverter((Animator)animator.Asset, exportOptions.ConvertTextureFormat, clips);
+                ExportFbx(convert, exportFile);
+                success = true;
+            }
+            catch (Exception ex)
+            {
+                var error = $"Export Animator:{animator.Name} error";
+                exportErrors.Add($"{error}{Environment.NewLine}{ex}");
+                Logger.Error(error, ex);
+                StatusStripUpdate($"Error exporting {animator.Name}: {ex.Message}");
+            }
+            finally
+            {
+                ClearCurrentExport(exportPath);
+            }
         });
 
-        if (exportOptions.OpenAfterExport)
+        var errorReportPath = WriteErrorReport(exportPath, exportErrors, logger);
+
+        if (success)
         {
-            OpenFolder(exportPath);
+            StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+            if (exportOptions.OpenAfterExport)
+            {
+                OpenFolder(exportPath);
+            }
         }
-        StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+        else
+        {
+            var status = "Animator export failed.";
+            if (errorReportPath != null) status += $" Error report: {Path.GetFileName(errorReportPath)}.";
+            StatusStripUpdate(status);
+        }
     }
 
     private async void ExportAllObjectsSplit_Click(object? sender, RoutedEventArgs e)
@@ -1586,20 +2024,64 @@ public partial class MainWindow : Window
 
         var clips = includeAnimations ? GetSelectedAnimationClips() : null;
         StatusStripUpdate($"Exporting {Path.GetFileName(exportFile)}");
+        var exportErrors = new List<string>();
+        var currentExportPath = Path.Combine(exportFolder ?? "", "export-current.txt");
+        bool success = false;
         await Task.Run(() =>
         {
-            IImported convert = gameObjects.Count == 1
-                ? CreateModelConverter(gameObjects[0], clips)
-                : CreateModelConverter(Path.GetFileNameWithoutExtension(exportFile), gameObjects, clips);
-            ExportFbx(convert, exportFile);
+            try
+            {
+                if (!string.IsNullOrEmpty(exportFolder))
+                {
+                    Directory.CreateDirectory(exportFolder);
+                    Directory.CreateDirectory(Path.GetDirectoryName(currentExportPath)!);
+                    File.WriteAllText(currentExportPath,
+                        $"Exporting merged model{Environment.NewLine}" +
+                        $"Name: {Path.GetFileName(exportFile)}{Environment.NewLine}" +
+                        $"Objects: {gameObjects.Count}{Environment.NewLine}",
+                        Encoding.UTF8);
+                }
+
+                IImported convert = gameObjects.Count == 1
+                    ? CreateModelConverter(gameObjects[0], clips)
+                    : CreateModelConverter(Path.GetFileNameWithoutExtension(exportFile), gameObjects, clips);
+                ExportFbx(convert, exportFile);
+                success = true;
+            }
+            catch (Exception ex)
+            {
+                var error = $"Export Model:{Path.GetFileName(exportFile)} error";
+                exportErrors.Add($"{error}{Environment.NewLine}{ex}");
+                Logger.Error(error, ex);
+                StatusStripUpdate($"Error exporting merged model: {ex.Message}");
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(exportFolder))
+                {
+                    ClearCurrentExport(exportFolder);
+                }
+            }
         });
 
+        var reportPath = exportFolder ?? "";
+        var errorReportPath = WriteErrorReport(reportPath, exportErrors, logger);
+
         progressBar.Value = 100;
-        if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+        if (success)
         {
-            OpenFolder(exportFolder);
+            StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+            if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+            {
+                OpenFolder(exportFolder);
+            }
         }
-        StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+        else
+        {
+            var status = "Merged model export failed.";
+            if (errorReportPath != null) status += $" Error report: {Path.GetFileName(errorReportPath)}.";
+            StatusStripUpdate(status);
+        }
     }
 
     private async Task ExportSplitObjects(string exportRoot, List<GameObjectNode> nodes, AnimationClip[]? clips, bool createObjectFolders)
@@ -1616,6 +2098,11 @@ public partial class MainWindow : Window
 
         Directory.CreateDirectory(exportRoot);
         StatusStripUpdate($"Exporting {exportNodes.Count} objects...");
+        var exportErrors = new List<string>();
+        var currentExportPath = Path.Combine(exportRoot, "export-current.txt");
+        int exported = 0;
+        int failed = 0;
+
         await Task.Run(() =>
         {
             for (var i = 0; i < exportNodes.Count; i++)
@@ -1629,19 +2116,49 @@ public partial class MainWindow : Window
 
                 var exportFile = GetUniqueFilePath(Path.Combine(targetFolder, FixFileName(gameObject.m_Name) + ".fbx"));
                 StatusStripUpdate($"Exporting {Path.GetFileName(exportFile)}");
-                var convert = CreateModelConverter(gameObject, clips);
-                ExportFbx(convert, exportFile);
+
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(currentExportPath)!);
+                    File.WriteAllText(currentExportPath,
+                        $"Exporting {i + 1}/{exportNodes.Count}{Environment.NewLine}" +
+                        $"Type: GameObject{Environment.NewLine}" +
+                        $"Name: {gameObject.m_Name}{Environment.NewLine}" +
+                        $"PathID: {gameObject.m_PathID}{Environment.NewLine}" +
+                        $"Source: {gameObject.assetsFile?.originalPath ?? gameObject.assetsFile?.fullName ?? gameObject.assetsFile?.fileName}{Environment.NewLine}",
+                        Encoding.UTF8);
+
+                    var convert = CreateModelConverter(gameObject, clips);
+                    ExportFbx(convert, exportFile);
+                    exported++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    var error = $"Export GameObject:{gameObject.m_Name} error";
+                    exportErrors.Add($"{error}{Environment.NewLine}{ex}");
+                    Logger.Error(error, ex);
+                    StatusStripUpdate($"Error exporting {gameObject.m_Name}: {ex.Message}");
+                }
 
                 var progress = (int)((i + 1.0) / exportNodes.Count * 100);
                 Dispatcher.UIThread.Post(() => progressBar.Value = progress);
             }
+
+            ClearCurrentExport(exportRoot);
         });
+
+        var errorReportPath = WriteErrorReport(exportRoot, exportErrors, logger);
+
+        var status = exported == 0 ? "Nothing exported." : $"Finished exporting {exported} objects.";
+        if (failed > 0) status += $" {failed} failed.";
+        if (errorReportPath != null) status += $" Error report: {Path.GetFileName(errorReportPath)}.";
+        StatusStripUpdate(status);
 
         if (exportOptions.OpenAfterExport)
         {
             OpenFolder(exportRoot);
         }
-        StatusStripUpdate("Finished");
     }
 
     private AnimationClip[]? GetSelectedAnimationClips()
@@ -1926,6 +2443,89 @@ public partial class MainWindow : Window
             AudioClip m_AudioClip => new AudioClipConverter(m_AudioClip).GetExtensionName(),
             _ => ".dat"
         };
+    }
+
+    private static void WriteCurrentExport(string path, AssetItem asset, int index, int count)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path,
+                $"Exporting {index}/{count}{Environment.NewLine}" +
+                $"Type: {asset.TypeString}{Environment.NewLine}" +
+                $"Name: {asset.Name}{Environment.NewLine}" +
+                $"PathID: {asset.PathID}{Environment.NewLine}" +
+                $"Source: {asset.SourceFile?.originalPath ?? asset.SourceFile?.fullName ?? asset.SourceFile?.fileName}{Environment.NewLine}",
+                Encoding.UTF8);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void ClearCurrentExport(string savePath)
+    {
+        try
+        {
+            var path = Path.Combine(savePath, "export-current.txt");
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static string? WriteErrorReport(string savePath, List<string> exportErrors, GUILogger logger)
+    {
+        var loadErrors = logger.GetMessages(LoggerEvent.Error);
+        if (loadErrors.Length == 0 && exportErrors.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(savePath);
+            var errorReportPath = Path.Combine(savePath, "errors.txt");
+            using (var writer = new StreamWriter(errorReportPath, false, Encoding.UTF8))
+            {
+                writer.WriteLine("AssetStudio error report");
+                writer.WriteLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                writer.WriteLine();
+
+                if (loadErrors.Length > 0)
+                {
+                    writer.WriteLine($"Logged errors ({loadErrors.Length})");
+                    writer.WriteLine(new string('=', 80));
+                    for (int i = 0; i < loadErrors.Length; i++)
+                    {
+                        writer.WriteLine($"[{i + 1}]");
+                        writer.WriteLine(loadErrors[i]);
+                        writer.WriteLine();
+                    }
+                }
+
+                if (exportErrors.Count > 0)
+                {
+                    writer.WriteLine($"Export errors ({exportErrors.Count})");
+                    writer.WriteLine(new string('=', 80));
+                    for (int i = 0; i < exportErrors.Count; i++)
+                    {
+                        writer.WriteLine($"[{i + 1}]");
+                        writer.WriteLine(exportErrors[i]);
+                        writer.WriteLine();
+                    }
+                }
+            }
+            return errorReportPath;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static void OpenFolder(string path)
@@ -2573,6 +3173,47 @@ public partial class MainWindow : Window
 
         return sb.ToString();
     }
+
+    private void ShowErrorMessage_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem menuItem)
+        {
+            logger.ShowErrorMessage = menuItem.IsChecked;
+            appSettings.ShowErrorMessage = menuItem.IsChecked;
+            appSettings.Save();
+        }
+    }
+
+    private async void ExportClassStructures_Click(object? sender, RoutedEventArgs e)
+    {
+        if (assetClassItems.Count > 0)
+        {
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel == null) return;
+
+            var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select folder to export class structures"));
+            if (folders != null && folders.Count > 0)
+            {
+                var savePath = folders[0].Path.LocalPath;
+                var count = assetClassItems.Count;
+                int i = 0;
+                Progress.Reset();
+                foreach (var item in assetClassItems)
+                {
+                    var versionPath = Path.Combine(savePath, item.UnityVersion);
+                    Directory.CreateDirectory(versionPath);
+
+                    var cleanClassName = FixFileName(item.Name);
+                    var saveFile = Path.Combine(versionPath, $"{item.ClassID} {cleanClassName}.txt");
+                    File.WriteAllText(saveFile, FormatAssetClass(item));
+
+                    Progress.Report(++i, count);
+                }
+
+                StatusStripUpdate("Finished exporting class structures");
+            }
+        }
+    }
 }
 
 public sealed class AvaloniaAppSettings
@@ -2584,6 +3225,7 @@ public sealed class AvaloniaAppSettings
 
     public string LoadFolderPath { get; set; } = string.Empty;
     public string ExportFolderPath { get; set; } = string.Empty;
+    public bool ShowErrorMessage { get; set; } = false;
 
     public static AvaloniaAppSettings Load()
     {
