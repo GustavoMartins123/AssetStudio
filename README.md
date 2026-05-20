@@ -26,7 +26,7 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
   * **MonoBehaviour** : json
   * **Animator** : export to FBX file with bound AnimationClip
 * Cross-Platform Linux Support:
-  * **AssetStudio.Avalonia** provides a modern, fast graphical user interface for Linux using Avalonia UI.
+  * **AssetStudio.Avalonia**
   * Includes feature-parity with the legacy Windows Forms UI (Scene Hierarchy search & check propagation, Asset List column sorting & filters, Asset Classes TypeTrees explorer, Log Viewer, settings persistence, etc.).
 
 ## Requirements
@@ -102,16 +102,16 @@ Use the publish script to build the managed GUI, build the native DLLs, and copy
 The script uses the normal `dotnet publish` output folder:
 
 ```text
-AssetStudioGUI\bin\Release\net10.0-windows\win-x64\publish
+AssetStudio.Avalonia\bin\Release\net10.0\win-x64\publish
 ```
 
 Run the executable from inside `publish`:
 
 ```text
-AssetStudioGUI\bin\Release\net10.0-windows\win-x64\publish\AssetStudioGUI.exe
+AssetStudio.Avalonia\bin\Release\net10.0\win-x64\publish\AssetStudio.Avalonia.exe
 ```
 
-Do not run the executable from `AssetStudioGUI\bin\Release\net10.0-windows\win-x64`; that folder is an intermediate build output and does not receive native dependencies.
+Do not run the executable from `AssetStudio.Avalonia\bin\Release\net10.0\win-x64`; that folder is an intermediate build output and does not receive native dependencies.
 
 The script requires Visual Studio with the C++ workload for native texture builds. Use `-SkipNative` only when you want to publish the managed app without texture decoder native support. Use `-OutputDir <path>` only when you intentionally want a custom publish folder.
 
@@ -142,7 +142,7 @@ Compressed texture conversion and audio previewing depend on native libraries. T
 ### Windows Layout:
 
 ```text
-AssetStudioGUI.exe
+AssetStudio.Avalonia.exe
 x64\Texture2DDecoderNative.dll
 ```
 
