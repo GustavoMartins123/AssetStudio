@@ -6,7 +6,7 @@
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
         Title="AssetStudio (Avalonia Linux Port)"
-        Icon="/Assets/as.ico"
+        Icon="/Assets/as.png"
         Width="1264" Height="681"
         WindowStartupLocation="CenterScreen">
     
