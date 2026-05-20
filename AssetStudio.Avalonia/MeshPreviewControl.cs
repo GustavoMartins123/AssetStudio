@@ -165,6 +165,7 @@ void main()
         private int pendingTextureWidth;
         private int pendingTextureHeight;
         private bool hasPendingTexture;
+        private int meshLoadCounter = 0;
 
         public MeshPreviewControl()
         {
@@ -212,40 +213,45 @@ void main()
         public void SetMesh(Mesh m_Mesh)
         {
             previewMaterialMode = false;
-            if (m_Mesh.m_VertexCount > 0)
+            if (m_Mesh.m_VertexCount <= 0) return;
+
+            int currentLoadId = ++meshLoadCounter;
+            var m_Vertices = m_Mesh.m_Vertices;
+            var m_VertexCount = m_Mesh.m_VertexCount;
+            var m_Indices = m_Mesh.m_Indices;
+            var m_Normals = m_Mesh.m_Normals;
+            var m_Colors = m_Mesh.m_Colors;
+
+            System.Threading.Tasks.Task.Run(() =>
             {
-                viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
-                
-                if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
-                {
-                    return;
-                }
+                if (m_Vertices == null || m_Vertices.Length == 0) return;
+
                 int count = 3;
-                if (m_Mesh.m_Vertices.Length == m_Mesh.m_VertexCount * 4)
+                if (m_Vertices.Length == m_VertexCount * 4)
                 {
                     count = 4;
                 }
-                vertexData = new Vector3[m_Mesh.m_VertexCount];
-                
+                var localVertexData = new Vector3[m_VertexCount];
+
                 // Calculate Bounding
                 float[] min = new float[3];
                 float[] max = new float[3];
                 for (int i = 0; i < 3; i++)
                 {
-                    min[i] = m_Mesh.m_Vertices[i];
-                    max[i] = m_Mesh.m_Vertices[i];
+                    min[i] = m_Vertices[i];
+                    max[i] = m_Vertices[i];
                 }
-                for (int v = 0; v < m_Mesh.m_VertexCount; v++)
+                for (int v = 0; v < m_VertexCount; v++)
                 {
                     for (int i = 0; i < 3; i++)
                     {
-                        min[i] = Math.Min(min[i], m_Mesh.m_Vertices[v * count + i]);
-                        max[i] = Math.Max(max[i], m_Mesh.m_Vertices[v * count + i]);
+                        min[i] = Math.Min(min[i], m_Vertices[v * count + i]);
+                        max[i] = Math.Max(max[i], m_Vertices[v * count + i]);
                     }
-                    vertexData[v] = new Vector3(
-                        m_Mesh.m_Vertices[v * count],
-                        m_Mesh.m_Vertices[v * count + 1],
-                        m_Mesh.m_Vertices[v * count + 2]);
+                    localVertexData[v] = new Vector3(
+                        m_Vertices[v * count],
+                        m_Vertices[v * count + 1],
+                        m_Vertices[v * count + 2]);
                 }
 
                 // Calculate modelMatrix
@@ -256,105 +262,117 @@ void main()
                     offset[i] = (max[i] + min[i]) / 2;
                 }
                 float d = Math.Max(1e-5f, dist.Length);
-                modelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
+                var localModelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
 
                 // Indices
-                indiceData = new int[m_Mesh.m_Indices.Count];
-                for (int i = 0; i < m_Mesh.m_Indices.Count; i = i + 3)
+                var localIndiceData = new int[m_Indices.Count];
+                for (int i = 0; i < m_Indices.Count; i = i + 3)
                 {
-                    indiceData[i] = (int)m_Mesh.m_Indices[i];
-                    indiceData[i + 1] = (int)m_Mesh.m_Indices[i + 1];
-                    indiceData[i + 2] = (int)m_Mesh.m_Indices[i + 2];
+                    localIndiceData[i] = (int)m_Indices[i];
+                    localIndiceData[i + 1] = (int)m_Indices[i + 1];
+                    localIndiceData[i + 2] = (int)m_Indices[i + 2];
                 }
 
                 // Normals
-                if (m_Mesh.m_Normals != null && m_Mesh.m_Normals.Length > 0)
+                Vector3[]? localNormalData = null;
+                if (m_Normals != null && m_Normals.Length > 0)
                 {
-                    if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 3)
-                        count = 3;
-                    else if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 4)
-                        count = 4;
-                    normalData = new Vector3[m_Mesh.m_VertexCount];
-                    for (int n = 0; n < m_Mesh.m_VertexCount; n++)
+                    int nCount = 3;
+                    if (m_Normals.Length == m_VertexCount * 3)
+                        nCount = 3;
+                    else if (m_Normals.Length == m_VertexCount * 4)
+                        nCount = 4;
+                    localNormalData = new Vector3[m_VertexCount];
+                    for (int n = 0; n < m_VertexCount; n++)
                     {
-                        normalData[n] = new Vector3(
-                            m_Mesh.m_Normals[n * count],
-                            m_Mesh.m_Normals[n * count + 1],
-                            m_Mesh.m_Normals[n * count + 2]);
+                        localNormalData[n] = new Vector3(
+                            m_Normals[n * nCount],
+                            m_Normals[n * nCount + 1],
+                            m_Normals[n * nCount + 2]);
                     }
-                }
-                else
-                {
-                    normalData = null;
                 }
 
                 // calculate normal by ourselves
-                normal2Data = new Vector3[m_Mesh.m_VertexCount];
-                int[] normalCalculatedCount = new int[m_Mesh.m_VertexCount];
-                for (int i = 0; i < m_Mesh.m_VertexCount; i++)
+                var localNormal2Data = new Vector3[m_VertexCount];
+                int[] normalCalculatedCount = new int[m_VertexCount];
+                for (int i = 0; i < m_VertexCount; i++)
                 {
-                    normal2Data[i] = Vector3.Zero;
+                    localNormal2Data[i] = Vector3.Zero;
                     normalCalculatedCount[i] = 0;
                 }
-                for (int i = 0; i < m_Mesh.m_Indices.Count; i = i + 3)
+                for (int i = 0; i < m_Indices.Count; i = i + 3)
                 {
-                    if (indiceData[i + 2] >= m_Mesh.m_VertexCount) continue;
-                    Vector3 dir1 = vertexData[indiceData[i + 1]] - vertexData[indiceData[i]];
-                    Vector3 dir2 = vertexData[indiceData[i + 2]] - vertexData[indiceData[i]];
+                    if (localIndiceData[i + 2] >= m_VertexCount) continue;
+                    Vector3 dir1 = localVertexData[localIndiceData[i + 1]] - localVertexData[localIndiceData[i]];
+                    Vector3 dir2 = localVertexData[localIndiceData[i + 2]] - localVertexData[localIndiceData[i]];
                     Vector3 normal = Vector3.Cross(dir1, dir2);
                     if (normal.LengthSquared > 0)
                         normal = Vector3.Normalize(normal);
                     for (int j = 0; j < 3; j++)
                     {
-                        normal2Data[indiceData[i + j]] += normal;
-                        normalCalculatedCount[indiceData[i + j]]++;
+                        localNormal2Data[localIndiceData[i + j]] += normal;
+                        normalCalculatedCount[localIndiceData[i + j]]++;
                     }
                 }
-                for (int i = 0; i < m_Mesh.m_VertexCount; i++)
+                for (int i = 0; i < m_VertexCount; i++)
                 {
                     if (normalCalculatedCount[i] == 0)
-                        normal2Data[i] = new Vector3(0, 1, 0);
+                        localNormal2Data[i] = new Vector3(0, 1, 0);
                     else
-                        normal2Data[i] = Vector3.Normalize(normal2Data[i]);
+                        localNormal2Data[i] = Vector3.Normalize(localNormal2Data[i]);
                 }
 
                 // Colors
-                if (m_Mesh.m_Colors != null && m_Mesh.m_Colors.Length == m_Mesh.m_VertexCount * 3)
+                Vector4[] localColorData;
+                if (m_Colors != null && m_Colors.Length == m_VertexCount * 3)
                 {
-                    colorData = new Vector4[m_Mesh.m_VertexCount];
-                    for (int c = 0; c < m_Mesh.m_VertexCount; c++)
+                    localColorData = new Vector4[m_VertexCount];
+                    for (int c = 0; c < m_VertexCount; c++)
                     {
-                        colorData[c] = new Vector4(
-                            m_Mesh.m_Colors[c * 3],
-                            m_Mesh.m_Colors[c * 3 + 1],
-                            m_Mesh.m_Colors[c * 3 + 2],
+                        localColorData[c] = new Vector4(
+                            m_Colors[c * 3],
+                            m_Colors[c * 3 + 1],
+                            m_Colors[c * 3 + 2],
                             1.0f);
                     }
                 }
-                else if (m_Mesh.m_Colors != null && m_Mesh.m_Colors.Length == m_Mesh.m_VertexCount * 4)
+                else if (m_Colors != null && m_Colors.Length == m_VertexCount * 4)
                 {
-                    colorData = new Vector4[m_Mesh.m_VertexCount];
-                    for (int c = 0; c < m_Mesh.m_VertexCount; c++)
+                    localColorData = new Vector4[m_VertexCount];
+                    for (int c = 0; c < m_VertexCount; c++)
                     {
-                        colorData[c] = new Vector4(
-                            m_Mesh.m_Colors[c * 4],
-                            m_Mesh.m_Colors[c * 4 + 1],
-                            m_Mesh.m_Colors[c * 4 + 2],
-                            m_Mesh.m_Colors[c * 4 + 3]);
+                        localColorData[c] = new Vector4(
+                            m_Colors[c * 4],
+                            m_Colors[c * 4 + 1],
+                            m_Colors[c * 4 + 2],
+                            m_Colors[c * 4 + 3]);
                     }
                 }
                 else
                 {
-                    colorData = new Vector4[m_Mesh.m_VertexCount];
-                    for (int c = 0; c < m_Mesh.m_VertexCount; c++)
+                    localColorData = new Vector4[m_VertexCount];
+                    for (int c = 0; c < m_VertexCount; c++)
                     {
-                        colorData[c] = new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
+                        localColorData[c] = new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
                     }
                 }
 
-                vao = 0;
-                RequestNextFrameRendering();
-            }
+                // Post back to UI thread
+                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentLoadId != meshLoadCounter) return;
+
+                    viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
+                    vertexData = localVertexData;
+                    modelMatrixData = localModelMatrixData;
+                    indiceData = localIndiceData;
+                    normalData = localNormalData;
+                    normal2Data = localNormal2Data;
+                    colorData = localColorData;
+                    vao = 0;
+                    RequestNextFrameRendering();
+                });
+            });
         }
 
         public void SetMaterialTexture(Image<Bgra32> image)

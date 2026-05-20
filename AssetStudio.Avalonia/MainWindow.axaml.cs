@@ -1257,8 +1257,21 @@ public partial class MainWindow : Window
                 }
                 if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
                 {
-                    PreviewInfoOverlay.Text = FormatMeshPreview(m_Mesh, assetItem);
+                    PreviewInfoOverlay.Text = "Loading details...";
                     PreviewInfoBorder.IsVisible = true;
+                    var localAssetItem = assetItem;
+                    var localMesh = m_Mesh;
+                    Task.Run(() =>
+                    {
+                        var infoText = FormatMeshPreview(localMesh, localAssetItem);
+                        global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                        {
+                            if (AssetListDataGrid.SelectedItem == localAssetItem && PreviewInfoOverlay != null)
+                            {
+                                PreviewInfoOverlay.Text = infoText;
+                            }
+                        });
+                    });
                 }
                 PreviewLabel.IsVisible = false;
                 StatusStripUpdate("Using OpenGL: OpenTK Core | 'Mouse Left'=Rotate | 'Mouse Right'=Move | 'Mouse Wheel'=Zoom | 'Ctrl W'=Wireframe | 'Ctrl S'=Shade | 'Ctrl N'=ReNormal");
@@ -3603,7 +3616,16 @@ public partial class MainWindow : Window
         if (dump != null)
         {
             sb.AppendLine("Mesh Serialization Structure:");
-            sb.AppendLine(dump);
+            if (dump.Length > 2000)
+            {
+                sb.AppendLine(dump.Substring(0, 2000));
+                sb.AppendLine("...");
+                sb.AppendLine("[Dump truncated: too large for side overlay. View full dump in the 'Dump' tab.]");
+            }
+            else
+            {
+                sb.AppendLine(dump);
+            }
         }
 
         return sb.ToString();
