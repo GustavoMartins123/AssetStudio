@@ -17,23 +17,27 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
 * Support asset types:
   * **Texture2D** : convert to png, tga, jpeg, bmp
   * **Sprite** : crop Texture2D to png, tga, jpeg, bmp
-  * **AudioClip** : mp3, ogg, wav, m4a, fsb. support convert FSB file to WAV(PCM)
+  * **AudioClip** : mp3, ogg, wav, m4a, fsb. Supports converting FSB files to WAV(PCM) and real-time audio playback preview via FMOD.
   * **Font** : ttf, otf
-  * **Mesh** : obj
+  * **Mesh** : obj, fbx, and real-time 3D preview via OpenGL (OpenGlControlBase on Linux)
   * **TextAsset**
   * **Shader**
   * **MovieTexture**
   * **VideoClip**
   * **MonoBehaviour** : json
   * **Animator** : export to FBX file with bound AnimationClip
+* Cross-Platform Linux Support:
+  * **AssetStudio.Avalonia** provides a modern, fast graphical user interface for Linux using Avalonia UI.
+  * Includes feature-parity with the legacy Windows Forms UI (Scene Hierarchy search & check propagation, Asset List column sorting & filters, Asset Classes TypeTrees explorer, Log Viewer, settings persistence, etc.).
 
 ## Requirements
 
-- AssetStudio.net472
+- AssetStudio.net472 (Windows-only)
    - [.NET Framework 4.7.2](https://dotnet.microsoft.com/download/dotnet-framework/net472)
-- AssetStudio.net10
+- AssetStudio.net10 (Windows-only)
    - [.NET Desktop Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)
-
+- AssetStudio.Avalonia (Linux / Cross-Platform)
+   - [.NET Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)
 
 ## Usage
 
@@ -84,7 +88,8 @@ First, use my another program [Il2CppDumper](https://github.com/Perfare/Il2CppDu
 
 ## Build
 
-* Visual Studio 2022 or newer
+* Windows: Visual Studio 2022 or newer
+* Linux: .NET 10.0 SDK, CMake, and GCC/G++
 
 ### One-command Windows publish
 
@@ -108,28 +113,51 @@ AssetStudioGUI\bin\Release\net10.0-windows\win-x64\publish\AssetStudioGUI.exe
 
 Do not run the executable from `AssetStudioGUI\bin\Release\net10.0-windows\win-x64`; that folder is an intermediate build output and does not receive native dependencies.
 
-The script is equivalent to running:
-
-```powershell
-dotnet publish AssetStudioGUI\AssetStudioGUI.csproj -f net10.0-windows -c Release -r win-x64 --self-contained true
-```
-
-and then copying the native DLLs into the publish folder.
-
 The script requires Visual Studio with the C++ workload for native texture builds. Use `-SkipNative` only when you want to publish the managed app without texture decoder native support. Use `-OutputDir <path>` only when you intentionally want a custom publish folder.
 
-### Native Dependencies
+### One-command Linux publish
 
-Compressed texture conversion depends on a native DLL. The managed application can build without it, but compressed texture export will fail at runtime if the DLL is missing.
+Use the publish script to build the native C++ decoder library, publish the Avalonia GUI application, and bundle the native dependencies (`libTexture2DDecoderNative.so` and `libfmod.so`) into the target publish folder:
 
-Expected runtime layout on 64-bit Windows:
+```bash
+./scripts/publish-linux.sh -c Release
+```
+
+The script output will be placed in:
+
+```text
+AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish
+```
+
+Run the executable from inside `publish`:
+
+```bash
+./AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish/AssetStudio.Avalonia
+```
+
+## Native Dependencies
+
+Compressed texture conversion and audio previewing depend on native libraries. The managed application can build and run without them, but texture/audio previews will fail at runtime if the libraries are missing.
+
+### Windows Layout:
 
 ```text
 AssetStudioGUI.exe
 x64\Texture2DDecoderNative.dll
 ```
 
-`Texture2DDecoderNative.dll` is required for compressed texture formats such as DXT, BC, ETC, PVRTC, ASTC and Crunch.
+* `Texture2DDecoderNative.dll` is required for compressed texture formats such as DXT, BC, ETC, PVRTC, ASTC, and Crunch.
+
+### Linux Layout:
+
+```text
+AssetStudio.Avalonia
+x64/libTexture2DDecoderNative.so
+x64/libfmod.so
+```
+
+* `libTexture2DDecoderNative.so` is required for compressed texture formats.
+* `libfmod.so` is required for audio playback previewing.
 
 ## Open source libraries used
 
@@ -137,3 +165,4 @@ x64\Texture2DDecoderNative.dll
 * [Ishotihadus/mikunyan](https://github.com/Ishotihadus/mikunyan)
 * [BinomialLLC/crunch](https://github.com/BinomialLLC/crunch)
 * [Unity-Technologies/crunch](https://github.com/Unity-Technologies/crunch/tree/unity)
+
