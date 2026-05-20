@@ -1,6 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
+using System.Runtime.InteropServices;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
@@ -50,6 +51,17 @@ public partial class MainWindow : Window
     private bool assetListSortDescending;
     private bool updatingFilterTypeMenu;
 
+    private FMOD.System? fmodSystem;
+    private FMOD.Sound? fmodSound;
+    private FMOD.Channel? fmodChannel;
+    private FMOD.SoundGroup? fmodMasterSoundGroup;
+    private FMOD.MODE fmodLoopMode = FMOD.MODE.LOOP_OFF;
+    private uint fmodLenMs;
+    private float fmodVolume = 0.8f;
+    private DispatcherTimer? fmodTimer;
+    private bool fmodIsDragging = false;
+    private byte[]? currentAudioData;
+
     public MainWindow()
     {
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
@@ -65,6 +77,15 @@ public partial class MainWindow : Window
 
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
         Title = $"AssetStudio v{version}";
+
+        try
+        {
+            FMODinit();
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Failed to initialize FMOD: {ex.Message}");
+        }
     }
 
     private void StatusStripUpdate(string text)
@@ -140,6 +161,11 @@ public partial class MainWindow : Window
         if (PreviewInfoOverlay != null)
         {
             PreviewInfoOverlay.Text = string.Empty;
+        }
+        if (FMODPanel != null)
+        {
+            FMODPanel.IsVisible = false;
+            FMODreset();
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
@@ -1204,6 +1230,11 @@ public partial class MainWindow : Window
         {
             PreviewInfoBorder.IsVisible = false;
         }
+        if (FMODPanel != null)
+        {
+            FMODPanel.IsVisible = false;
+            FMODreset();
+        }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
 
@@ -1223,6 +1254,9 @@ public partial class MainWindow : Window
 
         switch (assetItem.Asset)
         {
+            case AudioClip m_AudioClip:
+                PreviewAudioClip(assetItem, m_AudioClip);
+                break;
             case Texture2D m_Texture2D:
                 PreviewTexture2D(assetItem, m_Texture2D);
                 break;
@@ -3671,6 +3705,435 @@ public partial class MainWindow : Window
             }
         }
     }
+
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        FMODreset();
+        if (fmodSystem != null)
+        {
+            fmodSystem.release();
+            fmodSystem = null;
+        }
+        base.OnClosing(e);
+    }
+
+    #region FMOD
+    private void FMODinit()
+    {
+        try
+        {
+            FMODreset();
+
+            var result = FMOD.Factory.System_Create(out fmodSystem);
+            if (ERRCHECK(result)) { return; }
+
+            result = fmodSystem.getVersion(out var version);
+            ERRCHECK(result);
+            if (version < FMOD.VERSION.number)
+            {
+                logger.Log(LoggerEvent.Error, $"Error! You are using an old version of FMOD {version:X}. This program requires {FMOD.VERSION.number:X}.");
+                return;
+            }
+
+            result = fmodSystem.init(2, FMOD.INITFLAGS.NORMAL, IntPtr.Zero);
+            if (ERRCHECK(result)) { return; }
+
+            result = fmodSystem.getMasterSoundGroup(out fmodMasterSoundGroup);
+            if (ERRCHECK(result)) { return; }
+
+            result = fmodMasterSoundGroup.setVolume(fmodVolume);
+            if (ERRCHECK(result)) { return; }
+
+            fmodTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(100)
+            };
+            fmodTimer.Tick += FmodTimer_Tick;
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"FMOD could not be initialized: {ex.Message}. Audio preview will be disabled.");
+        }
+    }
+
+    private void FmodTimer_Tick(object? sender, EventArgs e)
+    {
+        uint ms = 0;
+        bool playing = false;
+        bool paused = false;
+
+        if (fmodChannel != null)
+        {
+            var result = fmodChannel.getPosition(out ms, FMOD.TIMEUNIT.MS);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                ERRCHECK(result);
+            }
+
+            result = fmodChannel.isPlaying(out playing);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                ERRCHECK(result);
+            }
+
+            result = fmodChannel.getPaused(out paused);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                ERRCHECK(result);
+            }
+        }
+
+        if (!fmodIsDragging && fmodLenMs > 0)
+        {
+            FMODtimerLabel.Text = $"{ms / 1000 / 60}:{ms / 1000 % 60:D2}.{ms / 10 % 100:D2} / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+            FMODprogressBar.Value = (int)(ms * 1000 / fmodLenMs);
+        }
+        FMODstatusLabel.Text = paused ? "Paused" : playing ? "Playing" : "Stopped";
+
+        if (fmodSystem != null && fmodChannel != null)
+        {
+            fmodSystem.update();
+        }
+    }
+
+    private void FMODreset()
+    {
+        fmodTimer?.Stop();
+        if (FMODprogressBar != null) FMODprogressBar.Value = 0;
+        if (FMODtimerLabel != null) FMODtimerLabel.Text = "0:00.0 / 0:00.0";
+        if (FMODstatusLabel != null) FMODstatusLabel.Text = "Stopped";
+        if (FMODinfoLabel != null) FMODinfoLabel.Text = "";
+
+        if (fmodSound != null && fmodSound.isValid())
+        {
+            var result = fmodSound.release();
+            ERRCHECK(result);
+            fmodSound = null;
+        }
+        currentAudioData = null;
+    }
+
+    private void FMODplayButton_Click(object? sender, RoutedEventArgs e)
+    {
+        if (fmodSound != null && fmodChannel != null && fmodSystem != null)
+        {
+            fmodTimer?.Start();
+            var result = fmodChannel.isPlaying(out var playing);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                if (ERRCHECK(result)) { return; }
+            }
+
+            if (playing)
+            {
+                result = fmodChannel.stop();
+                if (ERRCHECK(result)) { return; }
+
+                result = fmodSystem.playSound(fmodSound, null, false, out fmodChannel);
+                if (ERRCHECK(result)) { return; }
+
+                FMODpauseButton.Content = "Pause";
+            }
+            else
+            {
+                result = fmodSystem.playSound(fmodSound, null, false, out fmodChannel);
+                if (ERRCHECK(result)) { return; }
+                FMODstatusLabel.Text = "Playing";
+
+                if (FMODprogressBar.Value > 0)
+                {
+                    uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
+                    result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
+                    if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                    {
+                        if (ERRCHECK(result)) { return; }
+                    }
+                }
+            }
+        }
+    }
+
+    private void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
+    {
+        if (fmodSound != null && fmodChannel != null)
+        {
+            var result = fmodChannel.isPlaying(out var playing);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                if (ERRCHECK(result)) { return; }
+            }
+
+            if (playing)
+            {
+                result = fmodChannel.getPaused(out var paused);
+                if (ERRCHECK(result)) { return; }
+                result = fmodChannel.setPaused(!paused);
+                if (ERRCHECK(result)) { return; }
+
+                if (paused)
+                {
+                    FMODstatusLabel.Text = "Playing";
+                    FMODpauseButton.Content = "Pause";
+                    fmodTimer?.Start();
+                }
+                else
+                {
+                    FMODstatusLabel.Text = "Paused";
+                    FMODpauseButton.Content = "Resume";
+                    fmodTimer?.Stop();
+                }
+            }
+        }
+    }
+
+    private void FMODstopButton_Click(object? sender, RoutedEventArgs e)
+    {
+        if (fmodChannel != null)
+        {
+            var result = fmodChannel.isPlaying(out var playing);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                if (ERRCHECK(result)) { return; }
+            }
+
+            if (playing)
+            {
+                result = fmodChannel.stop();
+                if (ERRCHECK(result)) { return; }
+                fmodTimer?.Stop();
+                FMODprogressBar.Value = 0;
+                FMODtimerLabel.Text = "0:00.0 / 0:00.0";
+                FMODstatusLabel.Text = "Stopped";
+                FMODpauseButton.Content = "Pause";
+            }
+        }
+    }
+
+    private void FMODloopButton_Click(object? sender, RoutedEventArgs e)
+    {
+        fmodLoopMode = FMODloopButton.IsChecked == true ? FMOD.MODE.LOOP_NORMAL : FMOD.MODE.LOOP_OFF;
+
+        if (fmodSound != null)
+        {
+            var result = fmodSound.setMode(fmodLoopMode);
+            if (ERRCHECK(result)) { return; }
+        }
+
+        if (fmodChannel != null)
+        {
+            var result = fmodChannel.isPlaying(out var playing);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                if (ERRCHECK(result)) { return; }
+            }
+
+            result = fmodChannel.getPaused(out var paused);
+            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            {
+                if (ERRCHECK(result)) { return; }
+            }
+
+            if (playing || paused)
+            {
+                result = fmodChannel.setMode(fmodLoopMode);
+                if (ERRCHECK(result)) { return; }
+            }
+        }
+    }
+
+    private void FMODvolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        fmodVolume = (float)(FMODvolumeBar.Value / 10.0);
+
+        if (fmodMasterSoundGroup != null)
+        {
+            var result = fmodMasterSoundGroup.setVolume(fmodVolume);
+            if (ERRCHECK(result)) { return; }
+        }
+    }
+
+    private void FMODprogressBar_PointerPressed(object? sender, global::Avalonia.Input.PointerPressedEventArgs e)
+    {
+        fmodIsDragging = true;
+        fmodTimer?.Stop();
+    }
+
+    private void FMODprogressBar_PointerReleased(object? sender, global::Avalonia.Input.PointerReleasedEventArgs e)
+    {
+        fmodIsDragging = false;
+        if (fmodChannel != null && fmodLenMs > 0)
+        {
+            uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
+            var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
+            if (!ERRCHECK(result))
+            {
+                result = fmodChannel.isPlaying(out var playing);
+                if (playing)
+                {
+                    fmodTimer?.Start();
+                }
+            }
+        }
+    }
+
+    private void FMODprogressBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (fmodIsDragging && fmodLenMs > 0)
+        {
+            uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
+            FMODtimerLabel.Text = $"{newms / 1000 / 60}:{newms / 1000 % 60:D2}.{newms / 10 % 100:D2} / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+        }
+    }
+
+    private void PreviewAudioClip(AssetItem assetItem, AudioClip m_AudioClip)
+    {
+        FMODreset();
+
+        if (fmodSystem == null)
+        {
+            StatusStripUpdate("Audio preview is unavailable (FMOD is not loaded).");
+            return;
+        }
+
+        var infoText = "Compression format: ";
+        if (m_AudioClip.version[0] < 5)
+        {
+            switch (m_AudioClip.m_Type)
+            {
+                case FMODSoundType.ACC:
+                    infoText += "Acc";
+                    break;
+                case FMODSoundType.AIFF:
+                    infoText += "AIFF";
+                    break;
+                case FMODSoundType.IT:
+                    infoText += "Impulse tracker";
+                    break;
+                case FMODSoundType.MOD:
+                    infoText += "Protracker / Fasttracker MOD";
+                    break;
+                case FMODSoundType.MPEG:
+                    infoText += "MP2/MP3 MPEG";
+                    break;
+                case FMODSoundType.OGGVORBIS:
+                    infoText += "Ogg vorbis";
+                    break;
+                case FMODSoundType.S3M:
+                    infoText += "ScreamTracker 3";
+                    break;
+                case FMODSoundType.WAV:
+                    infoText += "Microsoft WAV";
+                    break;
+                case FMODSoundType.XM:
+                    infoText += "FastTracker 2 XM";
+                    break;
+                case FMODSoundType.XMA:
+                    infoText += "Xbox360 XMA";
+                    break;
+                case FMODSoundType.VAG:
+                    infoText += "PlayStation Portable ADPCM";
+                    break;
+                case FMODSoundType.AUDIOQUEUE:
+                    infoText += "iPhone";
+                    break;
+                default:
+                    infoText += "Unknown";
+                    break;
+            }
+        }
+        else
+        {
+            switch (m_AudioClip.m_CompressionFormat)
+            {
+                case AudioCompressionFormat.PCM:
+                    infoText += "PCM";
+                    break;
+                case AudioCompressionFormat.Vorbis:
+                    infoText += "Vorbis";
+                    break;
+                case AudioCompressionFormat.ADPCM:
+                    infoText += "ADPCM";
+                    break;
+                case AudioCompressionFormat.MP3:
+                    infoText += "MP3";
+                    break;
+                case AudioCompressionFormat.PSMVAG:
+                    infoText += "PlayStation Portable ADPCM";
+                    break;
+                case AudioCompressionFormat.HEVAG:
+                    infoText += "PSVita ADPCM";
+                    break;
+                case AudioCompressionFormat.XMA:
+                    infoText += "Xbox360 XMA";
+                    break;
+                case AudioCompressionFormat.AAC:
+                    infoText += "AAC";
+                    break;
+                case AudioCompressionFormat.GCADPCM:
+                    infoText += "Nintendo 3DS/Wii DSP";
+                    break;
+                case AudioCompressionFormat.ATRAC9:
+                    infoText += "PSVita ATRAC9";
+                    break;
+                default:
+                    infoText += "Unknown";
+                    break;
+            }
+        }
+
+        currentAudioData = m_AudioClip.m_AudioData.GetData();
+        if (currentAudioData == null || currentAudioData.Length == 0)
+        {
+            StatusStripUpdate("AudioClip data is empty or invalid.");
+            return;
+        }
+
+        var exinfo = new FMOD.CREATESOUNDEXINFO();
+        exinfo.cbsize = Marshal.SizeOf(exinfo);
+        exinfo.length = (uint)m_AudioClip.m_Size;
+
+        var result = fmodSystem.createSound(currentAudioData, FMOD.MODE.OPENMEMORY | fmodLoopMode, ref exinfo, out fmodSound);
+        if (ERRCHECK(result)) return;
+
+        fmodSound.getNumSubSounds(out var numsubsounds);
+        if (numsubsounds > 0)
+        {
+            result = fmodSound.getSubSound(0, out var subsound);
+            if (result == FMOD.RESULT.OK)
+            {
+                fmodSound = subsound;
+            }
+        }
+
+        result = fmodSound.getLength(out fmodLenMs, FMOD.TIMEUNIT.MS);
+        if (ERRCHECK(result)) return;
+
+        result = fmodSystem.playSound(fmodSound, null, true, out fmodChannel);
+        if (ERRCHECK(result)) return;
+
+        FMODPanel.IsVisible = true;
+
+        result = fmodChannel.getFrequency(out var frequency);
+        if (ERRCHECK(result)) return;
+
+        FMODinfoLabel.Text = $"{frequency} Hz | {infoText}";
+        FMODtimerLabel.Text = $"0:00.0 / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+        FMODTitleLabel.Text = m_AudioClip.m_Name;
+        FMODpauseButton.Content = "Pause";
+        StatusStripUpdate($"Loaded audio: {m_AudioClip.m_Name}");
+    }
+
+    private bool ERRCHECK(FMOD.RESULT result)
+    {
+        if (result != FMOD.RESULT.OK)
+        {
+            FMODreset();
+            StatusStripUpdate($"FMOD error! {result} - {FMOD.Error.String(result)}");
+            return true;
+        }
+        return false;
+    }
+    #endregion
 }
 
 public sealed class AvaloniaAppSettings

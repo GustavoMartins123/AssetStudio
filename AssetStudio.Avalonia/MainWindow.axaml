@@ -169,6 +169,33 @@
                                 </ScrollViewer>
                             </Grid>
                         </Border>
+
+                        <Border x:Name="FMODPanel" Background="#E01E1E24" BorderBrush="#44ffffff" BorderThickness="1" CornerRadius="12" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="450" IsVisible="False">
+                            <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
+                                <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
+                                    <TextBlock x:Name="FMODTitleLabel" Text="Audio Player" Foreground="White" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="FMODstatusLabel" Grid.Column="1" Text="Stopped" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                </Grid>
+                                
+                                <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
+                                    <TextBlock x:Name="FMODinfoLabel" Text="44100 Hz" Foreground="#B0B0B0" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="FMODtimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="White" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
+                                </Grid>
+                                
+                                <Slider x:Name="FMODprogressBar" Grid.Row="2" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32" 
+                                        PointerPressed="FMODprogressBar_PointerPressed" PointerReleased="FMODprogressBar_PointerReleased" ValueChanged="FMODprogressBar_ValueChanged"/>
+                                
+                                <Grid Grid.Row="3" ColumnDefinitions="Auto,Auto,Auto,Auto,*,Auto,Auto" ColumnSpacing="8">
+                                    <Button x:Name="FMODplayButton" Grid.Column="0" Content="Play" Click="FMODplayButton_Click" Width="55" HorizontalContentAlignment="Center"/>
+                                    <Button x:Name="FMODpauseButton" Grid.Column="1" Content="Pause" Click="FMODpauseButton_Click" Width="65" HorizontalContentAlignment="Center"/>
+                                    <Button x:Name="FMODstopButton" Grid.Column="2" Content="Stop" Click="FMODstopButton_Click" Width="55" HorizontalContentAlignment="Center"/>
+                                    <CheckBox x:Name="FMODloopButton" Grid.Column="3" Content="Loop" Click="FMODloopButton_Click" Foreground="White" VerticalAlignment="Center" Margin="6,0,0,0"/>
+                                    
+                                    <TextBlock Grid.Column="5" Text="Vol" Foreground="White" VerticalAlignment="Center" Margin="4,0,0,0" FontSize="11"/>
+                                    <Slider x:Name="FMODvolumeBar" Grid.Column="6" Minimum="0" Maximum="10" Value="8" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="FMODvolumeBar_ValueChanged"/>
+                                </Grid>
+                            </Grid>
+                        </Border>
                     </Panel>
                 </TabItem>
                 <TabItem Header="Dump">

@@ -79,6 +79,12 @@ if [[ "$SKIP_NATIVE" != "true" ]]; then
     echo "Copied libTexture2DDecoderNative.so to $NATIVE_TARGET_DIR"
 fi
 
+if [[ -f "$REPO_ROOT/AssetStudio.Avalonia/Libraries/x64/libfmod.so" ]]; then
+    mkdir -p "$NATIVE_TARGET_DIR"
+    cp "$REPO_ROOT/AssetStudio.Avalonia/Libraries/x64/libfmod.so" "$NATIVE_TARGET_DIR/"
+    echo "Copied libfmod.so to $NATIVE_TARGET_DIR"
+fi
+
 echo ""
 echo "Done: $PUBLISH_DIR"
 echo "You can run the app with: $PUBLISH_DIR/AssetStudio.Avalonia"
