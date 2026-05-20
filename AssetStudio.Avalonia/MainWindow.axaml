@@ -158,6 +158,7 @@
                         <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="White" />
                         <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
                         <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True" />
+                        <local:TextureGLPreviewControl x:Name="TextureGLPreview" IsVisible="False" Focusable="True" />
                         <Border x:Name="PreviewInfoBorder" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="False">
                             <Grid RowDefinitions="Auto,*">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="8,4,8,4">

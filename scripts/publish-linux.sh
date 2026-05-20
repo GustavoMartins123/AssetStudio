@@ -85,6 +85,68 @@ if [[ -f "$REPO_ROOT/AssetStudio.Avalonia/Libraries/x64/libfmod.so" ]]; then
     echo "Copied libfmod.so to $NATIVE_TARGET_DIR"
 fi
 
+ICON_SRC="$REPO_ROOT/AssetStudio.Avalonia/Assets/as.png"
+if [[ -f "$ICON_SRC" ]]; then
+    cp "$ICON_SRC" "$PUBLISH_DIR/as.png"
+    echo "Copied as.png icon to $PUBLISH_DIR"
+fi
+
+DESKTOP_FILE="$PUBLISH_DIR/AssetStudio.desktop"
+cat > "$DESKTOP_FILE" <<DESKTOP_EOF
+[Desktop Entry]
+Type=Application
+Name=AssetStudio
+Comment=Unity asset viewer and extractor
+Exec="$PUBLISH_DIR/AssetStudio.Avalonia" %F
+Icon=$PUBLISH_DIR/as.png
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=AssetStudio.Avalonia
+MimeType=application/octet-stream;
+DESKTOP_EOF
+chmod +x "$DESKTOP_FILE"
+echo "Generated $DESKTOP_FILE"
+
+INSTALL_SCRIPT="$PUBLISH_DIR/install-desktop.sh"
+cat > "$INSTALL_SCRIPT" <<'INSTALL_HEADER'
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+INSTALL_HEADER
+
+cat >> "$INSTALL_SCRIPT" <<INSTALL_BODY
+DESKTOP_DIR="\$HOME/.local/share/applications"
+ICON_DIR="\$HOME/.local/share/icons/hicolor/256x256/apps"
+mkdir -p "\$DESKTOP_DIR" "\$ICON_DIR"
+
+cp "\$SCRIPT_DIR/as.png" "\$ICON_DIR/assetstudio.png"
+gtk-update-icon-cache -f -t "\$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+
+cat > "\$DESKTOP_DIR/assetstudio.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=AssetStudio
+Comment=Unity asset viewer and extractor
+Exec="\$SCRIPT_DIR/AssetStudio.Avalonia" %F
+Icon=assetstudio
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=AssetStudio.Avalonia
+MimeType=application/octet-stream;
+EOF
+
+chmod +x "\$DESKTOP_DIR/assetstudio.desktop"
+update-desktop-database "\$DESKTOP_DIR" 2>/dev/null || true
+
+echo "Done! AssetStudio should now appear in your application launcher."
+INSTALL_BODY
+
+chmod +x "$INSTALL_SCRIPT"
+echo "Generated $INSTALL_SCRIPT"
+
 echo ""
 echo "Done: $PUBLISH_DIR"
 echo "You can run the app with: $PUBLISH_DIR/AssetStudio.Avalonia"
+echo ""
+echo "To add AssetStudio to your application launcher, run:"
+echo "  $INSTALL_SCRIPT"

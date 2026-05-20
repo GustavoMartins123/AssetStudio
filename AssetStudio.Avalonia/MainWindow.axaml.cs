@@ -4,6 +4,8 @@ using Avalonia.Input.Platform;
 using System.Runtime.InteropServices;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
+using Avalonia.Platform;
+using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using System.Diagnostics;
 using AssetStudio;
@@ -31,6 +33,7 @@ public partial class MainWindow : Window
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private Texture2D? currentPreviewTexture;
     private Sprite? currentPreviewSprite;
+    private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
     private long texturePreviewIdCounter;
     private List<AssetItem> visibleAssets = new List<AssetItem>();
@@ -66,6 +69,12 @@ public partial class MainWindow : Window
     {
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
+        try
+        {
+            using var iconStream = AssetLoader.Open(new Uri("avares://AssetStudio.Avalonia/Assets/as.png"));
+            Icon = new WindowIcon(new Bitmap(iconStream));
+        }
+        catch { }
         logger = new GUILogger(StatusStripUpdate, this);
         logger.ShowErrorMessage = appSettings.ShowErrorMessage;
         Logger.Default = logger;
@@ -85,6 +94,59 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             logger.Log(LoggerEvent.Error, $"Failed to initialize FMOD: {ex.Message}");
+        }
+
+        // Detect GPU support (OpenGL interface availability)
+        try
+        {
+            var locatorType = typeof(global::Avalonia.Application).Assembly.GetType("Avalonia.AvaloniaLocator");
+            var currentProp = locatorType?.GetProperty("Current", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            var currentLocator = currentProp?.GetValue(null);
+            if (currentLocator != null)
+            {
+                var getServiceMethod = currentLocator.GetType().GetMethod("GetService");
+                var openGlInterfaceType = typeof(global::Avalonia.Application).Assembly.GetType("Avalonia.OpenGL.IPlatformOpenGlInterface");
+                if (getServiceMethod != null && openGlInterfaceType != null)
+                {
+                    var glInterface = getServiceMethod.MakeGenericMethod(openGlInterfaceType).Invoke(currentLocator, null);
+                    if (glInterface == null)
+                    {
+                        useGpuTexturePreview = false;
+                        logger.Log(LoggerEvent.Info, "GPU acceleration (OpenGL) not supported: platform OpenGl interface is null. Falling back to CPU.");
+                    }
+                    else
+                    {
+                        useGpuTexturePreview = true;
+                        logger.Log(LoggerEvent.Info, "GPU acceleration (OpenGL) detected.");
+                    }
+                }
+                else
+                {
+                    useGpuTexturePreview = true;
+                }
+            }
+            else
+            {
+                useGpuTexturePreview = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            useGpuTexturePreview = true;
+            logger.Log(LoggerEvent.Warning, $"GPU acceleration detection failed: {ex.Message}. Defaulting to GPU preview.");
+        }
+
+        if (TextureGLPreview != null)
+        {
+            TextureGLPreview.GpuErrorOccurred += (errMsg) =>
+            {
+                logger.Log(LoggerEvent.Warning, $"GPU texture preview error: {errMsg}. Falling back to CPU.");
+                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    useGpuTexturePreview = false;
+                    UpdateImagePreview();
+                });
+            };
         }
     }
 
@@ -153,6 +215,10 @@ public partial class MainWindow : Window
         if (GLPreviewControl != null)
         {
             GLPreviewControl.IsVisible = false;
+        }
+        if (TextureGLPreview != null)
+        {
+            TextureGLPreview.IsVisible = false;
         }
         if (PreviewInfoBorder != null)
         {
@@ -1226,6 +1292,10 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.IsVisible = false;
         }
+        if (TextureGLPreview != null)
+        {
+            TextureGLPreview.IsVisible = false;
+        }
         if (PreviewInfoBorder != null)
         {
             PreviewInfoBorder.IsVisible = false;
@@ -1710,8 +1780,87 @@ public partial class MainWindow : Window
         if (currentPreviewTexture == null && currentPreviewSprite == null)
             return;
 
+        if (currentPreviewTexture != null && useGpuTexturePreview && TextureGLPreview != null)
+        {
+            try
+            {
+                ImagePreviewBox.IsVisible = false;
+                GLPreviewControl.IsVisible = false;
+                TextPreviewBox.IsVisible = false;
+                PreviewLabel.IsVisible = false;
+                TextureGLPreview.IsVisible = true;
+                TextureGLPreview.Focus();
+
+                TextureGLPreview.SetTexture(currentPreviewTexture);
+                TextureGLPreview.SetChannels(textureChannels);
+
+                string infoText = $"Width: {currentPreviewTexture.m_Width}\nHeight: {currentPreviewTexture.m_Height}\nFormat: {currentPreviewTexture.m_TextureFormat}";
+                switch (currentPreviewTexture.m_TextureSettings.m_FilterMode)
+                {
+                    case 0: infoText += "\nFilter Mode: Point "; break;
+                    case 1: infoText += "\nFilter Mode: Bilinear "; break;
+                    case 2: infoText += "\nFilter Mode: Trilinear "; break;
+                }
+                infoText += $"\nAnisotropic level: {currentPreviewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {currentPreviewTexture.m_TextureSettings.m_MipBias}";
+                switch (currentPreviewTexture.m_TextureSettings.m_WrapMode)
+                {
+                    case 0: infoText += "\nWrap mode: Repeat"; break;
+                    case 1: infoText += "\nWrap mode: Clamp"; break;
+                }
+
+                int validChannel = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    if (textureChannels[i]) validChannel++;
+                }
+
+                infoText += "\nChannels: ";
+                if (validChannel == 0)
+                {
+                    infoText += "None";
+                }
+                else
+                {
+                    var channelNames = new string[4] { "R", "G", "B", "A" };
+                    var activeList = new List<string>();
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (textureChannels[i])
+                            activeList.Add(channelNames[i]);
+                    }
+                    infoText += string.Join(" ", activeList);
+                }
+                infoText += "\nRender mode: GPU (OpenGL)";
+
+                if (displayInfo.IsChecked == true)
+                {
+                    PreviewInfoOverlay.Text = infoText;
+                    PreviewInfoBorder.IsVisible = true;
+                }
+                else
+                {
+                    PreviewInfoBorder.IsVisible = false;
+                }
+
+                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
+                return;
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Warning, $"GPU texture preview failed: {ex.Message}. Falling back to CPU.");
+                useGpuTexturePreview = false;
+                // Fall through to CPU path
+            }
+        }
+
+        // CPU Fallback path
+        if (TextureGLPreview != null)
+        {
+            TextureGLPreview.IsVisible = false;
+        }
+
         long currentId = ++texturePreviewIdCounter;
-        StatusStripUpdate("Loading preview...");
+        StatusStripUpdate("Loading preview (CPU)...");
 
         Task.Run(() =>
         {
@@ -1814,6 +1963,7 @@ public partial class MainWindow : Window
                         }
                         infoText += string.Join(" ", activeList);
                     }
+                    infoText += "\nRender mode: CPU (Fallback)";
 
                     image.Dispose();
 
