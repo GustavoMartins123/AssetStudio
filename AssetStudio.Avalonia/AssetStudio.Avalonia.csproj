@@ -3,8 +3,10 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
+    <ApplicationIcon>Assets\as.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\'))</RepoRoot>
   </PropertyGroup>
 
   <ItemGroup>
@@ -23,4 +25,20 @@
     <ProjectReference Include="..\AssetStudio\AssetStudio.csproj" />
     <ProjectReference Include="..\AssetStudioUtility\AssetStudioUtility.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Assets\as.ico" />
+  </ItemGroup>
+
+  <Target Name="CopyExtraFiles" AfterTargets="AfterBuild">
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
+  </Target>
+
+  <Target Name="PublishExtraFiles" AfterTargets="Publish">
+    <Copy SourceFiles="$(TargetDir)x86\Texture2DDecoderNative.dll" DestinationFolder="$(PublishDir)x86" Condition="Exists('$(TargetDir)x86\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(TargetDir)x64\Texture2DDecoderNative.dll" DestinationFolder="$(PublishDir)x64" Condition="Exists('$(TargetDir)x64\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(TargetDir)x64\libTexture2DDecoderNative.so" DestinationFolder="$(PublishDir)x64" Condition="Exists('$(TargetDir)x64\libTexture2DDecoderNative.so')" />
+  </Target>
 </Project>

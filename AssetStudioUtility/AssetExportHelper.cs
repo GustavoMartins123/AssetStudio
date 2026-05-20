@@ -12,61 +12,13 @@ namespace AssetStudio
     {
         public static bool ExportMaterial(Material material, string fallbackName, string exportPath, ImageFormat textureFormat)
         {
-            var exportMaterial = ResolveMaterialForExport(material) ?? material;
-            var exportName = string.IsNullOrEmpty(exportMaterial.m_Name) ? fallbackName : exportMaterial.m_Name;
+            var exportName = string.IsNullOrEmpty(material.m_Name) ? fallbackName : material.m_Name;
             Directory.CreateDirectory(exportPath);
             var filePath = Path.Combine(exportPath, FixFileName(exportName) + ".mat");
             if (File.Exists(filePath)) return false;
 
-            File.WriteAllText(filePath, BuildUnityMaterial(exportMaterial, exportName, exportPath, textureFormat), Encoding.UTF8);
+            File.WriteAllText(filePath, BuildUnityMaterial(material, exportName, exportPath, textureFormat), Encoding.UTF8);
             return true;
-        }
-
-        private static Material ResolveMaterialForExport(Material material)
-        {
-            var visited = new HashSet<Material>();
-            while (material != null && visited.Add(material))
-            {
-                if (HasMaterialProperties(material))
-                {
-                    return material;
-                }
-
-                if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
-                {
-                    material = parent;
-                    continue;
-                }
-
-                break;
-            }
-
-            return null;
-        }
-
-        private static bool HasMaterialProperties(Material material)
-        {
-            if (material == null || string.IsNullOrEmpty(material.m_Name))
-            {
-                return false;
-            }
-
-            var properties = material.m_SavedProperties;
-            if (properties == null)
-            {
-                return true;
-            }
-
-            var texEnvs = properties.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>();
-            if (texEnvs.Any(x => x.Value?.m_Texture != null && !x.Value.m_Texture.IsNull))
-            {
-                return true;
-            }
-
-            return properties.m_Ints?.Length > 0
-                || properties.m_Floats?.Length > 0
-                || properties.m_Colors?.Length > 0
-                || material.m_Shader != null && !material.m_Shader.IsNull;
         }
 
         private static string BuildUnityMaterial(Material material, string materialName, string exportPath, ImageFormat textureFormat)

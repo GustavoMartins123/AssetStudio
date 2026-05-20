@@ -373,18 +373,11 @@ namespace AssetStudio
                 {
                     if (meshR.m_Materials[i - firstSubMesh].TryGet(out var m_Material))
                     {
-                        mat = ResolveMaterial(m_Material);
+                        mat = m_Material;
                     }
                 }
-                if (mat == null)
-                {
-                    mat = FindFallbackMaterial(meshR, i - firstSubMesh);
-                }
                 ImportedMaterial iMat = ConvertMaterial(mat);
-                if (!string.IsNullOrEmpty(iMat?.Name))
-                {
-                    iSubmesh.Material = iMat.Name;
-                }
+                iSubmesh.Material = iMat.Name;
                 iSubmesh.BaseVertex = (int)mesh.m_SubMeshes[i].firstVertex;
 
                 //Face
@@ -698,97 +691,6 @@ namespace AssetStudio
             return m_GameObject.m_Name;
         }
 
-        private static Material FindFallbackMaterial(Renderer renderer, int preferredIndex)
-        {
-            if (preferredIndex >= 0)
-            {
-                for (var i = preferredIndex + 1; i < renderer.m_Materials.Length; i++)
-                {
-                    if (renderer.m_Materials[i].TryGet(out var material))
-                    {
-                        material = ResolveMaterial(material);
-                        if (material != null)
-                        {
-                            return material;
-                        }
-                    }
-                }
-
-                for (var i = preferredIndex - 1; i >= 0; i--)
-                {
-                    if (renderer.m_Materials[i].TryGet(out var material))
-                    {
-                        material = ResolveMaterial(material);
-                        if (material != null)
-                        {
-                            return material;
-                        }
-                    }
-                }
-            }
-
-            foreach (var pptr in renderer.m_Materials)
-            {
-                if (pptr.TryGet(out var material))
-                {
-                    material = ResolveMaterial(material);
-                    if (material != null)
-                    {
-                        return material;
-                    }
-                }
-            }
-            return null;
-        }
-
-        private static Material ResolveMaterial(Material material)
-        {
-            var visited = new HashSet<Material>();
-            while (material != null && visited.Add(material))
-            {
-                if (IsUsableMaterial(material))
-                {
-                    return material;
-                }
-
-                if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
-                {
-                    material = parent;
-                    continue;
-                }
-
-                break;
-            }
-
-            return null;
-        }
-
-        private static bool IsUsableMaterial(Material material)
-        {
-            if (material == null || string.IsNullOrEmpty(material.m_Name))
-            {
-                return false;
-            }
-
-            var properties = material.m_SavedProperties;
-            if (properties == null)
-            {
-                return true;
-            }
-
-            var texEnvs = properties.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>();
-            var hasTextureReference = texEnvs.Any(x => x.Value?.m_Texture != null && !x.Value.m_Texture.IsNull);
-            if (texEnvs.Length > 0)
-            {
-                return hasTextureReference;
-            }
-
-            return properties.m_Ints?.Length > 0
-                || properties.m_Floats?.Length > 0
-                || properties.m_Colors?.Length > 0
-                || material.m_Shader != null && !material.m_Shader.IsNull;
-        }
-
         private ImportedMaterial ConvertMaterial(Material mat)
         {
             ImportedMaterial iMat;
@@ -896,7 +798,7 @@ namespace AssetStudio
             }
             else
             {
-                iMat = null;
+                iMat = new ImportedMaterial();
             }
             return iMat;
         }

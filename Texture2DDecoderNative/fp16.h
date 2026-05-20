@@ -2,7 +2,14 @@
 #ifndef FP16_H
 #define FP16_H
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
 #include "fp16/fp16.h"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #endif /* FP16_H */
 

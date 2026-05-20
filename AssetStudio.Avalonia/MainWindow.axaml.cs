@@ -148,6 +148,24 @@ public partial class MainWindow : Window
         };
     }
 
+    private async Task<FilePickerSaveOptions> CreateFbxSaveOptions(string title, string suggestedFileName)
+    {
+        return new FilePickerSaveOptions
+        {
+            Title = title,
+            SuggestedFileName = suggestedFileName,
+            DefaultExtension = "fbx",
+            SuggestedStartLocation = await TryGetFolder(appSettings.ExportFolderPath),
+            FileTypeChoices = new[]
+            {
+                new FilePickerFileType("Fbx file")
+                {
+                    Patterns = new[] { "*.fbx" }
+                }
+            }
+        };
+    }
+
     private void SaveLoadFolder(string path)
     {
         var folder = Directory.Exists(path) ? path : Path.GetDirectoryName(path);
@@ -718,8 +736,17 @@ public partial class MainWindow : Window
             if (pptr.TryGet(out var obj) && objectAssetItemDic.TryGetValue(obj, out var item))
             {
                 item.Container = container;
+                if (obj is Material material && string.IsNullOrEmpty(material.m_Name))
+                {
+                    var name = Path.GetFileNameWithoutExtension(container);
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        item.Name = name;
+                    }
+                }
             }
         }
+        LinkFbxSubAssetsToSceneNodes();
         containers.Clear();
         objectAssetItemDic.Clear();
 
@@ -1256,19 +1283,7 @@ public partial class MainWindow : Window
             IImported convert = selectedGameObjects.Count > 0
                 ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
                 : new ModelConverter((Animator)animator.Asset, exportOptions.ConvertTextureFormat, clips);
-            ModelExporter.ExportFbx(exportFile, convert,
-                exportOptions.EulerFilter,
-                (float)exportOptions.FilterPrecision,
-                exportOptions.ExportAllNodes,
-                exportOptions.ExportSkins,
-                exportOptions.ExportAnimations,
-                exportOptions.ExportBlendShape,
-                exportOptions.CastToBone,
-                (float)exportOptions.BoneSize,
-                exportOptions.ExportAllUvsAsDiffuseMaps,
-                (float)exportOptions.ScaleFactor,
-                exportOptions.FbxVersion,
-                exportOptions.FbxFormat == 1);
+            ExportFbx(convert, exportFile);
         });
 
         if (exportOptions.OpenAfterExport)
@@ -1276,6 +1291,346 @@ public partial class MainWindow : Window
             OpenFolder(exportPath);
         }
         StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+    }
+
+    private async void ExportAllObjectsSplit_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sceneTreeNodes.Count == 0)
+        {
+            StatusStripUpdate("No Objects available for export");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (folders == null || folders.Count == 0) return;
+
+        var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+        await ExportSplitObjects(savePath, sceneTreeNodes.SelectMany(x => x.Children).ToList(), null, createObjectFolders: true);
+    }
+
+    private async void ExportSelectedObjectsSplit_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportSelectedObjectsSplit(false);
+    }
+
+    private async void ExportSelectedObjectsSplitWithAnimationClip_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportSelectedObjectsSplit(true);
+    }
+
+    private async Task ExportSelectedObjectsSplit(bool includeAnimations)
+    {
+        var selectedNodes = GetSelectedParentNodes();
+        if (selectedNodes.Count == 0)
+        {
+            StatusStripUpdate("No Object selected for export.");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (folders == null || folders.Count == 0) return;
+
+        var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+        var exportPath = Path.Combine(savePath, "GameObject");
+        Directory.CreateDirectory(exportPath);
+        await ExportSplitObjects(exportPath, selectedNodes, includeAnimations ? GetSelectedAnimationClips() : null, createObjectFolders: false);
+    }
+
+    private async void ExportSelectedObjectsMerge_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportSelectedObjectsMerge(false);
+    }
+
+    private async void ExportSelectedObjectsMergeWithAnimationClip_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportSelectedObjectsMerge(true);
+    }
+
+    private async Task ExportSelectedObjectsMerge(bool includeAnimations)
+    {
+        var gameObjects = GetSelectedParentNodes()
+            .Where(x => x.GameObject != null)
+            .Select(x => x.GameObject!)
+            .ToList();
+        if (gameObjects.Count == 0)
+        {
+            StatusStripUpdate("No Object selected for export.");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var suggestedName = FixFileName(gameObjects[0].m_Name) + " (merge).fbx";
+        var file = await topLevel.StorageProvider.SaveFilePickerAsync(await CreateFbxSaveOptions("Save merged FBX", suggestedName));
+        if (file == null) return;
+
+        var exportFile = file.Path.LocalPath;
+        var exportFolder = Path.GetDirectoryName(exportFile);
+        if (!string.IsNullOrEmpty(exportFolder))
+        {
+            SaveExportFolder(exportFolder);
+        }
+
+        var clips = includeAnimations ? GetSelectedAnimationClips() : null;
+        StatusStripUpdate($"Exporting {Path.GetFileName(exportFile)}");
+        await Task.Run(() =>
+        {
+            IImported convert = gameObjects.Count == 1
+                ? CreateModelConverter(gameObjects[0], clips)
+                : CreateModelConverter(Path.GetFileNameWithoutExtension(exportFile), gameObjects, clips);
+            ExportFbx(convert, exportFile);
+        });
+
+        progressBar.Value = 100;
+        if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+        {
+            OpenFolder(exportFolder);
+        }
+        StatusStripUpdate($"Finished exporting {Path.GetFileName(exportFile)}");
+    }
+
+    private async Task ExportSplitObjects(string exportRoot, List<GameObjectNode> nodes, AnimationClip[]? clips, bool createObjectFolders)
+    {
+        var exportNodes = nodes
+            .Where(node => node.GameObject != null)
+            .Where(HasModelContent)
+            .ToList();
+        if (exportNodes.Count == 0)
+        {
+            StatusStripUpdate("No Objects available for export");
+            return;
+        }
+
+        Directory.CreateDirectory(exportRoot);
+        StatusStripUpdate($"Exporting {exportNodes.Count} objects...");
+        await Task.Run(() =>
+        {
+            for (var i = 0; i < exportNodes.Count; i++)
+            {
+                var node = exportNodes[i];
+                var gameObject = node.GameObject!;
+                var targetFolder = createObjectFolders
+                    ? GetUniqueDirectoryPath(Path.Combine(exportRoot, FixFileName(gameObject.m_Name)))
+                    : exportRoot;
+                Directory.CreateDirectory(targetFolder);
+
+                var exportFile = GetUniqueFilePath(Path.Combine(targetFolder, FixFileName(gameObject.m_Name) + ".fbx"));
+                StatusStripUpdate($"Exporting {Path.GetFileName(exportFile)}");
+                var convert = CreateModelConverter(gameObject, clips);
+                ExportFbx(convert, exportFile);
+
+                var progress = (int)((i + 1.0) / exportNodes.Count * 100);
+                Dispatcher.UIThread.Post(() => progressBar.Value = progress);
+            }
+        });
+
+        if (exportOptions.OpenAfterExport)
+        {
+            OpenFolder(exportRoot);
+        }
+        StatusStripUpdate("Finished");
+    }
+
+    private AnimationClip[]? GetSelectedAnimationClips()
+    {
+        var clips = GetSelectedAssets()
+            .Where(x => x.Type == ClassIDType.AnimationClip)
+            .Select(x => (AnimationClip)x.Asset)
+            .ToArray();
+        return clips.Length == 0 ? null : clips;
+    }
+
+    private ModelConverter CreateModelConverter(string rootName, List<GameObject> gameObjects, AnimationClip[]? clips)
+    {
+        return clips == null
+            ? new ModelConverter(rootName, gameObjects, exportOptions.ConvertTextureFormat)
+            : new ModelConverter(rootName, gameObjects, exportOptions.ConvertTextureFormat, clips);
+    }
+
+    private ModelConverter CreateModelConverter(GameObject gameObject, AnimationClip[]? clips)
+    {
+        return clips == null
+            ? new ModelConverter(gameObject, exportOptions.ConvertTextureFormat)
+            : new ModelConverter(gameObject, exportOptions.ConvertTextureFormat, clips);
+    }
+
+    private List<GameObjectNode> GetSelectedParentNodes()
+    {
+        var nodes = new List<GameObjectNode>();
+        foreach (var root in sceneTreeNodes)
+        {
+            CollectSelectedParentNodes(root, nodes);
+        }
+        return nodes;
+    }
+
+    private static void CollectSelectedParentNodes(GameObjectNode node, List<GameObjectNode> nodes)
+    {
+        if (node.GameObject != null && node.IsChecked)
+        {
+            nodes.Add(node);
+            return;
+        }
+
+        foreach (var child in node.Children)
+        {
+            CollectSelectedParentNodes(child, nodes);
+        }
+    }
+
+    private static bool HasModelContent(GameObjectNode node)
+    {
+        var gameObjects = new List<GameObject>();
+        CollectGameObjects(node, gameObjects);
+        return gameObjects.Any(x => x.m_SkinnedMeshRenderer != null || x.m_MeshFilter != null);
+    }
+
+    private static void CollectGameObjects(GameObjectNode node, List<GameObject> gameObjects)
+    {
+        if (node.GameObject != null)
+        {
+            gameObjects.Add(node.GameObject);
+        }
+
+        foreach (var child in node.Children)
+        {
+            CollectGameObjects(child, gameObjects);
+        }
+    }
+
+    private static string GetUniqueDirectoryPath(string directoryPath)
+    {
+        var candidate = directoryPath;
+        for (var i = 1; Directory.Exists(candidate); i++)
+        {
+            candidate = $"{directoryPath} ({i})";
+        }
+        return candidate;
+    }
+
+    private static string GetUniqueFilePath(string filePath)
+    {
+        if (!File.Exists(filePath)) return filePath;
+
+        var directory = Path.GetDirectoryName(filePath) ?? string.Empty;
+        var name = Path.GetFileNameWithoutExtension(filePath);
+        var extension = Path.GetExtension(filePath);
+        for (var i = 1; ; i++)
+        {
+            var candidate = Path.Combine(directory, $"{name} ({i}){extension}");
+            if (!File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+
+    private void LinkFbxSubAssetsToSceneNodes()
+    {
+        var fbxNodes = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in exportableAssets)
+        {
+            if (item.TreeNode?.GameObject == null)
+            {
+                continue;
+            }
+
+            var fbxContainer = GetFbxContainerPath(item.Container);
+            if (fbxContainer == null)
+            {
+                continue;
+            }
+
+            fbxNodes.TryAdd(fbxContainer, GetFbxRootNode(item.TreeNode, fbxContainer));
+        }
+
+        foreach (var item in exportableAssets)
+        {
+            var fbxContainer = GetFbxContainerPath(item.Container);
+            if (fbxContainer == null || fbxNodes.ContainsKey(fbxContainer))
+            {
+                continue;
+            }
+
+            var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
+            var node = FindSceneNodeByName(fbxName);
+            if (node?.GameObject != null)
+            {
+                fbxNodes[fbxContainer] = node;
+            }
+        }
+
+        foreach (var item in exportableAssets)
+        {
+            var fbxContainer = GetFbxContainerPath(item.Container);
+            if (fbxContainer == null || !fbxNodes.TryGetValue(fbxContainer, out var node))
+            {
+                continue;
+            }
+
+            item.TreeNode = node;
+            if (item.Asset is Mesh or Animator)
+            {
+                var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
+                if (!string.IsNullOrEmpty(fbxName))
+                {
+                    item.Name = fbxName;
+                }
+            }
+        }
+    }
+
+    private static GameObjectNode GetFbxRootNode(GameObjectNode node, string fbxContainer)
+    {
+        var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
+        var current = node;
+        while (current.Parent?.GameObject != null)
+        {
+            current = current.Parent;
+        }
+
+        var namedRoot = FindNodeByName(current, fbxName);
+        return namedRoot ?? current;
+    }
+
+    private static GameObjectNode? FindNodeByName(GameObjectNode node, string name)
+    {
+        if (node.GameObject != null && string.Equals(node.Name, name, StringComparison.OrdinalIgnoreCase))
+        {
+            return node;
+        }
+
+        foreach (var child in node.Children)
+        {
+            var match = FindNodeByName(child, name);
+            if (match != null)
+            {
+                return match;
+            }
+        }
+
+        return null;
+    }
+
+    private GameObjectNode? FindSceneNodeByName(string name)
+    {
+        foreach (var root in sceneTreeNodes)
+        {
+            var match = FindNodeByName(root, name);
+            if (match != null)
+            {
+                return match;
+            }
+        }
+
+        return null;
     }
 
     private static List<GameObject> GetTopLevelSelectedGameObjects(List<GameObject> gameObjects)
@@ -1380,10 +1735,14 @@ public partial class MainWindow : Window
     private bool ExportConvertFile(AssetItem item, string exportPath)
     {
         Directory.CreateDirectory(exportPath);
-        var fileName = FixFileName(item.Name);
+        var fileName = FixFileName(GetExportFileName(item));
 
         switch (item.Asset)
         {
+            case Mesh m_Mesh:
+            {
+                return ExportMesh(item, m_Mesh, exportPath, fileName);
+            }
             case Texture2D m_Texture2D:
             {
                 if (!exportOptions.ConvertTexture)
@@ -1495,6 +1854,151 @@ public partial class MainWindow : Window
                 return true;
             }
         }
+    }
+
+    private bool ExportMesh(AssetItem item, Mesh mesh, string exportPath, string fileName)
+    {
+        if (item.TreeNode?.GameObject != null)
+        {
+            var fbxPath = Path.Combine(exportPath, fileName + ".fbx");
+            if (File.Exists(fbxPath))
+            {
+                fbxPath = Path.Combine(exportPath, fileName + item.UniqueID + ".fbx");
+            }
+
+            var convert = new ModelConverter(item.TreeNode.GameObject, exportOptions.ConvertTextureFormat);
+            if (convert.MeshList.Count > 0)
+            {
+                ExportFbx(convert, fbxPath);
+                return true;
+            }
+        }
+
+        if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
+        {
+            return false;
+        }
+
+        var objPath = Path.Combine(exportPath, fileName + ".obj");
+        if (File.Exists(objPath)) return false;
+
+        using var writer = new StreamWriter(objPath, false, Encoding.UTF8);
+        writer.WriteLine("g " + mesh.m_Name);
+
+        var componentCount = mesh.m_Vertices.Length == mesh.m_VertexCount * 4 ? 4 : 3;
+        for (int v = 0; v < mesh.m_VertexCount; v++)
+        {
+            writer.WriteLine(
+                "v {0} {1} {2}",
+                CleanFloat(-mesh.m_Vertices[v * componentCount]),
+                CleanFloat(mesh.m_Vertices[v * componentCount + 1]),
+                CleanFloat(mesh.m_Vertices[v * componentCount + 2]));
+        }
+
+        if (mesh.m_UV0?.Length > 0)
+        {
+            componentCount = mesh.m_UV0.Length == mesh.m_VertexCount * 2
+                ? 2
+                : mesh.m_UV0.Length == mesh.m_VertexCount * 3
+                    ? 3
+                    : 4;
+            for (int v = 0; v < mesh.m_VertexCount; v++)
+            {
+                writer.WriteLine("vt {0} {1}", CleanFloat(mesh.m_UV0[v * componentCount]), CleanFloat(mesh.m_UV0[v * componentCount + 1]));
+            }
+        }
+
+        if (mesh.m_Normals?.Length > 0)
+        {
+            componentCount = mesh.m_Normals.Length == mesh.m_VertexCount * 4 ? 4 : 3;
+            for (int v = 0; v < mesh.m_VertexCount; v++)
+            {
+                writer.WriteLine(
+                    "vn {0} {1} {2}",
+                    CleanFloat(-mesh.m_Normals[v * componentCount]),
+                    CleanFloat(mesh.m_Normals[v * componentCount + 1]),
+                    CleanFloat(mesh.m_Normals[v * componentCount + 2]));
+            }
+        }
+
+        var firstFace = 0;
+        for (var i = 0; i < mesh.m_SubMeshes.Length; i++)
+        {
+            writer.WriteLine($"g {mesh.m_Name}_{i}");
+            var faceCount = (int)mesh.m_SubMeshes[i].indexCount / 3;
+            var end = firstFace + faceCount;
+            for (int f = firstFace; f < end; f++)
+            {
+                writer.WriteLine(
+                    "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}",
+                    mesh.m_Indices[f * 3 + 2] + 1,
+                    mesh.m_Indices[f * 3 + 1] + 1,
+                    mesh.m_Indices[f * 3] + 1);
+            }
+            firstFace = end;
+        }
+
+        return true;
+    }
+
+    private static string GetExportFileName(AssetItem item)
+    {
+        var fbxContainer = GetFbxContainerPath(item.Container);
+        if (fbxContainer != null && item.Asset is Mesh or Animator)
+        {
+            var name = Path.GetFileNameWithoutExtension(fbxContainer);
+            if (!string.IsNullOrEmpty(name))
+            {
+                return name;
+            }
+        }
+
+        return item.Name;
+    }
+
+    private static string? GetFbxContainerPath(string container)
+    {
+        if (string.IsNullOrEmpty(container))
+        {
+            return null;
+        }
+
+        var parts = container.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+        var path = string.Empty;
+        foreach (var part in parts)
+        {
+            path = string.IsNullOrEmpty(path) ? part : Path.Combine(path, part);
+            if (string.Equals(Path.GetExtension(part), ".fbx", StringComparison.OrdinalIgnoreCase))
+            {
+                return path;
+            }
+        }
+
+        return null;
+    }
+
+    private void ExportFbx(IImported convert, string exportFile)
+    {
+        ModelExporter.ExportFbx(exportFile, convert,
+            exportOptions.EulerFilter,
+            (float)exportOptions.FilterPrecision,
+            exportOptions.ExportAllNodes,
+            exportOptions.ExportSkins,
+            exportOptions.ExportAnimations,
+            exportOptions.ExportBlendShape,
+            exportOptions.CastToBone,
+            (float)exportOptions.BoneSize,
+            exportOptions.ExportAllUvsAsDiffuseMaps,
+            (float)exportOptions.ScaleFactor,
+            exportOptions.FbxVersion,
+            exportOptions.FbxFormat == 1);
+    }
+
+    private static string CleanFloat(float value)
+    {
+        return float.IsNaN(value) || float.IsInfinity(value)
+            ? "0"
+            : value.ToString(CultureInfo.InvariantCulture);
     }
 
     private static string FixFileName(string name)
@@ -1669,8 +2173,14 @@ public class AssetItem
 
     private bool IsFbxSubAsset()
     {
-        return !string.IsNullOrEmpty(Container)
-            && string.Equals(Path.GetExtension(Container), ".fbx", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(Container))
+        {
+            return false;
+        }
+
+        return Container
+            .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+            .Any(part => string.Equals(Path.GetExtension(part), ".fbx", StringComparison.OrdinalIgnoreCase));
     }
 }
 

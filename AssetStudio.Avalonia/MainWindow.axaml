@@ -6,6 +6,7 @@
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
         Title="AssetStudio (Avalonia Linux Port)"
+        Icon="/Assets/as.ico"
         Width="1264" Height="681"
         WindowStartupLocation="CenterScreen">
     
@@ -29,19 +30,19 @@
                 <MenuItem Header="Export options" Click="ShowExportOptions_Click" />
             </MenuItem>
             <MenuItem Header="_Model">
-                <MenuItem Header="Export all objects (split)" />
-                <MenuItem Header="Export selected objects (split)" />
-                <MenuItem Header="Export selected objects (split) + selected AnimationClips" />
+                <MenuItem Header="Export all objects (split)" Click="ExportAllObjectsSplit_Click" />
+                <MenuItem Header="Export selected objects (split)" Click="ExportSelectedObjectsSplit_Click" />
+                <MenuItem Header="Export selected objects (split) + selected AnimationClips" Click="ExportSelectedObjectsSplitWithAnimationClip_Click" />
                 <Separator />
-                <MenuItem Header="Export selected objects (merge)" />
-                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" />
+                <MenuItem Header="Export selected objects (merge)" Click="ExportSelectedObjectsMerge_Click" />
+                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" Click="ExportSelectedObjectsMergeWithAnimationClip_Click" />
             </MenuItem>
             <MenuItem Header="_Export">
                 <MenuItem Header="All assets" Click="ExportAllAssets_Click" />
                 <MenuItem Header="Selected assets" Click="ExportSelectedAssets_Click" />
                 <MenuItem Header="Filtered assets" Click="ExportFilteredAssets_Click" />
                 <Separator />
-                <MenuItem Header="Animator + selected AnimationClips" />
+                <MenuItem Header="Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click" />
                 <Separator />
                 <MenuItem Header="Raw">
                     <MenuItem Header="All assets" Click="ExportAllAssetsRaw_Click" />

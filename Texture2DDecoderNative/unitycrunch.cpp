@@ -1,7 +1,15 @@
 #include "unitycrunch.h"
 #include <stdint.h>
 #include <algorithm>
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4018 4244)
+#endif
 #include "unitycrunch/crn_decomp.h"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 bool unity_crunch_unpack_level(const uint8_t* data, uint32_t data_size, uint32_t level_index, void** ret, uint32_t* ret_size) {
 	unitycrnd::crn_texture_info tex_info;
