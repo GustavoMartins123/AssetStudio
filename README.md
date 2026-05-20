@@ -1,5 +1,4 @@
 # AssetStudio
-[![Build status](https://ci.appveyor.com/api/projects/status/rnu7l90422pdewx4?svg=true)](https://ci.appveyor.com/project/Perfare/assetstudio/branch/master/artifacts)
 
 ## Attribution and maintenance note
 
@@ -19,7 +18,7 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
   * **Sprite** : crop Texture2D to png, tga, jpeg, bmp
   * **AudioClip** : mp3, ogg, wav, m4a, fsb. Supports converting FSB files to WAV(PCM) and real-time audio playback preview via FMOD.
   * **Font** : ttf, otf
-  * **Mesh** : obj, fbx, and real-time 3D preview via OpenGL (OpenGlControlBase on Linux)
+  * **Mesh** : obj, fbx, and real-time 3D preview via OpenGL
   * **TextAsset**
   * **Shader**
   * **MovieTexture**
@@ -84,7 +83,7 @@ When you select an asset of the MonoBehaviour type for the first time, AssetStud
 
 #### For Il2Cpp
 
-First, use my another program [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) to generate dummy dll, then when using AssetStudio to select the assembly directory, select the dummy dll folder.
+First, use [Il2CppDumper by Perfare](https://github.com/Perfare/Il2CppDumper) to generate dummy dlls, then when using AssetStudio to select the assembly directory, select the dummy dll folder.
 
 ## Build
 
@@ -157,7 +156,7 @@ x64/libfmod.so
 ```
 
 * `libTexture2DDecoderNative.so` is required for compressed texture formats.
-* `libfmod.so` is required for audio playback previewing.
+* `libfmod.so` is required for audio playback previewing. A precompiled copy of `libfmod.so` is included in this repository under `AssetStudio.Avalonia/Libraries/x64/` and will be automatically copied to the build output. If you need to obtain or update it manually, you can download the Linux Programmer's API from the [FMOD Downloads](https://www.fmod.com/download) page.
 
 ## Open source libraries used
 
