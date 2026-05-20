@@ -79,6 +79,10 @@ public partial class MainWindow : Window
         logger.ShowErrorMessage = appSettings.ShowErrorMessage;
         Logger.Default = logger;
         showErrorMessageMenu.IsChecked = appSettings.ShowErrorMessage;
+        exportOptions.CopyFrom(appSettings.ExportOptions);
+        displayAll.IsChecked = appSettings.DisplayAll;
+        displayInfo.IsChecked = appSettings.DisplayInfo;
+        enablePreview.IsChecked = appSettings.EnablePreview;
         Progress.Default = new Progress<int>(SetProgressBarValue);
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
@@ -146,6 +150,14 @@ public partial class MainWindow : Window
                     useGpuTexturePreview = false;
                     UpdateImagePreview();
                 });
+            };
+        }
+
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.GpuErrorOccurred += (errMsg) =>
+            {
+                logger.Log(LoggerEvent.Warning, $"GPU mesh preview error: {errMsg}.");
             };
         }
     }
@@ -391,6 +403,8 @@ public partial class MainWindow : Window
 
     private void DisplayAll_Click(object? sender, RoutedEventArgs e)
     {
+        appSettings.DisplayAll = displayAll.IsChecked == true;
+        appSettings.Save();
         if (assetsManager.assetsFileList.Count > 0)
         {
             BuildAssetStructures();
@@ -399,6 +413,8 @@ public partial class MainWindow : Window
 
     private void EnablePreview_Click(object? sender, RoutedEventArgs e)
     {
+        appSettings.EnablePreview = enablePreview.IsChecked == true;
+        appSettings.Save();
         if (enablePreview.IsChecked != true)
         {
             ClearPreview("Preview disabled");
@@ -411,6 +427,8 @@ public partial class MainWindow : Window
 
     private void DisplayInfo_Click(object? sender, RoutedEventArgs e)
     {
+        appSettings.DisplayInfo = displayInfo.IsChecked == true;
+        appSettings.Save();
         if (AssetListDataGrid.SelectedItem is AssetItem selected)
         {
             PreviewLabel.Text = displayInfo.IsChecked == true
@@ -454,6 +472,8 @@ public partial class MainWindow : Window
         if (result == null) return;
 
         exportOptions.CopyFrom(result);
+        appSettings.ExportOptions.CopyFrom(result);
+        appSettings.Save();
         StatusStripUpdate("Export options updated.");
     }
 
@@ -1288,7 +1308,7 @@ public partial class MainWindow : Window
             ImagePreviewBox.Source = null;
             ImagePreviewBox.IsVisible = false;
         }
-        if (GLPreviewControl != null)
+        if (GLPreviewControl != null && assetItem.Asset is not Material)
         {
             GLPreviewControl.IsVisible = false;
         }
@@ -4296,6 +4316,10 @@ public sealed class AvaloniaAppSettings
     public string LoadFolderPath { get; set; } = string.Empty;
     public string ExportFolderPath { get; set; } = string.Empty;
     public bool ShowErrorMessage { get; set; } = false;
+    public bool DisplayAll { get; set; } = false;
+    public bool DisplayInfo { get; set; } = true;
+    public bool EnablePreview { get; set; } = true;
+    public ExportOptionsState ExportOptions { get; set; } = new();
 
     public static AvaloniaAppSettings Load()
     {

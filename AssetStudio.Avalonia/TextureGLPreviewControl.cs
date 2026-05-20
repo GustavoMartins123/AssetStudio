@@ -14,10 +14,9 @@ namespace AssetStudio.Avalonia
 {
     public class TextureGLPreviewControl : OpenGlControlBase
     {
-        // Shaders
-        private const string vsSource = @"#version 140
-in vec2 vertexPosition;
-in vec2 vertexTexCoord;
+        private const string vsSource = @"
+layout(location = 0) in vec2 vertexPosition;
+layout(location = 1) in vec2 vertexTexCoord;
 out vec2 texCoord;
 uniform mat4 u_mvp;
 void main()
@@ -26,9 +25,9 @@ void main()
     texCoord = vertexTexCoord;
 }";
 
-        private const string fsSource = @"#version 140
+        private const string fsSource = @"
 in vec2 texCoord;
-out vec4 outputColor;
+layout(location = 0) out vec4 outputColor;
 uniform sampler2D mainTex;
 uniform vec4 channelMask;
 uniform int isAlphaOnly;
@@ -50,10 +49,11 @@ void main()
     }
 }";
 
+        private const int LocationPosition = 0;
+        private const int LocationTexCoord = 1;
+
         // Programs and bindings
         private int pgmID;
-        private int attributeVertexPosition;
-        private int attributeTexCoord;
         private int uniformTexture;
         private int uniformMvp;
         private int uniformChannelMask;
@@ -153,11 +153,17 @@ void main()
             try
             {
                 GL.LoadBindings(new AvaloniaBindingsContext(gl));
+                
+                var version = gl.ContextInfo?.Version;
+                bool isGles = version.HasValue && version.Value.Type == GlProfileType.OpenGLES;
+                string glslVersion = isGles ? "#version 300 es" : "#version 330 core";
+                string precision = isGles ? "precision mediump float;" : "";
+
                 GL.ClearColor(0.15f, 0.15f, 0.15f, 1.0f);
 
                 pgmID = GL.CreateProgram();
-                LoadShaderFromString(vsSource, ShaderType.VertexShader, pgmID, out _);
-                LoadShaderFromString(fsSource, ShaderType.FragmentShader, pgmID, out _);
+                LoadShaderFromString($"{glslVersion}\n{vsSource}", ShaderType.VertexShader, pgmID, out _);
+                LoadShaderFromString($"{glslVersion}\n{precision}\n{fsSource}", ShaderType.FragmentShader, pgmID, out _);
                 GL.LinkProgram(pgmID);
 
                 GL.GetProgram(pgmID, GetProgramParameterName.LinkStatus, out int status);
@@ -167,8 +173,6 @@ void main()
                     throw new Exception($"GL Program link error: {log}");
                 }
 
-                attributeVertexPosition = GL.GetAttribLocation(pgmID, "vertexPosition");
-                attributeTexCoord = GL.GetAttribLocation(pgmID, "vertexTexCoord");
                 uniformTexture = GL.GetUniformLocation(pgmID, "mainTex");
                 uniformMvp = GL.GetUniformLocation(pgmID, "u_mvp");
                 uniformChannelMask = GL.GetUniformLocation(pgmID, "channelMask");
@@ -295,11 +299,11 @@ void main()
                     GL.BufferData(BufferTarget.ElementArrayBuffer, (IntPtr)(indices.Length * sizeof(int)), indices, BufferUsageHint.StaticDraw);
 
                     int stride = 4 * sizeof(float);
-                    GL.VertexAttribPointer(attributeVertexPosition, 2, VertexAttribPointerType.Float, false, stride, 0);
-                    GL.EnableVertexAttribArray(attributeVertexPosition);
+                    GL.VertexAttribPointer(LocationPosition, 2, VertexAttribPointerType.Float, false, stride, 0);
+                    GL.EnableVertexAttribArray(LocationPosition);
 
-                    GL.VertexAttribPointer(attributeTexCoord, 2, VertexAttribPointerType.Float, false, stride, (IntPtr)(2 * sizeof(float)));
-                    GL.EnableVertexAttribArray(attributeTexCoord);
+                    GL.VertexAttribPointer(LocationTexCoord, 2, VertexAttribPointerType.Float, false, stride, (IntPtr)(2 * sizeof(float)));
+                    GL.EnableVertexAttribArray(LocationTexCoord);
 
                     GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
                     GL.BindVertexArray(0);
