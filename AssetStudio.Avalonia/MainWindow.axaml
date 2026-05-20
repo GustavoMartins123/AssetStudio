@@ -158,8 +158,16 @@
                         <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="White" />
                         <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
                         <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True" />
-                        <Border x:Name="PreviewInfoBorder" Background="#90000000" CornerRadius="4" Padding="8" Margin="10" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="False">
-                            <TextBlock x:Name="PreviewInfoOverlay" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" />
+                        <Border x:Name="PreviewInfoBorder" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="False">
+                            <Grid RowDefinitions="Auto,*">
+                                <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="8,4,8,4">
+                                    <TextBlock Text="Mesh Information" VerticalAlignment="Center" Foreground="#AAA" FontWeight="Bold" FontSize="11" />
+                                    <Button Grid.Column="1" x:Name="TogglePreviewInfoBtn" Content="▼" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Click="TogglePreviewInfoBtn_Click" />
+                                </Grid>
+                                <ScrollViewer Grid.Row="1" x:Name="PreviewInfoScroll" MaxHeight="450" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                                    <TextBlock x:Name="PreviewInfoOverlay" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" Margin="8,0,8,8" />
+                                </ScrollViewer>
+                            </Grid>
                         </Border>
                     </Panel>
                 </TabItem>

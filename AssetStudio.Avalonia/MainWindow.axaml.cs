@@ -332,6 +332,16 @@ public partial class MainWindow : Window
         }
     }
 
+    private void TogglePreviewInfoBtn_Click(object? sender, RoutedEventArgs e)
+    {
+        if (PreviewInfoScroll != null && TogglePreviewInfoBtn != null)
+        {
+            bool isVisible = PreviewInfoScroll.IsVisible;
+            PreviewInfoScroll.IsVisible = !isVisible;
+            TogglePreviewInfoBtn.Content = !isVisible ? "▼" : "▲";
+        }
+    }
+
     private async void SetProjectRoot_Click(object? sender, RoutedEventArgs e)
     {
         var topLevel = TopLevel.GetTopLevel(this);
@@ -1086,6 +1096,26 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SetTextWithTruncation(TextBox textBox, string? text, string fallbackText = "")
+    {
+        if (text == null)
+        {
+            textBox.Text = fallbackText;
+            return;
+        }
+
+        const int maxChars = 100000;
+        if (text.Length > maxChars)
+        {
+            textBox.Text = text.Substring(0, maxChars) + 
+                $"{Environment.NewLine}...{Environment.NewLine}[Preview truncated: content is too large ({text.Length:N0} characters). Please export the asset to view full content]";
+        }
+        else
+        {
+            textBox.Text = text;
+        }
+    }
+
     private async Task UpdateDumpForSelectedAsset()
     {
         if (AssetListDataGrid.SelectedItem is not AssetItem assetItem)
@@ -1098,7 +1128,7 @@ public partial class MainWindow : Window
         try
         {
             var dump = await DumpAsset(assetItem.Asset);
-            DumpTextBox.Text = dump ?? "No Dump Available";
+            SetTextWithTruncation(DumpTextBox, dump, "No Dump Available");
         }
         catch (Exception ex)
         {
@@ -1108,13 +1138,20 @@ public partial class MainWindow : Window
 
     private async Task<string?> DumpAsset(Object asset)
     {
-        var dump = asset.Dump();
-        if (dump == null && asset is MonoBehaviour monoBehaviour)
+        if (asset is MonoBehaviour monoBehaviour)
         {
-            var typeTree = await MonoBehaviourToTypeTree(monoBehaviour);
-            dump = monoBehaviour.Dump(typeTree);
+            var dump = await Task.Run(() => monoBehaviour.Dump());
+            if (dump == null)
+            {
+                var typeTree = await MonoBehaviourToTypeTree(monoBehaviour);
+                dump = await Task.Run(() => monoBehaviour.Dump(typeTree));
+            }
+            return dump;
         }
-        return dump;
+        else
+        {
+            return await Task.Run(() => asset.Dump());
+        }
     }
 
     private async Task<TypeTree> MonoBehaviourToTypeTree(MonoBehaviour monoBehaviour)
@@ -1199,12 +1236,12 @@ public partial class MainWindow : Window
                 PreviewMaterial(assetItem, m_Material);
                 break;
             case TextAsset m_TextAsset:
-                TextPreviewBox.Text = fbxHeader + Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty);
+                SetTextWithTruncation(TextPreviewBox, fbxHeader + Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty));
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
             case Shader m_Shader:
-                TextPreviewBox.Text = fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read");
+                SetTextWithTruncation(TextPreviewBox, fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read"));
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
@@ -1227,7 +1264,7 @@ public partial class MainWindow : Window
                 StatusStripUpdate("Using OpenGL: OpenTK Core | 'Mouse Left'=Rotate | 'Mouse Right'=Move | 'Mouse Wheel'=Zoom | 'Ctrl W'=Wireframe | 'Ctrl S'=Shade | 'Ctrl N'=ReNormal");
                 break;
             case Object obj when obj.type == ClassIDType.PrefabInstance:
-                TextPreviewBox.Text = fbxHeader + FormatPrefab(obj);
+                SetTextWithTruncation(TextPreviewBox, fbxHeader + FormatPrefab(obj));
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
@@ -1244,7 +1281,7 @@ public partial class MainWindow : Window
             default:
                 if (dumpStr != null)
                 {
-                    TextPreviewBox.Text = fbxHeader + dumpStr;
+                    SetTextWithTruncation(TextPreviewBox, fbxHeader + dumpStr);
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
                 }
@@ -1596,7 +1633,7 @@ public partial class MainWindow : Window
             if (obj != null)
             {
                 var str = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
-                TextPreviewBox.Text = fbxHeader + str;
+                SetTextWithTruncation(TextPreviewBox, fbxHeader + str);
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 StatusStripUpdate("MonoBehaviour preview loaded (JSON format).");
@@ -1610,7 +1647,7 @@ public partial class MainWindow : Window
 
         if (dumpStr != null)
         {
-            TextPreviewBox.Text = fbxHeader + dumpStr;
+            SetTextWithTruncation(TextPreviewBox, fbxHeader + dumpStr);
             TextPreviewBox.IsVisible = true;
             PreviewLabel.IsVisible = false;
             StatusStripUpdate("MonoBehaviour loaded (text dump).");

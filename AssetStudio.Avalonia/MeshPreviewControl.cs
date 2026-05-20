@@ -5,6 +5,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.OpenGL;
 using Avalonia.OpenGL.Controls;
+using Avalonia.Media;
 using OpenTK;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
@@ -164,6 +165,18 @@ void main()
         private int pendingTextureWidth;
         private int pendingTextureHeight;
         private bool hasPendingTexture;
+
+        public MeshPreviewControl()
+        {
+            ClipToBounds = true;
+            Focusable = true;
+        }
+
+        public override void Render(DrawingContext context)
+        {
+            base.Render(context);
+            context.DrawRectangle(Brushes.Transparent, null, new Rect(Bounds.Size));
+        }
 
         public int WireframeMode
         {
