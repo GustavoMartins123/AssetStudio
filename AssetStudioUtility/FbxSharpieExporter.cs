@@ -127,7 +127,7 @@ namespace AssetStudio
             _frameGlobalMatrixMap[normalizedPath] = globalMatrix;
             var isBone = IsBonePath(normalizedPath);
             var zeroTransform = ShouldZeroBoneTransform(normalizedPath);
-            var modelType = isBone ? "LimbNode" : "Null";
+            var modelType = _meshPathSet.Contains(normalizedPath) ? "Mesh" : isBone ? "LimbNode" : "Null";
             var fbxName = GetUniqueFbxName(frame.Name);
 
             var model = N("Model");
@@ -292,14 +292,40 @@ namespace AssetStudio
             {
                 foreach (var face in sub.FaceList)
                 {
-                    indices.Add(face.VertexIndices[0]);
-                    indices.Add(face.VertexIndices[1]);
-                    indices.Add(~face.VertexIndices[2]);
+                    if (!TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                        continue;
+
+                    indices.Add(index0);
+                    indices.Add(index1);
+                    indices.Add(~index2);
                 }
             }
             var n = N("PolygonVertexIndex");
             n.AddProperty(new IntegerArrayToken(indices.ToArray()));
             geo.AddNode(n);
+        }
+
+        private static bool TryResolveFaceIndices(ImportedFace face, int baseVertex, int vertexCount, out int index0, out int index1, out int index2)
+        {
+            index0 = index1 = index2 = 0;
+            if (face?.VertexIndices == null || face.VertexIndices.Length < 3)
+                return false;
+
+            index0 = face.VertexIndices[0] + baseVertex;
+            index1 = face.VertexIndices[1] + baseVertex;
+            index2 = face.VertexIndices[2] + baseVertex;
+            if (IsValidIndex(index0, vertexCount) && IsValidIndex(index1, vertexCount) && IsValidIndex(index2, vertexCount))
+                return true;
+
+            index0 = face.VertexIndices[0];
+            index1 = face.VertexIndices[1];
+            index2 = face.VertexIndices[2];
+            return IsValidIndex(index0, vertexCount) && IsValidIndex(index1, vertexCount) && IsValidIndex(index2, vertexCount);
+        }
+
+        private static bool IsValidIndex(int index, int vertexCount)
+        {
+            return index >= 0 && index < vertexCount;
         }
 
         private void BuildLayerElementNormal(FbxNode geo, ImportedMesh mesh)
