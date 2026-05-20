@@ -37,6 +37,7 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
    - [.NET Desktop Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)
 - AssetStudio.Avalonia (Linux / Cross-Platform)
    - [.NET Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)
+   - Tested on: **Ubuntu 24.04.4 LTS**
 
 ## Usage
 
