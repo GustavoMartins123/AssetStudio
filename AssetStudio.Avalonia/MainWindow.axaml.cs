@@ -271,7 +271,13 @@ public partial class MainWindow : Window
 
         try
         {
-            return await topLevel.StorageProvider.TryGetFolderFromPathAsync(new Uri(path));
+            var absolutePath = Path.GetFullPath(path).Replace('\\', '/');
+            if (!absolutePath.StartsWith("/"))
+            {
+                absolutePath = "/" + absolutePath;
+            }
+            var uri = new Uri("file://" + absolutePath);
+            return await topLevel.StorageProvider.TryGetFolderFromPathAsync(uri);
         }
         catch
         {
@@ -2367,6 +2373,11 @@ public partial class MainWindow : Window
 
     private async Task ExportAssets(List<AssetItem> toExport, ExportMode mode)
     {
+        if (mode == ExportMode.Convert)
+        {
+            toExport = toExport.Where(x => !ShouldSkipConvertedAsset(x)).ToList();
+        }
+
         if (toExport.Count == 0)
         {
             StatusStripUpdate("No exportable assets loaded");
@@ -3142,11 +3153,21 @@ public partial class MainWindow : Window
 
     private bool ExportConvertFile(AssetItem item, string exportPath)
     {
+        if (ShouldSkipConvertedAsset(item))
+        {
+            return false;
+        }
+
         Directory.CreateDirectory(exportPath);
         var fileName = FixFileName(GetExportFileName(item));
 
         switch (item.Asset)
         {
+            case Animator _:
+            case AnimationClip _:
+            {
+                return false;
+            }
             case Mesh m_Mesh:
             {
                 return ExportMesh(item, m_Mesh, exportPath, fileName);
@@ -3315,6 +3336,13 @@ public partial class MainWindow : Window
         }
     }
 
+    private static bool ShouldSkipConvertedAsset(AssetItem item)
+    {
+        return item.Asset is Animator
+            || item.Asset is AnimationClip
+            || (item.IsFbxSubAsset() && (item.Asset is Material || item.Asset is Shader));
+    }
+
     private bool ExportMesh(AssetItem item, Mesh mesh, string exportPath, string fileName)
     {
         if (item.TreeNode?.GameObject != null)
@@ -3325,7 +3353,10 @@ public partial class MainWindow : Window
                 fbxPath = Path.Combine(exportPath, fileName + item.UniqueID + ".fbx");
             }
 
-            var convert = new ModelConverter(item.TreeNode.GameObject, exportOptions.ConvertTextureFormat);
+            var animator = FindAnimatorForModelExport(item);
+            var convert = animator != null
+                ? new ModelConverter(animator, exportOptions.ConvertTextureFormat)
+                : new ModelConverter(item.TreeNode.GameObject, exportOptions.ConvertTextureFormat);
             if (convert.MeshList.Count > 0)
             {
                 ExportFbx(convert, fbxPath);
@@ -3398,6 +3429,38 @@ public partial class MainWindow : Window
         }
 
         return true;
+    }
+
+    private Animator? FindAnimatorForModelExport(AssetItem item)
+    {
+        for (var node = item.TreeNode; node != null; node = node.Parent)
+        {
+            if (node.GameObject?.m_Animator != null)
+            {
+                return node.GameObject.m_Animator;
+            }
+        }
+
+        return item.TreeNode != null ? FindAnimatorInSceneNode(item.TreeNode) : null;
+    }
+
+    private static Animator? FindAnimatorInSceneNode(GameObjectNode node)
+    {
+        if (node.GameObject?.m_Animator != null)
+        {
+            return node.GameObject.m_Animator;
+        }
+
+        foreach (var child in node.Children)
+        {
+            var animator = FindAnimatorInSceneNode(child);
+            if (animator != null)
+            {
+                return animator;
+            }
+        }
+
+        return null;
     }
 
     private static string GetExportFileName(AssetItem item)
@@ -4510,7 +4573,7 @@ public class AssetItem
                type == ClassIDType.MonoBehaviour;
     }
 
-    private bool IsFbxSubAsset()
+    public bool IsFbxSubAsset()
     {
         if (string.IsNullOrEmpty(Container))
         {

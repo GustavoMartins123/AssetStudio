@@ -188,6 +188,17 @@ namespace AssetStudio
                 {
                     case AnimatorOverrideController m_AnimatorOverrideController:
                         {
+                            foreach (var clipOverride in m_AnimatorOverrideController.m_Clips)
+                            {
+                                if (clipOverride.m_OverrideClip.TryGet(out var m_OverrideClip))
+                                {
+                                    animationClipHashSet.Add(m_OverrideClip);
+                                }
+                                else if (clipOverride.m_OriginalClip.TryGet(out var m_OriginalClip))
+                                {
+                                    animationClipHashSet.Add(m_OriginalClip);
+                                }
+                            }
                             if (m_AnimatorOverrideController.m_Controller.TryGet<AnimatorController>(out var m_AnimatorController))
                             {
                                 foreach (var pptr in m_AnimatorController.m_AnimationClips)
@@ -371,10 +382,33 @@ namespace AssetStudio
                 Material mat = null;
                 if (i - firstSubMesh < meshR.m_Materials.Length)
                 {
-                    if (meshR.m_Materials[i - firstSubMesh].TryGet(out var m_Material))
+                    var matPPtr = meshR.m_Materials[i - firstSubMesh];
+                    if (matPPtr != null && !matPPtr.IsNull)
                     {
+                        if (!matPPtr.TryGet(out var m_Material))
+                        {
+                            Logger.Warning($"Material TryGet failed for submesh {i}: FileID={matPPtr.m_FileID}, PathID={matPPtr.m_PathID}. Searching all loaded files...");
+                            // Fallback: search all loaded files for this material by PathID
+                            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                            {
+                                if (sf.ObjectsDic.TryGetValue(matPPtr.m_PathID, out var obj) && obj is Material foundMat)
+                                {
+                                    m_Material = foundMat;
+                                    Logger.Info($"Found material '{foundMat.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                    break;
+                                }
+                            }
+                        }
                         mat = m_Material;
                     }
+                    else
+                    {
+                        Logger.Warning($"Material PPtr is null for submesh {i} (m_Materials.Length={meshR.m_Materials.Length}).");
+                    }
+                }
+                else
+                {
+                    Logger.Warning($"No material slot for submesh {i}: index {i - firstSubMesh} >= m_Materials.Length {meshR.m_Materials.Length}.");
                 }
                 ImportedMaterial iMat = ConvertMaterial(mat);
                 iSubmesh.Material = iMat.Name;

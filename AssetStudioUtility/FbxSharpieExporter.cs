@@ -252,6 +252,31 @@ namespace AssetStudio
             if (mesh.Path != null && TryGetFrameId(mesh.Path, out var meshModelId))
                 modelId = meshModelId;
 
+            // If no frame was found for this mesh, create a standalone Model node
+            // so geometry and materials can be properly connected
+            if (modelId == 0)
+            {
+                modelId = GenId();
+                var meshName = mesh.Path ?? "UnnamedMesh";
+                var lastSlash = meshName.LastIndexOf('/');
+                if (lastSlash >= 0) meshName = meshName.Substring(lastSlash + 1);
+                var fbxName = GetUniqueFbxName(meshName);
+
+                var model = N("Model");
+                model.AddProperty(new LongToken(modelId));
+                model.AddProperty(new StringToken($"Model::{fbxName}"));
+                model.AddProperty(new StringToken("Mesh"));
+
+                var props = N("Properties70");
+                props.AddNode(MakeP("Lcl Translation", "Lcl Translation", "", "A+", 0, 0, 0));
+                props.AddNode(MakeP("Lcl Rotation", "Lcl Rotation", "", "A+", 0, 0, 0));
+                props.AddNode(MakeP("Lcl Scaling", "Lcl Scaling", "", "A+", 1, 1, 1));
+                model.AddNode(props);
+
+                _objects.AddNode(model);
+                Connect(modelId, 0); // connect to root
+            }
+
             var geoId = GenId();
             _exportedMeshCount++;
             if (mesh.Path != null)
@@ -286,8 +311,7 @@ namespace AssetStudio
             BuildLayer(geo, mesh);
             _objects.AddNode(geo);
 
-            if (modelId != 0)
-                Connect(geoId, modelId);
+            Connect(geoId, modelId);
 
             ConnectMaterialsToModel(mesh, modelId, convert);
 
@@ -532,8 +556,13 @@ namespace AssetStudio
                 if (!string.IsNullOrEmpty(sub.Material) && materialIndexByName.TryGetValue(sub.Material, out var index))
                     materialIndex = index;
 
-                for (var i = 0; i < sub.FaceList.Count; i++)
-                    materialIndices.Add(materialIndex);
+                foreach (var face in sub.FaceList)
+                {
+                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out _, out _, out _))
+                    {
+                        materialIndices.Add(materialIndex);
+                    }
+                }
             }
 
             var matIdx = N("Materials");
