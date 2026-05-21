@@ -1414,7 +1414,6 @@ public partial class MainWindow : Window
                                     textureBytes[i] = textureBytes[i + 2];
                                     textureBytes[i + 2] = temp;
                                 }
-                                StatusStripUpdate($"Mesh texture loaded: {meshTexture.m_Name} ({texW}x{texH}) | Ctrl+S to toggle textured/shaded");
                             }
                         }
                         catch (Exception ex)
@@ -1455,8 +1454,14 @@ public partial class MainWindow : Window
                     });
                 }
                 PreviewLabel.IsVisible = false;
-                if (meshTexture == null)
+                if (meshTexture != null)
+                {
+                    StatusStripUpdate("OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded");
+                }
+                else
+                {
                     StatusStripUpdate("OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
+                }
                 break;
             }
             case Object obj when obj.type == ClassIDType.PrefabInstance:
@@ -1829,6 +1834,109 @@ public partial class MainWindow : Window
 
     private void PreviewAvatar(Avatar avatar)
     {
+        Mesh? avatarMesh = null;
+        var avatarItem = exportableAssets.FirstOrDefault(x => x.Asset == avatar);
+        var avatarContainer = avatarItem?.Container;
+        if (!string.IsNullOrEmpty(avatarContainer))
+        {
+            var avatarTokens = GetPathTokens(avatarContainer);
+            var candidates = avatar.assetsFile.Objects.OfType<Mesh>().ToList();
+            Mesh? bestMesh = null;
+            int bestScore = 0;
+            foreach (var mesh in candidates)
+            {
+                var meshItem = exportableAssets.FirstOrDefault(x => x.Asset == mesh);
+                var meshContainer = meshItem?.Container;
+                var meshTokens = GetPathTokens(!string.IsNullOrEmpty(meshContainer) ? meshContainer : mesh.m_Name);
+                var overlap = avatarTokens.Intersect(meshTokens, StringComparer.OrdinalIgnoreCase).Count();
+                if (overlap > bestScore)
+                {
+                    bestScore = overlap;
+                    bestMesh = mesh;
+                }
+            }
+            avatarMesh = bestMesh;
+        }
+
+        if (avatarMesh == null)
+        {
+            var avatarTokens = GetPathTokens(avatar.m_Name);
+            Mesh? bestMesh = null;
+            int bestScore = 0;
+            foreach (var file in assetsManager.assetsFileList)
+            {
+                foreach (var obj in file.Objects)
+                {
+                    if (obj is Mesh mesh)
+                    {
+                        var meshItem = exportableAssets.FirstOrDefault(x => x.Asset == mesh);
+                        var meshContainer = meshItem?.Container;
+                        var meshTokens = GetPathTokens(!string.IsNullOrEmpty(meshContainer) ? meshContainer : mesh.m_Name);
+                        var overlap = avatarTokens.Intersect(meshTokens, StringComparer.OrdinalIgnoreCase).Count();
+                        if (overlap > bestScore)
+                        {
+                            bestScore = overlap;
+                            bestMesh = mesh;
+                        }
+                    }
+                }
+            }
+            avatarMesh = bestMesh;
+        }
+
+        global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
+        int[]? parentIndices = null;
+
+        if (avatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null && avatar.m_Avatar.m_AvatarSkeletonPose?.m_X != null)
+        {
+            var nodes = avatar.m_Avatar.m_AvatarSkeleton.m_Node;
+            var poses = avatar.m_Avatar.m_AvatarSkeletonPose.m_X;
+            int count = Math.Min(nodes.Length, poses.Length);
+
+            bonePositions = new global::OpenTK.Mathematics.Vector3[count];
+            parentIndices = new int[count];
+
+            global::OpenTK.Mathematics.Matrix4[] globalMatrices = new global::OpenTK.Mathematics.Matrix4[count];
+
+            for (int i = 0; i < count; i++)
+            {
+                var node = nodes[i];
+                var pose = poses[i];
+
+                global::OpenTK.Mathematics.Matrix4 localMat = global::OpenTK.Mathematics.Matrix4.CreateScale(pose.s.X, pose.s.Y, pose.s.Z) *
+                                                              global::OpenTK.Mathematics.Matrix4.CreateFromQuaternion(new global::OpenTK.Mathematics.Quaternion(pose.q.X, pose.q.Y, pose.q.Z, pose.q.W)) *
+                                                              global::OpenTK.Mathematics.Matrix4.CreateTranslation(pose.t.X, pose.t.Y, pose.t.Z);
+
+                if (node.m_ParentId == -1 || node.m_ParentId >= count)
+                {
+                    globalMatrices[i] = localMat;
+                }
+                else
+                {
+                    globalMatrices[i] = localMat * globalMatrices[node.m_ParentId];
+                }
+
+                bonePositions[i] = globalMatrices[i].ExtractTranslation();
+                parentIndices[i] = node.m_ParentId;
+            }
+        }
+
+        if (avatarMesh != null && bonePositions != null && parentIndices != null && GLPreviewControl != null)
+        {
+            GLPreviewControl.SetAvatar(avatarMesh, bonePositions, parentIndices);
+            GLPreviewControl.IsVisible = true;
+            GLPreviewControl.Focus();
+            TextPreviewBox.IsVisible = false;
+            PreviewLabel.IsVisible = false;
+            StatusStripUpdate($"OpenGL Avatar Preview | Mesh: {avatarMesh.m_Name} | Skeleton Joints: {bonePositions.Length}");
+            return;
+        }
+
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.IsVisible = false;
+        }
+
         var sb = new StringBuilder();
         sb.AppendLine("=========================================");
         sb.AppendLine($"AVATAR: {avatar.m_Name}");

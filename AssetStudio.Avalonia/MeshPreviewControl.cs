@@ -58,6 +58,37 @@ void main()
 	outputColor = vec4(0.0, 0.0, 0.0, 1.0);
 }";
 
+        private const string vsSkeletonSource = @"
+layout(location = 0) in vec3 vertexPosition;
+uniform mat4 modelMatrix;
+uniform mat4 viewMatrix;
+uniform mat4 projMatrix;
+void main()
+{
+	gl_Position = projMatrix * viewMatrix * modelMatrix * vec4(vertexPosition, 1.0);
+}";
+
+        private const string fsGreenSource = @"
+layout(location = 0) out vec4 outputColor;
+void main()
+{
+	outputColor = vec4(0.0, 0.9, 0.1, 1.0);
+}";
+
+        private const string fsYellowSource = @"
+layout(location = 0) out vec4 outputColor;
+void main()
+{
+	outputColor = vec4(1.0, 0.9, 0.0, 1.0);
+}";
+
+        private const string fsRedSource = @"
+layout(location = 0) out vec4 outputColor;
+void main()
+{
+	outputColor = vec4(1.0, 0.3, 0.0, 1.0);
+}";
+
         private const string fsColorSource = @"
 layout(location = 0) out vec4 outputColor;
 in vec4 color;
@@ -128,6 +159,27 @@ void main()
         private int uniformModelMatrixTex;
         private int uniformViewMatrixTex;
         private int uniformProjMatrixTex;
+
+        private int pgmGreenID;
+        private int uniformModelMatrixGreen;
+        private int uniformViewMatrixGreen;
+        private int uniformProjMatrixGreen;
+
+        private int pgmYellowID;
+        private int uniformModelMatrixYellow;
+        private int uniformViewMatrixYellow;
+        private int uniformProjMatrixYellow;
+
+        private int pgmRedID;
+        private int uniformModelMatrixRed;
+        private int uniformViewMatrixRed;
+        private int uniformProjMatrixRed;
+
+        private int vaoSkeleton;
+        private int vboSkeleton;
+        private int boneLinesVertexCount;
+        private int jointPointsVertexCount;
+        private bool isAvatarMode;
 
         // VBO / VAO state
         private int vao;
@@ -216,6 +268,7 @@ void main()
 
         public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, byte[]? textureData = null, int textureWidth = 0, int textureHeight = 0)
         {
+            isAvatarMode = false;
             previewMaterialMode = false;
             if (m_Mesh.m_VertexCount <= 0) return;
 
@@ -562,6 +615,51 @@ void main()
                 uniformModelMatrixTex = GL.GetUniformLocation(pgmTexID, "modelMatrix");
                 uniformViewMatrixTex = GL.GetUniformLocation(pgmTexID, "viewMatrix");
                 uniformProjMatrixTex = GL.GetUniformLocation(pgmTexID, "projMatrix");
+
+                pgmGreenID = GL.CreateProgram();
+                LoadShaderFromString($"{glslVersion}\n{vsSkeletonSource}", ShaderType.VertexShader, pgmGreenID, out _);
+                LoadShaderFromString($"{glslVersion}\n{precision}\n{fsGreenSource}", ShaderType.FragmentShader, pgmGreenID, out _);
+                GL.LinkProgram(pgmGreenID);
+                GL.GetProgram(pgmGreenID, GetProgramParameterName.LinkStatus, out status);
+                if (status == 0)
+                {
+                    string log = GL.GetProgramInfoLog(pgmGreenID);
+                    throw new Exception($"Shader link error (pgmGreenID): {log}");
+                }
+
+                uniformModelMatrixGreen = GL.GetUniformLocation(pgmGreenID, "modelMatrix");
+                uniformViewMatrixGreen = GL.GetUniformLocation(pgmGreenID, "viewMatrix");
+                uniformProjMatrixGreen = GL.GetUniformLocation(pgmGreenID, "projMatrix");
+
+                pgmYellowID = GL.CreateProgram();
+                LoadShaderFromString($"{glslVersion}\n{vsSkeletonSource}", ShaderType.VertexShader, pgmYellowID, out _);
+                LoadShaderFromString($"{glslVersion}\n{precision}\n{fsYellowSource}", ShaderType.FragmentShader, pgmYellowID, out _);
+                GL.LinkProgram(pgmYellowID);
+                GL.GetProgram(pgmYellowID, GetProgramParameterName.LinkStatus, out status);
+                if (status == 0)
+                {
+                    string log = GL.GetProgramInfoLog(pgmYellowID);
+                    throw new Exception($"Shader link error (pgmYellowID): {log}");
+                }
+
+                uniformModelMatrixYellow = GL.GetUniformLocation(pgmYellowID, "modelMatrix");
+                uniformViewMatrixYellow = GL.GetUniformLocation(pgmYellowID, "viewMatrix");
+                uniformProjMatrixYellow = GL.GetUniformLocation(pgmYellowID, "projMatrix");
+
+                pgmRedID = GL.CreateProgram();
+                LoadShaderFromString($"{glslVersion}\n{vsSkeletonSource}", ShaderType.VertexShader, pgmRedID, out _);
+                LoadShaderFromString($"{glslVersion}\n{precision}\n{fsRedSource}", ShaderType.FragmentShader, pgmRedID, out _);
+                GL.LinkProgram(pgmRedID);
+                GL.GetProgram(pgmRedID, GetProgramParameterName.LinkStatus, out status);
+                if (status == 0)
+                {
+                    string log = GL.GetProgramInfoLog(pgmRedID);
+                    throw new Exception($"Shader link error (pgmRedID): {log}");
+                }
+
+                uniformModelMatrixRed = GL.GetUniformLocation(pgmRedID, "modelMatrix");
+                uniformViewMatrixRed = GL.GetUniformLocation(pgmRedID, "viewMatrix");
+                uniformProjMatrixRed = GL.GetUniformLocation(pgmRedID, "projMatrix");
             }
             catch (Exception ex)
             {
@@ -578,6 +676,9 @@ void main()
                 if (pgmColorID != 0) GL.DeleteProgram(pgmColorID);
                 if (pgmBlackID != 0) GL.DeleteProgram(pgmBlackID);
                 if (pgmTexID != 0) GL.DeleteProgram(pgmTexID);
+                if (pgmGreenID != 0) GL.DeleteProgram(pgmGreenID);
+                if (pgmYellowID != 0) GL.DeleteProgram(pgmYellowID);
+                if (pgmRedID != 0) GL.DeleteProgram(pgmRedID);
                 if (previewTextureId != 0) GL.DeleteTexture(previewTextureId);
             }
             catch
@@ -635,6 +736,60 @@ void main()
                 GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
                 GL.Enable(EnableCap.DepthTest);
                 GL.DepthFunc(DepthFunction.Lequal);
+
+                if (isAvatarMode)
+                {
+                    if (vao == 0)
+                    {
+                        CreateVAO();
+                    }
+
+                    if (vaoWireframe != 0)
+                    {
+                        GL.UseProgram(pgmGreenID);
+                        GL.UniformMatrix4(uniformModelMatrixGreen, false, ref modelMatrixData);
+                        GL.UniformMatrix4(uniformViewMatrixGreen, false, ref viewMatrixData);
+                        GL.UniformMatrix4(uniformProjMatrixGreen, false, ref projMatrixData);
+                        GL.BindVertexArray(vaoWireframe);
+                        int lineCount = indiceData != null ? (indiceData.Length / 3) * 6 : 0;
+                        if (lineCount > 0)
+                        {
+                            GL.DrawElements(BeginMode.Lines, lineCount, DrawElementsType.UnsignedInt, 0);
+                        }
+                    }
+
+                    if (vaoSkeleton != 0 && (boneLinesVertexCount > 0 || jointPointsVertexCount > 0))
+                    {
+                        GL.BindVertexArray(vaoSkeleton);
+
+                        if (boneLinesVertexCount > 0)
+                        {
+                            GL.LineWidth(3.0f);
+                            GL.UseProgram(pgmYellowID);
+                            GL.UniformMatrix4(uniformModelMatrixYellow, false, ref modelMatrixData);
+                            GL.UniformMatrix4(uniformViewMatrixYellow, false, ref viewMatrixData);
+                            GL.UniformMatrix4(uniformProjMatrixYellow, false, ref projMatrixData);
+                            GL.DrawArrays(BeginMode.Lines, 0, boneLinesVertexCount);
+                        }
+
+                        if (jointPointsVertexCount > 0)
+                        {
+                            GL.PointSize(10.0f);
+                            GL.UseProgram(pgmRedID);
+                            GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
+                            GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
+                            GL.UniformMatrix4(uniformProjMatrixRed, false, ref projMatrixData);
+                            GL.DrawArrays(BeginMode.Points, boneLinesVertexCount, jointPointsVertexCount);
+                        }
+
+                        GL.LineWidth(1.0f);
+                        GL.PointSize(1.0f);
+                    }
+
+                    GL.BindVertexArray(0);
+                    GL.Flush();
+                    return;
+                }
 
                 if (vao == 0)
                 {
@@ -854,6 +1009,16 @@ void main()
                 GL.DeleteVertexArrays(1, ref vaoWireframe);
                 vaoWireframe = 0;
             }
+            if (vaoSkeleton != 0)
+            {
+                GL.DeleteVertexArrays(1, ref vaoSkeleton);
+                vaoSkeleton = 0;
+            }
+            if (vboSkeleton != 0)
+            {
+                GL.DeleteBuffer(vboSkeleton);
+                vboSkeleton = 0;
+            }
             if (vbos.Count > 0)
             {
                 int[] arr = vbos.ToArray();
@@ -880,6 +1045,11 @@ void main()
 
         protected override void OnPointerMoved(PointerEventArgs e)
         {
+            if (isAvatarMode)
+            {
+                e.Handled = true;
+                return;
+            }
             base.OnPointerMoved(e);
             var prop = e.GetCurrentPoint(this).Properties;
             bool isLeft = prop.IsLeftButtonPressed;
@@ -916,6 +1086,11 @@ void main()
 
         protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
         {
+            if (isAvatarMode)
+            {
+                e.Handled = true;
+                return;
+            }
             base.OnPointerWheelChanged(e);
             float delta = (float)e.Delta.Y;
             viewMatrixData *= Matrix4.CreateScale(1 + delta * 0.1f);
@@ -925,6 +1100,23 @@ void main()
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
+            if (isAvatarMode)
+            {
+                if (e.Key == Key.Left || e.Key == Key.A)
+                {
+                    viewMatrixData *= Matrix4.CreateRotationY((float)(Math.PI / 2));
+                    RequestNextFrameRendering();
+                    e.Handled = true;
+                    return;
+                }
+                else if (e.Key == Key.Right || e.Key == Key.D)
+                {
+                    viewMatrixData *= Matrix4.CreateRotationY((float)(-Math.PI / 2));
+                    RequestNextFrameRendering();
+                    e.Handled = true;
+                    return;
+                }
+            }
             base.OnKeyDown(e);
             var isCtrl = (e.KeyModifiers & KeyModifiers.Control) != 0;
             if (isCtrl)
@@ -973,6 +1165,149 @@ void main()
             
             GL.AttachShader(program, shaderId);
             GL.DeleteShader(shaderId);
+        }
+
+        private void CreateSkeletonVAO(Vector3[] vertices)
+        {
+            if (vaoSkeleton != 0)
+            {
+                GL.DeleteVertexArrays(1, ref vaoSkeleton);
+                vaoSkeleton = 0;
+            }
+            if (vboSkeleton != 0)
+            {
+                GL.DeleteBuffer(vboSkeleton);
+                vbos.Remove(vboSkeleton);
+                vboSkeleton = 0;
+            }
+
+            if (vertices.Length == 0) return;
+
+            GL.GenVertexArrays(1, out vaoSkeleton);
+            GL.BindVertexArray(vaoSkeleton);
+
+            GL.GenBuffers(1, out vboSkeleton);
+            vbos.Add(vboSkeleton);
+            GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
+            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(vertices.Length * 12), vertices, BufferUsageHint.StaticDraw);
+            GL.VertexAttribPointer(LocationPosition, 3, VertexAttribPointerType.Float, false, 0, 0);
+            GL.EnableVertexAttribArray(LocationPosition);
+
+            GL.BindVertexArray(0);
+        }
+
+        public void SetAvatar(Mesh m_Mesh, Vector3[] bonePositions, int[] parentIndices)
+        {
+            isAvatarMode = true;
+            previewMaterialMode = false;
+            if (m_Mesh.m_VertexCount <= 0) return;
+
+            int currentLoadId = ++meshLoadCounter;
+            var m_Vertices = m_Mesh.m_Vertices;
+            var m_VertexCount = m_Mesh.m_VertexCount;
+            var m_Indices = m_Mesh.m_Indices;
+            var m_Normals = m_Mesh.m_Normals;
+            var m_Colors = m_Mesh.m_Colors;
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                if (m_Vertices == null || m_Vertices.Length == 0) return;
+
+                int count = 3;
+                if (m_Vertices.Length == m_VertexCount * 4)
+                {
+                    count = 4;
+                }
+                var localVertexData = new Vector3[m_VertexCount];
+
+                float[] min = new float[3];
+                float[] max = new float[3];
+                for (int i = 0; i < 3; i++)
+                {
+                    min[i] = m_Vertices[i];
+                    max[i] = m_Vertices[i];
+                }
+                for (int v = 0; v < m_VertexCount; v++)
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        min[i] = Math.Min(min[i], m_Vertices[v * count + i]);
+                        max[i] = Math.Max(max[i], m_Vertices[v * count + i]);
+                    }
+                    localVertexData[v] = new Vector3(
+                        m_Vertices[v * count],
+                        m_Vertices[v * count + 1],
+                        m_Vertices[v * count + 2]);
+                }
+
+                Vector3 dist = Vector3.One, offset = Vector3.Zero;
+                for (int i = 0; i < 3; i++)
+                {
+                    dist[i] = max[i] - min[i];
+                    offset[i] = (max[i] + min[i]) / 2;
+                }
+                float d = Math.Max(1e-5f, dist.Length);
+                var localModelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
+
+                var localIndiceData = new int[m_Indices.Count];
+                for (int i = 0; i < m_Indices.Count; i = i + 3)
+                {
+                    localIndiceData[i] = (int)m_Indices[i];
+                    localIndiceData[i + 1] = (int)m_Indices[i + 1];
+                    localIndiceData[i + 2] = (int)m_Indices[i + 2];
+                }
+
+                var skeletonVerts = new List<Vector3>();
+                int boneLinesCount = 0;
+                int jointPointsCount = 0;
+
+                if (bonePositions != null && parentIndices != null)
+                {
+                    var normalizedBones = new Vector3[bonePositions.Length];
+                    for (int i = 0; i < bonePositions.Length; i++)
+                    {
+                        normalizedBones[i] = (bonePositions[i] - offset) * (2f / d);
+                    }
+
+                    for (int i = 0; i < normalizedBones.Length; i++)
+                    {
+                        int pIdx = parentIndices[i];
+                        if (pIdx >= 0 && pIdx < normalizedBones.Length)
+                        {
+                            skeletonVerts.Add(normalizedBones[i]);
+                            skeletonVerts.Add(normalizedBones[pIdx]);
+                            boneLinesCount += 2;
+                        }
+                    }
+
+                    for (int i = 0; i < normalizedBones.Length; i++)
+                    {
+                        skeletonVerts.Add(normalizedBones[i]);
+                        jointPointsCount++;
+                    }
+                }
+
+                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentLoadId != meshLoadCounter) return;
+
+                    viewMatrixData = Matrix4.Identity;
+                    vertexData = localVertexData;
+                    modelMatrixData = localModelMatrixData;
+                    indiceData = localIndiceData;
+                    normalData = null;
+                    normal2Data = null;
+                    colorData = null;
+                    uvData = null;
+
+                    boneLinesVertexCount = boneLinesCount;
+                    jointPointsVertexCount = jointPointsCount;
+
+                    CreateSkeletonVAO(skeletonVerts.ToArray());
+                    vao = 0;
+                    RequestNextFrameRendering();
+                });
+            });
         }
 
         private class AvaloniaBindingsContext : IBindingsContext
