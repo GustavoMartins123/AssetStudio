@@ -9,6 +9,8 @@ using OpenTK;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
 using Texture2DDecoder;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
 
 namespace AssetStudio.Avalonia
 {
@@ -125,6 +127,34 @@ void main()
                 {
                     GpuErrorOccurred?.Invoke($"Failed to get raw texture data: {ex.Message}");
                     return;
+                }
+            }
+
+            hasTexture = true;
+            RequestNextFrameRendering();
+        }
+
+        public void SetImage(Image<Bgra32> image)
+        {
+            ResetPanAndZoom();
+
+            lock (textureLock)
+            {
+                currentTexture = null;
+                pendingWidth = image.Width;
+                pendingHeight = image.Height;
+                pendingFormat = TextureFormat.RGBA32;
+                pendingVersion = null;
+                pendingPlatform = BuildTarget.NoTarget;
+                hasPendingTexture = true;
+
+                pendingTextureData = new byte[image.Width * image.Height * 4];
+                image.CopyPixelDataTo(pendingTextureData);
+                for (int i = 0; i < pendingTextureData.Length; i += 4)
+                {
+                    byte temp = pendingTextureData[i]; // B
+                    pendingTextureData[i] = pendingTextureData[i + 2]; // R to B
+                    pendingTextureData[i + 2] = temp; // B to R
                 }
             }
 
@@ -495,7 +525,15 @@ void main()
             }
             else if (uploadFormat == TextureFormat.BGRA32)
             {
-                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, dataToUpload);
+                byte[] rgbaBytes = new byte[dataToUpload.Length];
+                System.Buffer.BlockCopy(dataToUpload, 0, rgbaBytes, 0, dataToUpload.Length);
+                for (int i = 0; i < rgbaBytes.Length; i += 4)
+                {
+                    byte temp = rgbaBytes[i];
+                    rgbaBytes[i] = rgbaBytes[i + 2];
+                    rgbaBytes[i + 2] = temp;
+                }
+                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, rgbaBytes);
             }
             else if (uploadFormat == TextureFormat.RGB24)
             {
@@ -514,7 +552,13 @@ void main()
                     var converter = new Texture2DConverter(currentTexture);
                     if (converter.DecodeTexture2D(decodedBytes))
                     {
-                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, decodedBytes);
+                        for (int i = 0; i < decodedBytes.Length; i += 4)
+                        {
+                            byte temp = decodedBytes[i];
+                            decodedBytes[i] = decodedBytes[i + 2];
+                            decodedBytes[i + 2] = temp;
+                        }
+                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, decodedBytes);
                     }
                     else
                     {

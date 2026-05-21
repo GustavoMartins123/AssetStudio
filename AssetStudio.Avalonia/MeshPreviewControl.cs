@@ -772,7 +772,7 @@ void main()
                             GL.UniformMatrix4(uniformModelMatrixYellow, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixYellow, false, ref viewMatrixData);
                             GL.UniformMatrix4(uniformProjMatrixYellow, false, ref projMatrixData);
-                            GL.DrawArrays(BeginMode.Lines, 0, boneLinesVertexCount);
+                            GL.DrawArrays(PrimitiveType.Lines, 0, boneLinesVertexCount);
                         }
 
                         if (jointPointsVertexCount > 0)
@@ -782,7 +782,7 @@ void main()
                             GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
                             GL.UniformMatrix4(uniformProjMatrixRed, false, ref projMatrixData);
-                            GL.DrawArrays(BeginMode.Points, boneLinesVertexCount, jointPointsVertexCount);
+                            GL.DrawArrays(PrimitiveType.Points, boneLinesVertexCount, jointPointsVertexCount);
                         }
 
                         GL.LineWidth(1.0f);

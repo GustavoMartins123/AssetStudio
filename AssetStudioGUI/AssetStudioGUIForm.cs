@@ -431,6 +431,7 @@ namespace AssetStudioGUI
                     case ClassIDType.Shader:
                     case ClassIDType.TextAsset:
                     case ClassIDType.MonoBehaviour:
+                    case ClassIDType.MonoScript:
                         textPreviewBox.Visible = !textPreviewBox.Visible;
                         break;
                     case ClassIDType.Font:
@@ -759,6 +760,9 @@ namespace AssetStudioGUI
                         break;
                     case MonoBehaviour m_MonoBehaviour:
                         PreviewMonoBehaviour(m_MonoBehaviour);
+                        break;
+                    case MonoScript m_MonoScript:
+                        PreviewMonoScript(m_MonoScript);
                         break;
                     case Font m_Font:
                         PreviewFont(m_Font);
@@ -1121,6 +1125,15 @@ namespace AssetStudioGUI
             }
             var str = JsonConvert.SerializeObject(obj, Formatting.Indented);
             PreviewText(str);
+        }
+
+        private void PreviewMonoScript(MonoScript m_MonoScript)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
+            sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
+            sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
+            PreviewText(sb.ToString());
         }
 
         private void PreviewFont(Font m_Font)

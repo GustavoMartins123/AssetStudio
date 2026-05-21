@@ -147,8 +147,11 @@ public partial class MainWindow : Window
                 logger.Log(LoggerEvent.Warning, $"GPU texture preview error: {errMsg}. Falling back to CPU.");
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
-                    useGpuTexturePreview = false;
-                    UpdateImagePreview();
+                    if (errMsg.Contains("initialization") || errMsg.Contains("link error") || errMsg.Contains("compile error"))
+                    {
+                        useGpuTexturePreview = false;
+                    }
+                    UpdateImagePreview(forceCpu: true);
                 });
             };
         }
@@ -1030,6 +1033,10 @@ public partial class MainWindow : Window
                         assetItem.Name = ((NamedObject)asset).m_Name;
                         exportable = true;
                         break;
+                    case MonoScript m_MonoScript:
+                        assetItem.Name = m_MonoScript.m_Name;
+                        exportable = true;
+                        break;
                     case Animator m_Animator:
                         if (m_Animator.m_GameObject.TryGet(out var gameObject))
                         {
@@ -1379,6 +1386,17 @@ public partial class MainWindow : Window
                 break;
             case MonoBehaviour m_MonoBehaviour:
                 PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader, dumpStr);
+                break;
+            case MonoScript m_MonoScript:
+                {
+                    var sb = new StringBuilder();
+                    sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
+                    sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
+                    sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
+                    SetTextWithTruncation(TextPreviewBox, sb.ToString());
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                }
                 break;
             case Mesh m_Mesh:
             {
@@ -2569,82 +2587,146 @@ public partial class MainWindow : Window
         }
     }
 
-    private void UpdateImagePreview()
+    private void UpdateImagePreview(bool forceCpu = false)
     {
         if (currentPreviewTexture == null && currentPreviewSprite == null)
             return;
 
-        if (currentPreviewTexture != null && useGpuTexturePreview && TextureGLPreview != null)
+        long currentId = ++texturePreviewIdCounter;
+
+        if (useGpuTexturePreview && TextureGLPreview != null && !forceCpu)
         {
-            try
+            StatusStripUpdate("Loading preview (GPU)...");
+
+            Task.Run(() =>
             {
-                ImagePreviewBox.IsVisible = false;
-                GLPreviewControl.IsVisible = false;
-                TextPreviewBox.IsVisible = false;
-                PreviewLabel.IsVisible = false;
-                TextureGLPreview.IsVisible = true;
-                TextureGLPreview.Focus();
+                try
+                {
+                    Image<Bgra32>? decodedImage = null;
+                    int width = 0;
+                    int height = 0;
+                    string infoText = string.Empty;
+                    bool isSprite = currentPreviewSprite != null;
 
-                TextureGLPreview.SetTexture(currentPreviewTexture);
-                TextureGLPreview.SetChannels(textureChannels);
+                    if (currentPreviewTexture != null)
+                    {
+                        width = currentPreviewTexture.m_Width;
+                        height = currentPreviewTexture.m_Height;
 
-                string infoText = $"Width: {currentPreviewTexture.m_Width}\nHeight: {currentPreviewTexture.m_Height}\nFormat: {currentPreviewTexture.m_TextureFormat}";
-                switch (currentPreviewTexture.m_TextureSettings.m_FilterMode)
-                {
-                    case 0: infoText += "\nFilter Mode: Point "; break;
-                    case 1: infoText += "\nFilter Mode: Bilinear "; break;
-                    case 2: infoText += "\nFilter Mode: Trilinear "; break;
-                }
-                infoText += $"\nAnisotropic level: {currentPreviewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {currentPreviewTexture.m_TextureSettings.m_MipBias}";
-                switch (currentPreviewTexture.m_TextureSettings.m_WrapMode)
-                {
-                    case 0: infoText += "\nWrap mode: Repeat"; break;
-                    case 1: infoText += "\nWrap mode: Clamp"; break;
-                }
+                        infoText = $"Width: {width}\nHeight: {height}\nFormat: {currentPreviewTexture.m_TextureFormat}";
+                        switch (currentPreviewTexture.m_TextureSettings.m_FilterMode)
+                        {
+                            case 0: infoText += "\nFilter Mode: Point "; break;
+                            case 1: infoText += "\nFilter Mode: Bilinear "; break;
+                            case 2: infoText += "\nFilter Mode: Trilinear "; break;
+                        }
+                        infoText += $"\nAnisotropic level: {currentPreviewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {currentPreviewTexture.m_TextureSettings.m_MipBias}";
+                        switch (currentPreviewTexture.m_TextureSettings.m_WrapMode)
+                        {
+                            case 0: infoText += "\nWrap mode: Repeat"; break;
+                            case 1: infoText += "\nWrap mode: Clamp"; break;
+                        }
+                    }
+                    else if (currentPreviewSprite != null)
+                    {
+                        decodedImage = currentPreviewSprite.GetImage();
+                        if (decodedImage == null)
+                        {
+                            throw new Exception("Failed to decode sprite image on CPU.");
+                        }
+                        width = decodedImage.Width;
+                        height = decodedImage.Height;
+                        infoText = $"Width: {width}\nHeight: {height}\n";
+                    }
 
-                int validChannel = 0;
-                for (int i = 0; i < 4; i++)
-                {
-                    if (textureChannels[i]) validChannel++;
-                }
-
-                infoText += "\nChannels: ";
-                if (validChannel == 0)
-                {
-                    infoText += "None";
-                }
-                else
-                {
-                    var channelNames = new string[4] { "R", "G", "B", "A" };
-                    var activeList = new List<string>();
+                    int validChannel = 0;
                     for (int i = 0; i < 4; i++)
                     {
-                        if (textureChannels[i])
-                            activeList.Add(channelNames[i]);
+                        if (textureChannels[i]) validChannel++;
                     }
-                    infoText += string.Join(" ", activeList);
-                }
-                infoText += "\nRender mode: GPU (OpenGL)";
 
-                if (displayInfo.IsChecked == true)
-                {
-                    PreviewInfoOverlay.Text = infoText;
-                    PreviewInfoBorder.IsVisible = true;
-                }
-                else
-                {
-                    PreviewInfoBorder.IsVisible = false;
-                }
+                    infoText += "\nChannels: ";
+                    if (validChannel == 0)
+                    {
+                        infoText += "None";
+                    }
+                    else
+                    {
+                        var channelNames = new string[4] { "R", "G", "B", "A" };
+                        var activeList = new List<string>();
+                        for (int i = 0; i < 4; i++)
+                        {
+                            if (textureChannels[i])
+                                activeList.Add(channelNames[i]);
+                        }
+                        infoText += string.Join(" ", activeList);
+                    }
+                    infoText += "\nRender mode: GPU (OpenGL)";
 
-                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
-                return;
-            }
-            catch (Exception ex)
-            {
-                logger.Log(LoggerEvent.Warning, $"GPU texture preview failed: {ex.Message}. Falling back to CPU.");
-                useGpuTexturePreview = false;
-                // Fall through to CPU path
-            }
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            try
+                            {
+                                ImagePreviewBox.IsVisible = false;
+                                GLPreviewControl.IsVisible = false;
+                                TextPreviewBox.IsVisible = false;
+                                PreviewLabel.IsVisible = false;
+                                TextureGLPreview.IsVisible = true;
+                                TextureGLPreview.Focus();
+
+                                if (isSprite && decodedImage != null)
+                                {
+                                    TextureGLPreview.SetImage(decodedImage);
+                                }
+                                else if (currentPreviewTexture != null)
+                                {
+                                    TextureGLPreview.SetTexture(currentPreviewTexture);
+                                }
+                                TextureGLPreview.SetChannels(textureChannels);
+
+                                if (displayInfo.IsChecked == true)
+                                {
+                                    PreviewInfoOverlay.Text = infoText;
+                                    PreviewInfoBorder.IsVisible = true;
+                                }
+                                else
+                                {
+                                    PreviewInfoBorder.IsVisible = false;
+                                }
+
+                                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.Log(LoggerEvent.Warning, $"GPU texture preview failed setup: {ex.Message}. Falling back to CPU.");
+                                UpdateImagePreview(forceCpu: true);
+                            }
+                            finally
+                            {
+                                decodedImage?.Dispose();
+                            }
+                        }
+                        else
+                        {
+                            decodedImage?.Dispose();
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    logger.Log(LoggerEvent.Warning, $"GPU texture preview failed preparation: {ex.Message}. Falling back to CPU.");
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            UpdateImagePreview(forceCpu: true);
+                        }
+                    });
+                }
+            });
+            return;
         }
 
         // CPU Fallback path
@@ -2653,7 +2735,6 @@ public partial class MainWindow : Window
             TextureGLPreview.IsVisible = false;
         }
 
-        long currentId = ++texturePreviewIdCounter;
         StatusStripUpdate("Loading preview (CPU)...");
 
         Task.Run(() =>
@@ -4033,6 +4114,17 @@ public partial class MainWindow : Window
                 var filePath = Path.Combine(exportPath, fileName + ".txt");
                 if (File.Exists(filePath)) return false;
                 File.WriteAllBytes(filePath, m_TextAsset.m_Script);
+                return true;
+            }
+            case MonoScript m_MonoScript:
+            {
+                var filePath = Path.Combine(exportPath, fileName + ".txt");
+                if (File.Exists(filePath)) return false;
+                var sb = new StringBuilder();
+                sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
+                sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
+                sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
+                File.WriteAllText(filePath, sb.ToString());
                 return true;
             }
             case Shader m_Shader:

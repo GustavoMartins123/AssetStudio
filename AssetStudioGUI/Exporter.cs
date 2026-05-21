@@ -1,4 +1,4 @@
-﻿using AssetStudio;
+using AssetStudio;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
@@ -95,6 +95,19 @@ namespace AssetStudioGUI
             if (!TryExportFile(exportPath, item, extension, out var exportFullPath))
                 return false;
             File.WriteAllBytes(exportFullPath, m_TextAsset.m_Script);
+            return true;
+        }
+
+        public static bool ExportMonoScript(AssetItem item, string exportPath)
+        {
+            if (!TryExportFile(exportPath, item, ".txt", out var exportFullPath))
+                return false;
+            var m_MonoScript = (MonoScript)item.Asset;
+            var sb = new StringBuilder();
+            sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
+            sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
+            sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
+            File.WriteAllText(exportFullPath, sb.ToString());
             return true;
         }
 
@@ -393,6 +406,8 @@ namespace AssetStudioGUI
                     return ExportTextAsset(item, exportPath);
                 case ClassIDType.MonoBehaviour:
                     return ExportMonoBehaviour(item, exportPath);
+                case ClassIDType.MonoScript:
+                    return ExportMonoScript(item, exportPath);
                 case ClassIDType.Font:
                     return ExportFont(item, exportPath);
                 case ClassIDType.Mesh:

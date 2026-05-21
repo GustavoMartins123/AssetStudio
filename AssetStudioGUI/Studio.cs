@@ -1,4 +1,4 @@
-﻿using AssetStudio;
+using AssetStudio;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -186,6 +186,10 @@ namespace AssetStudioGUI
                         case MovieTexture _:
                         case Sprite _:
                             assetItem.Text = ((NamedObject)asset).m_Name;
+                            exportable = true;
+                            break;
+                        case MonoScript m_MonoScript:
+                            assetItem.Text = m_MonoScript.m_Name;
                             exportable = true;
                             break;
                         case Animator m_Animator:
