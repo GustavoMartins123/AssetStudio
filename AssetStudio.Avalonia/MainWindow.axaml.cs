@@ -1891,6 +1891,7 @@ public partial class MainWindow : Window
         {
             var nodes = avatar.m_Avatar.m_AvatarSkeleton.m_Node;
             var poses = avatar.m_Avatar.m_AvatarSkeletonPose.m_X;
+            var ids = avatar.m_Avatar.m_AvatarSkeleton.m_ID;
             int count = Math.Min(nodes.Length, poses.Length);
 
             bonePositions = new global::OpenTK.Mathematics.Vector3[count];
@@ -1916,9 +1917,109 @@ public partial class MainWindow : Window
                     globalMatrices[i] = localMat * globalMatrices[node.m_ParentId];
                 }
 
-                bonePositions[i] = globalMatrices[i].ExtractTranslation();
+                global::OpenTK.Mathematics.Vector3 pos = globalMatrices[i].ExtractTranslation();
+
+                if (avatarMesh != null && avatarMesh.m_BoneNameHashes != null && avatarMesh.m_BindPose != null)
+                {
+                    string? path = null;
+                    if (ids != null && i < ids.Length)
+                    {
+                        path = avatar.FindBonePath(ids[i]);
+                    }
+
+                    var possibleHashes = new List<uint>();
+                    if (ids != null && i < ids.Length)
+                    {
+                        possibleHashes.Add(ids[i]);
+                    }
+                    if (avatar.m_Avatar.m_SkeletonNameIDArray != null && i < avatar.m_Avatar.m_SkeletonNameIDArray.Length)
+                    {
+                        possibleHashes.Add(avatar.m_Avatar.m_SkeletonNameIDArray[i]);
+                    }
+                    if (!string.IsNullOrEmpty(path))
+                    {
+                        var crc = new SevenZip.CRC();
+                        var bytes = System.Text.Encoding.UTF8.GetBytes(path);
+                        crc.Update(bytes, 0, (uint)bytes.Length);
+                        possibleHashes.Add(crc.GetDigest());
+
+                        string tempPath = path;
+                        int slashIndex;
+                        while ((slashIndex = tempPath.IndexOf("/", StringComparison.Ordinal)) >= 0)
+                        {
+                            tempPath = tempPath.Substring(slashIndex + 1);
+                            var subCrc = new SevenZip.CRC();
+                            var subBytes = System.Text.Encoding.UTF8.GetBytes(tempPath);
+                            subCrc.Update(subBytes, 0, (uint)subBytes.Length);
+                            possibleHashes.Add(subCrc.GetDigest());
+                        }
+                    }
+
+                    int meshBoneIndex = -1;
+                    foreach (var h in possibleHashes)
+                    {
+                        for (int j = 0; j < avatarMesh.m_BoneNameHashes.Length; j++)
+                        {
+                            if (avatarMesh.m_BoneNameHashes[j] == h)
+                            {
+                                meshBoneIndex = j;
+                                break;
+                            }
+                        }
+                        if (meshBoneIndex >= 0) break;
+                    }
+
+                    if (meshBoneIndex >= 0 && meshBoneIndex < avatarMesh.m_BindPose.Length)
+                    {
+                        var m = avatarMesh.m_BindPose[meshBoneIndex];
+                        var openTkMatrix = new global::OpenTK.Mathematics.Matrix4(
+                            m.M00, m.M10, m.M20, m.M30,
+                            m.M01, m.M11, m.M21, m.M31,
+                            m.M02, m.M12, m.M22, m.M32,
+                            m.M03, m.M13, m.M23, m.M33
+                        );
+                        try
+                        {
+                            var inv = openTkMatrix.Inverted();
+                            pos = inv.ExtractTranslation();
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+
+                bonePositions[i] = pos;
                 parentIndices[i] = node.m_ParentId;
             }
+
+            // Write diagnostics to file
+            try
+            {
+                var diagPath = "/home/gustavo/Área de trabalho/AssetStudio/skeleton_diagnostics.txt";
+                var lines = new List<string>();
+                lines.Add($"Avatar: {avatar.m_Name}");
+                if (avatarMesh != null)
+                {
+                    lines.Add($"AvatarMesh: {avatarMesh.m_Name}");
+                    lines.Add($"Mesh Bone Name Hashes count: {avatarMesh.m_BoneNameHashes?.Length ?? 0}");
+                    lines.Add($"Mesh Bind Poses count: {avatarMesh.m_BindPose?.Length ?? 0}");
+                }
+                else
+                {
+                    lines.Add("AvatarMesh: null");
+                }
+                
+                for (int j = 0; j < count; j++)
+                {
+                    var node = nodes[j];
+                    var name = (ids != null && j < ids.Length) ? (avatar.FindBonePath(ids[j]) ?? $"Node_{j}") : $"Node_{j}";
+                    var pos = bonePositions[j];
+                    lines.Add($"Bone {j}: Name={name}, Parent={node.m_ParentId}, Pos=({pos.X:F4}, {pos.Y:F4}, {pos.Z:F4})");
+                }
+                System.IO.File.WriteAllLines(diagPath, lines);
+            }
+            catch {}
         }
 
         if (avatarMesh != null && bonePositions != null && parentIndices != null && GLPreviewControl != null)

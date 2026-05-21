@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -180,6 +181,7 @@ void main()
         private int boneLinesVertexCount;
         private int jointPointsVertexCount;
         private bool isAvatarMode;
+        private Vector3[]? pendingSkeletonVertices;
 
         // VBO / VAO state
         private int vao;
@@ -760,6 +762,7 @@ void main()
 
                     if (vaoSkeleton != 0 && (boneLinesVertexCount > 0 || jointPointsVertexCount > 0))
                     {
+                        GL.Disable(EnableCap.DepthTest);
                         GL.BindVertexArray(vaoSkeleton);
 
                         if (boneLinesVertexCount > 0)
@@ -774,7 +777,7 @@ void main()
 
                         if (jointPointsVertexCount > 0)
                         {
-                            GL.PointSize(10.0f);
+                            GL.PointSize(12.0f);
                             GL.UseProgram(pgmRedID);
                             GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
@@ -784,6 +787,7 @@ void main()
 
                         GL.LineWidth(1.0f);
                         GL.PointSize(1.0f);
+                        GL.Enable(EnableCap.DepthTest);
                     }
 
                     GL.BindVertexArray(0);
@@ -984,7 +988,7 @@ void main()
 
         private void CreateVAO()
         {
-            CleanupBuffers();
+            CleanupBuffers(isAvatarMode);
 
             GL.GenVertexArrays(1, out vao);
             GL.BindVertexArray(vao);
@@ -995,9 +999,15 @@ void main()
             GL.BindVertexArray(vaoWireframe);
             BindAttribsAndEBO(true);
             GL.BindVertexArray(0);
+
+            if (pendingSkeletonVertices != null)
+            {
+                CreateSkeletonVAO(pendingSkeletonVertices);
+                pendingSkeletonVertices = null;
+            }
         }
 
-        private void CleanupBuffers()
+        private void CleanupBuffers(bool keepSkeleton = false)
         {
             if (vao != 0)
             {
@@ -1009,21 +1019,40 @@ void main()
                 GL.DeleteVertexArrays(1, ref vaoWireframe);
                 vaoWireframe = 0;
             }
-            if (vaoSkeleton != 0)
+            if (!keepSkeleton)
             {
-                GL.DeleteVertexArrays(1, ref vaoSkeleton);
-                vaoSkeleton = 0;
-            }
-            if (vboSkeleton != 0)
-            {
-                GL.DeleteBuffer(vboSkeleton);
-                vboSkeleton = 0;
+                if (vaoSkeleton != 0)
+                {
+                    GL.DeleteVertexArrays(1, ref vaoSkeleton);
+                    vaoSkeleton = 0;
+                }
+                if (vboSkeleton != 0)
+                {
+                    GL.DeleteBuffer(vboSkeleton);
+                    vbos.Remove(vboSkeleton);
+                    vboSkeleton = 0;
+                }
             }
             if (vbos.Count > 0)
             {
-                int[] arr = vbos.ToArray();
-                GL.DeleteBuffers(arr.Length, arr);
-                vbos.Clear();
+                if (keepSkeleton && vboSkeleton != 0)
+                {
+                    var toDelete = vbos.Where(x => x != vboSkeleton).ToArray();
+                    if (toDelete.Length > 0)
+                    {
+                        GL.DeleteBuffers(toDelete.Length, toDelete);
+                        foreach (var id in toDelete)
+                        {
+                            vbos.Remove(id);
+                        }
+                    }
+                }
+                else
+                {
+                    int[] arr = vbos.ToArray();
+                    GL.DeleteBuffers(arr.Length, arr);
+                    vbos.Clear();
+                }
             }
         }
 
@@ -1263,20 +1292,27 @@ void main()
 
                 if (bonePositions != null && parentIndices != null)
                 {
-                    var normalizedBones = new Vector3[bonePositions.Length];
-                    for (int i = 0; i < bonePositions.Length; i++)
-                    {
-                        normalizedBones[i] = (bonePositions[i] - offset) * (2f / d);
-                    }
+                    var normalizedBones = bonePositions;
 
                     for (int i = 0; i < normalizedBones.Length; i++)
                     {
                         int pIdx = parentIndices[i];
                         if (pIdx >= 0 && pIdx < normalizedBones.Length)
                         {
-                            skeletonVerts.Add(normalizedBones[i]);
-                            skeletonVerts.Add(normalizedBones[pIdx]);
-                            boneLinesCount += 2;
+                            var a = normalizedBones[i];
+                            var b = normalizedBones[pIdx];
+                            int segments = 8;
+                            for (int s = 0; s < segments; s++)
+                            {
+                                if (s % 2 == 0)
+                                {
+                                    float t0 = (float)s / segments;
+                                    float t1 = (float)(s + 1) / segments;
+                                    skeletonVerts.Add(a + (b - a) * t0);
+                                    skeletonVerts.Add(a + (b - a) * t1);
+                                    boneLinesCount += 2;
+                                }
+                            }
                         }
                     }
 
@@ -1303,7 +1339,7 @@ void main()
                     boneLinesVertexCount = boneLinesCount;
                     jointPointsVertexCount = jointPointsCount;
 
-                    CreateSkeletonVAO(skeletonVerts.ToArray());
+                    pendingSkeletonVertices = skeletonVerts.ToArray();
                     vao = 0;
                     RequestNextFrameRendering();
                 });
