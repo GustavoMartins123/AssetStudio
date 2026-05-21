@@ -1025,6 +1025,8 @@ public partial class MainWindow : Window
                     case Font _:
                     case MovieTexture _:
                     case Sprite _:
+                    case Avatar _:
+                    case RuntimeAnimatorController _:
                         assetItem.Name = ((NamedObject)asset).m_Name;
                         exportable = true;
                         break;
@@ -1379,9 +1381,58 @@ public partial class MainWindow : Window
                 PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader, dumpStr);
                 break;
             case Mesh m_Mesh:
+            {
+                Texture2D? meshTexture = null;
                 if (GLPreviewControl != null)
                 {
-                    GLPreviewControl.SetMesh(m_Mesh);
+                    var allMaterials = FindMaterialsForMesh(m_Mesh);
+                    foreach (var mat in allMaterials)
+                    {
+                        meshTexture = FindTextureForMaterial(mat);
+                        if (meshTexture != null) break;
+                    }
+                    
+                    global::OpenTK.Mathematics.Vector2[]? uvs = null;
+                    byte[]? textureBytes = null;
+                    int texW = 0;
+                    int texH = 0;
+
+                    if (meshTexture != null)
+                    {
+                        try
+                        {
+                            var image = meshTexture.ConvertToImage(true);
+                            if (image != null)
+                            {
+                                texW = image.Width;
+                                texH = image.Height;
+                                textureBytes = new byte[texW * texH * 4];
+                                image.CopyPixelDataTo(textureBytes);
+                                for (int i = 0; i < textureBytes.Length; i += 4)
+                                {
+                                    byte temp = textureBytes[i];
+                                    textureBytes[i] = textureBytes[i + 2];
+                                    textureBytes[i + 2] = temp;
+                                }
+                                StatusStripUpdate($"Mesh texture loaded: {meshTexture.m_Name} ({texW}x{texH}) | Ctrl+S to toggle textured/shaded");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            StatusStripUpdate($"Texture decode failed: {ex.Message}");
+                        }
+                    }
+
+                    if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
+                    {
+                        uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
+                        for (int i = 0; i < m_Mesh.m_VertexCount; i++)
+                        {
+                            uvs[i] = new global::OpenTK.Mathematics.Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
+                        }
+                    }
+
+                    GLPreviewControl.SetMesh(m_Mesh, uvs, textureBytes, texW, texH);
                     GLPreviewControl.IsVisible = true;
                     GLPreviewControl.Focus();
                 }
@@ -1404,8 +1455,10 @@ public partial class MainWindow : Window
                     });
                 }
                 PreviewLabel.IsVisible = false;
-                StatusStripUpdate("Using OpenGL: OpenTK Core | 'Mouse Left'=Rotate | 'Mouse Right'=Move | 'Mouse Wheel'=Zoom | 'Ctrl W'=Wireframe | 'Ctrl S'=Shade | 'Ctrl N'=ReNormal");
+                if (meshTexture == null)
+                    StatusStripUpdate("OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
                 break;
+            }
             case Object obj when obj.type == ClassIDType.PrefabInstance:
                 SetTextWithTruncation(TextPreviewBox, fbxHeader + FormatPrefab(obj));
                 TextPreviewBox.IsVisible = true;
@@ -1415,8 +1468,17 @@ public partial class MainWindow : Window
             case MovieTexture _:
                 StatusStripUpdate("Only supported export.");
                 break;
-            case Animator _:
-                StatusStripUpdate("Can be exported to FBX file.");
+            case Animator m_Animator:
+                PreviewAnimatorGraph(m_Animator);
+                break;
+            case AnimatorController m_AnimatorController:
+                PreviewAnimatorGraph(m_AnimatorController);
+                break;
+            case AnimatorOverrideController m_AnimatorOverrideController:
+                PreviewAnimatorGraph(m_AnimatorOverrideController);
+                break;
+            case Avatar m_Avatar:
+                PreviewAvatar(m_Avatar);
                 break;
             case AnimationClip _:
                 StatusStripUpdate("Can be exported with Animator or Objects");
@@ -1430,6 +1492,378 @@ public partial class MainWindow : Window
                 }
                 break;
         }
+    }
+
+    private void PreviewAnimatorGraph(Object asset)
+    {
+        AnimatorController? controller = null;
+        AnimatorOverrideController? overrideController = null;
+        string header = "";
+
+        if (asset is Animator animator)
+        {
+            header = $"ANIMATOR: {((animator.m_GameObject.TryGet(out var go)) ? go.m_Name : "Animator")}\n";
+            if (animator.m_Controller.TryGet(out var rac))
+            {
+                if (rac is AnimatorController ac)
+                {
+                    controller = ac;
+                }
+                else if (rac is AnimatorOverrideController aoc)
+                {
+                    overrideController = aoc;
+                }
+            }
+            else
+            {
+                var globalController = assetsManager.assetsFileList
+                    .SelectMany(x => x.Objects)
+                    .FirstOrDefault(x => x.m_PathID == animator.m_Controller.m_PathID && x is RuntimeAnimatorController);
+                if (globalController is AnimatorController ac)
+                {
+                    controller = ac;
+                }
+                else if (globalController is AnimatorOverrideController aoc)
+                {
+                    overrideController = aoc;
+                }
+            }
+
+            if (controller == null && overrideController == null)
+            {
+                var animName = animator.m_GameObject.TryGet(out var goObj) ? goObj.m_Name : "Animator";
+                var matchingController = assetsManager.assetsFileList
+                    .SelectMany(x => x.Objects)
+                    .OfType<AnimatorController>()
+                    .FirstOrDefault(ac => ac.m_Name.Contains(animName, StringComparison.OrdinalIgnoreCase) || 
+                                          animName.Contains(ac.m_Name, StringComparison.OrdinalIgnoreCase));
+                if (matchingController != null)
+                {
+                    controller = matchingController;
+                }
+                else
+                {
+                    var fallbackSb = new StringBuilder();
+                    fallbackSb.AppendLine(header);
+                    fallbackSb.AppendLine("=========================================");
+                    fallbackSb.AppendLine("ANIMATOR COMPONENT (No Controller Referenced)");
+                    fallbackSb.AppendLine("=========================================");
+                    fallbackSb.AppendLine();
+                    fallbackSb.AppendLine("Properties:");
+                    fallbackSb.AppendLine($"  - Enabled: True");
+                    fallbackSb.AppendLine($"  - Apply Root Motion: True");
+                    fallbackSb.AppendLine($"  - Has Transform Hierarchy: {animator.m_HasTransformHierarchy}");
+                    fallbackSb.AppendLine();
+
+                    Avatar? avatar = null;
+                    if (animator.m_Avatar.TryGet(out var av))
+                    {
+                        avatar = av;
+                    }
+                    else
+                    {
+                        avatar = assetsManager.assetsFileList
+                            .SelectMany(x => x.Objects)
+                            .FirstOrDefault(x => x.m_PathID == animator.m_Avatar.m_PathID) as Avatar;
+                    }
+
+                    if (avatar != null)
+                    {
+                        fallbackSb.AppendLine($"Referenced Avatar: {avatar.m_Name} (Size: {avatar.m_AvatarSize} bytes)");
+                        fallbackSb.AppendLine();
+                        if (avatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null)
+                        {
+                            fallbackSb.AppendLine("Avatar Skeleton Nodes:");
+                            var skeleton = avatar.m_Avatar.m_AvatarSkeleton;
+                            for (int i = 0; i < skeleton.m_Node.Length; i++)
+                            {
+                                var node = skeleton.m_Node[i];
+                                string name = "Unknown";
+                                if (skeleton.m_ID != null && i < skeleton.m_ID.Length)
+                                {
+                                    name = avatar.FindBonePath(skeleton.m_ID[i]);
+                                    if (string.IsNullOrEmpty(name))
+                                    {
+                                        name = $"Hash_{skeleton.m_ID[i]}";
+                                    }
+                                }
+                                fallbackSb.AppendLine($"  [{i}] Node: \"{name}\" (Parent ID: {node.m_ParentId}, Axes ID: {node.m_AxesId})");
+                            }
+                            fallbackSb.AppendLine();
+                        }
+                    }
+                    else
+                    {
+                        fallbackSb.AppendLine("Referenced Avatar: None or unresolved.");
+                        fallbackSb.AppendLine();
+                    }
+
+                    var siblingClips = assetsManager.assetsFileList
+                        .SelectMany(x => x.Objects)
+                        .OfType<AnimationClip>()
+                        .Where(clip => {
+                            if (!string.IsNullOrEmpty(animator.assetsFile.originalPath) && 
+                                !string.IsNullOrEmpty(clip.assetsFile.originalPath))
+                            {
+                                if (clip.assetsFile.originalPath == animator.assetsFile.originalPath) return true;
+                            }
+                            return clip.m_Name.Contains(animName, StringComparison.OrdinalIgnoreCase) || 
+                                   animName.Contains(clip.m_Name, StringComparison.OrdinalIgnoreCase);
+                        })
+                        .ToList();
+
+                    if (siblingClips.Count > 0)
+                    {
+                        fallbackSb.AppendLine("Sibling Animation Clips (found in same container):");
+                        foreach (var clip in siblingClips)
+                        {
+                            fallbackSb.AppendLine($"  * {clip.m_Name} (PathID: {clip.m_PathID}, Size: {clip.byteSize} bytes)");
+                        }
+                    }
+                    else
+                    {
+                        fallbackSb.AppendLine("No matching sibling Animation Clips found in loaded files.");
+                    }
+
+                    SetTextWithTruncation(TextPreviewBox, fallbackSb.ToString());
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                    return;
+                }
+            }
+        }
+        else if (asset is AnimatorController ac)
+        {
+            controller = ac;
+        }
+        else if (asset is AnimatorOverrideController aoc)
+        {
+            overrideController = aoc;
+        }
+
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(header))
+        {
+            sb.AppendLine(header);
+        }
+
+        if (controller != null)
+        {
+            sb.AppendLine("=========================================");
+            sb.AppendLine($"ANIMATOR CONTROLLER: {controller.m_Name}");
+            sb.AppendLine("=========================================");
+            sb.AppendLine();
+
+            var m_Controller = controller.m_Controller;
+            if (m_Controller == null)
+            {
+                sb.AppendLine("Animator Controller state machine constant is empty.");
+            }
+            else
+            {
+                sb.AppendLine($"Layers count: {m_Controller.m_LayerArray?.Length ?? 0}");
+                sb.AppendLine();
+
+                if (m_Controller.m_LayerArray != null)
+                {
+                    for (int layerIdx = 0; layerIdx < m_Controller.m_LayerArray.Length; layerIdx++)
+                    {
+                        var layer = m_Controller.m_LayerArray[layerIdx];
+                        sb.AppendLine("-----------------------------------------");
+                        sb.AppendLine($"Layer {layerIdx}: State Machine Index: {layer.m_StateMachineIndex}");
+                        sb.AppendLine("-----------------------------------------");
+
+                        if (m_Controller.m_StateMachineArray != null && layer.m_StateMachineIndex < m_Controller.m_StateMachineArray.Length)
+                        {
+                            var sm = m_Controller.m_StateMachineArray[layer.m_StateMachineIndex];
+                            
+                            string defaultStateName = "None";
+                            if (sm.m_StateConstantArray != null && sm.m_DefaultState < sm.m_StateConstantArray.Length)
+                            {
+                                var ds = sm.m_StateConstantArray[sm.m_DefaultState];
+                                defaultStateName = GetNameFromTOS(controller.m_TOS, ds.m_NameID);
+                            }
+                            sb.AppendLine($"Default State: {defaultStateName}");
+                            sb.AppendLine();
+
+                            if (sm.m_StateConstantArray == null || sm.m_StateConstantArray.Length == 0)
+                            {
+                                sb.AppendLine("  (No states found in this layer)");
+                            }
+                            else
+                            {
+                                sb.AppendLine("States & Transitions:");
+                                var states = sm.m_StateConstantArray!;
+                                for (int stateIdx = 0; stateIdx < states.Length; stateIdx++)
+                                {
+                                    var state = states[stateIdx];
+                                    var stateName = GetNameFromTOS(controller.m_TOS, state.m_NameID);
+                                    
+                                    var clips = new List<string>();
+                                    if (state.m_BlendTreeConstantArray != null)
+                                    {
+                                        foreach (var bt in state.m_BlendTreeConstantArray)
+                                        {
+                                            if (bt.m_NodeArray != null)
+                                            {
+                                                foreach (var node in bt.m_NodeArray)
+                                                {
+                                                    if (node.m_ClipID != 0xFFFFFFFF)
+                                                    {
+                                                        clips.Add(GetClipName(controller, node.m_ClipID));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    string clipInfo = clips.Count > 0 ? string.Join(", ", clips) : "None";
+                                    bool isDefault = (stateIdx == sm.m_DefaultState);
+                                    string prefix = isDefault ? "▶ [DEFAULT] " : "  * ";
+
+                                    sb.AppendLine($"{prefix}{stateName} (Motion: {clipInfo})");
+
+                                    if (state.m_TransitionConstantArray != null && state.m_TransitionConstantArray.Length > 0)
+                                    {
+                                        for (int transIdx = 0; transIdx < state.m_TransitionConstantArray.Length; transIdx++)
+                                        {
+                                            var trans = state.m_TransitionConstantArray[transIdx];
+                                            string destName = "Unknown";
+                                            var statesList = sm.m_StateConstantArray;
+                                            var selectorStates = sm.m_SelectorStateConstantArray;
+                                            if (statesList != null && trans.m_DestinationState < statesList.Length)
+                                            {
+                                                var destState = statesList[trans.m_DestinationState];
+                                                destName = GetNameFromTOS(controller.m_TOS, destState.m_NameID);
+                                            }
+                                            else if (selectorStates != null && statesList != null && trans.m_DestinationState >= statesList.Length && (trans.m_DestinationState - statesList.Length) < selectorStates.Length)
+                                            {
+                                                destName = $"SelectorState_{trans.m_DestinationState - statesList.Length}";
+                                            }
+
+                                            string lineChar = (transIdx == state.m_TransitionConstantArray.Length - 1) ? "└──" : "├──";
+                                            sb.AppendLine($"    {lineChar} transition ──> {destName}");
+                                        }
+                                    }
+                                    sb.AppendLine();
+                                }
+                            }
+                        }
+                        else
+                        {
+                            sb.AppendLine("  (State machine not found or index out of range)");
+                        }
+                        sb.AppendLine();
+                    }
+                }
+            }
+        }
+        else if (overrideController != null)
+        {
+            sb.AppendLine("=========================================");
+            sb.AppendLine($"ANIMATOR OVERRIDE CONTROLLER: {overrideController.m_Name}");
+            sb.AppendLine("=========================================");
+            sb.AppendLine();
+
+            string baseName = "None";
+            if (overrideController.m_Controller.TryGet(out var baseC))
+            {
+                baseName = baseC.m_Name;
+            }
+            sb.AppendLine($"Base Controller: {baseName}");
+            sb.AppendLine();
+
+            sb.AppendLine("Animation Clip Overrides:");
+            if (overrideController.m_Clips == null || overrideController.m_Clips.Length == 0)
+            {
+                sb.AppendLine("  (No clip overrides defined)");
+            }
+            else
+            {
+                foreach (var clipOverride in overrideController.m_Clips)
+                {
+                    string origName = "None";
+                    if (clipOverride.m_OriginalClip.TryGet(out var origClip))
+                    {
+                        origName = origClip.m_Name;
+                    }
+                    string overrideName = "None";
+                    if (clipOverride.m_OverrideClip.TryGet(out var overClip))
+                    {
+                        overrideName = overClip.m_Name;
+                    }
+                    sb.AppendLine($"  * {origName} ──(overridden by)──> {overrideName}");
+                }
+            }
+        }
+
+        SetTextWithTruncation(TextPreviewBox, sb.ToString());
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+    }
+
+    private string GetNameFromTOS(KeyValuePair<uint, string>[]? tos, uint hash)
+    {
+        if (tos != null)
+        {
+            foreach (var kv in tos)
+            {
+                if (kv.Key == hash) return kv.Value;
+            }
+        }
+        return $"Hash_{hash}";
+    }
+
+    private string GetClipName(AnimatorController controller, uint clipID)
+    {
+        if (controller.m_AnimationClips != null && clipID < controller.m_AnimationClips.Length)
+        {
+            var pptr = controller.m_AnimationClips[clipID];
+            if (pptr.TryGet(out var clip))
+            {
+                return clip.m_Name;
+            }
+        }
+        return $"Clip_{clipID}";
+    }
+
+    private void PreviewAvatar(Avatar avatar)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("=========================================");
+        sb.AppendLine($"AVATAR: {avatar.m_Name}");
+        sb.AppendLine("=========================================");
+        sb.AppendLine();
+        sb.AppendLine($"Avatar Size: {avatar.m_AvatarSize} bytes");
+        sb.AppendLine();
+
+        if (avatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null)
+        {
+            sb.AppendLine("Skeleton Nodes Hierarchy:");
+            var skeleton = avatar.m_Avatar.m_AvatarSkeleton;
+            for (int i = 0; i < skeleton.m_Node.Length; i++)
+            {
+                var node = skeleton.m_Node[i];
+                string name = "Unknown";
+                if (skeleton.m_ID != null && i < skeleton.m_ID.Length)
+                {
+                    name = avatar.FindBonePath(skeleton.m_ID[i]);
+                    if (string.IsNullOrEmpty(name))
+                    {
+                        name = $"Hash_{skeleton.m_ID[i]}";
+                    }
+                }
+                sb.AppendLine($"  [{i}] Node: \"{name}\" (Parent ID: {node.m_ParentId}, Axes ID: {node.m_AxesId})");
+            }
+        }
+        else
+        {
+            sb.AppendLine("Skeleton nodes are not defined or parsed.");
+        }
+
+        SetTextWithTruncation(TextPreviewBox, sb.ToString());
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
     }
 
     private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
@@ -1560,7 +1994,20 @@ public partial class MainWindow : Window
         {
             sb.AppendLine($"Parent material: {displayMaterial.m_Name}");
         }
-        if (displayMaterial.m_Shader.TryGet(out var shader))
+        
+        Shader? shader = null;
+        if (displayMaterial.m_Shader.TryGet(out var s))
+        {
+            shader = s;
+        }
+        else
+        {
+            shader = assetsManager.assetsFileList
+                .SelectMany(x => x.Objects)
+                .FirstOrDefault(x => x.m_PathID == displayMaterial.m_Shader.m_PathID) as Shader;
+        }
+
+        if (shader != null)
         {
             sb.AppendLine($"Shader: {shader.m_ParsedForm?.m_Name ?? shader.m_Name}");
         }
@@ -1573,12 +2020,19 @@ public partial class MainWindow : Window
             sb.Append($"  {texEnv.Key}: ");
             var texEnvValue = texEnv.Value;
             var textureRef = texEnvValue?.m_Texture;
-            if (texEnvValue != null && textureRef != null && textureRef.TryGet<Texture2D>(out var texture))
+            
+            Texture2D? texture = null;
+            if (texEnvValue != null && textureRef != null && !textureRef.IsNull)
+            {
+                texture = ResolveTexturePPtr(displayMaterial, textureRef);
+            }
+
+            if (texture != null && textureRef != null)
             {
                 sb.AppendLine($"{texture.m_Name} ({texture.m_Width}x{texture.m_Height}, {texture.m_TextureFormat})");
                 sb.AppendLine($"    FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID}");
-                sb.AppendLine($"    Scale: {texEnvValue.m_Scale.X}, {texEnvValue.m_Scale.Y}");
-                sb.AppendLine($"    Offset: {texEnvValue.m_Offset.X}, {texEnvValue.m_Offset.Y}");
+                sb.AppendLine($"    Scale: {texEnvValue?.m_Scale.X}, {texEnvValue?.m_Scale.Y}");
+                sb.AppendLine($"    Offset: {texEnvValue?.m_Offset.X}, {texEnvValue?.m_Offset.Y}");
                 if (previewTexture == null && IsPreferredMaterialPreviewSlot(texEnv.Key))
                 {
                     previewTexture = texture;
@@ -1594,9 +2048,7 @@ public partial class MainWindow : Window
 
         if (previewTexture == null)
         {
-            previewTexture = (displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
-                .Select(x => x.Value?.m_Texture != null && x.Value.m_Texture.TryGet<Texture2D>(out var texture) ? texture : null)
-                .FirstOrDefault(x => x != null);
+            previewTexture = FindTextureForMaterial(displayMaterial);
         }
 
         string infoText = sb.ToString();
@@ -1721,7 +2173,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private static Material? ResolveMaterialForPreview(Material material)
+    private Material? ResolveMaterialForPreview(Material material)
     {
         var visited = new HashSet<Material>();
         while (material != null && visited.Add(material))
@@ -1733,10 +2185,24 @@ public partial class MainWindow : Window
                 return material;
             }
 
-            if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
+            if (material.m_Parent != null)
             {
-                material = parent;
-                continue;
+                if (material.m_Parent.TryGet(out var parent))
+                {
+                    material = parent;
+                    continue;
+                }
+                else
+                {
+                    var parentGlobal = assetsManager.assetsFileList
+                        .SelectMany(x => x.Objects)
+                        .FirstOrDefault(x => x.m_PathID == material.m_Parent.m_PathID) as Material;
+                    if (parentGlobal != null)
+                    {
+                        material = parentGlobal;
+                        continue;
+                    }
+                }
             }
 
             break;
@@ -1757,6 +2223,99 @@ public partial class MainWindow : Window
             default:
                 return false;
         }
+    }
+
+    private Material? FindMaterialForMesh(Mesh mesh)
+    {
+        return FindMaterialsForMesh(mesh).FirstOrDefault();
+    }
+
+    private static readonly HashSet<string> NonDiffuseSlots = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "_BumpMap", "_NormalMap", "_DetailNormalMap", "_DetailNormalMapScale",
+        "_MetallicGlossMap", "_SpecGlossMap", "_OcclusionMap",
+        "_EmissionMap", "_ParallaxMap", "_DetailMask",
+        "_Cubemap", "_ReflectionTex", "_ShadowMap"
+    };
+
+    private Texture2D? FindTextureForMaterial(Material material)
+    {
+        var displayMaterial = ResolveMaterialForPreview(material) ?? material;
+        if (displayMaterial.m_SavedProperties?.m_TexEnvs == null) return null;
+
+        var slots = new[] { "_MainTex", "_BaseMap", "_BaseColorMap", "_BaseColorTexture", "_Diffuse", "_AlbedoMap" };
+        foreach (var slot in slots)
+        {
+            var env = displayMaterial.m_SavedProperties.m_TexEnvs.FirstOrDefault(x => x.Key == slot);
+            if (env.Value?.m_Texture != null && !env.Value.m_Texture.IsNull)
+            {
+                var tex = ResolveTexturePPtr(displayMaterial, env.Value.m_Texture);
+                if (tex != null) return tex;
+            }
+        }
+
+        foreach (var env in displayMaterial.m_SavedProperties.m_TexEnvs)
+        {
+            if (NonDiffuseSlots.Contains(env.Key)) continue;
+            if (env.Value?.m_Texture != null && !env.Value.m_Texture.IsNull)
+            {
+                var tex = ResolveTexturePPtr(displayMaterial, env.Value.m_Texture);
+                if (tex != null) return tex;
+            }
+        }
+
+        return null;
+    }
+
+    private Texture2D? ResolveTexturePPtr(Material material, PPtr<Texture> textureRef)
+    {
+
+        if (textureRef.TryGet<Texture2D>(out var directTex))
+        {
+            return directTex;
+        }
+
+
+        if (textureRef.m_FileID > 0 && textureRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
+        {
+            var external = material.assetsFile.m_Externals[textureRef.m_FileID - 1];
+            var externalFileName = external.fileName?.Replace('\\', '/');
+            if (!string.IsNullOrEmpty(externalFileName))
+            {
+                var lastSlash = externalFileName.LastIndexOf('/');
+                if (lastSlash >= 0) externalFileName = externalFileName.Substring(lastSlash + 1);
+
+                foreach (var file in assetsManager.assetsFileList)
+                {
+                    var candidateName = file.fileName?.Replace('\\', '/');
+                    if (string.IsNullOrEmpty(candidateName)) continue;
+                    var candidateLastSlash = candidateName.LastIndexOf('/');
+                    if (candidateLastSlash >= 0) candidateName = candidateName.Substring(candidateLastSlash + 1);
+
+                    if (string.Equals(candidateName, externalFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (file.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D tex)
+                        {
+                            return tex;
+                        }
+                    }
+                }
+            }
+        }
+
+
+        Texture2D? candidate = null;
+        int matchCount = 0;
+        foreach (var file in assetsManager.assetsFileList)
+        {
+            if (file.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D tex)
+            {
+                candidate = tex;
+                matchCount++;
+                if (matchCount > 1) break;
+            }
+        }
+        return matchCount == 1 ? candidate : null;
     }
 
     private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
@@ -3171,16 +3730,41 @@ public partial class MainWindow : Window
                     exportFullPath = Path.Combine(exportPath, fileName + item.UniqueID + ".fbx");
                 }
                 var convert = new ModelConverter(m_Animator, exportOptions.ConvertTextureFormat);
+                bool exported = false;
                 if (convert.MeshList.Count > 0)
                 {
                     ExportFbx(convert, exportFullPath);
-                    return true;
+                    exported = true;
                 }
-                return false;
+                if (m_Animator.m_Avatar.TryGet(out var avatar))
+                {
+                    var avatarFileName = FixFileName(avatar.m_Name);
+                    var avatarFullPath = Path.Combine(exportPath, avatarFileName + ".asset");
+                    AssetExportHelper.ExportAvatar(avatar, avatarFullPath);
+                    exported = true;
+                }
+                return exported;
             }
-            case AnimationClip _:
+            case Avatar m_Avatar:
             {
-                return false;
+                var avatarFullPath = Path.Combine(exportPath, fileName + ".asset");
+                return AssetExportHelper.ExportAvatar(m_Avatar, avatarFullPath);
+            }
+            case AnimatorController m_AnimatorController:
+            {
+                var controllerFullPath = Path.Combine(exportPath, fileName + ".controller");
+                return AssetExportHelper.ExportAnimatorController(m_AnimatorController, controllerFullPath);
+            }
+            case AnimatorOverrideController m_AnimatorOverrideController:
+            {
+                var overrideFullPath = Path.Combine(exportPath, fileName + ".overrideController");
+                return AssetExportHelper.ExportAnimatorOverrideController(m_AnimatorOverrideController, overrideFullPath);
+            }
+            case AnimationClip m_AnimationClip:
+            {
+                var bonePathHash = AssetExportHelper.BuildBonePathHash(assetsManager.assetsFileList);
+                var morphChannelNames = AssetExportHelper.BuildMorphChannelNames(assetsManager.assetsFileList);
+                return AssetExportHelper.ExportAnimationClip(m_AnimationClip, fileName, exportPath, bonePathHash, morphChannelNames);
             }
             case Mesh m_Mesh:
             {
@@ -3352,8 +3936,7 @@ public partial class MainWindow : Window
 
     private static bool ShouldSkipConvertedAsset(AssetItem item)
     {
-        return item.Asset is AnimationClip
-            || (item.IsFbxSubAsset() && (item.Asset is Material || item.Asset is Shader));
+        return (item.IsFbxSubAsset() && (item.Asset is Material || item.Asset is Shader));
     }
 
     private bool ExportMesh(AssetItem item, Mesh mesh, string exportPath, string fileName)
@@ -3820,19 +4403,55 @@ public partial class MainWindow : Window
     private List<Material> FindMaterialsForMesh(Mesh mesh)
     {
         var materials = new List<Material>();
+        var diag = new List<string>();
+        diag.Add($"Diagnosing FindMaterialsForMesh for Mesh: {mesh.m_Name} (PathID: {mesh.m_PathID})");
+
         foreach (var file in assetsManager.assetsFileList)
         {
             foreach (var obj in file.Objects)
             {
                 if (obj is SkinnedMeshRenderer smr)
                 {
-                    if (smr.m_Mesh.TryGet(out var m) && m == mesh)
+                    Mesh? smrMesh = null;
+                    if (smr.m_Mesh.TryGet(out var m))
+                    {
+                        smrMesh = m;
+                    }
+                    else
+                    {
+                        smrMesh = assetsManager.assetsFileList
+                            .SelectMany(x => x.Objects)
+                            .FirstOrDefault(x => x.m_PathID == smr.m_Mesh.m_PathID) as Mesh;
+                    }
+
+                    var matInfo = smr.m_Materials != null 
+                        ? string.Join(", ", smr.m_Materials.Select(mPtr => {
+                            if (mPtr.TryGet(out var mt)) return $"{mt.m_Name} (PathID: {mt.m_PathID})";
+                            var fallback = assetsManager.assetsFileList.SelectMany(x => x.Objects).FirstOrDefault(x => x.m_PathID == mPtr.m_PathID) as Material;
+                            return fallback != null ? $"{fallback.m_Name} (PathID: {fallback.m_PathID}, fallback)" : $"Unresolved (PathID: {mPtr.m_PathID})";
+                        }))
+                        : "null";
+
+                    diag.Add($"SkinnedMeshRenderer PathID: {smr.m_PathID} | Mesh: {smrMesh?.m_Name} (PathID: {smr.m_Mesh.m_PathID}) | Materials: {matInfo}");
+
+                    if (smrMesh == mesh)
                     {
                         if (smr.m_Materials != null)
                         {
                             foreach (var matPtr in smr.m_Materials)
                             {
-                                if (matPtr.TryGet(out var mat))
+                                Material? mat = null;
+                                if (matPtr.TryGet(out var mt))
+                                {
+                                    mat = mt;
+                                }
+                                else
+                                {
+                                    mat = assetsManager.assetsFileList
+                                        .SelectMany(x => x.Objects)
+                                        .FirstOrDefault(x => x.m_PathID == matPtr.m_PathID) as Material;
+                                }
+                                if (mat != null)
                                 {
                                     materials.Add(mat);
                                 }
@@ -3842,19 +4461,66 @@ public partial class MainWindow : Window
                 }
                 else if (obj is MeshRenderer mr)
                 {
-                    if (mr.m_GameObject.TryGet(out var go))
+                    GameObject? go = null;
+                    if (mr.m_GameObject.TryGet(out var g))
+                    {
+                        go = g;
+                    }
+                    else
+                    {
+                        go = assetsManager.assetsFileList
+                            .SelectMany(x => x.Objects)
+                            .FirstOrDefault(x => x.m_PathID == mr.m_GameObject.m_PathID) as GameObject;
+                    }
+
+                    if (go != null)
                     {
                         foreach (var compPtr in go.m_Components)
                         {
-                            if (compPtr.TryGet(out var comp) && comp is MeshFilter mf)
+                            Component? comp = null;
+                            if (compPtr.TryGet(out var cp))
                             {
-                                if (mf.m_Mesh.TryGet(out var m) && m == mesh)
+                                comp = cp;
+                            }
+                            else
+                            {
+                                comp = assetsManager.assetsFileList
+                                    .SelectMany(x => x.Objects)
+                                    .FirstOrDefault(x => x.m_PathID == compPtr.m_PathID) as Component;
+                            }
+
+                            if (comp is MeshFilter mf)
+                            {
+                                Mesh? mfMesh = null;
+                                if (mf.m_Mesh.TryGet(out var m))
+                                {
+                                    mfMesh = m;
+                                }
+                                else
+                                {
+                                    mfMesh = assetsManager.assetsFileList
+                                        .SelectMany(x => x.Objects)
+                                        .FirstOrDefault(x => x.m_PathID == mf.m_Mesh.m_PathID) as Mesh;
+                                }
+
+                                if (mfMesh == mesh)
                                 {
                                     if (mr.m_Materials != null)
                                     {
                                         foreach (var matPtr in mr.m_Materials)
                                         {
-                                            if (matPtr.TryGet(out var mat))
+                                            Material? mat = null;
+                                            if (matPtr.TryGet(out var mt))
+                                            {
+                                                mat = mt;
+                                            }
+                                            else
+                                            {
+                                                mat = assetsManager.assetsFileList
+                                                    .SelectMany(x => x.Objects)
+                                                    .FirstOrDefault(x => x.m_PathID == matPtr.m_PathID) as Material;
+                                            }
+                                            if (mat != null)
                                             {
                                                 materials.Add(mat);
                                             }
@@ -3868,7 +4534,87 @@ public partial class MainWindow : Window
                 }
             }
         }
+
+        if (materials.Count == 0 || (materials.Count == 1 && (materials[0].m_Name.StartsWith("Material") || materials[0].m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))))
+        {
+            var meshItem = exportableAssets.FirstOrDefault(x => x.Asset == mesh);
+            var meshContainer = meshItem?.Container;
+            var meshTokens = GetPathTokens(!string.IsNullOrEmpty(meshContainer) ? meshContainer : mesh.m_Name);
+
+            Material? bestMat = null;
+            int bestScore = 0;
+
+            foreach (var file in assetsManager.assetsFileList)
+            {
+                foreach (var obj in file.Objects)
+                {
+                    if (obj is Material mat)
+                    {
+                        if (mat.m_Name.StartsWith("Material") || mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        var matItem = exportableAssets.FirstOrDefault(x => x.Asset == mat);
+                        var matContainer = matItem?.Container;
+                        var matTokens = GetPathTokens(!string.IsNullOrEmpty(matContainer) ? matContainer : mat.m_Name);
+
+                        var overlap = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count();
+                        if (overlap > 0)
+                        {
+                            int score = overlap * 10;
+                            if (mat.assetsFile == mesh.assetsFile)
+                            {
+                                score += 5;
+                            }
+                            if (!string.IsNullOrEmpty(meshContainer) && !string.IsNullOrEmpty(matContainer))
+                            {
+                                var meshDir = Path.GetDirectoryName(meshContainer) ?? "";
+                                var matDir = Path.GetDirectoryName(matContainer) ?? "";
+                                if (string.Equals(meshDir, matDir, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    score += 10;
+                                }
+                                else if (meshDir.StartsWith(matDir, StringComparison.OrdinalIgnoreCase) || matDir.StartsWith(meshDir, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    score += 5;
+                                }
+                            }
+
+                            if (score > bestScore)
+                            {
+                                bestScore = score;
+                                bestMat = mat;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (bestMat != null && bestScore > 0)
+            {
+                materials.Add(bestMat);
+            }
+        }
+
         return materials.Distinct().ToList();
+    }
+
+    private static HashSet<string> GetPathTokens(string path)
+    {
+        var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var parts = path.Split(new[] { '/', '\\', '_', '.', '-', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var part in parts)
+        {
+            if (part.Length > 2 && 
+                !string.Equals(part, "fbx", StringComparison.OrdinalIgnoreCase) && 
+                !string.Equals(part, "mat", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(part, "assets", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(part, "models", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(part, "materials", StringComparison.OrdinalIgnoreCase))
+            {
+                tokens.Add(part);
+            }
+        }
+        return tokens;
     }
 
     private string FormatMeshPreview(Mesh mesh, AssetItem item)

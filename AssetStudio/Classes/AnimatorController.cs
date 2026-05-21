@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -580,15 +580,17 @@ namespace AssetStudio
 
     public sealed class AnimatorController : RuntimeAnimatorController
     {
+        public ControllerConstant m_Controller;
+        public KeyValuePair<uint, string>[] m_TOS;
         public PPtr<AnimationClip>[] m_AnimationClips;
 
         public AnimatorController(ObjectReader reader) : base(reader)
         {
             var m_ControllerSize = reader.ReadUInt32();
-            var m_Controller = new ControllerConstant(reader);
+            m_Controller = new ControllerConstant(reader);
 
             int tosSize = reader.ReadInt32();
-            var m_TOS = new KeyValuePair<uint, string>[tosSize];
+            m_TOS = new KeyValuePair<uint, string>[tosSize];
             for (int i = 0; i < tosSize; i++)
             {
                 m_TOS[i] = new KeyValuePair<uint, string>(reader.ReadUInt32(), reader.ReadAlignedString());

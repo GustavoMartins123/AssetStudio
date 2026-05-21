@@ -214,7 +214,7 @@ void main()
             }
         }
 
-        public void SetMesh(Mesh m_Mesh)
+        public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, byte[]? textureData = null, int textureWidth = 0, int textureHeight = 0)
         {
             previewMaterialMode = false;
             if (m_Mesh.m_VertexCount <= 0) return;
@@ -361,6 +361,27 @@ void main()
                     }
                 }
 
+                Vector2[]? localUvData = uvs;
+                if (localUvData == null && m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_VertexCount * 2)
+                {
+                    localUvData = new Vector2[m_VertexCount];
+                    for (int i = 0; i < m_VertexCount; i++)
+                    {
+                        localUvData[i] = new Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
+                    }
+                }
+
+                if (textureData != null && textureWidth > 0 && textureHeight > 0)
+                {
+                    lock (textureLock)
+                    {
+                        pendingTextureWidth = textureWidth;
+                        pendingTextureHeight = textureHeight;
+                        pendingTextureData = textureData;
+                        hasPendingTexture = true;
+                    }
+                }
+
                 // Post back to UI thread
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -373,6 +394,11 @@ void main()
                     normalData = localNormalData;
                     normal2Data = localNormal2Data;
                     colorData = localColorData;
+                    uvData = localUvData;
+                    if (textureData != null)
+                    {
+                        previewMaterialMode = true;
+                    }
                     vao = 0;
                     RequestNextFrameRendering();
                 });
@@ -911,7 +937,14 @@ void main()
                 }
                 else if (e.Key == Key.S)
                 {
-                    shadeMode = shadeMode == 0 ? 1 : 0;
+                    if (uvData != null && previewTextureId != 0)
+                    {
+                        previewMaterialMode = !previewMaterialMode;
+                    }
+                    else
+                    {
+                        shadeMode = shadeMode == 0 ? 1 : 0;
+                    }
                     RequestNextFrameRendering();
                     e.Handled = true;
                 }
