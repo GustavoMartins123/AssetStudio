@@ -1006,6 +1006,7 @@ namespace AssetStudio
                     switch (col.Key)
                     {
                         case "_Color":
+                        case "_BaseColor":
                             iMat.Diffuse = col.Value;
                             break;
                         case "_SColor":
@@ -1015,6 +1016,7 @@ namespace AssetStudio
                             iMat.Emissive = col.Value;
                             break;
                         case "_SpecularColor":
+                        case "_SpecColor":
                             iMat.Specular = col.Value;
                             break;
                         case "_ReflectColor":

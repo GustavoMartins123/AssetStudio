@@ -456,19 +456,29 @@ namespace AssetStudio
             layer.AddProperty(new IntegerToken(0));
             AddSimpleNode(layer, "Version", 101);
             AddSimpleNode(layer, "Name", "");
-            AddSimpleNode(layer, "MappingInformationType", "ByControlPoint");
+            AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var data = new double[mesh.VertexList.Count * 3];
-            for (int i = 0; i < mesh.VertexList.Count; i++)
+            var normalData = new List<double>();
+            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
-                var n = mesh.VertexList[i].Normal;
-                data[i * 3] = n.X;
-                data[i * 3 + 1] = n.Y;
-                data[i * 3 + 2] = n.Z;
+                var sub = mesh.SubmeshList[subIdx];
+                foreach (var face in sub.FaceList)
+                {
+                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                    {
+                        var n0 = mesh.VertexList[index0].Normal;
+                        var n1 = mesh.VertexList[index1].Normal;
+                        var n2 = mesh.VertexList[index2].Normal;
+                        normalData.Add(n0.X); normalData.Add(n0.Y); normalData.Add(n0.Z);
+                        normalData.Add(n1.X); normalData.Add(n1.Y); normalData.Add(n1.Z);
+                        normalData.Add(n2.X); normalData.Add(n2.Y); normalData.Add(n2.Z);
+                    }
+                }
             }
+
             var normNode = N("Normals");
-            normNode.AddProperty(new DoubleArrayToken(data));
+            normNode.AddProperty(new DoubleArrayToken(normalData.ToArray()));
             layer.AddNode(normNode);
             geo.AddNode(layer);
         }
@@ -479,21 +489,45 @@ namespace AssetStudio
             layer.AddProperty(new IntegerToken(uvIndex));
             AddSimpleNode(layer, "Version", 101);
             AddSimpleNode(layer, "Name", uvIndex == 0 ? "UVMap" : $"UVMap_{uvIndex}");
-            AddSimpleNode(layer, "MappingInformationType", "ByControlPoint");
-            AddSimpleNode(layer, "ReferenceInformationType", "Direct");
+            AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
+            AddSimpleNode(layer, "ReferenceInformationType", "IndexToDirect");
 
-            var data = new double[mesh.VertexList.Count * 2];
+            var uvData = new List<double>();
             for (int i = 0; i < mesh.VertexList.Count; i++)
             {
                 if (mesh.VertexList[i].UV?[uvIndex] != null)
                 {
-                    data[i * 2] = mesh.VertexList[i].UV[uvIndex][0];
-                    data[i * 2 + 1] = mesh.VertexList[i].UV[uvIndex][1];
+                    uvData.Add(mesh.VertexList[i].UV[uvIndex][0]);
+                    uvData.Add(mesh.VertexList[i].UV[uvIndex][1]);
+                }
+                else
+                {
+                    uvData.Add(0.0);
+                    uvData.Add(0.0);
                 }
             }
             var uvNode = N("UV");
-            uvNode.AddProperty(new DoubleArrayToken(data));
+            uvNode.AddProperty(new DoubleArrayToken(uvData.ToArray()));
             layer.AddNode(uvNode);
+
+            var uvIndices = new List<int>();
+            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
+            {
+                var sub = mesh.SubmeshList[subIdx];
+                foreach (var face in sub.FaceList)
+                {
+                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                    {
+                        uvIndices.Add(index0);
+                        uvIndices.Add(index1);
+                        uvIndices.Add(index2);
+                    }
+                }
+            }
+            var uvIndexNode = N("UVIndex");
+            uvIndexNode.AddProperty(new IntegerArrayToken(uvIndices.ToArray()));
+            layer.AddNode(uvIndexNode);
+
             geo.AddNode(layer);
         }
 
@@ -503,19 +537,29 @@ namespace AssetStudio
             layer.AddProperty(new IntegerToken(0));
             AddSimpleNode(layer, "Version", 101);
             AddSimpleNode(layer, "Name", "");
-            AddSimpleNode(layer, "MappingInformationType", "ByControlPoint");
+            AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var data = new double[mesh.VertexList.Count * 3];
-            for (int i = 0; i < mesh.VertexList.Count; i++)
+            var tangentData = new List<double>();
+            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
-                var t = mesh.VertexList[i].Tangent;
-                data[i * 3] = t.X;
-                data[i * 3 + 1] = t.Y;
-                data[i * 3 + 2] = t.Z;
+                var sub = mesh.SubmeshList[subIdx];
+                foreach (var face in sub.FaceList)
+                {
+                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                    {
+                        var t0 = mesh.VertexList[index0].Tangent;
+                        var t1 = mesh.VertexList[index1].Tangent;
+                        var t2 = mesh.VertexList[index2].Tangent;
+                        tangentData.Add(t0.X); tangentData.Add(t0.Y); tangentData.Add(t0.Z);
+                        tangentData.Add(t1.X); tangentData.Add(t1.Y); tangentData.Add(t1.Z);
+                        tangentData.Add(t2.X); tangentData.Add(t2.Y); tangentData.Add(t2.Z);
+                    }
+                }
             }
+
             var tangNode = N("Tangents");
-            tangNode.AddProperty(new DoubleArrayToken(data));
+            tangNode.AddProperty(new DoubleArrayToken(tangentData.ToArray()));
             layer.AddNode(tangNode);
             geo.AddNode(layer);
         }
@@ -526,20 +570,29 @@ namespace AssetStudio
             layer.AddProperty(new IntegerToken(0));
             AddSimpleNode(layer, "Version", 101);
             AddSimpleNode(layer, "Name", "");
-            AddSimpleNode(layer, "MappingInformationType", "ByControlPoint");
+            AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var data = new double[mesh.VertexList.Count * 4];
-            for (int i = 0; i < mesh.VertexList.Count; i++)
+            var colorData = new List<double>();
+            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
-                var c = mesh.VertexList[i].Color;
-                data[i * 4] = c.R;
-                data[i * 4 + 1] = c.G;
-                data[i * 4 + 2] = c.B;
-                data[i * 4 + 3] = c.A;
+                var sub = mesh.SubmeshList[subIdx];
+                foreach (var face in sub.FaceList)
+                {
+                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                    {
+                        var c0 = mesh.VertexList[index0].Color;
+                        var c1 = mesh.VertexList[index1].Color;
+                        var c2 = mesh.VertexList[index2].Color;
+                        colorData.Add(c0.R); colorData.Add(c0.G); colorData.Add(c0.B); colorData.Add(c0.A);
+                        colorData.Add(c1.R); colorData.Add(c1.G); colorData.Add(c1.B); colorData.Add(c1.A);
+                        colorData.Add(c2.R); colorData.Add(c2.G); colorData.Add(c2.B); colorData.Add(c2.A);
+                    }
+                }
             }
+
             var colorNode = N("Colors");
-            colorNode.AddProperty(new DoubleArrayToken(data));
+            colorNode.AddProperty(new DoubleArrayToken(colorData.ToArray()));
             layer.AddNode(colorNode);
             geo.AddNode(layer);
         }
@@ -689,16 +742,16 @@ namespace AssetStudio
                     }
                 }
 
-                if (indices.Count > 0)
-                {
-                    var idxNode = N("Indexes");
-                    idxNode.AddProperty(new IntegerArrayToken(indices.ToArray()));
-                    cluster.AddNode(idxNode);
+                if (indices.Count == 0)
+                    continue;
 
-                    var wNode = N("Weights");
-                    wNode.AddProperty(new DoubleArrayToken(weights.ToArray()));
-                    cluster.AddNode(wNode);
-                }
+                var idxNode = N("Indexes");
+                idxNode.AddProperty(new IntegerArrayToken(indices.ToArray()));
+                cluster.AddNode(idxNode);
+
+                var wNode = N("Weights");
+                wNode.AddProperty(new DoubleArrayToken(weights.ToArray()));
+                cluster.AddNode(wNode);
 
                 var transformLink = ToFbxMatrixArray(GetBindPoseLinkMatrix(meshBindMatrix, bone));
 
@@ -754,7 +807,7 @@ namespace AssetStudio
 
         private void ExportMaterialTextures(ImportedMaterial mat, long materialId, IImported convert)
         {
-            if (mat.Textures == null || convert.TextureList == null)
+            if (mat.Textures == null)
                 return;
 
             foreach (var matTex in mat.Textures)
@@ -762,14 +815,24 @@ namespace AssetStudio
                 if (string.IsNullOrEmpty(matTex.Name))
                     continue;
 
-                var texture = ImportedHelpers.FindTexture(matTex.Name, convert.TextureList);
-                if (texture == null)
+                var texture = convert.TextureList != null ? ImportedHelpers.FindTexture(matTex.Name, convert.TextureList) : null;
+                long textureId;
+                if (texture != null)
                 {
-                    Logger.Warning($"Material '{mat.Name}' references texture '{matTex.Name}', but it was not converted.");
-                    continue;
+                    textureId = ExportTexture(texture);
+                }
+                else
+                {
+                    using (var ms = new MemoryStream())
+                    {
+                        var dummyTex = new ImportedTexture(ms, matTex.Name)
+                        {
+                            Data = null
+                        };
+                        textureId = ExportTexture(dummyTex);
+                    }
                 }
 
-                var textureId = ExportTexture(texture);
                 ConnectProperty(textureId, materialId, GetMaterialTextureProperty(matTex.Dest));
             }
         }
