@@ -28,6 +28,7 @@ public sealed class ExportOptionsState
     public bool ExportAllNodes { get; set; } = true;
     public bool ExportSkins { get; set; } = true;
     public bool ExportAnimations { get; set; } = true;
+    public bool ExportAnimationsSplit { get; set; } = false;
     public bool ExportBlendShape { get; set; } = true;
     public bool CastToBone { get; set; }
     public bool ExportAllUvsAsDiffuseMaps { get; set; }
@@ -51,6 +52,7 @@ public sealed class ExportOptionsState
         ExportAllNodes = other.ExportAllNodes;
         ExportSkins = other.ExportSkins;
         ExportAnimations = other.ExportAnimations;
+        ExportAnimationsSplit = other.ExportAnimationsSplit;
         ExportBlendShape = other.ExportBlendShape;
         CastToBone = other.CastToBone;
         ExportAllUvsAsDiffuseMaps = other.ExportAllUvsAsDiffuseMaps;
@@ -75,6 +77,7 @@ public sealed class ExportOptionsWindow : Window
     private readonly CheckBox exportAllNodes = new() { Content = "Export all nodes" };
     private readonly CheckBox exportSkins = new() { Content = "Export skins" };
     private readonly CheckBox exportAnimations = new() { Content = "Export animations" };
+    private readonly CheckBox exportAnimationsSplit = new() { Content = "Export animations as separate FBX files" };
     private readonly CheckBox exportBlendShape = new() { Content = "Export blend shapes" };
     private readonly CheckBox castToBone = new() { Content = "Cast to bone" };
     private readonly CheckBox exportAllUvsAsDiffuseMaps = new() { Content = "Export all UVs as diffuse maps" };
@@ -114,6 +117,7 @@ public sealed class ExportOptionsWindow : Window
         panel.Children.Add(exportAllNodes);
         panel.Children.Add(exportSkins);
         panel.Children.Add(exportAnimations);
+        panel.Children.Add(exportAnimationsSplit);
         panel.Children.Add(exportBlendShape);
         panel.Children.Add(castToBone);
         panel.Children.Add(exportAllUvsAsDiffuseMaps);
@@ -152,6 +156,7 @@ public sealed class ExportOptionsWindow : Window
         exportAllNodes.IsChecked = state.ExportAllNodes;
         exportSkins.IsChecked = state.ExportSkins;
         exportAnimations.IsChecked = state.ExportAnimations;
+        exportAnimationsSplit.IsChecked = state.ExportAnimationsSplit;
         exportBlendShape.IsChecked = state.ExportBlendShape;
         castToBone.IsChecked = state.CastToBone;
         exportAllUvsAsDiffuseMaps.IsChecked = state.ExportAllUvsAsDiffuseMaps;
@@ -174,6 +179,7 @@ public sealed class ExportOptionsWindow : Window
         state.ExportAllNodes = exportAllNodes.IsChecked == true;
         state.ExportSkins = exportSkins.IsChecked == true;
         state.ExportAnimations = exportAnimations.IsChecked == true;
+        state.ExportAnimationsSplit = exportAnimationsSplit.IsChecked == true;
         state.ExportBlendShape = exportBlendShape.IsChecked == true;
         state.CastToBone = castToBone.IsChecked == true;
         state.ExportAllUvsAsDiffuseMaps = exportAllUvsAsDiffuseMaps.IsChecked == true;

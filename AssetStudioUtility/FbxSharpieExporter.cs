@@ -100,46 +100,59 @@ namespace AssetStudio
 
         public void Export(IImported convert, string exportPath)
         {
-            _rootFrame = convert.RootFrame;
-            _exportDirectory = Path.GetDirectoryName(exportPath);
-            if (!string.IsNullOrEmpty(_exportDirectory))
-                Directory.CreateDirectory(_exportDirectory);
-
-            BuildBonePathSet(convert);
-
-            if (convert.RootFrame != null)
+            var currentCulture = System.Threading.Thread.CurrentThread.CurrentCulture;
+            var currentUICulture = System.Threading.Thread.CurrentThread.CurrentUICulture;
+            try
             {
-                ExportFrame(convert.RootFrame, 0, System.Numerics.Matrix4x4.Identity);
-                ExportBindPose();
-            }
+                System.Threading.Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+                System.Threading.Thread.CurrentThread.CurrentUICulture = System.Globalization.CultureInfo.InvariantCulture;
 
-            if (convert.MaterialList != null)
+                _rootFrame = convert.RootFrame;
+                _exportDirectory = Path.GetDirectoryName(exportPath);
+                if (!string.IsNullOrEmpty(_exportDirectory))
+                    Directory.CreateDirectory(_exportDirectory);
+
+                BuildBonePathSet(convert);
+
+                if (convert.RootFrame != null)
+                {
+                    ExportFrame(convert.RootFrame, 0, System.Numerics.Matrix4x4.Identity);
+                    ExportBindPose();
+                }
+
+                if (convert.MaterialList != null)
+                {
+                    foreach (var mat in convert.MaterialList)
+                        ExportMaterial(mat, convert);
+                }
+
+                if (convert.MeshList != null)
+                {
+                    foreach (var mesh in convert.MeshList)
+                        ExportMesh(mesh, convert);
+                }
+
+                if (_exportBlendShape && convert.MorphList != null)
+                {
+                    foreach (var morph in convert.MorphList)
+                        ExportMorph(morph);
+                }
+
+                if (_exportAnimations && convert.AnimationList != null)
+                {
+                    foreach (var anim in convert.AnimationList)
+                        ExportAnimation(anim);
+                }
+
+                BuildTakes();
+                WriteExportReport(exportPath, convert);
+                if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else FbxIO.WriteBinary(_document, exportPath);
+            }
+            finally
             {
-                foreach (var mat in convert.MaterialList)
-                    ExportMaterial(mat, convert);
+                System.Threading.Thread.CurrentThread.CurrentCulture = currentCulture;
+                System.Threading.Thread.CurrentThread.CurrentUICulture = currentUICulture;
             }
-
-            if (convert.MeshList != null)
-            {
-                foreach (var mesh in convert.MeshList)
-                    ExportMesh(mesh, convert);
-            }
-
-            if (_exportBlendShape && convert.MorphList != null)
-            {
-                foreach (var morph in convert.MorphList)
-                    ExportMorph(morph);
-            }
-
-            if (_exportAnimations && convert.AnimationList != null)
-            {
-                foreach (var anim in convert.AnimationList)
-                    ExportAnimation(anim);
-            }
-
-            BuildTakes();
-            WriteExportReport(exportPath, convert);
-            if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else FbxIO.WriteBinary(_document, exportPath);
         }
 
         private void ExportFrame(ImportedFrame frame, long parentId, System.Numerics.Matrix4x4 parentGlobal)
@@ -481,11 +494,6 @@ namespace AssetStudio
             var uvNode = N("UV");
             uvNode.AddProperty(new DoubleArrayToken(data));
             layer.AddNode(uvNode);
-            var uvIdxNode = N("UVIndex");
-            var indices = new int[mesh.VertexList.Count];
-            for(int i = 0; i < indices.Length; i++) indices[i] = i;
-            uvIdxNode.AddProperty(new IntegerArrayToken(indices));
-            layer.AddNode(uvIdxNode);
             geo.AddNode(layer);
         }
 

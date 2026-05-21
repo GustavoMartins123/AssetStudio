@@ -14,6 +14,26 @@ namespace AssetStudio
         List<ImportedMorph> MorphList { get; }
     }
 
+    public class ImportedWrapper : IImported
+    {
+        public ImportedFrame RootFrame { get; set; }
+        public List<ImportedMesh> MeshList { get; set; }
+        public List<ImportedMaterial> MaterialList { get; set; }
+        public List<ImportedTexture> TextureList { get; set; }
+        public List<ImportedKeyframedAnimation> AnimationList { get; set; }
+        public List<ImportedMorph> MorphList { get; set; }
+
+        public ImportedWrapper(IImported source)
+        {
+            RootFrame = source.RootFrame;
+            MeshList = source.MeshList;
+            MaterialList = source.MaterialList;
+            TextureList = source.TextureList;
+            AnimationList = source.AnimationList;
+            MorphList = source.MorphList;
+        }
+    }
+
     public class ImportedFrame
     {
         public string Name { get; set; }

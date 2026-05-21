@@ -98,11 +98,47 @@ namespace AssetStudio
 
         private void InitWithAnimator(Animator m_Animator)
         {
-            if (m_Animator.m_Avatar.TryGet(out var m_Avatar))
+            if (!m_Animator.m_Avatar.TryGet(out var m_Avatar))
+            {
+                if (m_Animator.m_Avatar != null && !m_Animator.m_Avatar.IsNull)
+                {
+                    foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(m_Animator.m_Avatar.m_PathID, out var obj) && obj is Avatar foundAvatar)
+                        {
+                            m_Avatar = foundAvatar;
+                            Logger.Info($"Found Avatar '{foundAvatar.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                            break;
+                        }
+                    }
+                }
+            }
+            if (m_Avatar != null)
                 avatar = m_Avatar;
 
-            m_Animator.m_GameObject.TryGet(out var m_GameObject);
-            InitWithGameObject(m_GameObject, m_Animator.m_HasTransformHierarchy);
+            if (!m_Animator.m_GameObject.TryGet(out var m_GameObject))
+            {
+                if (m_Animator.m_GameObject != null && !m_Animator.m_GameObject.IsNull)
+                {
+                    foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(m_Animator.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                        {
+                            m_GameObject = foundGo;
+                            Logger.Info($"Found GameObject '{foundGo.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                            break;
+                        }
+                    }
+                }
+            }
+            if (m_GameObject != null)
+            {
+                InitWithGameObject(m_GameObject, m_Animator.m_HasTransformHierarchy);
+            }
+            else
+            {
+                Logger.Error($"GameObject for Animator (PathID: {m_Animator.m_PathID}) could not be resolved.");
+            }
         }
 
         private void InitWithGameObject(GameObject m_GameObject, bool hasTransformHierarchy = true)
@@ -117,8 +153,25 @@ namespace AssetStudio
             {
                 var frameList = new List<ImportedFrame>();
                 var tempTransform = m_Transform;
-                while (tempTransform.m_Father.TryGet(out var m_Father))
+                while (tempTransform != null)
                 {
+                    var fatherPtr = tempTransform.m_Father;
+                    if (fatherPtr == null || fatherPtr.IsNull)
+                        break;
+                    Transform m_Father = null;
+                    if (!fatherPtr.TryGet(out m_Father))
+                    {
+                        foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                        {
+                            if (sf.ObjectsDic.TryGetValue(fatherPtr.m_PathID, out var obj) && obj is Transform foundFather)
+                            {
+                                m_Father = foundFather;
+                                break;
+                            }
+                        }
+                    }
+                    if (m_Father == null)
+                        break;
                     frameList.Add(ConvertTransform(m_Father));
                     tempTransform = m_Father;
                 }
@@ -146,43 +199,97 @@ namespace AssetStudio
 
         private void ConvertMeshRenderer(Transform m_Transform)
         {
-            m_Transform.m_GameObject.TryGet(out var m_GameObject);
-
-            if (m_GameObject.m_MeshRenderer != null)
+            if (!m_Transform.m_GameObject.TryGet(out var m_GameObject))
             {
-                ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
-            }
-
-            if (m_GameObject.m_SkinnedMeshRenderer != null)
-            {
-                ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
-            }
-
-            if (m_GameObject.m_Animation != null)
-            {
-                foreach (var animation in m_GameObject.m_Animation.m_Animations)
+                foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
                 {
-                    if (animation.TryGet(out var animationClip))
+                    if (sf.ObjectsDic.TryGetValue(m_Transform.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
                     {
-                        if (!boundAnimationPathDic.ContainsKey(animationClip))
+                        m_GameObject = foundGo;
+                        break;
+                    }
+                }
+            }
+
+            if (m_GameObject != null)
+            {
+                if (m_GameObject.m_MeshRenderer != null)
+                {
+                    ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
+                }
+
+                if (m_GameObject.m_SkinnedMeshRenderer != null)
+                {
+                    ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
+                }
+
+                if (m_GameObject.m_Animation != null)
+                {
+                    foreach (var animation in m_GameObject.m_Animation.m_Animations)
+                    {
+                        var animationPtr = animation;
+                        if (!animationPtr.TryGet(out var animationClip))
                         {
-                            boundAnimationPathDic.Add(animationClip, GetTransformPath(m_Transform));
+                            foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                            {
+                                if (sf.ObjectsDic.TryGetValue(animationPtr.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                {
+                                    animationClip = foundClip;
+                                    break;
+                                }
+                            }
                         }
-                        animationClipHashSet.Add(animationClip);
+                        if (animationClip != null)
+                        {
+                            if (!boundAnimationPathDic.ContainsKey(animationClip))
+                            {
+                                boundAnimationPathDic.Add(animationClip, GetTransformPath(m_Transform));
+                            }
+                            animationClipHashSet.Add(animationClip);
+                        }
                     }
                 }
             }
 
             foreach (var pptr in m_Transform.m_Children)
             {
-                if (pptr.TryGet(out var child))
+                var childPtr = pptr;
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+                if (child != null)
                     ConvertMeshRenderer(child);
             }
         }
 
         private void CollectAnimationClip(Animator m_Animator)
         {
-            if (m_Animator.m_Controller.TryGet(out var m_Controller))
+            RuntimeAnimatorController m_Controller = null;
+            if (!m_Animator.m_Controller.TryGet(out m_Controller))
+            {
+                if (m_Animator.m_Controller != null && !m_Animator.m_Controller.IsNull)
+                {
+                    foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(m_Animator.m_Controller.m_PathID, out var obj) && obj is RuntimeAnimatorController foundController)
+                        {
+                            m_Controller = foundController;
+                            Logger.Info($"Found Controller '{foundController.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (m_Controller != null)
             {
                 switch (m_Controller)
                 {
@@ -190,20 +297,74 @@ namespace AssetStudio
                         {
                             foreach (var clipOverride in m_AnimatorOverrideController.m_Clips)
                             {
-                                if (clipOverride.m_OverrideClip.TryGet(out var m_OverrideClip))
+                                AnimationClip m_OverrideClip = null;
+                                if (!clipOverride.m_OverrideClip.TryGet(out m_OverrideClip) && clipOverride.m_OverrideClip != null && !clipOverride.m_OverrideClip.IsNull)
+                                {
+                                    foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                                    {
+                                        if (sf.ObjectsDic.TryGetValue(clipOverride.m_OverrideClip.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                        {
+                                            m_OverrideClip = foundClip;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (m_OverrideClip != null)
                                 {
                                     animationClipHashSet.Add(m_OverrideClip);
                                 }
-                                else if (clipOverride.m_OriginalClip.TryGet(out var m_OriginalClip))
+                                else
                                 {
-                                    animationClipHashSet.Add(m_OriginalClip);
+                                    AnimationClip m_OriginalClip = null;
+                                    if (!clipOverride.m_OriginalClip.TryGet(out m_OriginalClip) && clipOverride.m_OriginalClip != null && !clipOverride.m_OriginalClip.IsNull)
+                                    {
+                                        foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                                        {
+                                            if (sf.ObjectsDic.TryGetValue(clipOverride.m_OriginalClip.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                            {
+                                                m_OriginalClip = foundClip;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (m_OriginalClip != null)
+                                    {
+                                        animationClipHashSet.Add(m_OriginalClip);
+                                    }
                                 }
                             }
-                            if (m_AnimatorOverrideController.m_Controller.TryGet<AnimatorController>(out var m_AnimatorController))
+
+                            AnimatorController m_AnimatorController = null;
+                            if (!m_AnimatorOverrideController.m_Controller.TryGet<AnimatorController>(out m_AnimatorController) && m_AnimatorOverrideController.m_Controller != null && !m_AnimatorOverrideController.m_Controller.IsNull)
+                            {
+                                foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                                {
+                                    if (sf.ObjectsDic.TryGetValue(m_AnimatorOverrideController.m_Controller.m_PathID, out var obj) && obj is AnimatorController foundController)
+                                    {
+                                        m_AnimatorController = foundController;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (m_AnimatorController != null)
                             {
                                 foreach (var pptr in m_AnimatorController.m_AnimationClips)
                                 {
-                                    if (pptr.TryGet(out var m_AnimationClip))
+                                    AnimationClip m_AnimationClip = null;
+                                    if (!pptr.TryGet(out m_AnimationClip) && pptr != null && !pptr.IsNull)
+                                    {
+                                        foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                                        {
+                                            if (sf.ObjectsDic.TryGetValue(pptr.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                            {
+                                                m_AnimationClip = foundClip;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (m_AnimationClip != null)
                                     {
                                         animationClipHashSet.Add(m_AnimationClip);
                                     }
@@ -216,7 +377,19 @@ namespace AssetStudio
                         {
                             foreach (var pptr in m_AnimatorController.m_AnimationClips)
                             {
-                                if (pptr.TryGet(out var m_AnimationClip))
+                                AnimationClip m_AnimationClip = null;
+                                if (!pptr.TryGet(out m_AnimationClip) && pptr != null && !pptr.IsNull)
+                                {
+                                    foreach (var sf in m_Animator.assetsFile.assetsManager.assetsFileList)
+                                    {
+                                        if (sf.ObjectsDic.TryGetValue(pptr.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                        {
+                                            m_AnimationClip = foundClip;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (m_AnimationClip != null)
                                 {
                                     animationClipHashSet.Add(m_AnimationClip);
                                 }
@@ -236,8 +409,18 @@ namespace AssetStudio
 
             var frame = new ImportedFrame(trans.m_Children.Length);
             transformDictionary[trans] = frame;
-            trans.m_GameObject.TryGet(out var m_GameObject);
-            frame.Name = m_GameObject.m_Name;
+            if (!trans.m_GameObject.TryGet(out var m_GameObject))
+            {
+                foreach (var sf in trans.assetsFile.assetsManager.assetsFileList)
+                {
+                    if (sf.ObjectsDic.TryGetValue(trans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                    {
+                        m_GameObject = foundGo;
+                        break;
+                    }
+                }
+            }
+            frame.Name = m_GameObject != null ? m_GameObject.m_Name : $"GameObject_{trans.m_GameObject.m_PathID}";
             SetFrame(frame, trans.m_LocalPosition, trans.m_LocalRotation, trans.m_LocalScale);
             return frame;
         }
@@ -298,7 +481,7 @@ namespace AssetStudio
             {
                 yaw = (float)Math.Atan2(2f * q.Y * q.W - 2f * q.X * q.Z, sqx - sqy - sqz + sqw);
                 pitch = (float)Math.Asin(Math.Max(-1f, Math.Min(1f, 2f * test / unit)));
-                roll = (float)Math.Atan2(2f * q.X * q.W - 2f * q.Y * q.Z, -sqx + sqy - sqz + sqw);
+                roll = (float)Math.Atan2(2f * q.X * q.W - 2f * q.Y * q.Z, -sqx + sqy -sqz + sqw);
             }
 
             return new Vector3(roll * 180f / (float)Math.PI, pitch * 180f / (float)Math.PI, yaw * 180f / (float)Math.PI);
@@ -322,7 +505,19 @@ namespace AssetStudio
             }
             foreach (var pptr in trans.m_Children)
             {
-                if (pptr.TryGet(out var child))
+                var childPtr = pptr;
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in trans.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+                if (child != null)
                     ConvertTransforms(child, frame);
             }
         }
@@ -333,8 +528,18 @@ namespace AssetStudio
             if (mesh == null)
                 return;
             var iMesh = new ImportedMesh();
-            meshR.m_GameObject.TryGet(out var m_GameObject2);
-            iMesh.Path = GetTransformPath(m_GameObject2.m_Transform);
+            if (!meshR.m_GameObject.TryGet(out var m_GameObject2))
+            {
+                foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                {
+                    if (sf.ObjectsDic.TryGetValue(meshR.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                    {
+                        m_GameObject2 = foundGo;
+                        break;
+                    }
+                }
+            }
+            iMesh.Path = m_GameObject2 != null ? GetTransformPath(m_GameObject2.m_Transform) : "";
             iMesh.SubmeshList = new List<ImportedSubmesh>();
             var subHashSet = new HashSet<int>();
             var combine = false;
@@ -519,7 +724,7 @@ namespace AssetStudio
                 {
                     if (sMesh.m_Bones.Length == mesh.m_BindPose.Length)
                     {
-                        var verifiedBoneCount = sMesh.m_Bones.Count(x => x.TryGet(out _));
+                        var verifiedBoneCount = sMesh.m_Bones.Count(x => TryGetBoneTransform(x, meshR, out _));
                         if (verifiedBoneCount > 0)
                         {
                             boneType = 1;
@@ -559,7 +764,7 @@ namespace AssetStudio
                     for (int i = 0; i < boneCount; i++)
                     {
                         var bone = new ImportedBone();
-                        if (sMesh.m_Bones[i].TryGet(out var m_Transform))
+                        if (TryGetBoneTransform(sMesh.m_Bones[i], meshR, out var m_Transform))
                         {
                             bone.Path = GetTransformPath(m_Transform);
                         }
@@ -663,24 +868,75 @@ namespace AssetStudio
             MeshList.Add(iMesh);
         }
 
+        private static bool TryGetBoneTransform(PPtr<Transform> bonePtr, Renderer meshR, out Transform transform)
+        {
+            if (bonePtr.TryGet(out transform))
+                return true;
+            if (bonePtr.IsNull)
+                return false;
+            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+            {
+                if (sf.ObjectsDic.TryGetValue(bonePtr.m_PathID, out var obj) && obj is Transform foundTransform)
+                {
+                    transform = foundTransform;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private static Mesh GetMesh(Renderer meshR)
         {
             if (meshR is SkinnedMeshRenderer sMesh)
             {
-                if (sMesh.m_Mesh.TryGet(out var m_Mesh))
+                if (!sMesh.m_Mesh.TryGet(out var m_Mesh))
                 {
-                    return m_Mesh;
+                    if (sMesh.m_Mesh != null && !sMesh.m_Mesh.IsNull)
+                    {
+                        foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                        {
+                            if (sf.ObjectsDic.TryGetValue(sMesh.m_Mesh.m_PathID, out var obj) && obj is Mesh foundMesh)
+                            {
+                                m_Mesh = foundMesh;
+                                Logger.Info($"Found mesh '{foundMesh.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                break;
+                            }
+                        }
+                    }
                 }
+                return m_Mesh;
             }
             else
             {
-                meshR.m_GameObject.TryGet(out var m_GameObject);
-                if (m_GameObject.m_MeshFilter != null)
+                if (!meshR.m_GameObject.TryGet(out var m_GameObject))
                 {
-                    if (m_GameObject.m_MeshFilter.m_Mesh.TryGet(out var m_Mesh))
+                    foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
                     {
-                        return m_Mesh;
+                        if (sf.ObjectsDic.TryGetValue(meshR.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                        {
+                            m_GameObject = foundGo;
+                            break;
+                        }
                     }
+                }
+                if (m_GameObject?.m_MeshFilter != null)
+                {
+                    if (!m_GameObject.m_MeshFilter.m_Mesh.TryGet(out var m_Mesh))
+                    {
+                        if (m_GameObject.m_MeshFilter.m_Mesh != null && !m_GameObject.m_MeshFilter.m_Mesh.IsNull)
+                        {
+                            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                            {
+                                if (sf.ObjectsDic.TryGetValue(m_GameObject.m_MeshFilter.m_Mesh.m_PathID, out var obj) && obj is Mesh foundMesh)
+                                {
+                                    m_Mesh = foundMesh;
+                                    Logger.Info($"Found mesh '{foundMesh.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return m_Mesh;
                 }
             }
 
@@ -728,7 +984,7 @@ namespace AssetStudio
         private ImportedMaterial ConvertMaterial(Material mat)
         {
             ImportedMaterial iMat;
-            if (mat != null)
+            if (mat != null && !string.IsNullOrEmpty(mat.m_Name))
             {
                 iMat = ImportedHelpers.FindMaterial(mat.m_Name, MaterialList);
                 if (iMat != null)
@@ -785,7 +1041,21 @@ namespace AssetStudio
                 foreach (var texEnv in mat.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
                 {
                     var textureRef = texEnv.Value?.m_Texture;
-                    if (textureRef == null || !textureRef.TryGet<Texture2D>(out var m_Texture2D)) //TODO other Texture
+                    Texture2D m_Texture2D = null;
+                    if (textureRef != null && !textureRef.IsNull && !textureRef.TryGet<Texture2D>(out m_Texture2D)) //TODO other Texture
+                    {
+                        foreach (var sf in mat.assetsFile.assetsManager.assetsFileList)
+                        {
+                            if (sf.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D foundTex)
+                            {
+                                m_Texture2D = foundTex;
+                                Logger.Info($"Found texture '{foundTex.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                break;
+                            }
+                        }
+                    }
+
+                    if (m_Texture2D == null)
                     {
                         if (textureRef != null && !textureRef.IsNull)
                         {
@@ -832,7 +1102,21 @@ namespace AssetStudio
             }
             else
             {
-                iMat = new ImportedMaterial();
+                iMat = ImportedHelpers.FindMaterial("Material", MaterialList);
+                if (iMat == null)
+                {
+                    iMat = new ImportedMaterial();
+                    iMat.Name = "Material";
+                    iMat.Diffuse = new Color(0.8f, 0.8f, 0.8f, 1);
+                    iMat.Ambient = new Color(0.2f, 0.2f, 0.2f, 1);
+                    iMat.Emissive = new Color(0, 0, 0, 1);
+                    iMat.Specular = new Color(0.2f, 0.2f, 0.2f, 1);
+                    iMat.Reflection = new Color(0, 0, 0, 1);
+                    iMat.Shininess = 20f;
+                    iMat.Transparency = 0f;
+                    iMat.Textures = new List<ImportedMaterialTexture>();
+                    MaterialList.Add(iMat);
+                }
             }
             return iMat;
         }

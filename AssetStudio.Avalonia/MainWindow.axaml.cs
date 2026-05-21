@@ -3163,7 +3163,21 @@ public partial class MainWindow : Window
 
         switch (item.Asset)
         {
-            case Animator _:
+            case Animator m_Animator:
+            {
+                var exportFullPath = Path.Combine(exportPath, fileName + ".fbx");
+                if (File.Exists(exportFullPath))
+                {
+                    exportFullPath = Path.Combine(exportPath, fileName + item.UniqueID + ".fbx");
+                }
+                var convert = new ModelConverter(m_Animator, exportOptions.ConvertTextureFormat);
+                if (convert.MeshList.Count > 0)
+                {
+                    ExportFbx(convert, exportFullPath);
+                    return true;
+                }
+                return false;
+            }
             case AnimationClip _:
             {
                 return false;
@@ -3338,8 +3352,7 @@ public partial class MainWindow : Window
 
     private static bool ShouldSkipConvertedAsset(AssetItem item)
     {
-        return item.Asset is Animator
-            || item.Asset is AnimationClip
+        return item.Asset is AnimationClip
             || (item.IsFbxSubAsset() && (item.Asset is Material || item.Asset is Shader));
     }
 
@@ -3501,19 +3514,66 @@ public partial class MainWindow : Window
 
     private void ExportFbx(IImported convert, string exportFile)
     {
-        ModelExporter.ExportFbx(exportFile, convert,
-            exportOptions.EulerFilter,
-            (float)exportOptions.FilterPrecision,
-            exportOptions.ExportAllNodes,
-            exportOptions.ExportSkins,
-            exportOptions.ExportAnimations,
-            exportOptions.ExportBlendShape,
-            exportOptions.CastToBone,
-            (float)exportOptions.BoneSize,
-            exportOptions.ExportAllUvsAsDiffuseMaps,
-            (float)exportOptions.ScaleFactor,
-            exportOptions.FbxVersion,
-            exportOptions.FbxFormat == 1);
+        if (exportOptions.ExportAnimations && exportOptions.ExportAnimationsSplit && convert.AnimationList?.Count > 0)
+        {
+            // 1. Export main model without animations
+            var mainConvert = new ImportedWrapper(convert)
+            {
+                AnimationList = new List<ImportedKeyframedAnimation>()
+            };
+            ModelExporter.ExportFbx(exportFile, mainConvert,
+                exportOptions.EulerFilter,
+                (float)exportOptions.FilterPrecision,
+                exportOptions.ExportAllNodes,
+                exportOptions.ExportSkins,
+                false, // Disable animation for main export
+                exportOptions.ExportBlendShape,
+                exportOptions.CastToBone,
+                (float)exportOptions.BoneSize,
+                exportOptions.ExportAllUvsAsDiffuseMaps,
+                (float)exportOptions.ScaleFactor,
+                exportOptions.FbxVersion,
+                exportOptions.FbxFormat == 1);
+
+            // 2. Export each animation clip separately
+            foreach (var anim in convert.AnimationList)
+            {
+                var animFile = Path.Combine(Path.GetDirectoryName(exportFile)!, $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.fbx");
+                var animConvert = new ImportedWrapper(convert)
+                {
+                    AnimationList = new List<ImportedKeyframedAnimation> { anim }
+                };
+                ModelExporter.ExportFbx(animFile, animConvert,
+                    exportOptions.EulerFilter,
+                    (float)exportOptions.FilterPrecision,
+                    exportOptions.ExportAllNodes,
+                    exportOptions.ExportSkins,
+                    true,
+                    exportOptions.ExportBlendShape,
+                    exportOptions.CastToBone,
+                    (float)exportOptions.BoneSize,
+                    exportOptions.ExportAllUvsAsDiffuseMaps,
+                    (float)exportOptions.ScaleFactor,
+                    exportOptions.FbxVersion,
+                    exportOptions.FbxFormat == 1);
+            }
+        }
+        else
+        {
+            ModelExporter.ExportFbx(exportFile, convert,
+                exportOptions.EulerFilter,
+                (float)exportOptions.FilterPrecision,
+                exportOptions.ExportAllNodes,
+                exportOptions.ExportSkins,
+                exportOptions.ExportAnimations,
+                exportOptions.ExportBlendShape,
+                exportOptions.CastToBone,
+                (float)exportOptions.BoneSize,
+                exportOptions.ExportAllUvsAsDiffuseMaps,
+                (float)exportOptions.ScaleFactor,
+                exportOptions.FbxVersion,
+                exportOptions.FbxFormat == 1);
+        }
     }
 
     private static string CleanFloat(float value)
