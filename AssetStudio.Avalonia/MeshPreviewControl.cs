@@ -182,6 +182,21 @@ void main()
         private int jointPointsVertexCount;
         private bool isAvatarMode;
         private Vector3[]? pendingSkeletonVertices;
+        private readonly object skeletonLock = new object();
+        private bool isAnimPlaying = false;
+        private int vboPosition;
+        private Vector3[][]? animatedMeshVertices;
+        private Vector3[]? pendingMeshVertices;
+        private readonly object meshLock = new object();
+
+        // Animation playback
+        private Vector3[][]? animationFrames;
+        private int[]? animParentIndices;
+        private int animCurrentFrame;
+        private int animBoneLinesPerFrame;
+        private int animJointPointsPerFrame;
+        private float animFps = 30f;
+        private global::Avalonia.Threading.DispatcherTimer? animTimer;
 
         // VBO / VAO state
         private int vao;
@@ -271,6 +286,7 @@ void main()
         public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, byte[]? textureData = null, int textureWidth = 0, int textureHeight = 0)
         {
             isAvatarMode = false;
+            StopAnimation();
             previewMaterialMode = false;
             if (m_Mesh.m_VertexCount <= 0) return;
 
@@ -745,6 +761,42 @@ void main()
                     {
                         CreateVAO();
                     }
+                    else
+                    {
+                        Vector3[]? localSkeletonVerts = null;
+                        lock (skeletonLock)
+                        {
+                            if (pendingSkeletonVertices != null)
+                            {
+                                localSkeletonVerts = pendingSkeletonVertices;
+                                pendingSkeletonVertices = null;
+                            }
+                        }
+
+                        if (localSkeletonVerts != null && vaoSkeleton != 0 && vboSkeleton != 0)
+                        {
+                            GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
+                            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localSkeletonVerts.Length * 12), localSkeletonVerts, BufferUsageHint.DynamicDraw);
+                            GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+                        }
+
+                        Vector3[]? localMeshVerts = null;
+                        lock (meshLock)
+                        {
+                            if (pendingMeshVertices != null)
+                            {
+                                localMeshVerts = pendingMeshVertices;
+                                pendingMeshVertices = null;
+                            }
+                        }
+
+                        if (localMeshVerts != null && vboPosition != 0)
+                        {
+                            GL.BindBuffer(BufferTarget.ArrayBuffer, vboPosition);
+                            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localMeshVerts.Length * 12), localMeshVerts, BufferUsageHint.DynamicDraw);
+                            GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+                        }
+                    }
 
                     if (vaoWireframe != 0)
                     {
@@ -897,13 +949,13 @@ void main()
             GL.EnableVertexAttribArray(address);
         }
 
-        private void CreateVBO(out int vboAddress, Vector3[]? data, int address)
+        private void CreateVBO(out int vboAddress, Vector3[]? data, int address, BufferUsageHint usage = BufferUsageHint.StaticDraw)
         {
             if (address < 0 || data == null) { vboAddress = 0; return; }
             GL.GenBuffers(1, out vboAddress);
             vbos.Add(vboAddress);
             GL.BindBuffer(BufferTarget.ArrayBuffer, vboAddress);
-            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(data.Length * 12), data, BufferUsageHint.StaticDraw);
+            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(data.Length * 12), data, usage);
             GL.VertexAttribPointer(address, 3, VertexAttribPointerType.Float, false, 0, 0);
             GL.EnableVertexAttribArray(address);
         }
@@ -932,7 +984,17 @@ void main()
         {
             if (previewMaterialMode && uvData != null)
             {
-                CreateVBO(out _, vertexData, LocationPosition);
+                if (vboPosition == 0)
+                {
+                    CreateVBO(out vboPosition, vertexData, LocationPosition, isAvatarMode ? BufferUsageHint.DynamicDraw : BufferUsageHint.StaticDraw);
+                }
+                else
+                {
+                    GL.BindBuffer(BufferTarget.ArrayBuffer, vboPosition);
+                    GL.VertexAttribPointer(LocationPosition, 3, VertexAttribPointerType.Float, false, 0, 0);
+                    GL.EnableVertexAttribArray(LocationPosition);
+                }
+
                 if (normalMode == 0)
                 {
                     CreateVBO(out _, normal2Data, LocationNormal);
@@ -946,7 +1008,17 @@ void main()
             }
             else
             {
-                CreateVBO(out _, vertexData, LocationPosition);
+                if (vboPosition == 0)
+                {
+                    CreateVBO(out vboPosition, vertexData, LocationPosition, isAvatarMode ? BufferUsageHint.DynamicDraw : BufferUsageHint.StaticDraw);
+                }
+                else
+                {
+                    GL.BindBuffer(BufferTarget.ArrayBuffer, vboPosition);
+                    GL.VertexAttribPointer(LocationPosition, 3, VertexAttribPointerType.Float, false, 0, 0);
+                    GL.EnableVertexAttribArray(LocationPosition);
+                }
+
                 if (normalMode == 0)
                 {
                     CreateVBO(out _, normal2Data, LocationNormal);
@@ -1000,10 +1072,19 @@ void main()
             BindAttribsAndEBO(true);
             GL.BindVertexArray(0);
 
-            if (pendingSkeletonVertices != null)
+            Vector3[]? localSkeletonVerts = null;
+            lock (skeletonLock)
             {
-                CreateSkeletonVAO(pendingSkeletonVertices);
-                pendingSkeletonVertices = null;
+                if (pendingSkeletonVertices != null)
+                {
+                    localSkeletonVerts = pendingSkeletonVertices;
+                    pendingSkeletonVertices = null;
+                }
+            }
+
+            if (localSkeletonVerts != null)
+            {
+                CreateSkeletonVAO(localSkeletonVerts);
             }
         }
 
@@ -1054,6 +1135,7 @@ void main()
                     vbos.Clear();
                 }
             }
+            vboPosition = 0;
         }
 
         protected override void OnPointerPressed(PointerPressedEventArgs e)
@@ -1218,6 +1300,7 @@ void main()
         public void SetAvatar(Mesh m_Mesh, Vector3[] bonePositions, int[] parentIndices)
         {
             isAvatarMode = true;
+            StopAnimation();
             previewMaterialMode = false;
             if (m_Mesh.m_VertexCount <= 0) return;
 
@@ -1329,11 +1412,300 @@ void main()
                     boneLinesVertexCount = boneLinesCount;
                     jointPointsVertexCount = jointPointsCount;
 
-                    pendingSkeletonVertices = skeletonVerts.ToArray();
+                    lock (skeletonLock)
+                    {
+                        pendingSkeletonVertices = skeletonVerts.ToArray();
+                    }
                     vao = 0;
                     RequestNextFrameRendering();
                 });
             });
+        }
+
+        public void SetAnimatedAvatar(Mesh m_Mesh, Vector3[][] frames, Matrix4[][] boneMatrices, int[] parentIndices, float fps)
+        {
+            isAvatarMode = true;
+            StopAnimation();
+            previewMaterialMode = false;
+            if (m_Mesh.m_VertexCount <= 0 || frames.Length == 0) return;
+
+            animationFrames = frames;
+            animParentIndices = parentIndices;
+            animCurrentFrame = 0;
+            animFps = fps > 0 ? fps : 30f;
+
+            int currentLoadId = ++meshLoadCounter;
+            var m_Vertices = m_Mesh.m_Vertices;
+            var m_VertexCount = m_Mesh.m_VertexCount;
+            var m_Indices = m_Mesh.m_Indices;
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                if (m_Vertices == null || m_Vertices.Length == 0) return;
+
+                int count = 3;
+                if (m_Vertices.Length == m_VertexCount * 4) count = 4;
+                var localVertexData = new Vector3[m_VertexCount];
+
+                float[] min = new float[3];
+                float[] max = new float[3];
+                for (int i = 0; i < 3; i++) { min[i] = m_Vertices[i]; max[i] = m_Vertices[i]; }
+                for (int v = 0; v < m_VertexCount; v++)
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        min[i] = Math.Min(min[i], m_Vertices[v * count + i]);
+                        max[i] = Math.Max(max[i], m_Vertices[v * count + i]);
+                    }
+                    localVertexData[v] = new Vector3(
+                        m_Vertices[v * count],
+                        m_Vertices[v * count + 1],
+                        m_Vertices[v * count + 2]);
+                }
+
+                Vector3 dist = Vector3.One, offset = Vector3.Zero;
+                for (int i = 0; i < 3; i++)
+                {
+                    dist[i] = max[i] - min[i];
+                    offset[i] = (max[i] + min[i]) / 2;
+                }
+                float d = Math.Max(1e-5f, dist.Length);
+                var localModelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
+
+                var localIndiceData = new int[m_Indices.Count];
+                for (int i = 0; i < m_Indices.Count; i = i + 3)
+                {
+                    localIndiceData[i] = (int)m_Indices[i];
+                    localIndiceData[i + 1] = (int)m_Indices[i + 1];
+                    localIndiceData[i + 2] = (int)m_Indices[i + 2];
+                }
+
+                // Compute skinned mesh vertices for all frames of the animation
+                Vector3[][]? localAnimatedMeshVerts = null;
+                if (m_Mesh.m_Skin != null && m_Mesh.m_Skin.Length >= m_VertexCount && m_Mesh.m_BindPose != null && m_Mesh.m_BindPose.Length >= parentIndices.Length && boneMatrices != null)
+                {
+                    localAnimatedMeshVerts = new Vector3[boneMatrices.Length][];
+                    for (int f = 0; f < boneMatrices.Length; f++)
+                    {
+                        var frameVerts = new Vector3[m_VertexCount];
+                        var frameMatrices = boneMatrices[f];
+                        
+                        // Pre-calculate skinning matrices for this frame
+                        var skinningMatrices = new Matrix4[frameMatrices.Length];
+                        for (int b = 0; b < frameMatrices.Length; b++)
+                        {
+                            if (b < m_Mesh.m_BindPose.Length)
+                            {
+                                var bp = m_Mesh.m_BindPose[b];
+                                var otkMat = new Matrix4(
+                                    bp.M00, bp.M01, bp.M02, bp.M03,
+                                    bp.M10, bp.M11, bp.M12, bp.M13,
+                                    bp.M20, bp.M21, bp.M22, bp.M23,
+                                    bp.M30, bp.M31, bp.M32, bp.M33
+                                );
+                                skinningMatrices[b] = otkMat * frameMatrices[b];
+                            }
+                            else
+                            {
+                                skinningMatrices[b] = Matrix4.Identity;
+                            }
+                        }
+
+                        for (int v = 0; v < m_VertexCount; v++)
+                        {
+                            var skin = m_Mesh.m_Skin[v];
+                            Vector3 skinnedPos = Vector3.Zero;
+                            float totalWeight = 0f;
+                            for (int j = 0; j < 4; j++)
+                            {
+                                float w = skin.weight[j];
+                                if (w > 0)
+                                {
+                                    int bIdx = skin.boneIndex[j];
+                                    if (bIdx >= 0 && bIdx < skinningMatrices.Length)
+                                    {
+                                        var posB = Vector3.TransformPosition(localVertexData[v], skinningMatrices[bIdx]);
+                                        skinnedPos += posB * w;
+                                        totalWeight += w;
+                                    }
+                                }
+                            }
+                            if (totalWeight > 0f)
+                            {
+                                skinnedPos /= totalWeight;
+                            }
+                            else
+                            {
+                                skinnedPos = localVertexData[v];
+                            }
+                            frameVerts[v] = skinnedPos;
+                        }
+                        localAnimatedMeshVerts[f] = frameVerts;
+                    }
+                }
+
+                var firstFrameBones = frames[0];
+                var skeletonVerts = BuildSkeletonVertices(firstFrameBones, parentIndices, out int boneLines, out int jointPoints);
+
+                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentLoadId != meshLoadCounter) return;
+
+                    viewMatrixData = Matrix4.Identity;
+                    vertexData = localVertexData;
+                    modelMatrixData = localModelMatrixData;
+                    indiceData = localIndiceData;
+                    normalData = null;
+                    normal2Data = null;
+                    colorData = null;
+                    uvData = null;
+
+                    animBoneLinesPerFrame = boneLines;
+                    animJointPointsPerFrame = jointPoints;
+                    boneLinesVertexCount = boneLines;
+                    jointPointsVertexCount = jointPoints;
+
+                    animatedMeshVertices = localAnimatedMeshVerts;
+
+                    lock (skeletonLock)
+                    {
+                        pendingSkeletonVertices = skeletonVerts;
+                    }
+                    vao = 0;
+                    RequestNextFrameRendering();
+
+                    // Start playback timer
+                    animTimer = new global::Avalonia.Threading.DispatcherTimer();
+                    animTimer.Interval = TimeSpan.FromMilliseconds(1000.0 / animFps);
+                    animTimer.Tick += OnAnimationTick;
+                    animTimer.Start();
+                    isAnimPlaying = true;
+                });
+            });
+        }
+
+        public bool IsPlaying => isAnimPlaying;
+
+        public void PlayAnimation()
+        {
+            if (animationFrames == null || animTimer == null) return;
+            if (!isAnimPlaying)
+            {
+                animTimer.Start();
+                isAnimPlaying = true;
+            }
+        }
+
+        public void PauseAnimation()
+        {
+            if (animTimer != null && isAnimPlaying)
+            {
+                animTimer.Stop();
+                isAnimPlaying = false;
+            }
+        }
+
+        public void RestartAnimation()
+        {
+            if (animationFrames == null) return;
+            animCurrentFrame = 0;
+            if (animTimer != null)
+            {
+                if (!isAnimPlaying)
+                {
+                    animTimer.Start();
+                    isAnimPlaying = true;
+                }
+            }
+            OnAnimationTick(null, EventArgs.Empty);
+        }
+
+        public void StopAnimation()
+        {
+            if (animTimer != null)
+            {
+                animTimer.Stop();
+                animTimer.Tick -= OnAnimationTick;
+                animTimer = null;
+            }
+            animationFrames = null;
+            animParentIndices = null;
+            animCurrentFrame = 0;
+            isAnimPlaying = false;
+            animatedMeshVertices = null;
+            pendingMeshVertices = null;
+        }
+
+        public int AnimCurrentFrame => animCurrentFrame;
+        public int AnimTotalFrames => animationFrames?.Length ?? 0;
+        public float AnimFps => animFps;
+
+        public event Action<int, int>? AnimationFrameChanged;
+
+        private void OnAnimationTick(object? sender, EventArgs e)
+        {
+            if (animationFrames == null || animParentIndices == null || animationFrames.Length == 0) return;
+
+            animCurrentFrame = (animCurrentFrame + 1) % animationFrames.Length;
+            var bonePositions = animationFrames[animCurrentFrame];
+            var skeletonVerts = BuildSkeletonVertices(bonePositions, animParentIndices, out int boneLines, out int jointPoints);
+
+            boneLinesVertexCount = boneLines;
+            jointPointsVertexCount = jointPoints;
+
+            lock (skeletonLock)
+            {
+                pendingSkeletonVertices = skeletonVerts;
+            }
+
+            if (animatedMeshVertices != null && animCurrentFrame < animatedMeshVertices.Length)
+            {
+                lock (meshLock)
+                {
+                    pendingMeshVertices = animatedMeshVertices[animCurrentFrame];
+                }
+            }
+
+            RequestNextFrameRendering();
+
+            AnimationFrameChanged?.Invoke(animCurrentFrame, animationFrames.Length);
+        }
+
+        private static Vector3[] BuildSkeletonVertices(Vector3[] bonePositions, int[] parentIndices, out int boneLinesCount, out int jointPointsCount)
+        {
+            var skeletonVerts = new List<Vector3>();
+            boneLinesCount = 0;
+            jointPointsCount = 0;
+
+            for (int i = 0; i < bonePositions.Length; i++)
+            {
+                int pIdx = parentIndices[i];
+                if (pIdx >= 0 && pIdx < bonePositions.Length)
+                {
+                    var a = bonePositions[i];
+                    var b = bonePositions[pIdx];
+                    int segments = 8;
+                    for (int s = 0; s < segments; s++)
+                    {
+                        if (s % 2 == 0)
+                        {
+                            float t0 = (float)s / segments;
+                            float t1 = (float)(s + 1) / segments;
+                            skeletonVerts.Add(a + (b - a) * t0);
+                            skeletonVerts.Add(a + (b - a) * t1);
+                            boneLinesCount += 2;
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < bonePositions.Length; i++)
+            {
+                skeletonVerts.Add(bonePositions[i]);
+                jointPointsCount++;
+            }
+
+            return skeletonVerts.ToArray();
         }
 
         private class AvaloniaBindingsContext : IBindingsContext

@@ -171,6 +171,14 @@
                             </Grid>
                         </Border>
 
+                        <Border x:Name="AnimationPlaybackPanel" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="8,4" IsVisible="False">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="AnimPlayPauseBtn" Content="Pause" Width="60" Height="28" FontSize="11" Click="AnimPlayPauseBtn_Click" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
+                                <Button x:Name="AnimRestartBtn" Content="Replay" Width="60" Height="28" FontSize="11" Click="AnimRestartBtn_Click" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
+                                <TextBlock x:Name="AnimFrameLabel" Text="Frame: 0/0" Foreground="White" VerticalAlignment="Center" FontSize="11" Margin="4,0" />
+                            </StackPanel>
+                        </Border>
+
                         <Border x:Name="FMODPanel" Background="#E01E1E24" BorderBrush="#44ffffff" BorderThickness="1" CornerRadius="12" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="450" IsVisible="False">
                             <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
