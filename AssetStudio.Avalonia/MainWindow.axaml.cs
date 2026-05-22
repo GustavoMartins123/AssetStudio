@@ -53,6 +53,8 @@ public partial class MainWindow : Window
     private int nextGameObjectSearchIndex;
     private bool assetListSortDescending;
     private bool updatingFilterTypeMenu;
+    private Dictionary<Mesh, List<Material>>? meshToMaterialsCache;
+    private List<Material>? allMaterialsCache;
 
     private FMOD.System? fmodSystem;
     private FMOD.Sound? fmodSound;
@@ -177,6 +179,8 @@ public partial class MainWindow : Window
 
     private void ResetForm()
     {
+        meshToMaterialsCache = null;
+        allMaterialsCache = null;
         logger.ClearErrors();
         exportableAssets.Clear();
         visibleAssets.Clear();
@@ -1905,139 +1909,86 @@ public partial class MainWindow : Window
         global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
         int[]? parentIndices = null;
 
-        if (avatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null && avatar.m_Avatar.m_AvatarSkeletonPose?.m_X != null)
+        if (avatarMesh != null && avatarMesh.m_BindPose != null && avatarMesh.m_BindPose.Length > 0
+            && avatarMesh.m_BoneNameHashes != null && avatarMesh.m_BoneNameHashes.Length > 0
+            && avatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null)
         {
+            int meshBoneCount = avatarMesh.m_BindPose.Length;
             var nodes = avatar.m_Avatar.m_AvatarSkeleton.m_Node;
-            var poses = avatar.m_Avatar.m_AvatarSkeletonPose.m_X;
-            var ids = avatar.m_Avatar.m_AvatarSkeleton.m_ID;
-            int count = Math.Min(nodes.Length, poses.Length);
+            var skelIds = avatar.m_Avatar.m_AvatarSkeleton.m_ID;
+            int skelCount = nodes.Length;
 
-            bonePositions = new global::OpenTK.Mathematics.Vector3[count];
-            parentIndices = new int[count];
-
-            global::OpenTK.Mathematics.Matrix4[] globalMatrices = new global::OpenTK.Mathematics.Matrix4[count];
-
-            for (int i = 0; i < count; i++)
+            var meshBonePositions = new global::OpenTK.Mathematics.Vector3[meshBoneCount];
+            for (int i = 0; i < meshBoneCount; i++)
             {
-                var node = nodes[i];
-                var pose = poses[i];
-
-                global::OpenTK.Mathematics.Matrix4 localMat = global::OpenTK.Mathematics.Matrix4.CreateScale(pose.s.X, pose.s.Y, pose.s.Z) *
-                                                              global::OpenTK.Mathematics.Matrix4.CreateFromQuaternion(new global::OpenTK.Mathematics.Quaternion(pose.q.X, pose.q.Y, pose.q.Z, pose.q.W)) *
-                                                              global::OpenTK.Mathematics.Matrix4.CreateTranslation(pose.t.X, pose.t.Y, pose.t.Z);
-
-                if (node.m_ParentId == -1 || node.m_ParentId >= count)
+                var bp = avatarMesh.m_BindPose[i];
+                var otkMat = new global::OpenTK.Mathematics.Matrix4(
+                    bp.M00, bp.M01, bp.M02, bp.M03,
+                    bp.M10, bp.M11, bp.M12, bp.M13,
+                    bp.M20, bp.M21, bp.M22, bp.M23,
+                    bp.M30, bp.M31, bp.M32, bp.M33
+                );
+                try
                 {
-                    globalMatrices[i] = localMat;
+                    var inv = otkMat.Inverted();
+                    meshBonePositions[i] = inv.ExtractTranslation();
                 }
-                else
+                catch
                 {
-                    globalMatrices[i] = localMat * globalMatrices[node.m_ParentId];
+                    meshBonePositions[i] = global::OpenTK.Mathematics.Vector3.Zero;
                 }
-
-                global::OpenTK.Mathematics.Vector3 pos = globalMatrices[i].ExtractTranslation();
-
-                if (avatarMesh != null && avatarMesh.m_BoneNameHashes != null && avatarMesh.m_BindPose != null)
-                {
-                    string? path = null;
-                    if (ids != null && i < ids.Length)
-                    {
-                        path = avatar.FindBonePath(ids[i]);
-                    }
-
-                    var possibleHashes = new List<uint>();
-                    if (ids != null && i < ids.Length)
-                    {
-                        possibleHashes.Add(ids[i]);
-                    }
-                    if (avatar.m_Avatar.m_SkeletonNameIDArray != null && i < avatar.m_Avatar.m_SkeletonNameIDArray.Length)
-                    {
-                        possibleHashes.Add(avatar.m_Avatar.m_SkeletonNameIDArray[i]);
-                    }
-                    if (!string.IsNullOrEmpty(path))
-                    {
-                        var crc = new SevenZip.CRC();
-                        var bytes = System.Text.Encoding.UTF8.GetBytes(path);
-                        crc.Update(bytes, 0, (uint)bytes.Length);
-                        possibleHashes.Add(crc.GetDigest());
-
-                        string tempPath = path;
-                        int slashIndex;
-                        while ((slashIndex = tempPath.IndexOf("/", StringComparison.Ordinal)) >= 0)
-                        {
-                            tempPath = tempPath.Substring(slashIndex + 1);
-                            var subCrc = new SevenZip.CRC();
-                            var subBytes = System.Text.Encoding.UTF8.GetBytes(tempPath);
-                            subCrc.Update(subBytes, 0, (uint)subBytes.Length);
-                            possibleHashes.Add(subCrc.GetDigest());
-                        }
-                    }
-
-                    int meshBoneIndex = -1;
-                    foreach (var h in possibleHashes)
-                    {
-                        for (int j = 0; j < avatarMesh.m_BoneNameHashes.Length; j++)
-                        {
-                            if (avatarMesh.m_BoneNameHashes[j] == h)
-                            {
-                                meshBoneIndex = j;
-                                break;
-                            }
-                        }
-                        if (meshBoneIndex >= 0) break;
-                    }
-
-                    if (meshBoneIndex >= 0 && meshBoneIndex < avatarMesh.m_BindPose.Length)
-                    {
-                        var m = avatarMesh.m_BindPose[meshBoneIndex];
-                        var openTkMatrix = new global::OpenTK.Mathematics.Matrix4(
-                            m.M00, m.M10, m.M20, m.M30,
-                            m.M01, m.M11, m.M21, m.M31,
-                            m.M02, m.M12, m.M22, m.M32,
-                            m.M03, m.M13, m.M23, m.M33
-                        );
-                        try
-                        {
-                            var inv = openTkMatrix.Inverted();
-                            pos = inv.ExtractTranslation();
-                        }
-                        catch
-                        {
-                        }
-                    }
-                }
-
-                bonePositions[i] = pos;
-                parentIndices[i] = node.m_ParentId;
             }
 
-            // Write diagnostics to file
-            try
+            var meshBoneHashToIdx = new Dictionary<uint, int>();
+            for (int j = 0; j < avatarMesh.m_BoneNameHashes.Length; j++)
             {
-                var diagPath = "/home/gustavo/Área de trabalho/AssetStudio/skeleton_diagnostics.txt";
-                var lines = new List<string>();
-                lines.Add($"Avatar: {avatar.m_Name}");
-                if (avatarMesh != null)
-                {
-                    lines.Add($"AvatarMesh: {avatarMesh.m_Name}");
-                    lines.Add($"Mesh Bone Name Hashes count: {avatarMesh.m_BoneNameHashes?.Length ?? 0}");
-                    lines.Add($"Mesh Bind Poses count: {avatarMesh.m_BindPose?.Length ?? 0}");
-                }
-                else
-                {
-                    lines.Add("AvatarMesh: null");
-                }
-                
-                for (int j = 0; j < count; j++)
-                {
-                    var node = nodes[j];
-                    var name = (ids != null && j < ids.Length) ? (avatar.FindBonePath(ids[j]) ?? $"Node_{j}") : $"Node_{j}";
-                    var pos = bonePositions[j];
-                    lines.Add($"Bone {j}: Name={name}, Parent={node.m_ParentId}, Pos=({pos.X:F4}, {pos.Y:F4}, {pos.Z:F4})");
-                }
-                System.IO.File.WriteAllLines(diagPath, lines);
+                meshBoneHashToIdx[avatarMesh.m_BoneNameHashes[j]] = j;
             }
-            catch {}
+
+            var skelNodeToMeshBone = new int[skelCount];
+            for (int i = 0; i < skelCount; i++)
+            {
+                skelNodeToMeshBone[i] = -1;
+                if (skelIds != null && i < skelIds.Length)
+                {
+                    if (meshBoneHashToIdx.TryGetValue(skelIds[i], out int mbIdx))
+                    {
+                        skelNodeToMeshBone[i] = mbIdx;
+                    }
+                }
+            }
+
+            var meshBoneToSkelNode = new int[meshBoneCount];
+            for (int i = 0; i < meshBoneCount; i++) meshBoneToSkelNode[i] = -1;
+            for (int i = 0; i < skelCount; i++)
+            {
+                if (skelNodeToMeshBone[i] >= 0)
+                {
+                    meshBoneToSkelNode[skelNodeToMeshBone[i]] = i;
+                }
+            }
+
+            var meshParentIndices = new int[meshBoneCount];
+            for (int mb = 0; mb < meshBoneCount; mb++)
+            {
+                meshParentIndices[mb] = -1;
+                int skelIdx = meshBoneToSkelNode[mb];
+                if (skelIdx < 0) continue;
+
+                int current = nodes[skelIdx].m_ParentId;
+                while (current >= 0 && current < skelCount)
+                {
+                    if (skelNodeToMeshBone[current] >= 0)
+                    {
+                        meshParentIndices[mb] = skelNodeToMeshBone[current];
+                        break;
+                    }
+                    current = nodes[current].m_ParentId;
+                }
+            }
+
+            bonePositions = meshBonePositions;
+            parentIndices = meshParentIndices;
         }
 
         if (avatarMesh != null && bonePositions != null && parentIndices != null && GLPreviewControl != null)
@@ -2496,12 +2447,15 @@ public partial class MainWindow : Window
 
     private Texture2D? ResolveTexturePPtr(Material material, PPtr<Texture> textureRef)
     {
-
         if (textureRef.TryGet<Texture2D>(out var directTex))
         {
             return directTex;
         }
 
+        if (material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj) && localObj is Texture2D localTex)
+        {
+            return localTex;
+        }
 
         if (textureRef.m_FileID > 0 && textureRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
         {
@@ -2530,19 +2484,19 @@ public partial class MainWindow : Window
             }
         }
 
-
         Texture2D? candidate = null;
-        int matchCount = 0;
         foreach (var file in assetsManager.assetsFileList)
         {
             if (file.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D tex)
             {
+                if (file == material.assetsFile)
+                {
+                    return tex;
+                }
                 candidate = tex;
-                matchCount++;
-                if (matchCount > 1) break;
             }
         }
-        return matchCount == 1 ? candidate : null;
+        return candidate;
     }
 
     private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
@@ -2968,23 +2922,35 @@ public partial class MainWindow : Window
         }
     }
 
+    private bool isSorting;
     private void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
     {
-        var sortMember = e.Column.SortMemberPath ?? e.Column.Header?.ToString();
-        if (string.IsNullOrEmpty(sortMember)) return;
-
-        if (assetListSortMember == sortMember)
+        if (isSorting) return;
+        isSorting = true;
+        try
         {
-            assetListSortDescending = !assetListSortDescending;
-        }
-        else
-        {
-            assetListSortMember = sortMember;
-            assetListSortDescending = false;
-        }
+            var sortMember = e.Column.SortMemberPath ?? e.Column.Header?.ToString();
+            if (string.IsNullOrEmpty(sortMember)) return;
 
-        e.Column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
-        ApplyAssetListSort();
+            if (assetListSortMember == sortMember)
+            {
+                assetListSortDescending = !assetListSortDescending;
+            }
+            else
+            {
+                assetListSortMember = sortMember;
+                assetListSortDescending = false;
+            }
+
+            ApplyAssetListSort();
+            e.Column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
+            
+            e.Handled = true;
+        }
+        finally
+        {
+            isSorting = false;
+        }
     }
 
     private void AssetListDataGrid_CellPointerPressed(object? sender, DataGridCellPointerPressedEventArgs e)
@@ -3115,8 +3081,8 @@ public partial class MainWindow : Window
                 ? assets.OrderByDescending(x => x.PathID)
                 : assets.OrderBy(x => x.PathID),
             "FullSize" or "Size" => assetListSortDescending
-                ? assets.OrderByDescending(x => x.FullSize)
-                : assets.OrderBy(x => x.FullSize),
+                ? assets.OrderByDescending(x => x.FullSize).ThenBy(x => x.PathID)
+                : assets.OrderBy(x => x.FullSize).ThenBy(x => x.PathID),
             "Container" => SortByString(assets, x => x.Container),
             "DisplayType" or "Type" => SortByString(assets, x => x.DisplayType),
             "Name" => SortByString(assets, x => x.Name),
@@ -3127,8 +3093,8 @@ public partial class MainWindow : Window
     private IEnumerable<AssetItem> SortByString(IEnumerable<AssetItem> assets, Func<AssetItem, string> selector)
     {
         return assetListSortDescending
-            ? assets.OrderByDescending(selector, StringComparer.OrdinalIgnoreCase)
-            : assets.OrderBy(selector, StringComparer.OrdinalIgnoreCase);
+            ? assets.OrderByDescending(selector, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.PathID)
+            : assets.OrderBy(selector, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.PathID);
     }
 
     private static string GetAssetCellText(AssetItem item, string? member)
@@ -4701,17 +4667,32 @@ public partial class MainWindow : Window
         return sb.ToString();
     }
 
-    private List<Material> FindMaterialsForMesh(Mesh mesh)
+    private void BuildMeshToMaterialsCache()
     {
-        var materials = new List<Material>();
-        var diag = new List<string>();
-        diag.Add($"Diagnosing FindMaterialsForMesh for Mesh: {mesh.m_Name} (PathID: {mesh.m_PathID})");
+        meshToMaterialsCache = new Dictionary<Mesh, List<Material>>();
+        allMaterialsCache = new List<Material>();
+
+        AssetStudio.Object? ResolveObject(long pathID)
+        {
+            foreach (var file in assetsManager.assetsFileList)
+            {
+                if (file.ObjectsDic.TryGetValue(pathID, out var obj))
+                {
+                    return obj;
+                }
+            }
+            return null;
+        }
 
         foreach (var file in assetsManager.assetsFileList)
         {
             foreach (var obj in file.Objects)
             {
-                if (obj is SkinnedMeshRenderer smr)
+                if (obj is Material mat)
+                {
+                    allMaterialsCache.Add(mat);
+                }
+                else if (obj is SkinnedMeshRenderer smr)
                 {
                     Mesh? smrMesh = null;
                     if (smr.m_Mesh.TryGet(out var m))
@@ -4720,42 +4701,30 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        smrMesh = assetsManager.assetsFileList
-                            .SelectMany(x => x.Objects)
-                            .FirstOrDefault(x => x.m_PathID == smr.m_Mesh.m_PathID) as Mesh;
+                        smrMesh = ResolveObject(smr.m_Mesh.m_PathID) as Mesh;
                     }
 
-                    var matInfo = smr.m_Materials != null 
-                        ? string.Join(", ", smr.m_Materials.Select(mPtr => {
-                            if (mPtr.TryGet(out var mt)) return $"{mt.m_Name} (PathID: {mt.m_PathID})";
-                            var fallback = assetsManager.assetsFileList.SelectMany(x => x.Objects).FirstOrDefault(x => x.m_PathID == mPtr.m_PathID) as Material;
-                            return fallback != null ? $"{fallback.m_Name} (PathID: {fallback.m_PathID}, fallback)" : $"Unresolved (PathID: {mPtr.m_PathID})";
-                        }))
-                        : "null";
-
-                    diag.Add($"SkinnedMeshRenderer PathID: {smr.m_PathID} | Mesh: {smrMesh?.m_Name} (PathID: {smr.m_Mesh.m_PathID}) | Materials: {matInfo}");
-
-                    if (smrMesh == mesh)
+                    if (smrMesh != null && smr.m_Materials != null)
                     {
-                        if (smr.m_Materials != null)
+                        if (!meshToMaterialsCache.TryGetValue(smrMesh, out var list))
                         {
-                            foreach (var matPtr in smr.m_Materials)
+                            list = new List<Material>();
+                            meshToMaterialsCache[smrMesh] = list;
+                        }
+                        foreach (var matPtr in smr.m_Materials)
+                        {
+                            Material? resolvedMat = null;
+                            if (matPtr.TryGet(out var mt))
                             {
-                                Material? mat = null;
-                                if (matPtr.TryGet(out var mt))
-                                {
-                                    mat = mt;
-                                }
-                                else
-                                {
-                                    mat = assetsManager.assetsFileList
-                                        .SelectMany(x => x.Objects)
-                                        .FirstOrDefault(x => x.m_PathID == matPtr.m_PathID) as Material;
-                                }
-                                if (mat != null)
-                                {
-                                    materials.Add(mat);
-                                }
+                                resolvedMat = mt;
+                            }
+                            else
+                            {
+                                resolvedMat = ResolveObject(matPtr.m_PathID) as Material;
+                            }
+                            if (resolvedMat != null)
+                            {
+                                list.Add(resolvedMat);
                             }
                         }
                     }
@@ -4769,9 +4738,7 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        go = assetsManager.assetsFileList
-                            .SelectMany(x => x.Objects)
-                            .FirstOrDefault(x => x.m_PathID == mr.m_GameObject.m_PathID) as GameObject;
+                        go = ResolveObject(mr.m_GameObject.m_PathID) as GameObject;
                     }
 
                     if (go != null)
@@ -4785,9 +4752,7 @@ public partial class MainWindow : Window
                             }
                             else
                             {
-                                comp = assetsManager.assetsFileList
-                                    .SelectMany(x => x.Objects)
-                                    .FirstOrDefault(x => x.m_PathID == compPtr.m_PathID) as Component;
+                                comp = ResolveObject(compPtr.m_PathID) as Component;
                             }
 
                             if (comp is MeshFilter mf)
@@ -4799,41 +4764,57 @@ public partial class MainWindow : Window
                                 }
                                 else
                                 {
-                                    mfMesh = assetsManager.assetsFileList
-                                        .SelectMany(x => x.Objects)
-                                        .FirstOrDefault(x => x.m_PathID == mf.m_Mesh.m_PathID) as Mesh;
+                                    mfMesh = ResolveObject(mf.m_Mesh.m_PathID) as Mesh;
                                 }
 
-                                if (mfMesh == mesh)
+                                if (mfMesh != null && mr.m_Materials != null)
                                 {
-                                    if (mr.m_Materials != null)
+                                    if (!meshToMaterialsCache.TryGetValue(mfMesh, out var list))
                                     {
-                                        foreach (var matPtr in mr.m_Materials)
+                                        list = new List<Material>();
+                                        meshToMaterialsCache[mfMesh] = list;
+                                    }
+                                    foreach (var matPtr in mr.m_Materials)
+                                    {
+                                        Material? resolvedMat = null;
+                                        if (matPtr.TryGet(out var mt))
                                         {
-                                            Material? mat = null;
-                                            if (matPtr.TryGet(out var mt))
-                                            {
-                                                mat = mt;
-                                            }
-                                            else
-                                            {
-                                                mat = assetsManager.assetsFileList
-                                                    .SelectMany(x => x.Objects)
-                                                    .FirstOrDefault(x => x.m_PathID == matPtr.m_PathID) as Material;
-                                            }
-                                            if (mat != null)
-                                            {
-                                                materials.Add(mat);
-                                            }
+                                            resolvedMat = mt;
+                                        }
+                                        else
+                                        {
+                                            resolvedMat = ResolveObject(matPtr.m_PathID) as Material;
+                                        }
+                                        if (resolvedMat != null)
+                                        {
+                                            list.Add(resolvedMat);
                                         }
                                     }
-                                    break;
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        foreach (var key in meshToMaterialsCache.Keys.ToList())
+        {
+            meshToMaterialsCache[key] = meshToMaterialsCache[key].Distinct().ToList();
+        }
+    }
+
+    private List<Material> FindMaterialsForMesh(Mesh mesh)
+    {
+        if (meshToMaterialsCache == null || allMaterialsCache == null)
+        {
+            BuildMeshToMaterialsCache();
+        }
+
+        var materials = new List<Material>();
+        if (meshToMaterialsCache!.TryGetValue(mesh, out var cachedList))
+        {
+            materials.AddRange(cachedList);
         }
 
         if (materials.Count == 0 || (materials.Count == 1 && (materials[0].m_Name.StartsWith("Material") || materials[0].m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))))
@@ -4845,47 +4826,71 @@ public partial class MainWindow : Window
             Material? bestMat = null;
             int bestScore = 0;
 
-            foreach (var file in assetsManager.assetsFileList)
+            foreach (var mat in allMaterialsCache!)
             {
-                foreach (var obj in file.Objects)
+                if (mat.m_Name.StartsWith("Material") || mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var matItem = exportableAssets.FirstOrDefault(x => x.Asset == mat);
+                var matContainer = matItem?.Container;
+                var matTokens = GetPathTokens(!string.IsNullOrEmpty(matContainer) ? matContainer : mat.m_Name);
+
+                var overlap = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count();
+                int score = overlap * 10;
+
+                // Priority 1: Same assetsFile (CAB) gets a very strong boost
+                if (mat.assetsFile == mesh.assetsFile)
                 {
-                    if (obj is Material mat)
+                    score += 25;
+                }
+
+                // Priority 2: Substring overlap check: find if there's a common word or part (minimum 4 chars)
+                bool hasSubstringMatch = false;
+                if (mat.m_Name.Length >= 4 && mesh.m_Name.Length >= 4)
+                {
+                    string shorter = mat.m_Name.Length < mesh.m_Name.Length ? mat.m_Name : mesh.m_Name;
+                    string longer = mat.m_Name.Length < mesh.m_Name.Length ? mesh.m_Name : mat.m_Name;
+                    for (int len = 8; len >= 4; len--)
                     {
-                        if (mat.m_Name.StartsWith("Material") || mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        var matItem = exportableAssets.FirstOrDefault(x => x.Asset == mat);
-                        var matContainer = matItem?.Container;
-                        var matTokens = GetPathTokens(!string.IsNullOrEmpty(matContainer) ? matContainer : mat.m_Name);
-
-                        var overlap = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count();
-                        if (overlap > 0)
+                        if (shorter.Length < len) continue;
+                        for (int start = 0; start <= shorter.Length - len; start++)
                         {
-                            int score = overlap * 10;
-                            if (mat.assetsFile == mesh.assetsFile)
+                            var sub = shorter.Substring(start, len);
+                            if (longer.Contains(sub, StringComparison.OrdinalIgnoreCase))
                             {
-                                score += 5;
-                            }
-                            if (!string.IsNullOrEmpty(meshContainer) && !string.IsNullOrEmpty(matContainer))
-                            {
-                                var meshDir = Path.GetDirectoryName(meshContainer) ?? "";
-                                var matDir = Path.GetDirectoryName(matContainer) ?? "";
-                                if (string.Equals(meshDir, matDir, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    score += 10;
-                                }
-                                else if (meshDir.StartsWith(matDir, StringComparison.OrdinalIgnoreCase) || matDir.StartsWith(meshDir, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    score += 5;
-                                }
-                            }
-
-                            if (score > bestScore)
-                            {
-                                bestScore = score;
-                                bestMat = mat;
+                                hasSubstringMatch = true;
+                                break;
                             }
                         }
+                        if (hasSubstringMatch) break;
+                    }
+                }
+
+                if (hasSubstringMatch)
+                {
+                    score += 15;
+                }
+
+                if (score > 0)
+                {
+                    if (!string.IsNullOrEmpty(meshContainer) && !string.IsNullOrEmpty(matContainer))
+                    {
+                        var meshDir = Path.GetDirectoryName(meshContainer) ?? "";
+                        var matDir = Path.GetDirectoryName(matContainer) ?? "";
+                        if (string.Equals(meshDir, matDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            score += 10;
+                        }
+                        else if (meshDir.StartsWith(matDir, StringComparison.OrdinalIgnoreCase) || matDir.StartsWith(meshDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            score += 5;
+                        }
+                    }
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestMat = mat;
                     }
                 }
             }

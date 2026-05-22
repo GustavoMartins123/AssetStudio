@@ -1074,11 +1074,6 @@ void main()
 
         protected override void OnPointerMoved(PointerEventArgs e)
         {
-            if (isAvatarMode)
-            {
-                e.Handled = true;
-                return;
-            }
             base.OnPointerMoved(e);
             var prop = e.GetCurrentPoint(this).Properties;
             bool isLeft = prop.IsLeftButtonPressed;
@@ -1115,11 +1110,6 @@ void main()
 
         protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
         {
-            if (isAvatarMode)
-            {
-                e.Handled = true;
-                return;
-            }
             base.OnPointerWheelChanged(e);
             float delta = (float)e.Delta.Y;
             viewMatrixData *= Matrix4.CreateScale(1 + delta * 0.1f);
