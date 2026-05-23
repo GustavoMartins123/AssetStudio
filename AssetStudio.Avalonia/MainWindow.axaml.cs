@@ -275,6 +275,24 @@ public partial class MainWindow : Window
         PreviewLabel.IsVisible = true;
     }
 
+    private void HideAnimationPlayback()
+    {
+        if (AnimationPlaybackPanel != null)
+        {
+            AnimationPlaybackPanel.IsVisible = false;
+        }
+
+        if (AnimFrameLabel != null)
+        {
+            AnimFrameLabel.Text = "Frame: 0/0";
+        }
+
+        if (AnimPlayPauseBtn != null)
+        {
+            AnimPlayPauseBtn.Content = "Pause";
+        }
+    }
+
     private async Task<IStorageFolder?> TryGetFolder(string? path)
     {
         if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
@@ -1356,6 +1374,11 @@ public partial class MainWindow : Window
             FMODPanel.IsVisible = false;
             FMODreset();
         }
+        if (assetItem.Asset is not AnimationClip)
+        {
+            HideAnimationPlayback();
+            GLPreviewControl?.StopAnimation();
+        }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
 
@@ -1637,31 +1660,16 @@ public partial class MainWindow : Window
                         fallbackSb.AppendLine();
                     }
 
-                    var siblingClips = assetsManager.assetsFileList
-                        .SelectMany(x => x.Objects)
-                        .OfType<AnimationClip>()
-                        .Where(clip => {
-                            if (!string.IsNullOrEmpty(animator.assetsFile.originalPath) && 
-                                !string.IsNullOrEmpty(clip.assetsFile.originalPath))
-                            {
-                                if (clip.assetsFile.originalPath == animator.assetsFile.originalPath) return true;
-                            }
-                            return clip.m_Name.Contains(animName, StringComparison.OrdinalIgnoreCase) || 
-                                   animName.Contains(clip.m_Name, StringComparison.OrdinalIgnoreCase);
-                        })
-                        .ToList();
+                    var siblingClips = FindLikelyAnimatorClips(animator, animName, avatar).ToList();
 
                     if (siblingClips.Count > 0)
                     {
-                        fallbackSb.AppendLine("Sibling Animation Clips (found in same container):");
-                        foreach (var clip in siblingClips)
-                        {
-                            fallbackSb.AppendLine($"  * {clip.m_Name} (PathID: {clip.m_PathID}, Size: {clip.byteSize} bytes)");
-                        }
+                        AppendGeneratedAnimatorController(fallbackSb, animName, siblingClips);
                     }
                     else
                     {
                         fallbackSb.AppendLine("No matching sibling Animation Clips found in loaded files.");
+                        fallbackSb.AppendLine("Generated controller was not created because no likely clips were found.");
                     }
 
                     SetTextWithTruncation(TextPreviewBox, fallbackSb.ToString());
@@ -1841,6 +1849,173 @@ public partial class MainWindow : Window
         PreviewLabel.IsVisible = false;
     }
 
+    private IEnumerable<AnimationClip> FindLikelyAnimatorClips(Animator animator, string animatorName, Avatar? avatar)
+    {
+        var keys = BuildAnimatorClipSearchKeys(animatorName, avatar?.m_Name, animator.assetsFile.originalPath);
+        var animatorPath = animator.assetsFile.originalPath ?? string.Empty;
+
+        return assetsManager.assetsFileList
+            .SelectMany(x => x.Objects)
+            .OfType<AnimationClip>()
+            .Select(clip => new
+            {
+                Clip = clip,
+                Score = ScoreAnimatorClipMatch(clip, keys, animatorPath)
+            })
+            .Where(x => x.Score > 0)
+            .OrderByDescending(x => x.Score)
+            .ThenBy(x => x.Clip.m_Name, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.Clip);
+    }
+
+    private static List<string> BuildAnimatorClipSearchKeys(string animatorName, string? avatarName, string? originalPath)
+    {
+        var keys = new List<string>();
+
+        void AddKey(string? raw)
+        {
+            var key = NormalizeAnimatorSearchKey(raw);
+            if (key.Length >= 4 && !keys.Any(x => string.Equals(x, key, StringComparison.OrdinalIgnoreCase)))
+            {
+                keys.Add(key);
+            }
+
+            var trimmed = StripAnimatorNameSuffixes(key);
+            if (trimmed.Length >= 4 && !keys.Any(x => string.Equals(x, trimmed, StringComparison.OrdinalIgnoreCase)))
+            {
+                keys.Add(trimmed);
+            }
+        }
+
+        AddKey(animatorName);
+        AddKey(avatarName);
+        AddKey(Path.GetFileNameWithoutExtension(originalPath ?? string.Empty));
+
+        foreach (var key in keys.ToArray())
+        {
+            var parts = key.Split('_', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 3)
+            {
+                AddKey(string.Join("_", parts.Take(3)));
+            }
+        }
+
+        return keys;
+    }
+
+    private static int ScoreAnimatorClipMatch(AnimationClip clip, List<string> keys, string animatorPath)
+    {
+        int score = 0;
+        var clipName = NormalizeAnimatorSearchKey(clip.m_Name);
+        var clipPath = clip.assetsFile.originalPath ?? string.Empty;
+
+        if (!string.IsNullOrEmpty(animatorPath)
+            && !string.IsNullOrEmpty(clipPath)
+            && string.Equals(animatorPath, clipPath, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 50;
+        }
+
+        foreach (var key in keys)
+        {
+            if (clipName.Equals(key, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 40;
+            }
+            else if (clipName.StartsWith(key + "_", StringComparison.OrdinalIgnoreCase)
+                || clipName.StartsWith(key + "-", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 30;
+            }
+            else if (clipName.Contains(key, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 10;
+            }
+        }
+
+        return score;
+    }
+
+    private static string NormalizeAnimatorSearchKey(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return Path.GetFileNameWithoutExtension(value)
+            .Replace("\\", "/", StringComparison.Ordinal)
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .LastOrDefault()
+            ?.Trim()
+            .ToLowerInvariant() ?? string.Empty;
+    }
+
+    private static string StripAnimatorNameSuffixes(string value)
+    {
+        var suffixes = new[]
+        {
+            "_avatar", "avatar", "_skin", "_body", "_mesh", "_model", "_prefab", "_animator", "animator"
+        };
+
+        string result = value;
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var suffix in suffixes)
+            {
+                if (result.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && result.Length > suffix.Length)
+                {
+                    result = result[..^suffix.Length].TrimEnd('_', '-', ' ');
+                    changed = true;
+                }
+            }
+        } while (changed);
+
+        return result;
+    }
+
+    private static void AppendGeneratedAnimatorController(StringBuilder sb, string animatorName, List<AnimationClip> clips)
+    {
+        var defaultClip = clips.FirstOrDefault(IsDefaultAnimatorClip) ?? clips.First();
+
+        sb.AppendLine("=========================================");
+        sb.AppendLine($"GENERATED ANIMATOR CONTROLLER: {animatorName}");
+        sb.AppendLine("=========================================");
+        sb.AppendLine("Source: inferred from matching AnimationClip assets.");
+        sb.AppendLine("Parameters: Unknown (not present in loaded Animator data).");
+        sb.AppendLine("Transitions: Unknown (states are listed without real conditions).");
+        sb.AppendLine();
+        sb.AppendLine("Layer 0: Base Layer");
+        sb.AppendLine($"Default State: {defaultClip.m_Name}");
+        sb.AppendLine();
+        sb.AppendLine("States:");
+
+        foreach (var clip in clips)
+        {
+            string prefix = ReferenceEquals(clip, defaultClip) ? "> [DEFAULT] " : "  * ";
+            sb.AppendLine($"{prefix}{clip.m_Name} (Motion: {clip.m_Name}, PathID: {clip.m_PathID}, Size: {clip.byteSize} bytes)");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("Matching Animation Clips:");
+        foreach (var clip in clips)
+        {
+            var path = string.IsNullOrEmpty(clip.assetsFile.originalPath) ? "[loaded asset]" : clip.assetsFile.originalPath;
+            sb.AppendLine($"  * {clip.m_Name} - {path}");
+        }
+    }
+
+    private static bool IsDefaultAnimatorClip(AnimationClip clip)
+    {
+        var name = NormalizeAnimatorSearchKey(clip.m_Name);
+        return name.Contains("idle", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("stand", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("wait", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("weak", StringComparison.OrdinalIgnoreCase);
+    }
+
     private string GetNameFromTOS(KeyValuePair<uint, string>[]? tos, uint hash)
     {
         if (tos != null)
@@ -1872,6 +2047,7 @@ public partial class MainWindow : Window
 
         global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
         int[]? parentIndices = null;
+        string[]? boneNames = null;
 
         if (avatarMesh != null && avatarMesh.m_BindPose != null && avatarMesh.m_BindPose.Length > 0
             && avatarMesh.m_BoneNameHashes != null && avatarMesh.m_BoneNameHashes.Length > 0
@@ -1932,6 +2108,20 @@ public partial class MainWindow : Window
                 }
             }
 
+            var meshBoneNames = new string[meshBoneCount];
+            for (int mb = 0; mb < meshBoneCount; mb++)
+            {
+                int skelIdx = meshBoneToSkelNode[mb];
+                if (skelIds != null && skelIdx >= 0 && skelIdx < skelIds.Length)
+                {
+                    meshBoneNames[mb] = avatar.FindBonePath(skelIds[skelIdx]) ?? string.Empty;
+                }
+                else
+                {
+                    meshBoneNames[mb] = string.Empty;
+                }
+            }
+
             var meshParentIndices = new int[meshBoneCount];
             for (int mb = 0; mb < meshBoneCount; mb++)
             {
@@ -1953,11 +2143,12 @@ public partial class MainWindow : Window
 
             bonePositions = meshBonePositions;
             parentIndices = meshParentIndices;
+            boneNames = meshBoneNames;
         }
 
         if (avatarMesh != null && bonePositions != null && parentIndices != null && GLPreviewControl != null)
         {
-            GLPreviewControl.SetAvatar(avatarMesh, bonePositions, parentIndices);
+            GLPreviewControl.SetAvatar(avatarMesh, bonePositions, parentIndices, boneNames);
             GLPreviewControl.IsVisible = true;
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
@@ -2092,6 +2283,20 @@ public partial class MainWindow : Window
         for (int i = 0; i < skelCount; i++)
             if (skelNodeToMeshBone[i] >= 0)
                 meshBoneToSkelNode[skelNodeToMeshBone[i]] = i;
+
+        var meshBoneNames = new string[meshBoneCount];
+        for (int mb = 0; mb < meshBoneCount; mb++)
+        {
+            int skelIdx = meshBoneToSkelNode[mb];
+            if (skelIds != null && skelIdx >= 0 && skelIdx < skelIds.Length)
+            {
+                meshBoneNames[mb] = avatar.FindBonePath(skelIds[skelIdx]) ?? string.Empty;
+            }
+            else
+            {
+                meshBoneNames[mb] = string.Empty;
+            }
+        }
 
         var meshParentIndices = new int[meshBoneCount];
         for (int mb = 0; mb < meshBoneCount; mb++)
@@ -2233,7 +2438,7 @@ public partial class MainWindow : Window
             // Fallback: show static bind pose with message
             if (GLPreviewControl != null)
             {
-                GLPreviewControl.SetAvatar(avatarMesh, restBonePositions, meshParentIndices);
+                GLPreviewControl.SetAvatar(avatarMesh, restBonePositions, meshParentIndices, meshBoneNames);
                 GLPreviewControl.IsVisible = true;
                 GLPreviewControl.Focus();
                 TextPreviewBox.IsVisible = false;
@@ -2365,7 +2570,7 @@ public partial class MainWindow : Window
         // Step 6: Send to GL preview
         if (GLPreviewControl != null)
         {
-            GLPreviewControl.SetAnimatedAvatar(avatarMesh, allFrames, allBoneMatrices, meshParentIndices, sampleRate);
+            GLPreviewControl.SetAnimatedAvatar(avatarMesh, allFrames, allBoneMatrices, meshParentIndices, sampleRate, meshBoneNames);
             GLPreviewControl.IsVisible = true;
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
@@ -2537,6 +2742,13 @@ public partial class MainWindow : Window
 
     private void PreviewMaterial(AssetItem assetItem, Material m_Material)
     {
+        HideAnimationPlayback();
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.StopAnimation();
+            GLPreviewControl.IsVisible = false;
+        }
+
         var displayMaterial = ResolveMaterialForPreview(m_Material) ?? m_Material;
         var sb = new StringBuilder();
         sb.AppendLine($"Material: {m_Material.m_Name}");
@@ -2658,6 +2870,10 @@ public partial class MainWindow : Window
                             }
                         });
                     }
+                    else
+                    {
+                        MakeAlphaOnlyTextureVisible(image);
+                    }
 
                     Dispatcher.UIThread.Post(() =>
                     {
@@ -2721,6 +2937,59 @@ public partial class MainWindow : Window
             if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
             StatusStripUpdate("Material loaded (no texture).");
         }
+    }
+
+    private static void MakeAlphaOnlyTextureVisible(Image<Bgra32> image)
+    {
+        long rgbSignal = 0;
+        long alphaSignal = 0;
+        int samples = 0;
+        byte minAlpha = byte.MaxValue;
+        byte maxAlpha = byte.MinValue;
+        int stepX = Math.Max(1, image.Width / 128);
+        int stepY = Math.Max(1, image.Height / 128);
+
+        image.ProcessPixelRows(accessor =>
+        {
+            for (int y = 0; y < accessor.Height; y += stepY)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (int x = 0; x < accessor.Width; x += stepX)
+                {
+                    var pixel = row[x];
+                    rgbSignal += pixel.R + pixel.G + pixel.B;
+                    alphaSignal += pixel.A;
+                    minAlpha = Math.Min(minAlpha, pixel.A);
+                    maxAlpha = Math.Max(maxAlpha, pixel.A);
+                    samples++;
+                }
+            }
+        });
+
+        if (samples == 0
+            || rgbSignal / (samples * 3) >= 8
+            || alphaSignal / samples <= 8
+            || maxAlpha - minAlpha <= 16)
+        {
+            return;
+        }
+
+        image.ProcessPixelRows(accessor =>
+        {
+            for (int y = 0; y < accessor.Height; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (int x = 0; x < accessor.Width; x++)
+                {
+                    ref Bgra32 pixel = ref row[x];
+                    byte value = pixel.A;
+                    pixel.R = value;
+                    pixel.G = value;
+                    pixel.B = value;
+                    pixel.A = byte.MaxValue;
+                }
+            }
+        });
     }
 
     private Material? ResolveMaterialForPreview(Material material)

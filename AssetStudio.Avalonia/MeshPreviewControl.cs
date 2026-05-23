@@ -303,6 +303,95 @@ void main()
             return Matrix4.CreateTranslation(-center) * Matrix4.CreateScale(PreviewFitScale / diagonal);
         }
 
+        private static string NormalizeBoneName(string name)
+        {
+            return name.Replace("\\", "/", StringComparison.Ordinal)
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .LastOrDefault()
+                ?.Replace("_", string.Empty, StringComparison.Ordinal)
+                .Replace("-", string.Empty, StringComparison.Ordinal)
+                .Replace(" ", string.Empty, StringComparison.Ordinal)
+                .ToLowerInvariant() ?? string.Empty;
+        }
+
+        private static int FindBoneIndex(string[]? boneNames, params string[] candidates)
+        {
+            if (boneNames == null)
+            {
+                return -1;
+            }
+
+            for (int c = 0; c < candidates.Length; c++)
+            {
+                string candidate = candidates[c].ToLowerInvariant();
+                for (int i = 0; i < boneNames.Length; i++)
+                {
+                    if (NormalizeBoneName(boneNames[i]).Contains(candidate, StringComparison.Ordinal))
+                    {
+                        return i;
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        private static bool TryGetBonePosition(Vector3[] bonePositions, string[]? boneNames, out Vector3 position, params string[] candidates)
+        {
+            int index = FindBoneIndex(boneNames, candidates);
+            if (index >= 0 && index < bonePositions.Length)
+            {
+                position = bonePositions[index];
+                return true;
+            }
+
+            position = Vector3.Zero;
+            return false;
+        }
+
+        private static bool TryNormalize(Vector3 value, out Vector3 normalized)
+        {
+            if (value.LengthSquared > 1e-8f)
+            {
+                normalized = Vector3.Normalize(value);
+                return true;
+            }
+
+            normalized = Vector3.Zero;
+            return false;
+        }
+
+        private static Matrix4 CreateAvatarInitialViewMatrix(Vector3[] bonePositions, string[]? boneNames)
+        {
+            if (TryGetBonePosition(bonePositions, boneNames, out var hips, "hips", "pelvis", "bip001pelvis")
+                && TryGetBonePosition(bonePositions, boneNames, out var head, "head", "neck")
+                && TryNormalize(head - hips, out var up))
+            {
+                Vector3 left = Vector3.Zero;
+                Vector3 right = Vector3.Zero;
+                bool hasLeft = TryGetBonePosition(bonePositions, boneNames, out left, "leftshoulder", "leftupperarm", "leftarm", "lefthand", "lshoulder", "lupperarm");
+                bool hasRight = TryGetBonePosition(bonePositions, boneNames, out right, "rightshoulder", "rightupperarm", "rightarm", "righthand", "rshoulder", "rupperarm");
+
+                if (hasLeft && hasRight && TryNormalize(right - left, out var side))
+                {
+                    var front = Vector3.Cross(side, up);
+                    if (TryNormalize(front, out front))
+                    {
+                        var view = Matrix4.LookAt(front, Vector3.Zero, up);
+                        view.Row3 = new Vector4(0, 0, 0, 1);
+                        return view;
+                    }
+                }
+
+                var fallbackFront = Math.Abs(Vector3.Dot(up, Vector3.UnitZ)) > 0.9f ? Vector3.UnitY : Vector3.UnitZ;
+                var fallbackView = Matrix4.LookAt(fallbackFront, Vector3.Zero, up);
+                fallbackView.Row3 = new Vector4(0, 0, 0, 1);
+                return fallbackView;
+            }
+
+            return Matrix4.Identity;
+        }
+
         private void ClearAvatarPreviewState()
         {
             isAvatarMode = false;
@@ -1324,7 +1413,7 @@ void main()
             GL.BindVertexArray(0);
         }
 
-        public void SetAvatar(Mesh m_Mesh, Vector3[] bonePositions, int[] parentIndices)
+        public void SetAvatar(Mesh m_Mesh, Vector3[] bonePositions, int[] parentIndices, string[]? boneNames = null)
         {
             isAvatarMode = true;
             StopAnimation();
@@ -1332,6 +1421,7 @@ void main()
             if (m_Mesh.m_VertexCount <= 0) return;
 
             int currentLoadId = ++meshLoadCounter;
+            var avatarBonePositions = bonePositions;
             var m_Vertices = m_Mesh.m_Vertices;
             var m_VertexCount = m_Mesh.m_VertexCount;
             var m_Indices = m_Mesh.m_Indices;
@@ -1413,7 +1503,7 @@ void main()
                 {
                     if (currentLoadId != meshLoadCounter) return;
 
-                    viewMatrixData = Matrix4.Identity;
+                    viewMatrixData = CreateAvatarInitialViewMatrix(avatarBonePositions, boneNames);
                     vertexData = localVertexData;
                     modelMatrixData = localModelMatrixData;
                     indiceData = localIndiceData;
@@ -1435,7 +1525,7 @@ void main()
             });
         }
 
-        public void SetAnimatedAvatar(Mesh m_Mesh, Vector3[][] frames, Matrix4[][] boneMatrices, int[] parentIndices, float fps)
+        public void SetAnimatedAvatar(Mesh m_Mesh, Vector3[][] frames, Matrix4[][] boneMatrices, int[] parentIndices, float fps, string[]? boneNames = null)
         {
             isAvatarMode = true;
             StopAnimation();
@@ -1560,7 +1650,7 @@ void main()
                 {
                     if (currentLoadId != meshLoadCounter) return;
 
-                    viewMatrixData = Matrix4.Identity;
+                    viewMatrixData = CreateAvatarInitialViewMatrix(frames[0], boneNames);
                     vertexData = localVertexData;
                     modelMatrixData = localModelMatrixData;
                     indiceData = localIndiceData;
