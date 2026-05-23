@@ -136,6 +136,7 @@ void main()
         private const int LocationNormal = 1;
         private const int LocationColor = 2;
         private const int LocationTexCoord = 3;
+        private const float PreviewFitScale = 1.35f;
 
         // Programs
         private int pgmID;
@@ -283,10 +284,49 @@ void main()
             }
         }
 
-        public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, byte[]? textureData = null, int textureWidth = 0, int textureHeight = 0)
+        private static void ExpandBounds(Vector3 point, ref Vector3 min, ref Vector3 max)
+        {
+            if (!float.IsFinite(point.X) || !float.IsFinite(point.Y) || !float.IsFinite(point.Z))
+            {
+                return;
+            }
+
+            min = Vector3.ComponentMin(min, point);
+            max = Vector3.ComponentMax(max, point);
+        }
+
+        private static Matrix4 CreatePreviewModelMatrix(Vector3 min, Vector3 max)
+        {
+            var size = max - min;
+            var center = (max + min) * 0.5f;
+            float diagonal = Math.Max(1e-5f, size.Length);
+            return Matrix4.CreateTranslation(-center) * Matrix4.CreateScale(PreviewFitScale / diagonal);
+        }
+
+        private void ClearAvatarPreviewState()
         {
             isAvatarMode = false;
             StopAnimation();
+            animatedMeshVertices = null;
+            boneLinesVertexCount = 0;
+            jointPointsVertexCount = 0;
+            animBoneLinesPerFrame = 0;
+            animJointPointsPerFrame = 0;
+
+            lock (skeletonLock)
+            {
+                pendingSkeletonVertices = null;
+            }
+
+            lock (meshLock)
+            {
+                pendingMeshVertices = null;
+            }
+        }
+
+        public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, byte[]? textureData = null, int textureWidth = 0, int textureHeight = 0)
+        {
+            ClearAvatarPreviewState();
             previewMaterialMode = false;
             if (m_Mesh.m_VertexCount <= 0) return;
 
@@ -309,35 +349,19 @@ void main()
                 var localVertexData = new Vector3[m_VertexCount];
 
                 // Calculate Bounding
-                float[] min = new float[3];
-                float[] max = new float[3];
-                for (int i = 0; i < 3; i++)
-                {
-                    min[i] = m_Vertices[i];
-                    max[i] = m_Vertices[i];
-                }
+                Vector3 min = new Vector3(m_Vertices[0], m_Vertices[1], m_Vertices[2]);
+                Vector3 max = min;
                 for (int v = 0; v < m_VertexCount; v++)
                 {
-                    for (int i = 0; i < 3; i++)
-                    {
-                        min[i] = Math.Min(min[i], m_Vertices[v * count + i]);
-                        max[i] = Math.Max(max[i], m_Vertices[v * count + i]);
-                    }
-                    localVertexData[v] = new Vector3(
+                    var vertex = new Vector3(
                         m_Vertices[v * count],
                         m_Vertices[v * count + 1],
                         m_Vertices[v * count + 2]);
+                    localVertexData[v] = vertex;
+                    ExpandBounds(vertex, ref min, ref max);
                 }
 
-                // Calculate modelMatrix
-                Vector3 dist = Vector3.One, offset = Vector3.Zero;
-                for (int i = 0; i < 3; i++)
-                {
-                    dist[i] = max[i] - min[i];
-                    offset[i] = (max[i] + min[i]) / 2;
-                }
-                float d = Math.Max(1e-5f, dist.Length);
-                var localModelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
+                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
 
                 // Indices
                 var localIndiceData = new int[m_Indices.Count];
@@ -478,6 +502,9 @@ void main()
 
         public void SetMaterialTexture(Image<Bgra32> image)
         {
+            ++meshLoadCounter;
+            ClearAvatarPreviewState();
+
             lock (textureLock)
             {
                 pendingTextureWidth = image.Width;
@@ -1322,34 +1349,17 @@ void main()
                 }
                 var localVertexData = new Vector3[m_VertexCount];
 
-                float[] min = new float[3];
-                float[] max = new float[3];
-                for (int i = 0; i < 3; i++)
-                {
-                    min[i] = m_Vertices[i];
-                    max[i] = m_Vertices[i];
-                }
+                Vector3 min = new Vector3(m_Vertices[0], m_Vertices[1], m_Vertices[2]);
+                Vector3 max = min;
                 for (int v = 0; v < m_VertexCount; v++)
                 {
-                    for (int i = 0; i < 3; i++)
-                    {
-                        min[i] = Math.Min(min[i], m_Vertices[v * count + i]);
-                        max[i] = Math.Max(max[i], m_Vertices[v * count + i]);
-                    }
-                    localVertexData[v] = new Vector3(
+                    var vertex = new Vector3(
                         m_Vertices[v * count],
                         m_Vertices[v * count + 1],
                         m_Vertices[v * count + 2]);
+                    localVertexData[v] = vertex;
+                    ExpandBounds(vertex, ref min, ref max);
                 }
-
-                Vector3 dist = Vector3.One, offset = Vector3.Zero;
-                for (int i = 0; i < 3; i++)
-                {
-                    dist[i] = max[i] - min[i];
-                    offset[i] = (max[i] + min[i]) / 2;
-                }
-                float d = Math.Max(1e-5f, dist.Length);
-                var localModelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
 
                 var localIndiceData = new int[m_Indices.Count];
                 for (int i = 0; i < m_Indices.Count; i = i + 3)
@@ -1369,6 +1379,7 @@ void main()
 
                     for (int i = 0; i < normalizedBones.Length; i++)
                     {
+                        ExpandBounds(normalizedBones[i], ref min, ref max);
                         int pIdx = parentIndices[i];
                         if (pIdx >= 0 && pIdx < normalizedBones.Length)
                         {
@@ -1395,6 +1406,8 @@ void main()
                         jointPointsCount++;
                     }
                 }
+
+                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
 
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -1447,30 +1460,17 @@ void main()
                 if (m_Vertices.Length == m_VertexCount * 4) count = 4;
                 var localVertexData = new Vector3[m_VertexCount];
 
-                float[] min = new float[3];
-                float[] max = new float[3];
-                for (int i = 0; i < 3; i++) { min[i] = m_Vertices[i]; max[i] = m_Vertices[i]; }
+                Vector3 min = new Vector3(m_Vertices[0], m_Vertices[1], m_Vertices[2]);
+                Vector3 max = min;
                 for (int v = 0; v < m_VertexCount; v++)
                 {
-                    for (int i = 0; i < 3; i++)
-                    {
-                        min[i] = Math.Min(min[i], m_Vertices[v * count + i]);
-                        max[i] = Math.Max(max[i], m_Vertices[v * count + i]);
-                    }
-                    localVertexData[v] = new Vector3(
+                    var vertex = new Vector3(
                         m_Vertices[v * count],
                         m_Vertices[v * count + 1],
                         m_Vertices[v * count + 2]);
+                    localVertexData[v] = vertex;
+                    ExpandBounds(vertex, ref min, ref max);
                 }
-
-                Vector3 dist = Vector3.One, offset = Vector3.Zero;
-                for (int i = 0; i < 3; i++)
-                {
-                    dist[i] = max[i] - min[i];
-                    offset[i] = (max[i] + min[i]) / 2;
-                }
-                float d = Math.Max(1e-5f, dist.Length);
-                var localModelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
 
                 var localIndiceData = new int[m_Indices.Count];
                 for (int i = 0; i < m_Indices.Count; i = i + 3)
@@ -1539,13 +1539,22 @@ void main()
                                 skinnedPos = localVertexData[v];
                             }
                             frameVerts[v] = skinnedPos;
+                            ExpandBounds(skinnedPos, ref min, ref max);
                         }
                         localAnimatedMeshVerts[f] = frameVerts;
                     }
                 }
 
                 var firstFrameBones = frames[0];
+                foreach (var frame in frames)
+                {
+                    foreach (var bonePosition in frame)
+                    {
+                        ExpandBounds(bonePosition, ref min, ref max);
+                    }
+                }
                 var skeletonVerts = BuildSkeletonVertices(firstFrameBones, parentIndices, out int boneLines, out int jointPoints);
+                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
 
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -1633,7 +1642,16 @@ void main()
             animCurrentFrame = 0;
             isAnimPlaying = false;
             animatedMeshVertices = null;
-            pendingMeshVertices = null;
+
+            lock (meshLock)
+            {
+                pendingMeshVertices = null;
+            }
+
+            lock (skeletonLock)
+            {
+                pendingSkeletonVertices = null;
+            }
         }
 
         public int AnimCurrentFrame => animCurrentFrame;

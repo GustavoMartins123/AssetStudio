@@ -12,7 +12,9 @@ param(
 
     [string]$OutputDir,
 
-    [switch]$SkipNative
+    [switch]$SkipNative,
+
+    [switch]$KeepBuildServers
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +71,18 @@ function Invoke-Checked {
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "$FilePath failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Stop-DotNetBuildServers {
+    if ($KeepBuildServers) {
+        return
+    }
+
+    Write-Host "Stopping .NET build servers..."
+    & dotnet build-server shutdown | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "dotnet build-server shutdown failed with exit code $LASTEXITCODE."
     }
 }
 
@@ -136,42 +150,64 @@ function Copy-NativeDll {
     return $false
 }
 
-Write-Host "Publishing AssetStudio.Avalonia ($Configuration, $Framework, $Runtime, self-contained=$SelfContained)"
-Assert-OutputExecutableIsNotRunning
-
-if (-not $SkipNative) {
-    $msbuild = Find-MSBuild
-    Write-Host "Using MSBuild: $msbuild"
-
-    Invoke-Checked $msbuild @(
-        (Join-Path $RepoRoot "Texture2DDecoderNative\Texture2DDecoderNative.vcxproj"),
-        "/m",
-        "/p:Configuration=$Configuration",
-        "/p:Platform=$NativePlatform"
-    )
-}
-
-$publishArgs = @(
-    "publish",
-    (Join-Path $RepoRoot "AssetStudio.Avalonia\AssetStudio.Avalonia.csproj"),
-    "-c", $Configuration,
-    "-f", $Framework,
-    "-r", $Runtime,
-    "--self-contained", $SelfContained.ToString().ToLowerInvariant()
-)
-
-if ($OutputDir) {
-    $publishArgs += @("-o", $PublishDir)
-}
-
-Invoke-Checked "dotnet" $publishArgs
-
-if (-not $SkipNative) {
-    if (-not (Copy-NativeDll "Texture2DDecoderNative" "Texture2DDecoderNative.dll")) {
-        throw "Texture2DDecoderNative.dll is required for texture export. Build Texture2DDecoderNative or rerun with -SkipNative to publish the managed app only."
+try {
+    $previousNodeReuse = $env:MSBUILDDISABLENODEREUSE
+    if (-not $KeepBuildServers) {
+        $env:MSBUILDDISABLENODEREUSE = "1"
     }
 
-}
+    Write-Host "Publishing AssetStudio.Avalonia ($Configuration, $Framework, $Runtime, self-contained=$SelfContained)"
+    Assert-OutputExecutableIsNotRunning
 
-Write-Host ""
-Write-Host "Done: $PublishDir"
+    if (-not $SkipNative) {
+        $msbuild = Find-MSBuild
+        Write-Host "Using MSBuild: $msbuild"
+
+        Invoke-Checked $msbuild @(
+            (Join-Path $RepoRoot "Texture2DDecoderNative\Texture2DDecoderNative.vcxproj"),
+            "/m",
+            "/nr:false",
+            "/p:Configuration=$Configuration",
+            "/p:Platform=$NativePlatform"
+        )
+    }
+
+    $publishArgs = @(
+        "publish",
+        (Join-Path $RepoRoot "AssetStudio.Avalonia\AssetStudio.Avalonia.csproj"),
+        "-c", $Configuration,
+        "-f", $Framework,
+        "-r", $Runtime,
+        "--self-contained", $SelfContained.ToString().ToLowerInvariant(),
+        "--disable-build-servers",
+        "/p:UseSharedCompilation=false"
+    )
+
+    if ($OutputDir) {
+        $publishArgs += @("-o", $PublishDir)
+    }
+
+    Invoke-Checked "dotnet" $publishArgs
+
+    if (-not $SkipNative) {
+        if (-not (Copy-NativeDll "Texture2DDecoderNative" "Texture2DDecoderNative.dll")) {
+            throw "Texture2DDecoderNative.dll is required for texture export. Build Texture2DDecoderNative or rerun with -SkipNative to publish the managed app only."
+        }
+
+    }
+
+    Write-Host ""
+    Write-Host "Done: $PublishDir"
+}
+finally {
+    if (-not $KeepBuildServers) {
+        Stop-DotNetBuildServers
+    }
+
+    if ($null -eq $previousNodeReuse) {
+        Remove-Item Env:\MSBUILDDISABLENODEREUSE -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:MSBUILDDISABLENODEREUSE = $previousNodeReuse
+    }
+}
