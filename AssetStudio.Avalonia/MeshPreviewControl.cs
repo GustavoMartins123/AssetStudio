@@ -233,6 +233,12 @@ void main()
         private int pendingTextureWidth;
         private int pendingTextureHeight;
         private bool hasPendingTexture;
+        private List<byte[]?>? pendingSubMeshTextures;
+        private List<int>? pendingSubMeshTexWidths;
+        private List<int>? pendingSubMeshTexHeights;
+        private bool hasPendingSubMeshTextures;
+        private int[]? previewTextureIds;
+        private Mesh? currentMesh;
         private int meshLoadCounter = 0;
 
         private double lastWidth;
@@ -413,7 +419,7 @@ void main()
             }
         }
 
-        public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, byte[]? textureData = null, int textureWidth = 0, int textureHeight = 0)
+        public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, List<byte[]?>? subMeshTextures = null, List<int>? subMeshTexWidths = null, List<int>? subMeshTexHeights = null)
         {
             ClearAvatarPreviewState();
             previewMaterialMode = false;
@@ -555,14 +561,14 @@ void main()
                     }
                 }
 
-                if (textureData != null && textureWidth > 0 && textureHeight > 0)
+                if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
                 {
                     lock (textureLock)
                     {
-                        pendingTextureWidth = textureWidth;
-                        pendingTextureHeight = textureHeight;
-                        pendingTextureData = textureData;
-                        hasPendingTexture = true;
+                        pendingSubMeshTextures = subMeshTextures;
+                        pendingSubMeshTexWidths = subMeshTexWidths;
+                        pendingSubMeshTexHeights = subMeshTexHeights;
+                        hasPendingSubMeshTextures = true;
                     }
                 }
 
@@ -579,7 +585,8 @@ void main()
                     normal2Data = localNormal2Data;
                     colorData = localColorData;
                     uvData = localUvData;
-                    if (textureData != null)
+                    currentMesh = m_Mesh; // Keep reference for submesh drawing
+                    if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
                     {
                         previewMaterialMode = true;
                     }
@@ -814,6 +821,14 @@ void main()
                 if (pgmYellowID != 0) GL.DeleteProgram(pgmYellowID);
                 if (pgmRedID != 0) GL.DeleteProgram(pgmRedID);
                 if (previewTextureId != 0) GL.DeleteTexture(previewTextureId);
+                if (previewTextureIds != null)
+                {
+                    foreach (var id in previewTextureIds)
+                    {
+                        if (id != 0) GL.DeleteTexture(id);
+                    }
+                    previewTextureIds = null;
+                }
             }
             catch
             {
@@ -833,31 +848,66 @@ void main()
                 bool updateTex = false;
                 byte[]? texBytes = null;
                 int texW = 0, texH = 0;
+                List<byte[]?>? subTexBytes = null;
+                List<int>? subTexW = null;
+                List<int>? subTexH = null;
+
                 lock (textureLock)
                 {
-                    if (hasPendingTexture)
+                    if (hasPendingSubMeshTextures)
+                    {
+                        updateTex = true;
+                        subTexBytes = pendingSubMeshTextures;
+                        subTexW = pendingSubMeshTexWidths;
+                        subTexH = pendingSubMeshTexHeights;
+                        hasPendingSubMeshTextures = false;
+                    }
+                    else if (hasPendingTexture)
                     {
                         updateTex = true;
                         texBytes = pendingTextureData;
                         texW = pendingTextureWidth;
                         texH = pendingTextureHeight;
                         hasPendingTexture = false;
+                        subTexBytes = new List<byte[]?> { pendingTextureData };
+                        subTexW = new List<int> { pendingTextureWidth };
+                        subTexH = new List<int> { pendingTextureHeight };
                     }
                 }
 
-                if (updateTex && texBytes != null)
+                if (updateTex && subTexBytes != null)
                 {
                     if (previewTextureId != 0)
                     {
                         GL.DeleteTexture(previewTextureId);
+                        previewTextureId = 0;
                     }
-                    previewTextureId = GL.GenTexture();
-                    GL.BindTexture(TextureTarget.Texture2D, previewTextureId);
-                    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, texW, texH, 0, PixelFormat.Rgba, PixelType.UnsignedByte, texBytes);
-                    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
-                    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
-                    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
-                    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+                    if (previewTextureIds != null)
+                    {
+                        foreach (var id in previewTextureIds)
+                        {
+                            if (id != 0) GL.DeleteTexture(id);
+                        }
+                    }
+                    
+                    previewTextureIds = new int[subTexBytes.Count];
+                    for (int i = 0; i < subTexBytes.Count; i++)
+                    {
+                        var tBytes = subTexBytes[i];
+                        if (tBytes == null) continue;
+
+                        int tw = subTexW![i];
+                        int th = subTexH![i];
+
+                        int id = GL.GenTexture();
+                        previewTextureIds[i] = id;
+                        GL.BindTexture(TextureTarget.Texture2D, id);
+                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, tw, th, 0, PixelFormat.Rgba, PixelType.UnsignedByte, tBytes);
+                        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+                        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+                        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+                        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+                    }
                 }
 
                 if (Bounds.Width != lastWidth || Bounds.Height != lastHeight)
@@ -972,38 +1022,83 @@ void main()
 
                 if (wireFrameMode == 0 || wireFrameMode == 2)
                 {
-                    if (previewMaterialMode && previewTextureId != 0)
-                    {
-                        GL.UseProgram(pgmTexID);
-                        GL.ActiveTexture(TextureUnit.Texture0);
-                        GL.BindTexture(TextureTarget.Texture2D, previewTextureId);
-                        GL.Uniform1(uniformTexture, 0);
-                        GL.UniformMatrix4(uniformModelMatrixTex, false, ref modelMatrixData);
-                        GL.UniformMatrix4(uniformViewMatrixTex, false, ref viewMatrixData);
-                        GL.UniformMatrix4(uniformProjMatrixTex, false, ref projMatrixData);
-                    }
-                    else
-                    {
-                        if (shadeMode == 0)
-                        {
-                            GL.UseProgram(pgmID);
-                            GL.UniformMatrix4(uniformModelMatrix, false, ref modelMatrixData);
-                            GL.UniformMatrix4(uniformViewMatrix, false, ref viewMatrixData);
-                            GL.UniformMatrix4(uniformProjMatrix, false, ref projMatrixData);
-                        }
-                        else
-                        {
-                            GL.UseProgram(pgmColorID);
-                            GL.UniformMatrix4(uniformModelMatrixColor, false, ref modelMatrixData);
-                            GL.UniformMatrix4(uniformViewMatrixColor, false, ref viewMatrixData);
-                            GL.UniformMatrix4(uniformProjMatrixColor, false, ref projMatrixData);
-                        }
-                    }
                     if (!isGles)
                     {
                         GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
                     }
-                    GL.DrawElements(BeginMode.Triangles, indiceData.Length, DrawElementsType.UnsignedInt, 0);
+
+                    if (previewMaterialMode && previewTextureIds != null && currentMesh != null && currentMesh.m_SubMeshes != null && currentMesh.m_SubMeshes.Length > 0 && !isAvatarMode)
+                    {
+                        int flatOffsetElements = 0;
+                        for (int i = 0; i < currentMesh.m_SubMeshes.Length; i++)
+                        {
+                            var subMesh = currentMesh.m_SubMeshes[i];
+                            int texIndex = i < previewTextureIds.Length ? i : 0;
+                            int texId = previewTextureIds != null && texIndex < previewTextureIds.Length ? previewTextureIds[texIndex] : 0;
+
+                            if (texId != 0)
+                            {
+                                GL.UseProgram(pgmTexID);
+                                GL.ActiveTexture(TextureUnit.Texture0);
+                                GL.BindTexture(TextureTarget.Texture2D, texId);
+                                GL.Uniform1(uniformTexture, 0);
+                                GL.UniformMatrix4(uniformModelMatrixTex, false, ref modelMatrixData);
+                                GL.UniformMatrix4(uniformViewMatrixTex, false, ref viewMatrixData);
+                                GL.UniformMatrix4(uniformProjMatrixTex, false, ref projMatrixData);
+                            }
+                            else
+                            {
+                                if (shadeMode == 0)
+                                {
+                                    GL.UseProgram(pgmID);
+                                    GL.UniformMatrix4(uniformModelMatrix, false, ref modelMatrixData);
+                                    GL.UniformMatrix4(uniformViewMatrix, false, ref viewMatrixData);
+                                    GL.UniformMatrix4(uniformProjMatrix, false, ref projMatrixData);
+                                }
+                                else
+                                {
+                                    GL.UseProgram(pgmColorID);
+                                    GL.UniformMatrix4(uniformModelMatrixColor, false, ref modelMatrixData);
+                                    GL.UniformMatrix4(uniformViewMatrixColor, false, ref viewMatrixData);
+                                    GL.UniformMatrix4(uniformProjMatrixColor, false, ref projMatrixData);
+                                }
+                            }
+
+                            GL.DrawElements(PrimitiveType.Triangles, (int)subMesh.indexCount, DrawElementsType.UnsignedInt, (IntPtr)(flatOffsetElements * 4));
+                            flatOffsetElements += (int)subMesh.indexCount;
+                        }
+                    }
+                    else
+                    {
+                        if (previewMaterialMode && previewTextureIds != null && previewTextureIds.Length > 0 && previewTextureIds[0] != 0)
+                        {
+                            GL.UseProgram(pgmTexID);
+                            GL.ActiveTexture(TextureUnit.Texture0);
+                            GL.BindTexture(TextureTarget.Texture2D, previewTextureIds[0]);
+                            GL.Uniform1(uniformTexture, 0);
+                            GL.UniformMatrix4(uniformModelMatrixTex, false, ref modelMatrixData);
+                            GL.UniformMatrix4(uniformViewMatrixTex, false, ref viewMatrixData);
+                            GL.UniformMatrix4(uniformProjMatrixTex, false, ref projMatrixData);
+                        }
+                        else
+                        {
+                            if (shadeMode == 0)
+                            {
+                                GL.UseProgram(pgmID);
+                                GL.UniformMatrix4(uniformModelMatrix, false, ref modelMatrixData);
+                                GL.UniformMatrix4(uniformViewMatrix, false, ref viewMatrixData);
+                                GL.UniformMatrix4(uniformProjMatrix, false, ref projMatrixData);
+                            }
+                            else
+                            {
+                                GL.UseProgram(pgmColorID);
+                                GL.UniformMatrix4(uniformModelMatrixColor, false, ref modelMatrixData);
+                                GL.UniformMatrix4(uniformViewMatrixColor, false, ref viewMatrixData);
+                                GL.UniformMatrix4(uniformProjMatrixColor, false, ref projMatrixData);
+                            }
+                        }
+                        GL.DrawElements(PrimitiveType.Triangles, indiceData.Length, DrawElementsType.UnsignedInt, 0);
+                    }
                 }
 
                 if (wireFrameMode == 1 || wireFrameMode == 2)

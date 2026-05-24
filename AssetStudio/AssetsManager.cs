@@ -513,6 +513,22 @@ namespace AssetStudio
         {
             Logger.Info("Process Assets...");
 
+            var spriteAtlasCache = new Dictionary<KeyValuePair<Guid, long>, SpriteAtlas>();
+
+            foreach (var assetsFile in assetsFileList)
+            {
+                foreach (var obj in assetsFile.Objects)
+                {
+                    if (obj is SpriteAtlas m_SpriteAtlas && m_SpriteAtlas.m_RenderDataMap != null)
+                    {
+                        foreach (var key in m_SpriteAtlas.m_RenderDataMap.Keys)
+                        {
+                            spriteAtlasCache[key] = m_SpriteAtlas;
+                        }
+                    }
+                }
+            }
+
             foreach (var assetsFile in assetsFileList)
             {
                 foreach (var obj in assetsFile.Objects)
@@ -560,11 +576,21 @@ namespace AssetStudio
                                 else
                                 {
                                     m_Sprite.m_SpriteAtlas.TryGet(out var m_SpriteAtlaOld);
-                                    if (m_SpriteAtlaOld.m_IsVariant)
+                                    if (m_SpriteAtlaOld != null && m_SpriteAtlaOld.m_IsVariant)
                                     {
                                         m_Sprite.m_SpriteAtlas.Set(m_SpriteAtlas);
                                     }
                                 }
+                            }
+                        }
+                    }
+                    else if (obj is Sprite m_Sprite)
+                    {
+                        if (m_Sprite.m_SpriteAtlas.IsNull && m_Sprite.m_RenderDataKey.Key != Guid.Empty)
+                        {
+                            if (spriteAtlasCache.TryGetValue(m_Sprite.m_RenderDataKey, out var atlas))
+                            {
+                                m_Sprite.m_SpriteAtlas.Set(atlas);
                             }
                         }
                     }

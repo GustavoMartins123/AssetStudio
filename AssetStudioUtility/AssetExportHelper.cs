@@ -413,6 +413,16 @@ TextureImporter:
                             AddPathToHash(bonePathHash, path);
                         }
                     }
+                    else if (obj is Avatar avatar && avatar.m_TOS != null)
+                    {
+                        foreach (var pair in avatar.m_TOS)
+                        {
+                            if (!string.IsNullOrEmpty(pair.Value))
+                            {
+                                bonePathHash[pair.Key] = pair.Value;
+                            }
+                        }
+                    }
                 }
             }
             return bonePathHash;

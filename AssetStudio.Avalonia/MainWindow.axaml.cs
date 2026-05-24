@@ -53,8 +53,9 @@ public partial class MainWindow : Window
     private int nextGameObjectSearchIndex;
     private bool assetListSortDescending;
     private bool updatingFilterTypeMenu;
-    private Dictionary<Mesh, List<Material>>? meshToMaterialsCache;
+    private Dictionary<Mesh, List<Material?>>? meshToMaterialsCache;
     private List<Material>? allMaterialsCache;
+    private Dictionary<AssetStudio.Object, AssetItem>? objectToAssetItemCache;
 
     private FMOD.System? fmodSystem;
     private FMOD.Sound? fmodSound;
@@ -188,6 +189,7 @@ public partial class MainWindow : Window
     {
         meshToMaterialsCache = null;
         allMaterialsCache = null;
+        objectToAssetItemCache = null;
         logger.ClearErrors();
         exportableAssets.Clear();
         visibleAssets.Clear();
@@ -233,6 +235,8 @@ public partial class MainWindow : Window
     {
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
+        TextPreviewBox.FontFamily = global::Avalonia.Media.FontFamily.Default;
+        TextPreviewBox.FontSize = 14;
         if (ImagePreviewBox != null)
         {
             ImagePreviewBox.Source = null;
@@ -574,7 +578,7 @@ public partial class MainWindow : Window
             }
         }
         updatingFilterTypeMenu = false;
-        FilterAssetList();
+        _ = FilterAssetListAsync(CancellationToken.None);
     }
 
     private void FilterType_Click(object? sender, RoutedEventArgs e)
@@ -584,7 +588,7 @@ public partial class MainWindow : Window
         updatingFilterTypeMenu = true;
         filterTypeAll.IsChecked = !GetFilterTypeItems().Any(x => x.IsChecked == true);
         updatingFilterTypeMenu = false;
-        FilterAssetList();
+        _ = FilterAssetListAsync(CancellationToken.None);
     }
 
     private void ClassSearch_TextChanged(object? sender, TextChangedEventArgs e)
@@ -1156,7 +1160,7 @@ public partial class MainWindow : Window
 
         visibleAssets = new List<AssetItem>(exportableAssets);
         BuildFilterTypeMenu();
-        FilterAssetList();
+        _ = FilterAssetListAsync(CancellationToken.None);
         BuildAssetClasses();
         SceneTreeView.ItemsSource = sceneTreeNodes;
 
@@ -1440,44 +1444,94 @@ public partial class MainWindow : Window
             case Mesh m_Mesh:
             {
                 Texture2D? meshTexture = null;
+                List<byte[]?>? subMeshTextures = null;
+                List<int>? subMeshTexWidths = null;
+                List<int>? subMeshTexHeights = null;
+
                 if (GLPreviewControl != null)
                 {
-                    var allMaterials = FindMaterialsForMesh(m_Mesh);
-                    foreach (var mat in allMaterials)
-                    {
-                        meshTexture = FindTextureForMaterial(mat);
-                        if (meshTexture != null) break;
-                    }
-                    
-                    global::OpenTK.Mathematics.Vector2[]? uvs = null;
-                    byte[]? textureBytes = null;
-                    int texW = 0;
-                    int texH = 0;
+                    subMeshTextures = new();
+                    subMeshTexWidths = new();
+                    subMeshTexHeights = new();
 
-                    if (meshTexture != null)
+                    var allMaterials = FindMaterialsForMesh(m_Mesh);
+                    
+                    if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
                     {
-                        try
+                        for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
                         {
-                            var image = meshTexture.ConvertToImage(true);
-                            if (image != null)
+                            byte[]? tb = null;
+                            int tw = 0, th = 0;
+
+                            if (i < allMaterials.Count && allMaterials[i] != null)
                             {
-                                texW = image.Width;
-                                texH = image.Height;
-                                textureBytes = new byte[texW * texH * 4];
-                                image.CopyPixelDataTo(textureBytes);
-                                for (int i = 0; i < textureBytes.Length; i += 4)
+                                var tex = FindTextureForMaterial(allMaterials[i]!);
+                                if (tex != null)
                                 {
-                                    byte temp = textureBytes[i];
-                                    textureBytes[i] = textureBytes[i + 2];
-                                    textureBytes[i + 2] = temp;
+                                    try
+                                    {
+                                        var image = tex.ConvertToImage(true);
+                                        if (image != null)
+                                        {
+                                            tw = image.Width;
+                                            th = image.Height;
+                                            tb = new byte[tw * th * 4];
+                                            image.CopyPixelDataTo(tb);
+                                            for (int p = 0; p < tb.Length; p += 4)
+                                            {
+                                                byte temp = tb[p];
+                                                tb[p] = tb[p + 2];
+                                                tb[p + 2] = temp;
+                                            }
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        StatusStripUpdate($"Texture decode failed for submesh {i}: {ex.Message}");
+                                    }
                                 }
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            StatusStripUpdate($"Texture decode failed: {ex.Message}");
+                            subMeshTextures.Add(tb);
+                            subMeshTexWidths.Add(tw);
+                            subMeshTexHeights.Add(th);
                         }
                     }
+                    else
+                    {
+                        // Fallback if no submeshes (shouldn't happen for valid meshes)
+                        byte[]? tb = null;
+                        int tw = 0, th = 0;
+                        if (allMaterials.Count > 0 && allMaterials[0] != null)
+                        {
+                            var tex = FindTextureForMaterial(allMaterials[0]!);
+                            if (tex != null)
+                            {
+                                try
+                                {
+                                    var image = tex.ConvertToImage(true);
+                                    if (image != null)
+                                    {
+                                        tw = image.Width;
+                                        th = image.Height;
+                                        tb = new byte[tw * th * 4];
+                                        image.CopyPixelDataTo(tb);
+                                        for (int p = 0; p < tb.Length; p += 4)
+                                        {
+                                            byte temp = tb[p];
+                                            tb[p] = tb[p + 2];
+                                            tb[p + 2] = temp;
+                                        }
+                                    }
+                                }
+                                catch {}
+                            }
+                        }
+                        subMeshTextures.Add(tb);
+                        subMeshTexWidths.Add(tw);
+                        subMeshTexHeights.Add(th);
+                    }
+
+                    global::OpenTK.Mathematics.Vector2[]? uvs = null;
 
                     if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
                     {
@@ -1488,7 +1542,7 @@ public partial class MainWindow : Window
                         }
                     }
 
-                    GLPreviewControl.SetMesh(m_Mesh, uvs, textureBytes, texW, texH);
+                    GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                     GLPreviewControl.IsVisible = true;
                     GLPreviewControl.Focus();
                 }
@@ -1511,7 +1565,7 @@ public partial class MainWindow : Window
                     });
                 }
                 PreviewLabel.IsVisible = false;
-                if (meshTexture != null)
+                if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
                 {
                     StatusStripUpdate("OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded");
                 }
@@ -2649,81 +2703,29 @@ public partial class MainWindow : Window
         {
             try
             {
-                var fontCollection = new FontCollection();
-                FontFamily family;
-                using (var ms = new MemoryStream(m_Font.m_FontData))
-                {
-                    family = fontCollection.Add(ms);
-                }
+                var tempFile = Path.Combine(Path.GetTempPath(), $"AssetStudioFont_{Guid.NewGuid():N}.ttf");
+                File.WriteAllBytes(tempFile, m_Font.m_FontData);
 
-                var sampleText = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789";
-                var lines = new List<(string text, SixLabors.Fonts.Font font)>
+                Dispatcher.UIThread.Post(() =>
                 {
-                    ($"Font: {m_Font.m_Name}", family.CreateFont(20, SixLabors.Fonts.FontStyle.Bold)),
-                    ($"Size 12: {sampleText}", family.CreateFont(12, SixLabors.Fonts.FontStyle.Regular)),
-                    ($"Size 18: {sampleText}", family.CreateFont(18, SixLabors.Fonts.FontStyle.Regular)),
-                    ($"Size 24: {sampleText}", family.CreateFont(24, SixLabors.Fonts.FontStyle.Regular)),
-                    ($"Size 36: {sampleText}", family.CreateFont(36, SixLabors.Fonts.FontStyle.Regular)),
-                    ($"Size 48: {sampleText}", family.CreateFont(48, SixLabors.Fonts.FontStyle.Regular)),
-                    ($"Size 60: Pack My Box With Five Dozen Liquor Jugs", family.CreateFont(60, SixLabors.Fonts.FontStyle.Regular)),
-                    ($"Size 72: Pack My Box With Five Dozen Liquor Jugs", family.CreateFont(72, SixLabors.Fonts.FontStyle.Regular))
-                };
-
-                float maxWidth = 800;
-                float totalHeight = 40;
-                var lineLayouts = new List<(string text, SixLabors.Fonts.Font font, float yOffset, float height)>();
-
-                foreach (var line in lines)
-                {
-                    var size = TextMeasurer.MeasureSize(line.text, new TextOptions(line.font));
-                    if (size.Width + 60 > maxWidth)
+                    if (currentId == texturePreviewIdCounter)
                     {
-                        maxWidth = size.Width + 60;
+                        var family = new global::Avalonia.Media.FontFamily($"file://{tempFile}");
+                        var sampleText = $"Font: {m_Font.m_Name}\n\n" +
+                                         $"Size 24: abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n\n" +
+                                         $"Size 48: Pack My Box With Five Dozen Liquor Jugs";
+
+                        TextPreviewBox.Text = sampleText;
+                        TextPreviewBox.FontFamily = family;
+                        TextPreviewBox.FontSize = 24;
+
+                        ImagePreviewBox.IsVisible = false;
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
+                        PreviewInfoBorder.IsVisible = false;
+                        StatusStripUpdate($"Font loaded: {m_Font.m_Name}");
                     }
-                    lineLayouts.Add((line.text, line.font, totalHeight, size.Height));
-                    totalHeight += size.Height + 20;
-                }
-                totalHeight += 40;
-
-                if (maxWidth > 4096)
-                {
-                    maxWidth = 4096;
-                }
-
-                using (var image = new Image<Bgra32>((int)maxWidth, (int)totalHeight))
-                {
-                    image.Mutate(ctx => ctx.Clear(SixLabors.ImageSharp.Color.FromRgb(245, 245, 245)));
-
-                    foreach (var layout in lineLayouts)
-                    {
-                        image.Mutate(ctx => ctx.DrawText(
-                            layout.text,
-                            layout.font,
-                            SixLabors.ImageSharp.Color.Black,
-                            new PointF(30, layout.yOffset)
-                        ));
-                    }
-
-                    using (var outMs = new MemoryStream())
-                    {
-                        image.SaveAsPng(outMs);
-                        outMs.Position = 0;
-                        var bitmap = new global::Avalonia.Media.Imaging.Bitmap(outMs);
-
-                        Dispatcher.UIThread.Post(() =>
-                        {
-                            if (currentId == texturePreviewIdCounter)
-                            {
-                                ImagePreviewBox.Source = bitmap;
-                                ImagePreviewBox.IsVisible = true;
-                                TextPreviewBox.IsVisible = false;
-                                PreviewLabel.IsVisible = false;
-                                PreviewInfoBorder.IsVisible = false;
-                                StatusStripUpdate($"Font loaded: {m_Font.m_Name}");
-                            }
-                        });
-                    }
-                }
+                });
             }
             catch (Exception ex)
             {
@@ -3126,6 +3128,9 @@ public partial class MainWindow : Window
         }
 
         Texture2D? candidate = null;
+        int bestScore = -1;
+        var matTokens = GetPathTokens(material.m_Name);
+
         foreach (var file in assetsManager.assetsFileList)
         {
             if (file.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D tex)
@@ -3134,7 +3139,15 @@ public partial class MainWindow : Window
                 {
                     return tex;
                 }
-                candidate = tex;
+                
+                var texTokens = GetPathTokens(tex.m_Name);
+                int score = matTokens.Intersect(texTokens, StringComparer.OrdinalIgnoreCase).Count() * 10;
+                
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    candidate = tex;
+                }
             }
         }
         return candidate;
@@ -3371,11 +3384,24 @@ public partial class MainWindow : Window
 
                 if (image == null)
                 {
+                    string failReason = "Unsupported image for preview";
+                    if (currentPreviewTexture != null)
+                    {
+                        failReason = $"Unsupported Texture Format: {currentPreviewTexture.m_TextureFormat}";
+                    }
+                    else if (currentPreviewSprite != null)
+                    {
+                        if (currentPreviewSprite.m_SpriteAtlas != null && currentPreviewSprite.m_SpriteAtlas.TryGet(out var atlas) && atlas.m_RenderDataMap.TryGetValue(currentPreviewSprite.m_RenderDataKey, out var atlasData) && atlasData.texture.TryGet(out var tex1))
+                            failReason = $"Unsupported Sprite Texture Format: {tex1.m_TextureFormat}";
+                        else if (currentPreviewSprite.m_RD.texture.TryGet(out var tex2))
+                            failReason = $"Unsupported Sprite Texture Format: {tex2.m_TextureFormat}";
+                    }
+
                     Dispatcher.UIThread.Post(() =>
                     {
                         if (currentId == texturePreviewIdCounter)
                         {
-                            StatusStripUpdate("Unsupported image for preview");
+                            StatusStripUpdate(failReason);
                             ImagePreviewBox.IsVisible = false;
                             PreviewInfoBorder.IsVisible = false;
                         }
@@ -3555,7 +3581,7 @@ public partial class MainWindow : Window
             await Task.Delay(800, debounce.Token);
             if (!debounce.IsCancellationRequested)
             {
-                FilterAssetList();
+                await FilterAssetListAsync(debounce.Token);
             }
         }
         catch (TaskCanceledException)
@@ -3564,7 +3590,7 @@ public partial class MainWindow : Window
     }
 
     private bool isSorting;
-    private void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
+    private async void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
     {
         if (isSorting) return;
         isSorting = true;
@@ -3583,8 +3609,8 @@ public partial class MainWindow : Window
                 assetListSortDescending = false;
             }
 
-            ApplyAssetListSort();
             e.Column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
+            await ApplyAssetListSortAsync();
             
             e.Handled = true;
         }
@@ -3671,69 +3697,106 @@ public partial class MainWindow : Window
         await ExportAnimatorWithSelectedAnimationClips(GetSelectedAssets());
     }
 
-    private void FilterAssetList()
+    private async Task FilterAssetListAsync(CancellationToken token)
     {
-        IEnumerable<AssetItem> assets = exportableAssets;
-
-        if (classFilterOverride != null)
-        {
-            assets = assets.Where(x => 
-                (int)x.Type == classFilterOverride.ClassID && 
-                x.SourceFile.unityVersion == classFilterOverride.UnityVersion);
-        }
-        else if (filterTypeAll.IsChecked != true)
-        {
-            var selectedTypes = GetFilterTypeItems()
-                .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
-                .Select(x => (ClassIDType)x.Tag!)
-                .ToHashSet();
-
-            assets = selectedTypes.Count == 0
-                ? Enumerable.Empty<AssetItem>()
-                : assets.Where(x => selectedTypes.Contains(x.Type));
-        }
-
         var filterText = listSearch?.Text?.Trim();
-        if (!string.IsNullOrEmpty(filterText))
+        var classFilter = classFilterOverride;
+        var filterTypeChecked = filterTypeAll.IsChecked != true;
+        var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
+            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+            .Select(x => (ClassIDType)x.Tag!)
+            .ToHashSet() : null;
+
+        var sortMember = assetListSortMember;
+        var sortDescending = assetListSortDescending;
+
+        try
         {
-            assets = assets.Where(x =>
-                x.Name.Contains(filterText, StringComparison.OrdinalIgnoreCase) ||
-                x.Container.Contains(filterText, StringComparison.OrdinalIgnoreCase) ||
-                x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase) ||
-                x.PathID.ToString(CultureInfo.InvariantCulture).Contains(filterText, StringComparison.OrdinalIgnoreCase));
+            var result = await Task.Run(() =>
+            {
+                var matches = new List<AssetItem>();
+                foreach (var x in exportableAssets)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    if (classFilter != null)
+                    {
+                        if ((int)x.Type != classFilter.ClassID || x.SourceFile.unityVersion != classFilter.UnityVersion)
+                            continue;
+                    }
+                    else if (selectedTypes != null)
+                    {
+                        if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
+                            continue;
+                    }
+
+                    if (!string.IsNullOrEmpty(filterText))
+                    {
+                        if (!x.Name.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
+                            !x.Container.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
+                            !x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
+                            !x.PathIDString.Contains(filterText, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+                    }
+
+                    matches.Add(x);
+                }
+
+                token.ThrowIfCancellationRequested();
+                return SortAssetListAsync(matches, sortMember, sortDescending).ToList();
+            }, token);
+
+            visibleAssets = result;
+            AssetListDataGrid.ItemsSource = visibleAssets;
+            StatusStripUpdate($"Showing {visibleAssets.Count} assets");
         }
-
-        visibleAssets = assets.ToList();
-        ApplyAssetListSort();
-    }
-
-    private void ApplyAssetListSort()
-    {
-        visibleAssets = SortAssetList(visibleAssets).ToList();
-        AssetListDataGrid.ItemsSource = visibleAssets;
-        StatusStripUpdate($"Showing {visibleAssets.Count} assets");
-    }
-
-    private IEnumerable<AssetItem> SortAssetList(IEnumerable<AssetItem> assets)
-    {
-        return assetListSortMember switch
+        catch (OperationCanceledException)
         {
-            "PathID" => assetListSortDescending
+            // Task canceled, ignore
+        }
+    }
+
+    private async Task ApplyAssetListSortAsync()
+    {
+        var sortMember = assetListSortMember;
+        var sortDescending = assetListSortDescending;
+        var currentAssets = visibleAssets;
+
+        try
+        {
+            var sorted = await Task.Run(() => SortAssetListAsync(currentAssets, sortMember, sortDescending).ToList());
+            visibleAssets = sorted;
+            AssetListDataGrid.ItemsSource = visibleAssets;
+            StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Error sorting asset list", ex);
+        }
+    }
+
+    private IEnumerable<AssetItem> SortAssetListAsync(IEnumerable<AssetItem> assets, string? sortMember, bool descending)
+    {
+        return sortMember switch
+        {
+            "PathID" => descending
                 ? assets.OrderByDescending(x => x.PathID)
                 : assets.OrderBy(x => x.PathID),
-            "FullSize" or "Size" => assetListSortDescending
+            "FullSize" or "Size" => descending
                 ? assets.OrderByDescending(x => x.FullSize).ThenBy(x => x.PathID)
                 : assets.OrderBy(x => x.FullSize).ThenBy(x => x.PathID),
-            "Container" => SortByString(assets, x => x.Container),
-            "DisplayType" or "Type" => SortByString(assets, x => x.DisplayType),
-            "Name" => SortByString(assets, x => x.Name),
+            "Container" => SortByStringAsync(assets, x => x.Container, descending),
+            "DisplayType" or "Type" => SortByStringAsync(assets, x => x.DisplayType, descending),
+            "Name" => SortByStringAsync(assets, x => x.Name, descending),
             _ => assets
         };
     }
 
-    private IEnumerable<AssetItem> SortByString(IEnumerable<AssetItem> assets, Func<AssetItem, string> selector)
+    private IEnumerable<AssetItem> SortByStringAsync(IEnumerable<AssetItem> assets, Func<AssetItem, string?> selector, bool descending)
     {
-        return assetListSortDescending
+        return descending
             ? assets.OrderByDescending(selector, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.PathID)
             : assets.OrderBy(selector, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.PathID);
     }
@@ -3744,7 +3807,7 @@ public partial class MainWindow : Window
         {
             "Container" => item.Container,
             "DisplayType" or "Type" => item.DisplayType,
-            "PathID" => item.PathID.ToString(CultureInfo.InvariantCulture),
+            "PathID" => item.PathIDString,
             "FullSize" or "Size" => item.FullSize.ToString(CultureInfo.InvariantCulture),
             _ => item.Name
         };
@@ -5096,14 +5159,14 @@ public partial class MainWindow : Window
         ClearClassFilterButton.IsVisible = true;
 
         LeftTabControl.SelectedIndex = 1;
-        FilterAssetList();
+        _ = FilterAssetListAsync(CancellationToken.None);
     }
 
     private void ClearClassFilter_Click(object? sender, RoutedEventArgs e)
     {
         classFilterOverride = null;
         ClearClassFilterButton.IsVisible = false;
-        FilterAssetList();
+        _ = FilterAssetListAsync(CancellationToken.None);
     }
 
     private Object? ResolvePPtr(object? pptrObj, SerializedFile file)
@@ -5308,10 +5371,44 @@ public partial class MainWindow : Window
         return sb.ToString();
     }
 
+    private Material? ResolveMaterial(long pathID, string meshName)
+    {
+        Material? bestMat = null;
+        int bestScore = -1;
+
+        var meshTokens = GetPathTokens(meshName);
+
+        foreach (var file in assetsManager.assetsFileList)
+        {
+            if (file.ObjectsDic.TryGetValue(pathID, out var obj) && obj is Material mat)
+            {
+                var matTokens = GetPathTokens(mat.m_Name);
+                int score = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count() * 10;
+                
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestMat = mat;
+                }
+            }
+        }
+        
+        return bestMat;
+    }
+
     private void BuildMeshToMaterialsCache()
     {
-        meshToMaterialsCache = new Dictionary<Mesh, List<Material>>();
+        meshToMaterialsCache = new Dictionary<Mesh, List<Material?>>();
         allMaterialsCache = new List<Material>();
+        objectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>();
+
+        foreach (var item in exportableAssets)
+        {
+            if (item.Asset != null)
+            {
+                objectToAssetItemCache[item.Asset] = item;
+            }
+        }
 
         AssetStudio.Object? ResolveObject(long pathID)
         {
@@ -5347,24 +5444,21 @@ public partial class MainWindow : Window
 
                     if (smrMesh != null && smr.m_Materials != null)
                     {
-                        if (!meshToMaterialsCache.TryGetValue(smrMesh, out var list))
+                        if (!meshToMaterialsCache.ContainsKey(smrMesh))
                         {
-                            list = new List<Material>();
+                            var list = new List<Material?>();
                             meshToMaterialsCache[smrMesh] = list;
-                        }
-                        foreach (var matPtr in smr.m_Materials)
-                        {
-                            Material? resolvedMat = null;
-                            if (matPtr.TryGet(out var mt))
+                            foreach (var matPtr in smr.m_Materials)
                             {
-                                resolvedMat = mt;
-                            }
-                            else
-                            {
-                                resolvedMat = ResolveObject(matPtr.m_PathID) as Material;
-                            }
-                            if (resolvedMat != null)
-                            {
+                                Material? resolvedMat = null;
+                                if (matPtr.TryGet(out var mt))
+                                {
+                                    resolvedMat = mt;
+                                }
+                                else
+                                {
+                                    resolvedMat = ResolveMaterial(matPtr.m_PathID, smrMesh.m_Name);
+                                }
                                 list.Add(resolvedMat);
                             }
                         }
@@ -5410,24 +5504,21 @@ public partial class MainWindow : Window
 
                                 if (mfMesh != null && mr.m_Materials != null)
                                 {
-                                    if (!meshToMaterialsCache.TryGetValue(mfMesh, out var list))
+                                    if (!meshToMaterialsCache.ContainsKey(mfMesh))
                                     {
-                                        list = new List<Material>();
+                                        var list = new List<Material?>();
                                         meshToMaterialsCache[mfMesh] = list;
-                                    }
-                                    foreach (var matPtr in mr.m_Materials)
-                                    {
-                                        Material? resolvedMat = null;
-                                        if (matPtr.TryGet(out var mt))
+                                        foreach (var matPtr in mr.m_Materials)
                                         {
-                                            resolvedMat = mt;
-                                        }
-                                        else
-                                        {
-                                            resolvedMat = ResolveObject(matPtr.m_PathID) as Material;
-                                        }
-                                        if (resolvedMat != null)
-                                        {
+                                            Material? resolvedMat = null;
+                                            if (matPtr.TryGet(out var mt))
+                                            {
+                                                resolvedMat = mt;
+                                            }
+                                            else
+                                            {
+                                                resolvedMat = ResolveMaterial(matPtr.m_PathID, mfMesh.m_Name);
+                                            }
                                             list.Add(resolvedMat);
                                         }
                                     }
@@ -5438,29 +5529,24 @@ public partial class MainWindow : Window
                 }
             }
         }
-
-        foreach (var key in meshToMaterialsCache.Keys.ToList())
-        {
-            meshToMaterialsCache[key] = meshToMaterialsCache[key].Distinct().ToList();
-        }
     }
 
-    private List<Material> FindMaterialsForMesh(Mesh mesh)
+    private List<Material?> FindMaterialsForMesh(Mesh mesh)
     {
         if (meshToMaterialsCache == null || allMaterialsCache == null)
         {
             BuildMeshToMaterialsCache();
         }
 
-        var materials = new List<Material>();
+        var materials = new List<Material?>();
         if (meshToMaterialsCache!.TryGetValue(mesh, out var cachedList))
         {
             materials.AddRange(cachedList);
         }
 
-        if (materials.Count == 0 || (materials.Count == 1 && (materials[0].m_Name.StartsWith("Material") || materials[0].m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))))
+        if (materials.Count == 0 || (materials.Count == 1 && (materials[0] == null || materials[0]!.m_Name.StartsWith("Material") || materials[0]!.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))))
         {
-            var meshItem = exportableAssets.FirstOrDefault(x => x.Asset == mesh);
+            var meshItem = objectToAssetItemCache!.GetValueOrDefault(mesh);
             var meshContainer = meshItem?.Container;
             var meshTokens = GetPathTokens(!string.IsNullOrEmpty(meshContainer) ? meshContainer : mesh.m_Name);
 
@@ -5472,7 +5558,7 @@ public partial class MainWindow : Window
                 if (mat.m_Name.StartsWith("Material") || mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                var matItem = exportableAssets.FirstOrDefault(x => x.Asset == mat);
+                var matItem = objectToAssetItemCache!.GetValueOrDefault(mat);
                 var matContainer = matItem?.Container;
                 var matTokens = GetPathTokens(!string.IsNullOrEmpty(matContainer) ? matContainer : mat.m_Name);
 
@@ -5542,7 +5628,7 @@ public partial class MainWindow : Window
             }
         }
 
-        return materials.Distinct().ToList();
+        return materials;
     }
 
     private static HashSet<string> GetPathTokens(string path)
@@ -6287,6 +6373,7 @@ public class AssetItem
     public string DisplayType => GetDisplayType();
     public string UniqueID { get; set; } = string.Empty;
     public long PathID { get; set; }
+    public string PathIDString { get; set; } = string.Empty;
     public long Size { get; set; }
     public long FullSize { get; set; }
     public ClassIDType Type { get; set; }
@@ -6298,6 +6385,7 @@ public class AssetItem
         TypeString = asset.type.ToString();
         Type = asset.type;
         PathID = asset.m_PathID;
+        PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
         Size = asset.byteSize;
         FullSize = asset.byteSize;
     }

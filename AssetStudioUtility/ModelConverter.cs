@@ -1439,16 +1439,19 @@ namespace AssetStudio
 
         private string GetPathFromHash(uint hash)
         {
-            bonePathHash.TryGetValue(hash, out var boneName);
-            if (string.IsNullOrEmpty(boneName))
+            if (bonePathHash.TryGetValue(hash, out var boneName))
             {
-                boneName = avatar?.FindBonePath(hash);
+                return boneName;
             }
-            if (string.IsNullOrEmpty(boneName))
+            if (avatar != null)
             {
-                boneName = "unknown " + hash;
+                boneName = avatar.FindBonePath(hash);
+                if (boneName != null)
+                {
+                    return boneName;
+                }
             }
-            return boneName;
+            return $"Bone_{hash}";
         }
 
         private void CreateBonePathHash(Transform m_Transform)
@@ -1478,44 +1481,235 @@ namespace AssetStudio
         {
             if (avatar == null)
                 throw new Exception("Transform hierarchy has been optimized, but can't find Avatar to deoptimize.");
-            // 1. Figure out the skeletonPaths from the unstripped avatar
-            var skeletonPaths = new List<string>();
-            foreach (var id in avatar.m_Avatar.m_AvatarSkeleton.m_ID)
+
+            var skeleton = avatar.m_Avatar.m_AvatarSkeleton;
+            var skeletonPose = avatar.m_Avatar.m_DefaultPose;
+            var nodes = skeleton.m_Node;
+
+            if (nodes == null || skeletonPose == null || skeletonPose.m_X == null)
+                return;
+
+            Mesh avatarMesh = null;
+            int bestScore = 0;
+            var avatarName = avatar.m_Name.Replace("Avatar", "").Trim();
+            var allMeshes = new List<Mesh>();
+            if (avatar.assetsFile?.assetsManager != null)
             {
-                var path = avatar.FindBonePath(id);
-                skeletonPaths.Add(path);
-            }
-            // 2. Restore the original transform hierarchy
-            // Prerequisite: skeletonPaths follow pre-order traversal
-            for (var i = 1; i < skeletonPaths.Count; i++) // start from 1, skip the root transform because it will always be there.
-            {
-                var path = skeletonPaths[i];
-                var strs = path.Split('/');
-                string transformName;
-                ImportedFrame parentFrame;
-                if (strs.Length == 1)
+                foreach (var f in avatar.assetsFile.assetsManager.assetsFileList)
                 {
-                    transformName = path;
-                    parentFrame = RootFrame;
+                    foreach (var obj in f.Objects)
+                    {
+                        if (obj is Mesh m && m.m_VertexCount > 0)
+                        {
+                            allMeshes.Add(m);
+                        }
+                    }
+                }
+            }
+
+            foreach (var mesh in allMeshes)
+            {
+                int score = 0;
+                if (mesh.assetsFile == avatar.assetsFile) score += 20;
+
+                if (mesh.m_BoneNameHashes != null && mesh.m_BoneNameHashes.Length > 0
+                    && mesh.m_BindPose != null && mesh.m_BindPose.Length > 0)
+                {
+                    score += mesh.m_BoneNameHashes.Length;
+                }
+
+                if (!string.IsNullOrEmpty(avatarName) && mesh.m_Name.IndexOf(avatarName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    score += 15;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    avatarMesh = mesh;
+                }
+            }
+
+            var skelCount = nodes.Length;
+            var skelIds = skeleton.m_ID;
+            
+            var skelNodeToMeshBone = new int[skelCount];
+            for (int i = 0; i < skelCount; i++) skelNodeToMeshBone[i] = -1;
+            
+            var meshBoneToSkelNode = new int[0];
+            var meshParentIndices = new int[0];
+            System.Numerics.Matrix4x4[] bindPoseInverses = null;
+            System.Numerics.Matrix4x4[] bindPoses = null;
+            bool hasBindPose = false;
+
+            System.Numerics.Matrix4x4 ToSystem(Matrix4x4 m)
+            {
+                return new System.Numerics.Matrix4x4(
+                    m.M00, m.M01, m.M02, m.M03,
+                    m.M10, m.M11, m.M12, m.M13,
+                    m.M20, m.M21, m.M22, m.M23,
+                    m.M30, m.M31, m.M32, m.M33
+                );
+            }
+
+            Vector3 ToAssetStudioVec(System.Numerics.Vector3 v)
+            {
+                return new Vector3(v.X, v.Y, v.Z);
+            }
+
+            Quaternion ToAssetStudioQuat(System.Numerics.Quaternion q)
+            {
+                return new Quaternion(q.X, q.Y, q.Z, q.W);
+            }
+
+            if (avatarMesh != null && avatarMesh.m_BoneNameHashes != null && avatarMesh.m_BindPose != null)
+            {
+                var meshBoneCount = avatarMesh.m_BoneNameHashes.Length;
+                var meshBoneHashToIdx = new Dictionary<uint, int>();
+                for (int j = 0; j < meshBoneCount; j++)
+                {
+                    meshBoneHashToIdx[avatarMesh.m_BoneNameHashes[j]] = j;
+                }
+
+                for (int i = 0; i < skelCount; i++)
+                {
+                    if (skelIds != null && i < skelIds.Length)
+                    {
+                        if (meshBoneHashToIdx.TryGetValue(skelIds[i], out int mbIdx))
+                        {
+                            skelNodeToMeshBone[i] = mbIdx;
+                        }
+                    }
+                }
+
+                meshBoneToSkelNode = new int[meshBoneCount];
+                for (int j = 0; j < meshBoneCount; j++) meshBoneToSkelNode[j] = -1;
+                for (int i = 0; i < skelCount; i++)
+                {
+                    if (skelNodeToMeshBone[i] >= 0)
+                    {
+                        meshBoneToSkelNode[skelNodeToMeshBone[i]] = i;
+                    }
+                }
+
+                meshParentIndices = new int[meshBoneCount];
+                for (int mb = 0; mb < meshBoneCount; mb++)
+                {
+                    meshParentIndices[mb] = -1;
+                    int skelIdx = meshBoneToSkelNode[mb];
+                    if (skelIdx < 0) continue;
+
+                    int current = nodes[skelIdx].m_ParentId;
+                    while (current >= 0 && current < skelCount)
+                    {
+                        if (skelNodeToMeshBone[current] >= 0)
+                        {
+                            meshParentIndices[mb] = skelNodeToMeshBone[current];
+                            break;
+                        }
+                        current = nodes[current].m_ParentId;
+                    }
+                }
+
+                bindPoseInverses = new System.Numerics.Matrix4x4[meshBoneCount];
+                bindPoses = new System.Numerics.Matrix4x4[meshBoneCount];
+                hasBindPose = true;
+                for (int j = 0; j < meshBoneCount; j++)
+                {
+                    var bp = ToSystem(avatarMesh.m_BindPose[j]);
+                    bindPoseInverses[j] = bp;
+                    if (System.Numerics.Matrix4x4.Invert(bp, out var inv))
+                    {
+                        bindPoses[j] = inv;
+                    }
+                    else
+                    {
+                        bindPoses[j] = System.Numerics.Matrix4x4.Identity;
+                    }
+                }
+            }
+
+            var frames = new ImportedFrame[nodes.Length];
+
+            // 1. Create all frames
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                var xform = skeletonPose.m_X[i];
+                var name = avatar.FindBonePath(skeleton.m_ID[i]);
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = $"Bone_{skeleton.m_ID[i]}";
                 }
                 else
                 {
-                    transformName = strs.Last();
-                    var parentFramePath = path.Substring(0, path.LastIndexOf('/'));
-                    parentFrame = RootFrame.FindRelativeFrameWithPath(parentFramePath);
+                    var lastSlash = name.LastIndexOf('/');
+                    if (lastSlash >= 0)
+                        name = name.Substring(lastSlash + 1);
                 }
-                var skeletonPose = avatar.m_Avatar.m_DefaultPose;
-                var xform = skeletonPose.m_X[i];
-                var frame = RootFrame.FindChild(transformName);
+
+                Vector3 tVec;
+                Quaternion qQuat;
+                Vector3 sVec;
+
+                int mb = skelNodeToMeshBone[i];
+                if (hasBindPose && mb >= 0)
+                {
+                    int pMb = meshParentIndices[mb];
+                    System.Numerics.Matrix4x4 localMat = pMb >= 0 ? bindPoses[mb] * bindPoseInverses[pMb] : bindPoses[mb];
+                    if (System.Numerics.Matrix4x4.Decompose(localMat, out var s, out var q, out var t))
+                    {
+                        tVec = ToAssetStudioVec(t);
+                        qQuat = ToAssetStudioQuat(q);
+                        sVec = ToAssetStudioVec(s);
+                    }
+                    else
+                    {
+                        tVec = xform.t;
+                        qQuat = xform.q;
+                        sVec = xform.s;
+                    }
+                }
+                else
+                {
+                    tVec = xform.t;
+                    qQuat = xform.q;
+                    sVec = xform.s;
+                }
+
+                var frame = RootFrame.FindChild(name);
                 if (frame != null)
                 {
-                    SetFrame(frame, xform.t, xform.q, xform.s);
+                    SetFrame(frame, tVec, qQuat, sVec);
                 }
                 else
                 {
-                    frame = CreateFrame(transformName, xform.t, xform.q, xform.s);
+                    frame = CreateFrame(name, tVec, qQuat, sVec);
                 }
-                parentFrame.AddChild(frame);
+                frames[i] = frame;
+            }
+
+            // 2. Build hierarchy using m_ParentId
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                var parentId = nodes[i].m_ParentId;
+                ImportedFrame parentFrame = null;
+                
+                if (parentId >= 0 && parentId < frames.Length)
+                {
+                    parentFrame = frames[parentId];
+                }
+                else
+                {
+                    parentFrame = RootFrame;
+                }
+
+                if (frames[i].Parent == null)
+                {
+                    parentFrame.AddChild(frames[i]);
+                }
+            }
+
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                bonePathHash[skeleton.m_ID[i]] = frames[i].Path;
             }
         }
 
