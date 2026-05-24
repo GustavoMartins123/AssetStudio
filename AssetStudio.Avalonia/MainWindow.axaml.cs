@@ -22,8 +22,6 @@ using System.Threading.Tasks;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
-using SixLabors.Fonts;
-using SixLabors.ImageSharp.Drawing.Processing;
 
 namespace AssetStudio.Avalonia;
 
@@ -1356,6 +1354,8 @@ public partial class MainWindow : Window
         }
 
         TextPreviewBox.IsVisible = false;
+        TextPreviewBox.FontFamily = global::Avalonia.Media.FontFamily.Default;
+        TextPreviewBox.FontSize = 14;
         if (ImagePreviewBox != null)
         {
             ImagePreviewBox.Source = null;
@@ -1418,9 +1418,7 @@ public partial class MainWindow : Window
                 PreviewMaterial(assetItem, m_Material);
                 break;
             case TextAsset m_TextAsset:
-                SetTextWithTruncation(TextPreviewBox, fbxHeader + Encoding.UTF8.GetString(m_TextAsset.m_Script).Replace("\0", string.Empty));
-                TextPreviewBox.IsVisible = true;
-                PreviewLabel.IsVisible = false;
+                PreviewTextAsset(assetItem, m_TextAsset, fbxHeader);
                 break;
             case Shader m_Shader:
                 SetTextWithTruncation(TextPreviewBox, fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read"));
@@ -2687,6 +2685,21 @@ public partial class MainWindow : Window
         UpdateImagePreview();
     }
 
+    private void PreviewTextAsset(AssetItem assetItem, TextAsset m_TextAsset, string fbxHeader)
+    {
+        var data = m_TextAsset.m_Script ?? Array.Empty<byte>();
+        var preview = TextAssetPreviewBuilder.Build(assetItem, data, fbxHeader);
+
+        TextPreviewBox.FontFamily = new global::Avalonia.Media.FontFamily("Consolas, Menlo, DejaVu Sans Mono, monospace");
+        TextPreviewBox.FontSize = 13;
+        SetTextWithTruncation(TextPreviewBox, preview);
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        PreviewInfoBorder.IsVisible = false;
+
+        StatusStripUpdate($"TextAsset preview loaded ({data.Length:N0} bytes).");
+    }
+
     private void PreviewFont(AssetItem assetItem, AssetStudio.Font m_Font)
     {
         if (m_Font.m_FontData == null || m_Font.m_FontData.Length == 0)
@@ -2703,26 +2716,25 @@ public partial class MainWindow : Window
         {
             try
             {
-                var tempFile = Path.Combine(Path.GetTempPath(), $"AssetStudioFont_{Guid.NewGuid():N}.ttf");
-                File.WriteAllBytes(tempFile, m_Font.m_FontData);
+                var fontPreview = FontAssetPreviewRenderer.Render(m_Font.m_Name, m_Font.m_FontData);
 
                 Dispatcher.UIThread.Post(() =>
                 {
                     if (currentId == texturePreviewIdCounter)
                     {
-                        var family = new global::Avalonia.Media.FontFamily($"file://{tempFile}");
-                        var sampleText = $"Font: {m_Font.m_Name}\n\n" +
-                                         $"Size 24: abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789\n\n" +
-                                         $"Size 48: Pack My Box With Five Dozen Liquor Jugs";
-
-                        TextPreviewBox.Text = sampleText;
-                        TextPreviewBox.FontFamily = family;
-                        TextPreviewBox.FontSize = 24;
-
-                        ImagePreviewBox.IsVisible = false;
-                        TextPreviewBox.IsVisible = true;
+                        ImagePreviewBox.Source = fontPreview.Bitmap;
+                        ImagePreviewBox.IsVisible = true;
+                        TextPreviewBox.IsVisible = false;
                         PreviewLabel.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
+                        if (displayInfo.IsChecked == true && PreviewInfoOverlay != null && PreviewInfoBorder != null)
+                        {
+                            PreviewInfoOverlay.Text = fontPreview.InfoText;
+                            PreviewInfoBorder.IsVisible = true;
+                        }
+                        else if (PreviewInfoBorder != null)
+                        {
+                            PreviewInfoBorder.IsVisible = false;
+                        }
                         StatusStripUpdate($"Font loaded: {m_Font.m_Name}");
                     }
                 });
@@ -2733,9 +2745,12 @@ public partial class MainWindow : Window
                 {
                     if (currentId == texturePreviewIdCounter)
                     {
-                        StatusStripUpdate($"Error rendering font preview: {ex.Message}");
+                        SetTextWithTruncation(TextPreviewBox, FontAssetPreviewRenderer.BuildFallbackText(m_Font, ex.Message));
                         ImagePreviewBox.IsVisible = false;
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
                         PreviewInfoBorder.IsVisible = false;
+                        StatusStripUpdate($"Unsupported font preview: {ex.Message}");
                     }
                 });
             }
