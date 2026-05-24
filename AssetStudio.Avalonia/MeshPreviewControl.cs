@@ -216,6 +216,19 @@ void main()
         private Matrix4 modelMatrixData = Matrix4.Identity;
         private Matrix4 viewMatrixData = Matrix4.Identity;
         private Matrix4 projMatrixData = Matrix4.Identity;
+        private Matrix4 initialViewMatrix = Matrix4.Identity;
+        private Matrix4 initialModelMatrix = Matrix4.Identity;
+        private float boneScale = 1.0f;
+
+        public float BoneScale
+        {
+            get => boneScale;
+            set
+            {
+                boneScale = value;
+                RequestNextFrameRendering();
+            }
+        }
 
         // Mode flags
         private int wireFrameMode = 0;
@@ -580,6 +593,8 @@ void main()
                     viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
                     vertexData = localVertexData;
                     modelMatrixData = localModelMatrixData;
+                    initialViewMatrix = viewMatrixData;
+                    initialModelMatrix = modelMatrixData;
                     indiceData = localIndiceData;
                     normalData = localNormalData;
                     normal2Data = localNormal2Data;
@@ -677,6 +692,8 @@ void main()
 
             viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
             modelMatrixData = Matrix4.CreateScale(0.8f);
+            initialViewMatrix = viewMatrixData;
+            initialModelMatrix = modelMatrixData;
         }
 
         protected override void OnOpenGlInit(GlInterface gl)
@@ -985,7 +1002,7 @@ void main()
 
                         if (boneLinesVertexCount > 0)
                         {
-                            GL.LineWidth(3.0f);
+                            GL.LineWidth(3.0f * boneScale);
                             GL.UseProgram(pgmYellowID);
                             GL.UniformMatrix4(uniformModelMatrixYellow, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixYellow, false, ref viewMatrixData);
@@ -995,7 +1012,7 @@ void main()
 
                         if (jointPointsVertexCount > 0)
                         {
-                            GL.PointSize(12.0f);
+                            GL.PointSize(12.0f * boneScale);
                             GL.UseProgram(pgmRedID);
                             GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
@@ -1027,14 +1044,15 @@ void main()
                         GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
                     }
 
-                    if (previewMaterialMode && previewTextureIds != null && currentMesh != null && currentMesh.m_SubMeshes != null && currentMesh.m_SubMeshes.Length > 0 && !isAvatarMode)
+                    var localTextureIds = previewTextureIds;
+                    if (previewMaterialMode && localTextureIds != null && currentMesh != null && currentMesh.m_SubMeshes != null && currentMesh.m_SubMeshes.Length > 0 && !isAvatarMode)
                     {
                         int flatOffsetElements = 0;
                         for (int i = 0; i < currentMesh.m_SubMeshes.Length; i++)
                         {
                             var subMesh = currentMesh.m_SubMeshes[i];
-                            int texIndex = i < previewTextureIds.Length ? i : 0;
-                            int texId = previewTextureIds != null && texIndex < previewTextureIds.Length ? previewTextureIds[texIndex] : 0;
+                            int texIndex = i < localTextureIds.Length ? i : 0;
+                            int texId = texIndex < localTextureIds.Length ? localTextureIds[texIndex] : 0;
 
                             if (texId != 0)
                             {
@@ -1070,11 +1088,11 @@ void main()
                     }
                     else
                     {
-                        if (previewMaterialMode && previewTextureIds != null && previewTextureIds.Length > 0 && previewTextureIds[0] != 0)
+                        if (previewMaterialMode && localTextureIds != null && localTextureIds.Length > 0 && localTextureIds[0] != 0)
                         {
                             GL.UseProgram(pgmTexID);
                             GL.ActiveTexture(TextureUnit.Texture0);
-                            GL.BindTexture(TextureTarget.Texture2D, previewTextureIds[0]);
+                            GL.BindTexture(TextureTarget.Texture2D, localTextureIds[0]);
                             GL.Uniform1(uniformTexture, 0);
                             GL.UniformMatrix4(uniformModelMatrixTex, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixTex, false, ref viewMatrixData);
@@ -1412,25 +1430,35 @@ void main()
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
-            if (isAvatarMode)
+            var isCtrl = (e.KeyModifiers & KeyModifiers.Control) != 0;
+            if (!isCtrl)
             {
                 if (e.Key == Key.Left || e.Key == Key.A)
                 {
-                    viewMatrixData *= Matrix4.CreateRotationY((float)(Math.PI / 2));
-                    RequestNextFrameRendering();
+                    RotateLeft90();
                     e.Handled = true;
                     return;
                 }
                 else if (e.Key == Key.Right || e.Key == Key.D)
                 {
-                    viewMatrixData *= Matrix4.CreateRotationY((float)(-Math.PI / 2));
-                    RequestNextFrameRendering();
+                    RotateRight90();
+                    e.Handled = true;
+                    return;
+                }
+                else if (e.Key == Key.Up || e.Key == Key.W)
+                {
+                    RotateUp90();
+                    e.Handled = true;
+                    return;
+                }
+                else if (e.Key == Key.Down || e.Key == Key.S)
+                {
+                    RotateDown90();
                     e.Handled = true;
                     return;
                 }
             }
             base.OnKeyDown(e);
-            var isCtrl = (e.KeyModifiers & KeyModifiers.Control) != 0;
             if (isCtrl)
             {
                 if (e.Key == Key.W)
@@ -1601,6 +1629,8 @@ void main()
                     viewMatrixData = CreateAvatarInitialViewMatrix(avatarBonePositions, boneNames);
                     vertexData = localVertexData;
                     modelMatrixData = localModelMatrixData;
+                    initialViewMatrix = viewMatrixData;
+                    initialModelMatrix = modelMatrixData;
                     indiceData = localIndiceData;
                     normalData = null;
                     normal2Data = null;
@@ -1748,6 +1778,8 @@ void main()
                     viewMatrixData = CreateAvatarInitialViewMatrix(frames[0], boneNames);
                     vertexData = localVertexData;
                     modelMatrixData = localModelMatrixData;
+                    initialViewMatrix = viewMatrixData;
+                    initialModelMatrix = modelMatrixData;
                     indiceData = localIndiceData;
                     normalData = null;
                     normal2Data = null;
@@ -1779,6 +1811,37 @@ void main()
         }
 
         public bool IsPlaying => isAnimPlaying;
+
+        public void ResetView()
+        {
+            viewMatrixData = initialViewMatrix;
+            modelMatrixData = initialModelMatrix;
+            RequestNextFrameRendering();
+        }
+
+        public void RotateLeft90()
+        {
+            viewMatrixData *= Matrix4.CreateRotationY((float)(Math.PI / 2));
+            RequestNextFrameRendering();
+        }
+
+        public void RotateRight90()
+        {
+            viewMatrixData *= Matrix4.CreateRotationY((float)(-Math.PI / 2));
+            RequestNextFrameRendering();
+        }
+
+        public void RotateUp90()
+        {
+            viewMatrixData *= Matrix4.CreateRotationX((float)(Math.PI / 2));
+            RequestNextFrameRendering();
+        }
+
+        public void RotateDown90()
+        {
+            viewMatrixData *= Matrix4.CreateRotationX((float)(-Math.PI / 2));
+            RequestNextFrameRendering();
+        }
 
         public void PlayAnimation()
         {

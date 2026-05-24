@@ -213,6 +213,7 @@ public partial class MainWindow : Window
         DumpTextBox.Text = string.Empty;
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
+        ClearTextAssetPreview();
         classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
@@ -235,6 +236,7 @@ public partial class MainWindow : Window
         TextPreviewBox.IsVisible = false;
         TextPreviewBox.FontFamily = global::Avalonia.Media.FontFamily.Default;
         TextPreviewBox.FontSize = 14;
+        ClearTextAssetPreview();
         if (ImagePreviewBox != null)
         {
             ImagePreviewBox.Source = null;
@@ -244,6 +246,19 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.StopAnimation();
             GLPreviewControl.IsVisible = false;
+            GLPreviewControl.BoneScale = 1.0f;
+        }
+        if (BoneSizeSlider != null)
+        {
+            BoneSizeSlider.Value = 1.0;
+        }
+        if (BoneSizeLabel != null)
+        {
+            BoneSizeLabel.Text = "1.0x";
+        }
+        if (BoneSizeContainer != null)
+        {
+            BoneSizeContainer.IsVisible = false;
         }
         if (AnimationPlaybackPanel != null)
         {
@@ -479,7 +494,7 @@ public partial class MainWindow : Window
             PreviewLabel.Text = displayInfo.IsChecked == true
                 ? $"{selected.TypeString}: {selected.Name}"
                 : string.Empty;
-            PreviewLabel.IsVisible = displayInfo.IsChecked == true && !TextPreviewBox.IsVisible && (ImagePreviewBox == null || !ImagePreviewBox.IsVisible);
+            PreviewLabel.IsVisible = displayInfo.IsChecked == true && !TextPreviewBox.IsVisible && !TextAssetPreviewPanel.IsVisible && (ImagePreviewBox == null || !ImagePreviewBox.IsVisible);
             if (PreviewInfoBorder != null)
             {
                 PreviewInfoBorder.IsVisible = displayInfo.IsChecked == true && (currentPreviewTexture != null || currentPreviewSprite != null);
@@ -692,6 +707,7 @@ public partial class MainWindow : Window
     private void ShowAssetClassPreview(AssetClassItem item)
     {
         RightTabControl.SelectedIndex = 0;
+        ClearTextAssetPreview();
         TextPreviewBox.Text = FormatAssetClass(item);
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
@@ -1356,6 +1372,7 @@ public partial class MainWindow : Window
         TextPreviewBox.IsVisible = false;
         TextPreviewBox.FontFamily = global::Avalonia.Media.FontFamily.Default;
         TextPreviewBox.FontSize = 14;
+        ClearTextAssetPreview();
         if (ImagePreviewBox != null)
         {
             ImagePreviewBox.Source = null;
@@ -1542,6 +1559,10 @@ public partial class MainWindow : Window
 
                     GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                     GLPreviewControl.IsVisible = true;
+                    if (BoneSizeContainer != null)
+                    {
+                        BoneSizeContainer.IsVisible = false;
+                    }
                     GLPreviewControl.Focus();
                 }
                 if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
@@ -2202,6 +2223,10 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.SetAvatar(avatarMesh, bonePositions, parentIndices, boneNames);
             GLPreviewControl.IsVisible = true;
+            if (BoneSizeContainer != null)
+            {
+                BoneSizeContainer.IsVisible = true;
+            }
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
@@ -2492,6 +2517,10 @@ public partial class MainWindow : Window
             {
                 GLPreviewControl.SetAvatar(avatarMesh, restBonePositions, meshParentIndices, meshBoneNames);
                 GLPreviewControl.IsVisible = true;
+                if (BoneSizeContainer != null)
+                {
+                    BoneSizeContainer.IsVisible = true;
+                }
                 GLPreviewControl.Focus();
                 TextPreviewBox.IsVisible = false;
                 PreviewLabel.IsVisible = false;
@@ -2624,6 +2653,10 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.SetAnimatedAvatar(avatarMesh, allFrames, allBoneMatrices, meshParentIndices, sampleRate, meshBoneNames);
             GLPreviewControl.IsVisible = true;
+            if (BoneSizeContainer != null)
+            {
+                BoneSizeContainer.IsVisible = true;
+            }
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
@@ -2688,11 +2721,17 @@ public partial class MainWindow : Window
     private void PreviewTextAsset(AssetItem assetItem, TextAsset m_TextAsset, string fbxHeader)
     {
         var data = m_TextAsset.m_Script ?? Array.Empty<byte>();
-        var preview = TextAssetPreviewBuilder.Build(assetItem, data, fbxHeader);
+        var preview = TextAssetPreviewBuilder.BuildPreview(assetItem, data, fbxHeader);
+        if (preview.HasDialogueCards)
+        {
+            ShowTextAssetDialoguePreview(assetItem, preview);
+            StatusStripUpdate($"TextAsset dialogue preview loaded ({preview.DialogueCards.Count:N0} cards, {data.Length:N0} bytes).");
+            return;
+        }
 
         TextPreviewBox.FontFamily = new global::Avalonia.Media.FontFamily("Consolas, Menlo, DejaVu Sans Mono, monospace");
         TextPreviewBox.FontSize = 13;
-        SetTextWithTruncation(TextPreviewBox, preview);
+        SetTextWithTruncation(TextPreviewBox, preview.DetailsText);
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
         PreviewInfoBorder.IsVisible = false;
@@ -2900,6 +2939,10 @@ public partial class MainWindow : Window
                             {
                                 GLPreviewControl.SetMaterialTexture(image);
                                 GLPreviewControl.IsVisible = true;
+                                if (BoneSizeContainer != null)
+                                {
+                                    BoneSizeContainer.IsVisible = false;
+                                }
                                 GLPreviewControl.Focus();
                             }
                             else
