@@ -6,7 +6,7 @@ using System.Text;
 
 namespace AssetStudio.Avalonia;
 
-internal static class TextAssetPreviewBuilder
+public static class TextAssetPreviewBuilder
 {
     private const int DecodeByteLimit = 1024 * 1024;
     private const int HexPreviewBytes = 4096;
@@ -64,7 +64,7 @@ internal static class TextAssetPreviewBuilder
             }
         }
 
-        sb.AppendLine($"TextAsset: {assetItem.Name}");
+        sb.AppendLine($"TextAsset: {assetItem?.Name ?? "Unknown"}");
         sb.AppendLine($"Bytes: {data.Length:N0}");
         sb.AppendLine($"UTF-8 sample: {(strictUtf8 ? "valid" : "contains invalid byte sequences")}");
         sb.AppendLine($"Binary markers: {nullBytes:N0} NUL bytes, {controlBytes:N0} control bytes, {highBitBytes:N0} bytes >= 0x80");
@@ -104,7 +104,8 @@ internal static class TextAssetPreviewBuilder
             sb.ToString(),
             "Generic TextAsset",
             0,
-            Array.Empty<TextAssetDialogueCard>());
+            Array.Empty<TextAssetDialogueCard>(),
+            sb.ToString());
     }
 
     private static TextAssetPreviewResult BuildPlainTextPreview(byte[] data, string fbxHeader, string decoded, int decodeBytes)
@@ -126,7 +127,8 @@ internal static class TextAssetPreviewBuilder
             sb.ToString(),
             "UTF-8 text",
             0,
-            Array.Empty<TextAssetDialogueCard>());
+            Array.Empty<TextAssetDialogueCard>(),
+            sb.ToString());
     }
 
     private static TextAssetPreviewResult BuildAmmoEpisodePreview(
@@ -165,7 +167,7 @@ internal static class TextAssetPreviewBuilder
 
         var commandStream = DecodeAmmoCommandStream(data, stringTable);
 
-        sb.AppendLine($"TextAsset: {assetItem.Name}");
+        sb.AppendLine($"TextAsset: {assetItem?.Name ?? "Unknown"}");
         sb.AppendLine($"Bytes: {data.Length:N0}");
         sb.AppendLine("Detected format: Ammo episode binary strings (0x0C + UInt16LE length + UTF-8)");
         sb.AppendLine($"String table: {stringTable.DeclaredCount:N0} declared, {strings.Count(entry => !entry.IsEmpty):N0} non-empty");
@@ -235,6 +237,13 @@ internal static class TextAssetPreviewBuilder
             AppendDecodedCommandStream(sb, commandStream);
             sb.AppendLine();
         }
+        else
+        {
+            sb.AppendLine("Decoded command stream:");
+            sb.AppendLine("------------------------------------------------------------");
+            sb.AppendLine($"Error status: {commandStream.Status}");
+            sb.AppendLine();
+        }
 
         sb.AppendLine($"String table order (first {Math.Min(strings.Count, MaxAmmoStringTableEntries):N0} of {strings.Count:N0}):");
         for (int i = 0; i < strings.Count && i < MaxAmmoStringTableEntries; i++)
@@ -252,11 +261,149 @@ internal static class TextAssetPreviewBuilder
         var cards = commandCards.Count > 0
             ? commandCards
             : BuildAmmoDialogueCards(strings, dialogueIndexes);
+
+        var plainTextSb = new StringBuilder();
+        plainTextSb.AppendLine("=== DIALOGUE SCRIPT ===");
+        plainTextSb.AppendLine();
+
+        int dialogueCount = 0;
+        var recentTexts = new Queue<string>();
+
+        if (commandCards.Count > 0)
+        {
+            foreach (var card in commandCards)
+            {
+                string cleanTextForCompare = card.Text.Trim();
+                if (recentTexts.Contains(cleanTextForCompare))
+                {
+                    continue;
+                }
+                recentTexts.Enqueue(cleanTextForCompare);
+                if (recentTexts.Count > 4)
+                {
+                    recentTexts.Dequeue();
+                }
+
+                if (card.Label.EndsWith(".Memo", StringComparison.OrdinalIgnoreCase))
+                {
+                    plainTextSb.AppendLine(card.Text);
+                }
+                else if (!string.IsNullOrEmpty(card.Speaker))
+                {
+                    plainTextSb.AppendLine($"{card.Speaker}: {card.Text}");
+                }
+                else
+                {
+                    plainTextSb.AppendLine(card.Text);
+                }
+                dialogueCount++;
+            }
+        }
+        else
+        {
+            foreach (var index in dialogueIndexes)
+            {
+                var entry = strings[index];
+                var label = FindNearbyLabel(strings, index);
+                if (IsLikelySpeakerString(entry.Text, label))
+                {
+                    continue;
+                }
+
+                if (entry.Text.Contains("\"Messages\"", StringComparison.Ordinal))
+                {
+                    var msgs = ExtractMessagesFromJson(entry.Text);
+                    var speaker = FindNearbySpeaker(strings, index);
+                    foreach (var msg in msgs)
+                    {
+                        var cleanText = NormalizeDialogueText(msg);
+                        if (string.IsNullOrWhiteSpace(cleanText))
+                        {
+                            continue;
+                        }
+
+                        if (recentTexts.Contains(cleanText))
+                        {
+                            continue;
+                        }
+                        recentTexts.Enqueue(cleanText);
+                        if (recentTexts.Count > 4)
+                        {
+                            recentTexts.Dequeue();
+                        }
+
+                        if (!string.IsNullOrEmpty(speaker))
+                        {
+                            plainTextSb.AppendLine($"{speaker}: {cleanText}");
+                        }
+                        else
+                        {
+                            plainTextSb.AppendLine(cleanText);
+                        }
+                        dialogueCount++;
+                    }
+                    continue;
+                }
+
+                var cleanTextRaw = NormalizeDialogueText(entry.Text);
+                if (string.IsNullOrWhiteSpace(cleanTextRaw))
+                {
+                    continue;
+                }
+
+                if (recentTexts.Contains(cleanTextRaw))
+                {
+                    continue;
+                }
+                recentTexts.Enqueue(cleanTextRaw);
+                if (recentTexts.Count > 4)
+                {
+                    recentTexts.Dequeue();
+                }
+
+                var speakerRaw = FindNearbySpeaker(strings, index);
+                if (!string.IsNullOrEmpty(speakerRaw))
+                {
+                    plainTextSb.AppendLine($"{speakerRaw}: {cleanTextRaw}");
+                }
+                else
+                {
+                    plainTextSb.AppendLine(cleanTextRaw);
+                }
+                dialogueCount++;
+            }
+        }
+
+        if (dialogueCount == 0)
+        {
+            plainTextSb.AppendLine("(No dialogues found)");
+        }
+
+        plainTextSb.AppendLine();
+        plainTextSb.AppendLine("============================================================");
+        plainTextSb.AppendLine($"=== ALL STRINGS ({strings.Count}) ===");
+        plainTextSb.AppendLine("============================================================");
+        plainTextSb.AppendLine();
+
+        for (int i = 0; i < strings.Count; i++)
+        {
+            var str = strings[i];
+            if (str.IsEmpty)
+            {
+                plainTextSb.AppendLine($"{(i + 1):D3}: <empty>");
+            }
+            else
+            {
+                plainTextSb.AppendLine($"{(i + 1):D3}: {str.Text}");
+            }
+        }
+
         return new TextAssetPreviewResult(
             sb.ToString(),
             commandStream.Commands.Count > 0 ? "Ammo episode command stream" : "Ammo episode binary strings",
             strings.Count(entry => !entry.IsEmpty),
-            cards);
+            cards,
+            plainTextSb.ToString());
     }
 
     private static List<TextAssetDialogueCard> BuildAmmoDialogueCards(
@@ -271,7 +418,23 @@ internal static class TextAssetPreviewBuilder
 
             if (entry.Text.Contains("\"Messages\"", StringComparison.Ordinal))
             {
-                continue;
+                var msgs = ExtractMessagesFromJson(entry.Text);
+                if (msgs.Count > 0)
+                {
+                    var speaker = FindNearbySpeaker(strings, index);
+                    foreach (var msg in msgs)
+                    {
+                        var displayText = NormalizeDialogueText(msg);
+                        cards.Add(new TextAssetDialogueCard(
+                            entry.Offset,
+                            entry.Length,
+                            label,
+                            speaker,
+                            displayText,
+                            GetDialogueKind(label)));
+                    }
+                    continue;
+                }
             }
 
             if (IsLikelySpeakerString(entry.Text, label))
@@ -279,8 +442,8 @@ internal static class TextAssetPreviewBuilder
                 continue;
             }
 
-            var displayText = NormalizeDialogueText(entry.Text);
-            if (string.IsNullOrWhiteSpace(displayText) || !LooksLikeDialogueCardText(entry.Text, label))
+            var displayText2 = NormalizeDialogueText(entry.Text);
+            if (string.IsNullOrWhiteSpace(displayText2) || !LooksLikeDialogueCardText(entry.Text, label))
             {
                 continue;
             }
@@ -290,7 +453,7 @@ internal static class TextAssetPreviewBuilder
                 entry.Length,
                 label,
                 FindNearbySpeaker(strings, index),
-                displayText,
+                displayText2,
                 GetDialogueKind(label)));
         }
 
@@ -336,7 +499,7 @@ internal static class TextAssetPreviewBuilder
                 }
 
                 text = text.Trim();
-                if (!IsCleanAmmoString(text))
+                if (index < 16 && !IsCleanAmmoString(text))
                 {
                     return false;
                 }
@@ -383,7 +546,7 @@ internal static class TextAssetPreviewBuilder
                 }
 
                 text = text.Trim();
-                if (!IsCleanAmmoString(text))
+                if (index < 16 && !IsCleanAmmoString(text))
                 {
                     break;
                 }
@@ -408,6 +571,16 @@ internal static class TextAssetPreviewBuilder
     {
         var commands = new List<AmmoCommandNode>();
         int streamOffset = stringTable.EndOffset;
+        while (streamOffset < data.Length && data[streamOffset] == 0x00)
+        {
+            streamOffset++;
+        }
+
+        if (streamOffset < data.Length && data[streamOffset] == 0x0A)
+        {
+            streamOffset++;
+        }
+
         if (streamOffset + 2 > data.Length)
         {
             return new AmmoCommandStream(streamOffset, 0, commands, "No command count after string table.");
@@ -416,7 +589,7 @@ internal static class TextAssetPreviewBuilder
         int declaredCount = ReadUInt16LittleEndian(data, streamOffset);
         if (declaredCount <= 0 || declaredCount > 4096)
         {
-            return new AmmoCommandStream(streamOffset, declaredCount, commands, "Command count is outside expected range.");
+            return new AmmoCommandStream(streamOffset, declaredCount, commands, $"Command count ({declaredCount}) is outside expected range.");
         }
 
         int offset = streamOffset + 2;
@@ -663,9 +836,29 @@ internal static class TextAssetPreviewBuilder
             foreach (var field in command.Fields)
             {
                 if (field.Value.Kind != AmmoValueKind.String ||
-                    string.IsNullOrWhiteSpace(field.Value.Text) ||
-                    field.Value.Text.Contains("\"Messages\"", StringComparison.Ordinal) ||
-                    !LooksLikeDialogueCardText(field.Value.Text, field.Name))
+                    string.IsNullOrWhiteSpace(field.Value.Text))
+                {
+                    continue;
+                }
+
+                if (field.Value.Text.Contains("\"Messages\"", StringComparison.Ordinal))
+                {
+                    var msgs = ExtractMessagesFromJson(field.Value.Text);
+                    foreach (var msg in msgs)
+                    {
+                        var displayText = NormalizeDialogueText(msg);
+                        cards.Add(new TextAssetDialogueCard(
+                            command.Offset,
+                            field.Value.StringLength,
+                            $"{command.Index.ToString("D3", CultureInfo.InvariantCulture)} {ShortCommandType(command.TypeName)}.{field.Name}",
+                            speaker,
+                            displayText,
+                            "Decoded command"));
+                    }
+                    continue;
+                }
+
+                if (!LooksLikeDialogueCardText(field.Value.Text, field.Name))
                 {
                     continue;
                 }
@@ -990,7 +1183,9 @@ internal static class TextAssetPreviewBuilder
     private static string NormalizeDialogueText(string text)
     {
         return RemoveUnityRichTextTags(text)
-            .Replace("\\n", Environment.NewLine, StringComparison.Ordinal)
+            .Replace("\\n", "\n", StringComparison.Ordinal)
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\n", Environment.NewLine, StringComparison.Ordinal)
             .Trim();
     }
 
@@ -1658,20 +1853,50 @@ internal static class TextAssetPreviewBuilder
 
         return sb.ToString();
     }
+
+    private static List<string> ExtractMessagesFromJson(string text)
+    {
+        var result = new List<string>();
+        try
+        {
+            if (text.Contains("\"Messages\"", StringComparison.Ordinal))
+            {
+                var obj = Newtonsoft.Json.Linq.JObject.Parse(text);
+                if (obj.TryGetValue("Messages", StringComparison.OrdinalIgnoreCase, out var token) && token is Newtonsoft.Json.Linq.JArray array)
+                {
+                    foreach (var item in array)
+                    {
+                        var msg = item.ToString();
+                        if (!string.IsNullOrWhiteSpace(msg))
+                        {
+                            result.Add(msg);
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Fallback
+        }
+        return result;
+    }
 }
 
-internal sealed class TextAssetPreviewResult
+public sealed class TextAssetPreviewResult
 {
     public TextAssetPreviewResult(
         string detailsText,
         string formatName,
         int parsedStringCount,
-        IReadOnlyList<TextAssetDialogueCard> dialogueCards)
+        IReadOnlyList<TextAssetDialogueCard> dialogueCards,
+        string plainTextScript)
     {
         DetailsText = detailsText;
         FormatName = formatName;
         ParsedStringCount = parsedStringCount;
         DialogueCards = dialogueCards;
+        PlainTextScript = plainTextScript;
     }
 
     public string DetailsText { get; }
@@ -1682,10 +1907,12 @@ internal sealed class TextAssetPreviewResult
 
     public IReadOnlyList<TextAssetDialogueCard> DialogueCards { get; }
 
+    public string PlainTextScript { get; }
+
     public bool HasDialogueCards => DialogueCards.Count > 0;
 }
 
-internal sealed class TextAssetDialogueCard
+public sealed class TextAssetDialogueCard
 {
     public TextAssetDialogueCard(int offset, int length, string label, string speaker, string text, string kind)
     {

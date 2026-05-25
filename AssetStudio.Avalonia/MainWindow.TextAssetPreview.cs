@@ -11,6 +11,13 @@ public partial class MainWindow : Window
 {
     private TextAssetPreviewResult? currentTextAssetPreview;
 
+    private enum TextAssetPreviewMode
+    {
+        Cards,
+        Text,
+        Info
+    }
+
     private void ShowTextAssetDialoguePreview(AssetItem assetItem, TextAssetPreviewResult preview)
     {
         currentTextAssetPreview = preview;
@@ -34,11 +41,10 @@ public partial class MainWindow : Window
 
         TextAssetDetailsTextBox.FontFamily = new FontFamily("Consolas, Menlo, DejaVu Sans Mono, monospace");
         TextAssetDetailsTextBox.FontSize = 13;
-        SetTextWithTruncation(TextAssetDetailsTextBox, preview.DetailsText);
 
         BuildTextAssetDialogueCards(preview);
         TextAssetPreviewPanel.IsVisible = true;
-        SetTextAssetPreviewMode(showCards: true);
+        SetTextAssetPreviewMode(TextAssetPreviewMode.Cards);
     }
 
     private void ClearTextAssetPreview()
@@ -51,27 +57,46 @@ public partial class MainWindow : Window
 
     private void TextAssetCardsViewButton_Click(object? sender, RoutedEventArgs e)
     {
-        SetTextAssetPreviewMode(showCards: true);
+        SetTextAssetPreviewMode(TextAssetPreviewMode.Cards);
     }
 
     private void TextAssetDetailsViewButton_Click(object? sender, RoutedEventArgs e)
     {
-        SetTextAssetPreviewMode(showCards: false);
+        SetTextAssetPreviewMode(TextAssetPreviewMode.Text);
     }
 
-    private void SetTextAssetPreviewMode(bool showCards)
+    private void TextAssetInfoViewButton_Click(object? sender, RoutedEventArgs e)
+    {
+        SetTextAssetPreviewMode(TextAssetPreviewMode.Info);
+    }
+
+    private void SetTextAssetPreviewMode(TextAssetPreviewMode mode)
     {
         if (currentTextAssetPreview == null)
         {
             return;
         }
 
+        bool showCards = mode == TextAssetPreviewMode.Cards;
         TextAssetDialogueScrollViewer.IsVisible = showCards;
         TextAssetDetailsTextBox.IsVisible = !showCards;
-        TextAssetCardsViewButton.Background = showCards ? BrushFor("#34507A") : BrushFor("#252A31");
-        TextAssetDetailsViewButton.Background = showCards ? BrushFor("#252A31") : BrushFor("#34507A");
+
+        if (mode == TextAssetPreviewMode.Text)
+        {
+            SetTextWithTruncation(TextAssetDetailsTextBox, currentTextAssetPreview.PlainTextScript);
+        }
+        else if (mode == TextAssetPreviewMode.Info)
+        {
+            SetTextWithTruncation(TextAssetDetailsTextBox, currentTextAssetPreview.DetailsText);
+        }
+
+        TextAssetCardsViewButton.Background = mode == TextAssetPreviewMode.Cards ? BrushFor("#34507A") : BrushFor("#252A31");
+        TextAssetDetailsViewButton.Background = mode == TextAssetPreviewMode.Text ? BrushFor("#34507A") : BrushFor("#252A31");
+        TextAssetInfoViewButton.Background = mode == TextAssetPreviewMode.Info ? BrushFor("#34507A") : BrushFor("#252A31");
+
         TextAssetCardsViewButton.Foreground = Brushes.White;
         TextAssetDetailsViewButton.Foreground = Brushes.White;
+        TextAssetInfoViewButton.Foreground = Brushes.White;
     }
 
     private void BuildTextAssetDialogueCards(TextAssetPreviewResult preview)

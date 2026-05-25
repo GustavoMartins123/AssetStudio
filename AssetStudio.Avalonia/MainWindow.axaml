@@ -168,6 +168,7 @@
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                                             <Button x:Name="TextAssetCardsViewButton" Content="Cards" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetCardsViewButton_Click" />
                                             <Button x:Name="TextAssetDetailsViewButton" Content="Text" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetDetailsViewButton_Click" />
+                                            <Button x:Name="TextAssetInfoViewButton" Content="Info" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetInfoViewButton_Click" />
                                         </StackPanel>
                                     </Grid>
                                 </Border>
