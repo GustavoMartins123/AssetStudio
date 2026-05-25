@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -84,6 +84,10 @@ namespace AssetStudio
 
         private static T[] ReadArray<T>(Func<T> del, int length)
         {
+            if (length < 0 || length > 10000000)
+            {
+                throw new OverflowException($"Invalid array length: {length}");
+            }
             var array = new T[length];
             for (int i = 0; i < length; i++)
             {

@@ -60,6 +60,8 @@
                     <MenuItem Header="Selected assets" Click="ExportSelectedAssetsXML_Click" />
                     <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsXML_Click" />
                 </MenuItem>
+                <Separator />
+                <MenuItem Header="Error log" Click="ExportErrorLog_Click" />
             </MenuItem>
             <MenuItem x:Name="filterTypeMenu" Header="Filter _Type">
                 <MenuItem x:Name="filterTypeAll" Header="All" ToggleType="CheckBox" IsChecked="True" Click="FilterTypeAll_Click" />

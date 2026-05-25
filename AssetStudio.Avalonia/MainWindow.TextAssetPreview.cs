@@ -30,7 +30,7 @@ public partial class MainWindow : Window
 
         TextAssetPreviewTitle.Text = assetItem.Name;
         TextAssetPreviewSubtitle.Text =
-            $"{preview.FormatName} | {preview.DialogueCards.Count:N0} cards | {preview.ParsedStringCount:N0} parsed strings";
+            $"{preview.FormatName} | {preview.DialogueCards.Count:N0} dialogue-like strings | {preview.ParsedStringCount:N0} parsed strings";
 
         TextAssetDetailsTextBox.FontFamily = new FontFamily("Consolas, Menlo, DejaVu Sans Mono, monospace");
         TextAssetDetailsTextBox.FontSize = 13;
@@ -160,23 +160,19 @@ public partial class MainWindow : Window
     private static string BuildTextAssetCardTitle(TextAssetDialogueCard card, int number)
     {
         var prefix = number.ToString("D3", CultureInfo.InvariantCulture);
-        if (!string.IsNullOrWhiteSpace(card.Speaker))
-        {
-            return $"{prefix} | {card.Speaker}";
-        }
-
         if (!string.IsNullOrWhiteSpace(card.Label))
         {
             return $"{prefix} | {card.Label}";
         }
 
-        return prefix;
+        return $"{prefix} | {card.Kind}";
     }
 
     private static string BuildTextAssetCardFooter(TextAssetDialogueCard card)
     {
         var label = string.IsNullOrWhiteSpace(card.Label) ? "unlabeled" : card.Label;
-        return $"{card.Kind} | {label} | {card.Length:N0} bytes";
+        var speaker = string.IsNullOrWhiteSpace(card.Speaker) ? string.Empty : $" | speaker hint: {card.Speaker}";
+        return $"{card.Kind} | {label}{speaker} | {card.Length:N0} bytes";
     }
 
     private static SolidColorBrush BrushFor(string color)

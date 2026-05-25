@@ -499,8 +499,35 @@ namespace AssetStudio
                             .AppendLine($"Assets {assetsFile.fileName}")
                             .AppendLine($"Path {assetsFile.originalPath}")
                             .AppendLine($"Type {objectReader.type}")
-                            .AppendLine($"PathID {objectInfo.m_PathID}")
-                            .Append(e);
+                            .AppendLine($"PathID {objectInfo.m_PathID}");
+
+                        if (objectInfo.serializedType?.m_Type?.m_Nodes != null)
+                        {
+                            sb.AppendLine("TypeTree Dump:");
+                            foreach (var node in objectInfo.serializedType.m_Type.m_Nodes)
+                            {
+                                sb.AppendLine($"[{node.m_Level}] {node.m_Type} {node.m_Name}");
+                            }
+                        }
+
+                        // Dump raw bytes for debugging Unity 6 formats
+                        try
+                        {
+                            objectReader.Reset(); // go back to start
+                            var rawBytes = objectReader.ReadBytes((int)objectInfo.byteSize);
+                            var hexDump = BitConverter.ToString(rawBytes).Replace("-", " ");
+                            sb.AppendLine("Raw Object Bytes:");
+                            
+                            // limit to 1024 bytes to avoid giant logs
+                            int maxLength = Math.Min(hexDump.Length, 1024 * 3); 
+                            sb.AppendLine(hexDump.Substring(0, maxLength));
+                        }
+                        catch (Exception ex2)
+                        {
+                            sb.AppendLine($"Failed to dump bytes: {ex2.Message}");
+                        }
+
+                        sb.Append(e);
                         Logger.Error(sb.ToString());
                     }
 

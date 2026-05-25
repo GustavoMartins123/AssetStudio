@@ -2725,7 +2725,7 @@ public partial class MainWindow : Window
         if (preview.HasDialogueCards)
         {
             ShowTextAssetDialoguePreview(assetItem, preview);
-            StatusStripUpdate($"TextAsset dialogue preview loaded ({preview.DialogueCards.Count:N0} cards, {data.Length:N0} bytes).");
+            StatusStripUpdate($"TextAsset localized preview loaded ({preview.DialogueCards.Count:N0} dialogue-like strings, {data.Length:N0} bytes).");
             return;
         }
 
@@ -3883,6 +3883,11 @@ public partial class MainWindow : Window
     private async void ExportAllAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(exportableAssets);
     private async void ExportSelectedAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(GetSelectedAssets());
     private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(visibleAssets);
+
+    private async void ExportErrorLog_Click(object? sender, RoutedEventArgs e)
+    {
+        await ErrorExporter.ExportErrorLog(this, logger, StatusStripUpdate);
+    }
 
     private async Task ExportAssetsList(List<AssetItem> toExport)
     {

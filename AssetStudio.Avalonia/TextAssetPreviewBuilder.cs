@@ -17,6 +17,7 @@ internal static class TextAssetPreviewBuilder
     private const int MaxAmmoCommandStrings = 120;
     private const int MaxAmmoTechnicalStrings = 260;
     private const int MaxAmmoStringTableEntries = 360;
+    private const int MaxAmmoDecodedCommands = 160;
 
     public static string Build(AssetItem assetItem, byte[] data, string fbxHeader)
     {
@@ -25,10 +26,11 @@ internal static class TextAssetPreviewBuilder
 
     public static TextAssetPreviewResult BuildPreview(AssetItem assetItem, byte[] data, string fbxHeader)
     {
-        var ammoStrings = ExtractAmmoEpisodeBinaryStrings(data);
-        if (IsAmmoEpisodeStringTable(ammoStrings))
+        if ((TryExtractAmmoEpisodeStringTable(data, out var ammoTable) ||
+             TryExtractAmmoEpisodeStringTableLenient(data, out ammoTable)) &&
+            IsAmmoEpisodeStringTable(ammoTable.Strings))
         {
-            return BuildAmmoEpisodePreview(assetItem, data, fbxHeader, ammoStrings);
+            return BuildAmmoEpisodePreview(assetItem, data, fbxHeader, ammoTable);
         }
 
         return BuildGenericPreview(assetItem, data, fbxHeader);
@@ -36,18 +38,23 @@ internal static class TextAssetPreviewBuilder
 
     private static TextAssetPreviewResult BuildGenericPreview(AssetItem assetItem, byte[] data, string fbxHeader)
     {
-        var sb = new StringBuilder();
-        if (!string.IsNullOrEmpty(fbxHeader))
-        {
-            sb.Append(fbxHeader);
-        }
-
         CountBinaryMarkers(data, out var nullBytes, out var controlBytes, out var highBitBytes);
 
         int decodeBytes = Math.Min(data.Length, DecodeByteLimit);
         string decoded = decodeBytes > 0 ? Encoding.UTF8.GetString(data, 0, decodeBytes) : string.Empty;
         bool strictUtf8 = TryDecodeUtf8Strict(data, 0, decodeBytes, out _);
         bool likelyBinary = nullBytes > 0 || controlBytes > Math.Max(8, data.Length / 100);
+        if (strictUtf8 && !likelyBinary)
+        {
+            return BuildPlainTextPreview(data, fbxHeader, decoded, decodeBytes);
+        }
+
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(fbxHeader))
+        {
+            sb.Append(fbxHeader);
+        }
+
         var readableStrings = ExtractReadableStrings(decoded, MaxReadableStrings);
         if (likelyBinary)
         {
@@ -100,12 +107,35 @@ internal static class TextAssetPreviewBuilder
             Array.Empty<TextAssetDialogueCard>());
     }
 
+    private static TextAssetPreviewResult BuildPlainTextPreview(byte[] data, string fbxHeader, string decoded, int decodeBytes)
+    {
+        var sb = new StringBuilder(decoded.Length + fbxHeader.Length + 128);
+        if (!string.IsNullOrEmpty(fbxHeader))
+        {
+            sb.Append(fbxHeader);
+        }
+
+        sb.Append(decoded);
+        if (decodeBytes < data.Length)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"[Text preview truncated at {decodeBytes:N0} bytes of {data.Length:N0}.]");
+        }
+
+        return new TextAssetPreviewResult(
+            sb.ToString(),
+            "UTF-8 text",
+            0,
+            Array.Empty<TextAssetDialogueCard>());
+    }
+
     private static TextAssetPreviewResult BuildAmmoEpisodePreview(
         AssetItem assetItem,
         byte[] data,
         string fbxHeader,
-        IReadOnlyList<BinaryStringEntry> strings)
+        AmmoStringTable stringTable)
     {
+        var strings = stringTable.Strings;
         var sb = new StringBuilder();
         if (!string.IsNullOrEmpty(fbxHeader))
         {
@@ -115,7 +145,7 @@ internal static class TextAssetPreviewBuilder
         CountBinaryMarkers(data, out var nullBytes, out var controlBytes, out var highBitBytes);
 
         var commandEntries = strings
-            .Where(entry => IsAmmoCommandClass(entry.Text))
+            .Where(entry => !entry.IsEmpty && IsAmmoCommandClass(entry.Text))
             .GroupBy(entry => entry.Text, StringComparer.Ordinal)
             .Select(group => group.First())
             .ToList();
@@ -123,22 +153,33 @@ internal static class TextAssetPreviewBuilder
         var dialogueIndexes = new List<int>();
         for (int i = 0; i < strings.Count; i++)
         {
-            if (IsLocalizedOrDialogueString(strings[i].Text))
+            if (!strings[i].IsEmpty && IsLocalizedOrDialogueString(strings[i].Text))
             {
                 dialogueIndexes.Add(i);
             }
         }
 
         var technicalEntries = strings
-            .Where(entry => !IsAmmoCommandClass(entry.Text) && !IsLocalizedOrDialogueString(entry.Text))
+            .Where(entry => !entry.IsEmpty && !IsAmmoCommandClass(entry.Text) && !IsLocalizedOrDialogueString(entry.Text))
             .ToList();
+
+        var commandStream = DecodeAmmoCommandStream(data, stringTable);
 
         sb.AppendLine($"TextAsset: {assetItem.Name}");
         sb.AppendLine($"Bytes: {data.Length:N0}");
         sb.AppendLine("Detected format: Ammo episode binary strings (0x0C + UInt16LE length + UTF-8)");
-        sb.AppendLine($"Parsed strings: {strings.Count:N0}");
+        sb.AppendLine($"String table: {stringTable.DeclaredCount:N0} declared, {strings.Count(entry => !entry.IsEmpty):N0} non-empty");
         sb.AppendLine($"Command classes: {commandEntries.Count:N0}");
         sb.AppendLine($"Localized/dialogue candidates: {dialogueIndexes.Count:N0}");
+        if (commandStream.Commands.Count > 0)
+        {
+            sb.AppendLine($"Decoded command stream: {commandStream.Commands.Count:N0} commands parsed from offset 0x{commandStream.StreamOffset.ToString("X6", CultureInfo.InvariantCulture)}");
+            sb.AppendLine("Card preview: extracted from decoded command fields; unsupported value tags are shown in the text report.");
+        }
+        else
+        {
+            sb.AppendLine("Card preview: extracted from the string table; speaker/order are best-effort hints, not a decoded command stream.");
+        }
         sb.AppendLine($"Binary markers: {nullBytes:N0} NUL bytes, {controlBytes:N0} control bytes, {highBitBytes:N0} bytes >= 0x80");
         sb.AppendLine();
 
@@ -189,6 +230,12 @@ internal static class TextAssetPreviewBuilder
             sb.AppendLine();
         }
 
+        if (commandStream.Commands.Count > 0)
+        {
+            AppendDecodedCommandStream(sb, commandStream);
+            sb.AppendLine();
+        }
+
         sb.AppendLine($"String table order (first {Math.Min(strings.Count, MaxAmmoStringTableEntries):N0} of {strings.Count:N0}):");
         for (int i = 0; i < strings.Count && i < MaxAmmoStringTableEntries; i++)
         {
@@ -199,11 +246,16 @@ internal static class TextAssetPreviewBuilder
             AppendTruncatedCount(sb, strings.Count - MaxAmmoStringTableEntries);
         }
 
-        var cards = BuildAmmoDialogueCards(strings, dialogueIndexes);
+        var commandCards = commandStream.Commands.Count > 0
+            ? BuildAmmoDialogueCardsFromCommands(commandStream.Commands)
+            : new List<TextAssetDialogueCard>();
+        var cards = commandCards.Count > 0
+            ? commandCards
+            : BuildAmmoDialogueCards(strings, dialogueIndexes);
         return new TextAssetPreviewResult(
             sb.ToString(),
-            "Ammo episode binary strings",
-            strings.Count,
+            commandStream.Commands.Count > 0 ? "Ammo episode command stream" : "Ammo episode binary strings",
+            strings.Count(entry => !entry.IsEmpty),
             cards);
     }
 
@@ -216,14 +268,19 @@ internal static class TextAssetPreviewBuilder
         {
             var entry = strings[index];
             var label = FindNearbyLabel(strings, index);
-            if (entry.Text.Contains("\"Messages\"", StringComparison.Ordinal) ||
-                IsLikelySpeakerString(entry.Text, label))
+
+            if (entry.Text.Contains("\"Messages\"", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (IsLikelySpeakerString(entry.Text, label))
             {
                 continue;
             }
 
             var displayText = NormalizeDialogueText(entry.Text);
-            if (string.IsNullOrWhiteSpace(displayText))
+            if (string.IsNullOrWhiteSpace(displayText) || !LooksLikeDialogueCardText(entry.Text, label))
             {
                 continue;
             }
@@ -240,38 +297,479 @@ internal static class TextAssetPreviewBuilder
         return cards;
     }
 
-    private static List<BinaryStringEntry> ExtractAmmoEpisodeBinaryStrings(byte[] data)
+    private static bool TryExtractAmmoEpisodeStringTable(byte[] data, out AmmoStringTable stringTable)
     {
-        var strings = new List<BinaryStringEntry>();
-        for (int offset = 0; offset + 3 <= data.Length; offset++)
+        stringTable = new AmmoStringTable(Array.Empty<BinaryStringEntry>(), 0, 0);
+
+        if (data.Length < 5 || data[2] != 0x0A)
         {
-            if (data[offset] != 0x0C)
-            {
-                continue;
-            }
-
-            int length = data[offset + 1] | (data[offset + 2] << 8);
-            if (length <= 0 || length > AmmoStringMaxLength || offset + 3 + length > data.Length)
-            {
-                continue;
-            }
-
-            if (!TryDecodeUtf8Strict(data, offset + 3, length, out var text))
-            {
-                continue;
-            }
-
-            text = text.Trim();
-            if (!IsCleanAmmoString(text))
-            {
-                continue;
-            }
-
-            strings.Add(new BinaryStringEntry(offset, length, text));
-            offset += 2 + length;
+            return false;
         }
 
-        return strings;
+        int declaredCount = ReadUInt16LittleEndian(data, 3);
+        if (declaredCount <= 0 || declaredCount > 8192)
+        {
+            return false;
+        }
+
+        var strings = new List<BinaryStringEntry>(declaredCount);
+        int offset = 5;
+        for (int index = 0; index < declaredCount; index++)
+        {
+            if (offset + 3 > data.Length || data[offset] != 0x0C)
+            {
+                return false;
+            }
+
+            int length = ReadUInt16LittleEndian(data, offset + 1);
+            if (length > AmmoStringMaxLength || offset + 3 + length > data.Length)
+            {
+                return false;
+            }
+
+            string text = string.Empty;
+            if (length > 0)
+            {
+                if (!TryDecodeUtf8Strict(data, offset + 3, length, out text))
+                {
+                    return false;
+                }
+
+                text = text.Trim();
+                if (!IsCleanAmmoString(text))
+                {
+                    return false;
+                }
+            }
+
+            strings.Add(new BinaryStringEntry(index, offset, length, text));
+            offset += 3 + length;
+        }
+
+        stringTable = new AmmoStringTable(strings, offset, declaredCount);
+        return true;
+    }
+
+    private static bool TryExtractAmmoEpisodeStringTableLenient(byte[] data, out AmmoStringTable stringTable)
+    {
+        stringTable = new AmmoStringTable(Array.Empty<BinaryStringEntry>(), 0, 0);
+        if (data.Length < 8)
+        {
+            return false;
+        }
+
+        int offset = data[2] == 0x0A ? 5 : 0;
+        while (offset + 3 <= data.Length && data[offset] != 0x0C)
+        {
+            offset++;
+        }
+
+        var strings = new List<BinaryStringEntry>();
+        int index = 0;
+        while (offset + 3 <= data.Length && data[offset] == 0x0C)
+        {
+            int length = ReadUInt16LittleEndian(data, offset + 1);
+            if (length > AmmoStringMaxLength || offset + 3 + length > data.Length)
+            {
+                break;
+            }
+
+            string text = string.Empty;
+            if (length > 0)
+            {
+                if (!TryDecodeUtf8Strict(data, offset + 3, length, out text))
+                {
+                    break;
+                }
+
+                text = text.Trim();
+                if (!IsCleanAmmoString(text))
+                {
+                    break;
+                }
+            }
+
+            strings.Add(new BinaryStringEntry(index, offset, length, text));
+            offset += 3 + length;
+            index++;
+        }
+
+        if (strings.Count < 16)
+        {
+            return false;
+        }
+
+        int declaredCount = data[2] == 0x0A ? ReadUInt16LittleEndian(data, 3) : strings.Count;
+        stringTable = new AmmoStringTable(strings, offset, declaredCount);
+        return true;
+    }
+
+    private static AmmoCommandStream DecodeAmmoCommandStream(byte[] data, AmmoStringTable stringTable)
+    {
+        var commands = new List<AmmoCommandNode>();
+        int streamOffset = stringTable.EndOffset;
+        if (streamOffset + 2 > data.Length)
+        {
+            return new AmmoCommandStream(streamOffset, 0, commands, "No command count after string table.");
+        }
+
+        int declaredCount = ReadUInt16LittleEndian(data, streamOffset);
+        if (declaredCount <= 0 || declaredCount > 4096)
+        {
+            return new AmmoCommandStream(streamOffset, declaredCount, commands, "Command count is outside expected range.");
+        }
+
+        int offset = streamOffset + 2;
+        string status = string.Empty;
+        for (int i = 0; i < declaredCount && offset < data.Length; i++)
+        {
+            SkipPaddingToMarker(data, ref offset, 0x0B, 8);
+            if (offset >= data.Length || data[offset] != 0x0B)
+            {
+                status = $"Stopped before command {i + 1:N0}: expected object marker 0x0B at 0x{offset.ToString("X6", CultureInfo.InvariantCulture)}.";
+                break;
+            }
+
+            if (!TryReadAmmoObject(data, stringTable, ref offset, commands.Count + 1, 0, out var command, out var error))
+            {
+                status = $"Stopped before command {i + 1:N0}: {error}";
+                break;
+            }
+
+            commands.Add(command);
+        }
+
+        if (commands.Count == 0 && string.IsNullOrEmpty(status))
+        {
+            status = "No commands parsed.";
+        }
+        else if (commands.Count < declaredCount && string.IsNullOrEmpty(status))
+        {
+            status = $"Parsed {commands.Count:N0} of {declaredCount:N0} declared commands.";
+        }
+
+        return new AmmoCommandStream(streamOffset, declaredCount, commands, status);
+    }
+
+    private static bool TryReadAmmoObject(
+        byte[] data,
+        AmmoStringTable stringTable,
+        ref int offset,
+        int commandIndex,
+        int depth,
+        out AmmoCommandNode command,
+        out string error)
+    {
+        command = new AmmoCommandNode(commandIndex, offset, string.Empty, Array.Empty<AmmoCommandField>());
+        error = string.Empty;
+        if (depth > 12)
+        {
+            error = "nested object depth limit reached.";
+            return false;
+        }
+
+        int startOffset = offset;
+        if (offset >= data.Length || data[offset] != 0x0B)
+        {
+            error = $"expected object marker 0x0B at 0x{offset.ToString("X6", CultureInfo.InvariantCulture)}.";
+            return false;
+        }
+        offset++;
+
+        if (!TryReadAmmoStringRef(data, stringTable, ref offset, out _, out var typeName))
+        {
+            error = $"expected object type string reference at 0x{offset.ToString("X6", CultureInfo.InvariantCulture)}.";
+            return false;
+        }
+
+        if (offset + 2 > data.Length)
+        {
+            error = "unexpected end while reading field count.";
+            return false;
+        }
+
+        int fieldCount = ReadUInt16LittleEndian(data, offset);
+        offset += 2;
+        if (fieldCount < 0 || fieldCount > 512)
+        {
+            error = $"field count {fieldCount:N0} is outside expected range.";
+            return false;
+        }
+
+        var fields = new List<AmmoCommandField>(fieldCount);
+        for (int i = 0; i < fieldCount; i++)
+        {
+            SkipPaddingToMarker(data, ref offset, 0x0D, 2);
+            if (!TryReadAmmoStringRef(data, stringTable, ref offset, out _, out var fieldName))
+            {
+                error = $"expected field name string reference at 0x{offset.ToString("X6", CultureInfo.InvariantCulture)}.";
+                return false;
+            }
+
+            if (!TryReadAmmoValue(data, stringTable, ref offset, depth + 1, out var value, out error))
+            {
+                error = $"{fieldName}: {error}";
+                return false;
+            }
+
+            fields.Add(new AmmoCommandField(fieldName, value));
+        }
+
+        command = new AmmoCommandNode(commandIndex, startOffset, typeName, fields);
+        return true;
+    }
+
+    private static bool TryReadAmmoValue(
+        byte[] data,
+        AmmoStringTable stringTable,
+        ref int offset,
+        int depth,
+        out AmmoValue value,
+        out string error)
+    {
+        value = AmmoValue.Unknown(0, offset);
+        error = string.Empty;
+        if (offset >= data.Length)
+        {
+            error = "unexpected end while reading value.";
+            return false;
+        }
+
+        int valueOffset = offset;
+        byte tag = data[offset++];
+        switch (tag)
+        {
+            case 0x02:
+                if (offset + 4 > data.Length)
+                {
+                    error = "unexpected end while reading Int32.";
+                    return false;
+                }
+                value = AmmoValue.Integer(BitConverter.ToInt32(data, offset), valueOffset);
+                offset += 4;
+                return true;
+
+            case 0x03:
+                if (offset + 8 > data.Length)
+                {
+                    error = "unexpected end while reading Float64.";
+                    return false;
+                }
+                value = AmmoValue.Number(BitConverter.ToDouble(data, offset), valueOffset);
+                offset += 8;
+                return true;
+
+            case 0x04:
+                value = AmmoValue.Boolean(true, valueOffset);
+                return true;
+
+            case 0x05:
+                value = AmmoValue.Boolean(false, valueOffset);
+                return true;
+
+            case 0x0A:
+                value = AmmoValue.Null(valueOffset);
+                return true;
+
+            case 0x0B:
+                offset = valueOffset;
+                if (!TryReadAmmoObject(data, stringTable, ref offset, 0, depth, out var nestedObject, out error))
+                {
+                    return false;
+                }
+                value = AmmoValue.Object(nestedObject, valueOffset);
+                return true;
+
+            case 0x0D:
+                offset = valueOffset;
+                if (!TryReadAmmoStringRef(data, stringTable, ref offset, out var stringIndex, out var text))
+                {
+                    error = "invalid string reference.";
+                    return false;
+                }
+                value = AmmoValue.String(stringIndex, text, GetStringLength(stringTable, stringIndex), valueOffset);
+                return true;
+
+            default:
+                value = AmmoValue.Unknown(tag, valueOffset);
+                return true;
+        }
+    }
+
+    private static bool TryReadAmmoStringRef(
+        byte[] data,
+        AmmoStringTable stringTable,
+        ref int offset,
+        out int stringIndex,
+        out string text)
+    {
+        stringIndex = -1;
+        text = string.Empty;
+        if (offset + 3 > data.Length || data[offset] != 0x0D)
+        {
+            return false;
+        }
+
+        stringIndex = ReadUInt16LittleEndian(data, offset + 1);
+        offset += 3;
+        text = LookupString(stringTable, stringIndex);
+        return true;
+    }
+
+    private static void AppendDecodedCommandStream(StringBuilder sb, AmmoCommandStream commandStream)
+    {
+        sb.AppendLine($"Decoded command stream (experimental, declared {commandStream.DeclaredCount:N0}, parsed {commandStream.Commands.Count:N0}):");
+        if (!string.IsNullOrEmpty(commandStream.Status))
+        {
+            sb.Append("  ");
+            sb.AppendLine(commandStream.Status);
+        }
+
+        int count = Math.Min(commandStream.Commands.Count, MaxAmmoDecodedCommands);
+        for (int i = 0; i < count; i++)
+        {
+            var command = commandStream.Commands[i];
+            sb.Append("  ");
+            sb.Append(command.Index.ToString("D3", CultureInfo.InvariantCulture));
+            sb.Append(" @0x");
+            sb.Append(command.Offset.ToString("X6", CultureInfo.InvariantCulture));
+            sb.Append(' ');
+            sb.Append(ShortCommandType(command.TypeName));
+            sb.Append(" (");
+            sb.Append(command.Fields.Count.ToString("N0", CultureInfo.InvariantCulture));
+            sb.AppendLine(" fields)");
+
+            foreach (var field in command.Fields)
+            {
+                sb.Append("      ");
+                sb.Append(field.Name);
+                sb.Append(" = ");
+                sb.AppendLine(FormatAmmoValue(field.Value));
+            }
+        }
+
+        if (commandStream.Commands.Count > MaxAmmoDecodedCommands)
+        {
+            AppendTruncatedCount(sb, commandStream.Commands.Count - MaxAmmoDecodedCommands);
+        }
+    }
+
+    private static List<TextAssetDialogueCard> BuildAmmoDialogueCardsFromCommands(IReadOnlyList<AmmoCommandNode> commands)
+    {
+        var cards = new List<TextAssetDialogueCard>();
+        foreach (var command in commands)
+        {
+            var speaker = FindCommandSpeaker(command);
+            foreach (var field in command.Fields)
+            {
+                if (field.Value.Kind != AmmoValueKind.String ||
+                    string.IsNullOrWhiteSpace(field.Value.Text) ||
+                    field.Value.Text.Contains("\"Messages\"", StringComparison.Ordinal) ||
+                    !LooksLikeDialogueCardText(field.Value.Text, field.Name))
+                {
+                    continue;
+                }
+
+                cards.Add(new TextAssetDialogueCard(
+                    command.Offset,
+                    field.Value.StringLength,
+                    $"{command.Index.ToString("D3", CultureInfo.InvariantCulture)} {ShortCommandType(command.TypeName)}.{field.Name}",
+                    speaker,
+                    NormalizeDialogueText(field.Value.Text),
+                    "Decoded command"));
+            }
+        }
+
+        return cards;
+    }
+
+    private static string FindCommandSpeaker(AmmoCommandNode command)
+    {
+        foreach (var field in command.Fields)
+        {
+            if (field.Name.Equals("Name", StringComparison.Ordinal) &&
+                field.Value.Kind == AmmoValueKind.String &&
+                IsLikelySpeakerString(field.Value.Text, "Name"))
+            {
+                return NormalizeDialogueText(field.Value.Text);
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static string FormatAmmoValue(AmmoValue value)
+    {
+        return value.Kind switch
+        {
+            AmmoValueKind.Null => "null",
+            AmmoValueKind.Boolean => value.BooleanValue ? "true" : "false",
+            AmmoValueKind.Integer => value.IntegerValue.ToString(CultureInfo.InvariantCulture),
+            AmmoValueKind.Number => value.NumberValue.ToString("G9", CultureInfo.InvariantCulture),
+            AmmoValueKind.String => $"\"{ToInlinePreview(value.Text, 180)}\" [#{value.StringIndex.ToString(CultureInfo.InvariantCulture)}]",
+            AmmoValueKind.Object => FormatAmmoObjectInline(value.ObjectValue),
+            _ => $"<unknown tag 0x{value.UnknownTag.ToString("X2", CultureInfo.InvariantCulture)} @0x{value.Offset.ToString("X6", CultureInfo.InvariantCulture)}>"
+        };
+    }
+
+    private static string FormatAmmoObjectInline(AmmoCommandNode? command)
+    {
+        if (command == null)
+        {
+            return "{}";
+        }
+
+        var fields = command.Fields
+            .Take(8)
+            .Select(field => $"{field.Name}={FormatAmmoValue(field.Value)}");
+        var suffix = command.Fields.Count > 8 ? ", ..." : string.Empty;
+        return $"{ShortCommandType(command.TypeName)} {{ {string.Join(", ", fields)}{suffix} }}";
+    }
+
+    private static string ShortCommandType(string typeName)
+    {
+        var value = typeName;
+        if (value.StartsWith("Ammo.", StringComparison.Ordinal))
+        {
+            value = value.Substring("Ammo.".Length);
+        }
+
+        const string suffix = "EpisodeCommand";
+        if (value.EndsWith(suffix, StringComparison.Ordinal))
+        {
+            value = value.Substring(0, value.Length - suffix.Length);
+        }
+
+        return string.IsNullOrEmpty(value) ? typeName : value;
+    }
+
+    private static string LookupString(AmmoStringTable stringTable, int stringIndex)
+    {
+        return stringIndex >= 0 && stringIndex < stringTable.Strings.Count
+            ? stringTable.Strings[stringIndex].Text
+            : $"<string #{stringIndex.ToString(CultureInfo.InvariantCulture)}>";
+    }
+
+    private static int GetStringLength(AmmoStringTable stringTable, int stringIndex)
+    {
+        return stringIndex >= 0 && stringIndex < stringTable.Strings.Count
+            ? stringTable.Strings[stringIndex].Length
+            : 0;
+    }
+
+    private static int ReadUInt16LittleEndian(byte[] data, int offset)
+    {
+        return data[offset] | (data[offset + 1] << 8);
+    }
+
+    private static void SkipPaddingToMarker(byte[] data, ref int offset, byte marker, int maxPadding)
+    {
+        int skipped = 0;
+        while (offset < data.Length && data[offset] != marker && data[offset] == 0 && skipped < maxPadding)
+        {
+            offset++;
+            skipped++;
+        }
     }
 
     private static bool IsAmmoEpisodeStringTable(IReadOnlyList<BinaryStringEntry> strings)
@@ -329,6 +827,59 @@ internal static class TextAssetPreviewBuilder
         return false;
     }
 
+    private static bool LooksLikeDialogueCardText(string text, string label)
+    {
+        if (IsLikelySpeakerString(text, label) || IsTechnicalString(text))
+        {
+            return false;
+        }
+
+        if (label is "Memo" or "Message" or "Oneshot")
+        {
+            return true;
+        }
+
+        if (text.Contains("<color=", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains('\n', StringComparison.Ordinal) ||
+            text.Contains("\\n", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        foreach (var ch in text)
+        {
+            if (ch is '\u3002' or '\u3001' or '\uFF01' or '\uFF1F' or '\u2026' or '\u2661')
+            {
+                return true;
+            }
+        }
+
+        return text.Length >= 18 && ContainsNonAsciiLetter(text);
+    }
+
+    private static bool ContainsNonAsciiLetter(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (ch <= 0x7F)
+            {
+                continue;
+            }
+
+            var category = char.GetUnicodeCategory(ch);
+            if (category is UnicodeCategory.UppercaseLetter
+                or UnicodeCategory.LowercaseLetter
+                or UnicodeCategory.TitlecaseLetter
+                or UnicodeCategory.ModifierLetter
+                or UnicodeCategory.OtherLetter)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static string FindNearbySpeaker(IReadOnlyList<BinaryStringEntry> strings, int index)
     {
         if (index + 1 < strings.Count && IsLikelySpeakerString(strings[index + 1].Text, FindNearbyLabel(strings, index + 1)))
@@ -355,8 +906,41 @@ internal static class TextAssetPreviewBuilder
         return string.Empty;
     }
 
+    private static readonly HashSet<string> TechnicalStringBlacklist = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Message", "Name", "Memo", "Oneshot", "StartPosition", "Duration", "Fov", "Time", "Scale", "Rotate", "Offset", "Distance", "Type", "Color", "Target", "Human", "Effect", "Common", "Smile", "Walk", "None", "Solo", "Horizon", "Center", "Forward", "Big", "Normal", "DollyIn", "Placement", "Prefabname",
+        "Top", "Bottom", "Left", "Right", "BottomLeft", "BottomRight", "TopLeft", "TopRight", "UpperLeft", "UpperRight", "UpperLeft1", "UpperLeft2", "UpperRight1", "UpperRight2",
+        "SmallOpenMouth", "BlinkEye", "CloseEyes", "FadeIn", "FadeOut", "AutoLocation", "EpisodeType", "Episode3D", "ExitCameraDuration", "IsDisableSkip", "IsExitKeepFade", "ShadowSetting", "Title", "LayoutType", "TwoOnTwo", "LocationName", "MapId", "UniqueId", "BgmId", "FadeInTime", "AvaterPositionType", "CharaId", "Gender", "Female", "HBodyShape", "Middle", "HModelId", "HMountType", "HPersonal", "HSequenceId", "HWeaponId", "IsInvalidBoundsExpand", "IsInvalidPhysical", "IsMount", "LayoutId", "MModelId", "MMotionId", "MSequenceId", "MonsterId", "Position", "x", "y", "z", "PreloadExtraFaceAtlas", "Rotation", "UniqueCharacterId", "AvaterBodySizeType", "HumanM", "CameraPresetAngleType", "CameraPresetDirectionType", "CameraPresetLayoutType", "CameraPresetPositionType", "CameraPresetShotType", "WaistShot", "IsClossFade", "PresetMove", "TargetId", "TargetIsMonster", "TargetUniqueId", "BodyType", "IsImmediateExecute", "IsRide", "Personality", "UnavailableMotion", "BodyShape", "ClipNumber", "CompleteMotionClipNumber", "IsInvalidCompleteTransition", "MotionType", "MountType", "MovedPosition", "PlayMotionOnComplete", "UnavailableFacialChange", "IsSystem", "CharaSubId", "CharacterProfileId", "ClipCategory", "DefaultClipNumber", "DefaultEpisodeUniqueClipId", "DefaultMotionType", "EpisodeUniqueClipId", "HumanMotionType", "IsInvalidTransition", "IsSetDefaultMotion", "SetDefaultMotion", "FaceMotion", "IsTrack", "BalloonPointCharaId", "BalloonPointType", "BalloonPosition", "BalloonPositionPresetType", "BalloonType", "IsAutoBalloonPointType", "IsAutoExecute", "IsAutoScreenFit", "IsLastReuseMessage", "IsMonster", "IsRefresh", "IsReuseMessageBox", "ReuseMessageListJson", "VoiceCharaId", "VoiceNo", "CharacterId", "IsAllCharacter", "IsRideTarget", "IsTargetCamera", "IsTargetNull", "MonsterYOffset", "TargetCharacterId", "TargetMonsterId", "TargetMountMonsterId", "UniqueTargetCharacterId"
+    };
+
+    private static bool IsTechnicalString(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return true;
+        }
+
+        if (text.StartsWith("Ammo.", StringComparison.Ordinal) ||
+            text.StartsWith("UnityEngine.", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (text.Length >= 3 && text.StartsWith("Is", StringComparison.Ordinal) && char.IsUpper(text[2]))
+        {
+            return true;
+        }
+
+        return TechnicalStringBlacklist.Contains(text);
+    }
+
     private static bool IsLikelySpeakerString(string text, string label)
     {
+        if (IsTechnicalString(text))
+        {
+            return false;
+        }
+
         if (label.Equals("Name", StringComparison.Ordinal))
         {
             return true;
@@ -374,7 +958,7 @@ internal static class TextAssetPreviewBuilder
         bool hasLetter = false;
         foreach (var ch in text)
         {
-            if (char.IsWhiteSpace(ch) || ch == 'ー' || ch == '・')
+            if (char.IsWhiteSpace(ch) || ch == '\u30FC' || ch == '\u30FB')
             {
                 continue;
             }
@@ -511,9 +1095,9 @@ internal static class TextAssetPreviewBuilder
         }
 
         var trimmed = text.Trim();
-        if (trimmed.Length == 1)
+        if (trimmed.Length <= 2)
         {
-            return char.IsLetterOrDigit(trimmed[0]);
+            return trimmed.Any(char.IsLetterOrDigit);
         }
 
         return IsUsefulReadableString(trimmed);
@@ -546,6 +1130,8 @@ internal static class TextAssetPreviewBuilder
     {
         sb.Append("  ");
         sb.Append(number.ToString("D3", CultureInfo.InvariantCulture));
+        sb.Append(" #");
+        sb.Append(entry.Index.ToString("D3", CultureInfo.InvariantCulture));
         sb.Append(" @0x");
         sb.Append(entry.Offset.ToString("X6", CultureInfo.InvariantCulture));
         sb.Append(" len=");
@@ -556,7 +1142,7 @@ internal static class TextAssetPreviewBuilder
             sb.Append(label);
             sb.Append(" = ");
         }
-        sb.AppendLine(ToInlinePreview(entry.Text, 260));
+        sb.AppendLine(entry.IsEmpty ? "<empty>" : ToInlinePreview(entry.Text, 260));
     }
 
     private static void AppendTruncatedCount(StringBuilder sb, int remaining)
@@ -583,18 +1169,165 @@ internal static class TextAssetPreviewBuilder
 
     private sealed class BinaryStringEntry
     {
-        public BinaryStringEntry(int offset, int length, string text)
+        public BinaryStringEntry(int index, int offset, int length, string text)
         {
+            Index = index;
             Offset = offset;
             Length = length;
             Text = text;
         }
+
+        public int Index { get; }
 
         public int Offset { get; }
 
         public int Length { get; }
 
         public string Text { get; }
+
+        public bool IsEmpty => Text.Length == 0;
+    }
+
+    private sealed class AmmoStringTable
+    {
+        public AmmoStringTable(IReadOnlyList<BinaryStringEntry> strings, int endOffset, int declaredCount)
+        {
+            Strings = strings;
+            EndOffset = endOffset;
+            DeclaredCount = declaredCount;
+        }
+
+        public IReadOnlyList<BinaryStringEntry> Strings { get; }
+
+        public int EndOffset { get; }
+
+        public int DeclaredCount { get; }
+    }
+
+    private sealed class AmmoCommandStream
+    {
+        public AmmoCommandStream(int streamOffset, int declaredCount, IReadOnlyList<AmmoCommandNode> commands, string status)
+        {
+            StreamOffset = streamOffset;
+            DeclaredCount = declaredCount;
+            Commands = commands;
+            Status = status;
+        }
+
+        public int StreamOffset { get; }
+
+        public int DeclaredCount { get; }
+
+        public IReadOnlyList<AmmoCommandNode> Commands { get; }
+
+        public string Status { get; }
+    }
+
+    private sealed class AmmoCommandNode
+    {
+        public AmmoCommandNode(int index, int offset, string typeName, IReadOnlyList<AmmoCommandField> fields)
+        {
+            Index = index;
+            Offset = offset;
+            TypeName = typeName;
+            Fields = fields;
+        }
+
+        public int Index { get; }
+
+        public int Offset { get; }
+
+        public string TypeName { get; }
+
+        public IReadOnlyList<AmmoCommandField> Fields { get; }
+    }
+
+    private sealed class AmmoCommandField
+    {
+        public AmmoCommandField(string name, AmmoValue value)
+        {
+            Name = name;
+            Value = value;
+        }
+
+        public string Name { get; }
+
+        public AmmoValue Value { get; }
+    }
+
+    private enum AmmoValueKind
+    {
+        Null,
+        Boolean,
+        Integer,
+        Number,
+        String,
+        Object,
+        Unknown
+    }
+
+    private sealed class AmmoValue
+    {
+        private AmmoValue(AmmoValueKind kind, int offset)
+        {
+            Kind = kind;
+            Offset = offset;
+            Text = string.Empty;
+        }
+
+        public AmmoValueKind Kind { get; private init; }
+
+        public int Offset { get; private init; }
+
+        public bool BooleanValue { get; private init; }
+
+        public int IntegerValue { get; private init; }
+
+        public double NumberValue { get; private init; }
+
+        public int StringIndex { get; private init; }
+
+        public int StringLength { get; private init; }
+
+        public string Text { get; private init; }
+
+        public AmmoCommandNode? ObjectValue { get; private init; }
+
+        public byte UnknownTag { get; private init; }
+
+        public static AmmoValue Null(int offset) => new(AmmoValueKind.Null, offset);
+
+        public static AmmoValue Boolean(bool value, int offset) => new(AmmoValueKind.Boolean, offset)
+        {
+            BooleanValue = value
+        };
+
+        public static AmmoValue Integer(int value, int offset) => new(AmmoValueKind.Integer, offset)
+        {
+            IntegerValue = value
+        };
+
+        public static AmmoValue Number(double value, int offset) => new(AmmoValueKind.Number, offset)
+        {
+            NumberValue = value
+        };
+
+        public static AmmoValue String(int stringIndex, string text, int stringLength, int offset) => new(AmmoValueKind.String, offset)
+        {
+            StringIndex = stringIndex,
+            StringLength = stringLength,
+            Text = text
+        };
+
+        public static AmmoValue Object(AmmoCommandNode command, int offset) => new(AmmoValueKind.Object, offset)
+        {
+            ObjectValue = command
+        };
+
+        public static AmmoValue Unknown(byte tag, int offset) => new(AmmoValueKind.Unknown, offset)
+        {
+            UnknownTag = tag
+        };
     }
 
     private static bool IsBinaryControlByte(byte value)

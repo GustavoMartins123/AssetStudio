@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 using System.Collections.Specialized;
 
@@ -89,18 +89,24 @@ namespace AssetStudio
                 var m_ModifiedSerializedProperties = reader.ReadBoolean();
                 reader.AlignStream();
             }
-
             if (version[0] == 4 && version[1] >= 1) //4.x
             {
                 var m_ShaderKeywords = reader.ReadStringArray();
             }
 
-            if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 3)) //2021.3 and up
+            if (version[0] >= 2021 && version[0] < 6000) //2021.1 ~ 2023.x
             {
-                var m_ValidKeywords = reader.ReadStringArray();
-                var m_InvalidKeywords = reader.ReadStringArray();
+                if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 3)) //2021.3 and up
+                {
+                    var m_ValidKeywords = reader.ReadStringArray();
+                    var m_InvalidKeywords = reader.ReadStringArray();
+                }
+                else if (version[0] >= 5) //5.0 ~ 2021.2
+                {
+                    var m_ShaderKeywords = reader.ReadAlignedString();
+                }
             }
-            else if (version[0] >= 5) //5.0 ~ 2021.2
+            else if (version[0] >= 5 && version[0] < 2021) //5.0 ~ 2020.3
             {
                 var m_ShaderKeywords = reader.ReadAlignedString();
             }

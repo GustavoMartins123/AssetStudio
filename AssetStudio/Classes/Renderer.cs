@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -77,6 +77,11 @@ namespace AssetStudio
                 if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 3)) //2018.3 and up
                 {
                     var m_RendererPriority = reader.ReadInt32();
+                }
+
+                if (version[0] >= 6000) //6000.0 and up
+                {
+                    reader.ReadInt32(); // Unknown field
                 }
 
                 var m_LightmapIndex = reader.ReadUInt16();
