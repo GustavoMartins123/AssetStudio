@@ -94,7 +94,7 @@ namespace AssetStudio
                 var m_ShaderKeywords = reader.ReadStringArray();
             }
 
-            if (version[0] >= 2021 && version[0] < 6000) //2021.1 ~ 2023.x
+            if (version[0] >= 2021) //2021.1 and up
             {
                 if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 3)) //2021.3 and up
                 {

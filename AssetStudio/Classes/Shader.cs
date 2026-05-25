@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -751,12 +751,13 @@ namespace AssetStudio
         public string m_TextureName;
         public SerializedTagMap m_Tags;
         public ushort[] m_SerializedKeywordStateMask;
+        public SerializedPackageRequirements m_PackageRequirements;
 
         public SerializedPass(ObjectReader reader)
         {
             var version = reader.version;
 
-            if (version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) //2020.2 and up
+            if ((version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) && version[0] < 6000) //2020.2 ~ 2023.x
             {
                 int numEditorDataHash = reader.ReadInt32();
                 m_EditorDataHash = new Hash128[numEditorDataHash];
@@ -809,6 +810,10 @@ namespace AssetStudio
             {
                 m_SerializedKeywordStateMask = reader.ReadUInt16Array();
                 reader.AlignStream();
+            }
+            if (version[0] >= 6000)
+            {
+                m_PackageRequirements = new SerializedPackageRequirements(reader);
             }
         }
     }
@@ -1028,4 +1033,40 @@ namespace AssetStudio
             }
         }
     }
+
+    public class SerializedPackageRequirement
+    {
+        public string name;
+        public string version;
+        public sbyte status;
+
+        public SerializedPackageRequirement(BinaryReader reader)
+        {
+            name = reader.ReadAlignedString();
+            version = reader.ReadAlignedString();
+            status = reader.ReadSByte();
+            reader.AlignStream();
+        }
+    }
+
+    public class SerializedPackageRequirements
+    {
+        public SerializedPackageRequirement[] m_Requirements;
+        public string m_StatusMessage;
+        public sbyte m_CombinedStatus;
+
+        public SerializedPackageRequirements(BinaryReader reader)
+        {
+            int numRequirements = reader.ReadInt32();
+            m_Requirements = new SerializedPackageRequirement[numRequirements];
+            for (int i = 0; i < numRequirements; i++)
+            {
+                m_Requirements[i] = new SerializedPackageRequirement(reader);
+            }
+            m_StatusMessage = reader.ReadAlignedString();
+            m_CombinedStatus = reader.ReadSByte();
+            reader.AlignStream();
+        }
+    }
 }
+
