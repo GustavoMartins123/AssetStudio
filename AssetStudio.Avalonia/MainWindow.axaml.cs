@@ -31,6 +31,8 @@ public partial class MainWindow : Window
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private Texture2D? currentPreviewTexture;
     private Sprite? currentPreviewSprite;
+    private Mesh? currentPreviewMesh;
+    private Avatar? currentPreviewAvatar;
     private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
     private long texturePreviewIdCounter;
@@ -84,6 +86,10 @@ public partial class MainWindow : Window
         displayAll.IsChecked = appSettings.DisplayAll;
         displayInfo.IsChecked = appSettings.DisplayInfo;
         enablePreview.IsChecked = appSettings.EnablePreview;
+        SpecifyUnityVersionTextBox.Text = appSettings.SpecifyUnityVersion;
+        SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
+        ApplyUnityVersionOption();
+        assetsManager.ProjectRoot = appSettings.ProjectRoot;
         Progress.Default = new Progress<int>(SetProgressBarValue);
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
@@ -228,6 +234,11 @@ public partial class MainWindow : Window
     private void ApplyUnityVersionOption()
     {
         assetsManager.SpecifyUnityVersion = SpecifyUnityVersionTextBox.Text?.Trim() ?? string.Empty;
+        if (appSettings.SpecifyUnityVersion != assetsManager.SpecifyUnityVersion)
+        {
+            appSettings.SpecifyUnityVersion = assetsManager.SpecifyUnityVersion;
+            appSettings.Save();
+        }
     }
 
     private void ClearPreview(string message = "[Preview Panel]")
@@ -522,6 +533,8 @@ public partial class MainWindow : Window
 
         assetsManager.ProjectRoot = folders[0].Path.LocalPath;
         SaveLoadFolder(assetsManager.ProjectRoot);
+        appSettings.ProjectRoot = assetsManager.ProjectRoot;
+        appSettings.Save();
         StatusStripUpdate($"Project root set to: {assetsManager.ProjectRoot}");
     }
 
@@ -1399,6 +1412,8 @@ public partial class MainWindow : Window
         {
             HideAnimationPlayback();
             GLPreviewControl?.StopAnimation();
+            currentPreviewMesh = null;
+            currentPreviewAvatar = null;
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
@@ -1557,6 +1572,7 @@ public partial class MainWindow : Window
                         }
                     }
 
+                    currentPreviewMesh = m_Mesh;
                     GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                     GLPreviewControl.IsVisible = true;
                     if (BoneSizeContainer != null)
@@ -2116,7 +2132,9 @@ public partial class MainWindow : Window
 
     private void PreviewAvatar(Avatar avatar)
     {
+        currentPreviewAvatar = avatar;
         Mesh? avatarMesh = FindBestMeshForAvatar(avatar);
+        currentPreviewMesh = avatarMesh;
 
         global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
         int[]? parentIndices = null;
@@ -2278,9 +2296,26 @@ public partial class MainWindow : Window
 
     private void PreviewAnimationClip(AnimationClip clip)
     {
-        // Step 1: Find an Avatar in the same assetsFile or sibling files
+        // Step 1: Find the Avatar and Mesh to use, preferring the currently visible one
         Avatar? avatar = null;
-        avatar = clip.assetsFile.Objects.OfType<Avatar>().FirstOrDefault();
+        Mesh? avatarMesh = null;
+
+        if (currentPreviewMesh != null && currentPreviewMesh.m_BindPose != null && currentPreviewMesh.m_BindPose.Length > 0
+            && currentPreviewMesh.m_BoneNameHashes != null && currentPreviewMesh.m_BoneNameHashes.Length > 0)
+        {
+            avatarMesh = currentPreviewMesh;
+            avatar = currentPreviewAvatar ?? FindBestAvatarForMesh(avatarMesh);
+        }
+        else if (currentPreviewAvatar != null && currentPreviewAvatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null)
+        {
+            avatar = currentPreviewAvatar;
+            avatarMesh = FindBestMeshForAvatar(avatar);
+        }
+
+        if (avatar == null)
+        {
+            avatar = clip.assetsFile.Objects.OfType<Avatar>().FirstOrDefault();
+        }
         if (avatar == null)
         {
             var clipNameBase = clip.m_Name.Split('_')[0];
@@ -2304,8 +2339,11 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Step 2: Find a Mesh for this avatar (reuse logic from PreviewAvatar)
-        Mesh? avatarMesh = FindBestMeshForAvatar(avatar);
+        if (avatarMesh == null)
+        {
+            avatarMesh = FindBestMeshForAvatar(avatar);
+        }
+
         if (avatarMesh == null || avatarMesh.m_BindPose == null || avatarMesh.m_BindPose.Length == 0
             || avatarMesh.m_BoneNameHashes == null || avatarMesh.m_BoneNameHashes.Length == 0)
         {
@@ -2704,6 +2742,33 @@ public partial class MainWindow : Window
         }
 
         return bestMesh;
+    }
+
+    private Avatar? FindBestAvatarForMesh(Mesh mesh)
+    {
+        Avatar? bestAvatar = null;
+        int bestScore = 0;
+        var meshName = mesh.m_Name.ToLowerInvariant();
+        var allAvatars = assetsManager.assetsFileList
+            .SelectMany(f => f.Objects)
+            .OfType<Avatar>();
+
+        foreach (var avatar in allAvatars)
+        {
+            int score = 0;
+            if (avatar.assetsFile == mesh.assetsFile) score += 20;
+
+            var avatarName = avatar.m_Name.Replace("Avatar", "").Trim().ToLowerInvariant();
+            if (!string.IsNullOrEmpty(avatarName) && meshName.Contains(avatarName))
+                score += 15;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestAvatar = avatar;
+            }
+        }
+        return bestAvatar;
     }
 
     private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
@@ -3211,14 +3276,14 @@ public partial class MainWindow : Window
         return candidate;
     }
 
-    private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
+    private async void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
     {
         try
         {
             object? obj = m_MonoBehaviour.ToType();
-            if (obj == null && assemblyLoader.Loaded)
+            if (obj == null)
             {
-                var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                var typeTree = await MonoBehaviourToTypeTree(m_MonoBehaviour);
                 if (typeTree != null)
                 {
                     obj = m_MonoBehaviour.ToType(typeTree);
@@ -3238,6 +3303,15 @@ public partial class MainWindow : Window
         catch
         {
             // Fallback
+        }
+
+        if (dumpStr == null)
+        {
+            var typeTree = await MonoBehaviourToTypeTree(m_MonoBehaviour);
+            if (typeTree != null)
+            {
+                dumpStr = m_MonoBehaviour.Dump(typeTree);
+            }
         }
 
         if (dumpStr != null)
@@ -3968,11 +4042,26 @@ public partial class MainWindow : Window
 
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
 
-        if (folders == null || folders.Count == 0) return;
+        if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump) && toExport.Any(x => x.Asset is MonoBehaviour))
+        {
+            var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
+            if (folders != null && folders.Count > 0)
+            {
+                SaveLoadFolder(folders[0].Path.LocalPath);
+                assemblyLoader.Load(folders[0].Path.LocalPath);
+            }
+            else
+            {
+                assemblyLoader.Loaded = true;
+            }
+        }
 
-        var savePath = folders[0].Path.LocalPath;
+        var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+
+        if (exportFolders == null || exportFolders.Count == 0) return;
+
+        var savePath = exportFolders[0].Path.LocalPath;
         SaveExportFolder(savePath);
         if (mode == ExportMode.Convert)
         {
@@ -4014,8 +4103,24 @@ public partial class MainWindow : Window
                             filePath += ".txt";
                             if (!File.Exists(filePath))
                             {
-                                var dump = asset.Asset.Dump() ?? "";
-                                File.WriteAllText(filePath, dump);
+                                string? dump = null;
+                                if (asset.Asset is MonoBehaviour m_MonoBehaviour)
+                                {
+                                    dump = m_MonoBehaviour.Dump();
+                                    if (dump == null && assemblyLoader.Loaded)
+                                    {
+                                        var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                                        if (typeTree != null)
+                                        {
+                                            dump = m_MonoBehaviour.Dump(typeTree);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    dump = asset.Asset.Dump();
+                                }
+                                File.WriteAllText(filePath, dump ?? "");
                                 exported++;
                             }
                             break;
@@ -6306,6 +6411,8 @@ public sealed class AvaloniaAppSettings
 
     public string LoadFolderPath { get; set; } = string.Empty;
     public string ExportFolderPath { get; set; } = string.Empty;
+    public string ProjectRoot { get; set; } = string.Empty;
+    public string SpecifyUnityVersion { get; set; } = string.Empty;
     public bool ShowErrorMessage { get; set; } = false;
     public bool DisplayAll { get; set; } = false;
     public bool DisplayInfo { get; set; } = true;

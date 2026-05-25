@@ -219,6 +219,8 @@ void main()
         private Matrix4 initialViewMatrix = Matrix4.Identity;
         private Matrix4 initialModelMatrix = Matrix4.Identity;
         private float boneScale = 1.0f;
+        private Vector3[]? staticBonePositions;
+        private int[]? staticParentIndices;
 
         public float BoneScale
         {
@@ -226,6 +228,7 @@ void main()
             set
             {
                 boneScale = value;
+                UpdateSkeletonVertices();
                 RequestNextFrameRendering();
             }
         }
@@ -1002,7 +1005,6 @@ void main()
 
                         if (boneLinesVertexCount > 0)
                         {
-                            GL.LineWidth(3.0f * boneScale);
                             GL.UseProgram(pgmYellowID);
                             GL.UniformMatrix4(uniformModelMatrixYellow, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixYellow, false, ref viewMatrixData);
@@ -1012,16 +1014,13 @@ void main()
 
                         if (jointPointsVertexCount > 0)
                         {
-                            GL.PointSize(12.0f * boneScale);
                             GL.UseProgram(pgmRedID);
                             GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
                             GL.UniformMatrix4(uniformProjMatrixRed, false, ref projMatrixData);
-                            GL.DrawArrays(PrimitiveType.Points, boneLinesVertexCount, jointPointsVertexCount);
+                            GL.DrawArrays(PrimitiveType.Lines, boneLinesVertexCount, jointPointsVertexCount);
                         }
 
-                        GL.LineWidth(1.0f);
-                        GL.PointSize(1.0f);
                         GL.Enable(EnableCap.DepthTest);
                     }
 
@@ -1543,6 +1542,9 @@ void main()
             previewMaterialMode = false;
             if (m_Mesh.m_VertexCount <= 0) return;
 
+            staticBonePositions = bonePositions;
+            staticParentIndices = parentIndices;
+
             int currentLoadId = ++meshLoadCounter;
             var avatarBonePositions = bonePositions;
             var m_Vertices = m_Mesh.m_Vertices;
@@ -1593,31 +1595,10 @@ void main()
                     for (int i = 0; i < normalizedBones.Length; i++)
                     {
                         ExpandBounds(normalizedBones[i], ref min, ref max);
-                        int pIdx = parentIndices[i];
-                        if (pIdx >= 0 && pIdx < normalizedBones.Length)
-                        {
-                            var a = normalizedBones[i];
-                            var b = normalizedBones[pIdx];
-                            int segments = 8;
-                            for (int s = 0; s < segments; s++)
-                            {
-                                if (s % 2 == 0)
-                                {
-                                    float t0 = (float)s / segments;
-                                    float t1 = (float)(s + 1) / segments;
-                                    skeletonVerts.Add(a + (b - a) * t0);
-                                    skeletonVerts.Add(a + (b - a) * t1);
-                                    boneLinesCount += 2;
-                                }
-                            }
-                        }
                     }
 
-                    for (int i = 0; i < normalizedBones.Length; i++)
-                    {
-                        skeletonVerts.Add(normalizedBones[i]);
-                        jointPointsCount++;
-                    }
+                    var verts = BuildSkeletonVertices(normalizedBones, parentIndices, out boneLinesCount, out jointPointsCount);
+                    skeletonVerts.AddRange(verts);
                 }
 
                 var localModelMatrixData = CreatePreviewModelMatrix(min, max);
@@ -1890,6 +1871,8 @@ void main()
             animCurrentFrame = 0;
             isAnimPlaying = false;
             animatedMeshVertices = null;
+            staticBonePositions = null;
+            staticParentIndices = null;
 
             lock (meshLock)
             {
@@ -1937,7 +1920,99 @@ void main()
             AnimationFrameChanged?.Invoke(animCurrentFrame, animationFrames.Length);
         }
 
-        private static Vector3[] BuildSkeletonVertices(Vector3[] bonePositions, int[] parentIndices, out int boneLinesCount, out int jointPointsCount)
+        private void UpdateSkeletonVertices()
+        {
+            Vector3[]? bones = null;
+            int[]? parents = null;
+
+            if (isAnimPlaying && animationFrames != null && animParentIndices != null && animCurrentFrame < animationFrames.Length)
+            {
+                bones = animationFrames[animCurrentFrame];
+                parents = animParentIndices;
+            }
+            else if (staticBonePositions != null && staticParentIndices != null)
+            {
+                bones = staticBonePositions;
+                parents = staticParentIndices;
+            }
+
+            if (bones != null && parents != null)
+            {
+                var skeletonVerts = BuildSkeletonVertices(bones, parents, out int boneLines, out int jointPoints);
+                boneLinesVertexCount = boneLines;
+                jointPointsVertexCount = jointPoints;
+                lock (skeletonLock)
+                {
+                    pendingSkeletonVertices = skeletonVerts;
+                }
+            }
+        }
+
+        private void AddOctahedronBone(List<Vector3> verts, Vector3 b, Vector3 a, float scale)
+        {
+            Vector3 v = a - b;
+            float len = v.Length;
+            if (len < 1e-5f) return;
+
+            Vector3 temp = Math.Abs(v.X) < Math.Abs(v.Y) ? Vector3.UnitX : Vector3.UnitY;
+            Vector3 u1 = Vector3.Normalize(Vector3.Cross(v, temp));
+            Vector3 u2 = Vector3.Normalize(Vector3.Cross(v, u1));
+
+            float thickness = Math.Min(len * 0.15f, 0.02f * scale);
+            if (thickness < 1e-5f) thickness = 1e-5f;
+
+            Vector3 c = b + v * 0.2f;
+
+            Vector3 p1 = c + u1 * thickness;
+            Vector3 p2 = c + u2 * thickness;
+            Vector3 p3 = c - u1 * thickness;
+            Vector3 p4 = c - u2 * thickness;
+
+            verts.Add(b); verts.Add(p1);
+            verts.Add(b); verts.Add(p2);
+            verts.Add(b); verts.Add(p3);
+            verts.Add(b); verts.Add(p4);
+
+            verts.Add(p1); verts.Add(p2);
+            verts.Add(p2); verts.Add(p3);
+            verts.Add(p3); verts.Add(p4);
+            verts.Add(p4); verts.Add(p1);
+
+            verts.Add(p1); verts.Add(a);
+            verts.Add(p2); verts.Add(a);
+            verts.Add(p3); verts.Add(a);
+            verts.Add(p4); verts.Add(a);
+        }
+
+        private void AddOctahedronJoint(List<Vector3> verts, Vector3 p, float scale)
+        {
+            float r = 0.005f * scale;
+            if (r < 1e-5f) r = 1e-5f;
+
+            Vector3 px1 = p + Vector3.UnitX * r;
+            Vector3 px2 = p - Vector3.UnitX * r;
+            Vector3 py1 = p + Vector3.UnitY * r;
+            Vector3 py2 = p - Vector3.UnitY * r;
+            Vector3 pz1 = p + Vector3.UnitZ * r;
+            Vector3 pz2 = p - Vector3.UnitZ * r;
+
+            verts.Add(px1); verts.Add(py1);
+            verts.Add(py1); verts.Add(px2);
+            verts.Add(px2); verts.Add(py2);
+            verts.Add(py2); verts.Add(px1);
+
+            verts.Add(px1); verts.Add(pz1);
+            verts.Add(py1); verts.Add(pz1);
+            verts.Add(px2); verts.Add(pz1);
+            verts.Add(py2); verts.Add(pz1);
+
+            verts.Add(px1); verts.Add(pz2);
+            verts.Add(py1); verts.Add(pz2);
+            verts.Add(px2); verts.Add(pz2);
+            verts.Add(py2); verts.Add(pz2);
+        }
+
+        private Vector3[] BuildSkeletonVertices(Vector3[] bonePositions, int[] parentIndices, out int boneLinesCount, out int jointPointsCount)
         {
             var skeletonVerts = new List<Vector3>();
             boneLinesCount = 0;
@@ -1950,25 +2025,15 @@ void main()
                 {
                     var a = bonePositions[i];
                     var b = bonePositions[pIdx];
-                    int segments = 8;
-                    for (int s = 0; s < segments; s++)
-                    {
-                        if (s % 2 == 0)
-                        {
-                            float t0 = (float)s / segments;
-                            float t1 = (float)(s + 1) / segments;
-                            skeletonVerts.Add(a + (b - a) * t0);
-                            skeletonVerts.Add(a + (b - a) * t1);
-                            boneLinesCount += 2;
-                        }
-                    }
+                    AddOctahedronBone(skeletonVerts, b, a, boneScale);
+                    boneLinesCount += 24;
                 }
             }
 
             for (int i = 0; i < bonePositions.Length; i++)
             {
-                skeletonVerts.Add(bonePositions[i]);
-                jointPointsCount++;
+                AddOctahedronJoint(skeletonVerts, bonePositions[i], boneScale);
+                jointPointsCount += 24;
             }
 
             return skeletonVerts.ToArray();
