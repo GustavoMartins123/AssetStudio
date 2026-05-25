@@ -10,6 +10,7 @@ namespace AssetStudio.Avalonia;
 public partial class MainWindow : Window
 {
     private TextAssetPreviewResult? currentTextAssetPreview;
+    private TextAssetPreviewMode currentPreviewMode = TextAssetPreviewMode.Cards;
 
     private enum TextAssetPreviewMode
     {
@@ -81,6 +82,8 @@ public partial class MainWindow : Window
         TextAssetDialogueScrollViewer.IsVisible = showCards;
         TextAssetDetailsTextBox.IsVisible = !showCards;
 
+        currentPreviewMode = mode;
+
         if (mode == TextAssetPreviewMode.Text)
         {
             SetTextWithTruncation(TextAssetDetailsTextBox, currentTextAssetPreview.PlainTextScript);
@@ -90,13 +93,19 @@ public partial class MainWindow : Window
             SetTextWithTruncation(TextAssetDetailsTextBox, currentTextAssetPreview.DetailsText);
         }
 
-        TextAssetCardsViewButton.Background = mode == TextAssetPreviewMode.Cards ? BrushFor("#34507A") : BrushFor("#252A31");
-        TextAssetDetailsViewButton.Background = mode == TextAssetPreviewMode.Text ? BrushFor("#34507A") : BrushFor("#252A31");
-        TextAssetInfoViewButton.Background = mode == TextAssetPreviewMode.Info ? BrushFor("#34507A") : BrushFor("#252A31");
+        bool isDark = ActualThemeVariant == global::Avalonia.Styling.ThemeVariant.Dark;
+        IBrush activeBg = BrushFor("#34507A");
+        IBrush activeFg = Brushes.White;
+        IBrush inactiveBg = isDark ? (IBrush)BrushFor("#252A31") : (IBrush)BrushFor("#E2E8F0");
+        IBrush inactiveFg = isDark ? Brushes.White : (IBrush)BrushFor("#2D3748");
 
-        TextAssetCardsViewButton.Foreground = Brushes.White;
-        TextAssetDetailsViewButton.Foreground = Brushes.White;
-        TextAssetInfoViewButton.Foreground = Brushes.White;
+        TextAssetCardsViewButton.Background = mode == TextAssetPreviewMode.Cards ? activeBg : inactiveBg;
+        TextAssetDetailsViewButton.Background = mode == TextAssetPreviewMode.Text ? activeBg : inactiveBg;
+        TextAssetInfoViewButton.Background = mode == TextAssetPreviewMode.Info ? activeBg : inactiveBg;
+
+        TextAssetCardsViewButton.Foreground = mode == TextAssetPreviewMode.Cards ? activeFg : inactiveFg;
+        TextAssetDetailsViewButton.Foreground = mode == TextAssetPreviewMode.Text ? activeFg : inactiveFg;
+        TextAssetInfoViewButton.Foreground = mode == TextAssetPreviewMode.Info ? activeFg : inactiveFg;
     }
 
     private void BuildTextAssetDialogueCards(TextAssetPreviewResult preview)
@@ -110,10 +119,12 @@ public partial class MainWindow : Window
 
     private Control CreateTextAssetDialogueCard(TextAssetDialogueCard card, int number)
     {
+        bool isDark = ActualThemeVariant == global::Avalonia.Styling.ThemeVariant.Dark;
+
         var border = new Border
         {
-            Background = BrushFor(card.Kind == "Note" ? "#23272E" : "#20242B"),
-            BorderBrush = BrushFor(card.Kind == "Note" ? "#5A6A7D" : "#46678E"),
+            Background = BrushFor(card.Kind == "Note" ? (isDark ? "#23272E" : "#F8FAFC") : (isDark ? "#20242B" : "#F1F5F9")),
+            BorderBrush = BrushFor(card.Kind == "Note" ? (isDark ? "#5A6A7D" : "#CBD5E1") : (isDark ? "#46678E" : "#94A3B8")),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
             Padding = new Thickness(12),
@@ -135,7 +146,7 @@ public partial class MainWindow : Window
         var title = new TextBlock
         {
             Text = BuildTextAssetCardTitle(card, number),
-            Foreground = Brushes.White,
+            Foreground = isDark ? Brushes.White : BrushFor("#1E293B"),
             FontSize = 13,
             FontWeight = FontWeight.SemiBold,
             TextWrapping = TextWrapping.Wrap
@@ -144,7 +155,7 @@ public partial class MainWindow : Window
         var metadata = new TextBlock
         {
             Text = $"0x{card.Offset.ToString("X6", CultureInfo.InvariantCulture)}",
-            Foreground = BrushFor("#8F9AA8"),
+            Foreground = isDark ? BrushFor("#8F9AA8") : BrushFor("#64748B"),
             FontFamily = new FontFamily("Consolas, Menlo, DejaVu Sans Mono, monospace"),
             FontSize = 11,
             Margin = new Thickness(12, 0, 0, 0),
@@ -158,7 +169,7 @@ public partial class MainWindow : Window
         var body = new TextBlock
         {
             Text = card.Text,
-            Foreground = BrushFor("#F1F5FA"),
+            Foreground = isDark ? BrushFor("#F1F5FA") : BrushFor("#0F172A"),
             FontSize = 16,
             LineHeight = 23,
             TextWrapping = TextWrapping.Wrap
@@ -168,7 +179,7 @@ public partial class MainWindow : Window
         var footer = new TextBlock
         {
             Text = BuildTextAssetCardFooter(card),
-            Foreground = BrushFor("#9DA8B5"),
+            Foreground = isDark ? BrushFor("#9DA8B5") : BrushFor("#475569"),
             FontSize = 11,
             TextWrapping = TextWrapping.Wrap
         };

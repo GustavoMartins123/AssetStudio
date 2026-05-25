@@ -4,8 +4,29 @@
              RequestedThemeVariant="Default">
              <!-- "Default" ThemeVariant follows system theme variant. "Dark" or "Light" are other available options. -->
 
+    <Application.Resources>
+        <StreamGeometry x:Key="icon_file">M4,2 A2,2 0 0,0 2,4 V20 A2,2 0 0,0 4,22 H16 A2,2 0 0,0 18,20 V8 L12,2 H4 M4,4 H11 V9 H16 V20 H4 V4 M12,4.5 L15.5,8 H12 V4.5 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_folder">M4,4 H9 L11,6 H20 A2,2 0 0,1 22,8 V18 A2,2 0 0,1 20,20 H4 A2,2 0 0,1 2,18 V6 A2,2 0 0,1 4,4 M4,6 V18 H20 V8 H10 L8,6 H4 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_extract">M12,2 A10,10 0 0,0 2,12 A10,10 0 0,0 12,22 A10,10 0 0,0 22,12 A10,10 0 0,0 12,2 M12,4 A8,8 0 0,1 20,12 A8,8 0 0,1 12,20 A8,8 0 0,1 4,12 A8,8 0 0,1 12,4 M11,8 V12 H8 L12,16 L16,12 H13 V8 H11 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_settings">M12,15.5 A3.5,3.5 0 0,1 8.5,12 A3.5,3.5 0 0,1 12,8.5 A3.5,3.5 0 0,1 15.5,12 A3.5,3.5 0 0,1 12,15.5 M19.43,12.97 C19.47,12.65 19.5,12.33 19.5,12 C19.5,11.67 19.47,11.34 19.43,11 L21.54,9.37 C21.73,9.22 21.78,8.95 21.66,8.73 L19.66,5.27 C19.54,5.05 19.27,4.97 19.05,5.05 L16.56,6.05 C16.04,5.66 15.47,5.34 14.86,5.08 L14.48,2.42 C14.44,2.18 14.24,2 14,2 H10 C9.76,2 9.56,2.18 9.52,2.42 L9.14,5.08 C8.53,5.34 7.96,5.66 7.44,6.05 L4.95,5.05 C4.73,4.97 4.46,5.05 4.34,5.27 L2.34,8.73 C2.21,8.95 2.27,9.22 2.46,9.37 L4.57,11 C4.53,11.34 4.5,11.67 4.5,12 C4.5,12.33 4.53,12.65 4.57,12.97 L2.46,14.63 C2.27,14.78 2.21,15.05 2.34,15.27 L4.34,18.73 C4.46,18.95 4.73,19.03 4.95,18.95 L7.44,17.95 C7.96,18.34 8.53,18.66 9.14,18.92 L9.52,21.58 C9.56,21.82 9.76,22 10,22 H14 C14.24,22 14.44,21.82 14.48,21.58 L14.86,18.92 C15.47,18.66 16.04,18.34 16.56,17.95 L19.05,18.95 C19.27,19.03 19.54,18.95 19.66,18.73 L21.66,15.27 C21.78,15.05 21.73,14.78 21.54,14.63 L19.43,12.97 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_eye">M12,9 A3,3 0 0,0 9,12 A3,3 0 0,0 12,15 A3,3 0 0,0 15,12 A3,3 0 0,0 12,9 M12,4.5 C7,4.5 2.73,7.61 1,12 C2.73,16.39 7,19.5 12,19.5 C17,19.5 21.27,16.39 23,12 C21.27,7.61 17,4.5 12,4.5 M12,17 A5,5 0 0,1 7,12 A5,5 0 0,1 12,7 A5,5 0 0,1 17,12 A5,5 0 0,1 12,17 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_preview">M21,16 C22.1,16 23,15.1 23,14 V4 C23,2.9 22.1,2 21,2 H3 C1.9,2 1,2.9 1,4 V14 C1,15.1 1.9,16 3,16 H10 V18 H8 V20 H16 V18 H14 V16 H21 M3,4 H21 V14 H3 V4 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_info">M11,9 H13 V7 H11 V9 M12,20 C7.59,20 4,16.41 4,12 C4,7.59 7.59,4 12,4 C16.41,4 20,7.59 20,12 C20,16.41 16.41,20 12,20 M12,2 A10,10 0 0,0 2,12 A10,10 0 0,0 12,22 A10,10 0 0,0 22,12 A10,10 0 0,0 12,2 M11,17 H13 V11 H11 V17 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_cube">M12,2 L2,7 V17 L12,22 L22,17 V7 L12,2 M12,4.1 L19.5,7.8 L12,11.5 L4.5,7.8 L12,4.1 M4,9.6 L11,13.1 V20.2 L4,16.7 V9.6 M20,9.6 V16.7 L13,20.2 V13.1 L20,9.6 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_export">M17,3 H5 A2,2 0 0,0 3,5 V19 A2,2 0 0,0 5,21 H19 A2,2 0 0,0 21,19 V7 L17,3 M12,19 A3,3 0 0,1 9,16 A3,3 0 0,1 12,13 A3,3 0 0,1 15,16 A3,3 0 0,1 12,19 M15,9 H5 V5 H15 V9 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_filter">M14,12 V19.88 C14.04,20.18 13.8,20.5 13.5,20.5 C13.38,20.5 13.26,20.45 13.18,20.37 L10.18,17.37 C10.07,17.26 10,17.11 10,16.96 V12 L3.2,4.4 C2.9,4.1 3,3.5 3.4,3.2 C3.58,3.06 3.79,3 4,3 H20 C20.55,3 21,3.45 21,4 C21,4.21 20.94,4.42 20.8,4.6 L14,12 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_debug">M20,8 H17.19 C16.74,7.22 16.12,6.55 15.37,6.04 L17,4.41 L15.59,3 L13.42,5.17 C12.96,5.06 12.49,5 12,5 C11.51,5 11.04,5.06 10.58,5.17 L8.41,3 L7,4.41 L8.62,6.04 C7.88,6.55 7.26,7.22 6.81,8 H4 V10 H6.09 C6.04,10.33 6,10.66 6,11 V12 H4 V14 H6 V15 C6,15.34 6.04,15.67 6.09,16 H4 V18 H6.81 C7.85,19.79 9.78,21 12,21 C14.22,21 16.15,19.79 17.19,18 H20 V16 H17.91 C17.96,15.67 18,15.34 18,15 V14 H20 V12 H18 V11 C18,10.66 17.96,10.33 17.91,10 H20 V8 M14,16 H10 V14 H14 V16 M14,12 H10 V10 H14 V12 Z</StreamGeometry>
+        <StreamGeometry x:Key="icon_theme">M12,18 C11.11,18 10.26,17.8 9.5,17.45 C11.56,16.5 13,14.42 13,12 C13,9.58 11.56,7.5 9.5,6.55 C10.26,6.2 11.11,6 12,6 A6,6 0 0,1 18,12 A6,6 0 0,1 12,18 M20,8.69 V4H15.31L12,0.69L8.69,4H4V8.69L0.69,12L4,15.31V20H8.69L12,23.31L15.31,20H20V15.31L23.31,12L20,8.69Z</StreamGeometry>
+    </Application.Resources>
+
     <Application.Styles>
         <FluentTheme />
         <StyleInclude Source="avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml"/>
+        <Style Selector="TextBlock">
+            <Setter Property="FontFamily" Value="Inter, Roboto, Segoe UI, -apple-system, sans-serif" />
+        </Style>
+        <Style Selector="TemplatedControl">
+            <Setter Property="FontFamily" Value="Inter, Roboto, Segoe UI, -apple-system, sans-serif" />
+        </Style>
     </Application.Styles>
 </Application>

@@ -13,62 +13,167 @@
     <DockPanel>
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="_File">
-                <MenuItem Header="Load file" Click="LoadFile_Click" />
-                <MenuItem Header="Load folder" Click="LoadFolder_Click" />
+                <MenuItem Header="Load file" Click="LoadFile_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Load folder" Click="LoadFolder_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
-                <MenuItem Header="Extract file" Click="ExtractFile_Click" />
-                <MenuItem Header="Extract folder" Click="ExtractFolder_Click" />
+                <MenuItem Header="Extract file" Click="ExtractFile_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Extract folder" Click="ExtractFolder_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Options">
-                <MenuItem x:Name="displayAll" Header="Display all assets" ToggleType="CheckBox" Click="DisplayAll_Click" />
-                <MenuItem x:Name="enablePreview" Header="Enable preview" ToggleType="CheckBox" IsChecked="True" Click="EnablePreview_Click" />
-                <MenuItem x:Name="displayInfo" Header="Display asset information" ToggleType="CheckBox" IsChecked="True" Click="DisplayInfo_Click" />
-                <MenuItem Header="Set project root..." Click="SetProjectRoot_Click" />
+                <MenuItem x:Name="displayAll" Header="Display all assets" ToggleType="CheckBox" Click="DisplayAll_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_eye}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="enablePreview" Header="Enable preview" ToggleType="CheckBox" IsChecked="True" Click="EnablePreview_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_preview}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="displayInfo" Header="Display asset information" ToggleType="CheckBox" IsChecked="True" Click="DisplayInfo_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Set project root..." Click="SetProjectRoot_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <MenuItem Header="Specify Unity version">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
+                    </MenuItem.Icon>
                     <TextBox x:Name="SpecifyUnityVersionTextBox" Width="140" PlaceholderText="2020.3.48f1" />
                 </MenuItem>
-                <MenuItem Header="Export options" Click="ShowExportOptions_Click" />
+                <MenuItem Header="Export options" Click="ShowExportOptions_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <Separator />
+                <MenuItem Header="Theme">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_theme}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                    <MenuItem x:Name="themeDefault" Header="System Default" ToggleType="Radio" GroupName="ThemeGroup" Click="ThemeDefault_Click" />
+                    <MenuItem x:Name="themeLight" Header="Light" ToggleType="Radio" GroupName="ThemeGroup" Click="ThemeLight_Click" />
+                    <MenuItem x:Name="themeDark" Header="Dark" ToggleType="Radio" GroupName="ThemeGroup" Click="ThemeDark_Click" />
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Model">
-                <MenuItem Header="Export all objects (split)" Click="ExportAllObjectsSplit_Click" />
-                <MenuItem Header="Export selected objects (split)" Click="ExportSelectedObjectsSplit_Click" />
-                <MenuItem Header="Export selected objects (split) + selected AnimationClips" Click="ExportSelectedObjectsSplitWithAnimationClip_Click" />
+                <MenuItem Header="Export all objects (split)" Click="ExportAllObjectsSplit_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Export selected objects (split)" Click="ExportSelectedObjectsSplit_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Export selected objects (split) + selected AnimationClips" Click="ExportSelectedObjectsSplitWithAnimationClip_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
-                <MenuItem Header="Export selected objects (merge)" Click="ExportSelectedObjectsMerge_Click" />
-                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" Click="ExportSelectedObjectsMergeWithAnimationClip_Click" />
+                <MenuItem Header="Export selected objects (merge)" Click="ExportSelectedObjectsMerge_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" Click="ExportSelectedObjectsMergeWithAnimationClip_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Export">
-                <MenuItem Header="All assets" Click="ExportAllAssets_Click" />
-                <MenuItem Header="Selected assets" Click="ExportSelectedAssets_Click" />
-                <MenuItem Header="Filtered assets" Click="ExportFilteredAssets_Click" />
+                <MenuItem Header="All assets" Click="ExportAllAssets_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Selected assets" Click="ExportSelectedAssets_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem Header="Filtered assets" Click="ExportFilteredAssets_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
-                <MenuItem Header="Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click" />
+                <MenuItem Header="Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
                 <MenuItem Header="Raw">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
                     <MenuItem Header="All assets" Click="ExportAllAssetsRaw_Click" />
                     <MenuItem Header="Selected assets" Click="ExportSelectedAssetsRaw_Click" />
                     <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsRaw_Click" />
                 </MenuItem>
                 <MenuItem Header="Dump">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
+                    </MenuItem.Icon>
                     <MenuItem Header="All assets" Click="ExportAllAssetsDump_Click" />
                     <MenuItem Header="Selected assets" Click="ExportSelectedAssetsDump_Click" />
                     <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsDump_Click" />
                 </MenuItem>
                 <Separator />
                 <MenuItem Header="Asset list to XML">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
+                    </MenuItem.Icon>
                     <MenuItem Header="All assets" Click="ExportAllAssetsXML_Click" />
                     <MenuItem Header="Selected assets" Click="ExportSelectedAssetsXML_Click" />
                     <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsXML_Click" />
                 </MenuItem>
                 <Separator />
-                <MenuItem Header="Error log" Click="ExportErrorLog_Click" />
+                <MenuItem Header="Error log" Click="ExportErrorLog_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem x:Name="filterTypeMenu" Header="Filter _Type">
                 <MenuItem x:Name="filterTypeAll" Header="All" ToggleType="CheckBox" IsChecked="True" Click="FilterTypeAll_Click" />
             </MenuItem>
             <MenuItem Header="_Debug">
-                <MenuItem x:Name="showErrorMessageMenu" Header="Show error message" ToggleType="CheckBox" Click="ShowErrorMessage_Click" />
-                <MenuItem x:Name="exportClassStructuresMenu" Header="Export class structures" Click="ExportClassStructures_Click" />
+                <MenuItem x:Name="showErrorMessageMenu" Header="Show error message" ToggleType="CheckBox" Click="ShowErrorMessage_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_debug}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="exportClassStructuresMenu" Header="Export class structures" Click="ExportClassStructures_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_debug}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
         </Menu>
 
@@ -151,19 +256,19 @@
                 </TabItem>
             </TabControl>
 
-            <GridSplitter Grid.Column="1" Background="#444" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
+            <GridSplitter Grid.Column="1" Background="{DynamicResource SystemControlBorderBackgroundBrush}" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
 
             <TabControl x:Name="RightTabControl" Grid.Column="2" Margin="2" SelectionChanged="RightTabControl_SelectionChanged">
                 <TabItem Header="Preview">
-                    <Panel Background="#222">
+                    <Panel Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
-                        <Border x:Name="TextAssetPreviewPanel" Background="#222" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False">
+                        <Border x:Name="TextAssetPreviewPanel" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False">
                             <Grid RowDefinitions="Auto,*">
-                                <Border Grid.Row="0" Background="#E01B1D22" BorderBrush="#333942" BorderThickness="0,0,0,1" Padding="12,8">
+                                <Border Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="12,8">
                                     <Grid ColumnDefinitions="*,Auto">
                                         <StackPanel Spacing="2">
-                                            <TextBlock x:Name="TextAssetPreviewTitle" Text="TextAsset" Foreground="White" FontSize="14" FontWeight="SemiBold" />
-                                            <TextBlock x:Name="TextAssetPreviewSubtitle" Text="" Foreground="#AEB7C2" FontSize="11" />
+                                            <TextBlock x:Name="TextAssetPreviewTitle" Text="TextAsset" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="14" FontWeight="SemiBold" />
+                                            <TextBlock x:Name="TextAssetPreviewSubtitle" Text="" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="11" />
                                         </StackPanel>
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                                             <Button x:Name="TextAssetCardsViewButton" Content="Cards" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetCardsViewButton_Click" />
@@ -180,7 +285,7 @@
                                 </Grid>
                             </Grid>
                         </Border>
-                        <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="White" />
+                        <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
                         <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
                         <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True" />
                         <local:TextureGLPreviewControl x:Name="TextureGLPreview" IsVisible="False" Focusable="True" />
@@ -231,16 +336,16 @@
                             </StackPanel>
                         </Border>
 
-                        <Border x:Name="FMODPanel" Background="#E01E1E24" BorderBrush="#44ffffff" BorderThickness="1" CornerRadius="12" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="450" IsVisible="False">
+                        <Border x:Name="FMODPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="12" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="450" IsVisible="False">
                             <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="FMODTitleLabel" Text="Audio Player" Foreground="White" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="FMODTitleLabel" Text="Audio Player" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
                                     <TextBlock x:Name="FMODstatusLabel" Grid.Column="1" Text="Stopped" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
                                 <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="FMODinfoLabel" Text="44100 Hz" Foreground="#B0B0B0" FontSize="12" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="FMODtimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="White" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="FMODinfoLabel" Text="44100 Hz" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="FMODtimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
                                 <Slider x:Name="FMODprogressBar" Grid.Row="2" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32" 
@@ -250,9 +355,9 @@
                                     <Button x:Name="FMODplayButton" Grid.Column="0" Content="Play" Click="FMODplayButton_Click" Width="55" HorizontalContentAlignment="Center"/>
                                     <Button x:Name="FMODpauseButton" Grid.Column="1" Content="Pause" Click="FMODpauseButton_Click" Width="65" HorizontalContentAlignment="Center"/>
                                     <Button x:Name="FMODstopButton" Grid.Column="2" Content="Stop" Click="FMODstopButton_Click" Width="55" HorizontalContentAlignment="Center"/>
-                                    <CheckBox x:Name="FMODloopButton" Grid.Column="3" Content="Loop" Click="FMODloopButton_Click" Foreground="White" VerticalAlignment="Center" Margin="6,0,0,0"/>
+                                    <CheckBox x:Name="FMODloopButton" Grid.Column="3" Content="Loop" Click="FMODloopButton_Click" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="6,0,0,0"/>
                                     
-                                    <TextBlock Grid.Column="5" Text="Vol" Foreground="White" VerticalAlignment="Center" Margin="4,0,0,0" FontSize="11"/>
+                                    <TextBlock Grid.Column="5" Text="Vol" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="4,0,0,0" FontSize="11"/>
                                     <Slider x:Name="FMODvolumeBar" Grid.Column="6" Minimum="0" Maximum="10" Value="8" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="FMODvolumeBar_ValueChanged"/>
                                 </Grid>
                             </Grid>

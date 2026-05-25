@@ -72,6 +72,7 @@ public partial class MainWindow : Window
     {
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
+        InitializeTheme();
         try
         {
             using var iconStream = AssetLoader.Open(new Uri("avares://AssetStudio.Avalonia/Assets/as.png"));
@@ -6418,6 +6419,7 @@ public sealed class AvaloniaAppSettings
     public bool DisplayInfo { get; set; } = true;
     public bool EnablePreview { get; set; } = true;
     public ExportOptionsState ExportOptions { get; set; } = new();
+    public string SelectedTheme { get; set; } = "Default";
 
     public static AvaloniaAppSettings Load()
     {
