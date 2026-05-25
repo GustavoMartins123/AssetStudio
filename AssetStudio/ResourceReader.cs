@@ -86,6 +86,21 @@ namespace AssetStudio
                 return path;
             }
 
+            if (Path.IsPathRooted(path))
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (dir != null && Directory.Exists(dir))
+                {
+                    var file = Path.GetFileName(path);
+                    var matchedFile = Directory.EnumerateFiles(dir)
+                        .FirstOrDefault(f => string.Equals(Path.GetFileName(f), file, StringComparison.OrdinalIgnoreCase));
+                    if (matchedFile != null)
+                    {
+                        return matchedFile;
+                    }
+                }
+            }
+
             foreach (var root in GetSearchRoots())
             {
                 var directPath = Path.Combine(root, path);
@@ -100,21 +115,49 @@ namespace AssetStudio
                     return resourceFilePath;
                 }
 
-                var findFiles = Directory.GetFiles(root, resourceFileName, SearchOption.AllDirectories);
-                var suffixMatches = findFiles
-                    .Where(x => NormalizePath(x).EndsWith(normalizedPath, StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
-                if (suffixMatches.Length == 1)
+                var directDir = Path.GetDirectoryName(directPath);
+                if (directDir != null && Directory.Exists(directDir))
                 {
-                    return suffixMatches[0];
+                    var fileToFind = Path.GetFileName(directPath);
+                    var matchedFile = Directory.EnumerateFiles(directDir)
+                        .FirstOrDefault(f => string.Equals(Path.GetFileName(f), fileToFind, StringComparison.OrdinalIgnoreCase));
+                    if (matchedFile != null)
+                    {
+                        return matchedFile;
+                    }
                 }
-                if (suffixMatches.Length > 1)
+
+                if (Directory.Exists(root))
                 {
-                    throw new IOException($"Found multiple resource files matching {path}");
+                    var matchedFile = Directory.EnumerateFiles(root)
+                        .FirstOrDefault(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase));
+                    if (matchedFile != null)
+                    {
+                        return matchedFile;
+                    }
                 }
-                if (findFiles.Length == 1)
+
+                if (Directory.Exists(root))
                 {
-                    return findFiles[0];
+                    var findFiles = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                        .Where(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+
+                    var suffixMatches = findFiles
+                        .Where(x => NormalizePath(x).EndsWith(normalizedPath, StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                    if (suffixMatches.Length == 1)
+                    {
+                        return suffixMatches[0];
+                    }
+                    if (suffixMatches.Length > 1)
+                    {
+                        throw new IOException($"Found multiple resource files matching {path}");
+                    }
+                    if (findFiles.Length == 1)
+                    {
+                        return findFiles[0];
+                    }
                 }
             }
 

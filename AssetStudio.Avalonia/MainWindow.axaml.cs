@@ -9,6 +9,7 @@ using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using System.Diagnostics;
 using AssetStudio;
+using AssetStudio.PInvoke;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -5964,6 +5965,9 @@ public partial class MainWindow : Window
         try
         {
             FMODreset();
+
+            // Preload platform-specific FMOD native library (handling x64/x86 and Linux/Windows/macOS differences)
+            DllLoader.PreloadDll("fmod");
 
             var result = FMOD.Factory.System_Create(out fmodSystem);
             if (ERRCHECK(result)) { return; }
