@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -42,6 +42,16 @@ namespace AssetStudio
         public void Reset()
         {
             Position = byteStart;
+        }
+
+        public new byte[] ReadBytes(int count)
+        {
+            long remaining = byteSize - (Position - byteStart);
+            if (count < 0 || count > remaining)
+            {
+                throw new EndOfStreamException($"Trying to allocate {count} bytes, but only {remaining} bytes remain in the object.");
+            }
+            return base.ReadBytes(count);
         }
     }
 }

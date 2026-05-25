@@ -320,7 +320,7 @@ namespace AssetStudio
                             // create a new stream
                             // - to store the deflated stream in
                             // - to keep the data for later extraction
-                            Stream streamReader = new MemoryStream();
+                            Stream streamReader = new MemoryStream((int)entry.Length);
                             using (Stream entryStream = entry.Open())
                             {
                                 entryStream.CopyTo(streamReader);
@@ -510,22 +510,21 @@ namespace AssetStudio
                             }
                         }
 
-                        // Dump raw bytes for debugging Unity 6 formats
+                        // TODO: REMOVE LATER - Hex dump for Unity 6 debugging only
                         try
                         {
                             objectReader.Reset(); // go back to start
-                            var rawBytes = objectReader.ReadBytes((int)objectInfo.byteSize);
+                            int bytesToRead = Math.Min((int)objectInfo.byteSize, 1024);
+                            var rawBytes = objectReader.ReadBytes(bytesToRead);
                             var hexDump = BitConverter.ToString(rawBytes).Replace("-", " ");
-                            sb.AppendLine("Raw Object Bytes:");
-                            
-                            // limit to 1024 bytes to avoid giant logs
-                            int maxLength = Math.Min(hexDump.Length, 1024 * 3); 
-                            sb.AppendLine(hexDump.Substring(0, maxLength));
+                            sb.AppendLine($"Raw Object Bytes (first {bytesToRead} bytes):");
+                            sb.AppendLine(hexDump);
                         }
                         catch (Exception ex2)
                         {
                             sb.AppendLine($"Failed to dump bytes: {ex2.Message}");
                         }
+                        // END TODO: REMOVE LATER
 
                         sb.Append(e);
                         Logger.Error(sb.ToString());

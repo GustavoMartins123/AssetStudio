@@ -69,6 +69,9 @@ public partial class MainWindow : Window
     private bool fmodIsDragging = false;
     private byte[]? currentAudioData;
 
+    private string? _pendingStatusText;
+    private bool _statusUpdatePending;
+
     public MainWindow()
     {
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
@@ -183,7 +186,16 @@ public partial class MainWindow : Window
 
     private void StatusStripUpdate(string text)
     {
-        Dispatcher.UIThread.Post(() => statusLabel.Text = text);
+        _pendingStatusText = text;
+        if (!_statusUpdatePending)
+        {
+            _statusUpdatePending = true;
+            Dispatcher.UIThread.Post(() =>
+            {
+                statusLabel.Text = _pendingStatusText;
+                _statusUpdatePending = false;
+            }, DispatcherPriority.Background);
+        }
     }
 
     private void SetProgressBarValue(int value)

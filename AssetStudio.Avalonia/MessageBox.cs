@@ -4,6 +4,7 @@ using Avalonia.Input.Platform;
 using Avalonia.Layout;
 using Avalonia.Threading;
 using System;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
@@ -14,9 +15,10 @@ public class MessageBox : Window
     private static readonly object _lock = new object();
     private static int _errorCount = 1;
 
-    private readonly TextBlock _textBlock;
-    private readonly ScrollViewer _scrollViewer;
+    private readonly TextBox _textBox;
     private readonly Button _button;
+    private readonly StringBuilder _contentBuilder = new();
+    private bool _updatePending = false;
 
     public MessageBox(string text, string title = "Message")
     {
@@ -36,20 +38,19 @@ public class MessageBox : Window
             RowSpacing = 15
         };
 
-        _textBlock = new TextBlock
+        _contentBuilder.Append(text);
+
+        _textBox = new TextBox
         {
             Text = text,
+            IsReadOnly = true,
             TextWrapping = global::Avalonia.Media.TextWrapping.Wrap,
+            AcceptsReturn = true,
             HorizontalAlignment = HorizontalAlignment.Stretch,
-            VerticalAlignment = VerticalAlignment.Top
-        };
-
-        _scrollViewer = new ScrollViewer
-        {
-            Content = _textBlock,
-            VerticalScrollBarVisibility = global::Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
-            HorizontalScrollBarVisibility = global::Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
-            MaxHeight = 350
+            VerticalAlignment = VerticalAlignment.Stretch,
+            MaxHeight = 350,
+            FontFamily = global::Avalonia.Media.FontFamily.Default,
+            FontSize = 13
         };
 
         var buttonPanel = new StackPanel
@@ -72,7 +73,7 @@ public class MessageBox : Window
             var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
             if (clipboard != null)
             {
-                await clipboard.SetTextAsync(_textBlock.Text);
+                await clipboard.SetTextAsync(_textBox.Text);
             }
         };
 
@@ -89,10 +90,10 @@ public class MessageBox : Window
         buttonPanel.Children.Add(copyButton);
         buttonPanel.Children.Add(_button);
 
-        Grid.SetRow(_scrollViewer, 0);
+        Grid.SetRow(_textBox, 0);
         Grid.SetRow(buttonPanel, 1);
 
-        grid.Children.Add(_scrollViewer);
+        grid.Children.Add(_textBox);
         grid.Children.Add(buttonPanel);
 
         Content = grid;
@@ -113,11 +114,23 @@ public class MessageBox : Window
     public void AppendMessage(string message)
     {
         _errorCount++;
-        _textBlock.Text += $"\n\n-----------------------------------------\n\nError {_errorCount}:\n{message}";
-        
-        Dispatcher.UIThread.Post(() => _scrollViewer.ScrollToEnd());
-        
+        _contentBuilder.Append($"\n\n-----------------------------------------\n\nError {_errorCount}:\n{message}");
         Title = $"Errors ({_errorCount})";
+        ScheduleUIUpdate();
+    }
+
+    private void ScheduleUIUpdate()
+    {
+        if (!_updatePending)
+        {
+            _updatePending = true;
+            Dispatcher.UIThread.Post(() =>
+            {
+                _textBox.Text = _contentBuilder.ToString();
+                _textBox.CaretIndex = _textBox.Text?.Length ?? 0;
+                _updatePending = false;
+            }, DispatcherPriority.Background);
+        }
     }
 
     public static void Show(Window? owner, string text, string title = "Message")

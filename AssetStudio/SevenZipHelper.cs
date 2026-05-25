@@ -12,8 +12,7 @@ namespace AssetStudio
             var decoder = new Decoder();
 
             inStream.Seek(0, SeekOrigin.Begin);
-            var newOutStream = new MemoryStream();
-
+            
             var properties = new byte[5];
             if (inStream.Read(properties, 0, 5) != 5)
                 throw new Exception("input .lzma is too short");
@@ -28,6 +27,7 @@ namespace AssetStudio
             decoder.SetDecoderProperties(properties);
 
             var compressedSize = inStream.Length - inStream.Position;
+            var newOutStream = new MemoryStream((int)outSize);
             decoder.Code(inStream, newOutStream, compressedSize, outSize, null);
 
             newOutStream.Position = 0;

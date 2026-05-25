@@ -3,6 +3,8 @@ using Avalonia.Controls;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia
 {
@@ -13,6 +15,9 @@ namespace AssetStudio.Avalonia
         private readonly List<(LoggerEvent Event, string Message)> messages = new List<(LoggerEvent Event, string Message)>();
         private readonly object messagesLock = new object();
         private readonly Window? owner;
+
+        private int _pendingErrorCount;
+        private int _errorStatusPending;
 
         public GUILogger(Action<string> action, Window? owner = null)
         {
@@ -30,10 +35,7 @@ namespace AssetStudio.Avalonia
                     {
                         MessageBox.Show(owner, message, "Error");
                     }
-                    else
-                    {
-                        action("Error logged. Export errors.txt to inspect details.");
-                    }
+                    ScheduleErrorStatusUpdate();
                     break;
                 case LoggerEvent.Warning:
                     AddMessage(loggerEvent, message);
@@ -42,6 +44,20 @@ namespace AssetStudio.Avalonia
                 default:
                     action(message);
                     break;
+            }
+        }
+
+        private void ScheduleErrorStatusUpdate()
+        {
+            Interlocked.Increment(ref _pendingErrorCount);
+            if (Interlocked.CompareExchange(ref _errorStatusPending, 1, 0) == 0)
+            {
+                Task.Delay(200).ContinueWith(_ =>
+                {
+                    var count = Interlocked.Exchange(ref _pendingErrorCount, 0);
+                    Interlocked.Exchange(ref _errorStatusPending, 0);
+                    action($"Error logged ({count} new). Export errors.txt to inspect details.");
+                }, TaskScheduler.Default);
             }
         }
 
@@ -70,6 +86,7 @@ namespace AssetStudio.Avalonia
             {
                 messages.Clear();
             }
+            Interlocked.Exchange(ref _pendingErrorCount, 0);
         }
     }
 }

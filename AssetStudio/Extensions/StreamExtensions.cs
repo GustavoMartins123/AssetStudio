@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 
 namespace AssetStudio
 {
@@ -8,16 +8,23 @@ namespace AssetStudio
 
         public static void CopyTo(this Stream source, Stream destination, long size)
         {
-            var buffer = new byte[BufferSize];
-            for (var left = size; left > 0; left -= BufferSize)
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(BufferSize);
+            try
             {
-                int toRead = BufferSize < left ? BufferSize : (int)left;
-                int read = source.Read(buffer, 0, toRead);
-                destination.Write(buffer, 0, read);
-                if (read != toRead)
+                for (var left = size; left > 0; left -= BufferSize)
                 {
-                    return;
+                    int toRead = BufferSize < left ? BufferSize : (int)left;
+                    int read = source.Read(buffer, 0, toRead);
+                    destination.Write(buffer, 0, read);
+                    if (read != toRead)
+                    {
+                        return;
+                    }
                 }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
             }
         }
     }

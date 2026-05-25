@@ -82,12 +82,24 @@ namespace AssetStudio
             return new Matrix4x4(reader.ReadSingleArray(16));
         }
 
-        private static T[] ReadArray<T>(Func<T> del, int length)
+        private static T[] ReadArray<T>(this BinaryReader reader, Func<T> del, int length)
         {
             if (length < 0 || length > 10000000)
             {
                 throw new OverflowException($"Invalid array length: {length}");
             }
+
+            long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
+            if (length > remainingStream)
+                throw new EndOfStreamException($"Array length {length} exceeds remaining stream length {remainingStream}");
+
+            if (reader is ObjectReader objReader)
+            {
+                long remainingObj = objReader.byteSize - (objReader.Position - objReader.byteStart);
+                if (length > remainingObj)
+                    throw new EndOfStreamException($"Array length {length} exceeds remaining object size {remainingObj}");
+            }
+
             var array = new T[length];
             for (int i = 0; i < length; i++)
             {
@@ -96,74 +108,87 @@ namespace AssetStudio
             return array;
         }
 
-        public static bool[] ReadBooleanArray(this BinaryReader reader)
-        {
-            return ReadArray(reader.ReadBoolean, reader.ReadInt32());
-        }
 
         public static byte[] ReadUInt8Array(this BinaryReader reader)
         {
-            return reader.ReadBytes(reader.ReadInt32());
+            int count = reader.ReadInt32();
+            if (count < 0) throw new OverflowException($"Invalid array length: {count}");
+
+            long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
+            if (count > remainingStream) throw new EndOfStreamException($"Array length {count} exceeds remaining stream length {remainingStream}");
+
+            if (reader is ObjectReader objReader)
+            {
+                long remainingObj = objReader.byteSize - (objReader.Position - objReader.byteStart);
+                if (count > remainingObj) throw new EndOfStreamException($"Array length {count} exceeds remaining object size {remainingObj}");
+            }
+
+            return reader.ReadBytes(count);
+        }
+
+        public static bool[] ReadBooleanArray(this BinaryReader reader)
+        {
+            return reader.ReadArray(reader.ReadBoolean, reader.ReadInt32());
         }
 
         public static ushort[] ReadUInt16Array(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadUInt16, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadUInt16, reader.ReadInt32());
         }
 
         public static int[] ReadInt32Array(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadInt32, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadInt32, reader.ReadInt32());
         }
 
         public static int[] ReadInt32Array(this BinaryReader reader, int length)
         {
-            return ReadArray(reader.ReadInt32, length);
+            return reader.ReadArray(reader.ReadInt32, length);
         }
 
         public static uint[] ReadUInt32Array(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadUInt32, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadUInt32, reader.ReadInt32());
         }
 
         public static uint[][] ReadUInt32ArrayArray(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadUInt32Array, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadUInt32Array, reader.ReadInt32());
         }
 
         public static uint[] ReadUInt32Array(this BinaryReader reader, int length)
         {
-            return ReadArray(reader.ReadUInt32, length);
+            return reader.ReadArray(reader.ReadUInt32, length);
         }
 
         public static float[] ReadSingleArray(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadSingle, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadSingle, reader.ReadInt32());
         }
 
         public static float[] ReadSingleArray(this BinaryReader reader, int length)
         {
-            return ReadArray(reader.ReadSingle, length);
+            return reader.ReadArray(reader.ReadSingle, length);
         }
 
         public static string[] ReadStringArray(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadAlignedString, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadAlignedString, reader.ReadInt32());
         }
 
         public static Vector2[] ReadVector2Array(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadVector2, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadVector2, reader.ReadInt32());
         }
 
         public static Vector4[] ReadVector4Array(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadVector4, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadVector4, reader.ReadInt32());
         }
 
         public static Matrix4x4[] ReadMatrixArray(this BinaryReader reader)
         {
-            return ReadArray(reader.ReadMatrix, reader.ReadInt32());
+            return reader.ReadArray(reader.ReadMatrix, reader.ReadInt32());
         }
     }
 }
