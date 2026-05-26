@@ -75,6 +75,12 @@ public partial class MainWindow : Window
     private bool _videoIsDragging = false;
     private string? _currentTempVideoPath;
 
+    [DllImport("libdl.so.2", EntryPoint = "dlopen")]
+    private static extern IntPtr DlOpen([MarshalAs(UnmanagedType.LPStr)] string fileName, int flags);
+
+    [DllImport("libc.so.6", EntryPoint = "setenv", SetLastError = true)]
+    private static extern int SetEnv([MarshalAs(UnmanagedType.LPStr)] string name, [MarshalAs(UnmanagedType.LPStr)] string value, int overwrite);
+
     private string? _pendingStatusText;
     private bool _statusUpdatePending;
 
@@ -111,16 +117,50 @@ public partial class MainWindow : Window
 
         try
         {
-            FMODinit();
-        }
-        catch (Exception ex)
-        {
-            logger.Log(LoggerEvent.Error, $"Failed to initialize FMOD: {ex.Message}");
-        }
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                var libDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "x64");
+                var libVlcPath = Path.Combine(libDir, "libvlc.so");
+                var libVlcCorePath = Path.Combine(libDir, "libvlccore.so");
+                var pluginsPath = Path.Combine(libDir, "plugins");
 
-        try
-        {
-            LibVLCSharp.Shared.Core.Initialize();
+                if (File.Exists(libVlcPath) && File.Exists(libVlcCorePath))
+                {
+                    try
+                    {
+                        SetEnv("VLC_PLUGIN_PATH", pluginsPath, 1);
+
+                        NativeLibrary.SetDllImportResolver(typeof(LibVLCSharp.Shared.LibVLC).Assembly, (libraryName, assembly, searchPath) =>
+                        {
+                            if (libraryName == "libvlc")
+                            {
+                                try
+                                {
+                                    DlOpen(libVlcCorePath, 0x102); // 0x2 (RTLD_NOW) | 0x100 (RTLD_GLOBAL)
+                                    var handle = DlOpen(libVlcPath, 0x102);
+                                    if (handle != IntPtr.Zero)
+                                    {
+                                        return handle;
+                                    }
+                                }
+                                catch { }
+                            }
+                            return IntPtr.Zero;
+                        });
+                    }
+                    catch (Exception initEx)
+                    {
+                        logger.Log(LoggerEvent.Warning, $"Failed to setup bundled LibVLC resolver: {initEx.Message}. Falling back to system VLC.");
+                    }
+                }
+
+                LibVLCSharp.Shared.Core.Initialize();
+            }
+            else
+            {
+                LibVLCSharp.Shared.Core.Initialize();
+            }
+
             _libVLC = new LibVLCSharp.Shared.LibVLC();
             _mediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
             _mediaPlayer.EndReached += MediaPlayer_EndReached;
@@ -130,7 +170,40 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            logger.Log(LoggerEvent.Error, $"Failed to initialize LibVLC: {ex.Message}. Embedded video preview will be disabled.");
+            var message = $"Failed to initialize LibVLC: {ex.Message}. Embedded video preview will be disabled.";
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                message += " Hint: Ensure system VLC is installed using: sudo apt install vlc libvlc-dev";
+            }
+            logger.Log(LoggerEvent.Error, message);
+        }
+
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                NativeLibrary.SetDllImportResolver(typeof(FMOD.System).Assembly, (libraryName, assembly, searchPath) =>
+                {
+                    if (libraryName == "fmod" || libraryName == "fmod64")
+                    {
+                        var libDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "x64");
+                        var libFmodPath = Path.Combine(libDir, "libfmod.so");
+                        if (File.Exists(libFmodPath))
+                        {
+                            if (NativeLibrary.TryLoad(libFmodPath, out var handle))
+                            {
+                                return handle;
+                            }
+                        }
+                    }
+                    return IntPtr.Zero;
+                });
+            }
+            FMODinit();
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Failed to initialize FMOD: {ex.Message}");
         }
 
         // Detect GPU support (OpenGL interface availability)

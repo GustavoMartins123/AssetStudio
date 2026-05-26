@@ -17,7 +17,7 @@ namespace FMOD
     */
     public class VERSION
     {
-        public const int    number = 0x00010716;
+        public const int    number = 0x00020300;
 #if WIN64
         public const string dll    = "fmod64";
 #else
@@ -1601,7 +1601,8 @@ namespace FMOD
             RESULT result   = RESULT.OK;
             IntPtr rawPtr   = new IntPtr();
 
-            result = FMOD_System_Create(out rawPtr);
+            result = FMOD_System_Create(out rawPtr, VERSION.number);
+
             if (result != RESULT.OK)
             {
                 return result;
@@ -1616,7 +1617,7 @@ namespace FMOD
         #region importfunctions
 
         [DllImport(VERSION.dll)]
-        private static extern RESULT FMOD_System_Create                      (out IntPtr system);
+        private static extern RESULT FMOD_System_Create                      (out IntPtr system, uint headerversion);
 
         #endregion
     }

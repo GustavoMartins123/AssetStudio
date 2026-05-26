@@ -40,6 +40,17 @@
     <AvaloniaResource Include="Assets\as.png" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="Libraries\x64\**\*">
+      <Link>x64\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="Libraries\x86\**\*">
+      <Link>x86\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
   <Target Name="CopyExtraFiles" AfterTargets="AfterBuild">
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll')" />
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll')" />
