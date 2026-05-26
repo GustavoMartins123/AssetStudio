@@ -59,10 +59,10 @@ public partial class MainWindow : Window
     private List<Material>? allMaterialsCache;
     private Dictionary<AssetStudio.Object, AssetItem>? objectToAssetItemCache;
 
-    private FMOD.System? fmodSystem;
-    private FMOD.Sound? fmodSound;
-    private FMOD.Channel? fmodChannel;
-    private FMOD.SoundGroup? fmodMasterSoundGroup;
+    private FMOD.System fmodSystem;
+    private FMOD.Sound fmodSound;
+    private FMOD.Channel fmodChannel;
+    private FMOD.SoundGroup fmodMasterSoundGroup;
     private FMOD.MODE fmodLoopMode = FMOD.MODE.LOOP_OFF;
     private uint fmodLenMs;
     private float fmodVolume = 0.8f;
@@ -6158,10 +6158,10 @@ public partial class MainWindow : Window
     protected override void OnClosing(WindowClosingEventArgs e)
     {
         FMODreset();
-        if (fmodSystem != null)
+        if (fmodSystem.hasHandle())
         {
             fmodSystem.release();
-            fmodSystem = null;
+            fmodSystem.clearHandle();
         }
         VideoReset();
         _mediaPlayer?.Dispose();
@@ -6217,7 +6217,7 @@ public partial class MainWindow : Window
         bool playing = false;
         bool paused = false;
 
-        if (fmodChannel != null)
+        if (fmodChannel.hasHandle())
         {
             var result = fmodChannel.getPosition(out ms, FMOD.TIMEUNIT.MS);
             if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
@@ -6245,7 +6245,7 @@ public partial class MainWindow : Window
         }
         FMODstatusLabel.Text = paused ? "Paused" : playing ? "Playing" : "Stopped";
 
-        if (fmodSystem != null && fmodChannel != null)
+        if (fmodSystem.hasHandle() && fmodChannel.hasHandle())
         {
             fmodSystem.update();
         }
@@ -6259,18 +6259,18 @@ public partial class MainWindow : Window
         if (FMODstatusLabel != null) FMODstatusLabel.Text = "Stopped";
         if (FMODinfoLabel != null) FMODinfoLabel.Text = "";
 
-        if (fmodSound != null && fmodSound.isValid())
+        if (fmodSound.hasHandle())
         {
             var result = fmodSound.release();
             ERRCHECK(result);
-            fmodSound = null;
+            fmodSound.clearHandle();
         }
         currentAudioData = null;
     }
 
     private void FMODplayButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (fmodSound != null && fmodChannel != null && fmodSystem != null)
+        if (fmodSound.hasHandle() && fmodChannel.hasHandle() && fmodSystem.hasHandle())
         {
             fmodTimer?.Start();
             var result = fmodChannel.isPlaying(out var playing);
@@ -6284,14 +6284,14 @@ public partial class MainWindow : Window
                 result = fmodChannel.stop();
                 if (ERRCHECK(result)) { return; }
 
-                result = fmodSystem.playSound(fmodSound, null, false, out fmodChannel);
+                result = fmodSystem.playSound(fmodSound, default, false, out fmodChannel);
                 if (ERRCHECK(result)) { return; }
 
                 FMODpauseButton.Content = "Pause";
             }
             else
             {
-                result = fmodSystem.playSound(fmodSound, null, false, out fmodChannel);
+                result = fmodSystem.playSound(fmodSound, default, false, out fmodChannel);
                 if (ERRCHECK(result)) { return; }
                 FMODstatusLabel.Text = "Playing";
 
@@ -6310,7 +6310,7 @@ public partial class MainWindow : Window
 
     private void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (fmodSound != null && fmodChannel != null)
+        if (fmodSound.hasHandle() && fmodChannel.hasHandle())
         {
             var result = fmodChannel.isPlaying(out var playing);
             if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
@@ -6343,7 +6343,7 @@ public partial class MainWindow : Window
 
     private void FMODstopButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (fmodChannel != null)
+        if (fmodChannel.hasHandle())
         {
             var result = fmodChannel.isPlaying(out var playing);
             if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
@@ -6368,13 +6368,13 @@ public partial class MainWindow : Window
     {
         fmodLoopMode = FMODloopButton.IsChecked == true ? FMOD.MODE.LOOP_NORMAL : FMOD.MODE.LOOP_OFF;
 
-        if (fmodSound != null)
+        if (fmodSound.hasHandle())
         {
             var result = fmodSound.setMode(fmodLoopMode);
             if (ERRCHECK(result)) { return; }
         }
 
-        if (fmodChannel != null)
+        if (fmodChannel.hasHandle())
         {
             var result = fmodChannel.isPlaying(out var playing);
             if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
@@ -6400,7 +6400,7 @@ public partial class MainWindow : Window
     {
         fmodVolume = (float)(FMODvolumeBar.Value / 10.0);
 
-        if (fmodMasterSoundGroup != null)
+        if (fmodMasterSoundGroup.hasHandle())
         {
             var result = fmodMasterSoundGroup.setVolume(fmodVolume);
             if (ERRCHECK(result)) { return; }
@@ -6416,7 +6416,7 @@ public partial class MainWindow : Window
     private void FMODprogressBar_PointerReleased(object? sender, global::Avalonia.Input.PointerReleasedEventArgs e)
     {
         fmodIsDragging = false;
-        if (fmodChannel != null && fmodLenMs > 0)
+        if (fmodChannel.hasHandle() && fmodLenMs > 0)
         {
             uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
             var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
@@ -6444,7 +6444,7 @@ public partial class MainWindow : Window
     {
         FMODreset();
 
-        if (fmodSystem == null)
+        if (!fmodSystem.hasHandle())
         {
             StatusStripUpdate("Audio preview is unavailable (FMOD is not loaded).");
             return;
@@ -6563,7 +6563,7 @@ public partial class MainWindow : Window
         result = fmodSound.getLength(out fmodLenMs, FMOD.TIMEUNIT.MS);
         if (ERRCHECK(result)) return;
 
-        result = fmodSystem.playSound(fmodSound, null, true, out fmodChannel);
+        result = fmodSystem.playSound(fmodSound, default, true, out fmodChannel);
         if (ERRCHECK(result)) return;
 
         FMODPanel.IsVisible = true;
