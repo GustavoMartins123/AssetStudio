@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace AssetStudio
@@ -32,6 +32,7 @@ namespace AssetStudio
             if (version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) //2020.2 and up
             {
                 var secondaryTexturesSize = reader.ReadInt32();
+                reader.CheckArrayLength(secondaryTexturesSize);
                 secondaryTextures = new SecondarySpriteTexture[secondaryTexturesSize];
                 for (int i = 0; i < secondaryTexturesSize; i++)
                 {
@@ -51,6 +52,7 @@ namespace AssetStudio
         public SpriteAtlas(ObjectReader reader) : base(reader)
         {
             var m_PackedSpritesSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_PackedSpritesSize);
             m_PackedSprites = new PPtr<Sprite>[m_PackedSpritesSize];
             for (int i = 0; i < m_PackedSpritesSize; i++)
             {

@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 namespace AssetStudio
 {
@@ -9,6 +9,7 @@ namespace AssetStudio
         public ResourceManager(ObjectReader reader) : base(reader)
         {
             var m_ContainerSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_ContainerSize);
             m_Container = new KeyValuePair<string, PPtr<Object>>[m_ContainerSize];
             for (int i = 0; i < m_ContainerSize; i++)
             {

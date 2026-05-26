@@ -99,6 +99,7 @@ namespace AssetStudio
             }
 
             var m_MaterialsSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_MaterialsSize);
             m_Materials = new PPtr<Material>[m_MaterialsSize];
             for (int i = 0; i < m_MaterialsSize; i++)
             {

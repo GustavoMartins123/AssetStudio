@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 
@@ -107,6 +107,7 @@ namespace AssetStudio
             if (version[0] >= 2019) //2019 and up
             {
                 var secondaryTexturesSize = reader.ReadInt32();
+                reader.CheckArrayLength(secondaryTexturesSize);
                 secondaryTextures = new SecondarySpriteTexture[secondaryTexturesSize];
                 for (int i = 0; i < secondaryTexturesSize; i++)
                 {
@@ -117,6 +118,7 @@ namespace AssetStudio
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
             {
                 var m_SubMeshesSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_SubMeshesSize);
                 m_SubMeshes = new SubMesh[m_SubMeshesSize];
                 for (int i = 0; i < m_SubMeshesSize; i++)
                 {
@@ -131,6 +133,7 @@ namespace AssetStudio
             else
             {
                 var verticesSize = reader.ReadInt32();
+                reader.CheckArrayLength(verticesSize);
                 vertices = new SpriteVertex[verticesSize];
                 for (int i = 0; i < verticesSize; i++)
                 {

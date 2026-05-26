@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 
 namespace AssetStudio
 {
@@ -44,6 +44,7 @@ namespace AssetStudio
             if (version[0] >= 2020) //2020.1 and up
             {
                 var m_VideoShadersSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_VideoShadersSize);
                 var m_VideoShaders = new PPtr<Shader>[m_VideoShadersSize];
                 for (int i = 0; i < m_VideoShadersSize; i++)
                 {

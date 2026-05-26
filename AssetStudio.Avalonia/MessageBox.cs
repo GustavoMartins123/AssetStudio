@@ -1,9 +1,12 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Templates;
 using Avalonia.Input.Platform;
 using Avalonia.Layout;
 using Avalonia.Threading;
 using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -15,21 +18,22 @@ public class MessageBox : Window
     private static readonly object _lock = new object();
     private static int _errorCount = 1;
 
-    private readonly TextBox _textBox;
+    private readonly ListBox _listBox;
     private readonly Button _button;
     private readonly StringBuilder _contentBuilder = new();
+    private readonly ObservableCollection<string> _lines = new();
+    private readonly List<string> _pendingLines = new();
     private bool _updatePending = false;
 
     public MessageBox(string text, string title = "Message")
     {
         Title = title;
-        SizeToContent = SizeToContent.WidthAndHeight;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         CanResize = true;
-        MinWidth = 320;
-        MaxWidth = 600;
-        MinHeight = 150;
-        MaxHeight = 500;
+        Width = 650;
+        Height = 450;
+        MinWidth = 400;
+        MinHeight = 250;
         Padding = new Thickness(20);
 
         var grid = new Grid
@@ -39,18 +43,28 @@ public class MessageBox : Window
         };
 
         _contentBuilder.Append(text);
-
-        _textBox = new TextBox
+        
+        foreach (var line in text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None))
         {
-            Text = text,
-            IsReadOnly = true,
-            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap,
-            AcceptsReturn = true,
+            _lines.Add(line);
+        }
+
+        _listBox = new ListBox
+        {
+            ItemsSource = _lines,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
-            MaxHeight = 350,
-            FontFamily = global::Avalonia.Media.FontFamily.Default,
-            FontSize = 13
+            Background = global::Avalonia.Media.Brushes.Transparent,
+            BorderThickness = new Thickness(1),
+            BorderBrush = global::Avalonia.Media.Brushes.LightGray,
+            ItemTemplate = new FuncDataTemplate<string>((value, namescope) => new TextBlock
+            {
+                Text = value,
+                FontFamily = new global::Avalonia.Media.FontFamily("Consolas, DejaVu Sans Mono, Courier New, monospace"),
+                FontSize = 12,
+                TextWrapping = global::Avalonia.Media.TextWrapping.NoWrap,
+                Margin = new Thickness(0, 1)
+            })
         };
 
         var buttonPanel = new StackPanel
@@ -73,7 +87,7 @@ public class MessageBox : Window
             var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
             if (clipboard != null)
             {
-                await clipboard.SetTextAsync(_textBox.Text);
+                await clipboard.SetTextAsync(_contentBuilder.ToString());
             }
         };
 
@@ -90,10 +104,10 @@ public class MessageBox : Window
         buttonPanel.Children.Add(copyButton);
         buttonPanel.Children.Add(_button);
 
-        Grid.SetRow(_textBox, 0);
+        Grid.SetRow(_listBox, 0);
         Grid.SetRow(buttonPanel, 1);
 
-        grid.Children.Add(_textBox);
+        grid.Children.Add(_listBox);
         grid.Children.Add(buttonPanel);
 
         Content = grid;
@@ -114,8 +128,17 @@ public class MessageBox : Window
     public void AppendMessage(string message)
     {
         _errorCount++;
-        _contentBuilder.Append($"\n\n-----------------------------------------\n\nError {_errorCount}:\n{message}");
+        var divider = $"\n\n-----------------------------------------\n\nError {_errorCount}:\n{message}";
+        _contentBuilder.Append(divider);
         Title = $"Errors ({_errorCount})";
+        
+        lock (_pendingLines)
+        {
+            foreach (var line in divider.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None))
+            {
+                _pendingLines.Add(line);
+            }
+        }
         ScheduleUIUpdate();
     }
 
@@ -126,8 +149,19 @@ public class MessageBox : Window
             _updatePending = true;
             Dispatcher.UIThread.Post(() =>
             {
-                _textBox.Text = _contentBuilder.ToString();
-                _textBox.CaretIndex = _textBox.Text?.Length ?? 0;
+                lock (_pendingLines)
+                {
+                    foreach (var line in _pendingLines)
+                    {
+                        _lines.Add(line);
+                    }
+                    _pendingLines.Clear();
+                }
+                
+                if (_lines.Count > 0)
+                {
+                    _listBox.ScrollIntoView(_lines.Count - 1);
+                }
                 _updatePending = false;
             }, DispatcherPriority.Background);
         }
