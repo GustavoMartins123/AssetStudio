@@ -22,21 +22,29 @@ namespace AssetStudio
         public string m_OriginalPath;
         public StreamedResource m_ExternalResources;
 
+        public uint m_ProxyWidth { get; private set; }
+        public uint m_ProxyHeight { get; private set; }
+        public uint m_Width { get; private set; }
+        public uint m_Height { get; private set; }
+        public double m_FrameRate { get; private set; }
+        public ulong m_FrameCount { get; private set; }
+        public int m_Format { get; private set; }
+
         public VideoClip(ObjectReader reader) : base(reader)
         {
             m_OriginalPath = reader.ReadAlignedString();
-            var m_ProxyWidth = reader.ReadUInt32();
-            var m_ProxyHeight = reader.ReadUInt32();
-            var Width = reader.ReadUInt32();
-            var Height = reader.ReadUInt32();
+            m_ProxyWidth = reader.ReadUInt32();
+            m_ProxyHeight = reader.ReadUInt32();
+            m_Width = reader.ReadUInt32();
+            m_Height = reader.ReadUInt32();
             if (version[0] > 2017 || (version[0] == 2017 && version[1] >= 2)) //2017.2 and up
             {
                 var m_PixelAspecRatioNum = reader.ReadUInt32();
                 var m_PixelAspecRatioDen = reader.ReadUInt32();
             }
-            var m_FrameRate = reader.ReadDouble();
-            var m_FrameCount = reader.ReadUInt64();
-            var m_Format = reader.ReadInt32();
+            m_FrameRate = reader.ReadDouble();
+            m_FrameCount = reader.ReadUInt64();
+            m_Format = reader.ReadInt32();
             var m_AudioChannelCount = reader.ReadUInt16Array();
             reader.AlignStream();
             var m_AudioSampleRate = reader.ReadUInt32Array();

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<OutputType>WinExe</OutputType>
@@ -77,6 +77,8 @@
 	<Target Name="CopyExtraFiles" AfterTargets="AfterBuild">
 		<Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll')" />
 		<Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll')" />
+		<Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\Release\Texture2DDecoderNative.dll')" />
+		<Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll')" />
 	</Target>
 
 	<Target Name="PublishExtraFiles" AfterTargets="Publish">

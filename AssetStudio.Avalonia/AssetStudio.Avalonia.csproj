@@ -22,9 +22,12 @@
       <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="LibVLCSharp" Version="3.8.2" />
+    <PackageReference Include="LibVLCSharp.Avalonia" Version="3.8.2" />
     <PackageReference Include="OpenTK" Version="4.8.2" />
     <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="1.0.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.18" />
   </ItemGroup>
 
   <ItemGroup>
@@ -40,6 +43,8 @@
   <Target Name="CopyExtraFiles" AfterTargets="AfterBuild">
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll')" />
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\Win32\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x86" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\Win32\Release\Texture2DDecoderNative.dll')" />
+    <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll')" />
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
     <Copy SourceFiles="Libraries\x64\libfmod.so" DestinationFolder="$(TargetDir)x64" Condition="Exists('Libraries\x64\libfmod.so')" />

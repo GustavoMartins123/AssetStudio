@@ -380,6 +380,7 @@ void main()
                 case TextureFormat.DXT1:
                 case TextureFormat.BC4:
                     return blocks * 8;
+                case TextureFormat.DXT3:
                 case TextureFormat.DXT5:
                 case TextureFormat.BC5:
                 case TextureFormat.BC6H:
@@ -391,6 +392,9 @@ void main()
                     {
                         case TextureFormat.Alpha8:
                             return pixels;
+                        case TextureFormat.ARGB4444:
+                        case TextureFormat.RGBA4444:
+                            return pixels * 2;
                         case TextureFormat.RGB24:
                             return pixels * 3;
                         case TextureFormat.RGBA32:
@@ -461,6 +465,10 @@ void main()
                 case TextureFormat.DXT1:
                     isCompressed = true;
                     glInternalFormat = 0x83F0; // GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+                    break;
+                case TextureFormat.DXT3:
+                    isCompressed = true;
+                    glInternalFormat = 0x83F2; // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
                     break;
                 case TextureFormat.DXT5:
                     isCompressed = true;
@@ -538,10 +546,6 @@ void main()
             else if (uploadFormat == TextureFormat.RGB24)
             {
                 GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb, width, height, 0, PixelFormat.Rgb, PixelType.UnsignedByte, dataToUpload);
-            }
-            else if (uploadFormat == TextureFormat.Alpha8)
-            {
-                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Alpha, width, height, 0, PixelFormat.Alpha, PixelType.UnsignedByte, dataToUpload);
             }
             else
             {

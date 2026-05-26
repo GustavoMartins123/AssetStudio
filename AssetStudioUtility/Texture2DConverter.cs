@@ -105,6 +105,8 @@ namespace AssetStudio
                     flag = DecodeDXT1(buff, bytes);
                     break;
                 case TextureFormat.DXT3:
+                    SwapBytesForXbox(buff);
+                    flag = DecodeDXT3(buff, bytes);
                     break;
                 case TextureFormat.DXT5: //test pass
                     SwapBytesForXbox(buff);
@@ -392,6 +394,90 @@ namespace AssetStudio
         private bool DecodeDXT1(byte[] image_data, byte[] buff)
         {
             return TextureDecoder.DecodeDXT1(image_data, m_Width, m_Height, buff);
+        }
+
+        private bool DecodeDXT3(byte[] image_data, byte[] buff)
+        {
+            int blockCountX = (m_Width + 3) / 4;
+            int blockCountY = (m_Height + 3) / 4;
+            int bytesPerBlock = 16;
+            
+            for (int y = 0; y < blockCountY; y++)
+            {
+                for (int x = 0; x < blockCountX; x++)
+                {
+                    int blockIndex = (y * blockCountX + x) * bytesPerBlock;
+                    if (blockIndex + 16 > image_data.Length)
+                        continue;
+
+                    ulong alphaData = BitConverter.ToUInt64(image_data, blockIndex);
+                    ushort c0 = BitConverter.ToUInt16(image_data, blockIndex + 8);
+                    ushort c1 = BitConverter.ToUInt16(image_data, blockIndex + 10);
+                    uint colorIndices = BitConverter.ToUInt32(image_data, blockIndex + 12);
+
+                    int r5_0 = (c0 >> 11) & 0x1F;
+                    int g6_0 = (c0 >> 5) & 0x3F;
+                    int b5_0 = c0 & 0x1F;
+                    byte r0 = (byte)((r5_0 << 3) | (r5_0 >> 2));
+                    byte g0 = (byte)((g6_0 << 2) | (g6_0 >> 4));
+                    byte b0 = (byte)((b5_0 << 3) | (b5_0 >> 2));
+
+                    int r5_1 = (c1 >> 11) & 0x1F;
+                    int g6_1 = (c1 >> 5) & 0x3F;
+                    int b5_1 = c1 & 0x1F;
+                    byte r1 = (byte)((r5_1 << 3) | (r5_1 >> 2));
+                    byte g1 = (byte)((g6_1 << 2) | (g6_1 >> 4));
+                    byte b1 = (byte)((b5_1 << 3) | (b5_1 >> 2));
+
+                    byte r2 = (byte)((2 * r0 + r1) / 3);
+                    byte g2 = (byte)((2 * g0 + g1) / 3);
+                    byte b2 = (byte)((2 * b0 + b1) / 3);
+
+                    byte r3 = (byte)((r0 + 2 * r1) / 3);
+                    byte g3 = (byte)((g0 + 2 * g1) / 3);
+                    byte b3 = (byte)((b0 + 2 * b1) / 3);
+
+                    for (int py = 0; py < 4; py++)
+                    {
+                        int pixelY = y * 4 + py;
+                        if (pixelY >= m_Height) continue;
+
+                        for (int px = 0; px < 4; px++)
+                        {
+                            int pixelX = x * 4 + px;
+                            if (pixelX >= m_Width) continue;
+
+                            int pixelIndexInBlock = py * 4 + px;
+                            
+                            int alphaShift = pixelIndexInBlock * 4;
+                            byte alpha4 = (byte)((alphaData >> alphaShift) & 0x0F);
+                            byte alpha = (byte)((alpha4 << 4) | alpha4);
+
+                            int colorShift = pixelIndexInBlock * 2;
+                            uint colorIndex = (colorIndices >> colorShift) & 0x03;
+
+                            byte r = 0, g = 0, b = 0;
+                            switch (colorIndex)
+                            {
+                                case 0: r = r0; g = g0; b = b0; break;
+                                case 1: r = r1; g = g1; b = b1; break;
+                                case 2: r = r2; g = g2; b = b2; break;
+                                case 3: r = r3; g = g3; b = b3; break;
+                            }
+
+                            int outIndex = (pixelY * m_Width + pixelX) * 4;
+                            if (outIndex + 4 <= buff.Length)
+                            {
+                                buff[outIndex] = b;
+                                buff[outIndex + 1] = g;
+                                buff[outIndex + 2] = r;
+                                buff[outIndex + 3] = alpha;
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
         }
 
         private bool DecodeDXT5(byte[] image_data, byte[] buff)
@@ -835,6 +921,7 @@ namespace AssetStudio
                     return pixels * 2;
                 case TextureFormat.DXT1:
                     return blocks * 8;
+                case TextureFormat.DXT3:
                 case TextureFormat.DXT5:
                     return blocks * 16;
                 case TextureFormat.BC4:

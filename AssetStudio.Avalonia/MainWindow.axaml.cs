@@ -34,6 +34,7 @@ public partial class MainWindow : Window
     private Sprite? currentPreviewSprite;
     private Mesh? currentPreviewMesh;
     private Avatar? currentPreviewAvatar;
+    private VideoClip? currentPreviewVideoClip;
     private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
     private long texturePreviewIdCounter;
@@ -68,6 +69,11 @@ public partial class MainWindow : Window
     private DispatcherTimer? fmodTimer;
     private bool fmodIsDragging = false;
     private byte[]? currentAudioData;
+
+    private LibVLCSharp.Shared.LibVLC? _libVLC;
+    private LibVLCSharp.Shared.MediaPlayer? _mediaPlayer;
+    private bool _videoIsDragging = false;
+    private string? _currentTempVideoPath;
 
     private string? _pendingStatusText;
     private bool _statusUpdatePending;
@@ -110,6 +116,21 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             logger.Log(LoggerEvent.Error, $"Failed to initialize FMOD: {ex.Message}");
+        }
+
+        try
+        {
+            LibVLCSharp.Shared.Core.Initialize();
+            _libVLC = new LibVLCSharp.Shared.LibVLC();
+            _mediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
+            _mediaPlayer.EndReached += MediaPlayer_EndReached;
+            _mediaPlayer.PositionChanged += MediaPlayer_PositionChanged;
+            _mediaPlayer.TimeChanged += MediaPlayer_TimeChanged;
+            VideoPlayerView.MediaPlayer = _mediaPlayer;
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Failed to initialize LibVLC: {ex.Message}. Embedded video preview will be disabled.");
         }
 
         // Detect GPU support (OpenGL interface availability)
@@ -306,8 +327,14 @@ public partial class MainWindow : Window
             FMODPanel.IsVisible = false;
             FMODreset();
         }
+        if (VideoClipPanel != null)
+        {
+            VideoClipPanel.IsVisible = false;
+            VideoReset();
+        }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        currentPreviewVideoClip = null;
         texturePreviewIdCounter++; // Cancel any running background image decoding task
         for (int i = 0; i < 4; i++)
         {
@@ -1422,6 +1449,11 @@ public partial class MainWindow : Window
             FMODPanel.IsVisible = false;
             FMODreset();
         }
+        if (VideoClipPanel != null)
+        {
+            VideoClipPanel.IsVisible = false;
+            VideoReset();
+        }
         if (assetItem.Asset is not AnimationClip)
         {
             HideAnimationPlayback();
@@ -1431,6 +1463,7 @@ public partial class MainWindow : Window
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        currentPreviewVideoClip = null;
 
         PreviewLabel.IsVisible = displayInfo.IsChecked == true;
         PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
@@ -1629,7 +1662,9 @@ public partial class MainWindow : Window
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
                 break;
-            case VideoClip _:
+            case VideoClip m_VideoClip:
+                PreviewVideoClip(assetItem, m_VideoClip);
+                break;
             case MovieTexture _:
                 StatusStripUpdate("Only supported export.");
                 break;
@@ -5886,7 +5921,10 @@ public partial class MainWindow : Window
         sb.AppendLine($"Associated Materials ({materials.Count}):");
         foreach (var mat in materials)
         {
-            sb.AppendLine($"  - {mat.m_Name} (PathID: {mat.m_PathID})");
+            if (mat != null)
+            {
+                sb.AppendLine($"  - {mat.m_Name} (PathID: {mat.m_PathID})");
+            }
         }
 
         if (associatedRenderers.Count > 0)
@@ -5968,6 +6006,9 @@ public partial class MainWindow : Window
             fmodSystem.release();
             fmodSystem = null;
         }
+        VideoReset();
+        _mediaPlayer?.Dispose();
+        _libVLC?.Dispose();
         base.OnClosing(e);
     }
 
@@ -6389,6 +6430,265 @@ public partial class MainWindow : Window
             return true;
         }
         return false;
+    }
+
+    private void MediaPlayer_EndReached(object? sender, EventArgs e)
+    {
+        Dispatcher.UIThread.Post(() => {
+            if (VideoLoopButton.IsChecked == true)
+            {
+                Task.Run(() => {
+                    if (_mediaPlayer != null)
+                    {
+                        _mediaPlayer.Stop();
+                        _mediaPlayer.Play();
+                    }
+                });
+            }
+            else
+            {
+                VideoStop();
+            }
+        });
+    }
+
+    private void MediaPlayer_PositionChanged(object? sender, LibVLCSharp.Shared.MediaPlayerPositionChangedEventArgs e)
+    {
+        Dispatcher.UIThread.Post(() => {
+            if (!_videoIsDragging)
+            {
+                VideoProgressBar.Value = e.Position * 1000;
+            }
+        });
+    }
+
+    private void MediaPlayer_TimeChanged(object? sender, LibVLCSharp.Shared.MediaPlayerTimeChangedEventArgs e)
+    {
+        Dispatcher.UIThread.Post(() => {
+            if (_mediaPlayer != null)
+            {
+                long currentMs = e.Time;
+                long totalMs = _mediaPlayer.Length;
+                if (totalMs < 0) totalMs = 0;
+                VideoTimerLabel.Text = $"{currentMs / 1000 / 60}:{currentMs / 1000 % 60:D2}.{currentMs / 10 % 100:D2} / {totalMs / 1000 / 60}:{totalMs / 1000 % 60:D2}.{totalMs / 10 % 100:D2}";
+            }
+        });
+    }
+
+    private void VideoStop()
+    {
+        try
+        {
+            if (_mediaPlayer != null)
+            {
+                _mediaPlayer.Stop();
+            }
+            Dispatcher.UIThread.Post(() => {
+                VideoStatusLabel.Text = "Stopped";
+                VideoPlayButton.Content = "Play";
+                VideoProgressBar.Value = 0;
+                VideoTimerLabel.Text = "0:00.0 / 0:00.0";
+            });
+        }
+        catch {}
+    }
+
+    private void VideoReset()
+    {
+        try
+        {
+            if (_mediaPlayer != null)
+            {
+                _mediaPlayer.Stop();
+                if (_mediaPlayer.Media != null)
+                {
+                    _mediaPlayer.Media.Dispose();
+                    _mediaPlayer.Media = null;
+                }
+            }
+        }
+        catch {}
+
+        if (!string.IsNullOrEmpty(_currentTempVideoPath) && File.Exists(_currentTempVideoPath))
+        {
+            try
+            {
+                File.Delete(_currentTempVideoPath);
+            }
+            catch {}
+            _currentTempVideoPath = null;
+        }
+
+        Dispatcher.UIThread.Post(() => {
+            VideoStatusLabel.Text = "Stopped";
+            VideoPlayButton.Content = "Play";
+            VideoProgressBar.Value = 0;
+            VideoTimerLabel.Text = "0:00.0 / 0:00.0";
+        });
+    }
+
+    private void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
+    {
+        currentPreviewVideoClip = m_VideoClip;
+
+        VideoTitleLabel.Text = m_VideoClip.m_Name;
+        VideoStatusLabel.Text = "Ready";
+        VideoResolutionLabel.Text = $"Resolution: {m_VideoClip.m_Width}x{m_VideoClip.m_Height} (Proxy: {m_VideoClip.m_ProxyWidth}x{m_VideoClip.m_ProxyHeight})";
+        VideoFrameRateLabel.Text = $"Frame Rate: {m_VideoClip.m_FrameRate:F2} FPS | Frames: {m_VideoClip.m_FrameCount}";
+        
+        var ext = Path.GetExtension(m_VideoClip.m_OriginalPath);
+        if (string.IsNullOrEmpty(ext)) ext = ".mp4";
+        VideoFormatLabel.Text = $"Format: {ext.ToUpperInvariant().TrimStart('.')}";
+
+        var data = m_VideoClip.m_VideoData.GetData();
+        if (data == null || data.Length == 0)
+        {
+            VideoInfoLabel.Text = "VideoClip data is empty or invalid.";
+            VideoPlayButton.IsEnabled = false;
+            VideoStopButton.IsEnabled = false;
+            VideoExportButton.IsEnabled = false;
+            VideoClipPanel.IsVisible = true;
+            PreviewLabel.IsVisible = false;
+            return;
+        }
+
+        VideoInfoLabel.Text = "Playing embedded native preview.";
+        VideoPlayButton.IsEnabled = true;
+        VideoStopButton.IsEnabled = true;
+        VideoExportButton.IsEnabled = true;
+        VideoVolumeBar.Value = 80;
+
+        VideoClipPanel.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate($"Loaded video clip: {m_VideoClip.m_Name}");
+
+        try
+        {
+            VideoReset();
+
+            var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
+            Directory.CreateDirectory(tempDir);
+
+            // Clean up older temp files
+            try
+            {
+                foreach (var oldFile in Directory.GetFiles(tempDir, "temp_video_*"))
+                {
+                    try { File.Delete(oldFile); } catch {}
+                }
+            }
+            catch {}
+
+            _currentTempVideoPath = Path.Combine(tempDir, $"temp_video_{m_VideoClip.m_Name}_{m_VideoClip.m_PathID}{ext}");
+            File.WriteAllBytes(_currentTempVideoPath, data);
+
+            if (_mediaPlayer != null && _libVLC != null)
+            {
+                var media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
+                _mediaPlayer.Media = media;
+                _mediaPlayer.Volume = (int)VideoVolumeBar.Value;
+                _mediaPlayer.Play();
+                VideoStatusLabel.Text = "Playing";
+                VideoPlayButton.Content = "Pause";
+            }
+        }
+        catch (Exception ex)
+        {
+            VideoInfoLabel.Text = $"Failed to play video natively: {ex.Message}";
+        }
+    }
+
+    private void VideoPlayButton_Click(object? sender, RoutedEventArgs e)
+    {
+        if (_mediaPlayer == null || currentPreviewVideoClip == null) return;
+
+        try
+        {
+            if (_mediaPlayer.IsPlaying)
+            {
+                _mediaPlayer.Pause();
+                VideoStatusLabel.Text = "Paused";
+                VideoPlayButton.Content = "Play";
+            }
+            else
+            {
+                if (_mediaPlayer.Media == null && !string.IsNullOrEmpty(_currentTempVideoPath))
+                {
+                    var media = new LibVLCSharp.Shared.Media(_libVLC!, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
+                    _mediaPlayer.Media = media;
+                }
+                _mediaPlayer.Play();
+                VideoStatusLabel.Text = "Playing";
+                VideoPlayButton.Content = "Pause";
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Failed to toggle playback: {ex.Message}");
+        }
+    }
+
+    private void VideoStopButton_Click(object? sender, RoutedEventArgs e)
+    {
+        VideoStop();
+    }
+
+    private void VideoVolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (_mediaPlayer != null)
+        {
+            _mediaPlayer.Volume = (int)VideoVolumeBar.Value;
+        }
+    }
+
+    private void VideoProgressBar_PointerPressed(object? sender, global::Avalonia.Input.PointerPressedEventArgs e)
+    {
+        _videoIsDragging = true;
+    }
+
+    private void VideoProgressBar_PointerReleased(object? sender, global::Avalonia.Input.PointerReleasedEventArgs e)
+    {
+        _videoIsDragging = false;
+        if (_mediaPlayer != null)
+        {
+            float pos = (float)(VideoProgressBar.Value / 1000.0);
+            _mediaPlayer.Position = pos;
+        }
+    }
+
+    private async void VideoExportButton_Click(object? sender, RoutedEventArgs e)
+    {
+        if (currentPreviewVideoClip == null) return;
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+
+        var extension = Path.GetExtension(currentPreviewVideoClip.m_OriginalPath);
+        if (string.IsNullOrEmpty(extension)) extension = ".mp4";
+
+        var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (exportFolders == null || exportFolders.Count == 0) return;
+
+        var savePath = exportFolders[0].Path.LocalPath;
+        var fileName = FixFileName(currentPreviewVideoClip.m_Name) + extension;
+        var filePath = Path.Combine(savePath, fileName);
+
+        try
+        {
+            var data = currentPreviewVideoClip.m_VideoData.GetData();
+            if (data == null || data.Length == 0)
+            {
+                StatusStripUpdate("VideoClip data is empty or invalid.");
+                return;
+            }
+
+            await File.WriteAllBytesAsync(filePath, data);
+            StatusStripUpdate($"Successfully exported video clip to: {filePath}");
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Failed to export video: {ex.Message}");
+        }
     }
 
     private void AnimPlayPauseBtn_Click(object? sender, global::Avalonia.Interactivity.RoutedEventArgs e)

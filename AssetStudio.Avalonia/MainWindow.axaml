@@ -3,6 +3,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="using:AssetStudio.Avalonia"
+        xmlns:vlc="clr-namespace:LibVLCSharp.Avalonia;assembly=LibVLCSharp.Avalonia"
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
         Title="AssetStudio (Avalonia Linux Port)"
@@ -335,6 +336,43 @@
                                 </StackPanel>
                             </StackPanel>
                         </Border>
+
+                        <Border x:Name="VideoClipPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="12" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="600" IsVisible="False">
+                            <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="12">
+                                <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
+                                    <TextBlock x:Name="VideoTitleLabel" Text="Video Player" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="VideoStatusLabel" Grid.Column="1" Text="Ready" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                </Grid>
+                                
+                                <StackPanel Grid.Row="1" Spacing="4">
+                                    <TextBlock x:Name="VideoResolutionLabel" Text="Resolution: 0x0" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12"/>
+                                    <TextBlock x:Name="VideoFrameRateLabel" Text="Frame Rate: 0 FPS" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12"/>
+                                    <TextBlock x:Name="VideoFormatLabel" Text="Format: Unknown" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12"/>
+                                    <TextBlock x:Name="VideoInfoLabel" Text="Loading preview..." Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                
+                                <Border Grid.Row="2" Background="Black" CornerRadius="8" ClipToBounds="True" Height="340">
+                                    <vlc:VideoView x:Name="VideoPlayerView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+                                </Border>
+
+                                <Grid Grid.Row="3" ColumnDefinitions="*,Auto" Margin="0,4">
+                                    <Slider x:Name="VideoProgressBar" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32"
+                                            PointerPressed="VideoProgressBar_PointerPressed" PointerReleased="VideoProgressBar_PointerReleased"/>
+                                    <TextBlock x:Name="VideoTimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                
+                                <Grid Grid.Row="4" ColumnDefinitions="Auto,Auto,Auto,*,Auto,Auto,Auto" ColumnSpacing="8">
+                                    <Button x:Name="VideoPlayButton" Grid.Column="0" Content="Play" Click="VideoPlayButton_Click" Width="60" HorizontalContentAlignment="Center"/>
+                                    <Button x:Name="VideoStopButton" Grid.Column="1" Content="Stop" Click="VideoStopButton_Click" Width="60" HorizontalContentAlignment="Center"/>
+                                    <CheckBox x:Name="VideoLoopButton" Grid.Column="2" Content="Loop" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="6,0,0,0"/>
+                                    
+                                    <TextBlock Grid.Column="4" Text="Vol" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="4,0,0,0" FontSize="11"/>
+                                    <Slider x:Name="VideoVolumeBar" Grid.Column="5" Minimum="0" Maximum="100" Value="80" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="VideoVolumeBar_ValueChanged"/>
+                                    <Button x:Name="VideoExportButton" Grid.Column="6" Content="Export" Click="VideoExportButton_Click" Width="70" HorizontalContentAlignment="Center"/>
+                                </Grid>
+                            </Grid>
+                        </Border>
+
 
                         <Border x:Name="FMODPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="12" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="450" IsVisible="False">
                             <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
