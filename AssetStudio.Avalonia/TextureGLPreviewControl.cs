@@ -245,6 +245,7 @@ void main()
                         texVersion = pendingVersion;
                         texPlatform = pendingPlatform;
                         hasPendingTexture = false;
+                        pendingTextureData = null;
                     }
                 }
 

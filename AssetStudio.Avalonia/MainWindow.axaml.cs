@@ -1396,9 +1396,19 @@ public partial class MainWindow : Window
 
     private async void RightTabControl_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (e.Source == RightTabControl && RightTabControl.SelectedIndex == 1)
+        if (e.Source == RightTabControl)
         {
-            await UpdateDumpForSelectedAsset();
+            if (RightTabControl.SelectedIndex == 1)
+            {
+                await UpdateDumpForSelectedAsset();
+            }
+            else if (RightTabControl.SelectedIndex == 0)
+            {
+                if (AssetListDataGrid.SelectedItem is AssetItem assetItem)
+                {
+                    PreviewAsset(assetItem);
+                }
+            }
         }
     }
 
@@ -1540,7 +1550,6 @@ public partial class MainWindow : Window
 
         PreviewLabel.IsVisible = displayInfo.IsChecked == true;
         PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
-        var dumpStr = assetItem.Asset.Dump();
 
         string fbxHeader = string.Empty;
         if (assetItem.DisplayType.Contains("FBX sub-asset"))
@@ -1552,218 +1561,229 @@ public partial class MainWindow : Window
                         $"--------------------------------------------------" + Environment.NewLine + Environment.NewLine;
         }
 
-        switch (assetItem.Asset)
+        try
         {
-            case AudioClip m_AudioClip:
-                PreviewAudioClip(assetItem, m_AudioClip);
-                break;
-            case Texture2D m_Texture2D:
-                PreviewTexture2D(assetItem, m_Texture2D);
-                break;
-            case Sprite m_Sprite:
-                PreviewSprite(assetItem, m_Sprite);
-                break;
-            case AssetStudio.Font m_Font:
-                PreviewFont(assetItem, m_Font);
-                break;
-            case Material m_Material:
-                PreviewMaterial(assetItem, m_Material);
-                break;
-            case TextAsset m_TextAsset:
-                PreviewTextAsset(assetItem, m_TextAsset, fbxHeader);
-                break;
-            case Shader m_Shader:
-                SetTextWithTruncation(TextPreviewBox, fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read"));
-                TextPreviewBox.IsVisible = true;
-                PreviewLabel.IsVisible = false;
-                break;
-            case MonoBehaviour m_MonoBehaviour:
-                PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader, dumpStr);
-                break;
-            case MonoScript m_MonoScript:
-                {
-                    var sb = new StringBuilder();
-                    sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
-                    sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
-                    sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
-                    SetTextWithTruncation(TextPreviewBox, sb.ToString());
+            switch (assetItem.Asset)
+            {
+                case AudioClip m_AudioClip:
+                    PreviewAudioClip(assetItem, m_AudioClip);
+                    break;
+                case Texture2D m_Texture2D:
+                    PreviewTexture2D(assetItem, m_Texture2D);
+                    break;
+                case Sprite m_Sprite:
+                    PreviewSprite(assetItem, m_Sprite);
+                    break;
+                case AssetStudio.Font m_Font:
+                    PreviewFont(assetItem, m_Font);
+                    break;
+                case Material m_Material:
+                    PreviewMaterial(assetItem, m_Material);
+                    break;
+                case TextAsset m_TextAsset:
+                    PreviewTextAsset(assetItem, m_TextAsset, fbxHeader);
+                    break;
+                case Shader m_Shader:
+                    SetTextWithTruncation(TextPreviewBox, fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read"));
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
-                }
-                break;
-            case Mesh m_Mesh:
-            {
-                Texture2D? meshTexture = null;
-                List<byte[]?>? subMeshTextures = null;
-                List<int>? subMeshTexWidths = null;
-                List<int>? subMeshTexHeights = null;
-
-                if (GLPreviewControl != null)
-                {
-                    subMeshTextures = new();
-                    subMeshTexWidths = new();
-                    subMeshTexHeights = new();
-
-                    var allMaterials = FindMaterialsForMesh(m_Mesh);
-                    
-                    if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
+                    break;
+                case MonoBehaviour m_MonoBehaviour:
+                    string? dumpStr = null;
+                    try
                     {
-                        for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
-                        {
-                            byte[]? tb = null;
-                            int tw = 0, th = 0;
+                        dumpStr = m_MonoBehaviour.Dump();
+                    }
+                    catch (Exception dumpEx)
+                    {
+                        dumpStr = $"Failed to dump MonoBehaviour: {dumpEx.Message}";
+                    }
+                    PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader, dumpStr);
+                    break;
+                case MonoScript m_MonoScript:
+                    {
+                        var sb = new StringBuilder();
+                        sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
+                        sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
+                        sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
+                        SetTextWithTruncation(TextPreviewBox, sb.ToString());
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
+                    }
+                    break;
+                case Mesh m_Mesh:
+                {
+                    List<byte[]?>? subMeshTextures = null;
+                    List<int>? subMeshTexWidths = null;
+                    List<int>? subMeshTexHeights = null;
 
-                            if (i < allMaterials.Count && allMaterials[i] != null)
+                    if (GLPreviewControl != null)
+                    {
+                        subMeshTextures = new();
+                        subMeshTexWidths = new();
+                        subMeshTexHeights = new();
+
+                        var allMaterials = FindMaterialsForMesh(m_Mesh);
+                        
+                        if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
+                        {
+                            for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
                             {
-                                var tex = FindTextureForMaterial(allMaterials[i]!);
-                                if (tex != null)
+                                byte[]? tb = null;
+                                int tw = 0, th = 0;
+
+                                if (i < allMaterials.Count && allMaterials[i] != null)
                                 {
-                                    try
+                                    var tex = FindTextureForMaterial(allMaterials[i]!);
+                                    if (tex != null)
                                     {
-                                        var image = tex.ConvertToImage(true);
-                                        if (image != null)
+                                        try
                                         {
-                                            tw = image.Width;
-                                            th = image.Height;
-                                            tb = new byte[tw * th * 4];
-                                            image.CopyPixelDataTo(tb);
-                                            for (int p = 0; p < tb.Length; p += 4)
+                                            using (var image = tex.ConvertToImage(true))
                                             {
-                                                byte temp = tb[p];
-                                                tb[p] = tb[p + 2];
-                                                tb[p + 2] = temp;
+                                                if (image != null)
+                                                {
+                                                    tw = image.Width;
+                                                    th = image.Height;
+                                                    tb = new byte[tw * th * 4];
+                                                    image.CopyPixelDataTo(tb);
+                                                    for (int p = 0; p < tb.Length; p += 4)
+                                                    {
+                                                        byte temp = tb[p];
+                                                        tb[p] = tb[p + 2];
+                                                        tb[p + 2] = temp;
+                                                    }
+                                                }
                                             }
                                         }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        StatusStripUpdate($"Texture decode failed for submesh {i}: {ex.Message}");
+                                        catch {}
                                     }
                                 }
+                                subMeshTextures.Add(tb);
+                                subMeshTexWidths.Add(tw);
+                                subMeshTexHeights.Add(th);
                             }
-                            subMeshTextures.Add(tb);
-                            subMeshTexWidths.Add(tw);
-                            subMeshTexHeights.Add(th);
                         }
+
+                        global::OpenTK.Mathematics.Vector2[]? uvs = null;
+
+                        if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
+                        {
+                            uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
+                            for (int i = 0; i < m_Mesh.m_VertexCount; i++)
+                            {
+                                uvs[i] = new global::OpenTK.Mathematics.Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
+                            }
+                        }
+
+                        currentPreviewMesh = m_Mesh;
+                        GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                        GLPreviewControl.IsVisible = true;
+                        if (BoneSizeContainer != null)
+                        {
+                            BoneSizeContainer.IsVisible = false;
+                        }
+                        GLPreviewControl.Focus();
+                    }
+                    if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    {
+                        PreviewInfoOverlay.Text = "Loading details...";
+                        PreviewInfoBorder.IsVisible = true;
+                        var localAssetItem = assetItem;
+                        var localMesh = m_Mesh;
+                        Task.Run(() =>
+                        {
+                            var infoText = FormatMeshPreview(localMesh, localAssetItem);
+                            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                            {
+                                if (AssetListDataGrid.SelectedItem == localAssetItem && PreviewInfoOverlay != null)
+                                {
+                                    PreviewInfoOverlay.Text = infoText;
+                                }
+                            });
+                        });
+                    }
+                    PreviewLabel.IsVisible = false;
+                    if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
+                    {
+                        StatusStripUpdate("OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded");
                     }
                     else
                     {
-                        // Fallback if no submeshes (shouldn't happen for valid meshes)
-                        byte[]? tb = null;
-                        int tw = 0, th = 0;
-                        if (allMaterials.Count > 0 && allMaterials[0] != null)
-                        {
-                            var tex = FindTextureForMaterial(allMaterials[0]!);
-                            if (tex != null)
-                            {
-                                try
-                                {
-                                    var image = tex.ConvertToImage(true);
-                                    if (image != null)
-                                    {
-                                        tw = image.Width;
-                                        th = image.Height;
-                                        tb = new byte[tw * th * 4];
-                                        image.CopyPixelDataTo(tb);
-                                        for (int p = 0; p < tb.Length; p += 4)
-                                        {
-                                            byte temp = tb[p];
-                                            tb[p] = tb[p + 2];
-                                            tb[p + 2] = temp;
-                                        }
-                                    }
-                                }
-                                catch {}
-                            }
-                        }
-                        subMeshTextures.Add(tb);
-                        subMeshTexWidths.Add(tw);
-                        subMeshTexHeights.Add(th);
+                        StatusStripUpdate("OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
                     }
-
-                    global::OpenTK.Mathematics.Vector2[]? uvs = null;
-
-                    if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
-                    {
-                        uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
-                        for (int i = 0; i < m_Mesh.m_VertexCount; i++)
-                        {
-                            uvs[i] = new global::OpenTK.Mathematics.Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
-                        }
-                    }
-
-                    currentPreviewMesh = m_Mesh;
-                    GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
-                    GLPreviewControl.IsVisible = true;
-                    if (BoneSizeContainer != null)
-                    {
-                        BoneSizeContainer.IsVisible = false;
-                    }
-                    GLPreviewControl.Focus();
+                    break;
                 }
-                if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                {
-                    PreviewInfoOverlay.Text = "Loading details...";
-                    PreviewInfoBorder.IsVisible = true;
-                    var localAssetItem = assetItem;
-                    var localMesh = m_Mesh;
-                    Task.Run(() =>
-                    {
-                        var infoText = FormatMeshPreview(localMesh, localAssetItem);
-                        global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                        {
-                            if (AssetListDataGrid.SelectedItem == localAssetItem && PreviewInfoOverlay != null)
-                            {
-                                PreviewInfoOverlay.Text = infoText;
-                            }
-                        });
-                    });
-                }
-                PreviewLabel.IsVisible = false;
-                if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
-                {
-                    StatusStripUpdate("OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded");
-                }
-                else
-                {
-                    StatusStripUpdate("OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
-                }
-                break;
-            }
-            case Object obj when obj.type == ClassIDType.PrefabInstance:
-                SetTextWithTruncation(TextPreviewBox, fbxHeader + FormatPrefab(obj));
-                TextPreviewBox.IsVisible = true;
-                PreviewLabel.IsVisible = false;
-                break;
-            case VideoClip m_VideoClip:
-                PreviewVideoClip(assetItem, m_VideoClip);
-                break;
-            case MovieTexture _:
-                StatusStripUpdate("Only supported export.");
-                break;
-            case Animator m_Animator:
-                PreviewAnimatorGraph(m_Animator);
-                break;
-            case AnimatorController m_AnimatorController:
-                PreviewAnimatorGraph(m_AnimatorController);
-                break;
-            case AnimatorOverrideController m_AnimatorOverrideController:
-                PreviewAnimatorGraph(m_AnimatorOverrideController);
-                break;
-            case Avatar m_Avatar:
-                PreviewAvatar(m_Avatar);
-                break;
-            case AnimationClip m_AnimationClip:
-                PreviewAnimationClip(m_AnimationClip);
-                break;
-            default:
-                if (dumpStr != null)
-                {
-                    SetTextWithTruncation(TextPreviewBox, fbxHeader + dumpStr);
+                case Object obj when obj.type == ClassIDType.PrefabInstance:
+                    SetTextWithTruncation(TextPreviewBox, fbxHeader + FormatPrefab(obj));
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
-                }
-                break;
+                    break;
+                case VideoClip m_VideoClip:
+                    PreviewVideoClip(assetItem, m_VideoClip);
+                    break;
+                case MovieTexture _:
+                    StatusStripUpdate("Only supported export.");
+                    break;
+                case Animator m_Animator:
+                    PreviewAnimatorGraph(m_Animator);
+                    break;
+                case AnimatorController m_AnimatorController:
+                    PreviewAnimatorGraph(m_AnimatorController);
+                    break;
+                case AnimatorOverrideController m_AnimatorOverrideController:
+                    PreviewAnimatorGraph(m_AnimatorOverrideController);
+                    break;
+                case Avatar m_Avatar:
+                    PreviewAvatar(m_Avatar);
+                    break;
+                case AnimationClip m_AnimationClip:
+                    PreviewAnimationClip(m_AnimationClip);
+                    break;
+                default:
+                    string? rawDump = null;
+                    try
+                    {
+                        rawDump = assetItem.Asset.Dump();
+                    }
+                    catch (Exception dumpEx)
+                    {
+                        rawDump = $"Failed to dump asset: {dumpEx.Message}";
+                    }
+                    if (rawDump != null)
+                    {
+                        SetTextWithTruncation(TextPreviewBox, fbxHeader + rawDump);
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
+                    }
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Error displaying preview for {assetItem.Name}: {ex.Message}");
+            StatusStripUpdate($"Preview error: {ex.Message}");
+
+            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+            if (TextureGLPreview != null) TextureGLPreview.IsVisible = false;
+            if (ImagePreviewBox != null)
+            {
+                ImagePreviewBox.Source = null;
+                ImagePreviewBox.IsVisible = false;
+            }
+            ClearTextAssetPreview();
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Failed to load preview for asset: {assetItem.Name}");
+            sb.AppendLine($"Type: {assetItem.DisplayType}");
+            sb.AppendLine($"PathID: {assetItem.PathID}");
+            sb.AppendLine();
+            sb.AppendLine("Error details:");
+            sb.AppendLine(ex.ToString());
+
+            SetTextWithTruncation(TextPreviewBox, sb.ToString());
+            TextPreviewBox.IsVisible = true;
+            PreviewLabel.IsVisible = false;
         }
     }
 
@@ -3142,6 +3162,7 @@ public partial class MainWindow : Window
                             if (GLPreviewControl != null)
                             {
                                 GLPreviewControl.SetMaterialTexture(image);
+                                image.Dispose();
                                 GLPreviewControl.IsVisible = true;
                                 if (BoneSizeContainer != null)
                                 {
@@ -5678,8 +5699,13 @@ public partial class MainWindow : Window
         return sb.ToString();
     }
 
-    private Material? ResolveMaterial(long pathID, string meshName)
+    private Material? ResolveMaterial(SerializedFile sourceFile, long pathID, string meshName)
     {
+        if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj) && obj is Material sourceMat)
+        {
+            return sourceMat;
+        }
+
         Material? bestMat = null;
         int bestScore = -1;
 
@@ -5687,7 +5713,8 @@ public partial class MainWindow : Window
 
         foreach (var file in assetsManager.assetsFileList)
         {
-            if (file.ObjectsDic.TryGetValue(pathID, out var obj) && obj is Material mat)
+            if (file == sourceFile) continue;
+            if (file.ObjectsDic.TryGetValue(pathID, out var otherObj) && otherObj is Material mat)
             {
                 var matTokens = GetPathTokens(mat.m_Name);
                 int score = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count() * 10;
@@ -5717,13 +5744,18 @@ public partial class MainWindow : Window
             }
         }
 
-        AssetStudio.Object? ResolveObject(long pathID)
+        AssetStudio.Object? ResolveObject(SerializedFile sourceFile, long pathID)
         {
+            if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj))
+            {
+                return obj;
+            }
             foreach (var file in assetsManager.assetsFileList)
             {
-                if (file.ObjectsDic.TryGetValue(pathID, out var obj))
+                if (file == sourceFile) continue;
+                if (file.ObjectsDic.TryGetValue(pathID, out var otherObj))
                 {
-                    return obj;
+                    return otherObj;
                 }
             }
             return null;
@@ -5746,27 +5778,35 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        smrMesh = ResolveObject(smr.m_Mesh.m_PathID) as Mesh;
+                        smrMesh = ResolveObject(file, smr.m_Mesh.m_PathID) as Mesh;
                     }
 
                     if (smrMesh != null && smr.m_Materials != null)
                     {
-                        if (!meshToMaterialsCache.ContainsKey(smrMesh))
+                        var list = new List<Material?>();
+                        foreach (var matPtr in smr.m_Materials)
                         {
-                            var list = new List<Material?>();
-                            meshToMaterialsCache[smrMesh] = list;
-                            foreach (var matPtr in smr.m_Materials)
+                            Material? resolvedMat = null;
+                            if (matPtr.TryGet(out var mt))
                             {
-                                Material? resolvedMat = null;
-                                if (matPtr.TryGet(out var mt))
-                                {
-                                    resolvedMat = mt;
-                                }
-                                else
-                                {
-                                    resolvedMat = ResolveMaterial(matPtr.m_PathID, smrMesh.m_Name);
-                                }
-                                list.Add(resolvedMat);
+                                resolvedMat = mt;
+                            }
+                            else
+                            {
+                                resolvedMat = ResolveMaterial(file, matPtr.m_PathID, smrMesh.m_Name);
+                            }
+                            list.Add(resolvedMat);
+                        }
+
+                        if (!meshToMaterialsCache.TryGetValue(smrMesh, out var existingList))
+                        {
+                            meshToMaterialsCache[smrMesh] = list;
+                        }
+                        else
+                        {
+                            if (ScoreMaterials(list) > ScoreMaterials(existingList))
+                            {
+                                meshToMaterialsCache[smrMesh] = list;
                             }
                         }
                     }
@@ -5780,7 +5820,7 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        go = ResolveObject(mr.m_GameObject.m_PathID) as GameObject;
+                        go = ResolveObject(file, mr.m_GameObject.m_PathID) as GameObject;
                     }
 
                     if (go != null)
@@ -5794,7 +5834,7 @@ public partial class MainWindow : Window
                             }
                             else
                             {
-                                comp = ResolveObject(compPtr.m_PathID) as Component;
+                                comp = ResolveObject(file, compPtr.m_PathID) as Component;
                             }
 
                             if (comp is MeshFilter mf)
@@ -5806,27 +5846,35 @@ public partial class MainWindow : Window
                                 }
                                 else
                                 {
-                                    mfMesh = ResolveObject(mf.m_Mesh.m_PathID) as Mesh;
+                                    mfMesh = ResolveObject(file, mf.m_Mesh.m_PathID) as Mesh;
                                 }
 
                                 if (mfMesh != null && mr.m_Materials != null)
                                 {
-                                    if (!meshToMaterialsCache.ContainsKey(mfMesh))
+                                    var list = new List<Material?>();
+                                    foreach (var matPtr in mr.m_Materials)
                                     {
-                                        var list = new List<Material?>();
-                                        meshToMaterialsCache[mfMesh] = list;
-                                        foreach (var matPtr in mr.m_Materials)
+                                        Material? resolvedMat = null;
+                                        if (matPtr.TryGet(out var mt))
                                         {
-                                            Material? resolvedMat = null;
-                                            if (matPtr.TryGet(out var mt))
-                                            {
-                                                resolvedMat = mt;
-                                            }
-                                            else
-                                            {
-                                                resolvedMat = ResolveMaterial(matPtr.m_PathID, mfMesh.m_Name);
-                                            }
-                                            list.Add(resolvedMat);
+                                            resolvedMat = mt;
+                                        }
+                                        else
+                                        {
+                                            resolvedMat = ResolveMaterial(file, matPtr.m_PathID, mfMesh.m_Name);
+                                        }
+                                        list.Add(resolvedMat);
+                                    }
+
+                                    if (!meshToMaterialsCache.TryGetValue(mfMesh, out var existingList))
+                                    {
+                                        meshToMaterialsCache[mfMesh] = list;
+                                    }
+                                    else
+                                    {
+                                        if (ScoreMaterials(list) > ScoreMaterials(existingList))
+                                        {
+                                            meshToMaterialsCache[mfMesh] = list;
                                         }
                                     }
                                 }
@@ -5836,6 +5884,25 @@ public partial class MainWindow : Window
                 }
             }
         }
+    }
+
+    private int ScoreMaterials(List<Material?> mats)
+    {
+        if (mats == null || mats.Count == 0) return 0;
+        int score = 0;
+        foreach (var mat in mats)
+        {
+            if (mat != null)
+            {
+                score += 1;
+                var tex = FindTextureForMaterial(mat);
+                if (tex != null)
+                {
+                    score += 100;
+                }
+            }
+        }
+        return score;
     }
 
     private List<Material?> FindMaterialsForMesh(Mesh mesh)

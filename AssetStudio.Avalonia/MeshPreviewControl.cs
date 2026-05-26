@@ -129,6 +129,8 @@ void main()
 	lightColor += vec3(0.779, 0.716, 0.453) * ContributionWeights.y;
 	lightColor += vec3(0.368, 0.477, 0.735) * ContributionWeights.x;
 	vec4 texColor = texture(mainTex, texCoord);
+	if (texColor.a < 0.25)
+		discard;
 	outputColor = vec4(texColor.rgb * lightColor, texColor.a);
 }";
 
@@ -881,6 +883,9 @@ void main()
                         subTexW = pendingSubMeshTexWidths;
                         subTexH = pendingSubMeshTexHeights;
                         hasPendingSubMeshTextures = false;
+                        pendingSubMeshTextures = null;
+                        pendingSubMeshTexWidths = null;
+                        pendingSubMeshTexHeights = null;
                     }
                     else if (hasPendingTexture)
                     {
@@ -892,6 +897,7 @@ void main()
                         subTexBytes = new List<byte[]?> { pendingTextureData };
                         subTexW = new List<int> { pendingTextureWidth };
                         subTexH = new List<int> { pendingTextureHeight };
+                        pendingTextureData = null;
                     }
                 }
 
@@ -940,48 +946,64 @@ void main()
                 GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
                 GL.Enable(EnableCap.DepthTest);
                 GL.DepthFunc(DepthFunction.Lequal);
+                GL.Enable(EnableCap.Blend);
+                GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+
+                if (vao == 0)
+                {
+                    if (!updateTex)
+                    {
+                        if (previewTextureId != 0)
+                        {
+                            GL.DeleteTexture(previewTextureId);
+                            previewTextureId = 0;
+                        }
+                        if (previewTextureIds != null)
+                        {
+                            foreach (var id in previewTextureIds)
+                            {
+                                if (id != 0) GL.DeleteTexture(id);
+                            }
+                            previewTextureIds = null;
+                        }
+                    }
+                    CreateVAO();
+                }
 
                 if (isAvatarMode)
                 {
-                    if (vao == 0)
+                    Vector3[]? localSkeletonVerts = null;
+                    lock (skeletonLock)
                     {
-                        CreateVAO();
+                        if (pendingSkeletonVertices != null)
+                        {
+                            localSkeletonVerts = pendingSkeletonVertices;
+                            pendingSkeletonVertices = null;
+                        }
                     }
-                    else
+
+                    if (localSkeletonVerts != null && vaoSkeleton != 0 && vboSkeleton != 0)
                     {
-                        Vector3[]? localSkeletonVerts = null;
-                        lock (skeletonLock)
-                        {
-                            if (pendingSkeletonVertices != null)
-                            {
-                                localSkeletonVerts = pendingSkeletonVertices;
-                                pendingSkeletonVertices = null;
-                            }
-                        }
+                        GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
+                        GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localSkeletonVerts.Length * 12), localSkeletonVerts, BufferUsageHint.DynamicDraw);
+                        GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+                    }
 
-                        if (localSkeletonVerts != null && vaoSkeleton != 0 && vboSkeleton != 0)
+                    Vector3[]? localMeshVerts = null;
+                    lock (meshLock)
+                    {
+                        if (pendingMeshVertices != null)
                         {
-                            GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
-                            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localSkeletonVerts.Length * 12), localSkeletonVerts, BufferUsageHint.DynamicDraw);
-                            GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+                            localMeshVerts = pendingMeshVertices;
+                            pendingMeshVertices = null;
                         }
+                    }
 
-                        Vector3[]? localMeshVerts = null;
-                        lock (meshLock)
-                        {
-                            if (pendingMeshVertices != null)
-                            {
-                                localMeshVerts = pendingMeshVertices;
-                                pendingMeshVertices = null;
-                            }
-                        }
-
-                        if (localMeshVerts != null && vboPosition != 0)
-                        {
-                            GL.BindBuffer(BufferTarget.ArrayBuffer, vboPosition);
-                            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localMeshVerts.Length * 12), localMeshVerts, BufferUsageHint.DynamicDraw);
-                            GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
-                        }
+                    if (localMeshVerts != null && vboPosition != 0)
+                    {
+                        GL.BindBuffer(BufferTarget.ArrayBuffer, vboPosition);
+                        GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localMeshVerts.Length * 12), localMeshVerts, BufferUsageHint.DynamicDraw);
+                        GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
                     }
 
                     if (vaoWireframe != 0)
@@ -1027,11 +1049,6 @@ void main()
                     GL.BindVertexArray(0);
                     GL.Flush();
                     return;
-                }
-
-                if (vao == 0)
-                {
-                    CreateVAO();
                 }
 
                 GL.BindVertexArray(vao);
