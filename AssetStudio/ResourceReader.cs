@@ -161,6 +161,32 @@ namespace AssetStudio
                 }
             }
 
+            // Fallback for renamed companion files (like level77 + level77.resS / level77.assets.resS)
+            var assetsFileDir = Path.GetDirectoryName(assetsFile.fullName);
+            if (!string.IsNullOrEmpty(assetsFileDir))
+            {
+                var assetsFileNameWithoutExt = Path.GetFileNameWithoutExtension(assetsFile.fullName);
+                var resourceExtension = Path.GetExtension(resourceFileName); // e.g. ".resS" or ".resource"
+                if (!string.IsNullOrEmpty(resourceExtension))
+                {
+                    string[] possibleNames = {
+                        assetsFileNameWithoutExt + resourceExtension,
+                        assetsFileNameWithoutExt + ".assets" + resourceExtension,
+                        assetsFileNameWithoutExt + (resourceExtension.Equals(".resS", StringComparison.OrdinalIgnoreCase) ? ".resource" : ".resS"),
+                        assetsFileNameWithoutExt + ".assets" + (resourceExtension.Equals(".resS", StringComparison.OrdinalIgnoreCase) ? ".resource" : ".resS")
+                    };
+
+                    foreach (var name in possibleNames)
+                    {
+                        var companionPath = Path.Combine(assetsFileDir, name);
+                        if (File.Exists(companionPath))
+                        {
+                            return companionPath;
+                        }
+                    }
+                }
+            }
+
             return null;
         }
 

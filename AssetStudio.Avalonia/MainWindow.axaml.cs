@@ -2930,8 +2930,25 @@ public partial class MainWindow : Window
     {
         if (m_Font.m_FontData == null || m_Font.m_FontData.Length == 0)
         {
-            StatusStripUpdate("Unsupported or empty font data.");
-            ClearPreview("Unsupported font");
+            StatusStripUpdate("Font has no embedded binary data.");
+            var sb = new StringBuilder();
+            sb.AppendLine($"Font: {m_Font.m_Name}");
+            sb.AppendLine("Format: System or Custom Reference (No embedded data)");
+            sb.AppendLine("Data size: 0 bytes");
+            sb.AppendLine();
+            sb.AppendLine("This font asset does not contain embedded TrueType/OpenType binary data.");
+            sb.AppendLine("It may reference a system-installed font or use custom character textures.");
+            sb.AppendLine();
+            sb.AppendLine("Raw metadata export is still available.");
+
+            SetTextWithTruncation(TextPreviewBox, sb.ToString());
+            ImagePreviewBox.IsVisible = false;
+            TextPreviewBox.IsVisible = true;
+            PreviewLabel.IsVisible = false;
+            if (PreviewInfoBorder != null)
+            {
+                PreviewInfoBorder.IsVisible = false;
+            }
             return;
         }
 
@@ -2942,7 +2959,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                var fontPreview = FontAssetPreviewRenderer.Render(m_Font.m_Name, m_Font.m_FontData);
+                var fontPreview = FontAssetPreviewRenderer.Render(m_Font.m_Name, m_Font.m_FontData, () => currentId != texturePreviewIdCounter);
 
                 Dispatcher.UIThread.Post(() =>
                 {

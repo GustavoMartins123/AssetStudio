@@ -99,6 +99,9 @@ namespace AssetStudio
                 case FileType.ZipFile:
                     LoadZipFile(reader);
                     break;
+                default:
+                    reader.Dispose();
+                    break;
             }
         }
 

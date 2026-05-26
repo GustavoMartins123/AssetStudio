@@ -1,4 +1,5 @@
 using System.IO;
+using System.Linq;
 using System.Text;
 using AvaloniaBitmap = Avalonia.Media.Imaging.Bitmap;
 using ImageSharpColor = SixLabors.ImageSharp.Color;
@@ -12,21 +13,54 @@ namespace AssetStudio.Avalonia;
 
 internal static class FontAssetPreviewRenderer
 {
-    public static (AvaloniaBitmap Bitmap, string InfoText) Render(string fontName, byte[] fontData)
+    private static bool TryGetSystemSandboxFont(out FontFamily family)
+    {
+        string[] preferredFonts = { "Noto Sans CJK JP", "Noto Sans", "DejaVu Sans", "Liberation Sans", "Ubuntu", "sans-serif" };
+        foreach (var fontName in preferredFonts)
+        {
+            if (SystemFonts.TryGet(fontName, out family))
+            {
+                return true;
+            }
+        }
+        var families = SystemFonts.Families.ToList();
+        if (families.Count > 0)
+        {
+            family = families[0];
+            return true;
+        }
+        family = default;
+        return false;
+    }
+
+    public static (AvaloniaBitmap Bitmap, string InfoText) Render(string fontName, byte[] fontData, System.Func<bool> isCancelled)
     {
         const int width = 1200;
         const int height = 720;
         const int margin = 42;
 
+        if (isCancelled()) throw new System.OperationCanceledException();
+
         var collection = new FontCollection();
         using var fontStream = new MemoryStream(fontData, writable: false);
         var family = collection.Add(fontStream);
 
+        if (isCancelled()) throw new System.OperationCanceledException();
+
         using var image = new Image<Rgba32>(width, height, new Rgba32(30, 33, 39));
         image.Mutate(ctx =>
         {
-            var titleFont = family.CreateFont(30, SixLabors.Fonts.FontStyle.Regular);
-            var smallFont = family.CreateFont(18, SixLabors.Fonts.FontStyle.Regular);
+            if (isCancelled()) return;
+
+            if (!TryGetSystemSandboxFont(out var metadataFamily))
+            {
+                metadataFamily = family;
+            }
+
+            if (isCancelled()) return;
+
+            var titleFont = metadataFamily.CreateFont(30, SixLabors.Fonts.FontStyle.Regular);
+            var smallFont = metadataFamily.CreateFont(18, SixLabors.Fonts.FontStyle.Regular);
             var mediumFont = family.CreateFont(32, SixLabors.Fonts.FontStyle.Regular);
             var largeFont = family.CreateFont(56, SixLabors.Fonts.FontStyle.Regular);
             var hugeFont = family.CreateFont(84, SixLabors.Fonts.FontStyle.Regular);
@@ -35,18 +69,30 @@ internal static class FontAssetPreviewRenderer
             var foreground = ImageSharpColor.FromRgb(245, 247, 250);
             var accent = ImageSharpColor.FromRgb(117, 207, 180);
 
+            if (isCancelled()) return;
             DrawText(ctx, titleFont, $"Font: {fontName}", foreground, margin, 34, width - margin * 2);
+            if (isCancelled()) return;
             DrawText(ctx, smallFont, $"Format: {DetectFontFormat(fontData)}   Size: {fontData.Length:N0} bytes", muted, margin, 88, width - margin * 2);
+            if (isCancelled()) return;
             DrawText(ctx, mediumFont, "abcdefghijklmnopqrstuvwxyz", foreground, margin, 150, width - margin * 2);
+            if (isCancelled()) return;
             DrawText(ctx, mediumFont, "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789", foreground, margin, 205, width - margin * 2);
+            if (isCancelled()) return;
             DrawText(ctx, largeFont, "Pack my box with five dozen liquor jugs.", accent, margin, 290, width - margin * 2);
+            if (isCancelled()) return;
             DrawText(ctx, hugeFont, "Hamburgefonstiv 123", foreground, margin, 405, width - margin * 2);
+            if (isCancelled()) return;
             DrawText(ctx, mediumFont, "\u65e5\u672c\u8a9e\u30b5\u30f3\u30d7\u30eb: \u30ea\u30bc \u30d5\u30a3\u30fc\u30ca \u30a6\u30a7\u30f3\u30c7\u30a3", foreground, margin, 600, width - margin * 2);
         });
+
+        if (isCancelled()) throw new System.OperationCanceledException();
 
         using var ms = new MemoryStream();
         image.SaveAsPng(ms);
         ms.Position = 0;
+
+        if (isCancelled()) throw new System.OperationCanceledException();
+
         return (new AvaloniaBitmap(ms), BuildInfoText(fontData));
     }
 
