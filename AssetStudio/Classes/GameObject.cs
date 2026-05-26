@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -20,6 +20,7 @@ namespace AssetStudio
         public GameObject(ObjectReader reader) : base(reader)
         {
             int m_Component_size = reader.ReadInt32();
+            reader.CheckArrayLength(m_Component_size);
             m_Components = new PPtr<Component>[m_Component_size];
             for (int i = 0; i < m_Component_size; i++)
             {

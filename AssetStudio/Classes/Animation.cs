@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -13,6 +13,7 @@ namespace AssetStudio
         {
             var m_Animation = new PPtr<AnimationClip>(reader);
             int numAnimations = reader.ReadInt32();
+            reader.CheckArrayLength(numAnimations);
             m_Animations = new PPtr<AnimationClip>[numAnimations];
             for (int i = 0; i < numAnimations; i++)
             {

@@ -28,6 +28,7 @@ namespace AssetStudio
             var m_StructSize = reader.ReadInt32();
 
             int numVectorParams = reader.ReadInt32();
+            reader.CheckArrayLength(numVectorParams);
             m_VectorParams = new VectorParameter[numVectorParams];
             for (int i = 0; i < numVectorParams; i++)
             {
@@ -35,6 +36,7 @@ namespace AssetStudio
             }
 
             int numMatrixParams = reader.ReadInt32();
+            reader.CheckArrayLength(numMatrixParams);
             m_MatrixParams = new MatrixParameter[numMatrixParams];
             for (int i = 0; i < numMatrixParams; i++)
             {
@@ -117,6 +119,7 @@ namespace AssetStudio
         public SerializedProperties(BinaryReader reader)
         {
             int numProps = reader.ReadInt32();
+            reader.CheckArrayLength(numProps);
             m_Props = new SerializedProperty[numProps];
             for (int i = 0; i < numProps; i++)
             {
@@ -296,6 +299,7 @@ namespace AssetStudio
         public ParserBindChannels(BinaryReader reader)
         {
             int numChannels = reader.ReadInt32();
+            reader.CheckArrayLength(numChannels);
             m_Channels = new ShaderBindChannel[numChannels];
             for (int i = 0; i < numChannels; i++)
             {
@@ -403,6 +407,7 @@ namespace AssetStudio
             m_NameIndex = reader.ReadInt32();
 
             int numMatrixParams = reader.ReadInt32();
+            reader.CheckArrayLength(numMatrixParams);
             m_MatrixParams = new MatrixParameter[numMatrixParams];
             for (int i = 0; i < numMatrixParams; i++)
             {
@@ -410,6 +415,7 @@ namespace AssetStudio
             }
 
             int numVectorParams = reader.ReadInt32();
+            reader.CheckArrayLength(numVectorParams);
             m_VectorParams = new VectorParameter[numVectorParams];
             for (int i = 0; i < numVectorParams; i++)
             {
@@ -418,6 +424,7 @@ namespace AssetStudio
             if (version[0] > 2017 || (version[0] == 2017 && version[1] >= 3)) //2017.3 and up
             {
                 int numStructParams = reader.ReadInt32();
+                reader.CheckArrayLength(numStructParams);
                 m_StructParams = new StructParameter[numStructParams];
                 for (int i = 0; i < numStructParams; i++)
                 {
@@ -503,6 +510,7 @@ namespace AssetStudio
         public SerializedProgramParameters(ObjectReader reader)
         {
             int numVectorParams = reader.ReadInt32();
+            reader.CheckArrayLength(numVectorParams);
             m_VectorParams = new VectorParameter[numVectorParams];
             for (int i = 0; i < numVectorParams; i++)
             {
@@ -510,6 +518,7 @@ namespace AssetStudio
             }
 
             int numMatrixParams = reader.ReadInt32();
+            reader.CheckArrayLength(numMatrixParams);
             m_MatrixParams = new MatrixParameter[numMatrixParams];
             for (int i = 0; i < numMatrixParams; i++)
             {
@@ -517,6 +526,7 @@ namespace AssetStudio
             }
 
             int numTextureParams = reader.ReadInt32();
+            reader.CheckArrayLength(numTextureParams);
             m_TextureParams = new TextureParameter[numTextureParams];
             for (int i = 0; i < numTextureParams; i++)
             {
@@ -524,6 +534,7 @@ namespace AssetStudio
             }
 
             int numBufferParams = reader.ReadInt32();
+            reader.CheckArrayLength(numBufferParams);
             m_BufferParams = new BufferBinding[numBufferParams];
             for (int i = 0; i < numBufferParams; i++)
             {
@@ -531,6 +542,7 @@ namespace AssetStudio
             }
 
             int numConstantBuffers = reader.ReadInt32();
+            reader.CheckArrayLength(numConstantBuffers);
             m_ConstantBuffers = new ConstantBuffer[numConstantBuffers];
             for (int i = 0; i < numConstantBuffers; i++)
             {
@@ -538,6 +550,7 @@ namespace AssetStudio
             }
 
             int numConstantBufferBindings = reader.ReadInt32();
+            reader.CheckArrayLength(numConstantBufferBindings);
             m_ConstantBufferBindings = new BufferBinding[numConstantBufferBindings];
             for (int i = 0; i < numConstantBufferBindings; i++)
             {
@@ -545,6 +558,7 @@ namespace AssetStudio
             }
 
             int numUAVParams = reader.ReadInt32();
+            reader.CheckArrayLength(numUAVParams);
             m_UAVParams = new UAVParameter[numUAVParams];
             for (int i = 0; i < numUAVParams; i++)
             {
@@ -552,6 +566,7 @@ namespace AssetStudio
             }
 
             int numSamplers = reader.ReadInt32();
+            reader.CheckArrayLength(numSamplers);
             m_Samplers = new SamplerParameter[numSamplers];
             for (int i = 0; i < numSamplers; i++)
             {
@@ -615,6 +630,7 @@ namespace AssetStudio
             else
             {
                 int numVectorParams = reader.ReadInt32();
+                reader.CheckArrayLength(numVectorParams);
                 m_VectorParams = new VectorParameter[numVectorParams];
                 for (int i = 0; i < numVectorParams; i++)
                 {
@@ -622,6 +638,7 @@ namespace AssetStudio
                 }
 
                 int numMatrixParams = reader.ReadInt32();
+                reader.CheckArrayLength(numMatrixParams);
                 m_MatrixParams = new MatrixParameter[numMatrixParams];
                 for (int i = 0; i < numMatrixParams; i++)
                 {
@@ -629,6 +646,7 @@ namespace AssetStudio
                 }
 
                 int numTextureParams = reader.ReadInt32();
+                reader.CheckArrayLength(numTextureParams);
                 m_TextureParams = new TextureParameter[numTextureParams];
                 for (int i = 0; i < numTextureParams; i++)
                 {
@@ -636,6 +654,7 @@ namespace AssetStudio
                 }
 
                 int numBufferParams = reader.ReadInt32();
+                reader.CheckArrayLength(numBufferParams);
                 m_BufferParams = new BufferBinding[numBufferParams];
                 for (int i = 0; i < numBufferParams; i++)
                 {
@@ -643,6 +662,7 @@ namespace AssetStudio
                 }
 
                 int numConstantBuffers = reader.ReadInt32();
+                reader.CheckArrayLength(numConstantBuffers);
                 m_ConstantBuffers = new ConstantBuffer[numConstantBuffers];
                 for (int i = 0; i < numConstantBuffers; i++)
                 {
@@ -650,6 +670,7 @@ namespace AssetStudio
                 }
 
                 int numConstantBufferBindings = reader.ReadInt32();
+                reader.CheckArrayLength(numConstantBufferBindings);
                 m_ConstantBufferBindings = new BufferBinding[numConstantBufferBindings];
                 for (int i = 0; i < numConstantBufferBindings; i++)
                 {
@@ -657,6 +678,7 @@ namespace AssetStudio
                 }
 
                 int numUAVParams = reader.ReadInt32();
+                reader.CheckArrayLength(numUAVParams);
                 m_UAVParams = new UAVParameter[numUAVParams];
                 for (int i = 0; i < numUAVParams; i++)
                 {
@@ -666,6 +688,7 @@ namespace AssetStudio
                 if (version[0] >= 2017) //2017 and up
                 {
                     int numSamplers = reader.ReadInt32();
+                    reader.CheckArrayLength(numSamplers);
                     m_Samplers = new SamplerParameter[numSamplers];
                     for (int i = 0; i < numSamplers; i++)
                     {
@@ -699,6 +722,7 @@ namespace AssetStudio
             var version = reader.version;
 
             int numSubPrograms = reader.ReadInt32();
+            reader.CheckArrayLength(numSubPrograms);
             m_SubPrograms = new SerializedSubProgram[numSubPrograms];
             for (int i = 0; i < numSubPrograms; i++)
             {
@@ -760,6 +784,7 @@ namespace AssetStudio
             if ((version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) && version[0] < 6000) //2020.2 ~ 2023.x
             {
                 int numEditorDataHash = reader.ReadInt32();
+                reader.CheckArrayLength(numEditorDataHash);
                 m_EditorDataHash = new Hash128[numEditorDataHash];
                 for (int i = 0; i < numEditorDataHash; i++)
                 {
@@ -778,6 +803,7 @@ namespace AssetStudio
             }
 
             int numIndices = reader.ReadInt32();
+            reader.CheckArrayLength(numIndices);
             m_NameIndices = new KeyValuePair<string, int>[numIndices];
             for (int i = 0; i < numIndices; i++)
             {
@@ -825,6 +851,7 @@ namespace AssetStudio
         public SerializedTagMap(BinaryReader reader)
         {
             int numTags = reader.ReadInt32();
+            reader.CheckArrayLength(numTags);
             tags = new KeyValuePair<string, string>[numTags];
             for (int i = 0; i < numTags; i++)
             {
@@ -842,6 +869,7 @@ namespace AssetStudio
         public SerializedSubShader(ObjectReader reader)
         {
             int numPasses = reader.ReadInt32();
+            reader.CheckArrayLength(numPasses);
             m_Passes = new SerializedPass[numPasses];
             for (int i = 0; i < numPasses; i++)
             {
@@ -897,6 +925,7 @@ namespace AssetStudio
             m_PropInfo = new SerializedProperties(reader);
 
             int numSubShaders = reader.ReadInt32();
+            reader.CheckArrayLength(numSubShaders);
             m_SubShaders = new SerializedSubShader[numSubShaders];
             for (int i = 0; i < numSubShaders; i++)
             {
@@ -915,6 +944,7 @@ namespace AssetStudio
             m_FallbackName = reader.ReadAlignedString();
 
             int numDependencies = reader.ReadInt32();
+            reader.CheckArrayLength(numDependencies);
             m_Dependencies = new SerializedShaderDependency[numDependencies];
             for (int i = 0; i < numDependencies; i++)
             {
@@ -924,6 +954,7 @@ namespace AssetStudio
             if (version[0] >= 2021) //2021.1 and up
             {
                 int m_CustomEditorForRenderPipelinesSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_CustomEditorForRenderPipelinesSize);
                 m_CustomEditorForRenderPipelines = new SerializedCustomEditorForRenderPipeline[m_CustomEditorForRenderPipelinesSize];
                 for (int i = 0; i < m_CustomEditorForRenderPipelinesSize; i++)
                 {
@@ -1058,6 +1089,7 @@ namespace AssetStudio
         public SerializedPackageRequirements(BinaryReader reader)
         {
             int numRequirements = reader.ReadInt32();
+            reader.CheckArrayLength(numRequirements);
             m_Requirements = new SerializedPackageRequirement[numRequirements];
             for (int i = 0; i < numRequirements; i++)
             {

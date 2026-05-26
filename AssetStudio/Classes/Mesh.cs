@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -137,10 +137,12 @@ namespace AssetStudio
             }
 
             m_VertexCount = reader.ReadUInt32();
+            reader.CheckArrayLength((int)m_VertexCount);
 
             if (version[0] >= 4) //4.0 and up
             {
                 var m_ChannelsSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_ChannelsSize);
                 m_Channels = new ChannelInfo[m_ChannelsSize];
                 for (int i = 0; i < m_ChannelsSize; i++)
                 {
@@ -156,7 +158,9 @@ namespace AssetStudio
                 }
                 else
                 {
-                    m_Streams = new StreamInfo[reader.ReadInt32()];
+                    var streamCount = reader.ReadInt32();
+                    reader.CheckArrayLength(streamCount);
+                    m_Streams = new StreamInfo[streamCount];
                 }
 
                 for (int i = 0; i < m_Streams.Length; i++)
@@ -355,6 +359,7 @@ namespace AssetStudio
             if (version[0] > 4 || (version[0] == 4 && version[1] >= 3)) //4.3 and up
             {
                 int numVerts = reader.ReadInt32();
+                reader.CheckArrayLength(numVerts);
                 vertices = new BlendShapeVertex[numVerts];
                 for (int i = 0; i < numVerts; i++)
                 {
@@ -362,6 +367,7 @@ namespace AssetStudio
                 }
 
                 int numShapes = reader.ReadInt32();
+                reader.CheckArrayLength(numShapes);
                 shapes = new MeshBlendShape[numShapes];
                 for (int i = 0; i < numShapes; i++)
                 {
@@ -369,6 +375,7 @@ namespace AssetStudio
                 }
 
                 int numChannels = reader.ReadInt32();
+                reader.CheckArrayLength(numChannels);
                 channels = new MeshBlendShapeChannel[numChannels];
                 for (int i = 0; i < numChannels; i++)
                 {
@@ -380,6 +387,7 @@ namespace AssetStudio
             else
             {
                 var m_ShapesSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_ShapesSize);
                 var m_Shapes = new MeshBlendShape[m_ShapesSize];
                 for (int i = 0; i < m_ShapesSize; i++)
                 {
@@ -387,6 +395,7 @@ namespace AssetStudio
                 }
                 reader.AlignStream();
                 var m_ShapeVerticesSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_ShapeVerticesSize);
                 var m_ShapeVertices = new BlendShapeVertex[m_ShapeVerticesSize]; //MeshBlendShapeVertex
                 for (int i = 0; i < m_ShapeVerticesSize; i++)
                 {
@@ -499,6 +508,7 @@ namespace AssetStudio
             }
 
             int m_SubMeshesSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_SubMeshesSize);
             m_SubMeshes = new SubMesh[m_SubMeshesSize];
             for (int i = 0; i < m_SubMeshesSize; i++)
             {
@@ -522,6 +532,7 @@ namespace AssetStudio
                 if (version[0] >= 2019) //2019 and up
                 {
                     var m_BonesAABBSize = reader.ReadInt32();
+                    reader.CheckArrayLength(m_BonesAABBSize);
                     var m_BonesAABB = new MinMaxAABB[m_BonesAABBSize];
                     for (int i = 0; i < m_BonesAABBSize; i++)
                     {
@@ -572,9 +583,12 @@ namespace AssetStudio
             if (version[0] < 3 || (version[0] == 3 && version[1] < 5)) //3.4.2 and earlier
             {
                 m_VertexCount = reader.ReadInt32();
+                reader.CheckArrayLength(m_VertexCount);
                 m_Vertices = reader.ReadSingleArray(m_VertexCount * 3); //Vector3
 
-                m_Skin = new BoneWeights4[reader.ReadInt32()];
+                var skinSize = reader.ReadInt32();
+                reader.CheckArrayLength(skinSize);
+                m_Skin = new BoneWeights4[skinSize];
                 for (int s = 0; s < m_Skin.Length; s++)
                 {
                     m_Skin[s] = new BoneWeights4(reader);
@@ -613,7 +627,9 @@ namespace AssetStudio
             {
                 if (version[0] < 2018 || (version[0] == 2018 && version[1] < 2)) //2018.2 down
                 {
-                    m_Skin = new BoneWeights4[reader.ReadInt32()];
+                    var skinSize = reader.ReadInt32();
+                    reader.CheckArrayLength(skinSize);
+                    m_Skin = new BoneWeights4[skinSize];
                     for (int s = 0; s < m_Skin.Length; s++)
                     {
                         m_Skin[s] = new BoneWeights4(reader);

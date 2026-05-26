@@ -82,7 +82,7 @@ namespace AssetStudio
             return new Matrix4x4(reader.ReadSingleArray(16));
         }
 
-        private static T[] ReadArray<T>(this BinaryReader reader, Func<T> del, int length)
+        public static void CheckArrayLength(this BinaryReader reader, int length)
         {
             if (length < 0 || length > 10000000)
             {
@@ -99,7 +99,11 @@ namespace AssetStudio
                 if (length > remainingObj)
                     throw new EndOfStreamException($"Array length {length} exceeds remaining object size {remainingObj}");
             }
+        }
 
+        public static T[] ReadArray<T>(this BinaryReader reader, Func<T> del, int length)
+        {
+            reader.CheckArrayLength(length);
             var array = new T[length];
             for (int i = 0; i < length; i++)
             {
@@ -112,17 +116,7 @@ namespace AssetStudio
         public static byte[] ReadUInt8Array(this BinaryReader reader)
         {
             int count = reader.ReadInt32();
-            if (count < 0) throw new OverflowException($"Invalid array length: {count}");
-
-            long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
-            if (count > remainingStream) throw new EndOfStreamException($"Array length {count} exceeds remaining stream length {remainingStream}");
-
-            if (reader is ObjectReader objReader)
-            {
-                long remainingObj = objReader.byteSize - (objReader.Position - objReader.byteStart);
-                if (count > remainingObj) throw new EndOfStreamException($"Array length {count} exceeds remaining object size {remainingObj}");
-            }
-
+            reader.CheckArrayLength(count);
             return reader.ReadBytes(count);
         }
 

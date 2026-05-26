@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -20,6 +20,7 @@ namespace AssetStudio
             m_LocalScale = reader.ReadVector3();
 
             int m_ChildrenCount = reader.ReadInt32();
+            reader.CheckArrayLength(m_ChildrenCount);
             m_Children = new PPtr<Transform>[m_ChildrenCount];
             for (int i = 0; i < m_ChildrenCount; i++)
             {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -27,6 +27,7 @@ namespace AssetStudio
             m_Controller = new PPtr<RuntimeAnimatorController>(reader);
 
             int numOverrides = reader.ReadInt32();
+            reader.CheckArrayLength(numOverrides);
             m_Clips = new AnimationClipOverride[numOverrides];
             for (int i = 0; i < numOverrides; i++)
             {

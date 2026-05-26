@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace AssetStudio
@@ -74,6 +74,7 @@ namespace AssetStudio
         public Skeleton(ObjectReader reader)
         {
             int numNodes = reader.ReadInt32();
+            reader.CheckArrayLength(numNodes);
             m_Node = new Node[numNodes];
             for (int i = 0; i < numNodes; i++)
             {
@@ -83,6 +84,7 @@ namespace AssetStudio
             m_ID = reader.ReadUInt32Array();
 
             int numAxes = reader.ReadInt32();
+            reader.CheckArrayLength(numAxes);
             m_AxesArray = new Axes[numAxes];
             for (int i = 0; i < numAxes; i++)
             {
@@ -98,6 +100,7 @@ namespace AssetStudio
         public SkeletonPose(ObjectReader reader)
         {
             int numXforms = reader.ReadInt32();
+            reader.CheckArrayLength(numXforms);
             m_X = new XForm[numXforms];
             for (int i = 0; i < numXforms; i++)
             {
@@ -192,6 +195,7 @@ namespace AssetStudio
             if (version[0] < 2018 || (version[0] == 2018 && version[1] < 2)) //2018.2 down
             {
                 int numHandles = reader.ReadInt32();
+                reader.CheckArrayLength(numHandles);
                 m_Handles = new Handle[numHandles];
                 for (int i = 0; i < numHandles; i++)
                 {
@@ -199,6 +203,7 @@ namespace AssetStudio
                 }
 
                 int numColliders = reader.ReadInt32();
+                reader.CheckArrayLength(numColliders);
                 m_ColliderArray = new Collider[numColliders];
                 for (int i = 0; i < numColliders; i++)
                 {
@@ -295,6 +300,7 @@ namespace AssetStudio
             m_Avatar = new AvatarConstant(reader);
 
             int numTOS = reader.ReadInt32();
+            reader.CheckArrayLength(numTOS);
             m_TOS = new KeyValuePair<uint, string>[numTOS];
             for (int i = 0; i < numTOS; i++)
             {

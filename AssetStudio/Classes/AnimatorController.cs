@@ -43,6 +43,7 @@ namespace AssetStudio
         public SkeletonMask(ObjectReader reader)
         {
             int numElements = reader.ReadInt32();
+            reader.CheckArrayLength(numElements);
             m_Data = new SkeletonMaskElement[numElements];
             for (int i = 0; i < numElements; i++)
             {
@@ -124,6 +125,7 @@ namespace AssetStudio
             var version = reader.version;
 
             int numConditions = reader.ReadInt32();
+            reader.CheckArrayLength(numConditions);
             m_ConditionConstantArray = new ConditionConstant[numConditions];
             for (int i = 0; i < numConditions; i++)
             {
@@ -201,6 +203,7 @@ namespace AssetStudio
             m_ChildPairAvgMagInvArray = reader.ReadSingleArray();
 
             int numNeighbours = reader.ReadInt32();
+            reader.CheckArrayLength(numNeighbours);
             m_ChildNeighborListArray = new MotionNeighborList[numNeighbours];
             for (int i = 0; i < numNeighbours; i++)
             {
@@ -307,6 +310,7 @@ namespace AssetStudio
             var version = reader.version;
 
             int numNodes = reader.ReadInt32();
+            reader.CheckArrayLength(numNodes);
             m_NodeArray = new BlendTreeNodeConstant[numNodes];
             for (int i = 0; i < numNodes; i++)
             {
@@ -346,6 +350,7 @@ namespace AssetStudio
             var version = reader.version;
 
             int numTransistions = reader.ReadInt32();
+            reader.CheckArrayLength(numTransistions);
             m_TransitionConstantArray = new TransitionConstant[numTransistions];
             for (int i = 0; i < numTransistions; i++)
             {
@@ -357,6 +362,7 @@ namespace AssetStudio
             if (version[0] < 5 || (version[0] == 5 && version[1] < 2)) //5.2 down
             {
                 int numInfos = reader.ReadInt32();
+                reader.CheckArrayLength(numInfos);
                 m_LeafInfoArray = new LeafInfoConstant[numInfos];
                 for (int i = 0; i < numInfos; i++)
                 {
@@ -365,6 +371,7 @@ namespace AssetStudio
             }
 
             int numBlends = reader.ReadInt32();
+            reader.CheckArrayLength(numBlends);
             m_BlendTreeConstantArray = new BlendTreeConstant[numBlends];
             for (int i = 0; i < numBlends; i++)
             {
@@ -425,6 +432,7 @@ namespace AssetStudio
             m_Destination = reader.ReadUInt32();
 
             int numConditions = reader.ReadInt32();
+            reader.CheckArrayLength(numConditions);
             m_ConditionConstantArray = new ConditionConstant[numConditions];
             for (int i = 0; i < numConditions; i++)
             {
@@ -442,6 +450,7 @@ namespace AssetStudio
         public SelectorStateConstant(ObjectReader reader)
         {
             int numTransitions = reader.ReadInt32();
+            reader.CheckArrayLength(numTransitions);
             m_TransitionConstantArray = new SelectorTransitionConstant[numTransitions];
             for (int i = 0; i < numTransitions; i++)
             {
@@ -467,6 +476,7 @@ namespace AssetStudio
             var version = reader.version;
 
             int numStates = reader.ReadInt32();
+            reader.CheckArrayLength(numStates);
             m_StateConstantArray = new StateConstant[numStates];
             for (int i = 0; i < numStates; i++)
             {
@@ -474,6 +484,7 @@ namespace AssetStudio
             }
 
             int numAnyStates = reader.ReadInt32();
+            reader.CheckArrayLength(numAnyStates);
             m_AnyStateTransitionConstantArray = new TransitionConstant[numAnyStates];
             for (int i = 0; i < numAnyStates; i++)
             {
@@ -483,6 +494,7 @@ namespace AssetStudio
             if (version[0] >= 5) //5.0 and up
             {
                 int numSelectors = reader.ReadInt32();
+                reader.CheckArrayLength(numSelectors);
                 m_SelectorStateConstantArray = new SelectorStateConstant[numSelectors];
                 for (int i = 0; i < numSelectors; i++)
                 {
@@ -524,6 +536,7 @@ namespace AssetStudio
             else
             {
                 int numPosValues = reader.ReadInt32();
+                reader.CheckArrayLength(numPosValues);
                 m_PositionValues = new Vector3[numPosValues];
                 for (int i = 0; i < numPosValues; i++)
                 {
@@ -533,6 +546,7 @@ namespace AssetStudio
                 m_QuaternionValues = reader.ReadVector4Array();
 
                 int numScaleValues = reader.ReadInt32();
+                reader.CheckArrayLength(numScaleValues);
                 m_ScaleValues = new Vector3[numScaleValues];
                 for (int i = 0; i < numScaleValues; i++)
                 {
@@ -560,6 +574,7 @@ namespace AssetStudio
         public ControllerConstant(ObjectReader reader)
         {
             int numLayers = reader.ReadInt32();
+            reader.CheckArrayLength(numLayers);
             m_LayerArray = new LayerConstant[numLayers];
             for (int i = 0; i < numLayers; i++)
             {
@@ -567,6 +582,7 @@ namespace AssetStudio
             }
 
             int numStates = reader.ReadInt32();
+            reader.CheckArrayLength(numStates);
             m_StateMachineArray = new StateMachineConstant[numStates];
             for (int i = 0; i < numStates; i++)
             {
@@ -590,6 +606,7 @@ namespace AssetStudio
             m_Controller = new ControllerConstant(reader);
 
             int tosSize = reader.ReadInt32();
+            reader.CheckArrayLength(tosSize);
             m_TOS = new KeyValuePair<uint, string>[tosSize];
             for (int i = 0; i < tosSize; i++)
             {
@@ -597,6 +614,7 @@ namespace AssetStudio
             }
 
             int numClips = reader.ReadInt32();
+            reader.CheckArrayLength(numClips);
             m_AnimationClips = new PPtr<AnimationClip>[numClips];
             for (int i = 0; i < numClips; i++)
             {

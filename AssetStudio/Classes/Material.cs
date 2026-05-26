@@ -34,6 +34,7 @@ namespace AssetStudio
             var version = reader.version;
 
             int m_TexEnvsSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_TexEnvsSize);
             m_TexEnvs = new KeyValuePair<string, UnityTexEnv>[m_TexEnvsSize];
             for (int i = 0; i < m_TexEnvsSize; i++)
             {
@@ -43,6 +44,7 @@ namespace AssetStudio
             if (version[0] >= 2021) //2021.1 and up
             {
                 int m_IntsSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_IntsSize);
                 m_Ints = new KeyValuePair<string, int>[m_IntsSize];
                 for (int i = 0; i < m_IntsSize; i++)
                 {
@@ -51,6 +53,7 @@ namespace AssetStudio
             }
 
             int m_FloatsSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_FloatsSize);
             m_Floats = new KeyValuePair<string, float>[m_FloatsSize];
             for (int i = 0; i < m_FloatsSize; i++)
             {
@@ -58,6 +61,7 @@ namespace AssetStudio
             }
 
             int m_ColorsSize = reader.ReadInt32();
+            reader.CheckArrayLength(m_ColorsSize);
             m_Colors = new KeyValuePair<string, Color>[m_ColorsSize];
             for (int i = 0; i < m_ColorsSize; i++)
             {

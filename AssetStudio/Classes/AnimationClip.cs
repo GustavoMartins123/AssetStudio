@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -42,6 +42,7 @@ namespace AssetStudio
         {
             var version = reader.version;
             int numCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numCurves);
             m_Curve = new Keyframe<T>[numCurves];
             for (int i = 0; i < numCurves; i++)
             {
@@ -331,6 +332,7 @@ namespace AssetStudio
         public PPtrCurve(ObjectReader reader)
         {
             int numCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numCurves);
             curve = new PPtrKeyframe[numCurves];
             for (int i = 0; i < numCurves; i++)
             {
@@ -432,6 +434,7 @@ namespace AssetStudio
             m_LookAtWeight = reader.ReadVector4();
 
             int numGoals = reader.ReadInt32();
+            reader.CheckArrayLength(numGoals);
             m_GoalArray = new HumanGoal[numGoals];
             for (int i = 0; i < numGoals; i++)
             {
@@ -446,6 +449,7 @@ namespace AssetStudio
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 2))//5.2 and up
             {
                 int numTDof = reader.ReadInt32();
+                reader.CheckArrayLength(numTDof);
                 m_TDoFArray = new Vector3[numTDof];
                 for (int i = 0; i < numTDof; i++)
                 {
@@ -511,6 +515,7 @@ namespace AssetStudio
                 time = reader.ReadSingle();
 
                 int numKeys = reader.ReadInt32();
+                reader.CheckArrayLength(numKeys);
                 keyList = new StreamedCurveKey[numKeys];
                 for (int i = 0; i < numKeys; i++)
                 {
@@ -608,6 +613,7 @@ namespace AssetStudio
         public ValueArrayConstant(ObjectReader reader)
         {
             int numVals = reader.ReadInt32();
+            reader.CheckArrayLength(numVals);
             m_ValueArray = new ValueConstant[numVals];
             for (int i = 0; i < numVals; i++)
             {
@@ -758,6 +764,7 @@ namespace AssetStudio
                 var m_AdditionalCurveIndexArray = reader.ReadInt32Array();
             }
             int numDeltas = reader.ReadInt32();
+            reader.CheckArrayLength(numDeltas);
             m_ValueArrayDelta = new ValueDelta[numDeltas];
             for (int i = 0; i < numDeltas; i++)
             {
@@ -835,6 +842,7 @@ namespace AssetStudio
         public AnimationClipBindingConstant(ObjectReader reader)
         {
             int numBindings = reader.ReadInt32();
+            reader.CheckArrayLength(numBindings);
             genericBindings = new GenericBinding[numBindings];
             for (int i = 0; i < numBindings; i++)
             {
@@ -842,6 +850,7 @@ namespace AssetStudio
             }
 
             int numMappings = reader.ReadInt32();
+            reader.CheckArrayLength(numMappings);
             pptrCurveMapping = new PPtr<Object>[numMappings];
             for (int i = 0; i < numMappings; i++)
             {
@@ -964,6 +973,7 @@ namespace AssetStudio
             }
             reader.AlignStream();
             int numRCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numRCurves);
             m_RotationCurves = new QuaternionCurve[numRCurves];
             for (int i = 0; i < numRCurves; i++)
             {
@@ -971,6 +981,7 @@ namespace AssetStudio
             }
 
             int numCRCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numCRCurves);
             m_CompressedRotationCurves = new CompressedAnimationCurve[numCRCurves];
             for (int i = 0; i < numCRCurves; i++)
             {
@@ -980,6 +991,7 @@ namespace AssetStudio
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 3))//5.3 and up
             {
                 int numEulerCurves = reader.ReadInt32();
+                reader.CheckArrayLength(numEulerCurves);
                 m_EulerCurves = new Vector3Curve[numEulerCurves];
                 for (int i = 0; i < numEulerCurves; i++)
                 {
@@ -988,6 +1000,7 @@ namespace AssetStudio
             }
 
             int numPCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numPCurves);
             m_PositionCurves = new Vector3Curve[numPCurves];
             for (int i = 0; i < numPCurves; i++)
             {
@@ -995,6 +1008,7 @@ namespace AssetStudio
             }
 
             int numSCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numSCurves);
             m_ScaleCurves = new Vector3Curve[numSCurves];
             for (int i = 0; i < numSCurves; i++)
             {
@@ -1002,6 +1016,7 @@ namespace AssetStudio
             }
 
             int numFCurves = reader.ReadInt32();
+            reader.CheckArrayLength(numFCurves);
             m_FloatCurves = new FloatCurve[numFCurves];
             for (int i = 0; i < numFCurves; i++)
             {
@@ -1011,6 +1026,7 @@ namespace AssetStudio
             if (version[0] > 4 || (version[0] == 4 && version[1] >= 3)) //4.3 and up
             {
                 int numPtrCurves = reader.ReadInt32();
+                reader.CheckArrayLength(numPtrCurves);
                 m_PPtrCurves = new PPtrCurve[numPtrCurves];
                 for (int i = 0; i < numPtrCurves; i++)
                 {
@@ -1040,6 +1056,7 @@ namespace AssetStudio
                 reader.AlignStream();
             }
             int numEvents = reader.ReadInt32();
+            reader.CheckArrayLength(numEvents);
             m_Events = new AnimationEvent[numEvents];
             for (int i = 0; i < numEvents; i++)
             {
