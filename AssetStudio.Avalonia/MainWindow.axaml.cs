@@ -67,13 +67,17 @@ public partial class MainWindow : Window
     private uint fmodLenMs;
     private float fmodVolume = 0.8f;
     private DispatcherTimer? fmodTimer;
-    private bool fmodIsDragging = false;
     private byte[]? currentAudioData;
+    private bool _isUpdatingAudioProgress = false;
+    private bool _isAudioDragging = false;
 
     private LibVLCSharp.Shared.LibVLC? _libVLC;
     private LibVLCSharp.Shared.MediaPlayer? _mediaPlayer;
-    private bool _videoIsDragging = false;
     private string? _currentTempVideoPath;
+    private bool _isUpdatingVideoProgress = false;
+    private bool _isVideoDragging = false;
+    private long _videoLengthMs = 0;
+    private volatile int _targetVolume = 80;
 
     [DllImport("libdl.so.2", EntryPoint = "dlopen")]
     private static extern IntPtr DlOpen([MarshalAs(UnmanagedType.LPStr)] string fileName, int flags);
@@ -111,6 +115,11 @@ public partial class MainWindow : Window
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
         AddHandler(DragDrop.DropEvent, Window_Drop);
+
+        FMODprogressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, FMODprogressBar_DragStarted);
+        FMODprogressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, FMODprogressBar_DragCompleted);
+        VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
+        VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
 
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
         Title = $"AssetStudio v{version}";
@@ -161,11 +170,30 @@ public partial class MainWindow : Window
                 LibVLCSharp.Shared.Core.Initialize();
             }
 
-            _libVLC = new LibVLCSharp.Shared.LibVLC();
+            _libVLC = new LibVLCSharp.Shared.LibVLC(
+                "--aout=directsound",
+                "--no-video-title-show",
+                "--gain=1.0"
+            );
+            try
+            {
+                var logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "vlc_log.txt");
+                if (File.Exists(logPath)) File.Delete(logPath);
+                _libVLC.Log += (sender, e) => {
+                    try
+                    {
+                        File.AppendAllText(logPath, $"[{e.Level}] {e.Module} - {e.Message}{Environment.NewLine}");
+                    }
+                    catch {}
+                };
+            }
+            catch {}
             _mediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
             _mediaPlayer.EndReached += MediaPlayer_EndReached;
             _mediaPlayer.PositionChanged += MediaPlayer_PositionChanged;
             _mediaPlayer.TimeChanged += MediaPlayer_TimeChanged;
+            _mediaPlayer.LengthChanged += MediaPlayer_LengthChanged;
+            _mediaPlayer.Playing += MediaPlayer_Playing;
             VideoPlayerView.MediaPlayer = _mediaPlayer;
         }
         catch (Exception ex)
@@ -6238,10 +6266,12 @@ public partial class MainWindow : Window
             }
         }
 
-        if (!fmodIsDragging && fmodLenMs > 0)
+        if (FMODprogressBar != null && !_isAudioDragging && fmodLenMs > 0)
         {
             FMODtimerLabel.Text = $"{ms / 1000 / 60}:{ms / 1000 % 60:D2}.{ms / 10 % 100:D2} / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+            _isUpdatingAudioProgress = true;
             FMODprogressBar.Value = (int)(ms * 1000 / fmodLenMs);
+            _isUpdatingAudioProgress = false;
         }
         FMODstatusLabel.Text = paused ? "Paused" : playing ? "Playing" : "Stopped";
 
@@ -6407,36 +6437,21 @@ public partial class MainWindow : Window
         }
     }
 
-    private void FMODprogressBar_PointerPressed(object? sender, global::Avalonia.Input.PointerPressedEventArgs e)
-    {
-        fmodIsDragging = true;
-        fmodTimer?.Stop();
-    }
-
-    private void FMODprogressBar_PointerReleased(object? sender, global::Avalonia.Input.PointerReleasedEventArgs e)
-    {
-        fmodIsDragging = false;
-        if (fmodChannel.hasHandle() && fmodLenMs > 0)
-        {
-            uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
-            var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
-            if (!ERRCHECK(result))
-            {
-                result = fmodChannel.isPlaying(out var playing);
-                if (playing)
-                {
-                    fmodTimer?.Start();
-                }
-            }
-        }
-    }
-
     private void FMODprogressBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
-        if (fmodIsDragging && fmodLenMs > 0)
+        if (_isUpdatingAudioProgress)
+            return;
+
+        if (fmodLenMs > 0 && FMODtimerLabel != null)
         {
             uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
             FMODtimerLabel.Text = $"{newms / 1000 / 60}:{newms / 1000 % 60:D2}.{newms / 10 % 100:D2} / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+            
+            if (fmodChannel.hasHandle())
+            {
+                var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
+                ERRCHECK(result);
+            }
         }
     }
 
@@ -6612,9 +6627,11 @@ public partial class MainWindow : Window
     private void MediaPlayer_PositionChanged(object? sender, LibVLCSharp.Shared.MediaPlayerPositionChangedEventArgs e)
     {
         Dispatcher.UIThread.Post(() => {
-            if (!_videoIsDragging)
+            if (VideoProgressBar != null && !_isVideoDragging)
             {
+                _isUpdatingVideoProgress = true;
                 VideoProgressBar.Value = e.Position * 1000;
+                _isUpdatingVideoProgress = false;
             }
         });
     }
@@ -6625,9 +6642,62 @@ public partial class MainWindow : Window
             if (_mediaPlayer != null)
             {
                 long currentMs = e.Time;
-                long totalMs = _mediaPlayer.Length;
+                long totalMs = _videoLengthMs;
                 if (totalMs < 0) totalMs = 0;
                 VideoTimerLabel.Text = $"{currentMs / 1000 / 60}:{currentMs / 1000 % 60:D2}.{currentMs / 10 % 100:D2} / {totalMs / 1000 / 60}:{totalMs / 1000 % 60:D2}.{totalMs / 10 % 100:D2}";
+            }
+        });
+    }
+
+    private void MediaPlayer_LengthChanged(object? sender, LibVLCSharp.Shared.MediaPlayerLengthChangedEventArgs e)
+    {
+        _videoLengthMs = e.Length;
+    }
+
+    private void MediaPlayer_Playing(object? sender, EventArgs e)
+    {
+        // CRITICAL: Set volume and unmute IMMEDIATELY on the VLC thread.
+        // Dispatching to UI thread adds latency that can miss short clips entirely.
+        if (_mediaPlayer != null)
+        {
+            try
+            {
+                _mediaPlayer.Mute = false;
+                _mediaPlayer.Volume = _targetVolume;
+            }
+            catch {}
+        }
+
+        Dispatcher.UIThread.Post(() => {
+            if (_mediaPlayer != null)
+            {
+                // Update audio status using Unity asset metadata (more reliable than LibVLC track parsing)
+                if (VideoAudioLabel != null && currentPreviewVideoClip != null)
+                {
+                    if (currentPreviewVideoClip.HasAudio)
+                    {
+                        var channels = currentPreviewVideoClip.m_AudioChannelCount;
+                        var rates = currentPreviewVideoClip.m_AudioSampleRate;
+                        var audioDetails = new System.Text.StringBuilder();
+                        audioDetails.Append("\ud83d\udd0a Audio: Yes");
+                        for (int i = 0; i < channels.Length; i++)
+                        {
+                            if (channels[i] > 0)
+                            {
+                                audioDetails.Append($" | Track {i + 1}: {channels[i]}ch");
+                                if (i < rates.Length)
+                                    audioDetails.Append($" {rates[i]}Hz");
+                            }
+                        }
+                        VideoAudioLabel.Text = audioDetails.ToString();
+                        VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#00e676"));
+                    }
+                    else
+                    {
+                        VideoAudioLabel.Text = "\ud83d\udd07 Audio: No (Video only - no audio track in asset)";
+                        VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
+                    }
+                }
             }
         });
     }
@@ -6697,6 +6767,33 @@ public partial class MainWindow : Window
         if (string.IsNullOrEmpty(ext)) ext = ".mp4";
         VideoFormatLabel.Text = $"Format: {ext.ToUpperInvariant().TrimStart('.')}";
 
+        if (VideoAudioLabel != null)
+        {
+            if (m_VideoClip.HasAudio)
+            {
+                var channels = m_VideoClip.m_AudioChannelCount;
+                var rates = m_VideoClip.m_AudioSampleRate;
+                var audioInfo = new System.Text.StringBuilder();
+                audioInfo.Append("🔊 Audio: Yes");
+                for (int i = 0; i < channels.Length; i++)
+                {
+                    if (channels[i] > 0)
+                    {
+                        audioInfo.Append($" | Track {i + 1}: {channels[i]}ch");
+                        if (i < rates.Length)
+                            audioInfo.Append($" {rates[i]}Hz");
+                    }
+                }
+                VideoAudioLabel.Text = audioInfo.ToString();
+                VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#00e676"));
+            }
+            else
+            {
+                VideoAudioLabel.Text = "🔇 Audio: No (Video only - no audio track in asset)";
+                VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
+            }
+        }
+
         var data = m_VideoClip.m_VideoData.GetData();
         if (data == null || data.Length == 0)
         {
@@ -6743,8 +6840,10 @@ public partial class MainWindow : Window
             {
                 var media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
                 _mediaPlayer.Media = media;
-                _mediaPlayer.Volume = (int)VideoVolumeBar.Value;
+                _targetVolume = (int)VideoVolumeBar.Value;
                 _mediaPlayer.Play();
+                // Volume and Mute are set in MediaPlayer_Playing handler on the VLC thread
+                // Setting them here before Play() is ignored by LibVLC 3.x
                 VideoStatusLabel.Text = "Playing";
                 VideoPlayButton.Content = "Pause";
             }
@@ -6792,20 +6891,49 @@ public partial class MainWindow : Window
 
     private void VideoVolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
+        _targetVolume = (int)VideoVolumeBar.Value;
         if (_mediaPlayer != null)
         {
-            _mediaPlayer.Volume = (int)VideoVolumeBar.Value;
+            _mediaPlayer.Volume = _targetVolume;
         }
     }
 
-    private void VideoProgressBar_PointerPressed(object? sender, global::Avalonia.Input.PointerPressedEventArgs e)
+    private void VideoProgressBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
-        _videoIsDragging = true;
+        if (_isUpdatingVideoProgress)
+            return;
+
+        if (_mediaPlayer != null)
+        {
+            float pos = (float)(VideoProgressBar.Value / 1000.0);
+            _mediaPlayer.Position = pos;
+        }
     }
 
-    private void VideoProgressBar_PointerReleased(object? sender, global::Avalonia.Input.PointerReleasedEventArgs e)
+    private void FMODprogressBar_DragStarted(object? sender, global::Avalonia.Input.VectorEventArgs e)
     {
-        _videoIsDragging = false;
+        _isAudioDragging = true;
+    }
+
+    private void FMODprogressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
+    {
+        _isAudioDragging = false;
+        if (fmodLenMs > 0 && fmodChannel.hasHandle())
+        {
+            uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
+            var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
+            ERRCHECK(result);
+        }
+    }
+
+    private void VideoProgressBar_DragStarted(object? sender, global::Avalonia.Input.VectorEventArgs e)
+    {
+        _isVideoDragging = true;
+    }
+
+    private void VideoProgressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
+    {
+        _isVideoDragging = false;
         if (_mediaPlayer != null)
         {
             float pos = (float)(VideoProgressBar.Value / 1000.0);
@@ -6816,6 +6944,18 @@ public partial class MainWindow : Window
     private async void VideoExportButton_Click(object? sender, RoutedEventArgs e)
     {
         if (currentPreviewVideoClip == null) return;
+
+        // Pause playback to prevent event loops and potential UI/VLC deadlocks while the modal dialog is open
+        try
+        {
+            if (_mediaPlayer != null && _mediaPlayer.IsPlaying)
+            {
+                _mediaPlayer.Pause();
+                VideoStatusLabel.Text = "Paused";
+                VideoPlayButton.Content = "Play";
+            }
+        }
+        catch {}
 
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;

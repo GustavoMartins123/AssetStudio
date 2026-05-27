@@ -29,6 +29,12 @@ namespace AssetStudio
         public double m_FrameRate { get; private set; }
         public ulong m_FrameCount { get; private set; }
         public int m_Format { get; private set; }
+        public ushort[] m_AudioChannelCount { get; private set; }
+        public uint[] m_AudioSampleRate { get; private set; }
+        public string[] m_AudioLanguage { get; private set; }
+
+        public bool HasAudio => m_AudioChannelCount != null && m_AudioChannelCount.Length > 0 
+            && System.Linq.Enumerable.Any(m_AudioChannelCount, ch => ch > 0);
 
         public VideoClip(ObjectReader reader) : base(reader)
         {
@@ -45,10 +51,10 @@ namespace AssetStudio
             m_FrameRate = reader.ReadDouble();
             m_FrameCount = reader.ReadUInt64();
             m_Format = reader.ReadInt32();
-            var m_AudioChannelCount = reader.ReadUInt16Array();
+            m_AudioChannelCount = reader.ReadUInt16Array();
             reader.AlignStream();
-            var m_AudioSampleRate = reader.ReadUInt32Array();
-            var m_AudioLanguage = reader.ReadStringArray();
+            m_AudioSampleRate = reader.ReadUInt32Array();
+            m_AudioLanguage = reader.ReadStringArray();
             if (version[0] >= 2020) //2020.1 and up
             {
                 var m_VideoShadersSize = reader.ReadInt32();
