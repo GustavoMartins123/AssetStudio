@@ -20,7 +20,7 @@ public sealed class ExportOptionsState
     public AssetGroupOption AssetGrouping { get; set; } = AssetGroupOption.TypeName;
     public bool ConvertTexture { get; set; } = true;
     public ImageFormat ConvertTextureFormat { get; set; } = ImageFormat.Png;
-    public bool ConvertAudio { get; set; } = true;
+    public bool ConvertAudio { get; set; } = false;
     public bool RestoreExtensionName { get; set; } = true;
     public bool OpenAfterExport { get; set; } = true;
     public bool EulerFilter { get; set; } = true;
@@ -107,7 +107,6 @@ public sealed class ExportOptionsWindow : Window
         panel.Children.Add(assetGrouping);
         panel.Children.Add(convertTexture);
         panel.Children.Add(Labeled("Texture format", convertTextureFormat));
-        panel.Children.Add(convertAudio);
         panel.Children.Add(restoreExtensionName);
         panel.Children.Add(openAfterExport);
         panel.Children.Add(Separator());
@@ -148,7 +147,7 @@ public sealed class ExportOptionsWindow : Window
         assetGrouping.SelectedIndex = (int)state.AssetGrouping;
         convertTexture.IsChecked = state.ConvertTexture;
         convertTextureFormat.SelectedItem = state.ConvertTextureFormat.ToString();
-        convertAudio.IsChecked = state.ConvertAudio;
+        convertAudio.IsChecked = false;
         restoreExtensionName.IsChecked = state.RestoreExtensionName;
         openAfterExport.IsChecked = state.OpenAfterExport;
         eulerFilter.IsChecked = state.EulerFilter;
@@ -171,7 +170,7 @@ public sealed class ExportOptionsWindow : Window
         state.AssetGrouping = (AssetGroupOption)Math.Max(0, assetGrouping.SelectedIndex);
         state.ConvertTexture = convertTexture.IsChecked == true;
         state.ConvertTextureFormat = Enum.Parse<ImageFormat>((string?)convertTextureFormat.SelectedItem ?? ImageFormat.Png.ToString());
-        state.ConvertAudio = convertAudio.IsChecked == true;
+        state.ConvertAudio = false;
         state.RestoreExtensionName = restoreExtensionName.IsChecked == true;
         state.OpenAfterExport = openAfterExport.IsChecked == true;
         state.EulerFilter = eulerFilter.IsChecked == true;

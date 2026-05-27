@@ -9,7 +9,6 @@ using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using System.Diagnostics;
 using AssetStudio;
-using AssetStudio.PInvoke;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -34,10 +33,14 @@ public partial class MainWindow : Window
     private Sprite? currentPreviewSprite;
     private Mesh? currentPreviewMesh;
     private Avatar? currentPreviewAvatar;
+    private AudioClip? currentPreviewAudioClip;
     private VideoClip? currentPreviewVideoClip;
     private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
     private long texturePreviewIdCounter;
+    private CancellationTokenSource? previewDebounce;
+    private const int PreviewDebounceMilliseconds = 180;
+    private const int MaxInlinePreviewTextureDimension = 1024;
     private List<AssetItem> visibleAssets = new List<AssetItem>();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private List<AssetClassItem> visibleAssetClassItems = new List<AssetClassItem>();
@@ -56,18 +59,18 @@ public partial class MainWindow : Window
     private bool assetListSortDescending;
     private bool updatingFilterTypeMenu;
     private Dictionary<Mesh, List<Material?>>? meshToMaterialsCache;
-    private List<Material>? allMaterialsCache;
+    private Dictionary<Mesh, List<string>>? meshAssociatedRenderersCache;
+    private Dictionary<Mesh, HashSet<string>>? meshSourceTypesCache;
+    private Dictionary<Material, Texture2D?>? materialMainTextureCache;
+    private Dictionary<Material, Material?>? materialPreviewMaterialCache;
+    private Dictionary<Material, Dictionary<string, Texture2D?>>? materialTextureSlotsCache;
     private Dictionary<AssetStudio.Object, AssetItem>? objectToAssetItemCache;
 
-    private FMOD.System fmodSystem;
-    private FMOD.Sound fmodSound;
-    private FMOD.Channel fmodChannel;
-    private FMOD.SoundGroup fmodMasterSoundGroup;
-    private FMOD.MODE fmodLoopMode = FMOD.MODE.LOOP_OFF;
-    private uint fmodLenMs;
-    private float fmodVolume = 0.8f;
-    private DispatcherTimer? fmodTimer;
-    private byte[]? currentAudioData;
+    private LibVLCSharp.Shared.MediaPlayer? _audioMediaPlayer;
+    private string? _currentTempAudioPath;
+    private long _audioLengthMs;
+    private DispatcherTimer? _audioTimer;
+    private volatile int _targetAudioVolume = 80;
     private bool _isUpdatingAudioProgress = false;
     private bool _isAudioDragging = false;
 
@@ -195,6 +198,15 @@ public partial class MainWindow : Window
             _mediaPlayer.LengthChanged += MediaPlayer_LengthChanged;
             _mediaPlayer.Playing += MediaPlayer_Playing;
             VideoPlayerView.MediaPlayer = _mediaPlayer;
+
+            _audioMediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
+            _audioMediaPlayer.EndReached += AudioMediaPlayer_EndReached;
+            _audioMediaPlayer.LengthChanged += AudioMediaPlayer_LengthChanged;
+            _audioTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(100)
+            };
+            _audioTimer.Tick += AudioTimer_Tick;
         }
         catch (Exception ex)
         {
@@ -204,34 +216,6 @@ public partial class MainWindow : Window
                 message += " Hint: Ensure system VLC is installed using: sudo apt install vlc libvlc-dev";
             }
             logger.Log(LoggerEvent.Error, message);
-        }
-
-        try
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-            {
-                NativeLibrary.SetDllImportResolver(typeof(FMOD.System).Assembly, (libraryName, assembly, searchPath) =>
-                {
-                    if (libraryName == "fmod" || libraryName == "fmod64")
-                    {
-                        var libDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "x64");
-                        var libFmodPath = Path.Combine(libDir, "libfmod.so");
-                        if (File.Exists(libFmodPath))
-                        {
-                            if (NativeLibrary.TryLoad(libFmodPath, out var handle))
-                            {
-                                return handle;
-                            }
-                        }
-                    }
-                    return IntPtr.Zero;
-                });
-            }
-            FMODinit();
-        }
-        catch (Exception ex)
-        {
-            logger.Log(LoggerEvent.Error, $"Failed to initialize FMOD: {ex.Message}");
         }
 
         // Detect GPU support (OpenGL interface availability)
@@ -328,7 +312,11 @@ public partial class MainWindow : Window
     private void ResetForm()
     {
         meshToMaterialsCache = null;
-        allMaterialsCache = null;
+        meshAssociatedRenderersCache = null;
+        meshSourceTypesCache = null;
+        materialMainTextureCache = null;
+        materialPreviewMaterialCache = null;
+        materialTextureSlotsCache = null;
         objectToAssetItemCache = null;
         logger.ClearErrors();
         exportableAssets.Clear();
@@ -426,7 +414,7 @@ public partial class MainWindow : Window
         if (FMODPanel != null)
         {
             FMODPanel.IsVisible = false;
-            FMODreset();
+            AudioReset();
         }
         if (VideoClipPanel != null)
         {
@@ -435,8 +423,12 @@ public partial class MainWindow : Window
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
         texturePreviewIdCounter++; // Cancel any running background image decoding task
+        previewDebounce?.Cancel();
+        previewDebounce?.Dispose();
+        previewDebounce = null;
         for (int i = 0; i < 4; i++)
         {
             textureChannels[i] = true;
@@ -853,8 +845,11 @@ public partial class MainWindow : Window
 
     private void AssetClassesDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (AssetClassesDataGrid.SelectedItem is not AssetClassItem item)
+        var selectedItem = sender is DataGrid grid ? grid.SelectedItem : AssetClassesDataGrid.SelectedItem;
+        if (selectedItem is not AssetClassItem item)
+        {
             return;
+        }
 
         ShowAssetClassPreview(item);
     }
@@ -1325,6 +1320,8 @@ public partial class MainWindow : Window
         }
         LinkFbxSubAssetsToSceneNodes();
         containers.Clear();
+        objectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>(objectAssetItemDic);
+        BuildAssetReferenceIndexes();
         objectAssetItemDic.Clear();
 
         visibleAssets = new List<AssetItem>(exportableAssets);
@@ -1408,17 +1405,20 @@ public partial class MainWindow : Window
 
     private async void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (AssetListDataGrid.SelectedItem is AssetItem assetItem)
+        var selectedItem = sender is DataGrid grid ? grid.SelectedItem : AssetListDataGrid.SelectedItem;
+        if (selectedItem is AssetItem assetItem)
         {
             if (RightTabControl.SelectedIndex == 1)
             {
                 await UpdateDumpForSelectedAsset();
             }
-            PreviewAsset(assetItem);
+            QueuePreviewAsset(assetItem);
         }
         else
         {
             DumpTextBox.Text = string.Empty;
+            previewDebounce?.Cancel();
+            ClearPreview("Preview Panel");
         }
     }
 
@@ -1434,10 +1434,50 @@ public partial class MainWindow : Window
             {
                 if (AssetListDataGrid.SelectedItem is AssetItem assetItem)
                 {
-                    PreviewAsset(assetItem);
+                    QueuePreviewAsset(assetItem);
                 }
             }
         }
+    }
+
+    private void QueuePreviewAsset(AssetItem assetItem)
+    {
+        if (RightTabControl.SelectedIndex != 0)
+        {
+            return;
+        }
+
+        previewDebounce?.Cancel();
+        previewDebounce?.Dispose();
+        previewDebounce = new CancellationTokenSource();
+        var token = previewDebounce.Token;
+        var previewId = ++texturePreviewIdCounter;
+
+        if (PreviewLabel != null)
+        {
+            PreviewLabel.IsVisible = displayInfo.IsChecked == true;
+            PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(PreviewDebounceMilliseconds, token);
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    if (!token.IsCancellationRequested
+                        && previewId == texturePreviewIdCounter
+                        && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        PreviewAsset(assetItem);
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }, token);
     }
 
     private void SetTextWithTruncation(TextBox textBox, string? text, string fallbackText = "")
@@ -1472,10 +1512,18 @@ public partial class MainWindow : Window
         try
         {
             var dump = await DumpAsset(assetItem.Asset);
+            if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+            {
+                return;
+            }
             SetTextWithTruncation(DumpTextBox, dump, "No Dump Available");
         }
         catch (Exception ex)
         {
+            if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+            {
+                return;
+            }
             DumpTextBox.Text = $"Dump {assetItem.Type}:{assetItem.Name} error{Environment.NewLine}{ex.Message}{Environment.NewLine}{ex.StackTrace}";
         }
     }
@@ -1528,6 +1576,7 @@ public partial class MainWindow : Window
 
     private void PreviewAsset(AssetItem assetItem)
     {
+        ++texturePreviewIdCounter;
         if (enablePreview.IsChecked != true)
         {
             ClearPreview("Preview disabled");
@@ -1558,7 +1607,7 @@ public partial class MainWindow : Window
         if (FMODPanel != null)
         {
             FMODPanel.IsVisible = false;
-            FMODreset();
+            AudioReset();
         }
         if (VideoClipPanel != null)
         {
@@ -1574,6 +1623,7 @@ public partial class MainWindow : Window
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
 
         PreviewLabel.IsVisible = displayInfo.IsChecked == true;
@@ -1641,22 +1691,33 @@ public partial class MainWindow : Window
                     break;
                 case Mesh m_Mesh:
                 {
-                    List<byte[]?>? subMeshTextures = null;
-                    List<int>? subMeshTexWidths = null;
-                    List<int>? subMeshTexHeights = null;
-
-                    if (GLPreviewControl != null)
+                    var meshPreviewId = texturePreviewIdCounter;
+                    PreviewLabel.IsVisible = false;
+                    StatusStripUpdate("Preparing mesh preview...");
+                    if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
                     {
-                        subMeshTextures = new();
-                        subMeshTexWidths = new();
-                        subMeshTexHeights = new();
+                        PreviewInfoOverlay.Text = "Loading details...";
+                        PreviewInfoBorder.IsVisible = true;
+                    }
 
+                    var localAssetItem = assetItem;
+                    var includeMeshInfo = displayInfo.IsChecked == true;
+                    Task.Run(() =>
+                    {
+                        var subMeshTextures = new List<byte[]?>();
+                        var subMeshTexWidths = new List<int>();
+                        var subMeshTexHeights = new List<int>();
                         var allMaterials = FindMaterialsForMesh(m_Mesh);
-                        
+
                         if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
                         {
                             for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
                             {
+                                if (meshPreviewId != texturePreviewIdCounter)
+                                {
+                                    return;
+                                }
+
                                 byte[]? tb = null;
                                 int tw = 0, th = 0;
 
@@ -1671,6 +1732,7 @@ public partial class MainWindow : Window
                                             {
                                                 if (image != null)
                                                 {
+                                                    LimitInlinePreviewImage(image);
                                                     tw = image.Width;
                                                     th = image.Height;
                                                     tb = new byte[tw * th * 4];
@@ -1694,7 +1756,6 @@ public partial class MainWindow : Window
                         }
 
                         global::OpenTK.Mathematics.Vector2[]? uvs = null;
-
                         if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
                         {
                             uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
@@ -1704,42 +1765,39 @@ public partial class MainWindow : Window
                             }
                         }
 
-                        currentPreviewMesh = m_Mesh;
-                        GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
-                        GLPreviewControl.IsVisible = true;
-                        if (BoneSizeContainer != null)
+                        var infoText = includeMeshInfo ? FormatMeshPreview(m_Mesh, localAssetItem) : string.Empty;
+                        var hasTextures = subMeshTextures.Any(t => t != null);
+
+                        Dispatcher.UIThread.Post(() =>
                         {
-                            BoneSizeContainer.IsVisible = false;
-                        }
-                        GLPreviewControl.Focus();
-                    }
-                    if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                    {
-                        PreviewInfoOverlay.Text = "Loading details...";
-                        PreviewInfoBorder.IsVisible = true;
-                        var localAssetItem = assetItem;
-                        var localMesh = m_Mesh;
-                        Task.Run(() =>
-                        {
-                            var infoText = FormatMeshPreview(localMesh, localAssetItem);
-                            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                            if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
                             {
-                                if (AssetListDataGrid.SelectedItem == localAssetItem && PreviewInfoOverlay != null)
+                                return;
+                            }
+
+                            if (GLPreviewControl != null)
+                            {
+                                currentPreviewMesh = m_Mesh;
+                                GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                                GLPreviewControl.IsVisible = true;
+                                if (BoneSizeContainer != null)
                                 {
-                                    PreviewInfoOverlay.Text = infoText;
+                                    BoneSizeContainer.IsVisible = false;
                                 }
-                            });
+                                GLPreviewControl.Focus();
+                            }
+
+                            if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                            {
+                                PreviewInfoOverlay.Text = infoText;
+                                PreviewInfoBorder.IsVisible = true;
+                            }
+
+                            StatusStripUpdate(hasTextures
+                                ? "OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded"
+                                : "OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
                         });
-                    }
-                    PreviewLabel.IsVisible = false;
-                    if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
-                    {
-                        StatusStripUpdate("OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded");
-                    }
-                    else
-                    {
-                        StatusStripUpdate("OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
-                    }
+                    });
                     break;
                 }
                 case Object obj when obj.type == ClassIDType.PrefabInstance:
@@ -3070,12 +3128,6 @@ public partial class MainWindow : Window
         {
             shader = s;
         }
-        else
-        {
-            shader = assetsManager.assetsFileList
-                .SelectMany(x => x.Objects)
-                .FirstOrDefault(x => x.m_PathID == displayMaterial.m_Shader.m_PathID) as Shader;
-        }
 
         if (shader != null)
         {
@@ -3091,11 +3143,7 @@ public partial class MainWindow : Window
             var texEnvValue = texEnv.Value;
             var textureRef = texEnvValue?.m_Texture;
             
-            Texture2D? texture = null;
-            if (texEnvValue != null && textureRef != null && !textureRef.IsNull)
-            {
-                texture = ResolveTexturePPtr(displayMaterial, textureRef);
-            }
+            var texture = texEnvValue != null ? GetMaterialTextureSlot(displayMaterial, texEnv.Key) : null;
 
             if (texture != null && textureRef != null)
             {
@@ -3150,6 +3198,9 @@ public partial class MainWindow : Window
                         });
                         return;
                     }
+                    var materialPreviewWasDownscaled = LimitInlinePreviewImage(image);
+                    var materialPreviewWidth = image.Width;
+                    var materialPreviewHeight = image.Height;
 
                     int validChannel = 0;
                     for (int i = 0; i < 4; i++)
@@ -3209,7 +3260,9 @@ public partial class MainWindow : Window
 
                             if (displayInfo.IsChecked == true)
                             {
-                                PreviewInfoOverlay.Text = infoText;
+                                PreviewInfoOverlay.Text = materialPreviewWasDownscaled
+                                    ? infoText + $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}"
+                                    : infoText;
                                 PreviewInfoBorder.IsVisible = true;
                             }
                             else
@@ -3305,7 +3358,39 @@ public partial class MainWindow : Window
         });
     }
 
+    private static bool LimitInlinePreviewImage(Image<Bgra32> image)
+    {
+        var maxSide = Math.Max(image.Width, image.Height);
+        if (maxSide <= MaxInlinePreviewTextureDimension)
+        {
+            return false;
+        }
+
+        var scale = MaxInlinePreviewTextureDimension / (float)maxSide;
+        var width = Math.Max(1, (int)Math.Round(image.Width * scale));
+        var height = Math.Max(1, (int)Math.Round(image.Height * scale));
+        image.Mutate(x => x.Resize(new ResizeOptions
+        {
+            Size = new SixLabors.ImageSharp.Size(width, height),
+            Mode = ResizeMode.Max
+        }));
+        return true;
+    }
+
     private Material? ResolveMaterialForPreview(Material material)
+    {
+        materialPreviewMaterialCache ??= new Dictionary<Material, Material?>();
+        if (materialPreviewMaterialCache.TryGetValue(material, out var cachedMaterial))
+        {
+            return cachedMaterial;
+        }
+
+        var resolvedMaterial = ResolveMaterialForPreviewUncached(material);
+        materialPreviewMaterialCache[material] = resolvedMaterial;
+        return resolvedMaterial;
+    }
+
+    private Material? ResolveMaterialForPreviewUncached(Material material)
     {
         var visited = new HashSet<Material>();
         while (material != null && visited.Add(material))
@@ -3323,17 +3408,6 @@ public partial class MainWindow : Window
                 {
                     material = parent;
                     continue;
-                }
-                else
-                {
-                    var parentGlobal = assetsManager.assetsFileList
-                        .SelectMany(x => x.Objects)
-                        .FirstOrDefault(x => x.m_PathID == material.m_Parent.m_PathID) as Material;
-                    if (parentGlobal != null)
-                    {
-                        material = parentGlobal;
-                        continue;
-                    }
                 }
             }
 
@@ -3372,31 +3446,84 @@ public partial class MainWindow : Window
 
     private Texture2D? FindTextureForMaterial(Material material)
     {
-        var displayMaterial = ResolveMaterialForPreview(material) ?? material;
+        materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
+
+        if (materialMainTextureCache.TryGetValue(material, out var directCachedTexture))
+        {
+            return directCachedTexture;
+        }
+
+        IndexMaterialTextures(material);
+        return materialMainTextureCache.TryGetValue(material, out var indexedTexture) ? indexedTexture : null;
+    }
+
+    private Texture2D? SelectMainTextureForMaterial(Material displayMaterial, IReadOnlyDictionary<string, Texture2D?> textureSlots)
+    {
         if (displayMaterial.m_SavedProperties?.m_TexEnvs == null) return null;
 
         var slots = new[] { "_MainTex", "_BaseMap", "_BaseColorMap", "_BaseColorTexture", "_Diffuse", "_AlbedoMap" };
         foreach (var slot in slots)
         {
-            var env = displayMaterial.m_SavedProperties.m_TexEnvs.FirstOrDefault(x => x.Key == slot);
-            if (env.Value?.m_Texture != null && !env.Value.m_Texture.IsNull)
+            if (textureSlots.TryGetValue(slot, out var tex) && tex != null)
             {
-                var tex = ResolveTexturePPtr(displayMaterial, env.Value.m_Texture);
-                if (tex != null) return tex;
+                return tex;
             }
         }
 
         foreach (var env in displayMaterial.m_SavedProperties.m_TexEnvs)
         {
             if (NonDiffuseSlots.Contains(env.Key)) continue;
-            if (env.Value?.m_Texture != null && !env.Value.m_Texture.IsNull)
+            if (textureSlots.TryGetValue(env.Key, out var tex) && tex != null)
             {
-                var tex = ResolveTexturePPtr(displayMaterial, env.Value.m_Texture);
-                if (tex != null) return tex;
+                return tex;
             }
         }
 
         return null;
+    }
+
+    private Texture2D? GetMaterialTextureSlot(Material material, string slotName)
+    {
+        IndexMaterialTextures(material);
+        return materialTextureSlotsCache != null
+            && materialTextureSlotsCache.TryGetValue(material, out var slots)
+            && slots.TryGetValue(slotName, out var texture)
+            ? texture
+            : null;
+    }
+
+    private void IndexMaterialTextures(Material material)
+    {
+        materialPreviewMaterialCache ??= new Dictionary<Material, Material?>();
+        materialTextureSlotsCache ??= new Dictionary<Material, Dictionary<string, Texture2D?>>();
+        materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
+
+        if (materialTextureSlotsCache.ContainsKey(material) && materialMainTextureCache.ContainsKey(material))
+        {
+            return;
+        }
+
+        var displayMaterial = ResolveMaterialForPreview(material) ?? material;
+        if (!materialTextureSlotsCache.TryGetValue(displayMaterial, out var slots))
+        {
+            slots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+            {
+                var textureRef = texEnv.Value?.m_Texture;
+                slots[texEnv.Key] = textureRef != null && !textureRef.IsNull
+                    ? ResolveTexturePPtr(displayMaterial, textureRef)
+                    : null;
+            }
+
+            materialTextureSlotsCache[displayMaterial] = slots;
+            materialMainTextureCache[displayMaterial] = SelectMainTextureForMaterial(displayMaterial, slots);
+        }
+
+        if (!ReferenceEquals(displayMaterial, material))
+        {
+            materialTextureSlotsCache[material] = slots;
+            materialMainTextureCache[material] = materialMainTextureCache[displayMaterial];
+        }
     }
 
     private Texture2D? ResolveTexturePPtr(Material material, PPtr<Texture> textureRef)
@@ -3406,62 +3533,14 @@ public partial class MainWindow : Window
             return directTex;
         }
 
-        if (material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj) && localObj is Texture2D localTex)
+        if (textureRef.m_FileID == 0
+            && material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj)
+            && localObj is Texture2D localTex)
         {
             return localTex;
         }
 
-        if (textureRef.m_FileID > 0 && textureRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
-        {
-            var external = material.assetsFile.m_Externals[textureRef.m_FileID - 1];
-            var externalFileName = external.fileName?.Replace('\\', '/');
-            if (!string.IsNullOrEmpty(externalFileName))
-            {
-                var lastSlash = externalFileName.LastIndexOf('/');
-                if (lastSlash >= 0) externalFileName = externalFileName.Substring(lastSlash + 1);
-
-                foreach (var file in assetsManager.assetsFileList)
-                {
-                    var candidateName = file.fileName?.Replace('\\', '/');
-                    if (string.IsNullOrEmpty(candidateName)) continue;
-                    var candidateLastSlash = candidateName.LastIndexOf('/');
-                    if (candidateLastSlash >= 0) candidateName = candidateName.Substring(candidateLastSlash + 1);
-
-                    if (string.Equals(candidateName, externalFileName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (file.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D tex)
-                        {
-                            return tex;
-                        }
-                    }
-                }
-            }
-        }
-
-        Texture2D? candidate = null;
-        int bestScore = -1;
-        var matTokens = GetPathTokens(material.m_Name);
-
-        foreach (var file in assetsManager.assetsFileList)
-        {
-            if (file.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D tex)
-            {
-                if (file == material.assetsFile)
-                {
-                    return tex;
-                }
-                
-                var texTokens = GetPathTokens(tex.m_Name);
-                int score = matTokens.Intersect(texTokens, StringComparer.OrdinalIgnoreCase).Count() * 10;
-                
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    candidate = tex;
-                }
-            }
-        }
-        return candidate;
+        return null;
     }
 
     private async void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
@@ -3517,7 +3596,9 @@ public partial class MainWindow : Window
 
     private void UpdateImagePreview(bool forceCpu = false)
     {
-        if (currentPreviewTexture == null && currentPreviewSprite == null)
+        var previewTexture = currentPreviewTexture;
+        var previewSprite = currentPreviewSprite;
+        if (previewTexture == null && previewSprite == null)
             return;
 
         long currentId = ++texturePreviewIdCounter;
@@ -3534,30 +3615,30 @@ public partial class MainWindow : Window
                     int width = 0;
                     int height = 0;
                     string infoText = string.Empty;
-                    bool isSprite = currentPreviewSprite != null;
+                    bool isSprite = previewSprite != null;
 
-                    if (currentPreviewTexture != null)
+                    if (previewTexture != null)
                     {
-                        width = currentPreviewTexture.m_Width;
-                        height = currentPreviewTexture.m_Height;
+                        width = previewTexture.m_Width;
+                        height = previewTexture.m_Height;
 
-                        infoText = $"Width: {width}\nHeight: {height}\nFormat: {currentPreviewTexture.m_TextureFormat}";
-                        switch (currentPreviewTexture.m_TextureSettings.m_FilterMode)
+                        infoText = $"Width: {width}\nHeight: {height}\nFormat: {previewTexture.m_TextureFormat}";
+                        switch (previewTexture.m_TextureSettings.m_FilterMode)
                         {
                             case 0: infoText += "\nFilter Mode: Point "; break;
                             case 1: infoText += "\nFilter Mode: Bilinear "; break;
                             case 2: infoText += "\nFilter Mode: Trilinear "; break;
                         }
-                        infoText += $"\nAnisotropic level: {currentPreviewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {currentPreviewTexture.m_TextureSettings.m_MipBias}";
-                        switch (currentPreviewTexture.m_TextureSettings.m_WrapMode)
+                        infoText += $"\nAnisotropic level: {previewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {previewTexture.m_TextureSettings.m_MipBias}";
+                        switch (previewTexture.m_TextureSettings.m_WrapMode)
                         {
                             case 0: infoText += "\nWrap mode: Repeat"; break;
                             case 1: infoText += "\nWrap mode: Clamp"; break;
                         }
                     }
-                    else if (currentPreviewSprite != null)
+                    else if (previewSprite != null)
                     {
-                        decodedImage = currentPreviewSprite.GetImage();
+                        decodedImage = previewSprite.GetImage();
                         if (decodedImage == null)
                         {
                             throw new Exception("Failed to decode sprite image on CPU.");
@@ -3608,9 +3689,9 @@ public partial class MainWindow : Window
                                 {
                                     TextureGLPreview.SetImage(decodedImage);
                                 }
-                                else if (currentPreviewTexture != null)
+                                else if (previewTexture != null)
                                 {
-                                    TextureGLPreview.SetTexture(currentPreviewTexture);
+                                    TextureGLPreview.SetTexture(previewTexture);
                                 }
                                 TextureGLPreview.SetChannels(textureChannels);
 
@@ -3671,31 +3752,31 @@ public partial class MainWindow : Window
             {
                 Image<Bgra32>? image = null;
                 string infoText = string.Empty;
-                bool isTexture = currentPreviewTexture != null;
+                bool isTexture = previewTexture != null;
 
-                if (currentPreviewTexture != null)
+                if (previewTexture != null)
                 {
-                    image = currentPreviewTexture.ConvertToImage(true);
+                    image = previewTexture.ConvertToImage(true);
                     if (image != null)
                     {
-                        infoText = $"Width: {currentPreviewTexture.m_Width}\nHeight: {currentPreviewTexture.m_Height}\nFormat: {currentPreviewTexture.m_TextureFormat}";
-                        switch (currentPreviewTexture.m_TextureSettings.m_FilterMode)
+                        infoText = $"Width: {previewTexture.m_Width}\nHeight: {previewTexture.m_Height}\nFormat: {previewTexture.m_TextureFormat}";
+                        switch (previewTexture.m_TextureSettings.m_FilterMode)
                         {
                             case 0: infoText += "\nFilter Mode: Point "; break;
                             case 1: infoText += "\nFilter Mode: Bilinear "; break;
                             case 2: infoText += "\nFilter Mode: Trilinear "; break;
                         }
-                        infoText += $"\nAnisotropic level: {currentPreviewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {currentPreviewTexture.m_TextureSettings.m_MipBias}";
-                        switch (currentPreviewTexture.m_TextureSettings.m_WrapMode)
+                        infoText += $"\nAnisotropic level: {previewTexture.m_TextureSettings.m_Aniso}\nMip map bias: {previewTexture.m_TextureSettings.m_MipBias}";
+                        switch (previewTexture.m_TextureSettings.m_WrapMode)
                         {
                             case 0: infoText += "\nWrap mode: Repeat"; break;
                             case 1: infoText += "\nWrap mode: Clamp"; break;
                         }
                     }
                 }
-                else if (currentPreviewSprite != null)
+                else if (previewSprite != null)
                 {
-                    image = currentPreviewSprite.GetImage();
+                    image = previewSprite.GetImage();
                     if (image != null)
                     {
                         infoText = $"Width: {image.Width}\nHeight: {image.Height}\n";
@@ -3705,15 +3786,15 @@ public partial class MainWindow : Window
                 if (image == null)
                 {
                     string failReason = "Unsupported image for preview";
-                    if (currentPreviewTexture != null)
+                    if (previewTexture != null)
                     {
-                        failReason = $"Unsupported Texture Format: {currentPreviewTexture.m_TextureFormat}";
+                        failReason = $"Unsupported Texture Format: {previewTexture.m_TextureFormat}";
                     }
-                    else if (currentPreviewSprite != null)
+                    else if (previewSprite != null)
                     {
-                        if (currentPreviewSprite.m_SpriteAtlas != null && currentPreviewSprite.m_SpriteAtlas.TryGet(out var atlas) && atlas.m_RenderDataMap.TryGetValue(currentPreviewSprite.m_RenderDataKey, out var atlasData) && atlasData.texture.TryGet(out var tex1))
+                        if (previewSprite.m_SpriteAtlas != null && previewSprite.m_SpriteAtlas.TryGet(out var atlas) && atlas.m_RenderDataMap.TryGetValue(previewSprite.m_RenderDataKey, out var atlasData) && atlasData.texture.TryGet(out var tex1))
                             failReason = $"Unsupported Sprite Texture Format: {tex1.m_TextureFormat}";
-                        else if (currentPreviewSprite.m_RD.texture.TryGet(out var tex2))
+                        else if (previewSprite.m_RD.texture.TryGet(out var tex2))
                             failReason = $"Unsupported Sprite Texture Format: {tex2.m_TextureFormat}";
                     }
 
@@ -3916,7 +3997,10 @@ public partial class MainWindow : Window
         isSorting = true;
         try
         {
-            var sortMember = e.Column.SortMemberPath ?? e.Column.Header?.ToString();
+            var column = e.Column;
+            if (column == null) return;
+
+            var sortMember = column.SortMemberPath ?? column.Header?.ToString();
             if (string.IsNullOrEmpty(sortMember)) return;
 
             if (assetListSortMember == sortMember)
@@ -3929,7 +4013,7 @@ public partial class MainWindow : Window
                 assetListSortDescending = false;
             }
 
-            e.Column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
+            column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
             await ApplyAssetListSortAsync();
             
             e.Handled = true;
@@ -3942,16 +4026,24 @@ public partial class MainWindow : Window
 
     private void AssetListDataGrid_CellPointerPressed(object? sender, DataGridCellPointerPressedEventArgs e)
     {
-        if (e.Row.DataContext is not AssetItem item)
+        var row = e.Row;
+        if (row?.DataContext is not AssetItem item)
         {
+            assetContextItem = null;
+            assetContextCellText = string.Empty;
             return;
         }
 
         assetContextItem = item;
-        assetContextCellText = GetAssetCellText(item, e.Column.SortMemberPath ?? e.Column.Header?.ToString());
+        var column = e.Column;
+        assetContextCellText = GetAssetCellText(item, column?.SortMemberPath ?? column?.Header?.ToString());
 
-        if (e.PointerPressedEventArgs.GetCurrentPoint(AssetListDataGrid).Properties.IsRightButtonPressed
-            && !AssetListDataGrid.SelectedItems.Contains(item))
+        var isRightButton = e.PointerPressedEventArgs?
+            .GetCurrentPoint(AssetListDataGrid)
+            .Properties
+            .IsRightButtonPressed == true;
+        var selectedItems = AssetListDataGrid.SelectedItems;
+        if (isRightButton && selectedItems != null && !selectedItems.Contains(item))
         {
             AssetListDataGrid.SelectedItem = item;
         }
@@ -4207,10 +4299,18 @@ public partial class MainWindow : Window
     private List<AssetItem> GetSelectedAssets()
     {
         var selected = new List<AssetItem>();
-        foreach (var item in AssetListDataGrid.SelectedItems)
+        var selectedItems = AssetListDataGrid.SelectedItems;
+        if (selectedItems == null)
+        {
+            return selected;
+        }
+
+        foreach (var item in selectedItems)
         {
             if (item is AssetItem assetItem)
+            {
                 selected.Add(assetItem);
+            }
         }
         return selected;
     }
@@ -5115,20 +5215,9 @@ public partial class MainWindow : Window
                 var m_AudioData = m_AudioClip.m_AudioData.GetData();
                 if (m_AudioData == null || m_AudioData.Length == 0) return false;
                 var converter = new AudioClipConverter(m_AudioClip);
-                if (exportOptions.ConvertAudio && converter.IsSupport)
-                {
-                    var filePath = Path.Combine(exportPath, fileName + ".wav");
-                    if (File.Exists(filePath)) return false;
-                    var buffer = converter.ConvertToWav();
-                    if (buffer == null) return false;
-                    File.WriteAllBytes(filePath, buffer);
-                }
-                else
-                {
-                    var filePath = Path.Combine(exportPath, fileName + converter.GetExtensionName());
-                    if (File.Exists(filePath)) return false;
-                    File.WriteAllBytes(filePath, m_AudioData);
-                }
+                var filePath = Path.Combine(exportPath, fileName + converter.GetExtensionName());
+                if (File.Exists(filePath)) return false;
+                File.WriteAllBytes(filePath, m_AudioData);
                 return true;
             }
             case Material m_Material:
@@ -5727,49 +5816,81 @@ public partial class MainWindow : Window
         return sb.ToString();
     }
 
-    private Material? ResolveMaterial(SerializedFile sourceFile, long pathID, string meshName)
-    {
-        if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj) && obj is Material sourceMat)
-        {
-            return sourceMat;
-        }
-
-        Material? bestMat = null;
-        int bestScore = -1;
-
-        var meshTokens = GetPathTokens(meshName);
-
-        foreach (var file in assetsManager.assetsFileList)
-        {
-            if (file == sourceFile) continue;
-            if (file.ObjectsDic.TryGetValue(pathID, out var otherObj) && otherObj is Material mat)
-            {
-                var matTokens = GetPathTokens(mat.m_Name);
-                int score = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count() * 10;
-                
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestMat = mat;
-                }
-            }
-        }
-        
-        return bestMat;
-    }
-
-    private void BuildMeshToMaterialsCache()
+    private void BuildAssetReferenceIndexes()
     {
         meshToMaterialsCache = new Dictionary<Mesh, List<Material?>>();
-        allMaterialsCache = new List<Material>();
-        objectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>();
+        meshAssociatedRenderersCache = new Dictionary<Mesh, List<string>>();
+        meshSourceTypesCache = new Dictionary<Mesh, HashSet<string>>();
+        materialMainTextureCache = new Dictionary<Material, Texture2D?>();
+        materialPreviewMaterialCache = new Dictionary<Material, Material?>();
+        materialTextureSlotsCache = new Dictionary<Material, Dictionary<string, Texture2D?>>();
 
-        foreach (var item in exportableAssets)
+        objectToAssetItemCache ??= new Dictionary<AssetStudio.Object, AssetItem>();
+        if (objectToAssetItemCache.Count == 0)
         {
-            if (item.Asset != null)
+            foreach (var item in exportableAssets)
             {
                 objectToAssetItemCache[item.Asset] = item;
             }
+        }
+
+        void AddMeshMaterials(Mesh mesh, List<Material?> materials)
+        {
+            if (!meshToMaterialsCache.TryGetValue(mesh, out var existingList)
+                || ScoreMaterials(materials) > ScoreMaterials(existingList))
+            {
+                meshToMaterialsCache[mesh] = materials;
+            }
+        }
+
+        void AddMeshAssociation(Mesh mesh, string sourceType, string? description)
+        {
+            if (!meshSourceTypesCache.TryGetValue(mesh, out var sourceTypes))
+            {
+                sourceTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                meshSourceTypesCache[mesh] = sourceTypes;
+            }
+            sourceTypes.Add(sourceType);
+
+            if (string.IsNullOrEmpty(description))
+            {
+                return;
+            }
+
+            if (!meshAssociatedRenderersCache.TryGetValue(mesh, out var renderers))
+            {
+                renderers = new List<string>();
+                meshAssociatedRenderersCache[mesh] = renderers;
+            }
+
+            renderers.Add(description);
+        }
+
+        GameObject? ResolveGameObject(SerializedFile sourceFile, PPtr<GameObject> pptr)
+        {
+            if (pptr.TryGet(out var go))
+            {
+                return go;
+            }
+            return pptr.m_FileID == 0 ? ResolveObject(sourceFile, pptr.m_PathID) as GameObject : null;
+        }
+
+        Mesh? ResolveMesh(SerializedFile sourceFile, PPtr<Mesh> pptr)
+        {
+            if (pptr.TryGet(out var mesh))
+            {
+                return mesh;
+            }
+            return pptr.m_FileID == 0 ? ResolveObject(sourceFile, pptr.m_PathID) as Mesh : null;
+        }
+
+        Material? ResolveRendererMaterial(PPtr<Material> pptr)
+        {
+            if (pptr.TryGet(out var material))
+            {
+                return material;
+            }
+            return null;
         }
 
         AssetStudio.Object? ResolveObject(SerializedFile sourceFile, long pathID)
@@ -5778,14 +5899,6 @@ public partial class MainWindow : Window
             {
                 return obj;
             }
-            foreach (var file in assetsManager.assetsFileList)
-            {
-                if (file == sourceFile) continue;
-                if (file.ObjectsDic.TryGetValue(pathID, out var otherObj))
-                {
-                    return otherObj;
-                }
-            }
             return null;
         }
 
@@ -5793,65 +5906,38 @@ public partial class MainWindow : Window
         {
             foreach (var obj in file.Objects)
             {
-                if (obj is Material mat)
+                if (obj is Material material)
                 {
-                    allMaterialsCache.Add(mat);
+                    IndexMaterialTextures(material);
                 }
                 else if (obj is SkinnedMeshRenderer smr)
                 {
-                    Mesh? smrMesh = null;
-                    if (smr.m_Mesh.TryGet(out var m))
-                    {
-                        smrMesh = m;
-                    }
-                    else
-                    {
-                        smrMesh = ResolveObject(file, smr.m_Mesh.m_PathID) as Mesh;
-                    }
+                    var smrMesh = ResolveMesh(file, smr.m_Mesh);
 
-                    if (smrMesh != null && smr.m_Materials != null)
+                    if (smrMesh != null)
                     {
-                        var list = new List<Material?>();
-                        foreach (var matPtr in smr.m_Materials)
-                        {
-                            Material? resolvedMat = null;
-                            if (matPtr.TryGet(out var mt))
-                            {
-                                resolvedMat = mt;
-                            }
-                            else
-                            {
-                                resolvedMat = ResolveMaterial(file, matPtr.m_PathID, smrMesh.m_Name);
-                            }
-                            list.Add(resolvedMat);
-                        }
+                        var go = ResolveGameObject(file, smr.m_GameObject);
+                        AddMeshAssociation(
+                            smrMesh,
+                            "SkinnedMeshRenderer",
+                            go != null ? $"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})" : null);
 
-                        if (!meshToMaterialsCache.TryGetValue(smrMesh, out var existingList))
+                        if (smr.m_Materials != null)
                         {
-                            meshToMaterialsCache[smrMesh] = list;
-                        }
-                        else
-                        {
-                            if (ScoreMaterials(list) > ScoreMaterials(existingList))
+                            var list = new List<Material?>();
+                            foreach (var matPtr in smr.m_Materials)
                             {
-                                meshToMaterialsCache[smrMesh] = list;
+                                list.Add(ResolveRendererMaterial(matPtr));
                             }
+                            AddMeshMaterials(smrMesh, list);
                         }
                     }
                 }
                 else if (obj is MeshRenderer mr)
                 {
-                    GameObject? go = null;
-                    if (mr.m_GameObject.TryGet(out var g))
-                    {
-                        go = g;
-                    }
-                    else
-                    {
-                        go = ResolveObject(file, mr.m_GameObject.m_PathID) as GameObject;
-                    }
+                    var go = ResolveGameObject(file, mr.m_GameObject);
 
-                    if (go != null)
+                    if (go?.m_Components != null)
                     {
                         foreach (var compPtr in go.m_Components)
                         {
@@ -5860,50 +5946,30 @@ public partial class MainWindow : Window
                             {
                                 comp = cp;
                             }
-                            else
+                            else if (compPtr.m_FileID == 0)
                             {
                                 comp = ResolveObject(file, compPtr.m_PathID) as Component;
                             }
 
                             if (comp is MeshFilter mf)
                             {
-                                Mesh? mfMesh = null;
-                                if (mf.m_Mesh.TryGet(out var m))
-                                {
-                                    mfMesh = m;
-                                }
-                                else
-                                {
-                                    mfMesh = ResolveObject(file, mf.m_Mesh.m_PathID) as Mesh;
-                                }
+                                var mfMesh = ResolveMesh(file, mf.m_Mesh);
 
-                                if (mfMesh != null && mr.m_Materials != null)
+                                if (mfMesh != null)
                                 {
-                                    var list = new List<Material?>();
-                                    foreach (var matPtr in mr.m_Materials)
-                                    {
-                                        Material? resolvedMat = null;
-                                        if (matPtr.TryGet(out var mt))
-                                        {
-                                            resolvedMat = mt;
-                                        }
-                                        else
-                                        {
-                                            resolvedMat = ResolveMaterial(file, matPtr.m_PathID, mfMesh.m_Name);
-                                        }
-                                        list.Add(resolvedMat);
-                                    }
+                                    AddMeshAssociation(
+                                        mfMesh,
+                                        "MeshFilter",
+                                        $"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
 
-                                    if (!meshToMaterialsCache.TryGetValue(mfMesh, out var existingList))
+                                    if (mr.m_Materials != null)
                                     {
-                                        meshToMaterialsCache[mfMesh] = list;
-                                    }
-                                    else
-                                    {
-                                        if (ScoreMaterials(list) > ScoreMaterials(existingList))
+                                        var list = new List<Material?>();
+                                        foreach (var matPtr in mr.m_Materials)
                                         {
-                                            meshToMaterialsCache[mfMesh] = list;
+                                            list.Add(ResolveRendererMaterial(matPtr));
                                         }
+                                        AddMeshMaterials(mfMesh, list);
                                     }
                                 }
                             }
@@ -5920,14 +5986,16 @@ public partial class MainWindow : Window
         int score = 0;
         foreach (var mat in mats)
         {
-            if (mat != null)
+            if (mat == null)
             {
-                score += 1;
-                var tex = FindTextureForMaterial(mat);
-                if (tex != null)
-                {
-                    score += 100;
-                }
+                continue;
+            }
+
+            score += 1;
+            if (!mat.m_Name.StartsWith("Material", StringComparison.OrdinalIgnoreCase)
+                && !mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 5;
             }
         }
         return score;
@@ -5935,102 +6003,17 @@ public partial class MainWindow : Window
 
     private List<Material?> FindMaterialsForMesh(Mesh mesh)
     {
-        if (meshToMaterialsCache == null || allMaterialsCache == null)
+        if (meshToMaterialsCache == null)
         {
-            BuildMeshToMaterialsCache();
+            BuildAssetReferenceIndexes();
         }
 
-        var materials = new List<Material?>();
         if (meshToMaterialsCache!.TryGetValue(mesh, out var cachedList))
         {
-            materials.AddRange(cachedList);
+            return new List<Material?>(cachedList);
         }
 
-        if (materials.Count == 0 || (materials.Count == 1 && (materials[0] == null || materials[0]!.m_Name.StartsWith("Material") || materials[0]!.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))))
-        {
-            var meshItem = objectToAssetItemCache!.GetValueOrDefault(mesh);
-            var meshContainer = meshItem?.Container;
-            var meshTokens = GetPathTokens(!string.IsNullOrEmpty(meshContainer) ? meshContainer : mesh.m_Name);
-
-            Material? bestMat = null;
-            int bestScore = 0;
-
-            foreach (var mat in allMaterialsCache!)
-            {
-                if (mat.m_Name.StartsWith("Material") || mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var matItem = objectToAssetItemCache!.GetValueOrDefault(mat);
-                var matContainer = matItem?.Container;
-                var matTokens = GetPathTokens(!string.IsNullOrEmpty(matContainer) ? matContainer : mat.m_Name);
-
-                var overlap = meshTokens.Intersect(matTokens, StringComparer.OrdinalIgnoreCase).Count();
-                int score = overlap * 10;
-
-                // Priority 1: Same assetsFile (CAB) gets a very strong boost
-                if (mat.assetsFile == mesh.assetsFile)
-                {
-                    score += 25;
-                }
-
-                // Priority 2: Substring overlap check: find if there's a common word or part (minimum 4 chars)
-                bool hasSubstringMatch = false;
-                if (mat.m_Name.Length >= 4 && mesh.m_Name.Length >= 4)
-                {
-                    string shorter = mat.m_Name.Length < mesh.m_Name.Length ? mat.m_Name : mesh.m_Name;
-                    string longer = mat.m_Name.Length < mesh.m_Name.Length ? mesh.m_Name : mat.m_Name;
-                    for (int len = 8; len >= 4; len--)
-                    {
-                        if (shorter.Length < len) continue;
-                        for (int start = 0; start <= shorter.Length - len; start++)
-                        {
-                            var sub = shorter.Substring(start, len);
-                            if (longer.Contains(sub, StringComparison.OrdinalIgnoreCase))
-                            {
-                                hasSubstringMatch = true;
-                                break;
-                            }
-                        }
-                        if (hasSubstringMatch) break;
-                    }
-                }
-
-                if (hasSubstringMatch)
-                {
-                    score += 15;
-                }
-
-                if (score > 0)
-                {
-                    if (!string.IsNullOrEmpty(meshContainer) && !string.IsNullOrEmpty(matContainer))
-                    {
-                        var meshDir = Path.GetDirectoryName(meshContainer) ?? "";
-                        var matDir = Path.GetDirectoryName(matContainer) ?? "";
-                        if (string.Equals(meshDir, matDir, StringComparison.OrdinalIgnoreCase))
-                        {
-                            score += 10;
-                        }
-                        else if (meshDir.StartsWith(matDir, StringComparison.OrdinalIgnoreCase) || matDir.StartsWith(meshDir, StringComparison.OrdinalIgnoreCase))
-                        {
-                            score += 5;
-                        }
-                    }
-
-                    if (score > bestScore)
-                    {
-                        bestScore = score;
-                        bestMat = mat;
-                    }
-                }
-            }
-
-            if (bestMat != null && bestScore > 0)
-            {
-                materials.Add(bestMat);
-            }
-        }
-
-        return materials;
+        return new List<Material?>();
     }
 
     private static HashSet<string> GetPathTokens(string path)
@@ -6069,37 +6052,13 @@ public partial class MainWindow : Window
             sb.AppendLine($"FBX Path: {item.Container}");
         }
 
-        bool usedBySkinnedMesh = false;
-        bool usedByMeshFilter = false;
-        var associatedRenderers = new List<string>();
-        foreach (var file in assetsManager.assetsFileList)
+        if (meshToMaterialsCache == null || meshAssociatedRenderersCache == null || meshSourceTypesCache == null)
         {
-            foreach (var obj in file.Objects)
-            {
-                if (obj is SkinnedMeshRenderer smr)
-                {
-                    if (smr.m_Mesh.TryGet(out var m) && m == mesh)
-                    {
-                        usedBySkinnedMesh = true;
-                        if (smr.m_GameObject.TryGet(out var go))
-                            associatedRenderers.Add($"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})");
-                    }
-                }
-                else if (obj is MeshFilter mf)
-                {
-                    if (mf.m_Mesh.TryGet(out var m) && m == mesh)
-                    {
-                        usedByMeshFilter = true;
-                        if (mf.m_GameObject.TryGet(out var go))
-                            associatedRenderers.Add($"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
-                    }
-                }
-            }
+            BuildAssetReferenceIndexes();
         }
 
-        var sourceTypes = new List<string>();
-        if (usedBySkinnedMesh) sourceTypes.Add("SkinnedMeshRenderer");
-        if (usedByMeshFilter) sourceTypes.Add("MeshFilter");
+        meshSourceTypesCache!.TryGetValue(mesh, out var cachedSourceTypes);
+        var sourceTypes = cachedSourceTypes?.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList() ?? new List<string>();
         sb.AppendLine($"Referenced By: {(sourceTypes.Count > 0 ? string.Join(", ", sourceTypes) : "None (Orphaned Mesh)")}");
 
         var materials = FindMaterialsForMesh(mesh);
@@ -6112,6 +6071,8 @@ public partial class MainWindow : Window
             }
         }
 
+        meshAssociatedRenderersCache!.TryGetValue(mesh, out var associatedRenderers);
+        associatedRenderers ??= new List<string>();
         if (associatedRenderers.Count > 0)
         {
             sb.AppendLine();
@@ -6185,255 +6146,216 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
-        FMODreset();
-        if (fmodSystem.hasHandle())
-        {
-            fmodSystem.release();
-            fmodSystem.clearHandle();
-        }
+        AudioReset();
         VideoReset();
+        _audioMediaPlayer?.Dispose();
         _mediaPlayer?.Dispose();
         _libVLC?.Dispose();
         base.OnClosing(e);
     }
 
-    #region FMOD
-    private void FMODinit()
+    #region Audio Preview
+    private void AudioTimer_Tick(object? sender, EventArgs e)
     {
-        try
+        if (_audioMediaPlayer == null)
+            return;
+
+        var currentMs = Math.Max(0, _audioMediaPlayer.Time);
+        var totalMs = _audioLengthMs > 0 ? _audioLengthMs : Math.Max(0, _audioMediaPlayer.Length);
+
+        if (FMODprogressBar != null && !_isAudioDragging && totalMs > 0)
         {
-            FMODreset();
-
-            // Preload platform-specific FMOD native library (handling x64/x86 and Linux/Windows/macOS differences)
-            DllLoader.PreloadDll("fmod");
-
-            var result = FMOD.Factory.System_Create(out fmodSystem);
-            if (ERRCHECK(result)) { return; }
-
-            result = fmodSystem.getVersion(out var version);
-            ERRCHECK(result);
-            if (version < FMOD.VERSION.number)
-            {
-                logger.Log(LoggerEvent.Error, $"Error! You are using an old version of FMOD {version:X}. This program requires {FMOD.VERSION.number:X}.");
-                return;
-            }
-
-            result = fmodSystem.init(2, FMOD.INITFLAGS.NORMAL, IntPtr.Zero);
-            if (ERRCHECK(result)) { return; }
-
-            result = fmodSystem.getMasterSoundGroup(out fmodMasterSoundGroup);
-            if (ERRCHECK(result)) { return; }
-
-            result = fmodMasterSoundGroup.setVolume(fmodVolume);
-            if (ERRCHECK(result)) { return; }
-
-            fmodTimer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(100)
-            };
-            fmodTimer.Tick += FmodTimer_Tick;
-        }
-        catch (Exception ex)
-        {
-            logger.Log(LoggerEvent.Error, $"FMOD could not be initialized: {ex.Message}. Audio preview will be disabled.");
-        }
-    }
-
-    private void FmodTimer_Tick(object? sender, EventArgs e)
-    {
-        uint ms = 0;
-        bool playing = false;
-        bool paused = false;
-
-        if (fmodChannel.hasHandle())
-        {
-            var result = fmodChannel.getPosition(out ms, FMOD.TIMEUNIT.MS);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-            {
-                ERRCHECK(result);
-            }
-
-            result = fmodChannel.isPlaying(out playing);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-            {
-                ERRCHECK(result);
-            }
-
-            result = fmodChannel.getPaused(out paused);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-            {
-                ERRCHECK(result);
-            }
-        }
-
-        if (FMODprogressBar != null && !_isAudioDragging && fmodLenMs > 0)
-        {
-            FMODtimerLabel.Text = $"{ms / 1000 / 60}:{ms / 1000 % 60:D2}.{ms / 10 % 100:D2} / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+            FMODtimerLabel.Text = FormatMediaTime(currentMs, totalMs);
             _isUpdatingAudioProgress = true;
-            FMODprogressBar.Value = (int)(ms * 1000 / fmodLenMs);
+            FMODprogressBar.Value = currentMs * 1000.0 / totalMs;
             _isUpdatingAudioProgress = false;
         }
-        FMODstatusLabel.Text = paused ? "Paused" : playing ? "Playing" : "Stopped";
 
-        if (fmodSystem.hasHandle() && fmodChannel.hasHandle())
-        {
-            fmodSystem.update();
-        }
+        FMODstatusLabel.Text = _audioMediaPlayer.IsPlaying ? "Playing" : "Paused";
     }
 
-    private void FMODreset()
+    private static string FormatMediaTime(long currentMs, long totalMs)
     {
-        fmodTimer?.Stop();
+        return $"{currentMs / 1000 / 60}:{currentMs / 1000 % 60:D2}.{currentMs / 10 % 100:D2} / {totalMs / 1000 / 60}:{totalMs / 1000 % 60:D2}.{totalMs / 10 % 100:D2}";
+    }
+
+    private void AudioReset()
+    {
+        _audioTimer?.Stop();
+        try
+        {
+            if (_audioMediaPlayer != null)
+            {
+                _audioMediaPlayer.Stop();
+                if (_audioMediaPlayer.Media != null)
+                {
+                    _audioMediaPlayer.Media.Dispose();
+                    _audioMediaPlayer.Media = null;
+                }
+            }
+        }
+        catch {}
+
+        if (!string.IsNullOrEmpty(_currentTempAudioPath) && File.Exists(_currentTempAudioPath))
+        {
+            try
+            {
+                File.Delete(_currentTempAudioPath);
+            }
+            catch {}
+            _currentTempAudioPath = null;
+        }
+
+        _audioLengthMs = 0;
         if (FMODprogressBar != null) FMODprogressBar.Value = 0;
         if (FMODtimerLabel != null) FMODtimerLabel.Text = "0:00.0 / 0:00.0";
         if (FMODstatusLabel != null) FMODstatusLabel.Text = "Stopped";
         if (FMODinfoLabel != null) FMODinfoLabel.Text = "";
-
-        if (fmodSound.hasHandle())
-        {
-            var result = fmodSound.release();
-            ERRCHECK(result);
-            fmodSound.clearHandle();
-        }
-        currentAudioData = null;
+        if (FMODpauseButton != null) FMODpauseButton.Content = "Pause";
     }
 
     private void FMODplayButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (fmodSound.hasHandle() && fmodChannel.hasHandle() && fmodSystem.hasHandle())
+        if (_audioMediaPlayer == null || currentPreviewAudioClip == null)
+            return;
+
+        try
         {
-            fmodTimer?.Start();
-            var result = fmodChannel.isPlaying(out var playing);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            if (!EnsureAudioPreviewFile(currentPreviewAudioClip))
             {
-                if (ERRCHECK(result)) { return; }
+                return;
             }
 
-            if (playing)
+            if (_audioMediaPlayer.Media == null && _libVLC != null && !string.IsNullOrEmpty(_currentTempAudioPath))
             {
-                result = fmodChannel.stop();
-                if (ERRCHECK(result)) { return; }
-
-                result = fmodSystem.playSound(fmodSound, default, false, out fmodChannel);
-                if (ERRCHECK(result)) { return; }
-
-                FMODpauseButton.Content = "Pause";
+                _audioMediaPlayer.Media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempAudioPath, LibVLCSharp.Shared.FromType.FromPath);
             }
-            else
-            {
-                result = fmodSystem.playSound(fmodSound, default, false, out fmodChannel);
-                if (ERRCHECK(result)) { return; }
-                FMODstatusLabel.Text = "Playing";
 
-                if (FMODprogressBar.Value > 0)
-                {
-                    uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
-                    result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
-                    if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                    {
-                        if (ERRCHECK(result)) { return; }
-                    }
-                }
+            _audioMediaPlayer.Stop();
+            _audioMediaPlayer.Play();
+            _audioMediaPlayer.Volume = _targetAudioVolume;
+            FMODstatusLabel.Text = "Playing";
+            FMODpauseButton.Content = "Pause";
+            _audioTimer?.Start();
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Failed to play audio: {ex.Message}");
+        }
+    }
+
+    private bool EnsureAudioPreviewFile(AudioClip audioClip)
+    {
+        if (!string.IsNullOrEmpty(_currentTempAudioPath) && File.Exists(_currentTempAudioPath))
+        {
+            return true;
+        }
+
+        var currentAudioData = audioClip.m_AudioData.GetData();
+        if (currentAudioData == null || currentAudioData.Length == 0)
+        {
+            StatusStripUpdate("AudioClip data is empty or invalid.");
+            return false;
+        }
+
+        if (_libVLC == null)
+        {
+            StatusStripUpdate("Audio preview is unavailable (LibVLC is not loaded).");
+            return false;
+        }
+
+        var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            foreach (var oldFile in Directory.GetFiles(tempDir, "temp_audio_*"))
+            {
+                try { File.Delete(oldFile); } catch {}
             }
         }
+        catch {}
+
+        var extension = new AudioClipConverter(audioClip).GetExtensionName();
+        if (extension.Equals(".AudioClip", StringComparison.OrdinalIgnoreCase))
+        {
+            extension = ".bin";
+        }
+
+        _currentTempAudioPath = Path.Combine(tempDir, $"temp_audio_{FixFileName(audioClip.m_Name)}_{audioClip.m_PathID}{extension}");
+        File.WriteAllBytes(_currentTempAudioPath, currentAudioData);
+
+        _audioMediaPlayer?.Media?.Dispose();
+        if (_audioMediaPlayer != null)
+        {
+            _audioMediaPlayer.Media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempAudioPath, LibVLCSharp.Shared.FromType.FromPath);
+        }
+
+        return true;
     }
 
     private void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (fmodSound.hasHandle() && fmodChannel.hasHandle())
+        if (_audioMediaPlayer == null)
+            return;
+
+        try
         {
-            var result = fmodChannel.isPlaying(out var playing);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+            if (_audioMediaPlayer.Media == null && currentPreviewAudioClip != null && !EnsureAudioPreviewFile(currentPreviewAudioClip))
             {
-                if (ERRCHECK(result)) { return; }
+                return;
             }
 
-            if (playing)
+            if (_audioMediaPlayer.IsPlaying)
             {
-                result = fmodChannel.getPaused(out var paused);
-                if (ERRCHECK(result)) { return; }
-                result = fmodChannel.setPaused(!paused);
-                if (ERRCHECK(result)) { return; }
-
-                if (paused)
-                {
-                    FMODstatusLabel.Text = "Playing";
-                    FMODpauseButton.Content = "Pause";
-                    fmodTimer?.Start();
-                }
-                else
-                {
-                    FMODstatusLabel.Text = "Paused";
-                    FMODpauseButton.Content = "Resume";
-                    fmodTimer?.Stop();
-                }
+                _audioMediaPlayer.Pause();
+                FMODstatusLabel.Text = "Paused";
+                FMODpauseButton.Content = "Resume";
             }
+            else
+            {
+                _audioMediaPlayer.Play();
+                _audioMediaPlayer.Volume = _targetAudioVolume;
+                FMODstatusLabel.Text = "Playing";
+                FMODpauseButton.Content = "Pause";
+                _audioTimer?.Start();
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Failed to pause audio: {ex.Message}");
         }
     }
 
     private void FMODstopButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (fmodChannel.hasHandle())
-        {
-            var result = fmodChannel.isPlaying(out var playing);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-            {
-                if (ERRCHECK(result)) { return; }
-            }
+        AudioStop();
+    }
 
-            if (playing)
-            {
-                result = fmodChannel.stop();
-                if (ERRCHECK(result)) { return; }
-                fmodTimer?.Stop();
-                FMODprogressBar.Value = 0;
-                FMODtimerLabel.Text = "0:00.0 / 0:00.0";
-                FMODstatusLabel.Text = "Stopped";
-                FMODpauseButton.Content = "Pause";
-            }
+    private void AudioStop()
+    {
+        try
+        {
+            _audioMediaPlayer?.Stop();
+            _audioTimer?.Stop();
+            if (FMODprogressBar != null) FMODprogressBar.Value = 0;
+            if (FMODtimerLabel != null) FMODtimerLabel.Text = "0:00.0 / 0:00.0";
+            if (FMODstatusLabel != null) FMODstatusLabel.Text = "Stopped";
+            if (FMODpauseButton != null) FMODpauseButton.Content = "Pause";
         }
+        catch {}
     }
 
     private void FMODloopButton_Click(object? sender, RoutedEventArgs e)
     {
-        fmodLoopMode = FMODloopButton.IsChecked == true ? FMOD.MODE.LOOP_NORMAL : FMOD.MODE.LOOP_OFF;
-
-        if (fmodSound.hasHandle())
-        {
-            var result = fmodSound.setMode(fmodLoopMode);
-            if (ERRCHECK(result)) { return; }
-        }
-
-        if (fmodChannel.hasHandle())
-        {
-            var result = fmodChannel.isPlaying(out var playing);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-            {
-                if (ERRCHECK(result)) { return; }
-            }
-
-            result = fmodChannel.getPaused(out var paused);
-            if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-            {
-                if (ERRCHECK(result)) { return; }
-            }
-
-            if (playing || paused)
-            {
-                result = fmodChannel.setMode(fmodLoopMode);
-                if (ERRCHECK(result)) { return; }
-            }
-        }
     }
 
     private void FMODvolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
-        fmodVolume = (float)(FMODvolumeBar.Value / 10.0);
-
-        if (fmodMasterSoundGroup.hasHandle())
+        _targetAudioVolume = (int)(FMODvolumeBar.Value * 10);
+        if (_audioMediaPlayer != null)
         {
-            var result = fmodMasterSoundGroup.setVolume(fmodVolume);
-            if (ERRCHECK(result)) { return; }
+            _audioMediaPlayer.Volume = _targetAudioVolume;
         }
     }
 
@@ -6442,28 +6364,47 @@ public partial class MainWindow : Window
         if (_isUpdatingAudioProgress)
             return;
 
-        if (fmodLenMs > 0 && FMODtimerLabel != null)
+        if (_audioMediaPlayer != null && _audioLengthMs > 0 && FMODtimerLabel != null)
         {
-            uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
-            FMODtimerLabel.Text = $"{newms / 1000 / 60}:{newms / 1000 % 60:D2}.{newms / 10 % 100:D2} / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
-            
-            if (fmodChannel.hasHandle())
+            var newMs = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
+            FMODtimerLabel.Text = FormatMediaTime(newMs, _audioLengthMs);
+
+            if (!_isAudioDragging)
             {
-                var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
-                ERRCHECK(result);
+                _audioMediaPlayer.Time = newMs;
             }
         }
     }
 
+    private void AudioMediaPlayer_EndReached(object? sender, EventArgs e)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (FMODloopButton.IsChecked == true && _audioMediaPlayer != null)
+            {
+                Task.Run(() =>
+                {
+                    _audioMediaPlayer.Stop();
+                    _audioMediaPlayer.Play();
+                    _audioMediaPlayer.Volume = _targetAudioVolume;
+                });
+            }
+            else
+            {
+                AudioStop();
+            }
+        });
+    }
+
+    private void AudioMediaPlayer_LengthChanged(object? sender, LibVLCSharp.Shared.MediaPlayerLengthChangedEventArgs e)
+    {
+        _audioLengthMs = e.Length;
+    }
+
     private void PreviewAudioClip(AssetItem assetItem, AudioClip m_AudioClip)
     {
-        FMODreset();
-
-        if (!fmodSystem.hasHandle())
-        {
-            StatusStripUpdate("Audio preview is unavailable (FMOD is not loaded).");
-            return;
-        }
+        AudioReset();
+        currentPreviewAudioClip = m_AudioClip;
 
         var infoText = "Compression format: ";
         if (m_AudioClip.version[0] < 5)
@@ -6551,57 +6492,19 @@ public partial class MainWindow : Window
             }
         }
 
-        currentAudioData = m_AudioClip.m_AudioData.GetData();
-        if (currentAudioData == null || currentAudioData.Length == 0)
+        if (_audioMediaPlayer == null || _libVLC == null)
         {
-            StatusStripUpdate("AudioClip data is empty or invalid.");
+            StatusStripUpdate("Audio preview is unavailable (LibVLC is not loaded).");
             return;
         }
 
-        var exinfo = new FMOD.CREATESOUNDEXINFO();
-        exinfo.cbsize = Marshal.SizeOf(exinfo);
-        exinfo.length = (uint)m_AudioClip.m_Size;
-
-        var result = fmodSystem.createSound(currentAudioData, FMOD.MODE.OPENMEMORY | fmodLoopMode, ref exinfo, out fmodSound);
-        if (ERRCHECK(result)) return;
-
-        fmodSound.getNumSubSounds(out var numsubsounds);
-        if (numsubsounds > 0)
-        {
-            result = fmodSound.getSubSound(0, out var subsound);
-            if (result == FMOD.RESULT.OK)
-            {
-                fmodSound = subsound;
-            }
-        }
-
-        result = fmodSound.getLength(out fmodLenMs, FMOD.TIMEUNIT.MS);
-        if (ERRCHECK(result)) return;
-
-        result = fmodSystem.playSound(fmodSound, default, true, out fmodChannel);
-        if (ERRCHECK(result)) return;
-
         FMODPanel.IsVisible = true;
-
-        result = fmodChannel.getFrequency(out var frequency);
-        if (ERRCHECK(result)) return;
-
-        FMODinfoLabel.Text = $"{frequency} Hz | {infoText}";
-        FMODtimerLabel.Text = $"0:00.0 / {fmodLenMs / 1000 / 60}:{fmodLenMs / 1000 % 60:D2}.{fmodLenMs / 10 % 100:D2}";
+        FMODinfoLabel.Text = infoText;
+        FMODtimerLabel.Text = "0:00.0 / 0:00.0";
         FMODTitleLabel.Text = m_AudioClip.m_Name;
+        FMODstatusLabel.Text = "Ready";
         FMODpauseButton.Content = "Pause";
-        StatusStripUpdate($"Loaded audio: {m_AudioClip.m_Name}");
-    }
-
-    private bool ERRCHECK(FMOD.RESULT result)
-    {
-        if (result != FMOD.RESULT.OK)
-        {
-            FMODreset();
-            StatusStripUpdate($"FMOD error! {result} - {FMOD.Error.String(result)}");
-            return true;
-        }
-        return false;
+        StatusStripUpdate($"Loaded audio metadata: {m_AudioClip.m_Name}");
     }
 
     private void MediaPlayer_EndReached(object? sender, EventArgs e)
@@ -6710,12 +6613,14 @@ public partial class MainWindow : Window
             {
                 _mediaPlayer.Stop();
             }
-            Dispatcher.UIThread.Post(() => {
-                VideoStatusLabel.Text = "Stopped";
-                VideoPlayButton.Content = "Play";
-                VideoProgressBar.Value = 0;
-                VideoTimerLabel.Text = "0:00.0 / 0:00.0";
-            });
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                SetVideoStoppedUi();
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(SetVideoStoppedUi);
+            }
         }
         catch {}
     }
@@ -6746,12 +6651,22 @@ public partial class MainWindow : Window
             _currentTempVideoPath = null;
         }
 
-        Dispatcher.UIThread.Post(() => {
-            VideoStatusLabel.Text = "Stopped";
-            VideoPlayButton.Content = "Play";
-            VideoProgressBar.Value = 0;
-            VideoTimerLabel.Text = "0:00.0 / 0:00.0";
-        });
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            SetVideoStoppedUi();
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(SetVideoStoppedUi);
+        }
+    }
+
+    private void SetVideoStoppedUi()
+    {
+        VideoStatusLabel.Text = "Stopped";
+        VideoPlayButton.Content = "Play";
+        VideoProgressBar.Value = 0;
+        VideoTimerLabel.Text = "0:00.0 / 0:00.0";
     }
 
     private void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
@@ -6794,19 +6709,7 @@ public partial class MainWindow : Window
             }
         }
 
-        var data = m_VideoClip.m_VideoData.GetData();
-        if (data == null || data.Length == 0)
-        {
-            VideoInfoLabel.Text = "VideoClip data is empty or invalid.";
-            VideoPlayButton.IsEnabled = false;
-            VideoStopButton.IsEnabled = false;
-            VideoExportButton.IsEnabled = false;
-            VideoClipPanel.IsVisible = true;
-            PreviewLabel.IsVisible = false;
-            return;
-        }
-
-        VideoInfoLabel.Text = "Playing embedded native preview.";
+        VideoInfoLabel.Text = "Ready. Press Play to load embedded native preview.";
         VideoPlayButton.IsEnabled = true;
         VideoStopButton.IsEnabled = true;
         VideoExportButton.IsEnabled = true;
@@ -6814,44 +6717,7 @@ public partial class MainWindow : Window
 
         VideoClipPanel.IsVisible = true;
         PreviewLabel.IsVisible = false;
-        StatusStripUpdate($"Loaded video clip: {m_VideoClip.m_Name}");
-
-        try
-        {
-            VideoReset();
-
-            var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
-            Directory.CreateDirectory(tempDir);
-
-            // Clean up older temp files
-            try
-            {
-                foreach (var oldFile in Directory.GetFiles(tempDir, "temp_video_*"))
-                {
-                    try { File.Delete(oldFile); } catch {}
-                }
-            }
-            catch {}
-
-            _currentTempVideoPath = Path.Combine(tempDir, $"temp_video_{m_VideoClip.m_Name}_{m_VideoClip.m_PathID}{ext}");
-            File.WriteAllBytes(_currentTempVideoPath, data);
-
-            if (_mediaPlayer != null && _libVLC != null)
-            {
-                var media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
-                _mediaPlayer.Media = media;
-                _targetVolume = (int)VideoVolumeBar.Value;
-                _mediaPlayer.Play();
-                // Volume and Mute are set in MediaPlayer_Playing handler on the VLC thread
-                // Setting them here before Play() is ignored by LibVLC 3.x
-                VideoStatusLabel.Text = "Playing";
-                VideoPlayButton.Content = "Pause";
-            }
-        }
-        catch (Exception ex)
-        {
-            VideoInfoLabel.Text = $"Failed to play video natively: {ex.Message}";
-        }
+        StatusStripUpdate($"Loaded video metadata: {m_VideoClip.m_Name}");
     }
 
     private void VideoPlayButton_Click(object? sender, RoutedEventArgs e)
@@ -6868,6 +6734,11 @@ public partial class MainWindow : Window
             }
             else
             {
+                if (!EnsureVideoPreviewFile(currentPreviewVideoClip))
+                {
+                    return;
+                }
+
                 if (_mediaPlayer.Media == null && !string.IsNullOrEmpty(_currentTempVideoPath))
                 {
                     var media = new LibVLCSharp.Shared.Media(_libVLC!, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
@@ -6882,6 +6753,55 @@ public partial class MainWindow : Window
         {
             StatusStripUpdate($"Failed to toggle playback: {ex.Message}");
         }
+    }
+
+    private bool EnsureVideoPreviewFile(VideoClip videoClip)
+    {
+        if (!string.IsNullOrEmpty(_currentTempVideoPath) && File.Exists(_currentTempVideoPath))
+        {
+            return true;
+        }
+
+        var ext = Path.GetExtension(videoClip.m_OriginalPath);
+        if (string.IsNullOrEmpty(ext)) ext = ".mp4";
+
+        var data = videoClip.m_VideoData.GetData();
+        if (data == null || data.Length == 0)
+        {
+            VideoInfoLabel.Text = "VideoClip data is empty or invalid.";
+            VideoStatusLabel.Text = "Missing";
+            VideoPlayButton.Content = "Play";
+            StatusStripUpdate("VideoClip data is empty or invalid.");
+            return false;
+        }
+
+        if (_mediaPlayer == null || _libVLC == null)
+        {
+            VideoInfoLabel.Text = "Video preview is unavailable (LibVLC is not loaded).";
+            StatusStripUpdate("Video preview is unavailable (LibVLC is not loaded).");
+            return false;
+        }
+
+        var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            foreach (var oldFile in Directory.GetFiles(tempDir, "temp_video_*"))
+            {
+                try { File.Delete(oldFile); } catch {}
+            }
+        }
+        catch {}
+
+        _currentTempVideoPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}{ext}");
+        File.WriteAllBytes(_currentTempVideoPath, data);
+
+        _mediaPlayer.Media?.Dispose();
+        _mediaPlayer.Media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
+        _targetVolume = (int)VideoVolumeBar.Value;
+        VideoInfoLabel.Text = "Embedded native preview loaded.";
+        return true;
     }
 
     private void VideoStopButton_Click(object? sender, RoutedEventArgs e)
@@ -6918,11 +6838,9 @@ public partial class MainWindow : Window
     private void FMODprogressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
     {
         _isAudioDragging = false;
-        if (fmodLenMs > 0 && fmodChannel.hasHandle())
+        if (_audioMediaPlayer != null && _audioLengthMs > 0)
         {
-            uint newms = (uint)(fmodLenMs * (FMODprogressBar.Value / 1000.0));
-            var result = fmodChannel.setPosition(newms, FMOD.TIMEUNIT.MS);
-            ERRCHECK(result);
+            _audioMediaPlayer.Time = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
         }
     }
 

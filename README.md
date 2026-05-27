@@ -16,7 +16,7 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
 * Support asset types:
   * **Texture2D** : convert to png, tga, jpeg, bmp
   * **Sprite** : crop Texture2D to png, tga, jpeg, bmp
-  * **AudioClip** : mp3, ogg, wav, m4a, fsb. Supports converting FSB files to WAV(PCM) and real-time audio playback preview via FMOD.
+  * **AudioClip** : mp3, ogg, wav, m4a, fsb. Supports real-time audio playback preview through LibVLC in the Avalonia UI.
   * **Font** : ttf, otf
   * **Mesh** : obj, fbx, and real-time 3D preview via OpenGL
   * **TextAsset**
@@ -117,7 +117,7 @@ The script requires Visual Studio with the C++ workload for native texture build
 
 ### One-command Linux publish
 
-Use the publish script to build the native C++ decoder library, publish the Avalonia GUI application, and bundle the native dependencies (`libTexture2DDecoderNative.so` and `libfmod.so`) into the target publish folder:
+Use the publish script to build the native C++ decoder library, publish the Avalonia GUI application, and bundle `libTexture2DDecoderNative.so` into the target publish folder:
 
 ```bash
 ./scripts/publish-linux.sh -c Release
@@ -137,7 +137,7 @@ Run the executable from inside `publish`:
 
 ## Native Dependencies
 
-Compressed texture conversion and audio previewing depend on native libraries. The managed application can build and run without them, but texture/audio previews will fail at runtime if the libraries are missing.
+Compressed texture conversion depends on the native texture decoder library. Audio and video previewing in the Avalonia UI use LibVLC.
 
 ### Windows Layout:
 
@@ -153,11 +153,9 @@ x64\Texture2DDecoderNative.dll
 ```text
 AssetStudio.Avalonia
 x64/libTexture2DDecoderNative.so
-x64/libfmod.so
 ```
 
 * `libTexture2DDecoderNative.so` is required for compressed texture formats.
-* `libfmod.so` is required for audio playback previewing. A precompiled copy of `libfmod.so` is included in this repository under `AssetStudio.Avalonia/Libraries/x64/` and will be automatically copied to the build output. If you need to obtain or update it manually, you can download the Linux Programmer's API from the [FMOD Downloads](https://www.fmod.com/download) page.
 
 ## Open source libraries used
 
@@ -165,4 +163,3 @@ x64/libfmod.so
 * [Ishotihadus/mikunyan](https://github.com/Ishotihadus/mikunyan)
 * [BinomialLLC/crunch](https://github.com/BinomialLLC/crunch)
 * [Unity-Technologies/crunch](https://github.com/Unity-Technologies/crunch/tree/unity)
-
