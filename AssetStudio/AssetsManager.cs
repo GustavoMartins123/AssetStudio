@@ -22,6 +22,10 @@ namespace AssetStudio
         private HashSet<string> noexistFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private HashSet<string> assetsFileListHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        private readonly object loadLock = new object();
+        private System.Collections.Concurrent.ConcurrentQueue<string> loadQueue;
+        private int loadTotalCount;
+
         public void LoadFiles(params string[] files)
         {
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
@@ -48,19 +52,68 @@ namespace AssetStudio
 
         private void Load(string[] files)
         {
-            foreach (var file in files)
+            loadQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+            loadTotalCount = files.Length;
+
+            lock (loadLock)
             {
-                importFiles.Add(file);
-                importFilesHash.Add(Path.GetFileName(file));
+                foreach (var file in files)
+                {
+                    importFiles.Add(file);
+                    importFilesHash.Add(Path.GetFileName(file));
+                    loadQueue.Enqueue(file);
+                }
             }
 
             Progress.Reset();
-            //use a for loop because list size can change
-            for (var i = 0; i < importFiles.Count; i++)
+
+            int completedCount = 0;
+            int threadCount = Math.Min(Environment.ProcessorCount, loadTotalCount);
+            if (threadCount < 1) threadCount = 1;
+
+            int activeWorkers = threadCount;
+            var tasks = new System.Threading.Tasks.Task[threadCount];
+            for (int t = 0; t < threadCount; t++)
             {
-                LoadFile(importFiles[i]);
-                Progress.Report(i + 1, importFiles.Count);
+                tasks[t] = System.Threading.Tasks.Task.Run(() =>
+                {
+                    bool isWorkerActive = true;
+                    while (true)
+                    {
+                        string file = null;
+                        if (loadQueue.TryDequeue(out file))
+                        {
+                            if (!isWorkerActive)
+                            {
+                                System.Threading.Interlocked.Increment(ref activeWorkers);
+                                isWorkerActive = true;
+                            }
+
+                            LoadFile(file);
+                            var completed = System.Threading.Interlocked.Increment(ref completedCount);
+                            Progress.Report(completed, System.Threading.Volatile.Read(ref loadTotalCount));
+                        }
+                        else
+                        {
+                            if (isWorkerActive)
+                            {
+                                System.Threading.Interlocked.Decrement(ref activeWorkers);
+                                isWorkerActive = false;
+                            }
+
+                            if (System.Threading.Volatile.Read(ref activeWorkers) == 0 && loadQueue.IsEmpty)
+                            {
+                                break;
+                            }
+
+                            System.Threading.Thread.Sleep(10);
+                        }
+                    }
+                });
             }
+            System.Threading.Tasks.Task.WaitAll(tasks);
+
+            loadQueue = null;
 
             importFiles.Clear();
             importFilesHash.Clear();
@@ -107,24 +160,47 @@ namespace AssetStudio
 
         private void LoadAssetsFile(FileReader reader)
         {
-            if (!assetsFileListHash.Contains(reader.FileName))
+            bool alreadyLoaded;
+            lock (loadLock)
+            {
+                alreadyLoaded = assetsFileListHash.Contains(reader.FileName);
+            }
+
+            if (!alreadyLoaded)
             {
                 Logger.Info($"Loading {reader.FullPath}");
                 try
                 {
                     var assetsFile = new SerializedFile(reader, this);
                     CheckStrippedVersion(assetsFile);
-                    assetsFileList.Add(assetsFile);
-                    assetsFileListHash.Add(assetsFile.fileName);
+                    
+                    lock (loadLock)
+                    {
+                        assetsFileList.Add(assetsFile);
+                        assetsFileListHash.Add(assetsFile.fileName);
+                    }
 
                     foreach (var sharedFile in assetsFile.m_Externals)
                     {
                         var sharedFileName = sharedFile.fileName;
 
-                        if (!importFilesHash.Contains(sharedFileName))
+                        bool containsShared;
+                        lock (loadLock)
+                        {
+                            containsShared = importFilesHash.Contains(sharedFileName);
+                        }
+
+                        if (!containsShared)
                         {
                             var sharedFilePath = Path.Combine(Path.GetDirectoryName(reader.FullPath), sharedFileName);
-                            if (!noexistFiles.Contains(sharedFilePath))
+                            
+                            bool containsNoExist;
+                            lock (loadLock)
+                            {
+                                containsNoExist = noexistFiles.Contains(sharedFilePath);
+                            }
+
+                            if (!containsNoExist)
                             {
                                 if (!File.Exists(sharedFilePath))
                                 {
@@ -136,12 +212,20 @@ namespace AssetStudio
                                 }
                                 if (File.Exists(sharedFilePath))
                                 {
-                                    importFiles.Add(sharedFilePath);
-                                    importFilesHash.Add(sharedFileName);
+                                    lock (loadLock)
+                                    {
+                                        importFiles.Add(sharedFilePath);
+                                        importFilesHash.Add(sharedFileName);
+                                        loadQueue?.Enqueue(sharedFilePath);
+                                        System.Threading.Interlocked.Increment(ref loadTotalCount);
+                                    }
                                 }
                                 else
                                 {
-                                    noexistFiles.Add(sharedFilePath);
+                                    lock (loadLock)
+                                    {
+                                        noexistFiles.Add(sharedFilePath);
+                                    }
                                 }
                             }
                         }
@@ -162,7 +246,13 @@ namespace AssetStudio
 
         private void LoadAssetsFromMemory(FileReader reader, string originalPath, string unityVersion = null)
         {
-            if (!assetsFileListHash.Contains(reader.FileName))
+            bool alreadyLoaded;
+            lock (loadLock)
+            {
+                alreadyLoaded = assetsFileListHash.Contains(reader.FileName);
+            }
+
+            if (!alreadyLoaded)
             {
                 try
                 {
@@ -173,17 +263,26 @@ namespace AssetStudio
                         assetsFile.SetVersion(unityVersion);
                     }
                     CheckStrippedVersion(assetsFile);
-                    assetsFileList.Add(assetsFile);
-                    assetsFileListHash.Add(assetsFile.fileName);
+                    
+                    lock (loadLock)
+                    {
+                        assetsFileList.Add(assetsFile);
+                        assetsFileListHash.Add(assetsFile.fileName);
+                    }
                 }
                 catch (Exception e)
                 {
                     Logger.Error($"Error while reading assets file {reader.FullPath} from {Path.GetFileName(originalPath)}", e);
-                    resourceFileReaders.Add(reader.FileName, reader);
+                    lock (loadLock)
+                    {
+                        resourceFileReaders[reader.FileName] = reader;
+                    }
                 }
             }
             else
+            {
                 Logger.Info($"Skipping {originalPath} ({reader.FileName})");
+            }
         }
 
         private void LoadBundleFile(FileReader reader, string originalPath = null)
@@ -202,7 +301,10 @@ namespace AssetStudio
                     }
                     else
                     {
-                        resourceFileReaders[file.fileName] = subReader; //TODO
+                        lock (loadLock)
+                        {
+                            resourceFileReaders[file.fileName] = subReader; //TODO
+                        }
                     }
                 }
             }
@@ -243,7 +345,10 @@ namespace AssetStudio
                             LoadWebFile(subReader);
                             break;
                         case FileType.ResourceFile:
-                            resourceFileReaders[file.fileName] = subReader; //TODO
+                            lock (loadLock)
+                            {
+                                resourceFileReaders[file.fileName] = subReader; //TODO
+                            }
                             break;
                     }
                 }
@@ -277,12 +382,18 @@ namespace AssetStudio
                             if (!splitFiles.Contains(basePath))
                             {
                                 splitFiles.Add(basePath);
-                                importFilesHash.Add(baseName);
+                                lock (loadLock)
+                                {
+                                    importFilesHash.Add(baseName);
+                                }
                             }
                         }
                         else
                         {
-                            importFilesHash.Add(entry.Name);
+                            lock (loadLock)
+                            {
+                                importFilesHash.Add(entry.Name);
+                            }
                         }
                     }
 
@@ -335,9 +446,12 @@ namespace AssetStudio
                             if (entryReader.FileType == FileType.ResourceFile)
                             {
                                 entryReader.Position = 0;
-                                if (!resourceFileReaders.ContainsKey(entry.Name))
+                                lock (loadLock)
                                 {
-                                    resourceFileReaders.Add(entry.Name, entryReader);
+                                    if (!resourceFileReaders.ContainsKey(entry.Name))
+                                    {
+                                        resourceFileReaders.Add(entry.Name, entryReader);
+                                    }
                                 }
                             }
                         }
@@ -393,147 +507,169 @@ namespace AssetStudio
             Logger.Info("Read assets...");
 
             var progressCount = assetsFileList.Sum(x => x.m_Objects.Count);
-            int i = 0;
+            int progressValue = 0;
             Progress.Reset();
+
             foreach (var assetsFile in assetsFileList)
             {
-                foreach (var objectInfo in assetsFile.m_Objects)
-                {
-                    var objectReader = new ObjectReader(assetsFile.reader, assetsFile, objectInfo);
-                    try
-                    {
-                        Object obj;
-                        switch (objectReader.type)
-                        {
-                            case ClassIDType.Animation:
-                                obj = new Animation(objectReader);
-                                break;
-                            case ClassIDType.AnimationClip:
-                                obj = new AnimationClip(objectReader);
-                                break;
-                            case ClassIDType.Animator:
-                                obj = new Animator(objectReader);
-                                break;
-                            case ClassIDType.AnimatorController:
-                                obj = new AnimatorController(objectReader);
-                                break;
-                            case ClassIDType.AnimatorOverrideController:
-                                obj = new AnimatorOverrideController(objectReader);
-                                break;
-                            case ClassIDType.AssetBundle:
-                                obj = new AssetBundle(objectReader);
-                                break;
-                            case ClassIDType.AudioClip:
-                                obj = new AudioClip(objectReader);
-                                break;
-                            case ClassIDType.Avatar:
-                                obj = new Avatar(objectReader);
-                                break;
-                            case ClassIDType.Font:
-                                obj = new Font(objectReader);
-                                break;
-                            case ClassIDType.GameObject:
-                                obj = new GameObject(objectReader);
-                                break;
-                            case ClassIDType.Material:
-                                obj = new Material(objectReader);
-                                break;
-                            case ClassIDType.Mesh:
-                                obj = new Mesh(objectReader);
-                                break;
-                            case ClassIDType.MeshFilter:
-                                obj = new MeshFilter(objectReader);
-                                break;
-                            case ClassIDType.MeshRenderer:
-                                obj = new MeshRenderer(objectReader);
-                                break;
-                            case ClassIDType.MonoBehaviour:
-                                obj = new MonoBehaviour(objectReader);
-                                break;
-                            case ClassIDType.MonoScript:
-                                obj = new MonoScript(objectReader);
-                                break;
-                            case ClassIDType.MovieTexture:
-                                obj = new MovieTexture(objectReader);
-                                break;
-                            case ClassIDType.PlayerSettings:
-                                obj = new PlayerSettings(objectReader);
-                                break;
-                            case ClassIDType.RectTransform:
-                                obj = new RectTransform(objectReader);
-                                break;
-                            case ClassIDType.Shader:
-                                obj = new Shader(objectReader);
-                                break;
-                            case ClassIDType.SkinnedMeshRenderer:
-                                obj = new SkinnedMeshRenderer(objectReader);
-                                break;
-                            case ClassIDType.Sprite:
-                                obj = new Sprite(objectReader);
-                                break;
-                            case ClassIDType.SpriteAtlas:
-                                obj = new SpriteAtlas(objectReader);
-                                break;
-                            case ClassIDType.TextAsset:
-                                obj = new TextAsset(objectReader);
-                                break;
-                            case ClassIDType.Texture2D:
-                                obj = new Texture2D(objectReader);
-                                break;
-                            case ClassIDType.Transform:
-                                obj = new Transform(objectReader);
-                                break;
-                            case ClassIDType.VideoClip:
-                                obj = new VideoClip(objectReader);
-                                break;
-                            case ClassIDType.ResourceManager:
-                                obj = new ResourceManager(objectReader);
-                                break;
-                            default:
-                                obj = new Object(objectReader);
-                                break;
-                        }
-                        assetsFile.AddObject(obj);
-                    }
-                    catch (Exception e)
-                    {
-                        var sb = new StringBuilder();
-                        sb.AppendLine("Unable to load object")
-                            .AppendLine($"Assets {assetsFile.fileName}")
-                            .AppendLine($"Path {assetsFile.originalPath}")
-                            .AppendLine($"Type {objectReader.type}")
-                            .AppendLine($"PathID {objectInfo.m_PathID}");
+                var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
 
-                        if (objectInfo.serializedType?.m_Type?.m_Nodes != null)
-                        {
-                            sb.AppendLine("TypeTree Dump:");
-                            foreach (var node in objectInfo.serializedType.m_Type.m_Nodes)
-                            {
-                                sb.AppendLine($"[{node.m_Level}] {node.m_Type} {node.m_Name}");
-                            }
-                        }
-
-                        // TODO: REMOVE LATER - Hex dump for Unity 6 debugging only
+                System.Threading.Tasks.Parallel.ForEach(
+                    assetsFile.m_Objects,
+                    () => assetsFile.reader.Clone(),
+                    (objectInfo, state, localReader) =>
+                    {
+                        var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                         try
                         {
-                            objectReader.Reset(); // go back to start
-                            int bytesToRead = Math.Min((int)objectInfo.byteSize, 1024);
-                            var rawBytes = objectReader.ReadBytes(bytesToRead);
-                            var hexDump = BitConverter.ToString(rawBytes).Replace("-", " ");
-                            sb.AppendLine($"Raw Object Bytes (first {bytesToRead} bytes):");
-                            sb.AppendLine(hexDump);
+                            Object obj;
+                            switch (objectReader.type)
+                            {
+                                case ClassIDType.Animation:
+                                    obj = new Animation(objectReader);
+                                    break;
+                                case ClassIDType.AnimationClip:
+                                    obj = new AnimationClip(objectReader);
+                                    break;
+                                case ClassIDType.Animator:
+                                    obj = new Animator(objectReader);
+                                    break;
+                                case ClassIDType.AnimatorController:
+                                    obj = new AnimatorController(objectReader);
+                                    break;
+                                case ClassIDType.AnimatorOverrideController:
+                                    obj = new AnimatorOverrideController(objectReader);
+                                    break;
+                                case ClassIDType.AssetBundle:
+                                    obj = new AssetBundle(objectReader);
+                                    break;
+                                case ClassIDType.AudioClip:
+                                    obj = new AudioClip(objectReader);
+                                    break;
+                                case ClassIDType.Avatar:
+                                    obj = new Avatar(objectReader);
+                                    break;
+                                case ClassIDType.Font:
+                                    obj = new Font(objectReader);
+                                    break;
+                                case ClassIDType.GameObject:
+                                    obj = new GameObject(objectReader);
+                                    break;
+                                case ClassIDType.Material:
+                                    obj = new Material(objectReader);
+                                    break;
+                                case ClassIDType.Mesh:
+                                    obj = new Mesh(objectReader);
+                                    break;
+                                case ClassIDType.MeshFilter:
+                                    obj = new MeshFilter(objectReader);
+                                    break;
+                                case ClassIDType.MeshRenderer:
+                                    obj = new MeshRenderer(objectReader);
+                                    break;
+                                case ClassIDType.MonoBehaviour:
+                                    obj = new MonoBehaviour(objectReader);
+                                    break;
+                                case ClassIDType.MonoScript:
+                                    obj = new MonoScript(objectReader);
+                                    break;
+                                case ClassIDType.MovieTexture:
+                                    obj = new MovieTexture(objectReader);
+                                    break;
+                                case ClassIDType.PlayerSettings:
+                                    obj = new PlayerSettings(objectReader);
+                                    break;
+                                case ClassIDType.RectTransform:
+                                    obj = new RectTransform(objectReader);
+                                    break;
+                                case ClassIDType.Shader:
+                                    obj = new Shader(objectReader);
+                                    break;
+                                case ClassIDType.SkinnedMeshRenderer:
+                                    obj = new SkinnedMeshRenderer(objectReader);
+                                    break;
+                                case ClassIDType.Sprite:
+                                    obj = new Sprite(objectReader);
+                                    break;
+                                case ClassIDType.SpriteAtlas:
+                                    obj = new SpriteAtlas(objectReader);
+                                    break;
+                                case ClassIDType.TextAsset:
+                                    obj = new TextAsset(objectReader);
+                                    break;
+                                case ClassIDType.Texture2D:
+                                    obj = new Texture2D(objectReader);
+                                    break;
+                                case ClassIDType.Transform:
+                                    obj = new Transform(objectReader);
+                                    break;
+                                case ClassIDType.VideoClip:
+                                    obj = new VideoClip(objectReader);
+                                    break;
+                                case ClassIDType.ResourceManager:
+                                    obj = new ResourceManager(objectReader);
+                                    break;
+                                default:
+                                    obj = new Object(objectReader);
+                                    break;
+                            }
+                            localObjects.Add(obj);
                         }
-                        catch (Exception ex2)
+                        catch (Exception e)
                         {
-                            sb.AppendLine($"Failed to dump bytes: {ex2.Message}");
+                            var sb = new StringBuilder();
+                            sb.AppendLine("Unable to load object")
+                                .AppendLine($"Assets {assetsFile.fileName}")
+                                .AppendLine($"Path {assetsFile.originalPath}")
+                                .AppendLine($"Type {objectReader.type}")
+                                .AppendLine($"PathID {objectInfo.m_PathID}");
+
+                            if (objectInfo.serializedType?.m_Type?.m_Nodes != null)
+                            {
+                                sb.AppendLine("TypeTree Dump:");
+                                foreach (var node in objectInfo.serializedType.m_Type.m_Nodes)
+                                {
+                                    sb.AppendLine($"[{node.m_Level}] {node.m_Type} {node.m_Name}");
+                                }
+                            }
+
+                            // TODO: REMOVE LATER - Hex dump for Unity 6 debugging only
+                            try
+                            {
+                                objectReader.Reset(); // go back to start
+                                int bytesToRead = Math.Min((int)objectInfo.byteSize, 1024);
+                                var rawBytes = objectReader.ReadBytes(bytesToRead);
+                                var hexDump = BitConverter.ToString(rawBytes).Replace("-", " ");
+                                sb.AppendLine($"Raw Object Bytes (first {bytesToRead} bytes):");
+                                sb.AppendLine(hexDump);
+                            }
+                            catch (Exception ex2)
+                            {
+                                sb.AppendLine($"Failed to dump bytes: {ex2.Message}");
+                            }
+                            // END TODO: REMOVE LATER
+
+                            sb.Append(e);
+                            Logger.Error(sb.ToString());
                         }
-                        // END TODO: REMOVE LATER
 
-                        sb.Append(e);
-                        Logger.Error(sb.ToString());
-                    }
+                        var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
+                        Progress.Report(currentProgress, progressCount);
 
-                    Progress.Report(++i, progressCount);
+                        return localReader;
+                    },
+                    localReader => localReader.Dispose()
+                );
+
+                var pathIdToIndex = new Dictionary<long, int>();
+                for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                {
+                    pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
+                }
+                var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
+                foreach (var obj in sortedObjects)
+                {
+                    assetsFile.AddObject(obj);
                 }
             }
         }

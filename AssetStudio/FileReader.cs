@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using System.Linq;
 
 namespace AssetStudio
@@ -98,6 +98,52 @@ namespace AssetStudio
                 return false;
             }
             return true;
+        }
+
+        public FileReader Clone()
+        {
+            if (BaseStream is MemoryStream memStream)
+            {
+                byte[] buffer;
+                try
+                {
+                    buffer = memStream.GetBuffer();
+                }
+                catch (System.UnauthorizedAccessException)
+                {
+                    buffer = memStream.ToArray();
+                }
+                var newStream = new MemoryStream(buffer, 0, (int)memStream.Length, false);
+                var clone = new FileReader(FullPath, newStream);
+                clone.Endian = Endian;
+                return clone;
+            }
+            else if (BaseStream is FileStream fileStream)
+            {
+                var newStream = File.Open(FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                var clone = new FileReader(FullPath, newStream);
+                clone.Endian = Endian;
+                return clone;
+            }
+            else
+            {
+                try
+                {
+                    var tempMemStream = new MemoryStream();
+                    var originalPosition = BaseStream.Position;
+                    BaseStream.Position = 0;
+                    BaseStream.CopyTo(tempMemStream);
+                    BaseStream.Position = originalPosition;
+                    tempMemStream.Position = originalPosition;
+                    var clone = new FileReader(FullPath, tempMemStream);
+                    clone.Endian = Endian;
+                    return clone;
+                }
+                catch (System.Exception ex)
+                {
+                    throw new System.NotSupportedException($"Cloning stream type {BaseStream.GetType().Name} failed.", ex);
+                }
+            }
         }
     }
 }

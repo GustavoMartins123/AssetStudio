@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace AssetStudio
 {
@@ -6,11 +6,15 @@ namespace AssetStudio
     {
         public static IProgress<int> Default = new Progress<int>();
         private static int preValue;
+        private static readonly object progressLock = new object();
 
         public static void Reset()
         {
-            preValue = 0;
-            Default.Report(0);
+            lock (progressLock)
+            {
+                preValue = 0;
+                Default.Report(0);
+            }
         }
 
         public static void Report(int current, int total)
@@ -21,10 +25,13 @@ namespace AssetStudio
 
         private static void Report(int value)
         {
-            if (value > preValue)
+            lock (progressLock)
             {
-                preValue = value;
-                Default.Report(value);
+                if (value > preValue)
+                {
+                    preValue = value;
+                    Default.Report(value);
+                }
             }
         }
     }
