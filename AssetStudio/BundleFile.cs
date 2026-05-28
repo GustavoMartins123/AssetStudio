@@ -1,4 +1,4 @@
-﻿using K4os.Compression.LZ4;
+using K4os.Compression.LZ4;
 using System;
 using System.IO;
 using System.Linq;
@@ -68,6 +68,7 @@ namespace AssetStudio
         private Node[] m_DirectoryInfo;
 
         public StreamFile[] fileList;
+        public Stream? BlocksStream { get; set; }
 
         public BundleFile(FileReader reader)
         {
@@ -82,26 +83,58 @@ namespace AssetStudio
                     break; //TODO
                 case "UnityWeb":
                 case "UnityRaw":
-                    if (m_Header.version == 6)
                     {
-                        goto case "UnityFS";
+                        if (m_Header.version == 6)
+                        {
+                            goto case "UnityFS";
+                        }
+                        ReadHeaderAndBlocksInfo(reader);
+                        var blocksStream = CreateBlocksStream(reader.FullPath);
+                        try
+                        {
+                            ReadBlocksAndDirectory(reader, blocksStream);
+                            ReadFiles(blocksStream, reader.FullPath);
+                        }
+                        catch
+                        {
+                            blocksStream.Dispose();
+                            throw;
+                        }
+                        if (blocksStream is MemoryStream)
+                        {
+                            blocksStream.Dispose();
+                        }
+                        else
+                        {
+                            BlocksStream = blocksStream;
+                        }
+                        break;
                     }
-                    ReadHeaderAndBlocksInfo(reader);
-                    using (var blocksStream = CreateBlocksStream(reader.FullPath))
-                    {
-                        ReadBlocksAndDirectory(reader, blocksStream);
-                        ReadFiles(blocksStream, reader.FullPath);
-                    }
-                    break;
                 case "UnityFS":
-                    ReadHeader(reader);
-                    ReadBlocksInfoAndDirectory(reader);
-                    using (var blocksStream = CreateBlocksStream(reader.FullPath))
                     {
-                        ReadBlocks(reader, blocksStream);
-                        ReadFiles(blocksStream, reader.FullPath);
+                        ReadHeader(reader);
+                        ReadBlocksInfoAndDirectory(reader);
+                        var blocksStream = CreateBlocksStream(reader.FullPath);
+                        try
+                        {
+                            ReadBlocks(reader, blocksStream);
+                            ReadFiles(blocksStream, reader.FullPath);
+                        }
+                        catch
+                        {
+                            blocksStream.Dispose();
+                            throw;
+                        }
+                        if (blocksStream is MemoryStream)
+                        {
+                            blocksStream.Dispose();
+                        }
+                        else
+                        {
+                            BlocksStream = blocksStream;
+                        }
+                        break;
                     }
-                    break;
             }
         }
 
@@ -231,28 +264,63 @@ namespace AssetStudio
 
         public void ReadFiles(Stream blocksStream, string path)
         {
-            var forceTemporaryFiles = ShouldUseTemporaryStream(blocksStream.Length);
             fileList = new StreamFile[m_DirectoryInfo.Length];
-            for (int i = 0; i < m_DirectoryInfo.Length; i++)
+            if (blocksStream is MemoryStream memStream)
             {
-                var node = m_DirectoryInfo[i];
-                var file = new StreamFile();
-                fileList[i] = file;
-                file.path = node.path;
-                file.fileName = Path.GetFileName(node.path);
-                if (forceTemporaryFiles || ShouldUseTemporaryStream(node.size))
+                byte[] sharedBuffer;
+                try
                 {
-                    /*var memoryMappedFile = MemoryMappedFile.CreateNew(null, entryinfo_size);
-                    file.stream = memoryMappedFile.CreateViewStream();*/
-                    file.stream = CreateTemporaryStream(path, file.fileName);
+                    sharedBuffer = memStream.GetBuffer();
                 }
-                else
+                catch (UnauthorizedAccessException)
                 {
+                    sharedBuffer = memStream.ToArray();
+                }
+
+                for (int i = 0; i < m_DirectoryInfo.Length; i++)
+                {
+                    var node = m_DirectoryInfo[i];
+                    var file = new StreamFile();
+                    fileList[i] = file;
+                    file.path = node.path;
+                    file.fileName = Path.GetFileName(node.path);
+                    
+                    // Directly wrap the shared buffer! Zero memory copy, zero allocation!
+                    file.stream = new MemoryStream(sharedBuffer, (int)node.offset, (int)node.size, false);
+                }
+            }
+            else if (blocksStream is FileStream fileStream)
+            {
+                var tempFilePath = fileStream.Name;
+                for (int i = 0; i < m_DirectoryInfo.Length; i++)
+                {
+                    var node = m_DirectoryInfo[i];
+                    var file = new StreamFile();
+                    fileList[i] = file;
+                    file.path = node.path;
+                    file.fileName = Path.GetFileName(node.path);
+
+                    // Directly wrap in a SubStream pointing to the single temp file!
+                    // Zero disk copy! Zero extra temp files!
+                    file.stream = new SubStream(tempFilePath, node.offset, node.size);
+                }
+            }
+            else
+            {
+                // Fallback for custom streams
+                for (int i = 0; i < m_DirectoryInfo.Length; i++)
+                {
+                    var node = m_DirectoryInfo[i];
+                    var file = new StreamFile();
+                    fileList[i] = file;
+                    file.path = node.path;
+                    file.fileName = Path.GetFileName(node.path);
                     file.stream = new MemoryStream((int)node.size);
+                    
+                    blocksStream.Position = node.offset;
+                    blocksStream.CopyTo(file.stream, node.size);
+                    file.stream.Position = 0;
                 }
-                blocksStream.Position = node.offset;
-                blocksStream.CopyTo(file.stream, node.size);
-                file.stream.Position = 0;
             }
         }
 

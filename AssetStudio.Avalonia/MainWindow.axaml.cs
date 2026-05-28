@@ -1156,7 +1156,7 @@ public partial class MainWindow : Window
         return extractedCount;
     }
 
-    private void BuildAssetStructures()
+    private async void BuildAssetStructures()
     {
         if (assetsManager.assetsFileList.Count == 0)
         {
@@ -1164,185 +1164,250 @@ public partial class MainWindow : Window
             return;
         }
 
-        string? productName = null;
-        exportableAssets.Clear();
-        sceneTreeNodes = new List<GameObjectNode>();
-        treeSearchResults.Clear();
-        nextGameObjectSearchIndex = 0;
-        var objectCount = assetsManager.assetsFileList.Sum(x => x.Objects.Count);
-        var treeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
-        var objectAssetItemDic = new Dictionary<Object, AssetItem>(objectCount);
-        var containers = new List<(PPtr<Object>, string)>();
+        StatusStripUpdate("Building asset structures...");
 
-        int i = 0;
+        // Capture required UI states on the UI thread
+        bool displayAllChecked = displayAll.IsChecked == true;
+        var filesListSnapshot = assetsManager.assetsFileList.ToList();
 
-        foreach (var assetsFile in assetsManager.assetsFileList)
+        var result = await Task.Run(() =>
         {
-            var fileNode = new GameObjectNode { Name = assetsFile.fileName };
+            string? localProductName = null;
+            var localExportableAssets = new List<AssetItem>();
+            var localSceneTreeNodes = new List<GameObjectNode>();
+            
+            var objectCount = filesListSnapshot.Sum(x => x.Objects.Count);
+            var localTreeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
+            var localObjectAssetItemDic = new Dictionary<Object, AssetItem>(objectCount);
+            var localContainers = new List<(PPtr<Object>, string)>();
 
-            foreach (var asset in assetsFile.Objects)
+            int i = 0;
+
+            foreach (var assetsFile in filesListSnapshot)
             {
-                var assetItem = new AssetItem(asset);
-                assetItem.UniqueID = " #" + i;
-                objectAssetItemDic[asset] = assetItem;
-                var exportable = false;
+                var fileNode = new GameObjectNode { Name = assetsFile.fileName };
 
-                switch (asset)
+                foreach (var asset in assetsFile.Objects)
                 {
-                    case GameObject m_GameObject:
-                        assetItem.Name = m_GameObject.m_Name;
+                    var assetItem = new AssetItem(asset);
+                    assetItem.UniqueID = " #" + i;
+                    localObjectAssetItemDic[asset] = assetItem;
+                    var exportable = false;
 
-                        if (!treeNodeDictionary.TryGetValue(m_GameObject, out var currentNode))
-                        {
-                            currentNode = new GameObjectNode { Name = m_GameObject.m_Name, GameObject = m_GameObject };
-                            treeNodeDictionary.Add(m_GameObject, currentNode);
-                        }
-
-                        var parentNode = fileNode;
-
-                        if (m_GameObject.m_Transform != null && m_GameObject.m_Transform.m_Father.TryGet(out var m_Father))
-                        {
-                            if (m_Father.m_GameObject.TryGet(out var parentGameObject))
-                            {
-                                if (!treeNodeDictionary.TryGetValue(parentGameObject, out var parentGameObjectNode))
-                                {
-                                    parentGameObjectNode = new GameObjectNode { Name = parentGameObject.m_Name, GameObject = parentGameObject };
-                                    treeNodeDictionary.Add(parentGameObject, parentGameObjectNode);
-                                }
-                                parentNode = parentGameObjectNode;
-                            }
-                        }
-
-                        parentNode.AddChild(currentNode);
-                        break;
-
-                    case Texture2D m_Texture2D:
-                        if (!string.IsNullOrEmpty(m_Texture2D.m_StreamData?.path))
-                            assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
-                        assetItem.Name = m_Texture2D.m_Name;
-                        exportable = true;
-                        break;
-                    case AudioClip m_AudioClip:
-                        if (!string.IsNullOrEmpty(m_AudioClip.m_Source))
-                            assetItem.FullSize = asset.byteSize + m_AudioClip.m_Size;
-                        assetItem.Name = m_AudioClip.m_Name;
-                        exportable = true;
-                        break;
-                    case VideoClip m_VideoClip:
-                        if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
-                            assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
-                        assetItem.Name = m_VideoClip.m_Name;
-                        exportable = true;
-                        break;
-                    case Shader m_Shader:
-                        assetItem.Name = m_Shader.m_ParsedForm?.m_Name ?? m_Shader.m_Name;
-                        exportable = true;
-                        break;
-                    case Mesh _:
-                    case Material _:
-                    case TextAsset _:
-                    case AnimationClip _:
-                    case Font _:
-                    case MovieTexture _:
-                    case Sprite _:
-                    case Avatar _:
-                    case RuntimeAnimatorController _:
-                        assetItem.Name = ((NamedObject)asset).m_Name;
-                        exportable = true;
-                        break;
-                    case MonoScript m_MonoScript:
-                        assetItem.Name = m_MonoScript.m_Name;
-                        exportable = true;
-                        break;
-                    case Animator m_Animator:
-                        if (m_Animator.m_GameObject.TryGet(out var gameObject))
-                        {
-                            assetItem.Name = gameObject.m_Name;
-                        }
-                        exportable = true;
-                        break;
-                    case MonoBehaviour m_MonoBehaviour:
-                        if (m_MonoBehaviour.m_Name == "" && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
-                        {
-                            assetItem.Name = m_Script.m_ClassName;
-                        }
-                        else
-                        {
-                            assetItem.Name = m_MonoBehaviour.m_Name;
-                        }
-                        exportable = true;
-                        break;
-                    case AssetBundle m_AssetBundle:
-                        foreach (var m_Container in m_AssetBundle.m_Container)
-                        {
-                            var preloadIndex = m_Container.Value.preloadIndex;
-                            var preloadSize = m_Container.Value.preloadSize;
-                            var preloadEnd = preloadIndex + preloadSize;
-                            for (int k = preloadIndex; k < preloadEnd; k++)
-                            {
-                                containers.Add((m_AssetBundle.m_PreloadTable[k], m_Container.Key));
-                            }
-                        }
-                        assetItem.Name = m_AssetBundle.m_Name;
-                        break;
-                    case ResourceManager m_ResourceManager:
-                        foreach (var m_Container in m_ResourceManager.m_Container)
-                        {
-                            containers.Add((m_Container.Value, m_Container.Key));
-                        }
-                        break;
-                    case PlayerSettings m_PlayerSettings:
-                        productName = m_PlayerSettings.productName;
-                        break;
-                    case NamedObject m_NamedObject:
-                        assetItem.Name = m_NamedObject.m_Name;
-                        break;
-                }
-
-                if (string.IsNullOrEmpty(assetItem.Name))
-                {
-                    assetItem.Name = assetItem.TypeString + assetItem.UniqueID;
-                }
-
-                if (displayAll.IsChecked || exportable)
-                {
-                    exportableAssets.Add(assetItem);
-                }
-                i++;
-            }
-
-            if (fileNode.ChildCount > 0)
-            {
-                sceneTreeNodes.Add(fileNode);
-            }
-        }
-
-        LinkAssetItemsToSceneNodes(treeNodeDictionary, objectAssetItemDic);
-        foreach ((var pptr, var container) in containers)
-        {
-            if (pptr.TryGet(out var obj) && objectAssetItemDic.TryGetValue(obj, out var item))
-            {
-                item.Container = container;
-                if (obj is Material material && string.IsNullOrEmpty(material.m_Name))
-                {
-                    var name = Path.GetFileNameWithoutExtension(container);
-                    if (!string.IsNullOrEmpty(name))
+                    switch (asset)
                     {
-                        item.Name = name;
+                        case GameObject m_GameObject:
+                            assetItem.Name = m_GameObject.m_Name;
+
+                            if (!localTreeNodeDictionary.TryGetValue(m_GameObject, out var currentNode))
+                            {
+                                currentNode = new GameObjectNode { Name = m_GameObject.m_Name, GameObject = m_GameObject };
+                                localTreeNodeDictionary.Add(m_GameObject, currentNode);
+                            }
+
+                            var parentNode = fileNode;
+
+                            if (m_GameObject.m_Transform != null && m_GameObject.m_Transform.m_Father.TryGet(out var m_Father))
+                            {
+                                if (m_Father.m_GameObject.TryGet(out var parentGameObject))
+                                {
+                                    if (!localTreeNodeDictionary.TryGetValue(parentGameObject, out var parentGameObjectNode))
+                                    {
+                                        parentGameObjectNode = new GameObjectNode { Name = parentGameObject.m_Name, GameObject = parentGameObject };
+                                        localTreeNodeDictionary.Add(parentGameObject, parentGameObjectNode);
+                                    }
+                                    parentNode = parentGameObjectNode;
+                                }
+                            }
+
+                            parentNode.AddChild(currentNode);
+                            break;
+
+                        case Texture2D m_Texture2D:
+                            if (!string.IsNullOrEmpty(m_Texture2D.m_StreamData?.path))
+                                assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
+                            assetItem.Name = m_Texture2D.m_Name;
+                            exportable = true;
+                            break;
+                        case AudioClip m_AudioClip:
+                            if (!string.IsNullOrEmpty(m_AudioClip.m_Source))
+                                assetItem.FullSize = asset.byteSize + m_AudioClip.m_Size;
+                            assetItem.Name = m_AudioClip.m_Name;
+                            exportable = true;
+                            break;
+                        case VideoClip m_VideoClip:
+                            if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
+                                assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
+                            assetItem.Name = m_VideoClip.m_Name;
+                            exportable = true;
+                            break;
+                        case Shader m_Shader:
+                            assetItem.Name = m_Shader.m_ParsedForm?.m_Name ?? m_Shader.m_Name;
+                            exportable = true;
+                            break;
+                        case Mesh _:
+                        case Material _:
+                        case TextAsset _:
+                        case AnimationClip _:
+                        case Font _:
+                        case MovieTexture _:
+                        case Sprite _:
+                        case Avatar _:
+                        case RuntimeAnimatorController _:
+                            assetItem.Name = ((NamedObject)asset).m_Name;
+                            exportable = true;
+                            break;
+                        case MonoScript m_MonoScript:
+                            assetItem.Name = m_MonoScript.m_Name;
+                            exportable = true;
+                            break;
+                        case Animator m_Animator:
+                            if (m_Animator.m_GameObject.TryGet(out var gameObject))
+                            {
+                                assetItem.Name = gameObject.m_Name;
+                            }
+                            exportable = true;
+                            break;
+                        case MonoBehaviour m_MonoBehaviour:
+                            if (m_MonoBehaviour.m_Name == "" && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
+                            {
+                                assetItem.Name = m_Script.m_ClassName;
+                            }
+                            else
+                            {
+                                assetItem.Name = m_MonoBehaviour.m_Name;
+                            }
+                            exportable = true;
+                            break;
+                        case AssetBundle m_AssetBundle:
+                            foreach (var m_Container in m_AssetBundle.m_Container)
+                            {
+                                var preloadIndex = m_Container.Value.preloadIndex;
+                                var preloadSize = m_Container.Value.preloadSize;
+                                var preloadEnd = preloadIndex + preloadSize;
+                                for (int k = preloadIndex; k < preloadEnd; k++)
+                                {
+                                    localContainers.Add((m_AssetBundle.m_PreloadTable[k], m_Container.Key));
+                                }
+                            }
+                            assetItem.Name = m_AssetBundle.m_Name;
+                            break;
+                        case ResourceManager m_ResourceManager:
+                            foreach (var m_Container in m_ResourceManager.m_Container)
+                            {
+                                localContainers.Add((m_Container.Value, m_Container.Key));
+                            }
+                            break;
+                        case PlayerSettings m_PlayerSettings:
+                            localProductName = m_PlayerSettings.productName;
+                            break;
+                        case NamedObject m_NamedObject:
+                            assetItem.Name = m_NamedObject.m_Name;
+                            break;
+                    }
+
+                    if (string.IsNullOrEmpty(assetItem.Name))
+                    {
+                        assetItem.Name = assetItem.TypeString + assetItem.UniqueID;
+                    }
+
+                    if (displayAllChecked || exportable)
+                    {
+                        localExportableAssets.Add(assetItem);
+                    }
+                    i++;
+                }
+
+                if (fileNode.ChildCount > 0)
+                {
+                    localSceneTreeNodes.Add(fileNode);
+                }
+            }
+
+            LinkAssetItemsToSceneNodesBackground(filesListSnapshot, localTreeNodeDictionary, localObjectAssetItemDic);
+            foreach ((var pptr, var container) in localContainers)
+            {
+                if (pptr.TryGet(out var obj) && localObjectAssetItemDic.TryGetValue(obj, out var item))
+                {
+                    item.Container = container;
+                    if (obj is Material material && string.IsNullOrEmpty(material.m_Name))
+                    {
+                        var name = Path.GetFileNameWithoutExtension(container);
+                        if (!string.IsNullOrEmpty(name))
+                        {
+                            item.Name = name;
+                        }
                     }
                 }
             }
-        }
-        LinkFbxSubAssetsToSceneNodes();
-        containers.Clear();
-        objectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>(objectAssetItemDic);
-        BuildAssetReferenceIndexes();
-        objectAssetItemDic.Clear();
+            LinkFbxSubAssetsToSceneNodesBackground(localExportableAssets, localSceneTreeNodes);
+            localContainers.Clear();
+
+            BuildAssetReferenceIndexesBackground(
+                filesListSnapshot,
+                localExportableAssets,
+                out var localObjectToAssetItemCache,
+                out var localMeshToMaterialsCache,
+                out var localMeshAssociatedRenderersCache,
+                out var localMeshSourceTypesCache,
+                out var localMaterialMainTextureCache,
+                out var localMaterialPreviewMaterialCache,
+                out var localMaterialTextureSlotsCache);
+
+            // Calculate Asset Classes on background thread
+            var localAssetClassItems = new List<AssetClassItem>();
+            var objectCounts = filesListSnapshot
+                .SelectMany(file => file.Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.type }))
+                .GroupBy(x => (x.unityVersion, x.ClassID))
+                .ToDictionary(x => x.Key, x => x.Count());
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var assetsFile in filesListSnapshot)
+            {
+                AddSerializedTypesBackground(assetsFile, assetsFile.m_Types, "Native", objectCounts, seen, localAssetClassItems);
+                AddSerializedTypesBackground(assetsFile, assetsFile.m_RefTypes, "Reference", objectCounts, seen, localAssetClassItems);
+            }
+
+            localAssetClassItems = localAssetClassItems
+                .OrderBy(x => x.UnityVersion, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.ClassID)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            return new BuildAssetStructuresResult
+            {
+                ProductName = localProductName,
+                ExportableAssets = localExportableAssets,
+                SceneTreeNodes = localSceneTreeNodes,
+                ObjectToAssetItemCache = localObjectToAssetItemCache,
+                MeshToMaterialsCache = localMeshToMaterialsCache,
+                MeshAssociatedRenderersCache = localMeshAssociatedRenderersCache,
+                MeshSourceTypesCache = localMeshSourceTypesCache,
+                MaterialMainTextureCache = localMaterialMainTextureCache,
+                MaterialPreviewMaterialCache = localMaterialPreviewMaterialCache,
+                MaterialTextureSlotsCache = localMaterialTextureSlotsCache,
+                AssetClassItems = localAssetClassItems
+            };
+        });
+
+        // Apply results back on the UI thread
+        exportableAssets = result.ExportableAssets;
+        sceneTreeNodes = result.SceneTreeNodes;
+        treeSearchResults.Clear();
+        nextGameObjectSearchIndex = 0;
+        objectToAssetItemCache = result.ObjectToAssetItemCache;
+        meshToMaterialsCache = result.MeshToMaterialsCache;
+        meshAssociatedRenderersCache = result.MeshAssociatedRenderersCache;
+        meshSourceTypesCache = result.MeshSourceTypesCache;
+        materialMainTextureCache = result.MaterialMainTextureCache;
+        materialPreviewMaterialCache = result.MaterialPreviewMaterialCache;
+        materialTextureSlotsCache = result.MaterialTextureSlotsCache;
+        assetClassItems = result.AssetClassItems;
 
         visibleAssets = new List<AssetItem>(exportableAssets);
         BuildFilterTypeMenu();
         _ = FilterAssetListAsync(CancellationToken.None);
-        BuildAssetClasses();
+        FilterAssetClasses();
         SceneTreeView.ItemsSource = sceneTreeNodes;
 
         var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {exportableAssets.Count} exportable assets";
@@ -1358,9 +1423,9 @@ public partial class MainWindow : Window
         if (assetsManager.assetsFileList.Count > 0)
         {
             var firstFile = assetsManager.assetsFileList[0];
-            if (!string.IsNullOrEmpty(productName))
+            if (!string.IsNullOrEmpty(result.ProductName))
             {
-                Title = $"AssetStudio v{version} - {productName} - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
+                Title = $"AssetStudio v{version} - {result.ProductName} - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
             }
             else
             {
@@ -1375,47 +1440,7 @@ public partial class MainWindow : Window
 
     private void LinkAssetItemsToSceneNodes(Dictionary<GameObject, GameObjectNode> treeNodeDictionary, Dictionary<Object, AssetItem> objectAssetItemDic)
     {
-        foreach (var assetsFile in assetsManager.assetsFileList)
-        {
-            foreach (var asset in assetsFile.Objects)
-            {
-                if (asset is not GameObject gameObject || !treeNodeDictionary.TryGetValue(gameObject, out var node))
-                {
-                    continue;
-                }
-
-                if (objectAssetItemDic.TryGetValue(gameObject, out var gameObjectItem))
-                {
-                    gameObjectItem.TreeNode = node;
-                }
-
-                foreach (var pptr in gameObject.m_Components)
-                {
-                    if (!pptr.TryGet(out var component))
-                    {
-                        continue;
-                    }
-
-                    if (objectAssetItemDic.TryGetValue(component, out var componentItem))
-                    {
-                        componentItem.TreeNode = node;
-                    }
-
-                    if (component is MeshFilter meshFilter
-                        && meshFilter.m_Mesh.TryGet(out var mesh)
-                        && objectAssetItemDic.TryGetValue(mesh, out var meshItem))
-                    {
-                        meshItem.TreeNode = node;
-                    }
-                    else if (component is SkinnedMeshRenderer skinnedMeshRenderer
-                        && skinnedMeshRenderer.m_Mesh.TryGet(out var skinnedMesh)
-                        && objectAssetItemDic.TryGetValue(skinnedMesh, out var skinnedMeshItem))
-                    {
-                        skinnedMeshItem.TreeNode = node;
-                    }
-                }
-            }
-        }
+        LinkAssetItemsToSceneNodesBackground(assetsManager.assetsFileList, treeNodeDictionary, objectAssetItemDic);
     }
 
     private async void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -3400,41 +3425,12 @@ public partial class MainWindow : Window
     private Material? ResolveMaterialForPreview(Material material)
     {
         materialPreviewMaterialCache ??= new Dictionary<Material, Material?>();
-        if (materialPreviewMaterialCache.TryGetValue(material, out var cachedMaterial))
-        {
-            return cachedMaterial;
-        }
-
-        var resolvedMaterial = ResolveMaterialForPreviewUncached(material);
-        materialPreviewMaterialCache[material] = resolvedMaterial;
-        return resolvedMaterial;
+        return ResolveMaterialForPreviewBackground(material, materialPreviewMaterialCache);
     }
 
     private Material? ResolveMaterialForPreviewUncached(Material material)
     {
-        var visited = new HashSet<Material>();
-        while (material != null && visited.Add(material))
-        {
-            var hasTextureReference = (material.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
-                .Any(x => x.Value?.m_Texture != null && !x.Value.m_Texture.IsNull);
-            if (hasTextureReference)
-            {
-                return material;
-            }
-
-            if (material.m_Parent != null)
-            {
-                if (material.m_Parent.TryGet(out var parent))
-                {
-                    material = parent;
-                    continue;
-                }
-            }
-
-            break;
-        }
-
-        return null;
+        return ResolveMaterialForPreviewUncachedBackground(material);
     }
 
     private static bool IsPreferredMaterialPreviewSlot(string propertyName)
@@ -3479,27 +3475,7 @@ public partial class MainWindow : Window
 
     private Texture2D? SelectMainTextureForMaterial(Material displayMaterial, IReadOnlyDictionary<string, Texture2D?> textureSlots)
     {
-        if (displayMaterial.m_SavedProperties?.m_TexEnvs == null) return null;
-
-        var slots = new[] { "_MainTex", "_BaseMap", "_BaseColorMap", "_BaseColorTexture", "_Diffuse", "_AlbedoMap" };
-        foreach (var slot in slots)
-        {
-            if (textureSlots.TryGetValue(slot, out var tex) && tex != null)
-            {
-                return tex;
-            }
-        }
-
-        foreach (var env in displayMaterial.m_SavedProperties.m_TexEnvs)
-        {
-            if (NonDiffuseSlots.Contains(env.Key)) continue;
-            if (textureSlots.TryGetValue(env.Key, out var tex) && tex != null)
-            {
-                return tex;
-            }
-        }
-
-        return null;
+        return SelectMainTextureForMaterialBackground(displayMaterial, textureSlots);
     }
 
     private Texture2D? GetMaterialTextureSlot(Material material, string slotName)
@@ -3518,49 +3494,12 @@ public partial class MainWindow : Window
         materialTextureSlotsCache ??= new Dictionary<Material, Dictionary<string, Texture2D?>>();
         materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
 
-        if (materialTextureSlotsCache.ContainsKey(material) && materialMainTextureCache.ContainsKey(material))
-        {
-            return;
-        }
-
-        var displayMaterial = ResolveMaterialForPreview(material) ?? material;
-        if (!materialTextureSlotsCache.TryGetValue(displayMaterial, out var slots))
-        {
-            slots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
-            foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
-            {
-                var textureRef = texEnv.Value?.m_Texture;
-                slots[texEnv.Key] = textureRef != null && !textureRef.IsNull
-                    ? ResolveTexturePPtr(displayMaterial, textureRef)
-                    : null;
-            }
-
-            materialTextureSlotsCache[displayMaterial] = slots;
-            materialMainTextureCache[displayMaterial] = SelectMainTextureForMaterial(displayMaterial, slots);
-        }
-
-        if (!ReferenceEquals(displayMaterial, material))
-        {
-            materialTextureSlotsCache[material] = slots;
-            materialMainTextureCache[material] = materialMainTextureCache[displayMaterial];
-        }
+        IndexMaterialTexturesBackground(material, materialPreviewMaterialCache, materialTextureSlotsCache, materialMainTextureCache);
     }
 
     private Texture2D? ResolveTexturePPtr(Material material, PPtr<Texture> textureRef)
     {
-        if (textureRef.TryGet<Texture2D>(out var directTex))
-        {
-            return directTex;
-        }
-
-        if (textureRef.m_FileID == 0
-            && material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj)
-            && localObj is Texture2D localTex)
-        {
-            return localTex;
-        }
-
-        return null;
+        return ResolveTexturePPtrBackground(material, textureRef);
     }
 
     private async void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
@@ -4864,58 +4803,7 @@ public partial class MainWindow : Window
 
     private void LinkFbxSubAssetsToSceneNodes()
     {
-        var fbxNodes = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var item in exportableAssets)
-        {
-            if (item.TreeNode?.GameObject == null)
-            {
-                continue;
-            }
-
-            var fbxContainer = GetFbxContainerPath(item.Container);
-            if (fbxContainer == null)
-            {
-                continue;
-            }
-
-            fbxNodes.TryAdd(fbxContainer, GetFbxRootNode(item.TreeNode, fbxContainer));
-        }
-
-        foreach (var item in exportableAssets)
-        {
-            var fbxContainer = GetFbxContainerPath(item.Container);
-            if (fbxContainer == null || fbxNodes.ContainsKey(fbxContainer))
-            {
-                continue;
-            }
-
-            var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
-            var node = FindSceneNodeByName(fbxName);
-            if (node?.GameObject != null)
-            {
-                fbxNodes[fbxContainer] = node;
-            }
-        }
-
-        foreach (var item in exportableAssets)
-        {
-            var fbxContainer = GetFbxContainerPath(item.Container);
-            if (fbxContainer == null || !fbxNodes.TryGetValue(fbxContainer, out var node))
-            {
-                continue;
-            }
-
-            item.TreeNode = node;
-            if (item.Asset is Mesh or Animator)
-            {
-                var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
-                if (!string.IsNullOrEmpty(fbxName))
-                {
-                    item.Name = fbxName;
-                }
-            }
-        }
+        LinkFbxSubAssetsToSceneNodesBackground(exportableAssets, sceneTreeNodes);
     }
 
     private static GameObjectNode GetFbxRootNode(GameObjectNode node, string fbxContainer)
@@ -5839,188 +5727,32 @@ public partial class MainWindow : Window
 
     private void BuildAssetReferenceIndexes()
     {
-        meshToMaterialsCache = new Dictionary<Mesh, List<Material?>>();
-        meshAssociatedRenderersCache = new Dictionary<Mesh, List<string>>();
-        meshSourceTypesCache = new Dictionary<Mesh, HashSet<string>>();
-        materialMainTextureCache = new Dictionary<Material, Texture2D?>();
-        materialPreviewMaterialCache = new Dictionary<Material, Material?>();
-        materialTextureSlotsCache = new Dictionary<Material, Dictionary<string, Texture2D?>>();
+        BuildAssetReferenceIndexesBackground(
+            assetsManager.assetsFileList,
+            exportableAssets,
+            out var localObjectToAssetItemCache,
+            out var localMeshToMaterialsCache,
+            out var localMeshAssociatedRenderersCache,
+            out var localMeshSourceTypesCache,
+            out var localMaterialMainTextureCache,
+            out var localMaterialPreviewMaterialCache,
+            out var localMaterialTextureSlotsCache);
 
-        objectToAssetItemCache ??= new Dictionary<AssetStudio.Object, AssetItem>();
-        if (objectToAssetItemCache.Count == 0)
-        {
-            foreach (var item in exportableAssets)
-            {
-                objectToAssetItemCache[item.Asset] = item;
-            }
-        }
-
-        void AddMeshMaterials(Mesh mesh, List<Material?> materials)
-        {
-            if (!meshToMaterialsCache.TryGetValue(mesh, out var existingList)
-                || ScoreMaterials(materials) > ScoreMaterials(existingList))
-            {
-                meshToMaterialsCache[mesh] = materials;
-            }
-        }
-
-        void AddMeshAssociation(Mesh mesh, string sourceType, string? description)
-        {
-            if (!meshSourceTypesCache.TryGetValue(mesh, out var sourceTypes))
-            {
-                sourceTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                meshSourceTypesCache[mesh] = sourceTypes;
-            }
-            sourceTypes.Add(sourceType);
-
-            if (string.IsNullOrEmpty(description))
-            {
-                return;
-            }
-
-            if (!meshAssociatedRenderersCache.TryGetValue(mesh, out var renderers))
-            {
-                renderers = new List<string>();
-                meshAssociatedRenderersCache[mesh] = renderers;
-            }
-
-            renderers.Add(description);
-        }
-
-        GameObject? ResolveGameObject(SerializedFile sourceFile, PPtr<GameObject> pptr)
-        {
-            if (pptr.TryGet(out var go))
-            {
-                return go;
-            }
-            return pptr.m_FileID == 0 ? ResolveObject(sourceFile, pptr.m_PathID) as GameObject : null;
-        }
-
-        Mesh? ResolveMesh(SerializedFile sourceFile, PPtr<Mesh> pptr)
-        {
-            if (pptr.TryGet(out var mesh))
-            {
-                return mesh;
-            }
-            return pptr.m_FileID == 0 ? ResolveObject(sourceFile, pptr.m_PathID) as Mesh : null;
-        }
-
-        Material? ResolveRendererMaterial(PPtr<Material> pptr)
-        {
-            if (pptr.TryGet(out var material))
-            {
-                return material;
-            }
-            return null;
-        }
-
-        AssetStudio.Object? ResolveObject(SerializedFile sourceFile, long pathID)
-        {
-            if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj))
-            {
-                return obj;
-            }
-            return null;
-        }
-
-        foreach (var file in assetsManager.assetsFileList)
-        {
-            foreach (var obj in file.Objects)
-            {
-                if (obj is Material material)
-                {
-                    IndexMaterialTextures(material);
-                }
-                else if (obj is SkinnedMeshRenderer smr)
-                {
-                    var smrMesh = ResolveMesh(file, smr.m_Mesh);
-
-                    if (smrMesh != null)
-                    {
-                        var go = ResolveGameObject(file, smr.m_GameObject);
-                        AddMeshAssociation(
-                            smrMesh,
-                            "SkinnedMeshRenderer",
-                            go != null ? $"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})" : null);
-
-                        if (smr.m_Materials != null)
-                        {
-                            var list = new List<Material?>();
-                            foreach (var matPtr in smr.m_Materials)
-                            {
-                                list.Add(ResolveRendererMaterial(matPtr));
-                            }
-                            AddMeshMaterials(smrMesh, list);
-                        }
-                    }
-                }
-                else if (obj is MeshRenderer mr)
-                {
-                    var go = ResolveGameObject(file, mr.m_GameObject);
-
-                    if (go?.m_Components != null)
-                    {
-                        foreach (var compPtr in go.m_Components)
-                        {
-                            Component? comp = null;
-                            if (compPtr.TryGet(out var cp))
-                            {
-                                comp = cp;
-                            }
-                            else if (compPtr.m_FileID == 0)
-                            {
-                                comp = ResolveObject(file, compPtr.m_PathID) as Component;
-                            }
-
-                            if (comp is MeshFilter mf)
-                            {
-                                var mfMesh = ResolveMesh(file, mf.m_Mesh);
-
-                                if (mfMesh != null)
-                                {
-                                    AddMeshAssociation(
-                                        mfMesh,
-                                        "MeshFilter",
-                                        $"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
-
-                                    if (mr.m_Materials != null)
-                                    {
-                                        var list = new List<Material?>();
-                                        foreach (var matPtr in mr.m_Materials)
-                                        {
-                                            list.Add(ResolveRendererMaterial(matPtr));
-                                        }
-                                        AddMeshMaterials(mfMesh, list);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        objectToAssetItemCache = localObjectToAssetItemCache;
+        meshToMaterialsCache = localMeshToMaterialsCache;
+        meshAssociatedRenderersCache = localMeshAssociatedRenderersCache;
+        meshSourceTypesCache = localMeshSourceTypesCache;
+        materialMainTextureCache = localMaterialMainTextureCache;
+        materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
+        materialTextureSlotsCache = localMaterialTextureSlotsCache;
     }
 
-    private int ScoreMaterials(List<Material?> mats)
+    private static int ScoreMaterials(List<Material?> mats)
     {
-        if (mats == null || mats.Count == 0) return 0;
-        int score = 0;
-        foreach (var mat in mats)
-        {
-            if (mat == null)
-            {
-                continue;
-            }
-
-            score += 1;
-            if (!mat.m_Name.StartsWith("Material", StringComparison.OrdinalIgnoreCase)
-                && !mat.m_Name.Equals("Default", StringComparison.OrdinalIgnoreCase))
-            {
-                score += 5;
-            }
-        }
-        return score;
+        return ScoreMaterialsStatic(mats);
     }
+
+
 
     private List<Material?> FindMaterialsForMesh(Mesh mesh)
     {

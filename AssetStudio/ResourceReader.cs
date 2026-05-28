@@ -12,6 +12,7 @@ namespace AssetStudio
         private long offset;
         private long size;
         private BinaryReader reader;
+        private bool isEmbedded;
 
         public int Size { get => (int)size; }
 
@@ -33,13 +34,22 @@ namespace AssetStudio
 
         public ResourceReader(BinaryReader reader, long offset, long size)
         {
-            this.reader = reader;
+            if (reader is ObjectReader objReader)
+            {
+                this.assetsFile = objReader.assetsFile;
+                this.isEmbedded = true;
+            }
+            else
+            {
+                this.reader = reader;
+            }
             this.offset = offset;
             this.size = size;
         }
 
-        private BinaryReader GetReader()
+        private BinaryReader GetReader(out bool shouldDispose)
         {
+            shouldDispose = false;
             if (needSearch)
             {
                 var resourceFileName = Path.GetFileName(path);
@@ -75,6 +85,11 @@ namespace AssetStudio
             }
             else
             {
+                if (isEmbedded && assetsFile != null)
+                {
+                    shouldDispose = true;
+                    return assetsFile.reader.Clone();
+                }
                 return reader;
             }
         }
@@ -243,69 +258,99 @@ namespace AssetStudio
 
         public byte[] GetData()
         {
-            var binaryReader = GetReader();
-            binaryReader.BaseStream.Position = offset;
-            var data = binaryReader.ReadBytes((int)size);
-            if (data.Length != size)
+            var binaryReader = GetReader(out var shouldDispose);
+            try
             {
-                throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {data.Length} bytes.");
-            }
-
-            // Testa se a maioria dos bytes é 0x01 (indicativo de XOR)
-            int sampleSize = Math.Min(data.Length, 1024);
-            int count01 = 0;
-            for (int i = 0; i < sampleSize; i++)
-            {
-                if (data[i] == 0x01)
-                    count01++;
-            }
-
-            // Se for criptografado com XOR
-            if (sampleSize > 0 && count01 > sampleSize * 0.5)
-            {
-                for (int i = 0; i < data.Length; i++)
+                binaryReader.BaseStream.Position = offset;
+                var data = binaryReader.ReadBytes((int)size);
+                if (data.Length != size)
                 {
-                    data[i] ^= 0xFF;
+                    throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {data.Length} bytes.");
+                }
+
+                // Testa se a maioria dos bytes é 0x01 (indicativo de XOR)
+                int sampleSize = Math.Min(data.Length, 1024);
+                int count01 = 0;
+                for (int i = 0; i < sampleSize; i++)
+                {
+                    if (data[i] == 0x01)
+                        count01++;
+                }
+
+                // Se for criptografado com XOR
+                if (sampleSize > 0 && count01 > sampleSize * 0.5)
+                {
+                    for (int i = 0; i < data.Length; i++)
+                    {
+                        data[i] ^= 0xFF;
+                    }
+                }
+
+                return data;
+            }
+            finally
+            {
+                if (shouldDispose)
+                {
+                    binaryReader.Dispose();
                 }
             }
-
-            return data;
         }
 
         public void GetData(byte[] buff)
         {
-            var binaryReader = GetReader();
-            binaryReader.BaseStream.Position = offset;
-            var read = binaryReader.Read(buff, 0, (int)size);
-            if (read != size)
+            var binaryReader = GetReader(out var shouldDispose);
+            try
             {
-                throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {read} bytes.");
-            }
-
-            int sampleSize = Math.Min(buff.Length, 1024);
-            int count01 = 0;
-            for (int i = 0; i < sampleSize; i++)
-            {
-                if (buff[i] == 0x01)
-                    count01++;
-            }
-
-            if (sampleSize > 0 && count01 > sampleSize * 0.5)
-            {
-                for (int i = 0; i < buff.Length; i++)
+                binaryReader.BaseStream.Position = offset;
+                var read = binaryReader.Read(buff, 0, (int)size);
+                if (read != size)
                 {
-                    buff[i] ^= 0xFF;
+                    throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {read} bytes.");
+                }
+
+                int sampleSize = Math.Min(buff.Length, 1024);
+                int count01 = 0;
+                for (int i = 0; i < sampleSize; i++)
+                {
+                    if (buff[i] == 0x01)
+                        count01++;
+                }
+
+                if (sampleSize > 0 && count01 > sampleSize * 0.5)
+                {
+                    for (int i = 0; i < buff.Length; i++)
+                    {
+                        buff[i] ^= 0xFF;
+                    }
+                }
+            }
+            finally
+            {
+                if (shouldDispose)
+                {
+                    binaryReader.Dispose();
                 }
             }
         }
 
         public void WriteData(string path)
         {
-            var binaryReader = GetReader();
-            binaryReader.BaseStream.Position = offset;
-            using (var writer = File.OpenWrite(path))
+            var binaryReader = GetReader(out var shouldDispose);
+            try
             {
-                binaryReader.BaseStream.CopyTo(writer, size);
+                binaryReader.BaseStream.Position = offset;
+                using (var writer = File.OpenWrite(path))
+                {
+                    binaryReader.BaseStream.CopyTo(writer, size);
+                }
+            }
+            finally
+            {
+                if (shouldDispose)
+                {
+                    binaryReader.Dispose();
+                }
             }
         }
     }

@@ -118,6 +118,13 @@ namespace AssetStudio
                 clone.Endian = Endian;
                 return clone;
             }
+            else if (BaseStream is SubStream subStream)
+            {
+                var newStream = new SubStream(subStream.FilePath, subStream.Offset, subStream.Length);
+                var clone = new FileReader(FullPath, newStream);
+                clone.Endian = Endian;
+                return clone;
+            }
             else if (BaseStream is FileStream fileStream)
             {
                 var streamPath = fileStream.Name;

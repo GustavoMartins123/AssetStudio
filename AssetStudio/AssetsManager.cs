@@ -13,6 +13,7 @@ namespace AssetStudio
         public string SpecifyUnityVersion;
         public string ProjectRoot;
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
+        public List<Stream> bundleStreams = new List<Stream>();
 
         internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         internal Dictionary<string, BinaryReader> resourceFileReaders = new Dictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
@@ -291,6 +292,13 @@ namespace AssetStudio
             try
             {
                 var bundleFile = new BundleFile(reader);
+                if (bundleFile.BlocksStream != null)
+                {
+                    lock (loadLock)
+                    {
+                        bundleStreams.Add(bundleFile.BlocksStream);
+                    }
+                }
                 foreach (var file in bundleFile.fileList)
                 {
                     var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.fileName);
@@ -499,6 +507,15 @@ namespace AssetStudio
             }
             resourceFileReaders.Clear();
 
+            lock (loadLock)
+            {
+                foreach (var stream in bundleStreams)
+                {
+                    stream.Dispose();
+                }
+                bundleStreams.Clear();
+            }
+
             assetsFileIndexCache.Clear();
         }
 
@@ -508,6 +525,7 @@ namespace AssetStudio
 
             var progressCount = assetsFileList.Sum(x => x.m_Objects.Count);
             int progressValue = 0;
+            int errorCount = 0;
             Progress.Reset();
 
             foreach (var assetsFile in assetsFileList)
@@ -617,40 +635,51 @@ namespace AssetStudio
                         }
                         catch (Exception e)
                         {
-                            var sb = new StringBuilder();
-                            sb.AppendLine("Unable to load object")
-                                .AppendLine($"Assets {assetsFile.fileName}")
-                                .AppendLine($"Path {assetsFile.originalPath}")
-                                .AppendLine($"Type {objectReader.type}")
-                                .AppendLine($"PathID {objectInfo.m_PathID}");
-
-                            if (objectInfo.serializedType?.m_Type?.m_Nodes != null)
+                            var errCount = System.Threading.Interlocked.Increment(ref errorCount);
+                            if (errCount <= 100)
                             {
-                                sb.AppendLine("TypeTree Dump:");
-                                foreach (var node in objectInfo.serializedType.m_Type.m_Nodes)
+                                var sb = new StringBuilder();
+                                sb.AppendLine("Unable to load object")
+                                    .AppendLine($"Assets {assetsFile.fileName}")
+                                    .AppendLine($"Path {assetsFile.originalPath}")
+                                    .AppendLine($"Type {objectReader.type}")
+                                    .AppendLine($"PathID {objectInfo.m_PathID}");
+
+                                if (objectInfo.serializedType?.m_Type?.m_Nodes != null)
                                 {
-                                    sb.AppendLine($"[{node.m_Level}] {node.m_Type} {node.m_Name}");
+                                    sb.AppendLine("TypeTree Dump:");
+                                    foreach (var node in objectInfo.serializedType.m_Type.m_Nodes)
+                                    {
+                                        sb.AppendLine($"[{node.m_Level}] {node.m_Type} {node.m_Name}");
+                                    }
                                 }
-                            }
 
-                            // TODO: REMOVE LATER - Hex dump for Unity 6 debugging only
-                            try
-                            {
-                                objectReader.Reset(); // go back to start
-                                int bytesToRead = Math.Min((int)objectInfo.byteSize, 1024);
-                                var rawBytes = objectReader.ReadBytes(bytesToRead);
-                                var hexDump = BitConverter.ToString(rawBytes).Replace("-", " ");
-                                sb.AppendLine($"Raw Object Bytes (first {bytesToRead} bytes):");
-                                sb.AppendLine(hexDump);
-                            }
-                            catch (Exception ex2)
-                            {
-                                sb.AppendLine($"Failed to dump bytes: {ex2.Message}");
-                            }
-                            // END TODO: REMOVE LATER
+                                if (errCount <= 20)
+                                {
+                                    // TODO: REMOVE LATER - Hex dump for Unity 6 debugging only
+                                    try
+                                    {
+                                        objectReader.Reset(); // go back to start
+                                        int bytesToRead = Math.Min((int)objectInfo.byteSize, 1024);
+                                        var rawBytes = objectReader.ReadBytes(bytesToRead);
+                                        var hexDump = BitConverter.ToString(rawBytes).Replace("-", " ");
+                                        sb.AppendLine($"Raw Object Bytes (first {bytesToRead} bytes):");
+                                        sb.AppendLine(hexDump);
+                                    }
+                                    catch (Exception ex2)
+                                    {
+                                        sb.AppendLine($"Failed to dump bytes: {ex2.Message}");
+                                    }
+                                    // END TODO: REMOVE LATER
+                                }
 
-                            sb.Append(e);
-                            Logger.Error(sb.ToString());
+                                sb.Append(e);
+                                Logger.Error(sb.ToString());
+                            }
+                            else if (errCount == 101)
+                            {
+                                Logger.Error("Too many errors encountered. Further error details are suppressed to maintain stability.");
+                            }
                         }
 
                         var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
