@@ -4,6 +4,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="using:AssetStudio.Avalonia"
         xmlns:vlc="clr-namespace:LibVLCSharp.Avalonia;assembly=LibVLCSharp.Avalonia"
+        xmlns:ffmpeg="using:AssetStudio.Avalonia.Controls"
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
         Title="AssetStudio (Avalonia Linux Port)"
@@ -353,7 +354,10 @@
                                 </StackPanel>
                                 
                                 <Border Grid.Row="2" Background="Black" CornerRadius="8" ClipToBounds="True" MinHeight="100">
-                                    <vlc:VideoView x:Name="VideoPlayerView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+                                    <Grid>
+                                        <ffmpeg:VideoPlayerControl x:Name="FfmpegVideoPlayer" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ShowControls="False" ShowOpenButton="False" Volume="80" />
+                                        <vlc:VideoView x:Name="VideoPlayerView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False" />
+                                    </Grid>
                                 </Border>
 
                                 <Grid Grid.Row="3" ColumnDefinitions="*,Auto" Margin="0,4">

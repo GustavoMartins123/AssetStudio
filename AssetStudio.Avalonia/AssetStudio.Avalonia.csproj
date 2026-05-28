@@ -24,6 +24,7 @@
     </PackageReference>
     <PackageReference Include="LibVLCSharp" Version="3.8.2" />
     <PackageReference Include="LibVLCSharp.Avalonia" Version="3.8.2" />
+    <PackageReference Include="FFmpegVideoPlayer.Avalonia" Version="2.8.0" />
     <PackageReference Include="OpenTK" Version="4.8.2" />
     <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="1.0.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
@@ -64,6 +65,8 @@
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll" DestinationFolder="$(TargetDir)x64" Condition="!Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\$(Configuration)\Texture2DDecoderNative.dll') And Exists('$(RepoRoot)Texture2DDecoderNative\bin\x64\Release\Texture2DDecoderNative.dll')" />
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)x64" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
     <Copy SourceFiles="$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so" DestinationFolder="$(TargetDir)" Condition="Exists('$(RepoRoot)Texture2DDecoderNative\build\libTexture2DDecoderNative.so')" />
+    <Copy SourceFiles="$(TargetDir)runtimes\win-x64\native\soft_oal.dll" DestinationFolder="$(TargetDir)" Condition="Exists('$(TargetDir)runtimes\win-x64\native\soft_oal.dll')" />
+    <Copy SourceFiles="$(TargetDir)runtimes\win-x64\native\OpenAL32.dll" DestinationFolder="$(TargetDir)" Condition="Exists('$(TargetDir)runtimes\win-x64\native\OpenAL32.dll')" />
   </Target>
 
   <Target Name="PublishExtraFiles" AfterTargets="Publish">
@@ -71,5 +74,7 @@
     <Copy SourceFiles="$(TargetDir)x64\Texture2DDecoderNative.dll" DestinationFolder="$(PublishDir)x64" Condition="Exists('$(TargetDir)x64\Texture2DDecoderNative.dll')" />
     <Copy SourceFiles="$(TargetDir)x64\libTexture2DDecoderNative.so" DestinationFolder="$(PublishDir)x64" Condition="Exists('$(TargetDir)x64\libTexture2DDecoderNative.so')" />
     <Copy SourceFiles="$(TargetDir)x64\libTexture2DDecoderNative.so" DestinationFolder="$(PublishDir)" Condition="Exists('$(TargetDir)x64\libTexture2DDecoderNative.so')" />
+    <Copy SourceFiles="$(TargetDir)runtimes\win-x64\native\soft_oal.dll" DestinationFolder="$(PublishDir)" Condition="Exists('$(TargetDir)runtimes\win-x64\native\soft_oal.dll')" />
+    <Copy SourceFiles="$(TargetDir)runtimes\win-x64\native\OpenAL32.dll" DestinationFolder="$(PublishDir)" Condition="Exists('$(TargetDir)runtimes\win-x64\native\OpenAL32.dll')" />
   </Target>
 </Project>
