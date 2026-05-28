@@ -455,6 +455,8 @@ namespace AssetStudio
 
     public sealed class Mesh : NamedObject
     {
+        public static bool LazyLoadMeshData { get; set; } = true;
+
         private bool m_Use16BitIndices = true;
         public SubMesh[] m_SubMeshes;
         private uint[] m_IndexBuffer;
@@ -478,6 +480,8 @@ namespace AssetStudio
         private VertexData m_VertexData;
         private CompressedMesh m_CompressedMesh;
         private StreamingInfo m_StreamData;
+        private bool m_DataProcessed;
+        private readonly object m_ProcessLock = new object();
 
         public List<uint> m_Indices = new List<uint>();
 
@@ -693,11 +697,55 @@ namespace AssetStudio
                 m_StreamData = new StreamingInfo(reader);
             }
 
-            ProcessData();
+            if (LazyLoadMeshData)
+            {
+                m_VertexCount = GetDeferredVertexCount();
+            }
+            else
+            {
+                EnsureProcessed();
+            }
+        }
+
+        public void EnsureProcessed()
+        {
+            if (m_DataProcessed)
+            {
+                return;
+            }
+
+            lock (m_ProcessLock)
+            {
+                if (m_DataProcessed)
+                {
+                    return;
+                }
+
+                ProcessData();
+                m_DataProcessed = true;
+            }
+        }
+
+        private int GetDeferredVertexCount()
+        {
+            if (m_VertexData?.m_VertexCount > 0)
+            {
+                return (int)m_VertexData.m_VertexCount;
+            }
+            if (m_CompressedMesh?.m_Vertices?.m_NumItems > 0)
+            {
+                return (int)m_CompressedMesh.m_Vertices.m_NumItems / 3;
+            }
+            return m_VertexCount;
         }
 
         private void ProcessData()
         {
+            if (m_DataProcessed)
+            {
+                return;
+            }
+
             if (!string.IsNullOrEmpty(m_StreamData?.path))
             {
                 if (m_VertexData.m_VertexCount > 0)
@@ -1186,6 +1234,7 @@ namespace AssetStudio
 
         public float[] GetUV(int uv)
         {
+            EnsureProcessed();
             switch (uv)
             {
                 case 0:

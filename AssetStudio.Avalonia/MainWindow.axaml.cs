@@ -1719,6 +1719,7 @@ public partial class MainWindow : Window
                     var includeMeshInfo = displayInfo.IsChecked == true;
                     Task.Run(() =>
                     {
+                        m_Mesh.EnsureProcessed();
                         var subMeshTextures = new List<byte[]?>();
                         var subMeshTexWidths = new List<int>();
                         var subMeshTexHeights = new List<int>();
@@ -2377,6 +2378,7 @@ public partial class MainWindow : Window
     {
         currentPreviewAvatar = avatar;
         Mesh? avatarMesh = FindBestMeshForAvatar(avatar);
+        avatarMesh?.EnsureProcessed();
         currentPreviewMesh = avatarMesh;
 
         global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
@@ -2543,6 +2545,7 @@ public partial class MainWindow : Window
         Avatar? avatar = null;
         Mesh? avatarMesh = null;
 
+        currentPreviewMesh?.EnsureProcessed();
         if (currentPreviewMesh != null && currentPreviewMesh.m_BindPose != null && currentPreviewMesh.m_BindPose.Length > 0
             && currentPreviewMesh.m_BoneNameHashes != null && currentPreviewMesh.m_BoneNameHashes.Length > 0)
         {
@@ -2586,6 +2589,7 @@ public partial class MainWindow : Window
         {
             avatarMesh = FindBestMeshForAvatar(avatar);
         }
+        avatarMesh?.EnsureProcessed();
 
         if (avatarMesh == null || avatarMesh.m_BindPose == null || avatarMesh.m_BindPose.Length == 0
             || avatarMesh.m_BoneNameHashes == null || avatarMesh.m_BoneNameHashes.Length == 0)
@@ -2965,6 +2969,7 @@ public partial class MainWindow : Window
 
         foreach (var mesh in allMeshes)
         {
+            mesh.EnsureProcessed();
             int score = 0;
             if (mesh.assetsFile == avatar.assetsFile) score += 20;
 
@@ -5391,6 +5396,7 @@ public partial class MainWindow : Window
             }
         }
 
+        mesh.EnsureProcessed();
         if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
         {
             return false;

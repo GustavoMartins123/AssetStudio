@@ -527,6 +527,7 @@ namespace AssetStudio
             var mesh = GetMesh(meshR);
             if (mesh == null)
                 return;
+            mesh.EnsureProcessed();
             var iMesh = new ImportedMesh();
             if (!meshR.m_GameObject.TryGet(out var m_GameObject2))
             {
@@ -1509,6 +1510,7 @@ namespace AssetStudio
 
             foreach (var mesh in allMeshes)
             {
+                mesh.EnsureProcessed();
                 int score = 0;
                 if (mesh.assetsFile == avatar.assetsFile) score += 20;
 
@@ -1560,6 +1562,7 @@ namespace AssetStudio
                 return new Quaternion(q.X, q.Y, q.Z, q.W);
             }
 
+            avatarMesh?.EnsureProcessed();
             if (avatarMesh != null && avatarMesh.m_BoneNameHashes != null && avatarMesh.m_BindPose != null)
             {
                 var meshBoneCount = avatarMesh.m_BoneNameHashes.Length;

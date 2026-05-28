@@ -441,6 +441,7 @@ void main()
         {
             ClearAvatarPreviewState();
             previewMaterialMode = false;
+            m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0) return;
 
             int currentLoadId = ++meshLoadCounter;
@@ -1557,6 +1558,7 @@ void main()
             isAvatarMode = true;
             StopAnimation();
             previewMaterialMode = false;
+            m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0) return;
 
             staticBonePositions = bonePositions;
@@ -1653,6 +1655,7 @@ void main()
             isAvatarMode = true;
             StopAnimation();
             previewMaterialMode = false;
+            m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0 || frames.Length == 0) return;
 
             animationFrames = frames;
