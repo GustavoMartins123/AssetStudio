@@ -9,6 +9,8 @@
     <ApplicationIcon>Assets\as.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <RuntimeIdentifiers>win-x64;win-x86;linux-x64</RuntimeIdentifiers>
+    <SelfContained Condition="'$(RuntimeIdentifier)' != '' and '$(SelfContained)' == ''">true</SelfContained>
     <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\'))</RepoRoot>
   </PropertyGroup>
 

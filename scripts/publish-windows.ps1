@@ -179,6 +179,7 @@ try {
         "-f", $Framework,
         "-r", $Runtime,
         "--self-contained", $SelfContained.ToString().ToLowerInvariant(),
+        "-m:1",
         "--disable-build-servers",
         "/p:UseSharedCompilation=false"
     )

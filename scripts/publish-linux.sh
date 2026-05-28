@@ -5,7 +5,7 @@ set -euo pipefail
 CONFIGURATION="Release"
 FRAMEWORK="net10.0"
 RUNTIME="linux-x64"
-SELF_CONTAINED="false"
+SELF_CONTAINED="true"
 OUTPUT_DIR=""
 SKIP_NATIVE="false"
 
@@ -67,6 +67,7 @@ dotnet publish "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" \
     -f "$FRAMEWORK" \
     -r "$RUNTIME" \
     --self-contained "$SELF_CONTAINED" \
+    -m:1 \
     -o "$PUBLISH_DIR"
 
 if [[ "$SKIP_NATIVE" != "true" ]]; then

@@ -33,6 +33,9 @@ namespace AssetStudio
 
     public class BundleFile
     {
+        public static bool LowMemoryMode { get; set; } = true;
+        public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
+
         public class Header
         {
             public string signature;
@@ -141,17 +144,56 @@ namespace AssetStudio
         {
             Stream blocksStream;
             var uncompressedSizeSum = m_BlocksInfo.Sum(x => x.uncompressedSize);
-            if (uncompressedSizeSum >= int.MaxValue)
+            if (ShouldUseTemporaryStream(uncompressedSizeSum))
             {
                 /*var memoryMappedFile = MemoryMappedFile.CreateNew(null, uncompressedSizeSum);
                 assetsDataStream = memoryMappedFile.CreateViewStream();*/
-                blocksStream = new FileStream(path + ".temp", FileMode.Create, FileAccess.ReadWrite, FileShare.None, 4096, FileOptions.DeleteOnClose);
+                blocksStream = CreateTemporaryStream(path, "blocks");
             }
             else
             {
                 blocksStream = new MemoryStream((int)uncompressedSizeSum);
             }
             return blocksStream;
+        }
+
+        private static bool ShouldUseTemporaryStream(long size)
+        {
+            return size >= int.MaxValue || (LowMemoryMode && size >= LowMemoryThreshold);
+        }
+
+        private static FileStream CreateTemporaryStream(string sourcePath, string kind)
+        {
+            var tempDirectory = Path.Combine(Path.GetTempPath(), "AssetStudio");
+            Directory.CreateDirectory(tempDirectory);
+            var fileName = $"{SanitizeTempFilePart(Path.GetFileName(sourcePath))}.{SanitizeTempFilePart(kind)}.{Guid.NewGuid():N}.tmp";
+            var tempPath = Path.Combine(tempDirectory, fileName);
+            return new FileStream(
+                tempPath,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.ReadWrite | FileShare.Delete,
+                1024 * 1024,
+                FileOptions.DeleteOnClose);
+        }
+
+        private static string SanitizeTempFilePart(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "bundle";
+            }
+
+            var invalidChars = Path.GetInvalidFileNameChars();
+            var chars = value.ToCharArray();
+            for (int i = 0; i < chars.Length; i++)
+            {
+                if (invalidChars.Contains(chars[i]))
+                {
+                    chars[i] = '_';
+                }
+            }
+            return new string(chars);
         }
 
         private void ReadBlocksAndDirectory(EndianBinaryReader reader, Stream blocksStream)
@@ -189,6 +231,7 @@ namespace AssetStudio
 
         public void ReadFiles(Stream blocksStream, string path)
         {
+            var forceTemporaryFiles = ShouldUseTemporaryStream(blocksStream.Length);
             fileList = new StreamFile[m_DirectoryInfo.Length];
             for (int i = 0; i < m_DirectoryInfo.Length; i++)
             {
@@ -197,13 +240,11 @@ namespace AssetStudio
                 fileList[i] = file;
                 file.path = node.path;
                 file.fileName = Path.GetFileName(node.path);
-                if (node.size >= int.MaxValue)
+                if (forceTemporaryFiles || ShouldUseTemporaryStream(node.size))
                 {
                     /*var memoryMappedFile = MemoryMappedFile.CreateNew(null, entryinfo_size);
                     file.stream = memoryMappedFile.CreateViewStream();*/
-                    var extractPath = path + "_unpacked" + Path.DirectorySeparatorChar;
-                    Directory.CreateDirectory(extractPath);
-                    file.stream = new FileStream(extractPath + file.fileName, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
+                    file.stream = CreateTemporaryStream(path, file.fileName);
                 }
                 else
                 {

@@ -120,7 +120,8 @@ namespace AssetStudio
             }
             else if (BaseStream is FileStream fileStream)
             {
-                var newStream = File.Open(FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                var streamPath = fileStream.Name;
+                var newStream = File.Open(streamPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 var clone = new FileReader(FullPath, newStream);
                 clone.Endian = Endian;
                 return clone;

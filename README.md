@@ -93,7 +93,7 @@ First, use [Il2CppDumper by Perfare](https://github.com/Perfare/Il2CppDumper) to
 
 ### One-command Windows publish
 
-Use the publish script to build the managed GUI, build the native DLLs, and copy the native dependencies into the runtime folder expected by AssetStudio:
+Use the publish script to build the managed GUI, build the native DLLs, and copy the native dependencies into the runtime folder expected by AssetStudio. The default publish is self-contained, so the target machine does not need the .NET SDK or runtime installed.
 
 ```powershell
 .\scripts\publish-windows.ps1 -Configuration Release -Platform x64
@@ -113,11 +113,11 @@ AssetStudio.Avalonia\bin\Release\net10.0\win-x64\publish\AssetStudio.Avalonia.ex
 
 Do not run the executable from `AssetStudio.Avalonia\bin\Release\net10.0\win-x64`; that folder is an intermediate build output and does not receive native dependencies.
 
-The script requires Visual Studio with the C++ workload for native texture builds. Use `-SkipNative` only when you want to publish the managed app without texture decoder native support. Use `-OutputDir <path>` only when you intentionally want a custom publish folder.
+The script requires Visual Studio with the C++ workload for native texture builds. Use `-SelfContained $false` only when you intentionally want a framework-dependent build, `-SkipNative` only when you want to publish the managed app without texture decoder native support, and `-OutputDir <path>` only when you intentionally want a custom publish folder.
 
 ### One-command Linux publish
 
-Use the publish script to build the native C++ decoder library, publish the Avalonia GUI application, and bundle `libTexture2DDecoderNative.so` into the target publish folder:
+Use the publish script to build the native C++ decoder library, publish the Avalonia GUI application, and bundle `libTexture2DDecoderNative.so` into the target publish folder. The default publish is self-contained, so the target machine does not need the .NET SDK or runtime installed.
 
 ```bash
 ./scripts/publish-linux.sh -c Release
@@ -134,6 +134,8 @@ Run the executable from inside `publish`:
 ```bash
 ./AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish/AssetStudio.Avalonia
 ```
+
+Use `--self-contained false` only when you intentionally want a framework-dependent Linux build.
 
 ## Native Dependencies
 
