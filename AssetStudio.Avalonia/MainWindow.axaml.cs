@@ -895,6 +895,12 @@ public partial class MainWindow : Window
         if (folders != null && folders.Count > 0)
         {
             var folderPath = folders[0].Path.LocalPath;
+            if (!await ConfirmFolderLoadIfRisky(folderPath))
+            {
+                StatusStripUpdate("Folder load cancelled.");
+                return;
+            }
+
             SaveLoadFolder(folderPath);
             ResetForm();
             StatusStripUpdate("Loading folder...");
@@ -967,6 +973,13 @@ public partial class MainWindow : Window
 
     private async Task LoadDroppedPaths(string[] paths)
     {
+        if (paths.Length == 1 && Directory.Exists(paths[0])
+            && !await ConfirmFolderLoadIfRisky(paths[0]))
+        {
+            StatusStripUpdate("Dropped folder load cancelled.");
+            return;
+        }
+
         ResetForm();
         assetsManager.Clear();
         ApplyUnityVersionOption();
@@ -988,6 +1001,126 @@ public partial class MainWindow : Window
         }
 
         BuildAssetStructures();
+    }
+
+    private async Task<bool> ConfirmFolderLoadIfRisky(string folderPath)
+    {
+        StatusStripUpdate("Scanning folder...");
+        ProjectScanResult scanResult;
+        try
+        {
+            scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath));
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Unable to scan folder before loading:\n{ex.Message}", "Folder scan failed");
+            return true;
+        }
+
+        if (!scanResult.IsRisky)
+        {
+            return true;
+        }
+
+        var message = BuildRiskyProjectMessage(scanResult);
+        return await ShowRiskyProjectDialog(message);
+    }
+
+    private static string BuildRiskyProjectMessage(ProjectScanResult scanResult)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("This folder contains a very large number of Unity bundles.");
+        sb.AppendLine();
+        sb.AppendLine($"Files: {scanResult.TotalFiles:N0}");
+        sb.AppendLine($"Size on disk: {FormatBytes(scanResult.TotalBytes)}");
+        sb.AppendLine($"Unity bundles: {scanResult.UnityBundleCount:N0}");
+        sb.AppendLine($"Serialized files: {scanResult.SerializedFileCount:N0}");
+        sb.AppendLine($"Resource files: {scanResult.ResourceFileCount:N0}");
+        if (scanResult.ErrorCount > 0)
+        {
+            sb.AppendLine($"Scan errors: {scanResult.ErrorCount:N0}");
+        }
+        sb.AppendLine();
+        sb.AppendLine("Loading all bundles at once can use far more memory than the project size on disk and may push Linux into swap.");
+        sb.AppendLine("The safer future path is scan/index mode with lazy loading. For now, continue only if you really want the eager load path.");
+        return sb.ToString();
+    }
+
+    private async Task<bool> ShowRiskyProjectDialog(string message)
+    {
+        var dialog = new Window
+        {
+            Title = "Large Unity project detected",
+            Width = 620,
+            Height = 420,
+            MinWidth = 520,
+            MinHeight = 320,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+
+        var grid = new Grid
+        {
+            RowDefinitions = new RowDefinitions("*,Auto"),
+            Margin = new global::Avalonia.Thickness(16),
+            RowSpacing = 12
+        };
+
+        var textBlock = new TextBlock
+        {
+            Text = message,
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
+        };
+
+        var scrollViewer = new ScrollViewer
+        {
+            Content = textBlock
+        };
+
+        var buttonPanel = new StackPanel
+        {
+            Orientation = global::Avalonia.Layout.Orientation.Horizontal,
+            HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right,
+            Spacing = 10
+        };
+
+        var cancelButton = new Button
+        {
+            Content = "Cancel",
+            MinWidth = 90
+        };
+        cancelButton.Click += (_, _) => dialog.Close(false);
+
+        var loadButton = new Button
+        {
+            Content = "Load anyway",
+            MinWidth = 120
+        };
+        loadButton.Click += (_, _) => dialog.Close(true);
+
+        buttonPanel.Children.Add(cancelButton);
+        buttonPanel.Children.Add(loadButton);
+
+        Grid.SetRow(scrollViewer, 0);
+        Grid.SetRow(buttonPanel, 1);
+        grid.Children.Add(scrollViewer);
+        grid.Children.Add(buttonPanel);
+        dialog.Content = grid;
+
+        return await dialog.ShowDialog<bool>(this);
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB", "TB" };
+        double value = bytes;
+        int unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return $"{value:0.##} {units[unit]}";
     }
 
     private int ExtractFolder(string path, string savePath)

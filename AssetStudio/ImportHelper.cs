@@ -34,21 +34,31 @@ namespace AssetStudio
             }
         }
 
-        public static string[] ProcessingSplitFiles(List<string> selectFile)
+        public static string[] ProcessingSplitFiles(IEnumerable<string> selectFile)
         {
-            var splitFiles = selectFile.Where(x => x.Contains(".split"))
-                .Select(x => Path.Combine(Path.GetDirectoryName(x), Path.GetFileNameWithoutExtension(x)))
-                .Distinct()
-                .ToList();
-            selectFile.RemoveAll(x => x.Contains(".split"));
-            foreach (var file in splitFiles)
+            var splitFiles = new List<string>();
+            var selectFilesList = new List<string>();
+            foreach (var x in selectFile)
+            {
+                if (x.Contains(".split"))
+                {
+                    splitFiles.Add(Path.Combine(Path.GetDirectoryName(x), Path.GetFileNameWithoutExtension(x)));
+                }
+                else
+                {
+                    selectFilesList.Add(x);
+                }
+            }
+
+            var distinctSplitFiles = splitFiles.Distinct();
+            foreach (var file in distinctSplitFiles)
             {
                 if (File.Exists(file))
                 {
-                    selectFile.Add(file);
+                    selectFilesList.Add(file);
                 }
             }
-            return selectFile.Distinct().ToArray();
+            return selectFilesList.Distinct().ToArray();
         }
 
         public static FileReader DecompressGZip(FileReader reader)

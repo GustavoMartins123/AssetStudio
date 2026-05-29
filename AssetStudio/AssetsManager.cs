@@ -10,6 +10,10 @@ namespace AssetStudio
 {
     public class AssetsManager
     {
+        private const double DefaultLoadThreadRatio = 0.4;
+        private const double DefaultReadThreadRatio = 0.4;
+        private const int DefaultMemoryLimitPercent = 85;
+
         public string SpecifyUnityVersion;
         public string ProjectRoot;
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
@@ -55,7 +59,7 @@ namespace AssetStudio
                 ProjectRoot = path;
             }
             MergeSplitAssets(path);
-            var toReadFile = ProcessingSplitFiles(files.ToList());
+            var toReadFile = ProcessingSplitFiles(files);
             Load(toReadFile);
         }
 
@@ -66,7 +70,7 @@ namespace AssetStudio
                 ProjectRoot = Path.GetFullPath(path);
             }
             MergeSplitAssets(path, true);
-            var files = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories).ToList();
+            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories);
             var toReadFile = ProcessingSplitFiles(files);
             Load(toReadFile);
         }
@@ -89,7 +93,7 @@ namespace AssetStudio
             Progress.Reset();
 
             int completedCount = 0;
-            int threadCount = Math.Min(Environment.ProcessorCount, loadTotalCount);
+            int threadCount = Math.Min(GetConfiguredThreadCount("ASSETSTUDIO_LOAD_THREADS", DefaultLoadThreadRatio), loadTotalCount);
             if (threadCount < 1) threadCount = 1;
 
             int activeWorkers = threadCount;
@@ -104,6 +108,8 @@ namespace AssetStudio
                         string file = null;
                         if (loadQueue.TryDequeue(out file))
                         {
+                            ThrowIfMemoryPressureTooHigh("loading files");
+
                             if (!isWorkerActive)
                             {
                                 System.Threading.Interlocked.Increment(ref activeWorkers);
@@ -552,11 +558,22 @@ namespace AssetStudio
             {
                 var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
 
+                var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                {
+                    MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
+                };
+
                 System.Threading.Tasks.Parallel.ForEach(
                     assetsFile.m_Objects,
+                    parallelOptions,
                     () => assetsFile.reader.Clone(),
                     (objectInfo, state, localReader) =>
                     {
+                        if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
+                        {
+                            ThrowIfMemoryPressureTooHigh("reading assets");
+                        }
+
                         var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                         try
                         {
@@ -721,6 +738,75 @@ namespace AssetStudio
                     assetsFile.AddObject(obj);
                 }
             }
+        }
+
+        private static int GetConfiguredThreadCount(string environmentVariable, double defaultRatio)
+        {
+            var value = Environment.GetEnvironmentVariable(environmentVariable);
+            if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
+            {
+                return configuredValue;
+            }
+
+            var processorCount = Environment.ProcessorCount;
+            if (processorCount < 1)
+            {
+                return 1;
+            }
+
+            return Math.Max(1, (int)Math.Floor(processorCount * defaultRatio));
+        }
+
+        private static int GetConfiguredMemoryLimitPercent()
+        {
+            var value = Environment.GetEnvironmentVariable("ASSETSTUDIO_MEMORY_LIMIT_PERCENT");
+            if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
+            {
+                return Math.Min(configuredValue, 100);
+            }
+
+            return DefaultMemoryLimitPercent;
+        }
+
+        private static void ThrowIfMemoryPressureTooHigh(string operation)
+        {
+            var limitPercent = GetConfiguredMemoryLimitPercent();
+            if (limitPercent >= 100)
+            {
+                return;
+            }
+
+            if (!TryGetMemoryLoadPercent(out var memoryLoadPercent))
+            {
+                return;
+            }
+
+            if (memoryLoadPercent < limitPercent)
+            {
+                return;
+            }
+
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: false);
+
+            if (TryGetMemoryLoadPercent(out memoryLoadPercent) && memoryLoadPercent >= limitPercent)
+            {
+                throw new InvalidOperationException(
+                    $"Asset loading stopped while {operation} because memory pressure reached {memoryLoadPercent}% " +
+                    $"(limit {limitPercent}%). Load fewer bundles at once or raise ASSETSTUDIO_MEMORY_LIMIT_PERCENT.");
+            }
+        }
+
+        private static bool TryGetMemoryLoadPercent(out int memoryLoadPercent)
+        {
+            var memoryInfo = GC.GetGCMemoryInfo();
+            if (memoryInfo.HighMemoryLoadThresholdBytes <= 0 || memoryInfo.MemoryLoadBytes <= 0)
+            {
+                memoryLoadPercent = 0;
+                return false;
+            }
+
+            memoryLoadPercent = (int)Math.Ceiling(memoryInfo.MemoryLoadBytes * 100d / memoryInfo.HighMemoryLoadThresholdBytes);
+            return true;
         }
 
         private void ProcessAssets()

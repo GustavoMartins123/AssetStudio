@@ -35,6 +35,7 @@ namespace AssetStudio
     {
         public static bool LowMemoryMode { get; set; } = true;
         public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
+        public static string TemporaryDirectory { get; set; }
 
         public class Header
         {
@@ -197,7 +198,7 @@ namespace AssetStudio
 
         private static FileStream CreateTemporaryStream(string sourcePath, string kind)
         {
-            var tempDirectory = Path.Combine(Path.GetTempPath(), "AssetStudio");
+            var tempDirectory = GetTemporaryDirectory();
             Directory.CreateDirectory(tempDirectory);
             var fileName = $"{SanitizeTempFilePart(Path.GetFileName(sourcePath))}.{SanitizeTempFilePart(kind)}.{Guid.NewGuid():N}.tmp";
             var tempPath = Path.Combine(tempDirectory, fileName);
@@ -208,6 +209,28 @@ namespace AssetStudio
                 FileShare.ReadWrite | FileShare.Delete,
                 1024 * 1024,
                 FileOptions.DeleteOnClose);
+        }
+
+        private static string GetTemporaryDirectory()
+        {
+            if (!string.IsNullOrWhiteSpace(TemporaryDirectory))
+            {
+                return TemporaryDirectory;
+            }
+
+            var environmentPath = Environment.GetEnvironmentVariable("ASSETSTUDIO_TEMP_DIR");
+            if (!string.IsNullOrWhiteSpace(environmentPath))
+            {
+                return environmentPath;
+            }
+
+            var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrWhiteSpace(localData))
+            {
+                return Path.Combine(localData, "AssetStudio", "Temp");
+            }
+
+            return Path.Combine(Path.GetTempPath(), "AssetStudio");
         }
 
         private static string SanitizeTempFilePart(string value)
