@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,6 +13,7 @@ namespace AssetStudio
         public string fullName;
         public string originalPath;
         public string fileName;
+        public bool IsProcessed = false;
         public int[] version = { 0, 0, 0, 0 };
         public BuildType buildType;
         public List<Object> Objects;

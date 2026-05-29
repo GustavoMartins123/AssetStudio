@@ -154,15 +154,30 @@ namespace AssetStudioGUI
             var paths = (string[])e.Data.GetData(DataFormats.FileDrop);
             if (paths.Length > 0)
             {
+                if (paths.Length == 1 && Directory.Exists(paths[0])
+                    && !await ConfirmFolderLoadIfRisky(paths[0]))
+                {
+                    StatusStripUpdate("Dropped folder load cancelled.");
+                    return;
+                }
+
                 ResetForm();
                 assetsManager.SpecifyUnityVersion = specifyUnityVersion.Text;
-                if (paths.Length == 1 && Directory.Exists(paths[0]))
+                try
                 {
-                    await Task.Run(() => assetsManager.LoadFolder(paths[0]));
+                    if (paths.Length == 1 && Directory.Exists(paths[0]))
+                    {
+                        await Task.Run(() => assetsManager.LoadFolder(paths[0]));
+                    }
+                    else
+                    {
+                        await Task.Run(() => assetsManager.LoadFiles(paths));
+                    }
                 }
-                else
+                catch (MemoryPressureException ex)
                 {
-                    await Task.Run(() => assetsManager.LoadFiles(paths));
+                    ShowMemoryPressureError(ex);
+                    return;
                 }
                 BuildAssetStructures();
             }
@@ -176,7 +191,15 @@ namespace AssetStudioGUI
                 ResetForm();
                 SetLoadFolder(Path.GetDirectoryName(openFileDialog1.FileNames[0]));
                 assetsManager.SpecifyUnityVersion = specifyUnityVersion.Text;
-                await Task.Run(() => assetsManager.LoadFiles(openFileDialog1.FileNames));
+                try
+                {
+                    await Task.Run(() => assetsManager.LoadFiles(openFileDialog1.FileNames));
+                }
+                catch (MemoryPressureException ex)
+                {
+                    ShowMemoryPressureError(ex);
+                    return;
+                }
                 BuildAssetStructures();
             }
         }
@@ -187,12 +210,126 @@ namespace AssetStudioGUI
             openFolderDialog.InitialFolder = openDirectoryBackup;
             if (openFolderDialog.ShowDialog(this) == DialogResult.OK)
             {
+                if (!await ConfirmFolderLoadIfRisky(openFolderDialog.Folder))
+                {
+                    StatusStripUpdate("Folder load cancelled.");
+                    return;
+                }
+
                 ResetForm();
                 SetLoadFolder(openFolderDialog.Folder);
                 assetsManager.SpecifyUnityVersion = specifyUnityVersion.Text;
-                await Task.Run(() => assetsManager.LoadFolder(openFolderDialog.Folder));
+                try
+                {
+                    await Task.Run(() => assetsManager.LoadFolder(openFolderDialog.Folder));
+                }
+                catch (MemoryPressureException ex)
+                {
+                    ShowMemoryPressureError(ex);
+                    return;
+                }
                 BuildAssetStructures();
             }
+        }
+
+        private async Task<bool> ConfirmFolderLoadIfRisky(string folderPath)
+        {
+            StatusStripUpdate("Scanning folder...");
+            ProjectScanResult scanResult;
+            using var scanCts = new CancellationTokenSource();
+            var scanProgress = new Progress<ScanProgress>(p =>
+            {
+                if (p.TotalFiles > 0)
+                {
+                    StatusStripUpdate($"Scanning folder... {p.ScannedFiles:N0}/{p.TotalFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
+                }
+                else
+                {
+                    StatusStripUpdate($"Scanning folder... {p.ScannedFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
+                }
+            });
+            try
+            {
+                scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath, scanCts.Token, scanProgress));
+            }
+            catch (OperationCanceledException)
+            {
+                StatusStripUpdate("Folder scan cancelled.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Unable to scan folder before loading:\n{ex.Message}", "Folder scan failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return true;
+            }
+
+            StatusStripUpdate($"Scan complete: {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
+
+            if (!scanResult.IsRisky)
+            {
+                return true;
+            }
+
+            var message = BuildRiskyProjectMessage(scanResult);
+            var choice = MessageBox.Show(this, message + "\nDo you want to continue loading?", "Large Unity project detected", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            return choice == DialogResult.Yes;
+        }
+
+        private static string BuildRiskyProjectMessage(ProjectScanResult scanResult)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("This folder contains a very large number of Unity bundles.");
+            sb.AppendLine();
+            sb.AppendLine($"Files: {scanResult.TotalFiles:N0}");
+            sb.AppendLine($"Size on disk: {FormatBytes(scanResult.TotalBytes)}");
+            sb.AppendLine($"Unity bundles: {scanResult.UnityBundleCount:N0}");
+            sb.AppendLine($"Serialized files: {scanResult.SerializedFileCount:N0}");
+            sb.AppendLine($"Resource files: {scanResult.ResourceFileCount:N0}");
+            if (scanResult.ErrorCount > 0)
+            {
+                sb.AppendLine($"Scan errors: {scanResult.ErrorCount:N0}");
+            }
+            sb.AppendLine();
+            sb.AppendLine($"Estimated RAM to load: {FormatBytes(scanResult.EstimatedMemoryBytes)}");
+            if (scanResult.AvailableMemoryBytes > 0)
+            {
+                sb.AppendLine($"Available RAM: {FormatBytes(scanResult.AvailableMemoryBytes)}");
+            }
+            if (scanResult.IsMemoryRisky)
+            {
+                sb.AppendLine();
+                sb.AppendLine("⚠ The estimated memory exceeds available RAM. Loading may freeze the system or trigger the OOM killer.");
+            }
+            sb.AppendLine();
+            sb.AppendLine("Loading all bundles at once can use far more memory than the project size on disk and may push Linux into swap.");
+            sb.AppendLine("The safer future path is scan/index mode with lazy loading. For now, continue only if you really want the eager load path.");
+            sb.AppendLine();
+            return sb.ToString();
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            string[] units = { "B", "KB", "MB", "GB", "TB" };
+            double value = bytes;
+            int unit = 0;
+            while (value >= 1024 && unit < units.Length - 1)
+            {
+                value /= 1024;
+                unit++;
+            }
+            return $"{value:0.##} {units[unit]}";
+        }
+
+        private void ShowMemoryPressureError(MemoryPressureException ex)
+        {
+            var msg = $"Loading was stopped because system memory usage reached {ex.MemoryLoadPercent}% (limit: {ex.LimitPercent}%).\n\n" +
+                      $"Operation: {ex.Operation}\n\n" +
+                      "Options:\n" +
+                      "• Load fewer bundles at a time\n" +
+                      "• Close other applications to free RAM\n" +
+                      "• Raise the limit with ASSETSTUDIO_MEMORY_LIMIT_PERCENT (current: " + ex.LimitPercent + ")";
+            StatusStripUpdate($"Loading stopped: memory pressure at {ex.MemoryLoadPercent}%.");
+            MessageBox.Show(this, msg, "Memory pressure — loading stopped", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private async void extractFileToolStripMenuItem_Click(object sender, EventArgs e)

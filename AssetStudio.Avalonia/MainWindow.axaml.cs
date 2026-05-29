@@ -86,6 +86,13 @@ public partial class MainWindow : Window
     private volatile int _targetVolume = 80;
     private DispatcherTimer? _ffmpegVideoTimer;
 
+    private ProjectScanResult? currentScanResult;
+    private bool isBuildingAssetStructures;
+    private CancellationTokenSource? indexingCts;
+    private bool isIndexingPaused;
+    private Task? indexingTask;
+    private List<string> pendingFilesToIndex = new List<string>();
+
     private string? _pendingStatusText;
     private bool _statusUpdatePending;
 
@@ -151,7 +158,7 @@ public partial class MainWindow : Window
             logger.Log(LoggerEvent.Error, $"Failed to initialize FFmpeg audio player: {ex.Message}");
         }
 
-        // Detect GPU support (OpenGL interface availability)
+        // Detect GPU support
         try
         {
             var locatorType = typeof(global::Avalonia.Application).Assembly.GetType("Avalonia.AvaloniaLocator");
@@ -284,6 +291,16 @@ public partial class MainWindow : Window
         classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
+        if (indexingCts != null)
+        {
+            indexingCts.Cancel();
+            indexingCts.Dispose();
+            indexingCts = null;
+        }
+        if (indexingMenu != null)
+        {
+            indexingMenu.IsVisible = false;
+        }
         progressBar.Value = 0;
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
@@ -881,7 +898,15 @@ public partial class MainWindow : Window
             StatusStripUpdate("Loading files...");
             assetsManager.Clear();
             ApplyUnityVersionOption();
-            await Task.Run(() => assetsManager.LoadFiles(filePaths));
+            try
+            {
+                await Task.Run(() => assetsManager.LoadFiles(filePaths));
+            }
+            catch (MemoryPressureException ex)
+            {
+                ShowMemoryPressureError(ex);
+                return;
+            }
             BuildAssetStructures();
         }
     }
@@ -895,19 +920,36 @@ public partial class MainWindow : Window
         if (folders != null && folders.Count > 0)
         {
             var folderPath = folders[0].Path.LocalPath;
-            if (!await ConfirmFolderLoadIfRisky(folderPath))
+            var loadChoice = await ConfirmFolderLoadIfRisky(folderPath);
+            if (loadChoice == RiskyLoadChoice.Cancel)
             {
                 StatusStripUpdate("Folder load cancelled.");
                 return;
             }
 
-            SaveLoadFolder(folderPath);
-            ResetForm();
-            StatusStripUpdate("Loading folder...");
-            assetsManager.Clear();
-            ApplyUnityVersionOption();
-            await Task.Run(() => assetsManager.LoadFolder(folderPath));
-            BuildAssetStructures();
+            if (loadChoice == RiskyLoadChoice.LazyLoad)
+            {
+                LoadPathsProgressiveAsync(new[] { folderPath });
+            }
+            else
+            {
+                SaveLoadFolder(folderPath);
+                ResetForm();
+                StatusStripUpdate("Loading folder...");
+                assetsManager.Clear();
+                assetsManager.LazyLoading = false;
+                ApplyUnityVersionOption();
+                try
+                {
+                    await Task.Run(() => assetsManager.LoadFolder(folderPath));
+                }
+                catch (MemoryPressureException ex)
+                {
+                    ShowMemoryPressureError(ex);
+                    return;
+                }
+                BuildAssetStructures();
+            }
         }
     }
 
@@ -973,57 +1015,445 @@ public partial class MainWindow : Window
 
     private async Task LoadDroppedPaths(string[] paths)
     {
-        if (paths.Length == 1 && Directory.Exists(paths[0])
-            && !await ConfirmFolderLoadIfRisky(paths[0]))
-        {
-            StatusStripUpdate("Dropped folder load cancelled.");
-            return;
-        }
-
-        ResetForm();
-        assetsManager.Clear();
-        ApplyUnityVersionOption();
-        StatusStripUpdate("Loading dropped files...");
-
+        var loadChoice = RiskyLoadChoice.EagerLoad;
         if (paths.Length == 1 && Directory.Exists(paths[0]))
         {
-            await Task.Run(() => assetsManager.LoadFolder(paths[0]));
+            loadChoice = await ConfirmFolderLoadIfRisky(paths[0]);
+            if (loadChoice == RiskyLoadChoice.Cancel)
+            {
+                StatusStripUpdate("Dropped folder load cancelled.");
+                return;
+            }
+        }
+
+        if (loadChoice == RiskyLoadChoice.LazyLoad)
+        {
+            LoadPathsProgressiveAsync(paths);
         }
         else
         {
-            var files = paths
-                .SelectMany(path => Directory.Exists(path)
-                    ? Directory.GetFiles(path, "*.*", SearchOption.AllDirectories)
-                    : new[] { path })
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            await Task.Run(() => assetsManager.LoadFiles(files));
-        }
+            ResetForm();
+            assetsManager.Clear();
+            assetsManager.LazyLoading = false;
+            ApplyUnityVersionOption();
+            StatusStripUpdate("Loading dropped files...");
 
-        BuildAssetStructures();
+            try
+            {
+                if (paths.Length == 1 && Directory.Exists(paths[0]))
+                {
+                    await Task.Run(() => assetsManager.LoadFolder(paths[0]));
+                }
+                else
+                {
+                    var files = paths
+                        .SelectMany(path => Directory.Exists(path)
+                            ? Directory.GetFiles(path, "*.*", SearchOption.AllDirectories)
+                            : new[] { path })
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+                    await Task.Run(() => assetsManager.LoadFiles(files));
+                }
+            }
+            catch (MemoryPressureException ex)
+            {
+                ShowMemoryPressureError(ex);
+                return;
+            }
+
+            BuildAssetStructures();
+        }
     }
 
-    private async Task<bool> ConfirmFolderLoadIfRisky(string folderPath)
+    public enum RiskyLoadChoice
+    {
+        Cancel,
+        EagerLoad,
+        LazyLoad
+    }
+
+    private async Task<RiskyLoadChoice> ConfirmFolderLoadIfRisky(string folderPath)
     {
         StatusStripUpdate("Scanning folder...");
         ProjectScanResult scanResult;
+        using var scanCts = new CancellationTokenSource();
+        var scanProgress = new Progress<ScanProgress>(p =>
+        {
+            if (p.TotalFiles > 0)
+            {
+                StatusStripUpdate($"Scanning folder... {p.ScannedFiles:N0}/{p.TotalFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
+            }
+            else
+            {
+                StatusStripUpdate($"Scanning folder... {p.ScannedFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
+            }
+        });
         try
         {
-            scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath));
+            scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath, scanCts.Token, scanProgress));
+        }
+        catch (OperationCanceledException)
+        {
+            StatusStripUpdate("Folder scan cancelled.");
+            return RiskyLoadChoice.Cancel;
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Unable to scan folder before loading:\n{ex.Message}", "Folder scan failed");
-            return true;
+            return RiskyLoadChoice.EagerLoad;
         }
+
+        StatusStripUpdate($"Scan complete: {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
 
         if (!scanResult.IsRisky)
         {
-            return true;
+            return RiskyLoadChoice.EagerLoad;
         }
+
+        currentScanResult = scanResult;
 
         var message = BuildRiskyProjectMessage(scanResult);
         return await ShowRiskyProjectDialog(message);
+    }
+
+    private async void LoadPathsProgressiveAsync(string[] paths)
+    {
+        ResetForm();
+        assetsManager.Clear();
+        assetsManager.LazyLoading = true;
+        ApplyUnityVersionOption();
+        StatusStripUpdate("Loading progressively...");
+
+        try
+        {
+            var files = new List<string>();
+            if (paths.Length == 1 && Directory.Exists(paths[0]))
+            {
+                var folderPath = paths[0];
+                SaveLoadFolder(folderPath);
+                await Task.Run(() => ImportHelper.MergeSplitAssets(folderPath, true));
+                var enumerated = await Task.Run(() => Directory.EnumerateFiles(folderPath, "*.*", SearchOption.AllDirectories));
+                files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(enumerated).ToList());
+            }
+            else
+            {
+                var targetFolder = Path.GetDirectoryName(Path.GetFullPath(paths[0])) ?? string.Empty;
+                if (!string.IsNullOrEmpty(targetFolder))
+                {
+                    SaveLoadFolder(targetFolder);
+                    await Task.Run(() => ImportHelper.MergeSplitAssets(targetFolder, false));
+                }
+
+                var list = paths
+                    .SelectMany(path => Directory.Exists(path)
+                        ? Directory.GetFiles(path, "*.*", SearchOption.AllDirectories)
+                        : new[] { path })
+                    .Distinct(StringComparer.OrdinalIgnoreCase);
+                files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(list).ToList());
+            }
+
+            if (files.Count == 0)
+            {
+                StatusStripUpdate("No Unity files found.");
+                return;
+            }
+
+            // Check cache
+            ProjectIndexCache? cachedIndex = null;
+            if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
+            {
+                cachedIndex = LoadIndexCache(paths[0], currentScanResult);
+            }
+
+            if (cachedIndex != null)
+            {
+                StatusStripUpdate("Loading project index from cache...");
+                foreach (var ch in cachedIndex.Handles)
+                {
+                    var handle = new AssetHandle
+                    {
+                        UniqueID = ch.UniqueID,
+                        Name = ch.Name,
+                        Type = (ClassIDType)ch.Type,
+                        Container = ch.Container,
+                        OriginalPath = ch.OriginalPath,
+                        SerializedFileName = ch.SerializedFileName,
+                        PathID = ch.PathID,
+                        ByteStart = ch.ByteStart,
+                        ByteSize = ch.ByteSize
+                    };
+                    assetsManager.ProjectIndex.AddHandle(handle);
+                }
+            }
+
+            StartProgressiveIndexing(files, paths);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Error during progressive load:\n{ex.Message}", "Load failed");
+            StatusStripUpdate("Progressive load failed.");
+        }
+    }
+
+    private void StartProgressiveIndexing(List<string> files, string[] paths)
+    {
+        if (indexingCts != null)
+        {
+            indexingCts.Cancel();
+            indexingCts.Dispose();
+        }
+
+        indexingCts = new CancellationTokenSource();
+        var token = indexingCts.Token;
+        isIndexingPaused = false;
+        pendingFilesToIndex = files.ToList();
+
+        indexingMenu.IsVisible = true;
+        pauseIndexingMenu.IsEnabled = true;
+        resumeIndexingMenu.IsEnabled = false;
+        stopIndexingMenu.IsEnabled = true;
+
+        var originalTotal = pendingFilesToIndex.Count;
+
+        indexingTask = Task.Run(async () =>
+        {
+            int batchSize = 100;
+            int loadedCount = 0;
+
+            while (pendingFilesToIndex.Count > 0)
+            {
+                if (token.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                while (isIndexingPaused)
+                {
+                    await Task.Delay(200, token);
+                    if (token.IsCancellationRequested)
+                        break;
+                }
+
+                if (token.IsCancellationRequested)
+                    break;
+
+                try
+                {
+                    AssetsManager.ThrowIfMemoryPressureTooHigh("progressive indexing");
+                }
+                catch (MemoryPressureException ex)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        ShowMemoryPressureError(ex);
+                        isIndexingPaused = true;
+                        pauseIndexingMenu.IsEnabled = false;
+                        resumeIndexingMenu.IsEnabled = true;
+                        StatusStripUpdate("Indexing paused due to high memory pressure.");
+                    });
+
+                    while (isIndexingPaused && !token.IsCancellationRequested)
+                    {
+                        await Task.Delay(500);
+                    }
+                    continue;
+                }
+
+                List<ClassIDType> activeFilters = new List<ClassIDType>();
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (filterTypeAll.IsChecked != true)
+                    {
+                        activeFilters = GetFilterTypeItems()
+                            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+                            .Select(x => (ClassIDType)x.Tag!)
+                            .ToList();
+                    }
+                });
+
+                await Task.Delay(50);
+
+                var batch = new List<string>();
+                lock (pendingFilesToIndex)
+                {
+                    var keywords = new List<string>();
+                    if (activeFilters.Contains(ClassIDType.Texture2D) || activeFilters.Contains(ClassIDType.Sprite))
+                        keywords.AddRange(new[] { "texture", "sprite", "atlas", "image", "pic" });
+                    if (activeFilters.Contains(ClassIDType.AudioClip))
+                        keywords.AddRange(new[] { "audio", "sound", "music", "sfx", "clip" });
+                    if (activeFilters.Contains(ClassIDType.Mesh))
+                        keywords.AddRange(new[] { "mesh", "model", "geom", "3d" });
+                    if (activeFilters.Contains(ClassIDType.AnimationClip) || activeFilters.Contains(ClassIDType.Animator))
+                        keywords.AddRange(new[] { "anim", "motion", "controller" });
+                    if (activeFilters.Contains(ClassIDType.Shader))
+                        keywords.Add("shader");
+                    if (activeFilters.Contains(ClassIDType.MonoBehaviour))
+                        keywords.AddRange(new[] { "script", "behavior", "mono" });
+
+                    if (keywords.Count > 0)
+                    {
+                        for (int i = 0; i < pendingFilesToIndex.Count && batch.Count < batchSize; i++)
+                        {
+                            var file = pendingFilesToIndex[i];
+                            var fileName = Path.GetFileName(file).ToLowerInvariant();
+                            if (keywords.Any(k => fileName.Contains(k)))
+                            {
+                                batch.Add(file);
+                                pendingFilesToIndex.RemoveAt(i);
+                                i--;
+                            }
+                        }
+                    }
+
+                    while (pendingFilesToIndex.Count > 0 && batch.Count < batchSize)
+                    {
+                        batch.Add(pendingFilesToIndex[0]);
+                        pendingFilesToIndex.RemoveAt(0);
+                    }
+                }
+
+                if (batch.Count == 0)
+                    break;
+
+                try
+                {
+                    assetsManager.LoadFiles(batch.ToArray());
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Error loading batch of {batch.Count} files", ex);
+                }
+
+                loadedCount += batch.Count;
+                var currentLoaded = loadedCount;
+                var progressPercent = (int)((double)currentLoaded / originalTotal * 100);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    progressBar.Value = progressPercent;
+                    StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%)");
+                    BuildAssetStructures();
+                });
+            }
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                indexingMenu.IsVisible = false;
+                progressBar.Value = 100;
+                StatusStripUpdate($"Indexing finished. Total files: {originalTotal:N0}");
+
+                if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !token.IsCancellationRequested)
+                {
+                    SaveIndexCache(paths[0], currentScanResult);
+                }
+
+                BuildAssetStructures();
+            });
+        }, token);
+    }
+
+    private void PauseIndexing_Click(object? sender, RoutedEventArgs e)
+    {
+        isIndexingPaused = true;
+        pauseIndexingMenu.IsEnabled = false;
+        resumeIndexingMenu.IsEnabled = true;
+        StatusStripUpdate("Indexing paused.");
+    }
+
+    private void ResumeIndexing_Click(object? sender, RoutedEventArgs e)
+    {
+        isIndexingPaused = false;
+        pauseIndexingMenu.IsEnabled = true;
+        resumeIndexingMenu.IsEnabled = false;
+        StatusStripUpdate("Resuming indexing...");
+    }
+
+    private void StopIndexing_Click(object? sender, RoutedEventArgs e)
+    {
+        indexingCts?.Cancel();
+        indexingMenu.IsVisible = false;
+        StatusStripUpdate("Stopping/cancelling indexing...");
+    }
+
+    private static string GetFolderCacheKey(string folderPath)
+    {
+        using var md5 = System.Security.Cryptography.MD5.Create();
+        var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
+        return Convert.ToHexString(hashBytes).ToLowerInvariant();
+    }
+
+    private void SaveIndexCache(string folderPath, ProjectScanResult scanResult)
+    {
+        try
+        {
+            var cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
+            if (!Directory.Exists(cacheDir))
+            {
+                Directory.CreateDirectory(cacheDir);
+            }
+
+            var cacheKey = GetFolderCacheKey(folderPath);
+            var cachePath = Path.Combine(cacheDir, $"{cacheKey}.json");
+
+            var cache = new ProjectIndexCache
+            {
+                RootPath = folderPath,
+                TotalFiles = scanResult.TotalFiles,
+                TotalBytes = scanResult.TotalBytes,
+                UnityBundleCount = scanResult.UnityBundleCount,
+                Handles = assetsManager.ProjectIndex.GetHandles().Select(h => new CachedAssetHandle
+                {
+                    UniqueID = h.UniqueID,
+                    Name = h.Name,
+                    Type = (int)h.Type,
+                    Container = h.Container,
+                    OriginalPath = h.OriginalPath,
+                    SerializedFileName = h.SerializedFileName,
+                    PathID = h.PathID,
+                    ByteStart = h.ByteStart,
+                    ByteSize = h.ByteSize
+                }).ToList()
+            };
+
+            var json = System.Text.Json.JsonSerializer.Serialize(cache);
+            File.WriteAllText(cachePath, json);
+            Logger.Info($"Saved index cache to {cachePath}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to save index cache: {ex.Message}");
+        }
+    }
+
+    private ProjectIndexCache? LoadIndexCache(string folderPath, ProjectScanResult scanResult)
+    {
+        try
+        {
+            var cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
+            var cacheKey = GetFolderCacheKey(folderPath);
+            var cachePath = Path.Combine(cacheDir, $"{cacheKey}.json");
+
+            if (!File.Exists(cachePath))
+            {
+                return null;
+            }
+
+            var json = File.ReadAllText(cachePath);
+            var cache = System.Text.Json.JsonSerializer.Deserialize<ProjectIndexCache>(json);
+
+            if (cache != null &&
+                cache.TotalFiles == scanResult.TotalFiles &&
+                cache.TotalBytes == scanResult.TotalBytes &&
+                cache.UnityBundleCount == scanResult.UnityBundleCount)
+            {
+                return cache;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to load index cache: {ex.Message}");
+        }
+        return null;
     }
 
     private static string BuildRiskyProjectMessage(ProjectScanResult scanResult)
@@ -1041,20 +1471,31 @@ public partial class MainWindow : Window
             sb.AppendLine($"Scan errors: {scanResult.ErrorCount:N0}");
         }
         sb.AppendLine();
+        sb.AppendLine($"Estimated RAM to load: {FormatBytes(scanResult.EstimatedMemoryBytes)}");
+        if (scanResult.AvailableMemoryBytes > 0)
+        {
+            sb.AppendLine($"Available RAM: {FormatBytes(scanResult.AvailableMemoryBytes)}");
+        }
+        if (scanResult.IsMemoryRisky)
+        {
+            sb.AppendLine();
+            sb.AppendLine("⚠ The estimated memory exceeds available RAM. Loading may freeze the system or trigger the OOM killer.");
+        }
+        sb.AppendLine();
         sb.AppendLine("Loading all bundles at once can use far more memory than the project size on disk and may push Linux into swap.");
-        sb.AppendLine("The safer future path is scan/index mode with lazy loading. For now, continue only if you really want the eager load path.");
+        sb.AppendLine("The safer alternative is Safe/Lazy Mode, which index-scans all files and only materializes assets on demand.");
         return sb.ToString();
     }
 
-    private async Task<bool> ShowRiskyProjectDialog(string message)
+    private async Task<RiskyLoadChoice> ShowRiskyProjectDialog(string message)
     {
         var dialog = new Window
         {
             Title = "Large Unity project detected",
-            Width = 620,
-            Height = 420,
-            MinWidth = 520,
-            MinHeight = 320,
+            Width = 640,
+            Height = 440,
+            MinWidth = 540,
+            MinHeight = 340,
             WindowStartupLocation = WindowStartupLocation.CenterOwner
         };
 
@@ -1088,16 +1529,25 @@ public partial class MainWindow : Window
             Content = "Cancel",
             MinWidth = 90
         };
-        cancelButton.Click += (_, _) => dialog.Close(false);
+        cancelButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.Cancel);
+
+        var lazyButton = new Button
+        {
+            Content = "Load in Safe/Lazy Mode (Recommended)",
+            MinWidth = 240,
+            FontWeight = global::Avalonia.Media.FontWeight.Bold
+        };
+        lazyButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.LazyLoad);
 
         var loadButton = new Button
         {
-            Content = "Load anyway",
-            MinWidth = 120
+            Content = "Load anyway (Eager)",
+            MinWidth = 150
         };
-        loadButton.Click += (_, _) => dialog.Close(true);
+        loadButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.EagerLoad);
 
         buttonPanel.Children.Add(cancelButton);
+        buttonPanel.Children.Add(lazyButton);
         buttonPanel.Children.Add(loadButton);
 
         Grid.SetRow(scrollViewer, 0);
@@ -1106,7 +1556,7 @@ public partial class MainWindow : Window
         grid.Children.Add(buttonPanel);
         dialog.Content = grid;
 
-        return await dialog.ShowDialog<bool>(this);
+        return await dialog.ShowDialog<RiskyLoadChoice>(this);
     }
 
     private static string FormatBytes(long bytes)
@@ -1121,6 +1571,18 @@ public partial class MainWindow : Window
         }
 
         return $"{value:0.##} {units[unit]}";
+    }
+
+    private void ShowMemoryPressureError(MemoryPressureException ex)
+    {
+        var msg = $"Loading was stopped because system memory usage reached {ex.MemoryLoadPercent}% (limit: {ex.LimitPercent}%).\n\n" +
+                  $"Operation: {ex.Operation}\n\n" +
+                  "Options:\n" +
+                  "• Load fewer bundles at a time\n" +
+                  "• Close other applications to free RAM\n" +
+                  "• Raise the limit with ASSETSTUDIO_MEMORY_LIMIT_PERCENT (current: " + ex.LimitPercent + ")";
+        StatusStripUpdate($"Loading stopped: memory pressure at {ex.MemoryLoadPercent}%.");
+        MessageBox.Show(this, msg, "Memory pressure — loading stopped");
     }
 
     private int ExtractFolder(string path, string savePath)
@@ -1213,17 +1675,25 @@ public partial class MainWindow : Window
 
     private async void BuildAssetStructures()
     {
-        if (assetsManager.assetsFileList.Count == 0)
+        if (isBuildingAssetStructures) return;
+        isBuildingAssetStructures = true;
+        try
         {
-            StatusStripUpdate("No Unity file can be loaded.");
-            return;
-        }
+            if (assetsManager.assetsFileList.Count == 0)
+            {
+                StatusStripUpdate("No Unity file can be loaded.");
+                return;
+            }
 
-        StatusStripUpdate("Building asset structures...");
+            StatusStripUpdate("Building asset structures...");
 
         // Capture required UI states on the UI thread
         bool displayAllChecked = displayAll.IsChecked == true;
-        var filesListSnapshot = assetsManager.assetsFileList.ToList();
+        List<SerializedFile> filesListSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesListSnapshot = assetsManager.assetsFileList.ToList();
+        }
 
         var result = await Task.Run(() =>
         {
@@ -1231,110 +1701,21 @@ public partial class MainWindow : Window
             var localExportableAssets = new List<AssetItem>();
             var localSceneTreeNodes = new List<GameObjectNode>();
             
-            var objectCount = filesListSnapshot.Sum(x => x.Objects.Count);
             var localTreeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
-            var localObjectAssetItemDic = new Dictionary<Object, AssetItem>(objectCount);
+            var localObjectAssetItemDic = new Dictionary<Object, AssetItem>();
+            var localPathIDAssetItemDic = new Dictionary<string, AssetItem>();
             var localContainers = new List<(PPtr<Object>, string)>();
 
             int i = 0;
 
-            foreach (var assetsFile in filesListSnapshot)
+            if (assetsManager.LazyLoading)
             {
-                var fileNode = new GameObjectNode { Name = assetsFile.fileName };
-
-                foreach (var asset in assetsFile.Objects)
+                foreach (var assetsFile in filesListSnapshot)
                 {
-                    var assetItem = new AssetItem(asset);
-                    assetItem.UniqueID = " #" + i;
-                    localObjectAssetItemDic[asset] = assetItem;
-                    var exportable = false;
-
-                    switch (asset)
+                    foreach (var asset in assetsFile.Objects)
                     {
-                        case GameObject m_GameObject:
-                            assetItem.Name = m_GameObject.m_Name;
-
-                            if (!localTreeNodeDictionary.TryGetValue(m_GameObject, out var currentNode))
-                            {
-                                currentNode = new GameObjectNode { Name = m_GameObject.m_Name, GameObject = m_GameObject };
-                                localTreeNodeDictionary.Add(m_GameObject, currentNode);
-                            }
-
-                            var parentNode = fileNode;
-
-                            if (m_GameObject.m_Transform != null && m_GameObject.m_Transform.m_Father.TryGet(out var m_Father))
-                            {
-                                if (m_Father.m_GameObject.TryGet(out var parentGameObject))
-                                {
-                                    if (!localTreeNodeDictionary.TryGetValue(parentGameObject, out var parentGameObjectNode))
-                                    {
-                                        parentGameObjectNode = new GameObjectNode { Name = parentGameObject.m_Name, GameObject = parentGameObject };
-                                        localTreeNodeDictionary.Add(parentGameObject, parentGameObjectNode);
-                                    }
-                                    parentNode = parentGameObjectNode;
-                                }
-                            }
-
-                            parentNode.AddChild(currentNode);
-                            break;
-
-                        case Texture2D m_Texture2D:
-                            if (!string.IsNullOrEmpty(m_Texture2D.m_StreamData?.path))
-                                assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
-                            assetItem.Name = m_Texture2D.m_Name;
-                            exportable = true;
-                            break;
-                        case AudioClip m_AudioClip:
-                            if (!string.IsNullOrEmpty(m_AudioClip.m_Source))
-                                assetItem.FullSize = asset.byteSize + m_AudioClip.m_Size;
-                            assetItem.Name = m_AudioClip.m_Name;
-                            exportable = true;
-                            break;
-                        case VideoClip m_VideoClip:
-                            if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
-                                assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
-                            assetItem.Name = m_VideoClip.m_Name;
-                            exportable = true;
-                            break;
-                        case Shader m_Shader:
-                            assetItem.Name = m_Shader.m_ParsedForm?.m_Name ?? m_Shader.m_Name;
-                            exportable = true;
-                            break;
-                        case Mesh _:
-                        case Material _:
-                        case TextAsset _:
-                        case AnimationClip _:
-                        case Font _:
-                        case MovieTexture _:
-                        case Sprite _:
-                        case Avatar _:
-                        case RuntimeAnimatorController _:
-                            assetItem.Name = ((NamedObject)asset).m_Name;
-                            exportable = true;
-                            break;
-                        case MonoScript m_MonoScript:
-                            assetItem.Name = m_MonoScript.m_Name;
-                            exportable = true;
-                            break;
-                        case Animator m_Animator:
-                            if (m_Animator.m_GameObject.TryGet(out var gameObject))
-                            {
-                                assetItem.Name = gameObject.m_Name;
-                            }
-                            exportable = true;
-                            break;
-                        case MonoBehaviour m_MonoBehaviour:
-                            if (m_MonoBehaviour.m_Name == "" && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
-                            {
-                                assetItem.Name = m_Script.m_ClassName;
-                            }
-                            else
-                            {
-                                assetItem.Name = m_MonoBehaviour.m_Name;
-                            }
-                            exportable = true;
-                            break;
-                        case AssetBundle m_AssetBundle:
+                        if (asset is AssetBundle m_AssetBundle)
+                        {
                             foreach (var m_Container in m_AssetBundle.m_Container)
                             {
                                 var preloadIndex = m_Container.Value.preloadIndex;
@@ -1345,25 +1726,47 @@ public partial class MainWindow : Window
                                     localContainers.Add((m_AssetBundle.m_PreloadTable[k], m_Container.Key));
                                 }
                             }
-                            assetItem.Name = m_AssetBundle.m_Name;
-                            break;
-                        case ResourceManager m_ResourceManager:
+                        }
+                        else if (asset is ResourceManager m_ResourceManager)
+                        {
                             foreach (var m_Container in m_ResourceManager.m_Container)
                             {
                                 localContainers.Add((m_Container.Value, m_Container.Key));
                             }
-                            break;
-                        case PlayerSettings m_PlayerSettings:
-                            localProductName = m_PlayerSettings.productName;
-                            break;
-                        case NamedObject m_NamedObject:
-                            assetItem.Name = m_NamedObject.m_Name;
-                            break;
+                        }
+                    }
+                }
+
+                var handles = assetsManager.ProjectIndex.GetHandles();
+                foreach (var handle in handles)
+                {
+                    var assetItem = new AssetItem(handle);
+                    assetItem.UniqueID = " #" + i;
+                    
+                    localPathIDAssetItemDic[handle.UniqueID] = assetItem;
+                    if (handle.RealObject != null)
+                    {
+                        localObjectAssetItemDic[handle.RealObject] = assetItem;
                     }
 
-                    if (string.IsNullOrEmpty(assetItem.Name))
+                    bool exportable = false;
+                    switch (handle.Type)
                     {
-                        assetItem.Name = assetItem.TypeString + assetItem.UniqueID;
+                        case ClassIDType.Texture2D:
+                        case ClassIDType.AudioClip:
+                        case ClassIDType.VideoClip:
+                        case ClassIDType.Shader:
+                        case ClassIDType.Mesh:
+                        case ClassIDType.Material:
+                        case ClassIDType.TextAsset:
+                        case ClassIDType.MonoBehaviour:
+                        case ClassIDType.Font:
+                        case ClassIDType.Sprite:
+                        case ClassIDType.MovieTexture:
+                        case ClassIDType.AnimationClip:
+                        case ClassIDType.Animator:
+                            exportable = true;
+                            break;
                     }
 
                     if (displayAllChecked || exportable)
@@ -1372,54 +1775,229 @@ public partial class MainWindow : Window
                     }
                     i++;
                 }
-
-                if (fileNode.ChildCount > 0)
+            }
+            else
+            {
+                foreach (var assetsFile in filesListSnapshot)
                 {
-                    localSceneTreeNodes.Add(fileNode);
+                    var fileNode = new GameObjectNode { Name = assetsFile.fileName };
+
+                    foreach (var asset in assetsFile.Objects)
+                    {
+                        var assetItem = new AssetItem(asset);
+                        assetItem.UniqueID = " #" + i;
+                        localObjectAssetItemDic[asset] = assetItem;
+                        localPathIDAssetItemDic[$"{assetsFile.fileName}#{asset.m_PathID}"] = assetItem;
+                        var exportable = false;
+
+                        switch (asset)
+                        {
+                            case GameObject m_GameObject:
+                                assetItem.Name = m_GameObject.m_Name;
+
+                                if (!localTreeNodeDictionary.TryGetValue(m_GameObject, out var currentNode))
+                                {
+                                    currentNode = new GameObjectNode { Name = m_GameObject.m_Name, GameObject = m_GameObject };
+                                    localTreeNodeDictionary.Add(m_GameObject, currentNode);
+                                }
+
+                                var parentNode = fileNode;
+
+                                if (m_GameObject.m_Transform != null && m_GameObject.m_Transform.m_Father.TryGet(out var m_Father))
+                                {
+                                    if (m_Father.m_GameObject.TryGet(out var parentGameObject))
+                                    {
+                                        if (!localTreeNodeDictionary.TryGetValue(parentGameObject, out var parentGameObjectNode))
+                                        {
+                                            parentGameObjectNode = new GameObjectNode { Name = parentGameObject.m_Name, GameObject = parentGameObject };
+                                            localTreeNodeDictionary.Add(parentGameObject, parentGameObjectNode);
+                                        }
+                                        parentNode = parentGameObjectNode;
+                                    }
+                                }
+
+                                parentNode.AddChild(currentNode);
+                                break;
+
+                            case Texture2D m_Texture2D:
+                                if (!string.IsNullOrEmpty(m_Texture2D.m_StreamData?.path))
+                                    assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
+                                assetItem.Name = m_Texture2D.m_Name;
+                                exportable = true;
+                                break;
+                            case AudioClip m_AudioClip:
+                                if (!string.IsNullOrEmpty(m_AudioClip.m_Source))
+                                    assetItem.FullSize = asset.byteSize + m_AudioClip.m_Size;
+                                assetItem.Name = m_AudioClip.m_Name;
+                                exportable = true;
+                                break;
+                            case VideoClip m_VideoClip:
+                                if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
+                                    assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
+                                assetItem.Name = m_VideoClip.m_Name;
+                                exportable = true;
+                                break;
+                            case Shader m_Shader:
+                                assetItem.Name = m_Shader.m_ParsedForm?.m_Name ?? m_Shader.m_Name;
+                                exportable = true;
+                                break;
+                            case Mesh _:
+                            case Material _:
+                            case TextAsset _:
+                            case AnimationClip _:
+                            case Font _:
+                            case MovieTexture _:
+                            case Sprite _:
+                            case Avatar _:
+                            case RuntimeAnimatorController _:
+                                assetItem.Name = ((NamedObject)asset).m_Name;
+                                exportable = true;
+                                break;
+                            case MonoScript m_MonoScript:
+                                assetItem.Name = m_MonoScript.m_Name;
+                                exportable = true;
+                                break;
+                            case Animator m_Animator:
+                                if (m_Animator.m_GameObject.TryGet(out var gameObject))
+                                {
+                                    assetItem.Name = gameObject.m_Name;
+                                }
+                                exportable = true;
+                                break;
+                            case MonoBehaviour m_MonoBehaviour:
+                                if (m_MonoBehaviour.m_Name == "" && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
+                                {
+                                    assetItem.Name = m_Script.m_ClassName;
+                                }
+                                else
+                                {
+                                    assetItem.Name = m_MonoBehaviour.m_Name;
+                                }
+                                exportable = true;
+                                break;
+                            case AssetBundle m_AssetBundle:
+                                foreach (var m_Container in m_AssetBundle.m_Container)
+                                {
+                                    var preloadIndex = m_Container.Value.preloadIndex;
+                                    var preloadSize = m_Container.Value.preloadSize;
+                                    var preloadEnd = preloadIndex + preloadSize;
+                                    for (int k = preloadIndex; k < preloadEnd; k++)
+                                    {
+                                        localContainers.Add((m_AssetBundle.m_PreloadTable[k], m_Container.Key));
+                                    }
+                                }
+                                assetItem.Name = m_AssetBundle.m_Name;
+                                break;
+                            case ResourceManager m_ResourceManager:
+                                foreach (var m_Container in m_ResourceManager.m_Container)
+                                {
+                                    localContainers.Add((m_Container.Value, m_Container.Key));
+                                }
+                                break;
+                            case PlayerSettings m_PlayerSettings:
+                                localProductName = m_PlayerSettings.productName;
+                                break;
+                            case NamedObject m_NamedObject:
+                                assetItem.Name = m_NamedObject.m_Name;
+                                break;
+                        }
+
+                        if (string.IsNullOrEmpty(assetItem.Name))
+                        {
+                            assetItem.Name = assetItem.TypeString + assetItem.UniqueID;
+                        }
+
+                        if (displayAllChecked || exportable)
+                        {
+                            localExportableAssets.Add(assetItem);
+                        }
+                        i++;
+                    }
+
+                    if (fileNode.ChildCount > 0)
+                    {
+                        localSceneTreeNodes.Add(fileNode);
+                    }
                 }
             }
 
-            LinkAssetItemsToSceneNodesBackground(filesListSnapshot, localTreeNodeDictionary, localObjectAssetItemDic);
+            if (!assetsManager.LazyLoading)
+            {
+                LinkAssetItemsToSceneNodesBackground(filesListSnapshot, localTreeNodeDictionary, localObjectAssetItemDic);
+            }
+
             foreach ((var pptr, var container) in localContainers)
             {
-                if (pptr.TryGet(out var obj) && localObjectAssetItemDic.TryGetValue(obj, out var item))
+                if (pptr.TryGetAssetsFile(out var targetFile))
                 {
-                    item.Container = container;
-                    if (obj is Material material && string.IsNullOrEmpty(material.m_Name))
+                    var targetKey = $"{targetFile.fileName}#{pptr.m_PathID}";
+                    if (localPathIDAssetItemDic.TryGetValue(targetKey, out var item))
                     {
-                        var name = Path.GetFileNameWithoutExtension(container);
-                        if (!string.IsNullOrEmpty(name))
+                        item.Container = container;
+                        if (item.Handle != null)
                         {
-                            item.Name = name;
+                            item.Handle.Container = container;
+                        }
+
+                        if (item.Type == ClassIDType.Material && string.IsNullOrEmpty(item.Name))
+                        {
+                            var name = Path.GetFileNameWithoutExtension(container);
+                            if (!string.IsNullOrEmpty(name))
+                            {
+                                item.Name = name;
+                                if (item.Handle != null)
+                                {
+                                    item.Handle.Name = name;
+                                }
+                            }
                         }
                     }
                 }
             }
-            LinkFbxSubAssetsToSceneNodesBackground(localExportableAssets, localSceneTreeNodes);
+
+            if (!assetsManager.LazyLoading)
+            {
+                LinkFbxSubAssetsToSceneNodesBackground(localExportableAssets, localSceneTreeNodes);
+            }
             localContainers.Clear();
 
-            BuildAssetReferenceIndexesBackground(
-                filesListSnapshot,
-                localExportableAssets,
-                out var localObjectToAssetItemCache,
-                out var localMeshToMaterialsCache,
-                out var localMeshAssociatedRenderersCache,
-                out var localMeshSourceTypesCache,
-                out var localMaterialMainTextureCache,
-                out var localMaterialPreviewMaterialCache,
-                out var localMaterialTextureSlotsCache);
+            var localObjectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>();
+            var localMeshToMaterialsCache = new Dictionary<Mesh, List<Material?>>();
+            var localMeshAssociatedRenderersCache = new Dictionary<Mesh, List<string>>();
+            var localMeshSourceTypesCache = new Dictionary<Mesh, HashSet<string>>();
+            var localMaterialMainTextureCache = new Dictionary<Material, Texture2D?>();
+            var localMaterialPreviewMaterialCache = new Dictionary<Material, Material?>();
+            var localMaterialTextureSlotsCache = new Dictionary<Material, Dictionary<string, Texture2D?>>();
 
-            BuildAnimationPreviewIndexesBackground(
-                filesListSnapshot,
-                out var localAnimationClipAvatarCache,
-                out var localAvatarMeshCache,
-                out var localMeshAvatarCache,
-                out var localAnimationClipTransformBindingsCache);
+            var localAnimationClipAvatarCache = new Dictionary<AnimationClip, Avatar?>();
+            var localAvatarMeshCache = new Dictionary<Avatar, Mesh?>();
+            var localMeshAvatarCache = new Dictionary<Mesh, Avatar?>();
+            var localAnimationClipTransformBindingsCache = new Dictionary<AnimationClip, HashSet<uint>>();
 
-            // Calculate Asset Classes on background thread
+            if (!assetsManager.LazyLoading)
+            {
+                BuildAssetReferenceIndexesBackground(
+                    filesListSnapshot,
+                    localExportableAssets,
+                    out localObjectToAssetItemCache,
+                    out localMeshToMaterialsCache,
+                    out localMeshAssociatedRenderersCache,
+                    out localMeshSourceTypesCache,
+                    out localMaterialMainTextureCache,
+                    out localMaterialPreviewMaterialCache,
+                    out localMaterialTextureSlotsCache);
+
+                BuildAnimationPreviewIndexesBackground(
+                    filesListSnapshot,
+                    out localAnimationClipAvatarCache,
+                    out localAvatarMeshCache,
+                    out localMeshAvatarCache,
+                    out localAnimationClipTransformBindingsCache);
+            }
+
             var localAssetClassItems = new List<AssetClassItem>();
             var objectCounts = filesListSnapshot
-                .SelectMany(file => file.Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.type }))
+                .SelectMany(file => file.m_Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.classID }))
                 .GroupBy(x => (x.unityVersion, x.ClassID))
                 .ToDictionary(x => x.Key, x => x.Count());
 
@@ -1505,6 +2083,11 @@ public partial class MainWindow : Window
         else
         {
             Title = $"AssetStudio v{version}";
+        }
+        }
+        finally
+        {
+            isBuildingAssetStructures = false;
         }
     }
 
@@ -4584,6 +5167,20 @@ public partial class MainWindow : Window
         var sortMember = assetListSortMember;
         var sortDescending = assetListSortDescending;
 
+        // Capture selection before filtering
+        var selectedUniqueIds = new HashSet<string>();
+        if (AssetListDataGrid.SelectedItems != null)
+        {
+            foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
+            {
+                var id = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
+                if (!string.IsNullOrEmpty(id))
+                {
+                    selectedUniqueIds.Add(id);
+                }
+            }
+        }
+
         try
         {
             var result = await Task.Run(() =>
@@ -4625,6 +5222,26 @@ public partial class MainWindow : Window
             visibleAssets = result;
             AssetListDataGrid.ItemsSource = visibleAssets;
             StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+
+            // Restore selection
+            if (selectedUniqueIds.Count > 0)
+            {
+                var newSelectedItems = new List<AssetItem>();
+                foreach (var item in visibleAssets)
+                {
+                    var id = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
+                    if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+                    {
+                        newSelectedItems.Add(item);
+                    }
+                }
+
+                AssetListDataGrid.SelectedItems.Clear();
+                foreach (var item in newSelectedItems)
+                {
+                    AssetListDataGrid.SelectedItems.Add(item);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
@@ -7438,7 +8055,21 @@ public class GameObjectNode : INotifyPropertyChanged
 
 public class AssetItem
 {
-    public Object Asset { get; set; }
+    private Object? _asset;
+    public Object? Asset
+    {
+        get
+        {
+            if (_asset == null && Handle != null)
+            {
+                _asset = SourceFile?.assetsManager?.ResolveHandle(Handle);
+            }
+            return _asset;
+        }
+        set => _asset = value;
+    }
+
+    public AssetHandle? Handle { get; set; }
     public SerializedFile SourceFile { get; set; }
     public GameObjectNode? TreeNode { get; set; }
     public string Name { get; set; } = string.Empty;
@@ -7462,6 +8093,20 @@ public class AssetItem
         PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
         Size = asset.byteSize;
         FullSize = asset.byteSize;
+    }
+
+    public AssetItem(AssetHandle handle)
+    {
+        Handle = handle;
+        SourceFile = handle.SourceFile;
+        TypeString = handle.Type.ToString();
+        Type = handle.Type;
+        PathID = handle.PathID;
+        PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
+        Size = handle.ByteSize;
+        FullSize = handle.ByteSize;
+        Name = handle.Name;
+        Container = handle.Container;
     }
 
     private string GetDisplayType()
@@ -7545,4 +8190,26 @@ public enum ExportMode
     Convert,
     Raw,
     Dump
+}
+
+public class ProjectIndexCache
+{
+    public string RootPath { get; set; } = string.Empty;
+    public int TotalFiles { get; set; }
+    public long TotalBytes { get; set; }
+    public int UnityBundleCount { get; set; }
+    public List<CachedAssetHandle> Handles { get; set; } = new List<CachedAssetHandle>();
+}
+
+public class CachedAssetHandle
+{
+    public string UniqueID { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public int Type { get; set; }
+    public string Container { get; set; } = string.Empty;
+    public string OriginalPath { get; set; } = string.Empty;
+    public string SerializedFileName { get; set; } = string.Empty;
+    public long PathID { get; set; }
+    public long ByteStart { get; set; }
+    public long ByteSize { get; set; }
 }

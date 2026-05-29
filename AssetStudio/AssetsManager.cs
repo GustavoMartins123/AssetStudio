@@ -18,6 +18,8 @@ namespace AssetStudio
         public string ProjectRoot;
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
         public List<Stream> bundleStreams = new List<Stream>();
+        public ProjectIndex ProjectIndex = new ProjectIndex();
+        public bool LazyLoading = false;
 
         internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         internal Dictionary<string, BinaryReader> resourceFileReaders = new Dictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
@@ -27,7 +29,7 @@ namespace AssetStudio
         private HashSet<string> noexistFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private HashSet<string> assetsFileListHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        private readonly object loadLock = new object();
+        public readonly object loadLock = new object();
         private System.Collections.Concurrent.ConcurrentQueue<string> loadQueue;
         private int loadTotalCount;
 
@@ -520,6 +522,7 @@ namespace AssetStudio
 
         public void Clear()
         {
+            ProjectIndex.Clear();
             foreach (var assetsFile in assetsFileList)
             {
                 assetsFile.Objects.Clear();
@@ -545,6 +548,113 @@ namespace AssetStudio
             assetsFileIndexCache.Clear();
         }
 
+        public static Object CreateObjectFromReader(ObjectReader objectReader)
+        {
+            switch (objectReader.type)
+            {
+                case ClassIDType.Animation:
+                    return new Animation(objectReader);
+                case ClassIDType.AnimationClip:
+                    return new AnimationClip(objectReader);
+                case ClassIDType.Animator:
+                    return new Animator(objectReader);
+                case ClassIDType.AnimatorController:
+                    return new AnimatorController(objectReader);
+                case ClassIDType.AnimatorOverrideController:
+                    return new AnimatorOverrideController(objectReader);
+                case ClassIDType.AssetBundle:
+                    return new AssetBundle(objectReader);
+                case ClassIDType.AudioClip:
+                    return new AudioClip(objectReader);
+                case ClassIDType.Avatar:
+                    return new Avatar(objectReader);
+                case ClassIDType.Font:
+                    return new Font(objectReader);
+                case ClassIDType.GameObject:
+                    return new GameObject(objectReader);
+                case ClassIDType.Material:
+                    return new Material(objectReader);
+                case ClassIDType.Mesh:
+                    return new Mesh(objectReader);
+                case ClassIDType.MeshFilter:
+                    return new MeshFilter(objectReader);
+                case ClassIDType.MeshRenderer:
+                    return new MeshRenderer(objectReader);
+                case ClassIDType.MonoBehaviour:
+                    return new MonoBehaviour(objectReader);
+                case ClassIDType.MonoScript:
+                    return new MonoScript(objectReader);
+                case ClassIDType.MovieTexture:
+                    return new MovieTexture(objectReader);
+                case ClassIDType.PlayerSettings:
+                    return new PlayerSettings(objectReader);
+                case ClassIDType.RectTransform:
+                    return new RectTransform(objectReader);
+                case ClassIDType.Shader:
+                    return new Shader(objectReader);
+                case ClassIDType.SkinnedMeshRenderer:
+                    return new SkinnedMeshRenderer(objectReader);
+                case ClassIDType.Sprite:
+                    return new Sprite(objectReader);
+                case ClassIDType.SpriteAtlas:
+                    return new SpriteAtlas(objectReader);
+                case ClassIDType.TextAsset:
+                    return new TextAsset(objectReader);
+                case ClassIDType.Texture2D:
+                    return new Texture2D(objectReader);
+                case ClassIDType.Transform:
+                    return new Transform(objectReader);
+                case ClassIDType.VideoClip:
+                    return new VideoClip(objectReader);
+                case ClassIDType.ResourceManager:
+                    return new ResourceManager(objectReader);
+                default:
+                    return new Object(objectReader);
+            }
+        }
+
+        public Object ResolveHandle(AssetHandle handle)
+        {
+            if (handle == null) return null;
+            if (handle.RealObject != null) return handle.RealObject;
+
+            lock (handle)
+            {
+                if (handle.RealObject != null) return handle.RealObject;
+
+                var assetsFile = handle.SourceFile;
+                using (var localReader = assetsFile.reader.Clone())
+                {
+                    var objectInfo = new ObjectInfo
+                    {
+                        m_PathID = handle.PathID,
+                        byteStart = handle.ByteStart,
+                        byteSize = (uint)handle.ByteSize,
+                        classID = (int)handle.Type,
+                        serializedType = assetsFile.m_Objects.FirstOrDefault(x => x.m_PathID == handle.PathID)?.serializedType
+                    };
+
+                    var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
+                    try
+                    {
+                        var obj = CreateObjectFromReader(objectReader);
+                        handle.RealObject = obj;
+                        
+                        if (!assetsFile.ObjectsDic.ContainsKey(obj.m_PathID))
+                        {
+                            assetsFile.AddObject(obj);
+                        }
+                        return obj;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"Error materializing object {handle.TypeString} PathID={handle.PathID}", ex);
+                        return null;
+                    }
+                }
+            }
+        }
+
         private void ReadAssets()
         {
             Logger.Info("Read assets...");
@@ -554,8 +664,151 @@ namespace AssetStudio
             int errorCount = 0;
             Progress.Reset();
 
+            if (LazyLoading)
+            {
+                foreach (var assetsFile in assetsFileList)
+                {
+                    if (assetsFile.IsProcessed) continue;
+                    assetsFile.IsProcessed = true;
+
+                    // Check if we already have cached handles for this file in ProjectIndex
+                    bool hasCachedHandles = false;
+                    foreach (var handle in ProjectIndex.GetHandles())
+                    {
+                        if (handle.SerializedFileName == assetsFile.fileName)
+                        {
+                            handle.SourceFile = assetsFile;
+                            hasCachedHandles = true;
+                        }
+                    }
+
+                    if (hasCachedHandles)
+                    {
+                        // Eagerly materialize containers (AssetBundle / ResourceManager)
+                        // so container mapping works.
+                        foreach (var objectInfo in assetsFile.m_Objects)
+                        {
+                            var classID = objectInfo.classID;
+                            ClassIDType type = ClassIDType.UnknownType;
+                            if (Enum.IsDefined(typeof(ClassIDType), classID))
+                            {
+                                type = (ClassIDType)classID;
+                            }
+
+                            if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
+                            {
+                                try
+                                {
+                                    using var localReader = assetsFile.reader.Clone();
+                                    var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
+                                    var obj = CreateObjectFromReader(objectReader);
+                                    assetsFile.AddObject(obj);
+
+                                    // Link to the handle
+                                    var handle = ProjectIndex.GetHandle($"{assetsFile.fileName}#{objectInfo.m_PathID}");
+                                    if (handle != null)
+                                    {
+                                        handle.RealObject = obj;
+                                    }
+                                }
+                                catch
+                                {
+                                    // Skip container loading errors
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
+                    var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
+                    };
+
+                    System.Threading.Tasks.Parallel.ForEach(
+                        assetsFile.m_Objects,
+                        parallelOptions,
+                        () => assetsFile.reader.Clone(),
+                        (objectInfo, state, localReader) =>
+                        {
+                            if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
+                            {
+                                ThrowIfMemoryPressureTooHigh("reading assets (lazy)");
+                            }
+
+                            var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
+                            
+                            ClassIDType type = ClassIDType.UnknownType;
+                            if (Enum.IsDefined(typeof(ClassIDType), objectInfo.classID))
+                            {
+                                type = (ClassIDType)objectInfo.classID;
+                            }
+
+                            var handle = new AssetHandle
+                            {
+                                UniqueID = $"{assetsFile.fileName}#{objectInfo.m_PathID}",
+                                Type = type,
+                                OriginalPath = assetsFile.originalPath,
+                                SerializedFileName = assetsFile.fileName,
+                                SourceFile = assetsFile,
+                                PathID = objectInfo.m_PathID,
+                                ByteStart = objectInfo.byteStart,
+                                ByteSize = objectInfo.byteSize
+                            };
+
+                            string name = null;
+                            if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
+                            {
+                                try
+                                {
+                                    var obj = CreateObjectFromReader(objectReader);
+                                    handle.RealObject = obj;
+                                    localObjects.Add(obj);
+                                    if (obj is AssetBundle bundle)
+                                        name = bundle.m_Name;
+                                    else if (obj is ResourceManager rm)
+                                        name = "ResourceManager";
+                                }
+                                catch
+                                {
+                                    // Fallback if container loading fails
+                                }
+                            }
+                            else
+                            {
+                                name = AssetHandle.TryReadObjectName(objectReader);
+                            }
+
+                            handle.Name = name ?? $"Unnamed_{type}_{objectInfo.m_PathID}";
+                            ProjectIndex.AddHandle(handle);
+
+                            var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
+                            Progress.Report(currentProgress, progressCount);
+
+                            return localReader;
+                        },
+                        localReader => localReader.Dispose()
+                    );
+
+                    var pathIdToIndex = new Dictionary<long, int>();
+                    for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                    {
+                        pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
+                    }
+                    var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
+                    foreach (var obj in sortedObjects)
+                    {
+                        assetsFile.AddObject(obj);
+                    }
+                }
+                return;
+            }
+
             foreach (var assetsFile in assetsFileList)
             {
+                if (assetsFile.IsProcessed) continue;
+                assetsFile.IsProcessed = true;
                 var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
 
                 var parallelOptions = new System.Threading.Tasks.ParallelOptions
@@ -577,97 +830,7 @@ namespace AssetStudio
                         var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                         try
                         {
-                            Object obj;
-                            switch (objectReader.type)
-                            {
-                                case ClassIDType.Animation:
-                                    obj = new Animation(objectReader);
-                                    break;
-                                case ClassIDType.AnimationClip:
-                                    obj = new AnimationClip(objectReader);
-                                    break;
-                                case ClassIDType.Animator:
-                                    obj = new Animator(objectReader);
-                                    break;
-                                case ClassIDType.AnimatorController:
-                                    obj = new AnimatorController(objectReader);
-                                    break;
-                                case ClassIDType.AnimatorOverrideController:
-                                    obj = new AnimatorOverrideController(objectReader);
-                                    break;
-                                case ClassIDType.AssetBundle:
-                                    obj = new AssetBundle(objectReader);
-                                    break;
-                                case ClassIDType.AudioClip:
-                                    obj = new AudioClip(objectReader);
-                                    break;
-                                case ClassIDType.Avatar:
-                                    obj = new Avatar(objectReader);
-                                    break;
-                                case ClassIDType.Font:
-                                    obj = new Font(objectReader);
-                                    break;
-                                case ClassIDType.GameObject:
-                                    obj = new GameObject(objectReader);
-                                    break;
-                                case ClassIDType.Material:
-                                    obj = new Material(objectReader);
-                                    break;
-                                case ClassIDType.Mesh:
-                                    obj = new Mesh(objectReader);
-                                    break;
-                                case ClassIDType.MeshFilter:
-                                    obj = new MeshFilter(objectReader);
-                                    break;
-                                case ClassIDType.MeshRenderer:
-                                    obj = new MeshRenderer(objectReader);
-                                    break;
-                                case ClassIDType.MonoBehaviour:
-                                    obj = new MonoBehaviour(objectReader);
-                                    break;
-                                case ClassIDType.MonoScript:
-                                    obj = new MonoScript(objectReader);
-                                    break;
-                                case ClassIDType.MovieTexture:
-                                    obj = new MovieTexture(objectReader);
-                                    break;
-                                case ClassIDType.PlayerSettings:
-                                    obj = new PlayerSettings(objectReader);
-                                    break;
-                                case ClassIDType.RectTransform:
-                                    obj = new RectTransform(objectReader);
-                                    break;
-                                case ClassIDType.Shader:
-                                    obj = new Shader(objectReader);
-                                    break;
-                                case ClassIDType.SkinnedMeshRenderer:
-                                    obj = new SkinnedMeshRenderer(objectReader);
-                                    break;
-                                case ClassIDType.Sprite:
-                                    obj = new Sprite(objectReader);
-                                    break;
-                                case ClassIDType.SpriteAtlas:
-                                    obj = new SpriteAtlas(objectReader);
-                                    break;
-                                case ClassIDType.TextAsset:
-                                    obj = new TextAsset(objectReader);
-                                    break;
-                                case ClassIDType.Texture2D:
-                                    obj = new Texture2D(objectReader);
-                                    break;
-                                case ClassIDType.Transform:
-                                    obj = new Transform(objectReader);
-                                    break;
-                                case ClassIDType.VideoClip:
-                                    obj = new VideoClip(objectReader);
-                                    break;
-                                case ClassIDType.ResourceManager:
-                                    obj = new ResourceManager(objectReader);
-                                    break;
-                                default:
-                                    obj = new Object(objectReader);
-                                    break;
-                            }
+                            Object obj = CreateObjectFromReader(objectReader);
                             localObjects.Add(obj);
                         }
                         catch (Exception e)
@@ -768,7 +931,7 @@ namespace AssetStudio
             return DefaultMemoryLimitPercent;
         }
 
-        private static void ThrowIfMemoryPressureTooHigh(string operation)
+        public static void ThrowIfMemoryPressureTooHigh(string operation)
         {
             var limitPercent = GetConfiguredMemoryLimitPercent();
             if (limitPercent >= 100)
@@ -790,9 +953,7 @@ namespace AssetStudio
 
             if (TryGetMemoryLoadPercent(out memoryLoadPercent) && memoryLoadPercent >= limitPercent)
             {
-                throw new InvalidOperationException(
-                    $"Asset loading stopped while {operation} because memory pressure reached {memoryLoadPercent}% " +
-                    $"(limit {limitPercent}%). Load fewer bundles at once or raise ASSETSTUDIO_MEMORY_LIMIT_PERCENT.");
+                throw new MemoryPressureException(operation, memoryLoadPercent, limitPercent);
             }
         }
 

@@ -24,7 +24,7 @@ namespace AssetStudio
             assetsFile = reader.assetsFile;
         }
 
-        private bool TryGetAssetsFile(out SerializedFile result)
+        public bool TryGetAssetsFile(out SerializedFile result)
         {
             result = null;
             if (m_FileID == 0)

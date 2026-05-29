@@ -176,6 +176,11 @@
                     </MenuItem.Icon>
                 </MenuItem>
             </MenuItem>
+            <MenuItem x:Name="indexingMenu" Header="_Indexing" IsVisible="False">
+                <MenuItem x:Name="pauseIndexingMenu" Header="Pause Indexing" Click="PauseIndexing_Click" />
+                <MenuItem x:Name="resumeIndexingMenu" Header="Resume Indexing" Click="ResumeIndexing_Click" IsEnabled="False" />
+                <MenuItem x:Name="stopIndexingMenu" Header="Stop/Cancel Indexing" Click="StopIndexing_Click" />
+            </MenuItem>
         </Menu>
 
         <Grid DockPanel.Dock="Bottom" ColumnDefinitions="*, Auto" Height="24" Margin="2,0">
