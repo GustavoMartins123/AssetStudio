@@ -22,6 +22,10 @@ namespace AssetStudio.Avalonia
             public Dictionary<Material, Texture2D?> MaterialMainTextureCache;
             public Dictionary<Material, Material?> MaterialPreviewMaterialCache;
             public Dictionary<Material, Dictionary<string, Texture2D?>> MaterialTextureSlotsCache;
+            public Dictionary<AnimationClip, Avatar?> AnimationClipAvatarCache;
+            public Dictionary<Avatar, Mesh?> AvatarMeshCache;
+            public Dictionary<Mesh, Avatar?> MeshAvatarCache;
+            public Dictionary<AnimationClip, HashSet<uint>> AnimationClipTransformBindingsCache;
             public List<AssetClassItem> AssetClassItems;
         }
 
@@ -321,6 +325,219 @@ namespace AssetStudio.Avalonia
             materialMainTextureCacheOut = localMaterialMainTextureCache;
             materialPreviewMaterialCacheOut = localMaterialPreviewMaterialCache;
             materialTextureSlotsCacheOut = localMaterialTextureSlotsCache;
+        }
+
+        private static void BuildAnimationPreviewIndexesBackground(
+            List<SerializedFile> assetsFileList,
+            out Dictionary<AnimationClip, Avatar?> animationClipAvatarCacheOut,
+            out Dictionary<Avatar, Mesh?> avatarMeshCacheOut,
+            out Dictionary<Mesh, Avatar?> meshAvatarCacheOut,
+            out Dictionary<AnimationClip, HashSet<uint>> animationClipTransformBindingsCacheOut)
+        {
+            var clips = assetsFileList.SelectMany(f => f.Objects).OfType<AnimationClip>().ToArray();
+            var avatars = assetsFileList.SelectMany(f => f.Objects).OfType<Avatar>().ToArray();
+            var meshes = assetsFileList.SelectMany(f => f.Objects).OfType<Mesh>()
+                .Where(m => m.m_BoneNameHashes != null && m.m_BoneNameHashes.Length > 0
+                    && m.m_BindPose != null && m.m_BindPose.Length > 0)
+                .ToArray();
+
+            var animationClipTransformBindingsCache = new Dictionary<AnimationClip, HashSet<uint>>(clips.Length);
+            foreach (var clip in clips)
+            {
+                animationClipTransformBindingsCache[clip] = GetTransformBindingPathsBackground(clip);
+            }
+
+            var avatarMeshCache = new Dictionary<Avatar, Mesh?>(avatars.Length);
+            foreach (var avatar in avatars)
+            {
+                avatarMeshCache[avatar] = FindBestMeshForAvatarBackground(avatar, meshes);
+            }
+
+            var meshAvatarCache = new Dictionary<Mesh, Avatar?>(meshes.Length);
+            foreach (var mesh in meshes)
+            {
+                meshAvatarCache[mesh] = FindBestAvatarForMeshBackground(mesh, avatars);
+            }
+
+            var animationClipAvatarCache = new Dictionary<AnimationClip, Avatar?>(clips.Length);
+            foreach (var clip in clips)
+            {
+                animationClipTransformBindingsCache.TryGetValue(clip, out var bindingPaths);
+                animationClipAvatarCache[clip] = FindBestAvatarForAnimationClipBackground(clip, bindingPaths ?? new HashSet<uint>(), avatars);
+            }
+
+            animationClipAvatarCacheOut = animationClipAvatarCache;
+            avatarMeshCacheOut = avatarMeshCache;
+            meshAvatarCacheOut = meshAvatarCache;
+            animationClipTransformBindingsCacheOut = animationClipTransformBindingsCache;
+        }
+
+        private static HashSet<uint> GetTransformBindingPathsBackground(AnimationClip clip)
+        {
+            var result = new HashSet<uint>();
+            var bindings = clip.m_ClipBindingConstant;
+            if (bindings == null && clip.m_MuscleClip?.m_Clip != null)
+            {
+                bindings = clip.m_MuscleClip.m_Clip.ConvertValueArrayToGenericBinding();
+            }
+
+            if (bindings?.genericBindings != null)
+            {
+                foreach (var binding in bindings.genericBindings)
+                {
+                    if (binding.typeID == ClassIDType.Transform)
+                    {
+                        result.Add(binding.path);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static Avatar? FindBestAvatarForAnimationClipBackground(AnimationClip clip, HashSet<uint> bindingPaths, Avatar[] avatars)
+        {
+            if (bindingPaths.Count == 0)
+            {
+                return null;
+            }
+
+            Avatar? bestAvatar = null;
+            int bestScore = 0;
+            var clipName = NormalizeAnimatorSearchKey(clip.m_Name);
+
+            foreach (var avatar in avatars)
+            {
+                if (avatar.m_TOS == null || avatar.m_TOS.Length == 0)
+                {
+                    continue;
+                }
+
+                var avatarPathHashes = new HashSet<uint>(avatar.m_TOS.Select(x => x.Key));
+                var overlap = bindingPaths.Count(avatarPathHashes.Contains);
+                if (!IsStrongAnimationAvatarMatch(bindingPaths.Count, overlap))
+                {
+                    continue;
+                }
+
+                var score = overlap * 100;
+                if (avatar.assetsFile == clip.assetsFile) score += 20;
+
+                var avatarName = NormalizeAnimatorSearchKey(avatar.m_Name.Replace("Avatar", string.Empty));
+                if (!string.IsNullOrEmpty(avatarName) && clipName.Contains(avatarName, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 15;
+                }
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestAvatar = avatar;
+                }
+            }
+
+            return bestAvatar;
+        }
+
+        private static Mesh? FindBestMeshForAvatarBackground(Avatar avatar, Mesh[] meshes)
+        {
+            var avatarBoneIds = avatar.m_Avatar?.m_AvatarSkeleton?.m_ID != null
+                ? new HashSet<uint>(avatar.m_Avatar.m_AvatarSkeleton.m_ID)
+                : new HashSet<uint>();
+            if (avatarBoneIds.Count == 0)
+            {
+                return null;
+            }
+
+            Mesh? bestMesh = null;
+            int bestScore = 0;
+            var avatarName = avatar.m_Name.Replace("Avatar", string.Empty).Trim();
+
+            foreach (var mesh in meshes)
+            {
+                var overlap = mesh.m_BoneNameHashes.Count(avatarBoneIds.Contains);
+                if (!IsStrongMeshAvatarMatch(mesh.m_BoneNameHashes.Length, overlap))
+                {
+                    continue;
+                }
+
+                var score = overlap * 100 + Math.Min(mesh.m_BoneNameHashes.Length, 40);
+                if (mesh.assetsFile == avatar.assetsFile) score += 20;
+                if (!string.IsNullOrEmpty(avatarName) && mesh.m_Name.Contains(avatarName, StringComparison.OrdinalIgnoreCase)) score += 15;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestMesh = mesh;
+                }
+            }
+
+            return bestMesh;
+        }
+
+        private static Avatar? FindBestAvatarForMeshBackground(Mesh mesh, Avatar[] avatars)
+        {
+            var meshBoneHashes = mesh.m_BoneNameHashes != null
+                ? new HashSet<uint>(mesh.m_BoneNameHashes)
+                : new HashSet<uint>();
+            if (meshBoneHashes.Count == 0)
+            {
+                return null;
+            }
+
+            Avatar? bestAvatar = null;
+            int bestScore = 0;
+            var meshName = mesh.m_Name.ToLowerInvariant();
+
+            foreach (var avatar in avatars)
+            {
+                if (avatar.m_Avatar?.m_AvatarSkeleton?.m_ID == null)
+                {
+                    continue;
+                }
+
+                var overlap = avatar.m_Avatar.m_AvatarSkeleton.m_ID.Count(meshBoneHashes.Contains);
+                if (!IsStrongMeshAvatarMatch(meshBoneHashes.Count, overlap))
+                {
+                    continue;
+                }
+
+                var score = overlap * 100;
+                if (avatar.assetsFile == mesh.assetsFile) score += 20;
+
+                var avatarName = avatar.m_Name.Replace("Avatar", string.Empty).Trim().ToLowerInvariant();
+                if (!string.IsNullOrEmpty(avatarName) && meshName.Contains(avatarName)) score += 15;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestAvatar = avatar;
+                }
+            }
+
+            return bestAvatar;
+        }
+
+        private static bool IsStrongAnimationAvatarMatch(int bindingCount, int overlap)
+        {
+            if (bindingCount <= 0 || overlap <= 0)
+            {
+                return false;
+            }
+
+            var minimum = bindingCount < 6 ? bindingCount : Math.Max(6, bindingCount / 20);
+            return overlap >= minimum;
+        }
+
+        private static bool IsStrongMeshAvatarMatch(int boneCount, int overlap)
+        {
+            if (boneCount <= 0 || overlap <= 0)
+            {
+                return false;
+            }
+
+            var minimum = boneCount < 6 ? boneCount : Math.Max(6, boneCount / 10);
+            return overlap >= minimum;
         }
 
         private static void IndexMaterialTexturesBackground(
