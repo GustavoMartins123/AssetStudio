@@ -34,7 +34,7 @@ namespace AssetStudio
             }
         }
 
-        public string Dump()
+        public virtual string Dump()
         {
             if (serializedType?.m_Type != null)
             {

@@ -36,6 +36,9 @@ public partial class MainWindow : Window
     private Avatar? currentPreviewAvatar;
     private AudioClip? currentPreviewAudioClip;
     private VideoClip? currentPreviewVideoClip;
+    private System.Diagnostics.Process? _linuxAudioProcess;
+    private bool _isLinuxAudioPaused;
+    private System.Diagnostics.Stopwatch? _linuxAudioStopwatch;
     private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
     private long texturePreviewIdCounter;
@@ -144,7 +147,16 @@ public partial class MainWindow : Window
             _audioMediaPlayer = new FFmpegMediaPlayer(action =>
             {
                 Dispatcher.UIThread.Post(action);
-            }, (sr, ch) => FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch));
+            }, (sr, ch) => {
+                try
+                {
+                    return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+                }
+                catch
+                {
+                    return null;
+                }
+            });
 
             _audioMediaPlayer.EndReached += AudioMediaPlayer_EndReached;
             _audioTimer = new DispatcherTimer
@@ -1755,6 +1767,7 @@ public partial class MainWindow : Window
                         case ClassIDType.Texture2D:
                         case ClassIDType.AudioClip:
                         case ClassIDType.VideoClip:
+                        case ClassIDType.VideoPlayer:
                         case ClassIDType.Shader:
                         case ClassIDType.Mesh:
                         case ClassIDType.Material:
@@ -1835,6 +1848,19 @@ public partial class MainWindow : Window
                                 if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
                                     assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
                                 assetItem.Name = m_VideoClip.m_Name;
+                                exportable = true;
+                                break;
+                            case VideoPlayer m_VideoPlayer:
+                                if (m_VideoPlayer.m_VideoClip.TryGet(out var resolvedClip) && resolvedClip != null)
+                                {
+                                    if (!string.IsNullOrEmpty(resolvedClip.m_OriginalPath))
+                                        assetItem.FullSize = asset.byteSize + (long)resolvedClip.m_ExternalResources.m_Size;
+                                    assetItem.Name = $"{(m_VideoPlayer.m_GameObject.TryGet(out var go) ? go.m_Name : "VideoPlayer")} (Clip: {resolvedClip.m_Name})";
+                                }
+                                else
+                                {
+                                    assetItem.Name = m_VideoPlayer.m_GameObject.TryGet(out var go) ? go.m_Name : "VideoPlayer";
+                                }
                                 exportable = true;
                                 break;
                             case Shader m_Shader:
@@ -2540,6 +2566,9 @@ public partial class MainWindow : Window
                     break;
                 case VideoClip m_VideoClip:
                     PreviewVideoClip(assetItem, m_VideoClip);
+                    break;
+                case VideoPlayer m_VideoPlayer:
+                    PreviewVideoPlayer(assetItem, m_VideoPlayer);
                     break;
                 case MovieTexture _:
                     StatusStripUpdate("Only supported export.");
@@ -6310,6 +6339,25 @@ public partial class MainWindow : Window
                 m_VideoClip.m_VideoData.WriteData(filePath);
                 return true;
             }
+            case VideoPlayer m_VideoPlayer:
+            {
+                if (m_VideoPlayer.m_VideoClip.TryGet(out var resolvedClip) && resolvedClip != null)
+                {
+                    if (resolvedClip.m_ExternalResources.m_Size <= 0) return false;
+                    var filePath = Path.Combine(exportPath, fileName + Path.GetExtension(resolvedClip.m_OriginalPath));
+                    if (File.Exists(filePath)) return false;
+                    resolvedClip.m_VideoData.WriteData(filePath);
+                    return true;
+                }
+                else if (m_VideoPlayer.m_Source == 1 && !string.IsNullOrEmpty(m_VideoPlayer.m_Url))
+                {
+                    var filePath = Path.Combine(exportPath, fileName + "_url.txt");
+                    if (File.Exists(filePath)) return false;
+                    File.WriteAllText(filePath, m_VideoPlayer.m_Url);
+                    return true;
+                }
+                return false;
+            }
             case MovieTexture m_MovieTexture:
             {
                 var filePath = Path.Combine(exportPath, fileName + ".ogv");
@@ -7043,9 +7091,37 @@ public partial class MainWindow : Window
         if (_audioMediaPlayer == null)
             return;
 
-        var currentMs = (long)(_audioMediaPlayer.Position * (float)_audioMediaPlayer.Length);
-        var totalMs = _audioLengthMs > 0 ? _audioLengthMs : _audioMediaPlayer.Length;
-        _audioLengthMs = totalMs;
+        long currentMs = 0;
+        long totalMs = 0;
+
+        if (useLinuxAudioFallback)
+        {
+            if (_linuxAudioStopwatch != null)
+            {
+                currentMs = _linuxAudioStopwatch.ElapsedMilliseconds;
+                if (currentMs > _audioLengthMs && _audioLengthMs > 0)
+                {
+                    currentMs = _audioLengthMs;
+                    if (FMODloopButton.IsChecked == true)
+                    {
+                        _linuxAudioStopwatch.Restart();
+                        PlayLinuxAudioFallback(_currentTempAudioPath!);
+                    }
+                    else
+                    {
+                        AudioStop();
+                        return;
+                    }
+                }
+            }
+            totalMs = _audioLengthMs;
+        }
+        else
+        {
+            currentMs = (long)(_audioMediaPlayer.Position * (float)_audioMediaPlayer.Length);
+            totalMs = _audioLengthMs > 0 ? _audioLengthMs : _audioMediaPlayer.Length;
+            _audioLengthMs = totalMs;
+        }
 
         if (FMODprogressBar != null && !_isAudioDragging && totalMs > 0)
         {
@@ -7055,7 +7131,14 @@ public partial class MainWindow : Window
             _isUpdatingAudioProgress = false;
         }
 
-        FMODstatusLabel.Text = _audioMediaPlayer.IsPlaying ? "Playing" : "Paused";
+        if (useLinuxAudioFallback)
+        {
+            FMODstatusLabel.Text = (_linuxAudioStopwatch != null && _linuxAudioStopwatch.IsRunning) ? "Playing" : "Paused";
+        }
+        else
+        {
+            FMODstatusLabel.Text = _audioMediaPlayer.IsPlaying ? "Playing" : "Paused";
+        }
     }
 
     private static string FormatMediaTime(long currentMs, long totalMs)
@@ -7068,7 +7151,12 @@ public partial class MainWindow : Window
         _audioTimer?.Stop();
         try
         {
-            if (_audioMediaPlayer != null)
+            if (useLinuxAudioFallback)
+            {
+                _linuxAudioStopwatch?.Reset();
+                StopLinuxAudioFallback();
+            }
+            else if (_audioMediaPlayer != null)
             {
                 _audioMediaPlayer.Stop();
                 _audioMediaPlayer.Close();
@@ -7106,13 +7194,23 @@ public partial class MainWindow : Window
                 return;
             }
 
-            _audioMediaPlayer.Stop();
-            try
+            if (useLinuxAudioFallback)
             {
-                _audioMediaPlayer.Volume = _targetAudioVolume;
+                _linuxAudioStopwatch ??= new System.Diagnostics.Stopwatch();
+                _linuxAudioStopwatch.Restart();
+                PlayLinuxAudioFallback(_currentTempAudioPath!);
             }
-            catch {}
-            _audioMediaPlayer.Play();
+            else
+            {
+                _audioMediaPlayer.Stop();
+                try
+                {
+                    _audioMediaPlayer.Volume = _targetAudioVolume;
+                }
+                catch {}
+                _audioMediaPlayer.Play();
+            }
+
             FMODstatusLabel.Text = "Playing";
             FMODpauseButton.Content = "Pause";
             _audioTimer?.Start();
@@ -7121,6 +7219,115 @@ public partial class MainWindow : Window
         {
             StatusStripUpdate($"Failed to play audio: {ex.Message}");
         }
+    }
+
+    private bool useLinuxAudioFallback => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux) && !isOpenAlSupportedCached;
+    private static bool? isOpenAlSupportedCachedVal;
+    private static bool isOpenAlSupportedCached
+    {
+        get
+        {
+            if (!isOpenAlSupportedCachedVal.HasValue)
+            {
+                isOpenAlSupportedCachedVal = IsOpenAlSupported();
+            }
+            return isOpenAlSupportedCachedVal.Value;
+        }
+    }
+
+    private static bool IsOpenAlSupported()
+    {
+        try
+        {
+            using var test = FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(44100, 2);
+            return test != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? GetLinuxAudioPlayerCommand()
+    {
+        string[] candidates = { "/usr/bin/pw-play", "/usr/bin/paplay", "/usr/bin/aplay", "/bin/aplay" };
+        foreach (var c in candidates)
+        {
+            if (File.Exists(c)) return c;
+        }
+        return null;
+    }
+
+    private bool PlayLinuxAudioFallback(string path)
+    {
+        try
+        {
+            StopLinuxAudioFallback();
+
+            var playerCmd = GetLinuxAudioPlayerCommand();
+            if (playerCmd == null)
+            {
+                Logger.Warning("No system audio player (pw-play, paplay, aplay) found on Linux.");
+                return false;
+            }
+
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = playerCmd,
+                Arguments = $"\"{path}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            _linuxAudioProcess = System.Diagnostics.Process.Start(startInfo);
+            _isLinuxAudioPaused = false;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Linux fallback audio play failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void StopLinuxAudioFallback()
+    {
+        try
+        {
+            if (_linuxAudioProcess != null && !_linuxAudioProcess.HasExited)
+            {
+                _linuxAudioProcess.Kill();
+            }
+            _linuxAudioProcess = null;
+            _isLinuxAudioPaused = false;
+        }
+        catch {}
+    }
+
+    private void PauseLinuxAudioFallback()
+    {
+        try
+        {
+            if (_linuxAudioProcess != null && !_linuxAudioProcess.HasExited && !_isLinuxAudioPaused)
+            {
+                System.Diagnostics.Process.Start("kill", $"-STOP {_linuxAudioProcess.Id}")?.WaitForExit();
+                _isLinuxAudioPaused = true;
+            }
+        }
+        catch {}
+    }
+
+    private void ResumeLinuxAudioFallback()
+    {
+        try
+        {
+            if (_linuxAudioProcess != null && !_linuxAudioProcess.HasExited && _isLinuxAudioPaused)
+            {
+                System.Diagnostics.Process.Start("kill", $"-CONT {_linuxAudioProcess.Id}")?.WaitForExit();
+                _isLinuxAudioPaused = false;
+            }
+        }
+        catch {}
     }
 
     private bool EnsureAudioPreviewFile(AudioClip audioClip)
@@ -7196,9 +7403,32 @@ public partial class MainWindow : Window
         _currentTempAudioPath = Path.Combine(tempDir, $"temp_audio_{FixFileName(audioClip.m_Name)}_{audioClip.m_PathID}{extension}");
         File.WriteAllBytes(_currentTempAudioPath, audioData);
 
-        if (_audioMediaPlayer != null)
+        // Retrieve duration from FSB bank if available to support simulated progress bar on Linux
+        try
         {
-            _audioMediaPlayer.Open(_currentTempAudioPath);
+            var m_AudioData = audioClip.m_AudioData.GetData();
+            if (m_AudioData != null && m_AudioData.Length > 0)
+            {
+                var bank = Fmod5Sharp.FsbLoader.LoadFsbFromByteArray(m_AudioData);
+                if (bank.Samples != null && bank.Samples.Count > 0)
+                {
+                    var sample = bank.Samples[0];
+                    if (sample.Metadata != null && sample.Metadata.Frequency > 0)
+                    {
+                        _audioLengthMs = (long)((double)sample.Metadata.SampleCount / sample.Metadata.Frequency * 1000.0);
+                    }
+                }
+            }
+        }
+        catch {}
+
+        if (_audioMediaPlayer != null && !useLinuxAudioFallback)
+        {
+            try
+            {
+                _audioMediaPlayer.Open(_currentTempAudioPath);
+            }
+            catch {}
         }
 
         return true;
@@ -7219,23 +7449,45 @@ public partial class MainWindow : Window
                 }
             }
 
-            if (_audioMediaPlayer.IsPlaying)
+            if (useLinuxAudioFallback)
             {
-                _audioMediaPlayer.Pause();
-                FMODstatusLabel.Text = "Paused";
-                FMODpauseButton.Content = "Resume";
+                if (_linuxAudioStopwatch != null && _linuxAudioStopwatch.IsRunning)
+                {
+                    _linuxAudioStopwatch.Stop();
+                    PauseLinuxAudioFallback();
+                    FMODstatusLabel.Text = "Paused";
+                    FMODpauseButton.Content = "Resume";
+                }
+                else
+                {
+                    _linuxAudioStopwatch ??= new System.Diagnostics.Stopwatch();
+                    _linuxAudioStopwatch.Start();
+                    ResumeLinuxAudioFallback();
+                    FMODstatusLabel.Text = "Playing";
+                    FMODpauseButton.Content = "Pause";
+                    _audioTimer?.Start();
+                }
             }
             else
             {
-                try
+                if (_audioMediaPlayer.IsPlaying)
                 {
-                    _audioMediaPlayer.Volume = _targetAudioVolume;
+                    _audioMediaPlayer.Pause();
+                    FMODstatusLabel.Text = "Paused";
+                    FMODpauseButton.Content = "Resume";
                 }
-                catch {}
-                _audioMediaPlayer.Play();
-                FMODstatusLabel.Text = "Playing";
-                FMODpauseButton.Content = "Pause";
-                _audioTimer?.Start();
+                else
+                {
+                    try
+                    {
+                        _audioMediaPlayer.Volume = _targetAudioVolume;
+                    }
+                    catch {}
+                    _audioMediaPlayer.Play();
+                    FMODstatusLabel.Text = "Playing";
+                    FMODpauseButton.Content = "Pause";
+                    _audioTimer?.Start();
+                }
             }
         }
         catch (Exception ex)
@@ -7253,7 +7505,15 @@ public partial class MainWindow : Window
     {
         try
         {
-            _audioMediaPlayer?.Stop();
+            if (useLinuxAudioFallback)
+            {
+                _linuxAudioStopwatch?.Reset();
+                StopLinuxAudioFallback();
+            }
+            else if (_audioMediaPlayer != null)
+            {
+                _audioMediaPlayer.Stop();
+            }
             _audioTimer?.Stop();
             if (FMODprogressBar != null) FMODprogressBar.Value = 0;
             if (FMODtimerLabel != null) FMODtimerLabel.Text = "0:00.0 / 0:00.0";
@@ -7270,9 +7530,13 @@ public partial class MainWindow : Window
     private void FMODvolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
         _targetAudioVolume = (int)(FMODvolumeBar.Value * 10);
-        if (_audioMediaPlayer != null)
+        if (_audioMediaPlayer != null && !useLinuxAudioFallback)
         {
-            _audioMediaPlayer.Volume = _targetAudioVolume;
+            try
+            {
+                _audioMediaPlayer.Volume = _targetAudioVolume;
+            }
+            catch {}
         }
     }
 
@@ -7281,14 +7545,18 @@ public partial class MainWindow : Window
         if (_isUpdatingAudioProgress)
             return;
 
-        if (_audioMediaPlayer != null && _audioLengthMs > 0 && FMODtimerLabel != null)
+        if (_audioLengthMs > 0 && FMODtimerLabel != null)
         {
             var newMs = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
             FMODtimerLabel.Text = FormatMediaTime(newMs, _audioLengthMs);
 
-            if (!_isAudioDragging)
+            if (!_isAudioDragging && !useLinuxAudioFallback && _audioMediaPlayer != null)
             {
-                _audioMediaPlayer.Seek(newMs / (float)_audioLengthMs);
+                try
+                {
+                    _audioMediaPlayer.Seek(newMs / (float)_audioLengthMs);
+                }
+                catch {}
             }
         }
     }
@@ -7297,13 +7565,17 @@ public partial class MainWindow : Window
     {
         Dispatcher.UIThread.Post(() =>
         {
-            if (FMODloopButton.IsChecked == true && _audioMediaPlayer != null)
+            if (FMODloopButton.IsChecked == true && !useLinuxAudioFallback && _audioMediaPlayer != null)
             {
                 Task.Run(() =>
                 {
-                    _audioMediaPlayer.Stop();
-                    _audioMediaPlayer.Play();
-                    _audioMediaPlayer.Volume = _targetAudioVolume;
+                    try
+                    {
+                        _audioMediaPlayer.Stop();
+                        _audioMediaPlayer.Play();
+                        _audioMediaPlayer.Volume = _targetAudioVolume;
+                    }
+                    catch {}
                 });
             }
             else
@@ -7655,6 +7927,36 @@ public partial class MainWindow : Window
         StatusStripUpdate($"Loaded video clip: {m_VideoClip.m_Name}");
     }
 
+    private void PreviewVideoPlayer(AssetItem assetItem, VideoPlayer m_VideoPlayer)
+    {
+        if (m_VideoPlayer.m_VideoClip.TryGet(out var m_VideoClip) && m_VideoClip != null)
+        {
+            StatusStripUpdate($"VideoPlayer references VideoClip: {m_VideoClip.m_Name}");
+            PreviewVideoClip(assetItem, m_VideoClip);
+            string vpName = m_VideoPlayer.m_GameObject.TryGet(out var go) ? go.m_Name : "VideoPlayer";
+            VideoTitleLabel.Text = $"{vpName} (VideoPlayer)";
+            
+            var sb = new StringBuilder();
+            sb.AppendLine(m_VideoPlayer.Dump());
+            sb.AppendLine("Ready. Press Play to load embedded native preview.");
+            VideoInfoLabel.Text = sb.ToString();
+        }
+        else if (m_VideoPlayer.m_Source == 1 && !string.IsNullOrEmpty(m_VideoPlayer.m_Url))
+        {
+            StatusStripUpdate($"VideoPlayer references URL: {m_VideoPlayer.m_Url}");
+            SetTextWithTruncation(TextPreviewBox, m_VideoPlayer.Dump());
+            TextPreviewBox.IsVisible = true;
+            PreviewLabel.IsVisible = false;
+        }
+        else
+        {
+            StatusStripUpdate("VideoPlayer has no loaded VideoClip or URL.");
+            SetTextWithTruncation(TextPreviewBox, m_VideoPlayer.Dump());
+            TextPreviewBox.IsVisible = true;
+            PreviewLabel.IsVisible = false;
+        }
+    }
+
     private void VideoPlayButton_Click(object? sender, RoutedEventArgs e)
     {
         if (currentPreviewVideoClip == null) return;
@@ -7829,9 +8131,13 @@ public partial class MainWindow : Window
     private void FMODprogressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
     {
         _isAudioDragging = false;
-        if (_audioMediaPlayer != null && _audioLengthMs > 0)
+        if (_audioMediaPlayer != null && _audioLengthMs > 0 && !useLinuxAudioFallback)
         {
-            _audioMediaPlayer.Seek((float)(FMODprogressBar.Value / 1000.0));
+            try
+            {
+                _audioMediaPlayer.Seek((float)(FMODprogressBar.Value / 1000.0));
+            }
+            catch {}
         }
     }
 

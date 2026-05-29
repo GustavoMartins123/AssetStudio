@@ -213,7 +213,16 @@ namespace AssetStudio.Avalonia.Controls
                 }
 
                 Func<int, int, IAudioPlayer?> func = AudioPlayerFactory ?? 
-                    ((sr, ch) => FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch));
+                    ((sr, ch) => {
+                        try
+                        {
+                            return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+                    });
 
                 _mediaPlayer = new FFmpegMediaPlayer(action =>
                 {

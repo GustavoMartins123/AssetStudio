@@ -606,6 +606,8 @@ namespace AssetStudio
                     return new Transform(objectReader);
                 case ClassIDType.VideoClip:
                     return new VideoClip(objectReader);
+                case ClassIDType.VideoPlayer:
+                    return new VideoPlayer(objectReader);
                 case ClassIDType.ResourceManager:
                     return new ResourceManager(objectReader);
                 default:
