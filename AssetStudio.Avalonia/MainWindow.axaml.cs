@@ -255,6 +255,8 @@ public partial class MainWindow : Window
                 });
             };
         }
+
+        ApplyAvatarPreviewControlSettings();
     }
 
     private void StatusStripUpdate(string text)
@@ -362,16 +364,8 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.StopAnimation();
             GLPreviewControl.IsVisible = false;
-            GLPreviewControl.BoneScale = 1.0f;
         }
-        if (BoneSizeSlider != null)
-        {
-            BoneSizeSlider.Value = 1.0;
-        }
-        if (BoneSizeLabel != null)
-        {
-            BoneSizeLabel.Text = "1.0x";
-        }
+        ApplyAvatarPreviewControlSettings();
         if (BoneSizeContainer != null)
         {
             BoneSizeContainer.IsVisible = false;
@@ -7164,6 +7158,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        FlushAvatarPreviewSettingsSave();
         AudioReset();
         VideoReset();
         _audioMediaPlayer?.Dispose();
@@ -8328,6 +8323,8 @@ public sealed class AvaloniaAppSettings
     public bool DisplayAll { get; set; } = false;
     public bool DisplayInfo { get; set; } = true;
     public bool EnablePreview { get; set; } = true;
+    public double AvatarPreviewBoneScale { get; set; } = 1.0;
+    public double AvatarPreviewMeshDensityPercent { get; set; } = 15.0;
     public ExportOptionsState ExportOptions { get; set; } = new();
     public string SelectedTheme { get; set; } = "Default";
 

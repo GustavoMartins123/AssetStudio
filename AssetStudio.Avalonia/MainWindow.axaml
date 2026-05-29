@@ -331,13 +331,19 @@
                                     <Button Grid.Column="3" x:Name="RotateDownBtn" Content="▼" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="RotateDownBtn_Click" Height="26" FontSize="10" ToolTip.Tip="Rotate Down 90°" />
                                 </Grid>
                                 
-                                <!-- Bone Size Slider Container -->
-                                <StackPanel x:Name="BoneSizeContainer" Spacing="2" IsVisible="False">
+                                <!-- Avatar Preview Sliders -->
+                                <StackPanel x:Name="BoneSizeContainer" Spacing="6" IsVisible="False">
                                     <Grid ColumnDefinitions="*,Auto">
                                         <TextBlock Text="Bone Size" Foreground="White" FontSize="10" VerticalAlignment="Center" />
                                         <TextBlock x:Name="BoneSizeLabel" Grid.Column="1" Text="1.0x" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
                                     </Grid>
                                     <Slider x:Name="BoneSizeSlider" Minimum="0.1" Maximum="5.0" Value="1.0" Focusable="False" Height="24" ValueChanged="BoneSizeSlider_ValueChanged" />
+
+                                    <Grid ColumnDefinitions="*,Auto" Margin="0,2,0,0">
+                                        <TextBlock Text="Mesh Vertices" Foreground="White" FontSize="10" VerticalAlignment="Center" />
+                                        <TextBlock x:Name="AvatarMeshDensityLabel" Grid.Column="1" Text="15%" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
+                                    </Grid>
+                                    <Slider x:Name="AvatarMeshDensitySlider" Minimum="1" Maximum="100" Value="15" TickFrequency="1" Focusable="False" Height="24" ValueChanged="AvatarMeshDensitySlider_ValueChanged" />
                                 </StackPanel>
                             </StackPanel>
                         </Border>
