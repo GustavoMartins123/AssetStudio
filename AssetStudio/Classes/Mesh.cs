@@ -137,7 +137,6 @@ namespace AssetStudio
             }
 
             m_VertexCount = reader.ReadUInt32();
-            reader.CheckArrayLength((int)m_VertexCount);
 
             if (version[0] >= 4) //4.0 and up
             {

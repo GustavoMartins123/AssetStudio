@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace AssetStudio
 {
@@ -111,7 +111,8 @@ namespace AssetStudio
                 return false;
             }
 
-            TObject match = null;
+            var matches = new System.Collections.Generic.List<TObject>();
+            var matchFiles = new System.Collections.Generic.List<SerializedFile>();
             foreach (var sourceFile in assetsFile.assetsManager.assetsFileList)
             {
                 if (sourceFile == assetsFile)
@@ -119,26 +120,73 @@ namespace AssetStudio
                     continue;
                 }
 
-                if (!TryGetObject(sourceFile, out TObject variable))
+                if (TryGetObject(sourceFile, out TObject variable))
                 {
-                    continue;
+                    matches.Add(variable);
+                    matchFiles.Add(sourceFile);
                 }
-
-                if (match != null)
-                {
-                    return false;
-                }
-
-                match = variable;
             }
 
-            if (match == null)
+            if (matches.Count == 0)
             {
                 return false;
             }
 
-            result = match;
-            return true;
+            if (matches.Count == 1)
+            {
+                result = matches[0];
+                return true;
+            }
+
+            TObject bestMatch = null;
+            int bestScore = -1;
+
+            var refFile = assetsFile;
+            var refDir = System.IO.Path.GetDirectoryName(refFile.fullName) ?? string.Empty;
+            var refName = System.IO.Path.GetFileNameWithoutExtension(refFile.fullName) ?? string.Empty;
+
+            for (int i = 0; i < matches.Count; i++)
+            {
+                var candidate = matches[i];
+                var candidateFile = matchFiles[i];
+
+                int score = 0;
+
+                var candidateDir = System.IO.Path.GetDirectoryName(candidateFile.fullName) ?? string.Empty;
+                if (string.Equals(candidateDir, refDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 10;
+                }
+
+                var candidateName = System.IO.Path.GetFileNameWithoutExtension(candidateFile.fullName) ?? string.Empty;
+                if (string.Equals(candidateName, refName, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 50;
+                }
+                else if (candidateName.Contains(refName, StringComparison.OrdinalIgnoreCase) || refName.Contains(candidateName, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 20;
+                }
+
+                if (string.Equals(candidateFile.originalPath, refFile.originalPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 100;
+                }
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestMatch = candidate;
+                }
+            }
+
+            if (bestMatch != null)
+            {
+                result = bestMatch;
+                return true;
+            }
+
+            return false;
         }
 
         private static bool IsExternalFileMatch(SerializedFile candidate, FileIdentifier external)

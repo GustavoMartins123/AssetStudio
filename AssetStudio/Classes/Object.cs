@@ -1,4 +1,5 @@
-﻿using System.Collections.Specialized;
+using System.Collections.Specialized;
+using System.Linq;
 
 namespace AssetStudio
 {
@@ -37,7 +38,7 @@ namespace AssetStudio
         {
             if (serializedType?.m_Type != null)
             {
-                return TypeTreeHelper.ReadTypeString(serializedType.m_Type, reader);
+                return ReadWithFreshReader(localReader => TypeTreeHelper.ReadTypeString(serializedType.m_Type, localReader));
             }
             return null;
         }
@@ -46,7 +47,7 @@ namespace AssetStudio
         {
             if (m_Type != null)
             {
-                return TypeTreeHelper.ReadTypeString(m_Type, reader);
+                return ReadWithFreshReader(localReader => TypeTreeHelper.ReadTypeString(m_Type, localReader));
             }
             return null;
         }
@@ -55,7 +56,7 @@ namespace AssetStudio
         {
             if (serializedType?.m_Type != null)
             {
-                return TypeTreeHelper.ReadType(serializedType.m_Type, reader);
+                return ReadWithFreshReader(localReader => TypeTreeHelper.ReadType(serializedType.m_Type, localReader));
             }
             return null;
         }
@@ -64,15 +65,40 @@ namespace AssetStudio
         {
             if (m_Type != null)
             {
-                return TypeTreeHelper.ReadType(m_Type, reader);
+                return ReadWithFreshReader(localReader => TypeTreeHelper.ReadType(m_Type, localReader));
             }
             return null;
         }
 
         public byte[] GetRawData()
         {
-            reader.Reset();
-            return reader.ReadBytes((int)byteSize);
+            return ReadWithFreshReader(localReader =>
+            {
+                localReader.Reset();
+                return localReader.ReadBytes((int)byteSize);
+            });
+        }
+
+        private T ReadWithFreshReader<T>(System.Func<ObjectReader, T> read)
+        {
+            var objectInfo = assetsFile.m_Objects.FirstOrDefault(x => x.m_PathID == m_PathID);
+            if (objectInfo == null)
+            {
+                objectInfo = new ObjectInfo
+                {
+                    byteStart = reader.byteStart,
+                    byteSize = byteSize,
+                    classID = (int)type,
+                    m_PathID = m_PathID,
+                    serializedType = serializedType
+                };
+            }
+
+            using (var fileReader = assetsFile.reader.Clone())
+            {
+                var objectReader = new ObjectReader(fileReader, assetsFile, objectInfo);
+                return read(objectReader);
+            }
         }
     }
 }

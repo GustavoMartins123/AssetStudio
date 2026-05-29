@@ -27,6 +27,26 @@ namespace AssetStudio
         private System.Collections.Concurrent.ConcurrentQueue<string> loadQueue;
         private int loadTotalCount;
 
+        private static string NormalizeResourceKey(string value)
+        {
+            return value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        }
+
+        private void RegisterResourceFileReader(BinaryReader reader, params string[] keys)
+        {
+            foreach (var key in keys)
+            {
+                if (string.IsNullOrEmpty(key))
+                {
+                    continue;
+                }
+
+                resourceFileReaders[key] = reader;
+                var normalizedKey = NormalizeResourceKey(key);
+                resourceFileReaders[normalizedKey] = reader;
+            }
+        }
+
         public void LoadFiles(params string[] files)
         {
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
@@ -276,7 +296,7 @@ namespace AssetStudio
                     Logger.Error($"Error while reading assets file {reader.FullPath} from {Path.GetFileName(originalPath)}", e);
                     lock (loadLock)
                     {
-                        resourceFileReaders[reader.FileName] = reader;
+                        RegisterResourceFileReader(reader, reader.FileName, reader.FullPath);
                     }
                 }
             }
@@ -301,7 +321,7 @@ namespace AssetStudio
                 }
                 foreach (var file in bundleFile.fileList)
                 {
-                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.fileName);
+                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.path);
                     var subReader = new FileReader(dummyPath, file.stream);
                     if (subReader.FileType == FileType.AssetsFile)
                     {
@@ -311,7 +331,7 @@ namespace AssetStudio
                     {
                         lock (loadLock)
                         {
-                            resourceFileReaders[file.fileName] = subReader; //TODO
+                            RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
                         }
                     }
                 }
@@ -339,7 +359,7 @@ namespace AssetStudio
                 var webFile = new WebFile(reader);
                 foreach (var file in webFile.fileList)
                 {
-                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.fileName);
+                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.path);
                     var subReader = new FileReader(dummyPath, file.stream);
                     switch (subReader.FileType)
                     {
@@ -355,7 +375,7 @@ namespace AssetStudio
                         case FileType.ResourceFile:
                             lock (loadLock)
                             {
-                                resourceFileReaders[file.fileName] = subReader; //TODO
+                                RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
                             }
                             break;
                     }
@@ -450,17 +470,17 @@ namespace AssetStudio
                             streamReader.Position = 0;
 
                             FileReader entryReader = new FileReader(dummyPath, streamReader);
-                            LoadFile(entryReader);
                             if (entryReader.FileType == FileType.ResourceFile)
                             {
                                 entryReader.Position = 0;
                                 lock (loadLock)
                                 {
-                                    if (!resourceFileReaders.ContainsKey(entry.Name))
-                                    {
-                                        resourceFileReaders.Add(entry.Name, entryReader);
-                                    }
+                                    RegisterResourceFileReader(entryReader, entry.Name, entry.FullName, entryReader.FullPath);
                                 }
+                            }
+                            else
+                            {
+                                LoadFile(entryReader);
                             }
                         }
                         catch (Exception e)

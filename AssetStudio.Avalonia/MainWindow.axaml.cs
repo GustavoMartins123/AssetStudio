@@ -1658,100 +1658,123 @@ public partial class MainWindow : Window
                     var includeMeshInfo = displayInfo.IsChecked == true;
                     Task.Run(() =>
                     {
-                        m_Mesh.EnsureProcessed();
-                        var subMeshTextures = new List<byte[]?>();
-                        var subMeshTexWidths = new List<int>();
-                        var subMeshTexHeights = new List<int>();
-                        var allMaterials = FindMaterialsForMesh(m_Mesh);
-
-                        if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
+                        try
                         {
-                            for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
+                            m_Mesh.EnsureProcessed();
+                            if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
                             {
-                                if (meshPreviewId != texturePreviewIdCounter)
+                                throw new Exception("Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.");
+                            }
+
+                            var subMeshTextures = new List<byte[]?>();
+                            var subMeshTexWidths = new List<int>();
+                            var subMeshTexHeights = new List<int>();
+                            var allMaterials = FindMaterialsForMesh(m_Mesh);
+
+                            if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
+                            {
+                                for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
+                                {
+                                    if (meshPreviewId != texturePreviewIdCounter)
+                                    {
+                                        return;
+                                    }
+
+                                    byte[]? tb = null;
+                                    int tw = 0, th = 0;
+
+                                    if (i < allMaterials.Count && allMaterials[i] != null)
+                                    {
+                                        var tex = FindTextureForMaterial(allMaterials[i]!);
+                                        if (tex != null)
+                                        {
+                                            try
+                                            {
+                                                using (var image = tex.ConvertToImage(true))
+                                                {
+                                                    if (image != null)
+                                                    {
+                                                        LimitInlinePreviewImage(image);
+                                                        tw = image.Width;
+                                                        th = image.Height;
+                                                        tb = new byte[tw * th * 4];
+                                                        image.CopyPixelDataTo(tb);
+                                                        for (int p = 0; p < tb.Length; p += 4)
+                                                        {
+                                                            byte temp = tb[p];
+                                                            tb[p] = tb[p + 2];
+                                                            tb[p + 2] = temp;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            catch {}
+                                        }
+                                    }
+                                    subMeshTextures.Add(tb);
+                                    subMeshTexWidths.Add(tw);
+                                    subMeshTexHeights.Add(th);
+                                }
+                            }
+
+                            global::OpenTK.Mathematics.Vector2[]? uvs = null;
+                            if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
+                            {
+                                uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
+                                for (int i = 0; i < m_Mesh.m_VertexCount; i++)
+                                {
+                                    uvs[i] = new global::OpenTK.Mathematics.Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
+                                }
+                            }
+
+                            var infoText = includeMeshInfo ? FormatMeshPreview(m_Mesh, localAssetItem) : string.Empty;
+                            var hasTextures = subMeshTextures.Any(t => t != null);
+
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
                                 {
                                     return;
                                 }
 
-                                byte[]? tb = null;
-                                int tw = 0, th = 0;
-
-                                if (i < allMaterials.Count && allMaterials[i] != null)
+                                if (GLPreviewControl != null)
                                 {
-                                    var tex = FindTextureForMaterial(allMaterials[i]!);
-                                    if (tex != null)
+                                    currentPreviewMesh = m_Mesh;
+                                    GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                                    GLPreviewControl.IsVisible = true;
+                                    if (BoneSizeContainer != null)
                                     {
-                                        try
-                                        {
-                                            using (var image = tex.ConvertToImage(true))
-                                            {
-                                                if (image != null)
-                                                {
-                                                    LimitInlinePreviewImage(image);
-                                                    tw = image.Width;
-                                                    th = image.Height;
-                                                    tb = new byte[tw * th * 4];
-                                                    image.CopyPixelDataTo(tb);
-                                                    for (int p = 0; p < tb.Length; p += 4)
-                                                    {
-                                                        byte temp = tb[p];
-                                                        tb[p] = tb[p + 2];
-                                                        tb[p + 2] = temp;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        catch {}
+                                        BoneSizeContainer.IsVisible = false;
+                                    }
+                                    GLPreviewControl.Focus();
+                                }
+
+                                if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                                {
+                                    PreviewInfoOverlay.Text = infoText;
+                                    PreviewInfoBorder.IsVisible = true;
+                                }
+
+                                StatusStripUpdate(hasTextures
+                                    ? "OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded"
+                                    : "OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.Log(LoggerEvent.Error, $"Mesh preview failed for {localAssetItem.Name}: {ex.Message}");
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                if (meshPreviewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
+                                {
+                                    StatusStripUpdate($"Mesh preview error: {ex.Message}");
+                                    if (PreviewInfoOverlay != null)
+                                    {
+                                        PreviewInfoOverlay.Text = $"Failed to load mesh: {ex.Message}";
                                     }
                                 }
-                                subMeshTextures.Add(tb);
-                                subMeshTexWidths.Add(tw);
-                                subMeshTexHeights.Add(th);
-                            }
+                            });
                         }
-
-                        global::OpenTK.Mathematics.Vector2[]? uvs = null;
-                        if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
-                        {
-                            uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
-                            for (int i = 0; i < m_Mesh.m_VertexCount; i++)
-                            {
-                                uvs[i] = new global::OpenTK.Mathematics.Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
-                            }
-                        }
-
-                        var infoText = includeMeshInfo ? FormatMeshPreview(m_Mesh, localAssetItem) : string.Empty;
-                        var hasTextures = subMeshTextures.Any(t => t != null);
-
-                        Dispatcher.UIThread.Post(() =>
-                        {
-                            if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
-                            {
-                                return;
-                            }
-
-                            if (GLPreviewControl != null)
-                            {
-                                currentPreviewMesh = m_Mesh;
-                                GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
-                                GLPreviewControl.IsVisible = true;
-                                if (BoneSizeContainer != null)
-                                {
-                                    BoneSizeContainer.IsVisible = false;
-                                }
-                                GLPreviewControl.Focus();
-                            }
-
-                            if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                            {
-                                PreviewInfoOverlay.Text = infoText;
-                                PreviewInfoBorder.IsVisible = true;
-                            }
-
-                            StatusStripUpdate(hasTextures
-                                ? "OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded"
-                                : "OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
-                        });
                     });
                     break;
                 }
