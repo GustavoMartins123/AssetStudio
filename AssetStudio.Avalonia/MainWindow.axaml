@@ -3,7 +3,6 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="using:AssetStudio.Avalonia"
-        xmlns:vlc="clr-namespace:LibVLCSharp.Avalonia;assembly=LibVLCSharp.Avalonia"
         xmlns:ffmpeg="using:AssetStudio.Avalonia.Controls"
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
@@ -356,7 +355,6 @@
                                 <Border Grid.Row="2" Background="Black" CornerRadius="8" ClipToBounds="True" MinHeight="100">
                                     <Grid>
                                         <ffmpeg:VideoPlayerControl x:Name="FfmpegVideoPlayer" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ShowControls="False" ShowOpenButton="False" Volume="80" />
-                                        <vlc:VideoView x:Name="VideoPlayerView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False" />
                                     </Grid>
                                 </Border>
 

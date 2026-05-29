@@ -21,10 +21,11 @@ layout(location = 0) in vec2 vertexPosition;
 layout(location = 1) in vec2 vertexTexCoord;
 out vec2 texCoord;
 uniform mat4 u_mvp;
+uniform int yFlip;
 void main()
 {
     gl_Position = u_mvp * vec4(vertexPosition, 0.0, 1.0);
-    texCoord = vertexTexCoord;
+    texCoord = vec2(vertexTexCoord.x, yFlip == 1 ? (1.0 - vertexTexCoord.y) : vertexTexCoord.y);
 }";
 
         private const string fsSource = @"
@@ -60,6 +61,7 @@ void main()
         private int uniformMvp;
         private int uniformChannelMask;
         private int uniformIsAlphaOnly;
+        private int uniformYFlip;
 
         // VBO / VAO state
         private int vao;
@@ -89,6 +91,8 @@ void main()
         private TextureFormat pendingFormat;
         private int[]? pendingVersion;
         private BuildTarget pendingPlatform;
+        private bool pendingNeedsYFlip;
+        private bool currentNeedsYFlip;
         private bool hasPendingTexture;
 
         public event Action<string>? GpuErrorOccurred;
@@ -117,6 +121,7 @@ void main()
                 pendingFormat = texture.m_TextureFormat;
                 pendingVersion = texture.version;
                 pendingPlatform = texture.platform;
+                pendingNeedsYFlip = false;
                 hasPendingTexture = true;
 
                 try
@@ -146,6 +151,7 @@ void main()
                 pendingFormat = TextureFormat.RGBA32;
                 pendingVersion = null;
                 pendingPlatform = BuildTarget.NoTarget;
+                pendingNeedsYFlip = true;
                 hasPendingTexture = true;
 
                 pendingTextureData = new byte[image.Width * image.Height * 4];
@@ -207,6 +213,7 @@ void main()
                 uniformMvp = GL.GetUniformLocation(pgmID, "u_mvp");
                 uniformChannelMask = GL.GetUniformLocation(pgmID, "channelMask");
                 uniformIsAlphaOnly = GL.GetUniformLocation(pgmID, "isAlphaOnly");
+                uniformYFlip = GL.GetUniformLocation(pgmID, "yFlip");
             }
             catch (Exception ex)
             {
@@ -244,6 +251,7 @@ void main()
                         texFormat = pendingFormat;
                         texVersion = pendingVersion;
                         texPlatform = pendingPlatform;
+                        currentNeedsYFlip = pendingNeedsYFlip;
                         hasPendingTexture = false;
                         pendingTextureData = null;
                     }
@@ -303,13 +311,12 @@ void main()
                 if (vao == 0)
                 {
                     // Quad vertices: Position (X, Y) and UV (U, V)
-                    // Flipped vertically by adjusting UVs
                     float[] vertices = new float[]
                     {
-                        -1.0f, -1.0f,  0.0f, 1.0f,
-                         1.0f, -1.0f,  1.0f, 1.0f,
-                         1.0f,  1.0f,  1.0f, 0.0f,
-                        -1.0f,  1.0f,  0.0f, 0.0f
+                        -1.0f, -1.0f,  0.0f, 0.0f,
+                         1.0f, -1.0f,  1.0f, 0.0f,
+                         1.0f,  1.0f,  1.0f, 1.0f,
+                        -1.0f,  1.0f,  0.0f, 1.0f
                     };
 
                     int[] indices = new int[]
@@ -349,6 +356,7 @@ void main()
 
                 // Set uniforms
                 GL.UniformMatrix4(uniformMvp, false, ref mvp);
+                GL.Uniform1(uniformYFlip, currentNeedsYFlip ? 1 : 0);
 
                 // Channel masking
                 GL.Uniform4(uniformChannelMask, channelMask[0] ? 1.0f : 0.0f, channelMask[1] ? 1.0f : 0.0f, channelMask[2] ? 1.0f : 0.0f, channelMask[3] ? 1.0f : 0.0f);

@@ -9,9 +9,8 @@ namespace Decompiler
     {
         static void Main(string[] args)
         {
-            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var assemblyPath = Path.Combine(userProfile, @".nuget\packages\fmod5sharp\3.1.0\lib\net8.0\Fmod5Sharp.dll");
-            var outputPath = @"f:\AssetStudio\scratch\Fmod5Sharp_decompiled.cs";
+            var assemblyPath = @"f:\AssetStudio\AssetStudio.Avalonia\bin\Debug\net10.0\FFmpegVideoPlayer.Core.dll";
+            var outputPath = @"f:\AssetStudio\scratch\FFmpegVideoPlayerCore_decompiled.cs";
 
             Console.WriteLine($"Decompiling {assemblyPath}...");
             

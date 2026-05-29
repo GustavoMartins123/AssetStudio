@@ -22,12 +22,12 @@ using System.Threading.Tasks;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
+using FFmpegVideoPlayer.Core;
 
 namespace AssetStudio.Avalonia;
 
 public partial class MainWindow : Window
 {
-    private static readonly bool UseFfmpegVideoPreview = true;
     private AssetsManager assetsManager = new AssetsManager();
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private Texture2D? currentPreviewTexture;
@@ -67,7 +67,7 @@ public partial class MainWindow : Window
     private Dictionary<Material, Dictionary<string, Texture2D?>>? materialTextureSlotsCache;
     private Dictionary<AssetStudio.Object, AssetItem>? objectToAssetItemCache;
 
-    private LibVLCSharp.Shared.MediaPlayer? _audioMediaPlayer;
+    private FFmpegMediaPlayer? _audioMediaPlayer;
     private string? _currentTempAudioPath;
     private long _audioLengthMs;
     private DispatcherTimer? _audioTimer;
@@ -75,21 +75,12 @@ public partial class MainWindow : Window
     private bool _isUpdatingAudioProgress = false;
     private bool _isAudioDragging = false;
 
-    private LibVLCSharp.Shared.LibVLC? _libVLC;
-    private LibVLCSharp.Shared.MediaPlayer? _mediaPlayer;
     private string? _currentTempVideoPath;
     private bool _isUpdatingVideoProgress = false;
     private bool _isVideoDragging = false;
     private long _videoLengthMs = 0;
     private volatile int _targetVolume = 80;
-    private long _videoAudioApplyVersion;
     private DispatcherTimer? _ffmpegVideoTimer;
-
-    [DllImport("libdl.so.2", EntryPoint = "dlopen")]
-    private static extern IntPtr DlOpen([MarshalAs(UnmanagedType.LPStr)] string fileName, int flags);
-
-    [DllImport("libc.so.6", EntryPoint = "setenv", SetLastError = true)]
-    private static extern int SetEnv([MarshalAs(UnmanagedType.LPStr)] string name, [MarshalAs(UnmanagedType.LPStr)] string value, int overwrite);
 
     private string? _pendingStatusText;
     private bool _statusUpdatePending;
@@ -132,105 +123,28 @@ public partial class MainWindow : Window
         };
         _ffmpegVideoTimer.Tick += FfmpegVideoTimer_Tick;
         FfmpegVideoPlayer.MediaEnded += FfmpegVideoPlayer_MediaEnded;
-        FfmpegVideoPlayer.IsVisible = UseFfmpegVideoPreview;
-        VideoPlayerView.IsVisible = !UseFfmpegVideoPreview;
+        FfmpegVideoPlayer.IsVisible = true;
 
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
         Title = $"AssetStudio v{version}";
 
-        if (!UseFfmpegVideoPreview)
+        try
         {
-            try
+            _audioMediaPlayer = new FFmpegMediaPlayer(action =>
             {
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                {
-                    var libDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "x64");
-                    var libVlcPath = Path.Combine(libDir, "libvlc.so");
-                    var libVlcCorePath = Path.Combine(libDir, "libvlccore.so");
-                    var pluginsPath = Path.Combine(libDir, "plugins");
+                Dispatcher.UIThread.Post(action);
+            }, (sr, ch) => FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch));
 
-                    if (File.Exists(libVlcPath) && File.Exists(libVlcCorePath))
-                    {
-                        try
-                        {
-                            SetEnv("VLC_PLUGIN_PATH", pluginsPath, 1);
-
-                            NativeLibrary.SetDllImportResolver(typeof(LibVLCSharp.Shared.LibVLC).Assembly, (libraryName, assembly, searchPath) =>
-                            {
-                                if (libraryName == "libvlc")
-                                {
-                                    try
-                                    {
-                                        DlOpen(libVlcCorePath, 0x102); // 0x2 (RTLD_NOW) | 0x100 (RTLD_GLOBAL)
-                                        var handle = DlOpen(libVlcPath, 0x102);
-                                        if (handle != IntPtr.Zero)
-                                        {
-                                            return handle;
-                                        }
-                                    }
-                                    catch { }
-                                }
-                                return IntPtr.Zero;
-                            });
-                        }
-                        catch (Exception initEx)
-                        {
-                            logger.Log(LoggerEvent.Warning, $"Failed to setup bundled LibVLC resolver: {initEx.Message}. Falling back to system VLC.");
-                        }
-                    }
-
-                    LibVLCSharp.Shared.Core.Initialize();
-                }
-                else
-                {
-                    LibVLCSharp.Shared.Core.Initialize();
-                }
-
-                var libVlcOptions = new List<string>
-                {
-                    "--no-video-title-show",
-                    "--gain=1.0"
-                };
-                _libVLC = new LibVLCSharp.Shared.LibVLC(libVlcOptions.ToArray());
-                try
-                {
-                    var logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "vlc_log.txt");
-                    if (File.Exists(logPath)) File.Delete(logPath);
-                    _libVLC.Log += (sender, e) => {
-                        try
-                        {
-                            File.AppendAllText(logPath, $"[{e.Level}] {e.Module} - {e.Message}{Environment.NewLine}");
-                        }
-                        catch {}
-                    };
-                }
-                catch {}
-                _mediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
-                _mediaPlayer.EndReached += MediaPlayer_EndReached;
-                _mediaPlayer.PositionChanged += MediaPlayer_PositionChanged;
-                _mediaPlayer.TimeChanged += MediaPlayer_TimeChanged;
-                _mediaPlayer.LengthChanged += MediaPlayer_LengthChanged;
-                _mediaPlayer.Playing += MediaPlayer_Playing;
-                VideoPlayerView.MediaPlayer = _mediaPlayer;
-
-                _audioMediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVLC);
-                _audioMediaPlayer.EndReached += AudioMediaPlayer_EndReached;
-                _audioMediaPlayer.LengthChanged += AudioMediaPlayer_LengthChanged;
-                _audioTimer = new DispatcherTimer
-                {
-                    Interval = TimeSpan.FromMilliseconds(100)
-                };
-                _audioTimer.Tick += AudioTimer_Tick;
-            }
-            catch (Exception ex)
+            _audioMediaPlayer.EndReached += AudioMediaPlayer_EndReached;
+            _audioTimer = new DispatcherTimer
             {
-                var message = $"Failed to initialize LibVLC: {ex.Message}. Embedded video preview will be disabled.";
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                {
-                    message += " Hint: Ensure system VLC is installed using: sudo apt install vlc libvlc-dev";
-                }
-                logger.Log(LoggerEvent.Error, message);
-            }
+                Interval = TimeSpan.FromMilliseconds(100)
+            };
+            _audioTimer.Tick += AudioTimer_Tick;
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Failed to initialize FFmpeg audio player: {ex.Message}");
         }
 
         // Detect GPU support (OpenGL interface availability)
@@ -5902,8 +5816,6 @@ public partial class MainWindow : Window
         AudioReset();
         VideoReset();
         _audioMediaPlayer?.Dispose();
-        _mediaPlayer?.Dispose();
-        _libVLC?.Dispose();
         base.OnClosing(e);
     }
 
@@ -5913,8 +5825,9 @@ public partial class MainWindow : Window
         if (_audioMediaPlayer == null)
             return;
 
-        var currentMs = Math.Max(0, _audioMediaPlayer.Time);
-        var totalMs = _audioLengthMs > 0 ? _audioLengthMs : Math.Max(0, _audioMediaPlayer.Length);
+        var currentMs = (long)(_audioMediaPlayer.Position * (float)_audioMediaPlayer.Length);
+        var totalMs = _audioLengthMs > 0 ? _audioLengthMs : _audioMediaPlayer.Length;
+        _audioLengthMs = totalMs;
 
         if (FMODprogressBar != null && !_isAudioDragging && totalMs > 0)
         {
@@ -5940,11 +5853,7 @@ public partial class MainWindow : Window
             if (_audioMediaPlayer != null)
             {
                 _audioMediaPlayer.Stop();
-                if (_audioMediaPlayer.Media != null)
-                {
-                    _audioMediaPlayer.Media.Dispose();
-                    _audioMediaPlayer.Media = null;
-                }
+                _audioMediaPlayer.Close();
             }
         }
         catch {}
@@ -5979,15 +5888,9 @@ public partial class MainWindow : Window
                 return;
             }
 
-            if (_audioMediaPlayer.Media == null && _libVLC != null && !string.IsNullOrEmpty(_currentTempAudioPath))
-            {
-                _audioMediaPlayer.Media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempAudioPath, LibVLCSharp.Shared.FromType.FromPath);
-            }
-
             _audioMediaPlayer.Stop();
             try
             {
-                _audioMediaPlayer.Mute = false;
                 _audioMediaPlayer.Volume = _targetAudioVolume;
             }
             catch {}
@@ -6013,12 +5916,6 @@ public partial class MainWindow : Window
         if (currentAudioData == null || currentAudioData.Length == 0)
         {
             StatusStripUpdate("AudioClip data is empty or invalid.");
-            return false;
-        }
-
-        if (_libVLC == null)
-        {
-            StatusStripUpdate("Audio preview is unavailable (LibVLC is not loaded).");
             return false;
         }
 
@@ -6081,10 +5978,9 @@ public partial class MainWindow : Window
         _currentTempAudioPath = Path.Combine(tempDir, $"temp_audio_{FixFileName(audioClip.m_Name)}_{audioClip.m_PathID}{extension}");
         File.WriteAllBytes(_currentTempAudioPath, audioData);
 
-        _audioMediaPlayer?.Media?.Dispose();
         if (_audioMediaPlayer != null)
         {
-            _audioMediaPlayer.Media = new LibVLCSharp.Shared.Media(_libVLC, _currentTempAudioPath, LibVLCSharp.Shared.FromType.FromPath);
+            _audioMediaPlayer.Open(_currentTempAudioPath);
         }
 
         return true;
@@ -6092,14 +5988,17 @@ public partial class MainWindow : Window
 
     private void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (_audioMediaPlayer == null)
+        if (_audioMediaPlayer == null || currentPreviewAudioClip == null)
             return;
 
         try
         {
-            if (_audioMediaPlayer.Media == null && currentPreviewAudioClip != null && !EnsureAudioPreviewFile(currentPreviewAudioClip))
+            if (string.IsNullOrEmpty(_currentTempAudioPath) || !File.Exists(_currentTempAudioPath))
             {
-                return;
+                if (!EnsureAudioPreviewFile(currentPreviewAudioClip))
+                {
+                    return;
+                }
             }
 
             if (_audioMediaPlayer.IsPlaying)
@@ -6112,7 +6011,6 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    _audioMediaPlayer.Mute = false;
                     _audioMediaPlayer.Volume = _targetAudioVolume;
                 }
                 catch {}
@@ -6172,7 +6070,7 @@ public partial class MainWindow : Window
 
             if (!_isAudioDragging)
             {
-                _audioMediaPlayer.Time = newMs;
+                _audioMediaPlayer.Seek(newMs / (float)_audioLengthMs);
             }
         }
     }
@@ -6197,16 +6095,11 @@ public partial class MainWindow : Window
         });
     }
 
-    private void AudioMediaPlayer_LengthChanged(object? sender, LibVLCSharp.Shared.MediaPlayerLengthChangedEventArgs e)
-    {
-        _audioLengthMs = e.Length;
-    }
-
     private void PreviewAudioClip(AssetItem assetItem, AudioClip m_AudioClip)
     {
         AudioReset();
         currentPreviewAudioClip = m_AudioClip;
-
+        
         var infoText = "Compression format: ";
         if (m_AudioClip.version[0] < 5)
         {
@@ -6293,9 +6186,9 @@ public partial class MainWindow : Window
             }
         }
 
-        if (_audioMediaPlayer == null || _libVLC == null)
+        if (_audioMediaPlayer == null)
         {
-            StatusStripUpdate("Audio preview is unavailable (LibVLC is not loaded).");
+            StatusStripUpdate("Audio preview is unavailable (FFmpeg player is not loaded).");
             return;
         }
 
@@ -6308,191 +6201,6 @@ public partial class MainWindow : Window
         StatusStripUpdate($"Loaded audio metadata: {m_AudioClip.m_Name}");
     }
 
-    private void MediaPlayer_EndReached(object? sender, EventArgs e)
-    {
-        Dispatcher.UIThread.Post(() => {
-            if (VideoLoopButton.IsChecked == true)
-            {
-                Task.Run(() => {
-                    if (_mediaPlayer != null)
-                    {
-                        _mediaPlayer.Stop();
-                        _mediaPlayer.Play();
-                        ApplyVideoAudioOutputState(forceTrack: true);
-                        ScheduleVideoAudioOutputRetries();
-                    }
-                });
-            }
-            else
-            {
-                VideoStop();
-            }
-        });
-    }
-
-    private void MediaPlayer_PositionChanged(object? sender, LibVLCSharp.Shared.MediaPlayerPositionChangedEventArgs e)
-    {
-        Dispatcher.UIThread.Post(() => {
-            if (VideoProgressBar != null && !_isVideoDragging)
-            {
-                _isUpdatingVideoProgress = true;
-                VideoProgressBar.Value = e.Position * 1000;
-                _isUpdatingVideoProgress = false;
-            }
-        });
-    }
-
-    private void MediaPlayer_TimeChanged(object? sender, LibVLCSharp.Shared.MediaPlayerTimeChangedEventArgs e)
-    {
-        Dispatcher.UIThread.Post(() => {
-            if (_mediaPlayer != null)
-            {
-                long currentMs = e.Time;
-                long totalMs = _videoLengthMs;
-                if (totalMs < 0) totalMs = 0;
-                VideoTimerLabel.Text = $"{currentMs / 1000 / 60}:{currentMs / 1000 % 60:D2}.{currentMs / 10 % 100:D2} / {totalMs / 1000 / 60}:{totalMs / 1000 % 60:D2}.{totalMs / 10 % 100:D2}";
-            }
-        });
-    }
-
-    private void MediaPlayer_LengthChanged(object? sender, LibVLCSharp.Shared.MediaPlayerLengthChangedEventArgs e)
-    {
-        _videoLengthMs = e.Length;
-    }
-
-    private void MediaPlayer_Playing(object? sender, EventArgs e)
-    {
-        ApplyVideoAudioOutputState(forceTrack: true);
-        ScheduleVideoAudioOutputRetries();
-
-        Dispatcher.UIThread.Post(() => {
-            if (_mediaPlayer != null)
-            {
-                UpdateVideoAudioLabelFromVlc();
-            }
-        });
-    }
-
-    private void ApplyVideoAudioOutputState(bool forceTrack = false)
-    {
-        if (_mediaPlayer == null)
-        {
-            return;
-        }
-
-        try
-        {
-            _mediaPlayer.Mute = false;
-            _mediaPlayer.Volume = _targetVolume;
-
-            if (forceTrack || _mediaPlayer.AudioTrack < 0)
-            {
-                var audioTrackDescription = _mediaPlayer.AudioTrackDescription;
-                if (audioTrackDescription != null)
-                {
-                    foreach (var track in audioTrackDescription)
-                    {
-                        if (track.Id >= 0)
-                        {
-                            _mediaPlayer.SetAudioTrack(track.Id);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.Log(LoggerEvent.Warning, $"Failed to apply video audio output settings: {ex.Message}");
-        }
-    }
-
-    private void ScheduleVideoAudioOutputRetries()
-    {
-        var version = Interlocked.Increment(ref _videoAudioApplyVersion);
-        _ = Task.Run(async () =>
-        {
-            foreach (var delayMs in new[] { 75, 250, 750, 1500 })
-            {
-                await Task.Delay(delayMs);
-                if (version != Interlocked.Read(ref _videoAudioApplyVersion))
-                {
-                    return;
-                }
-                ApplyVideoAudioOutputState(forceTrack: true);
-            }
-        });
-    }
-
-    private void UpdateVideoAudioLabelFromVlc()
-    {
-        if (VideoAudioLabel == null)
-        {
-            return;
-        }
-
-        try
-        {
-            var audioTracks = _mediaPlayer?.Media?.Tracks?
-                .Where(track => track.TrackType == LibVLCSharp.Shared.TrackType.Audio)
-                .ToArray() ?? Array.Empty<LibVLCSharp.Shared.MediaTrack>();
-
-            if (audioTracks.Length > 0)
-            {
-                SetVideoAudioLabelFromTracks(audioTracks);
-                return;
-            }
-
-            if (_mediaPlayer?.AudioTrackCount > 0)
-            {
-                VideoAudioLabel.Text = $"Audio: yes ({_mediaPlayer.AudioTrackCount} VLC track(s))";
-                VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#00e676"));
-                return;
-            }
-
-            VideoAudioLabel.Text = currentPreviewVideoClip?.HasAudio == true
-                ? "Audio: Unity metadata says yes, but VLC found no playable audio track"
-                : "Audio: no playable track found";
-            VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
-        }
-        catch (Exception ex)
-        {
-            VideoAudioLabel.Text = $"Audio: track check failed ({ex.Message})";
-            VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
-        }
-    }
-
-    private static string FormatVlcAudioTracks(LibVLCSharp.Shared.MediaTrack[] audioTracks)
-    {
-        var audioDetails = new StringBuilder("Audio: yes");
-        for (var i = 0; i < audioTracks.Length; i++)
-        {
-            var audio = audioTracks[i].Data.Audio;
-            audioDetails.Append($" | Track {i + 1}");
-            if (audio.Channels > 0)
-            {
-                audioDetails.Append($": {audio.Channels}ch");
-            }
-            if (audio.Rate > 0)
-            {
-                audioDetails.Append($" {audio.Rate}Hz");
-            }
-        }
-
-        return audioDetails.ToString();
-    }
-
-    private void SetVideoAudioLabelFromTracks(LibVLCSharp.Shared.MediaTrack[] audioTracks)
-    {
-        if (VideoAudioLabel == null)
-        {
-            return;
-        }
-
-        VideoAudioLabel.Text = FormatVlcAudioTracks(audioTracks);
-        VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#00e676"));
-    }
-
     private void SetInitialVideoAudioLabel(VideoClip videoClip)
     {
         if (VideoAudioLabel == null)
@@ -6500,83 +6208,185 @@ public partial class MainWindow : Window
             return;
         }
 
-        VideoAudioLabel.Text = videoClip.HasAudio
-            ? "Audio: checking playable VLC tracks..."
-            : "Audio: Unity metadata reports no audio";
-        VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
+        byte[]? data = null;
+        try
+        {
+            data = videoClip.m_VideoData.GetData();
+        }
+        catch {}
+
+        bool fileHasAudio = VideoAudioProber.HasAudio(data);
+
+        if (videoClip.HasAudio)
+        {
+            if (!fileHasAudio)
+            {
+                VideoAudioLabel.Text = "Audio: yes | No audio stream in file";
+                VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
+                return;
+            }
+
+            var sb = new StringBuilder("Audio: yes");
+            if (videoClip.m_AudioChannelCount != null)
+            {
+                for (int i = 0; i < videoClip.m_AudioChannelCount.Length; i++)
+                {
+                    var ch = videoClip.m_AudioChannelCount[i];
+                    var rate = videoClip.m_AudioSampleRate != null && videoClip.m_AudioSampleRate.Length > i ? videoClip.m_AudioSampleRate[i] : 0;
+                    sb.Append($" | Track {i + 1}: {ch}ch");
+                    if (rate > 0)
+                    {
+                        sb.Append($" {rate}Hz");
+                    }
+                }
+            }
+            VideoAudioLabel.Text = sb.ToString();
+            VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#00e676"));
+        }
+        else
+        {
+            VideoAudioLabel.Text = "Audio: no playable track found";
+            VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
+        }
+    }
+
+    private static class VideoAudioProber
+    {
+        public static bool HasAudio(byte[]? bytes)
+        {
+            if (bytes == null || bytes.Length < 8)
+            {
+                return false;
+            }
+
+            // 1. Detect format
+            // WebM / Matroska magic: 1A 45 DF A3
+            if (bytes[0] == 0x1A && bytes[1] == 0x45 && bytes[2] == 0xDF && bytes[3] == 0xA3)
+            {
+                return WebMHasAudio(bytes);
+            }
+
+            // MP4 magic: check for 'ftyp' box type in the first 16 bytes
+            if (bytes.Length >= 16 && bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70)
+            {
+                return Mp4HasAudio(bytes);
+            }
+
+            // Fallback: default to true if we don't recognize or support the format
+            return true;
+        }
+
+        private static bool WebMHasAudio(byte[] bytes)
+        {
+            // Scan the first 128KB for the TrackType = Audio EBML element
+            // TrackType ID is 0x83, size is 0x81 (VINT size 1), audio value is 0x02.
+            int scanLength = Math.Min(bytes.Length, 128 * 1024);
+            for (int i = 0; i < scanLength - 2; i++)
+            {
+                if (bytes[i] == 0x83 && bytes[i + 1] == 0x81 && bytes[i + 2] == 0x02)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool Mp4HasAudio(byte[] bytes)
+        {
+            int offset = 0;
+            try
+            {
+                return ScanMp4BoxesForAudio(bytes, ref offset, bytes.Length);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool ScanMp4BoxesForAudio(byte[] bytes, ref int offset, int endOffset)
+        {
+            while (offset + 8 <= endOffset)
+            {
+                int startOffset = offset;
+                
+                // Read box size (4 bytes)
+                long size = (uint)((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]);
+                
+                // Read box type (4 bytes)
+                string type = Encoding.ASCII.GetString(bytes, offset + 4, 4);
+                offset += 8;
+
+                if (size == 1)
+                {
+                    // 64-bit size
+                    if (offset + 8 <= endOffset)
+                    {
+                        size = ((long)bytes[offset] << 56) | ((long)bytes[offset + 1] << 48) |
+                               ((long)bytes[offset + 2] << 40) | ((long)bytes[offset + 3] << 32) |
+                               ((long)bytes[offset + 4] << 24) | ((long)bytes[offset + 5] << 16) |
+                               ((long)bytes[offset + 6] << 8) | bytes[offset + 7];
+                        offset += 8;
+                    }
+                }
+                else if (size == 0)
+                {
+                    // Extends to the end of the file
+                    size = endOffset - startOffset;
+                }
+
+                long boxContentEnd = startOffset + size;
+                if (boxContentEnd > endOffset || boxContentEnd <= startOffset)
+                {
+                    boxContentEnd = endOffset;
+                }
+
+                if (type == "moov" || type == "trak" || type == "mdia")
+                {
+                    // Recurse into nested container boxes
+                    int localOffset = offset;
+                    if (ScanMp4BoxesForAudio(bytes, ref localOffset, (int)boxContentEnd))
+                    {
+                        return true;
+                    }
+                }
+                else if (type == "hdlr")
+                {
+                    // Handler Reference Box
+                    if (offset + 12 <= boxContentEnd)
+                    {
+                        string handlerType = Encoding.ASCII.GetString(bytes, offset + 8, 4);
+                        if (handlerType == "soun")
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                offset = (int)boxContentEnd;
+            }
+            return false;
+        }
     }
 
     private void VideoStop()
     {
-        if (UseFfmpegVideoPreview)
-        {
-            try
-            {
-                _ffmpegVideoTimer?.Stop();
-                FfmpegVideoPlayer.Stop();
-            }
-            catch {}
-
-            SetVideoStoppedUi();
-            return;
-        }
-
-        Interlocked.Increment(ref _videoAudioApplyVersion);
         try
         {
-            if (_mediaPlayer != null)
-            {
-                _mediaPlayer.Stop();
-            }
-            if (Dispatcher.UIThread.CheckAccess())
-            {
-                SetVideoStoppedUi();
-            }
-            else
-            {
-                Dispatcher.UIThread.Post(SetVideoStoppedUi);
-            }
+            _ffmpegVideoTimer?.Stop();
+            FfmpegVideoPlayer.Stop();
         }
         catch {}
+
+        SetVideoStoppedUi();
     }
 
     private void VideoReset()
     {
-        if (UseFfmpegVideoPreview)
-        {
-            try
-            {
-                _ffmpegVideoTimer?.Stop();
-                FfmpegVideoPlayer.Stop();
-            }
-            catch {}
-
-            if (!string.IsNullOrEmpty(_currentTempVideoPath) && File.Exists(_currentTempVideoPath))
-            {
-                try
-                {
-                    File.Delete(_currentTempVideoPath);
-                }
-                catch {}
-                _currentTempVideoPath = null;
-            }
-
-            SetVideoStoppedUi();
-            return;
-        }
-
-        Interlocked.Increment(ref _videoAudioApplyVersion);
         try
         {
-            if (_mediaPlayer != null)
-            {
-                _mediaPlayer.Stop();
-                if (_mediaPlayer.Media != null)
-                {
-                    _mediaPlayer.Media.Dispose();
-                    _mediaPlayer.Media = null;
-                }
-            }
+            _ffmpegVideoTimer?.Stop();
+            FfmpegVideoPlayer.Stop();
         }
         catch {}
 
@@ -6590,14 +6400,7 @@ public partial class MainWindow : Window
             _currentTempVideoPath = null;
         }
 
-        if (Dispatcher.UIThread.CheckAccess())
-        {
-            SetVideoStoppedUi();
-        }
-        else
-        {
-            Dispatcher.UIThread.Post(SetVideoStoppedUi);
-        }
+        SetVideoStoppedUi();
     }
 
     private void SetVideoStoppedUi()
@@ -6636,82 +6439,43 @@ public partial class MainWindow : Window
 
     private void VideoPlayButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (UseFfmpegVideoPreview)
-        {
-            if (currentPreviewVideoClip == null) return;
-
-            try
-            {
-                if (FfmpegVideoPlayer.IsPlaying)
-                {
-                    FfmpegVideoPlayer.Pause();
-                    _ffmpegVideoTimer?.Stop();
-                    VideoStatusLabel.Text = "Paused";
-                    VideoPlayButton.Content = "Play";
-                }
-                else
-                {
-                    var hasLoadedFile = FfmpegVideoPlayer.HasMediaLoaded
-                        && !string.IsNullOrEmpty(_currentTempVideoPath)
-                        && File.Exists(_currentTempVideoPath);
-
-                    if (!hasLoadedFile)
-                    {
-                        if (!EnsureVideoPreviewFile(currentPreviewVideoClip))
-                        {
-                            return;
-                        }
-
-                        FfmpegVideoPlayer.Open(_currentTempVideoPath!);
-                    }
-
-                    FfmpegVideoPlayer.Volume = _targetVolume;
-                    FfmpegVideoPlayer.Play();
-                    _ffmpegVideoTimer?.Start();
-                    VideoStatusLabel.Text = "Playing";
-                    VideoPlayButton.Content = "Pause";
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusStripUpdate($"Failed to toggle FFmpeg playback: {ex.Message}");
-            }
-            return;
-        }
-
-        if (_mediaPlayer == null || currentPreviewVideoClip == null) return;
+        if (currentPreviewVideoClip == null) return;
 
         try
         {
-            if (_mediaPlayer.IsPlaying)
+            if (FfmpegVideoPlayer.IsPlaying)
             {
-                _mediaPlayer.Pause();
+                FfmpegVideoPlayer.Pause();
+                _ffmpegVideoTimer?.Stop();
                 VideoStatusLabel.Text = "Paused";
                 VideoPlayButton.Content = "Play";
             }
             else
             {
-                if (!EnsureVideoPreviewFile(currentPreviewVideoClip))
+                var hasLoadedFile = FfmpegVideoPlayer.HasMediaLoaded
+                    && !string.IsNullOrEmpty(_currentTempVideoPath)
+                    && File.Exists(_currentTempVideoPath);
+
+                if (!hasLoadedFile)
                 {
-                    return;
+                    if (!EnsureVideoPreviewFile(currentPreviewVideoClip))
+                    {
+                        return;
+                    }
+
+                    FfmpegVideoPlayer.Open(_currentTempVideoPath!);
                 }
 
-                if (_mediaPlayer.Media == null && !string.IsNullOrEmpty(_currentTempVideoPath))
-                {
-                    var media = new LibVLCSharp.Shared.Media(_libVLC!, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
-                    _mediaPlayer.Media = media;
-                }
-                ApplyVideoAudioOutputState(forceTrack: true);
-                _mediaPlayer.Play();
-                ApplyVideoAudioOutputState(forceTrack: true);
-                ScheduleVideoAudioOutputRetries();
+                FfmpegVideoPlayer.Volume = _targetVolume;
+                FfmpegVideoPlayer.Play();
+                _ffmpegVideoTimer?.Start();
                 VideoStatusLabel.Text = "Playing";
                 VideoPlayButton.Content = "Pause";
             }
         }
         catch (Exception ex)
         {
-            StatusStripUpdate($"Failed to toggle playback: {ex.Message}");
+            StatusStripUpdate($"Failed to toggle FFmpeg playback: {ex.Message}");
         }
     }
 
@@ -6750,68 +6514,10 @@ public partial class MainWindow : Window
         _currentTempVideoPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}{ext}");
         File.WriteAllBytes(_currentTempVideoPath, data);
 
-        if (UseFfmpegVideoPreview)
-        {
-            _videoLengthMs = 0;
-            VideoInfoLabel.Text = "Embedded FFmpeg preview loaded.";
-            StatusStripUpdate($"Loaded video clip with FFmpeg backend: {videoClip.m_Name}");
-            if (_libVLC != null)
-            {
-                _ = ParseVideoTracksAsync(_currentTempVideoPath, videoClip);
-            }
-            return true;
-        }
-
-        var mediaPlayer = _mediaPlayer;
-        var libVlc = _libVLC;
-        if (mediaPlayer == null || libVlc == null)
-        {
-            VideoInfoLabel.Text = "Video preview is unavailable (LibVLC is not loaded).";
-            StatusStripUpdate("Video preview is unavailable (LibVLC is not loaded).");
-            return false;
-        }
-
-        mediaPlayer.Media?.Dispose();
-        mediaPlayer.Media = new LibVLCSharp.Shared.Media(libVlc, _currentTempVideoPath, LibVLCSharp.Shared.FromType.FromPath);
-        _targetVolume = (int)VideoVolumeBar.Value;
-        VideoInfoLabel.Text = "Embedded native preview loaded.";
-        _ = ParseVideoTracksAsync(_currentTempVideoPath, videoClip);
+        _videoLengthMs = 0;
+        VideoInfoLabel.Text = "Embedded FFmpeg preview loaded.";
+        StatusStripUpdate($"Loaded video clip with FFmpeg backend: {videoClip.m_Name}");
         return true;
-    }
-
-    private async Task ParseVideoTracksAsync(string videoPath, VideoClip videoClip)
-    {
-        try
-        {
-            using var probeMedia = new LibVLCSharp.Shared.Media(_libVLC!, videoPath, LibVLCSharp.Shared.FromType.FromPath);
-            await probeMedia.Parse(
-                LibVLCSharp.Shared.MediaParseOptions.ParseLocal,
-                1500,
-                CancellationToken.None);
-
-            var audioTracks = probeMedia.Tracks?
-                .Where(track => track.TrackType == LibVLCSharp.Shared.TrackType.Audio)
-                .ToArray() ?? Array.Empty<LibVLCSharp.Shared.MediaTrack>();
-
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                if (_currentTempVideoPath == videoPath && ReferenceEquals(currentPreviewVideoClip, videoClip))
-                {
-                    if (audioTracks.Length > 0)
-                    {
-                        SetVideoAudioLabelFromTracks(audioTracks);
-                    }
-                    else
-                    {
-                        UpdateVideoAudioLabelFromVlc();
-                    }
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            logger.Log(LoggerEvent.Warning, $"Failed to parse video tracks: {ex.Message}");
-        }
     }
 
     private void VideoStopButton_Click(object? sender, RoutedEventArgs e)
@@ -6822,22 +6528,12 @@ public partial class MainWindow : Window
     private void VideoVolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
         _targetVolume = (int)VideoVolumeBar.Value;
-        if (UseFfmpegVideoPreview)
-        {
-            FfmpegVideoPlayer.Volume = _targetVolume;
-            return;
-        }
-
-        if (_mediaPlayer != null)
-        {
-            _mediaPlayer.Mute = false;
-            _mediaPlayer.Volume = _targetVolume;
-        }
+        FfmpegVideoPlayer.Volume = _targetVolume;
     }
 
     private void FfmpegVideoTimer_Tick(object? sender, EventArgs e)
     {
-        if (!UseFfmpegVideoPreview || _isVideoDragging)
+        if (_isVideoDragging)
         {
             return;
         }
@@ -6873,11 +6569,6 @@ public partial class MainWindow : Window
     {
         Dispatcher.UIThread.Post(() =>
         {
-            if (!UseFfmpegVideoPreview)
-            {
-                return;
-            }
-
             try
             {
                 _ffmpegVideoTimer?.Stop();
@@ -6909,17 +6600,7 @@ public partial class MainWindow : Window
         if (_isUpdatingVideoProgress)
             return;
 
-        if (UseFfmpegVideoPreview)
-        {
-            FfmpegVideoPlayer.Seek((float)(VideoProgressBar.Value / 1000.0));
-            return;
-        }
-
-        if (_mediaPlayer != null)
-        {
-            float pos = (float)(VideoProgressBar.Value / 1000.0);
-            _mediaPlayer.Position = pos;
-        }
+        FfmpegVideoPlayer.Seek((float)(VideoProgressBar.Value / 1000.0));
     }
 
     private void FMODprogressBar_DragStarted(object? sender, global::Avalonia.Input.VectorEventArgs e)
@@ -6932,7 +6613,7 @@ public partial class MainWindow : Window
         _isAudioDragging = false;
         if (_audioMediaPlayer != null && _audioLengthMs > 0)
         {
-            _audioMediaPlayer.Time = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
+            _audioMediaPlayer.Seek((float)(FMODprogressBar.Value / 1000.0));
         }
     }
 
@@ -6944,36 +6625,20 @@ public partial class MainWindow : Window
     private void VideoProgressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
     {
         _isVideoDragging = false;
-        if (UseFfmpegVideoPreview)
-        {
-            FfmpegVideoPlayer.Seek((float)(VideoProgressBar.Value / 1000.0));
-            return;
-        }
-
-        if (_mediaPlayer != null)
-        {
-            float pos = (float)(VideoProgressBar.Value / 1000.0);
-            _mediaPlayer.Position = pos;
-        }
+        FfmpegVideoPlayer.Seek((float)(VideoProgressBar.Value / 1000.0));
     }
 
     private async void VideoExportButton_Click(object? sender, RoutedEventArgs e)
     {
         if (currentPreviewVideoClip == null) return;
 
-        // Pause playback to prevent event loops and potential UI/VLC deadlocks while the modal dialog is open
+        // Pause playback to prevent event loops and potential UI deadlocks while the modal dialog is open
         try
         {
-            if (UseFfmpegVideoPreview && FfmpegVideoPlayer.IsPlaying)
+            if (FfmpegVideoPlayer.IsPlaying)
             {
                 FfmpegVideoPlayer.Pause();
                 _ffmpegVideoTimer?.Stop();
-                VideoStatusLabel.Text = "Paused";
-                VideoPlayButton.Content = "Play";
-            }
-            else if (_mediaPlayer != null && _mediaPlayer.IsPlaying)
-            {
-                _mediaPlayer.Pause();
                 VideoStatusLabel.Text = "Paused";
                 VideoPlayButton.Content = "Play";
             }

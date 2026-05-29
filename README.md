@@ -16,7 +16,7 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
 * Support asset types:
   * **Texture2D** : convert to png, tga, jpeg, bmp
   * **Sprite** : crop Texture2D to png, tga, jpeg, bmp
-  * **AudioClip** : mp3, ogg, wav, m4a, fsb. Supports real-time audio playback preview through LibVLC in the Avalonia UI.
+  * **AudioClip** : mp3, ogg, wav, m4a, fsb. Supports real-time audio playback preview in the Avalonia UI.
   * **Font** : ttf, otf
   * **Mesh** : obj, fbx, and real-time 3D preview via OpenGL
   * **TextAsset**
@@ -139,7 +139,7 @@ Use `--self-contained false` only when you intentionally want a framework-depend
 
 ## Native Dependencies
 
-Compressed texture conversion depends on the native texture decoder library. Audio and video previewing in the Avalonia UI use LibVLC.
+Compressed texture conversion depends on the native texture decoder library. Audio and video previewing in the Avalonia UI use FFmpeg.
 
 ### Windows Layout:
 

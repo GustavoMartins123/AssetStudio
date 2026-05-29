@@ -24,13 +24,10 @@
       <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="LibVLCSharp" Version="3.8.2" />
-    <PackageReference Include="LibVLCSharp.Avalonia" Version="3.8.2" />
     <PackageReference Include="FFmpegVideoPlayer.Avalonia" Version="2.8.0" />
     <PackageReference Include="OpenTK" Version="4.8.2" />
     <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="1.0.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
-    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.18" />
   </ItemGroup>
 
   <ItemGroup>
