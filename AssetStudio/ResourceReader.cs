@@ -211,7 +211,7 @@ namespace AssetStudio
 
                 if (Directory.Exists(root))
                 {
-                    var findFiles = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                    var findFiles = ImportHelper.GetFilesSafe(root, "*", true)
                         .Where(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase))
                         .ToArray();
 

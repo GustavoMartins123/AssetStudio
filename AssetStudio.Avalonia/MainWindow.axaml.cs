@@ -127,6 +127,21 @@ public partial class MainWindow : Window
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
         AddHandler(DragDrop.DropEvent, Window_Drop);
 
+        AssetsManager.MemoryPressureCallback = (operation, loadPercent, limitPercent) =>
+        {
+            if (global::Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                return true;
+            }
+            return global::Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+            {
+                var msg = $"Memory usage has reached {loadPercent}% (limit: {limitPercent}%) during {operation}.\n\n" +
+                          "Continuing may slow down your system or cause it to run out of memory.\n\n" +
+                          "Do you want to ignore this warning and continue loading?";
+                return await ShowMemoryPressureWarningDialog(msg);
+            }).GetAwaiter().GetResult();
+        };
+
         FMODprogressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, FMODprogressBar_DragStarted);
         FMODprogressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, FMODprogressBar_DragCompleted);
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
@@ -960,6 +975,12 @@ public partial class MainWindow : Window
                     ShowMemoryPressureError(ex);
                     return;
                 }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, $"Error loading folder:\n{ex.Message}", "Load failed");
+                    StatusStripUpdate("Folder load failed.");
+                    return;
+                }
                 BuildAssetStructures();
             }
         }
@@ -1060,7 +1081,7 @@ public partial class MainWindow : Window
                 {
                     var files = paths
                         .SelectMany(path => Directory.Exists(path)
-                            ? Directory.GetFiles(path, "*.*", SearchOption.AllDirectories)
+                            ? ImportHelper.GetFilesSafe(path, "*.*", true)
                             : new[] { path })
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .ToArray();
@@ -1144,7 +1165,7 @@ public partial class MainWindow : Window
                 var folderPath = paths[0];
                 SaveLoadFolder(folderPath);
                 await Task.Run(() => ImportHelper.MergeSplitAssets(folderPath, true));
-                var enumerated = await Task.Run(() => Directory.EnumerateFiles(folderPath, "*.*", SearchOption.AllDirectories));
+                var enumerated = await Task.Run(() => ImportHelper.GetFilesSafe(folderPath, "*.*", true));
                 files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(enumerated).ToList());
             }
             else
@@ -1158,7 +1179,7 @@ public partial class MainWindow : Window
 
                 var list = paths
                     .SelectMany(path => Directory.Exists(path)
-                        ? Directory.GetFiles(path, "*.*", SearchOption.AllDirectories)
+                        ? ImportHelper.GetFilesSafe(path, "*.*", true)
                         : new[] { path })
                     .Distinct(StringComparer.OrdinalIgnoreCase);
                 files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(list).ToList());
@@ -1585,6 +1606,70 @@ public partial class MainWindow : Window
         return $"{value:0.##} {units[unit]}";
     }
 
+    private async Task<bool> ShowMemoryPressureWarningDialog(string message)
+    {
+        var dialog = new Window
+        {
+            Title = "Memory pressure warning",
+            Width = 550,
+            Height = 220,
+            MinWidth = 400,
+            MinHeight = 180,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+
+        var grid = new Grid
+        {
+            RowDefinitions = new RowDefinitions("*,Auto"),
+            Margin = new global::Avalonia.Thickness(16),
+            RowSpacing = 12
+        };
+
+        var textBlock = new TextBlock
+        {
+            Text = message,
+            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
+        };
+
+        var scrollViewer = new ScrollViewer
+        {
+            Content = textBlock
+        };
+
+        var buttonPanel = new StackPanel
+        {
+            Orientation = global::Avalonia.Layout.Orientation.Horizontal,
+            HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right,
+            Spacing = 10
+        };
+
+        var cancelButton = new Button
+        {
+            Content = "Cancel loading",
+            MinWidth = 120
+        };
+        cancelButton.Click += (_, _) => dialog.Close(false);
+
+        var continueButton = new Button
+        {
+            Content = "Ignore and continue",
+            MinWidth = 150,
+            FontWeight = global::Avalonia.Media.FontWeight.Bold
+        };
+        continueButton.Click += (_, _) => dialog.Close(true);
+
+        buttonPanel.Children.Add(cancelButton);
+        buttonPanel.Children.Add(continueButton);
+
+        Grid.SetRow(scrollViewer, 0);
+        Grid.SetRow(buttonPanel, 1);
+        grid.Children.Add(scrollViewer);
+        grid.Children.Add(buttonPanel);
+        dialog.Content = grid;
+
+        return await dialog.ShowDialog<bool>(this);
+    }
+
     private void ShowMemoryPressureError(MemoryPressureException ex)
     {
         var msg = $"Loading was stopped because system memory usage reached {ex.MemoryLoadPercent}% (limit: {ex.LimitPercent}%).\n\n" +
@@ -1599,7 +1684,7 @@ public partial class MainWindow : Window
 
     private int ExtractFolder(string path, string savePath)
     {
-        var files = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories);
+        var files = ImportHelper.GetFilesSafe(path, "*.*", true);
         var extractedCount = 0;
         Progress.Reset();
 

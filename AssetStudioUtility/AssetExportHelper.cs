@@ -235,7 +235,7 @@ namespace AssetStudio
 
             foreach (var root in roots.Where(Directory.Exists))
             {
-                var matches = Directory.GetFiles(root, shaderFileName, SearchOption.AllDirectories);
+                var matches = ImportHelper.GetFilesSafe(root, shaderFileName, true);
                 foreach (var match in matches)
                 {
                     if (TryReadGuid(match, out guid))

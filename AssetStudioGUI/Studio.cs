@@ -45,7 +45,7 @@ namespace AssetStudioGUI
         {
             int extractedCount = 0;
             Progress.Reset();
-            var files = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories);
+            var files = ImportHelper.GetFilesSafe(path, "*.*", true);
             for (int i = 0; i < files.Length; i++)
             {
                 var file = files[i];

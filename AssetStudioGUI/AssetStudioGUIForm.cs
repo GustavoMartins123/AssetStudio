@@ -179,6 +179,12 @@ namespace AssetStudioGUI
                     ShowMemoryPressureError(ex);
                     return;
                 }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, $"Error loading files:\n{ex.Message}", "Load failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    StatusStripUpdate("Load failed.");
+                    return;
+                }
                 BuildAssetStructures();
             }
         }
@@ -198,6 +204,12 @@ namespace AssetStudioGUI
                 catch (MemoryPressureException ex)
                 {
                     ShowMemoryPressureError(ex);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, $"Error loading files:\n{ex.Message}", "Load failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    StatusStripUpdate("Load failed.");
                     return;
                 }
                 BuildAssetStructures();
@@ -226,6 +238,12 @@ namespace AssetStudioGUI
                 catch (MemoryPressureException ex)
                 {
                     ShowMemoryPressureError(ex);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, $"Error loading folder:\n{ex.Message}", "Load failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    StatusStripUpdate("Load failed.");
                     return;
                 }
                 BuildAssetStructures();

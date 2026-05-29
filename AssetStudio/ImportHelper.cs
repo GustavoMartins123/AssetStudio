@@ -10,7 +10,7 @@ namespace AssetStudio
     {
         public static void MergeSplitAssets(string path, bool allDirectories = false)
         {
-            var splitFiles = Directory.GetFiles(path, "*.split0", allDirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly);
+            var splitFiles = GetFilesSafe(path, "*.split0", allDirectories);
             foreach (var splitFile in splitFiles)
             {
                 var destFile = Path.GetFileNameWithoutExtension(splitFile);
@@ -86,6 +86,42 @@ namespace AssetStudio
                 }
                 stream.Position = 0;
                 return new FileReader(reader.FullPath, stream);
+            }
+        }
+
+        public static string[] GetFilesSafe(string path, string searchPattern, bool recursive)
+        {
+            var files = new List<string>();
+            GetFilesSafeInternal(path, searchPattern, recursive, files);
+            return files.ToArray();
+        }
+
+        private static void GetFilesSafeInternal(string path, string searchPattern, bool recursive, List<string> result)
+        {
+            try
+            {
+                var files = Directory.GetFiles(path, searchPattern, SearchOption.TopDirectoryOnly);
+                result.AddRange(files);
+            }
+            catch
+            {
+                // ignore
+            }
+
+            if (recursive)
+            {
+                try
+                {
+                    var subDirs = Directory.GetDirectories(path);
+                    foreach (var dir in subDirs)
+                    {
+                        GetFilesSafeInternal(dir, searchPattern, true, result);
+                    }
+                }
+                catch
+                {
+                    // ignore
+                }
             }
         }
     }

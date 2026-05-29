@@ -12,7 +12,10 @@ namespace AssetStudio
     {
         private const double DefaultLoadThreadRatio = 0.4;
         private const double DefaultReadThreadRatio = 0.4;
-        private const int DefaultMemoryLimitPercent = 85;
+        private const int DefaultMemoryLimitPercent = 90;
+
+        public static bool DisableMemoryPressureCheck = false;
+        public static Func<string, int, int, bool> MemoryPressureCallback;
 
         public string SpecifyUnityVersion;
         public string ProjectRoot;
@@ -55,6 +58,7 @@ namespace AssetStudio
 
         public void LoadFiles(params string[] files)
         {
+            DisableMemoryPressureCheck = false;
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
             if (string.IsNullOrEmpty(ProjectRoot))
             {
@@ -67,12 +71,13 @@ namespace AssetStudio
 
         public void LoadFolder(string path)
         {
+            DisableMemoryPressureCheck = false;
             if (string.IsNullOrEmpty(ProjectRoot))
             {
                 ProjectRoot = Path.GetFullPath(path);
             }
             MergeSplitAssets(path, true);
-            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories);
+            var files = ImportHelper.GetFilesSafe(path, "*.*", true);
             var toReadFile = ProcessingSplitFiles(files);
             Load(toReadFile);
         }
@@ -118,7 +123,14 @@ namespace AssetStudio
                                 isWorkerActive = true;
                             }
 
-                            LoadFile(file);
+                            try
+                            {
+                                LoadFile(file);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error($"Error loading file {file}: {ex.Message}", ex);
+                            }
                             var completed = System.Threading.Interlocked.Increment(ref completedCount);
                             Progress.Report(completed, System.Threading.Volatile.Read(ref loadTotalCount));
                         }
@@ -231,9 +243,9 @@ namespace AssetStudio
 
                             if (!containsNoExist)
                             {
-                                if (!File.Exists(sharedFilePath))
+                                 if (!File.Exists(sharedFilePath))
                                 {
-                                    var findFiles = Directory.GetFiles(Path.GetDirectoryName(reader.FullPath), sharedFileName, SearchOption.AllDirectories);
+                                    var findFiles = ImportHelper.GetFilesSafe(Path.GetDirectoryName(reader.FullPath), sharedFileName, true);
                                     if (findFiles.Length > 0)
                                     {
                                         sharedFilePath = findFiles[0];
@@ -522,6 +534,7 @@ namespace AssetStudio
 
         public void Clear()
         {
+            DisableMemoryPressureCheck = false;
             ProjectIndex.Clear();
             foreach (var assetsFile in assetsFileList)
             {
@@ -935,6 +948,12 @@ namespace AssetStudio
 
         public static void ThrowIfMemoryPressureTooHigh(string operation)
         {
+#if NET6_0_OR_GREATER
+            if (DisableMemoryPressureCheck)
+            {
+                return;
+            }
+
             var limitPercent = GetConfiguredMemoryLimitPercent();
             if (limitPercent >= 100)
             {
@@ -951,25 +970,38 @@ namespace AssetStudio
                 return;
             }
 
-            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: false);
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
 
             if (TryGetMemoryLoadPercent(out memoryLoadPercent) && memoryLoadPercent >= limitPercent)
             {
+                if (MemoryPressureCallback != null)
+                {
+                    if (MemoryPressureCallback(operation, memoryLoadPercent, limitPercent))
+                    {
+                        DisableMemoryPressureCheck = true;
+                        return;
+                    }
+                }
                 throw new MemoryPressureException(operation, memoryLoadPercent, limitPercent);
             }
+#endif
         }
 
         private static bool TryGetMemoryLoadPercent(out int memoryLoadPercent)
         {
+            memoryLoadPercent = 0;
+#if NET6_0_OR_GREATER
             var memoryInfo = GC.GetGCMemoryInfo();
             if (memoryInfo.HighMemoryLoadThresholdBytes <= 0 || memoryInfo.MemoryLoadBytes <= 0)
             {
-                memoryLoadPercent = 0;
                 return false;
             }
 
             memoryLoadPercent = (int)Math.Ceiling(memoryInfo.MemoryLoadBytes * 100d / memoryInfo.HighMemoryLoadThresholdBytes);
             return true;
+#else
+            return false;
+#endif
         }
 
         private void ProcessAssets()
