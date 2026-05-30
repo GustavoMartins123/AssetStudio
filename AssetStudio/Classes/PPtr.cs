@@ -36,25 +36,28 @@ namespace AssetStudio
             if (m_FileID > 0 && m_FileID - 1 < assetsFile.m_Externals.Count)
             {
                 var assetsManager = assetsFile.assetsManager;
-                var assetsFileList = assetsManager.assetsFileList;
-                var assetsFileIndexCache = assetsManager.assetsFileIndexCache;
-
-                if (index == -2)
+                lock (assetsManager.loadLock)
                 {
-                    var m_External = assetsFile.m_Externals[m_FileID - 1];
-                    var name = m_External.fileName;
-                    var cacheKey = name + "|" + m_External.pathName;
-                    if (!assetsFileIndexCache.TryGetValue(cacheKey, out index))
+                    var assetsFileList = assetsManager.assetsFileList;
+                    var assetsFileIndexCache = assetsManager.assetsFileIndexCache;
+
+                    if (index == -2)
                     {
-                        index = assetsFileList.FindIndex(x => IsExternalFileMatch(x, m_External));
-                        assetsFileIndexCache.Add(cacheKey, index);
+                        var m_External = assetsFile.m_Externals[m_FileID - 1];
+                        var name = m_External.fileName;
+                        var cacheKey = name + "|" + m_External.pathName;
+                        if (!assetsFileIndexCache.TryGetValue(cacheKey, out index))
+                        {
+                            index = assetsFileList.FindIndex(x => IsExternalFileMatch(x, m_External));
+                            assetsFileIndexCache[cacheKey] = index;
+                        }
                     }
-                }
 
-                if (index >= 0)
-                {
-                    result = assetsFileList[index];
-                    return true;
+                    if (index >= 0 && index < assetsFileList.Count)
+                    {
+                        result = assetsFileList[index];
+                        return true;
+                    }
                 }
             }
 
@@ -113,7 +116,13 @@ namespace AssetStudio
 
             var matches = new System.Collections.Generic.List<TObject>();
             var matchFiles = new System.Collections.Generic.List<SerializedFile>();
-            foreach (var sourceFile in assetsFile.assetsManager.assetsFileList)
+            System.Collections.Generic.List<SerializedFile> filesSnapshot;
+            lock (assetsFile.assetsManager.loadLock)
+            {
+                filesSnapshot = new System.Collections.Generic.List<SerializedFile>(assetsFile.assetsManager.assetsFileList);
+            }
+
+            foreach (var sourceFile in filesSnapshot)
             {
                 if (sourceFile == assetsFile)
                 {
@@ -249,13 +258,16 @@ namespace AssetStudio
             }
 
             var assetsManager = assetsFile.assetsManager;
-            var assetsFileList = assetsManager.assetsFileList;
-            var assetsFileIndexCache = assetsManager.assetsFileIndexCache;
-
-            if (!assetsFileIndexCache.TryGetValue(name, out index))
+            lock (assetsManager.loadLock)
             {
-                index = assetsFileList.FindIndex(x => x.fileName.Equals(name, StringComparison.OrdinalIgnoreCase));
-                assetsFileIndexCache.Add(name, index);
+                var assetsFileList = assetsManager.assetsFileList;
+                var assetsFileIndexCache = assetsManager.assetsFileIndexCache;
+
+                if (!assetsFileIndexCache.TryGetValue(name, out index))
+                {
+                    index = assetsFileList.FindIndex(x => x.fileName.Equals(name, StringComparison.OrdinalIgnoreCase));
+                    assetsFileIndexCache[name] = index;
+                }
             }
 
             m_PathID = m_Object.m_PathID;

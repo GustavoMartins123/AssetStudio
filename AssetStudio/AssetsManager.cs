@@ -713,20 +713,22 @@ namespace AssetStudio
 
             if (LazyLoading)
             {
-                foreach (var assetsFile in assetsFileList)
+                var unprocessedFiles = assetsFileList.Where(x => !x.IsProcessed).ToList();
+                var parallelOptions = new System.Threading.Tasks.ParallelOptions
                 {
-                    if (assetsFile.IsProcessed) continue;
+                    MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
+                };
+
+                System.Threading.Tasks.Parallel.ForEach(unprocessedFiles, parallelOptions, assetsFile =>
+                {
                     assetsFile.IsProcessed = true;
 
-                    // Check if we already have cached handles for this file in ProjectIndex
+                    // Lookup cached handles using O(1) dictionary index
                     bool hasCachedHandles = false;
-                    foreach (var handle in ProjectIndex.GetHandles())
+                    foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
                     {
-                        if (handle.SerializedFileName == assetsFile.fileName)
-                        {
-                            handle.SourceFile = assetsFile;
-                            hasCachedHandles = true;
-                        }
+                        handle.SourceFile = assetsFile;
+                        hasCachedHandles = true;
                     }
 
                     if (hasCachedHandles)
@@ -764,25 +766,17 @@ namespace AssetStudio
                                 }
                             }
                         }
-                        continue;
                     }
-
-                    var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
-                    var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                    else
                     {
-                        MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
-                    };
+                        var localObjects = new List<Object>();
+                        using var localReader = assetsFile.reader.Clone();
 
-                    System.Threading.Tasks.Parallel.ForEach(
-                        assetsFile.m_Objects,
-                        parallelOptions,
-                        () => assetsFile.reader.Clone(),
-                        (objectInfo, state, localReader) =>
+                        foreach (var objectInfo in assetsFile.m_Objects)
                         {
                             if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                             {
-                                state.Stop();
-                                return localReader;
+                                break;
                             }
 
                             if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
@@ -792,8 +786,7 @@ namespace AssetStudio
 
                             if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                             {
-                                state.Stop();
-                                return localReader;
+                                break;
                             }
 
                             var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
@@ -844,23 +837,20 @@ namespace AssetStudio
 
                             var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
                             Progress.Report(currentProgress, progressCount);
+                        }
 
-                            return localReader;
-                        },
-                        localReader => localReader.Dispose()
-                    );
-
-                    var pathIdToIndex = new Dictionary<long, int>();
-                    for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
-                    {
-                        pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
+                        var pathIdToIndex = new Dictionary<long, int>();
+                        for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                        {
+                            pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
+                        }
+                        var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
+                        foreach (var obj in sortedObjects)
+                        {
+                            assetsFile.AddObject(obj);
+                        }
                     }
-                    var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
-                    foreach (var obj in sortedObjects)
-                    {
-                        assetsFile.AddObject(obj);
-                    }
-                }
+                });
                 return;
             }
 

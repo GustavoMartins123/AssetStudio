@@ -22,6 +22,7 @@ namespace AssetStudio
         
         public bool IsMaterialized => RealObject != null;
         public Object RealObject { get; set; }
+        public object? Tag { get; set; }
 
         public string DisplayType => GetDisplayType();
 

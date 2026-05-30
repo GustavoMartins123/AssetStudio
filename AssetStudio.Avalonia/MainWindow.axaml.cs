@@ -45,9 +45,11 @@ public partial class MainWindow : Window
     private CancellationTokenSource? previewDebounce;
     private const int PreviewDebounceMilliseconds = 180;
     private const int MaxInlinePreviewTextureDimension = 1024;
-    private List<AssetItem> visibleAssets = new List<AssetItem>();
+    private const int ProgressiveIndexingUiThrottleMilliseconds = 2500;
+    private System.Collections.ObjectModel.ObservableCollection<AssetItem> visibleAssets = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
-    private List<AssetClassItem> visibleAssetClassItems = new List<AssetClassItem>();
+    private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
+    private System.Diagnostics.Stopwatch? _indexingUiThrottleStopwatch;
     private AssetClassItem? classFilterOverride;
     private List<GameObjectNode> sceneTreeNodes = new List<GameObjectNode>();
     private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
@@ -848,25 +850,31 @@ public partial class MainWindow : Window
 
         // Save selection and scroll state
         var selectedItem = AssetClassesDataGrid.SelectedItem as AssetClassItem;
-        (int ClassID, string UnityVersion, string SourceFile, string SourceKind)? selectedKey = selectedItem != null
-            ? (selectedItem.ClassID, selectedItem.UnityVersion, selectedItem.SourceFile, selectedItem.SourceKind)
+        (int ClassID, string Name, string Namespace, string Assembly, string UnityVersion, string SourceFile, string SourceKind)? selectedKey = selectedItem != null
+            ? (selectedItem.ClassID, selectedItem.Name, selectedItem.Namespace, selectedItem.Assembly, selectedItem.UnityVersion, selectedItem.SourceFile, selectedItem.SourceKind)
             : null;
 
         var scrollViewer = FindVisualChild<ScrollViewer>(AssetClassesDataGrid);
         var scrollOffset = scrollViewer?.Offset ?? default;
 
-        visibleAssetClassItems = classes.ToList();
+        SyncObservableCollection(visibleAssetClassItems, classes.ToList());
 
         isRefreshingClassesList = true;
         try
         {
-            AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
+            if (AssetClassesDataGrid.ItemsSource != visibleAssetClassItems)
+            {
+                AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
+            }
 
             // Restore selection
             if (selectedKey != null)
             {
                 var newSelected = visibleAssetClassItems.FirstOrDefault(x =>
                     x.ClassID == selectedKey.Value.ClassID &&
+                    x.Name == selectedKey.Value.Name &&
+                    x.Namespace == selectedKey.Value.Namespace &&
+                    x.Assembly == selectedKey.Value.Assembly &&
                     x.UnityVersion == selectedKey.Value.UnityVersion &&
                     x.SourceFile == selectedKey.Value.SourceFile &&
                     x.SourceKind == selectedKey.Value.SourceKind);
@@ -1310,6 +1318,7 @@ public partial class MainWindow : Window
         var token = indexingCts.Token;
         isIndexingPaused = false;
         pendingFilesToIndex = files.ToList();
+        _indexingUiThrottleStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         indexingMenu.IsVisible = true;
         pauseIndexingMenu.IsEnabled = true;
@@ -1330,11 +1339,9 @@ public partial class MainWindow : Window
                     break;
                 }
 
-                while (isIndexingPaused)
+                while (isIndexingPaused && !token.IsCancellationRequested)
                 {
-                    await Task.Delay(200, token);
-                    if (token.IsCancellationRequested)
-                        break;
+                    await Task.Delay(200);
                 }
 
                 if (token.IsCancellationRequested)
@@ -1431,19 +1438,32 @@ public partial class MainWindow : Window
                 var currentLoaded = loadedCount;
                 var progressPercent = (int)((double)currentLoaded / originalTotal * 100);
 
-                Dispatcher.UIThread.Post(() =>
+                var shouldUpdateUi = currentLoaded < originalTotal && ShouldUpdateProgressiveIndexingUi();
+
+                if (shouldUpdateUi)
                 {
-                    progressBar.Value = progressPercent;
-                    StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%)");
-                    BuildAssetStructures();
-                });
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        progressBar.Value = progressPercent;
+                        StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%)");
+                        BuildAssetStructures();
+                    });
+                }
             }
+
+            var finalLoadedCount = loadedCount;
+            var finalProgressPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
+            var wasCancelled = token.IsCancellationRequested;
 
             Dispatcher.UIThread.Post(() =>
             {
+                _indexingUiThrottleStopwatch?.Stop();
+                _indexingUiThrottleStopwatch = null;
                 indexingMenu.IsVisible = false;
-                progressBar.Value = 100;
-                StatusStripUpdate($"Indexing finished. Total files: {originalTotal:N0}");
+                progressBar.Value = wasCancelled ? finalProgressPercent : 100;
+                StatusStripUpdate(wasCancelled
+                    ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalProgressPercent}%)"
+                    : $"Indexing finished. Total files: {originalTotal:N0}");
 
                 if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !token.IsCancellationRequested)
                 {
@@ -1455,12 +1475,33 @@ public partial class MainWindow : Window
         }, token);
     }
 
+    private bool ShouldUpdateProgressiveIndexingUi(bool force = false)
+    {
+        var stopwatch = _indexingUiThrottleStopwatch;
+        if (stopwatch == null)
+        {
+            return force;
+        }
+
+        lock (stopwatch)
+        {
+            if (!force && stopwatch.ElapsedMilliseconds < ProgressiveIndexingUiThrottleMilliseconds)
+            {
+                return false;
+            }
+
+            stopwatch.Restart();
+            return true;
+        }
+    }
+
     private void PauseIndexing_Click(object? sender, RoutedEventArgs e)
     {
         isIndexingPaused = true;
         pauseIndexingMenu.IsEnabled = false;
         resumeIndexingMenu.IsEnabled = true;
         StatusStripUpdate("Indexing paused.");
+        BuildAssetStructures();
     }
 
     private void ResumeIndexing_Click(object? sender, RoutedEventArgs e)
@@ -1915,7 +1956,16 @@ public partial class MainWindow : Window
                 var handles = assetsManager.ProjectIndex.GetHandles();
                 foreach (var handle in handles)
                 {
-                    var assetItem = new AssetItem(handle);
+                    AssetItem assetItem;
+                    if (handle.Tag is AssetItem existingItem)
+                    {
+                        assetItem = existingItem;
+                    }
+                    else
+                    {
+                        assetItem = new AssetItem(handle);
+                        handle.Tag = assetItem;
+                    }
                     assetItem.UniqueID = " #" + i;
                     
                     localPathIDAssetItemDic[handle.UniqueID] = assetItem;
@@ -2241,7 +2291,6 @@ public partial class MainWindow : Window
         animationClipTransformBindingsCache = result.AnimationClipTransformBindingsCache;
         assetClassItems = result.AssetClassItems;
 
-        visibleAssets = new List<AssetItem>(exportableAssets);
         BuildFilterTypeMenu();
         _ = FilterAssetListAsync(CancellationToken.None);
         FilterAssetClasses();
@@ -5364,6 +5413,7 @@ public partial class MainWindow : Window
 
         var sortMember = assetListSortMember;
         var sortDescending = assetListSortDescending;
+        var assetsSnapshot = exportableAssets.ToList();
 
         // Capture selection before filtering
         var selectedUniqueIds = new HashSet<string>();
@@ -5395,7 +5445,7 @@ public partial class MainWindow : Window
             var result = await Task.Run(() =>
             {
                 var matches = new List<AssetItem>();
-                foreach (var x in exportableAssets)
+                foreach (var x in assetsSnapshot)
                 {
                     token.ThrowIfCancellationRequested();
 
@@ -5428,12 +5478,15 @@ public partial class MainWindow : Window
                 return SortAssetListAsync(matches, sortMember, sortDescending).ToList();
             }, token);
 
-            visibleAssets = result;
+            SyncObservableCollection(visibleAssets, result);
 
             isRefreshingFilterList = true;
             try
             {
-                AssetListDataGrid.ItemsSource = visibleAssets;
+                if (AssetListDataGrid.ItemsSource != visibleAssets)
+                {
+                    AssetListDataGrid.ItemsSource = visibleAssets;
+                }
                 StatusStripUpdate($"Showing {visibleAssets.Count} assets");
 
                 // Restore selection
@@ -5449,10 +5502,14 @@ public partial class MainWindow : Window
                         }
                     }
 
-                    AssetListDataGrid.SelectedItems.Clear();
-                    foreach (var item in newSelectedItems)
+                    var selectedItems = AssetListDataGrid.SelectedItems;
+                    if (selectedItems != null)
                     {
-                        AssetListDataGrid.SelectedItems.Add(item);
+                        selectedItems.Clear();
+                        foreach (var item in newSelectedItems)
+                        {
+                            selectedItems.Add(item);
+                        }
                     }
                 }
             }
@@ -5502,13 +5559,16 @@ public partial class MainWindow : Window
     {
         var sortMember = assetListSortMember;
         var sortDescending = assetListSortDescending;
-        var currentAssets = visibleAssets;
+        var currentAssets = visibleAssets.ToList();
 
         try
         {
             var sorted = await Task.Run(() => SortAssetListAsync(currentAssets, sortMember, sortDescending).ToList());
-            visibleAssets = sorted;
-            AssetListDataGrid.ItemsSource = visibleAssets;
+            SyncObservableCollection(visibleAssets, sorted);
+            if (AssetListDataGrid.ItemsSource != visibleAssets)
+            {
+                AssetListDataGrid.ItemsSource = visibleAssets;
+            }
             StatusStripUpdate($"Showing {visibleAssets.Count} assets");
         }
         catch (Exception ex)
@@ -5553,18 +5613,104 @@ public partial class MainWindow : Window
         };
     }
 
-    private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets, ExportMode.Convert);
+    private static void SyncObservableCollection<T>(System.Collections.ObjectModel.ObservableCollection<T> collection, IReadOnlyList<T>? targetList)
+    {
+        if (collection == null) return;
+        if (targetList == null)
+        {
+            collection.Clear();
+            return;
+        }
+
+        if (targetList.Count == 0)
+        {
+            collection.Clear();
+            return;
+        }
+
+        if (collection.Count == 0)
+        {
+            foreach (var item in targetList)
+            {
+                collection.Add(item);
+            }
+            return;
+        }
+
+        var targetSet = new HashSet<T>(targetList);
+
+        for (int i = collection.Count - 1; i >= 0; i--)
+        {
+            if (!targetSet.Contains(collection[i]))
+            {
+                collection.RemoveAt(i);
+            }
+        }
+
+        for (int i = 0; i < targetList.Count; i++)
+        {
+            var targetItem = targetList[i];
+
+            if (i < collection.Count)
+            {
+                if (EqualityComparer<T>.Default.Equals(collection[i], targetItem))
+                {
+                    SyncCollectionItem(collection[i], targetItem);
+                    continue;
+                }
+
+                int indexInCollection = -1;
+                for (int j = i + 1; j < collection.Count; j++)
+                {
+                    if (EqualityComparer<T>.Default.Equals(collection[j], targetItem))
+                    {
+                        indexInCollection = j;
+                        break;
+                    }
+                }
+
+                if (indexInCollection != -1)
+                {
+                    SyncCollectionItem(collection[indexInCollection], targetItem);
+                    collection.Move(indexInCollection, i);
+                }
+                else
+                {
+                    collection.Insert(i, targetItem);
+                }
+            }
+            else
+            {
+                collection.Add(targetItem);
+            }
+        }
+
+        while (collection.Count > targetList.Count)
+        {
+            collection.RemoveAt(collection.Count - 1);
+        }
+    }
+
+    private static void SyncCollectionItem<T>(T existingItem, T targetItem)
+    {
+        if (existingItem is AssetClassItem existingClass && targetItem is AssetClassItem targetClass)
+        {
+            existingClass.CopyFrom(targetClass);
+        }
+    }
+
+    private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Convert);
     private async void ExportSelectedAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
-    private async void ExportFilteredAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets, ExportMode.Convert);
+    private async void ExportFilteredAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Convert);
     private async void ExportAllAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets, ExportMode.Raw);
     private async void ExportSelectedAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Raw);
-    private async void ExportFilteredAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets, ExportMode.Raw);
+    private async void ExportFilteredAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Raw);
     private async void ExportAllAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets, ExportMode.Dump);
     private async void ExportSelectedAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Dump);
-    private async void ExportFilteredAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets, ExportMode.Dump);
+    private async void ExportFilteredAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Dump);
     private async void ExportAllAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(exportableAssets);
     private async void ExportSelectedAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(GetSelectedAssets());
-    private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(visibleAssets);
+    private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(visibleAssets.ToList());
 
     private async void ExportErrorLog_Click(object? sender, RoutedEventArgs e)
     {
@@ -8701,17 +8847,122 @@ public class AssetItem
     }
 }
 
-public class AssetClassItem
+public class AssetClassItem : INotifyPropertyChanged, IEquatable<AssetClassItem>
 {
-    public int ClassID { get; set; }
-    public string Name { get; set; } = string.Empty;
-    public string Namespace { get; set; } = string.Empty;
-    public string Assembly { get; set; } = string.Empty;
-    public string UnityVersion { get; set; } = string.Empty;
-    public string SourceFile { get; set; } = string.Empty;
-    public string SourceKind { get; set; } = string.Empty;
-    public int ObjectCount { get; set; }
-    public SerializedType SerializedType { get; set; } = null!;
+    private int _classID;
+    private string _name = string.Empty;
+    private string _namespace = string.Empty;
+    private string _assembly = string.Empty;
+    private string _unityVersion = string.Empty;
+    private string _sourceFile = string.Empty;
+    private string _sourceKind = string.Empty;
+    private int _objectCount;
+    private SerializedType _serializedType = null!;
+
+    public int ClassID
+    {
+        get => _classID;
+        set => SetProperty(ref _classID, value, nameof(ClassID));
+    }
+
+    public string Name
+    {
+        get => _name;
+        set => SetProperty(ref _name, value ?? string.Empty, nameof(Name));
+    }
+
+    public string Namespace
+    {
+        get => _namespace;
+        set => SetProperty(ref _namespace, value ?? string.Empty, nameof(Namespace));
+    }
+
+    public string Assembly
+    {
+        get => _assembly;
+        set => SetProperty(ref _assembly, value ?? string.Empty, nameof(Assembly));
+    }
+
+    public string UnityVersion
+    {
+        get => _unityVersion;
+        set => SetProperty(ref _unityVersion, value ?? string.Empty, nameof(UnityVersion));
+    }
+
+    public string SourceFile
+    {
+        get => _sourceFile;
+        set => SetProperty(ref _sourceFile, value ?? string.Empty, nameof(SourceFile));
+    }
+
+    public string SourceKind
+    {
+        get => _sourceKind;
+        set => SetProperty(ref _sourceKind, value ?? string.Empty, nameof(SourceKind));
+    }
+
+    public int ObjectCount
+    {
+        get => _objectCount;
+        set => SetProperty(ref _objectCount, value, nameof(ObjectCount));
+    }
+
+    public SerializedType SerializedType
+    {
+        get => _serializedType;
+        set => SetProperty(ref _serializedType, value, nameof(SerializedType));
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public void CopyFrom(AssetClassItem other)
+    {
+        ClassID = other.ClassID;
+        Name = other.Name;
+        Namespace = other.Namespace;
+        Assembly = other.Assembly;
+        UnityVersion = other.UnityVersion;
+        SourceFile = other.SourceFile;
+        SourceKind = other.SourceKind;
+        ObjectCount = other.ObjectCount;
+        SerializedType = other.SerializedType;
+    }
+
+    public bool Equals(AssetClassItem? other)
+    {
+        return other != null
+            && ClassID == other.ClassID
+            && string.Equals(Name, other.Name, StringComparison.Ordinal)
+            && string.Equals(Namespace, other.Namespace, StringComparison.Ordinal)
+            && string.Equals(Assembly, other.Assembly, StringComparison.Ordinal)
+            && string.Equals(UnityVersion, other.UnityVersion, StringComparison.Ordinal)
+            && string.Equals(SourceFile, other.SourceFile, StringComparison.Ordinal)
+            && string.Equals(SourceKind, other.SourceKind, StringComparison.Ordinal);
+    }
+
+    public override bool Equals(object? obj) => Equals(obj as AssetClassItem);
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(ClassID, Name, Namespace, Assembly, UnityVersion, SourceFile, SourceKind);
+    }
+
+    private bool SetProperty<T>(ref T field, T value, string propertyName)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value))
+        {
+            return false;
+        }
+
+        field = value;
+        OnPropertyChanged(propertyName);
+        return true;
+    }
+
+    private void OnPropertyChanged(string propertyName)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 }
 
 public enum ExportMode
