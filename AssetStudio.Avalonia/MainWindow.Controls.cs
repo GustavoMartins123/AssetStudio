@@ -128,13 +128,33 @@ public partial class MainWindow : Window
     {
         if (GLPreviewControl != null)
         {
-            GLPreviewControl.AvatarReferenceMeshDensityPercent = (float)densityPercent;
+            GLPreviewControl.PreviewMeshDensityPercent = (float)densityPercent;
         }
         if (AvatarMeshDensityLabel != null)
         {
             AvatarMeshDensityLabel.Text = densityPercent >= MaxAvatarPreviewMeshDensityPercent
                 ? "Original"
                 : $"{densityPercent:0}%";
+        }
+    }
+
+    private void ShowPreviewGeometryControls(bool showBoneControls)
+    {
+        if (BoneSizeContainer != null)
+        {
+            BoneSizeContainer.IsVisible = true;
+        }
+        if (BoneSizeControls != null)
+        {
+            BoneSizeControls.IsVisible = showBoneControls;
+        }
+    }
+
+    private void HidePreviewGeometryControls()
+    {
+        if (BoneSizeContainer != null)
+        {
+            BoneSizeContainer.IsVisible = false;
         }
     }
 

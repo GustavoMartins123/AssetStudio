@@ -51,7 +51,7 @@ class Program
         };
     }
 
-    private static void WriteCrashLog(string title, Exception? exception)
+    internal static void WriteCrashLog(string title, Exception? exception)
     {
         try
         {

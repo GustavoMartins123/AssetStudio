@@ -198,7 +198,7 @@ void main()
         private Vector3[][]? animatedMeshVertices;
         private Vector3[]? pendingMeshVertices;
         private readonly object meshLock = new object();
-        private float avatarReferenceMeshDensityPercent = AvatarReferenceMeshSimplifier.DefaultDensityPercent;
+        private float previewMeshDensityPercent = PreviewMeshSimplifier.DefaultDensityPercent;
         private Mesh? avatarReferenceMeshSource;
         private Vector3[]? avatarReferenceSourceVertices;
         private List<uint>? avatarReferenceSourceIndices;
@@ -250,19 +250,45 @@ void main()
             }
         }
 
-        public float AvatarReferenceMeshDensityPercent
+        public float PreviewMeshDensityPercent
         {
-            get => avatarReferenceMeshDensityPercent;
+            get => previewMeshDensityPercent;
             set
             {
-                var clamped = Math.Clamp(value, AvatarReferenceMeshSimplifier.MinDensityPercent, AvatarReferenceMeshSimplifier.MaxDensityPercent);
-                if (Math.Abs(avatarReferenceMeshDensityPercent - clamped) < 0.01f)
+                var clamped = Math.Clamp(value, PreviewMeshSimplifier.MinDensityPercent, PreviewMeshSimplifier.MaxDensityPercent);
+                if (Math.Abs(previewMeshDensityPercent - clamped) < 0.01f)
                 {
                     return;
                 }
 
-                avatarReferenceMeshDensityPercent = clamped;
+                previewMeshDensityPercent = clamped;
+                RebuildPreviewMeshGeometry();
+            }
+        }
+
+        public float AvatarReferenceMeshDensityPercent
+        {
+            get => PreviewMeshDensityPercent;
+            set => PreviewMeshDensityPercent = value;
+        }
+
+        private void RebuildPreviewMeshGeometry()
+        {
+            if (isAvatarMode)
+            {
                 RebuildAvatarReferenceMeshPreview();
+                return;
+            }
+
+            if (meshPreviewSource != null)
+            {
+                SetMesh(
+                    meshPreviewSource,
+                    meshPreviewSourceUvs,
+                    meshPreviewSourceSubMeshTextures,
+                    meshPreviewSourceSubMeshTexWidths,
+                    meshPreviewSourceSubMeshTexHeights,
+                    resetMaterialOverrides: false);
             }
         }
 
@@ -288,7 +314,12 @@ void main()
         private List<int>? pendingSubMeshTexHeights;
         private bool hasPendingSubMeshTextures;
         private int[]? previewTextureIds;
-        private Mesh? currentMesh;
+        private Mesh? meshPreviewSource;
+        private Vector2[]? meshPreviewSourceUvs;
+        private List<byte[]?>? meshPreviewSourceSubMeshTextures;
+        private List<int>? meshPreviewSourceSubMeshTexWidths;
+        private List<int>? meshPreviewSourceSubMeshTexHeights;
+        private int[]? previewSubMeshIndexCounts;
         private int meshLoadCounter = 0;
 
         private double lastWidth;
@@ -372,7 +403,7 @@ void main()
             return Matrix4.CreateTranslation(-center) * Matrix4.CreateScale(PreviewFitScale / diagonal);
         }
 
-        private static Vector3[][]? BuildAnimatedAvatarReferenceVertices(Mesh mesh, Vector3[] sourceVertexData, AvatarReferenceMesh referenceMesh, Matrix4[][] boneMatrices, int[] parentIndices, ref Vector3 min, ref Vector3 max, bool expandBounds)
+        private static Vector3[][]? BuildAnimatedAvatarReferenceVertices(Mesh mesh, Vector3[] sourceVertexData, PreviewMeshGeometry referenceMesh, Matrix4[][] boneMatrices, int[] parentIndices, ref Vector3 min, ref Vector3 max, bool expandBounds)
         {
             if (referenceMesh.SourceVertexIndices.Length == 0
                 || mesh.m_Skin == null
@@ -463,11 +494,11 @@ void main()
             var parentIndices = avatarReferenceParentIndices;
             var min = avatarReferenceMin;
             var max = avatarReferenceMax;
-            var densityPercent = avatarReferenceMeshDensityPercent;
+            var densityPercent = previewMeshDensityPercent;
 
             System.Threading.Tasks.Task.Run(() =>
             {
-                var referenceMesh = AvatarReferenceMeshSimplifier.Build(sourceVertices, sourceIndices, min, max, densityPercent);
+                var referenceMesh = PreviewMeshSimplifier.Build(sourceVertices, sourceIndices, min, max, densityPercent);
                 Vector3[][]? rebuiltAnimatedVertices = null;
 
                 if (sourceMesh != null && boneMatrices != null && parentIndices != null)
@@ -616,11 +647,159 @@ void main()
             }
         }
 
+        private void ClearMeshPreviewSource()
+        {
+            meshPreviewSource = null;
+            meshPreviewSourceUvs = null;
+            meshPreviewSourceSubMeshTextures = null;
+            meshPreviewSourceSubMeshTexWidths = null;
+            meshPreviewSourceSubMeshTexHeights = null;
+            previewSubMeshIndexCounts = null;
+        }
+
+        private static Vector3[] BuildCalculatedNormals(Vector3[] vertices, int[] indices)
+        {
+            var normals = new Vector3[vertices.Length];
+            var counts = new int[vertices.Length];
+
+            for (int i = 0; i + 2 < indices.Length; i += 3)
+            {
+                int i0 = indices[i];
+                int i1 = indices[i + 1];
+                int i2 = indices[i + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertices.Length || i1 >= vertices.Length || i2 >= vertices.Length)
+                {
+                    continue;
+                }
+
+                Vector3 dir1 = vertices[i1] - vertices[i0];
+                Vector3 dir2 = vertices[i2] - vertices[i0];
+                Vector3 normal = Vector3.Cross(dir1, dir2);
+                if (normal.LengthSquared > 0)
+                {
+                    normal = Vector3.Normalize(normal);
+                }
+
+                normals[i0] += normal;
+                normals[i1] += normal;
+                normals[i2] += normal;
+                counts[i0]++;
+                counts[i1]++;
+                counts[i2]++;
+            }
+
+            for (int i = 0; i < normals.Length; i++)
+            {
+                normals[i] = counts[i] == 0 || normals[i].LengthSquared <= 0
+                    ? new Vector3(0, 1, 0)
+                    : Vector3.Normalize(normals[i]);
+            }
+
+            return normals;
+        }
+
+        private static Vector3[]? RemapVector3Data(Vector3[]? source, int[] sourceVertexIndices)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            var remapped = new Vector3[sourceVertexIndices.Length];
+            for (int i = 0; i < sourceVertexIndices.Length; i++)
+            {
+                int sourceIndex = sourceVertexIndices[i];
+                if (sourceIndex >= 0 && sourceIndex < source.Length)
+                {
+                    remapped[i] = source[sourceIndex];
+                }
+            }
+
+            return remapped;
+        }
+
+        private static Vector4[]? RemapVector4Data(Vector4[]? source, int[] sourceVertexIndices)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            var remapped = new Vector4[sourceVertexIndices.Length];
+            for (int i = 0; i < sourceVertexIndices.Length; i++)
+            {
+                int sourceIndex = sourceVertexIndices[i];
+                remapped[i] = sourceIndex >= 0 && sourceIndex < source.Length
+                    ? source[sourceIndex]
+                    : Vector4.One;
+            }
+
+            return remapped;
+        }
+
+        private static Vector2[]? RemapVector2Data(Vector2[]? source, int[] sourceVertexIndices)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            var remapped = new Vector2[sourceVertexIndices.Length];
+            for (int i = 0; i < sourceVertexIndices.Length; i++)
+            {
+                int sourceIndex = sourceVertexIndices[i];
+                if (sourceIndex >= 0 && sourceIndex < source.Length)
+                {
+                    remapped[i] = source[sourceIndex];
+                }
+            }
+
+            return remapped;
+        }
+
+        private static int[]? BuildSubMeshIndexCounts(Mesh mesh, int indexCount)
+        {
+            var subMeshes = mesh.m_SubMeshes;
+            if (subMeshes == null || subMeshes.Length == 0 || indexCount <= 0)
+            {
+                return null;
+            }
+
+            var counts = new int[subMeshes.Length];
+            long total = 0;
+            for (int i = 0; i < subMeshes.Length; i++)
+            {
+                long count = Math.Max(0, (long)subMeshes[i].indexCount);
+                if (count > int.MaxValue)
+                {
+                    return null;
+                }
+
+                counts[i] = (int)count;
+                total += count;
+            }
+
+            return total == indexCount ? counts : null;
+        }
+
         public void SetMesh(Mesh m_Mesh, Vector2[]? uvs = null, List<byte[]?>? subMeshTextures = null, List<int>? subMeshTexWidths = null, List<int>? subMeshTexHeights = null)
+        {
+            SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
+        }
+
+        private void SetMesh(Mesh m_Mesh, Vector2[]? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
         {
             ClearAvatarPreviewState();
             previewMaterialMode = false;
-            materialTintOverrides = null;
+            if (resetMaterialOverrides)
+            {
+                materialTintOverrides = null;
+            }
+            meshPreviewSource = m_Mesh;
+            meshPreviewSourceUvs = uvs;
+            meshPreviewSourceSubMeshTextures = subMeshTextures;
+            meshPreviewSourceSubMeshTexWidths = subMeshTexWidths;
+            meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
             m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0) return;
 
@@ -685,35 +864,7 @@ void main()
                     }
                 }
 
-                // calculate normal by ourselves
-                var localNormal2Data = new Vector3[m_VertexCount];
-                int[] normalCalculatedCount = new int[m_VertexCount];
-                for (int i = 0; i < m_VertexCount; i++)
-                {
-                    localNormal2Data[i] = Vector3.Zero;
-                    normalCalculatedCount[i] = 0;
-                }
-                for (int i = 0; i < m_Indices.Count; i = i + 3)
-                {
-                    if (localIndiceData[i + 2] >= m_VertexCount) continue;
-                    Vector3 dir1 = localVertexData[localIndiceData[i + 1]] - localVertexData[localIndiceData[i]];
-                    Vector3 dir2 = localVertexData[localIndiceData[i + 2]] - localVertexData[localIndiceData[i]];
-                    Vector3 normal = Vector3.Cross(dir1, dir2);
-                    if (normal.LengthSquared > 0)
-                        normal = Vector3.Normalize(normal);
-                    for (int j = 0; j < 3; j++)
-                    {
-                        localNormal2Data[localIndiceData[i + j]] += normal;
-                        normalCalculatedCount[localIndiceData[i + j]]++;
-                    }
-                }
-                for (int i = 0; i < m_VertexCount; i++)
-                {
-                    if (normalCalculatedCount[i] == 0)
-                        localNormal2Data[i] = new Vector3(0, 1, 0);
-                    else
-                        localNormal2Data[i] = Vector3.Normalize(localNormal2Data[i]);
-                }
+                var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
 
                 // Colors
                 Vector4[] localColorData;
@@ -760,6 +911,22 @@ void main()
                     }
                 }
 
+                var localPreviewSubMeshIndexCounts = BuildSubMeshIndexCounts(m_Mesh, localIndiceData.Length);
+                if (previewMeshDensityPercent < PreviewMeshSimplifier.MaxDensityPercent - 0.01f)
+                {
+                    var simplified = PreviewMeshSimplifier.Build(localVertexData, m_Indices, min, max, previewMeshDensityPercent, localPreviewSubMeshIndexCounts);
+                    if (simplified.Indices.Length > 0)
+                    {
+                        localVertexData = simplified.Vertices;
+                        localIndiceData = simplified.Indices;
+                        localPreviewSubMeshIndexCounts = simplified.SubMeshIndexCounts;
+                        localNormalData = RemapVector3Data(localNormalData, simplified.SourceVertexIndices);
+                        localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
+                        localColorData = RemapVector4Data(localColorData, simplified.SourceVertexIndices) ?? localColorData;
+                        localUvData = RemapVector2Data(localUvData, simplified.SourceVertexIndices);
+                    }
+                }
+
                 if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
                 {
                     lock (textureLock)
@@ -786,7 +953,7 @@ void main()
                     normal2Data = localNormal2Data;
                     colorData = localColorData;
                     uvData = localUvData;
-                    currentMesh = m_Mesh; // Keep reference for submesh drawing
+                    previewSubMeshIndexCounts = localPreviewSubMeshIndexCounts;
                     if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
                     {
                         previewMaterialMode = true;
@@ -801,6 +968,7 @@ void main()
         {
             ++meshLoadCounter;
             ClearAvatarPreviewState();
+            ClearMeshPreviewSource();
             materialTintOverrides = null;
 
             lock (textureLock)
@@ -1247,18 +1415,29 @@ void main()
 
                     var localTextureIds = previewTextureIds;
                     var localMaterialTints = materialTintOverrides;
-                    var localSubMeshes = currentMesh?.m_SubMeshes;
-                    bool drawBySubMesh = localSubMeshes != null
-                        && localSubMeshes.Length > 0
+                    var localSubMeshIndexCounts = previewSubMeshIndexCounts;
+                    bool drawBySubMesh = localSubMeshIndexCounts != null
+                        && localSubMeshIndexCounts.Length > 0
                         && !isAvatarMode
                         && ((previewMaterialMode && localTextureIds != null) || (localMaterialTints != null && localMaterialTints.Length > 0));
 
-                    if (drawBySubMesh && localSubMeshes != null)
+                    if (drawBySubMesh && localSubMeshIndexCounts != null)
                     {
                         int flatOffsetElements = 0;
-                        for (int i = 0; i < localSubMeshes.Length; i++)
+                        for (int i = 0; i < localSubMeshIndexCounts.Length; i++)
                         {
-                            var subMesh = localSubMeshes[i];
+                            int indexCount = localSubMeshIndexCounts[i];
+                            if (indexCount <= 0)
+                            {
+                                continue;
+                            }
+
+                            if (indiceData == null || flatOffsetElements >= indiceData.Length)
+                            {
+                                break;
+                            }
+
+                            indexCount = Math.Min(indexCount, indiceData.Length - flatOffsetElements);
                             int texIndex = localTextureIds != null && i < localTextureIds.Length ? i : 0;
                             int texId = localTextureIds != null && texIndex < localTextureIds.Length ? localTextureIds[texIndex] : 0;
                             var tint = GetMaterialTint(i);
@@ -1294,8 +1473,8 @@ void main()
                                 }
                             }
 
-                            GL.DrawElements(PrimitiveType.Triangles, (int)subMesh.indexCount, DrawElementsType.UnsignedInt, (IntPtr)(flatOffsetElements * 4));
-                            flatOffsetElements += (int)subMesh.indexCount;
+                            GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, (IntPtr)(flatOffsetElements * 4));
+                            flatOffsetElements += indexCount;
                         }
                     }
                     else
@@ -1774,6 +1953,7 @@ void main()
         public void SetAvatar(Mesh m_Mesh, Vector3[] bonePositions, int[] parentIndices, string[]? boneNames = null)
         {
             isAvatarMode = true;
+            ClearMeshPreviewSource();
             StopAnimation();
             previewMaterialMode = false;
             m_Mesh.EnsureProcessed();
@@ -1815,7 +1995,7 @@ void main()
 
                 var sourceMeshMin = min;
                 var sourceMeshMax = max;
-                var referenceMesh = AvatarReferenceMeshSimplifier.Build(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, avatarReferenceMeshDensityPercent);
+                var referenceMesh = PreviewMeshSimplifier.Build(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, previewMeshDensityPercent);
                 var localIndiceData = referenceMesh.Indices;
 
                 var skeletonVerts = new List<Vector3>();
@@ -1875,6 +2055,7 @@ void main()
         public void SetAnimatedAvatar(Mesh m_Mesh, Vector3[][] frames, Matrix4[][] boneMatrices, int[] parentIndices, float fps, string[]? boneNames = null)
         {
             isAvatarMode = true;
+            ClearMeshPreviewSource();
             StopAnimation();
             previewMaterialMode = false;
             m_Mesh.EnsureProcessed();
@@ -1912,7 +2093,7 @@ void main()
 
                 var sourceMeshMin = min;
                 var sourceMeshMax = max;
-                var referenceMesh = AvatarReferenceMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, avatarReferenceMeshDensityPercent);
+                var referenceMesh = PreviewMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, previewMeshDensityPercent);
                 var localVertexData = referenceMesh.Vertices;
                 var localIndiceData = referenceMesh.Indices;
 

@@ -50,7 +50,7 @@ public partial class MainWindow : Window
     private const int UserPreviewPriorityMilliseconds = 1800;
     private const int UserInteractionYieldDelayMilliseconds = 40;
     private long userInteractionPriorityUntilTimestamp;
-    private System.Collections.ObjectModel.ObservableCollection<AssetItem> visibleAssets = new();
+    private List<AssetItem> visibleAssets = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
     private System.Diagnostics.Stopwatch? _indexingUiThrottleStopwatch;
@@ -444,10 +444,7 @@ public partial class MainWindow : Window
             GLPreviewControl.IsVisible = false;
         }
         ApplyAvatarPreviewControlSettings();
-        if (BoneSizeContainer != null)
-        {
-            BoneSizeContainer.IsVisible = false;
-        }
+        HidePreviewGeometryControls();
         ClearMeshMaterialControls();
         if (AnimationPlaybackPanel != null)
         {
@@ -2725,10 +2722,7 @@ public partial class MainWindow : Window
                                     GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                                     GLPreviewControl.IsVisible = true;
                                     BuildMeshMaterialControls(m_Mesh, allMaterials);
-                                    if (BoneSizeContainer != null)
-                                    {
-                                        BoneSizeContainer.IsVisible = false;
-                                    }
+                                    ShowPreviewGeometryControls(showBoneControls: false);
                                     GLPreviewControl.Focus();
                                 }
 
@@ -3434,10 +3428,7 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.SetAvatar(avatarMesh, bonePositions, parentIndices, boneNames);
             GLPreviewControl.IsVisible = true;
-            if (BoneSizeContainer != null)
-            {
-                BoneSizeContainer.IsVisible = true;
-            }
+            ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
@@ -4037,10 +4028,7 @@ public partial class MainWindow : Window
             {
                 GLPreviewControl.SetAvatar(avatarMesh, restBonePositions, meshParentIndices, meshBoneNames);
                 GLPreviewControl.IsVisible = true;
-                if (BoneSizeContainer != null)
-                {
-                    BoneSizeContainer.IsVisible = true;
-                }
+                ShowPreviewGeometryControls(showBoneControls: true);
                 GLPreviewControl.Focus();
                 TextPreviewBox.IsVisible = false;
                 PreviewLabel.IsVisible = false;
@@ -4307,10 +4295,7 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.SetAnimatedAvatar(avatarMesh, allFrames, allBoneMatrices, renderParentIndices, sampleRate, meshBoneNames);
             GLPreviewControl.IsVisible = true;
-            if (BoneSizeContainer != null)
-            {
-                BoneSizeContainer.IsVisible = true;
-            }
+            ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
@@ -4606,10 +4591,7 @@ public partial class MainWindow : Window
                                 {
                                     GLPreviewControl.SetMaterialTexture(image);
                                     GLPreviewControl.IsVisible = true;
-                                    if (BoneSizeContainer != null)
-                                    {
-                                        BoneSizeContainer.IsVisible = false;
-                                    }
+                                    HidePreviewGeometryControls();
                                     GLPreviewControl.Focus();
                                 }
 
@@ -5282,6 +5264,7 @@ public partial class MainWindow : Window
     private bool isSorting;
     private async void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
     {
+        e.Handled = true;
         if (isSorting) return;
         PrioritizeUserInteraction();
         isSorting = true;
@@ -5303,10 +5286,13 @@ public partial class MainWindow : Window
                 assetListSortDescending = false;
             }
 
-            column.Sort(assetListSortDescending ? ListSortDirection.Descending : ListSortDirection.Ascending);
             await ApplyAssetListSortAsync();
-            
-            e.Handled = true;
+            UpdateAssetListSortHeaderIndicators();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Error sorting asset list", ex);
+            StatusStripUpdate("Error sorting asset list. See error log.");
         }
         finally
         {
@@ -5446,34 +5432,36 @@ public partial class MainWindow : Window
                 foreach (var x in assetsSnapshot)
                 {
                     token.ThrowIfCancellationRequested();
+                    if (x == null)
+                    {
+                        continue;
+                    }
 
                     if (classFilter != null)
                     {
-                        if ((int)x.Type != classFilter.ClassID || x.SourceFile.unityVersion != classFilter.UnityVersion)
+                        if (!AssetMatchesClassFilter(x, classFilter))
+                        {
                             continue;
+                        }
                     }
                     else if (selectedTypes != null)
                     {
                         if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
-                            continue;
-                    }
-
-                    if (!string.IsNullOrEmpty(filterText))
-                    {
-                        if (!x.Name.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
-                            !x.Container.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
-                            !x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
-                            !x.PathIDString.Contains(filterText, StringComparison.OrdinalIgnoreCase))
                         {
                             continue;
                         }
+                    }
+
+                    if (!string.IsNullOrEmpty(filterText) && !AssetMatchesTextFilter(x, filterText))
+                    {
+                        continue;
                     }
 
                     matches.Add(x);
                 }
 
                 token.ThrowIfCancellationRequested();
-                return SortAssetListAsync(matches, sortMember, sortDescending).ToList();
+                return SortAssetList(matches, sortMember, sortDescending);
             }, token);
 
             isRefreshingFilterList = true;
@@ -5546,6 +5534,11 @@ public partial class MainWindow : Window
         {
             // Task canceled, ignore
         }
+        catch (Exception ex)
+        {
+            Logger.Error("Error filtering asset list", ex);
+            StatusStripUpdate("Error filtering asset list. See error log.");
+        }
     }
 
     private async Task ApplyAssetListSortAsync()
@@ -5556,58 +5549,171 @@ public partial class MainWindow : Window
 
         try
         {
-            var sorted = await Task.Run(() => SortAssetListAsync(currentAssets, sortMember, sortDescending).ToList());
+            var sorted = await Task.Run(() => SortAssetList(currentAssets, sortMember, sortDescending));
             ReplaceVisibleAssets(sorted);
             StatusStripUpdate($"Showing {visibleAssets.Count} assets");
         }
         catch (Exception ex)
         {
             Logger.Error("Error sorting asset list", ex);
+            StatusStripUpdate("Error sorting asset list. See error log.");
         }
     }
 
-    private IEnumerable<AssetItem> SortAssetListAsync(IEnumerable<AssetItem> assets, string? sortMember, bool descending)
+    private static bool AssetMatchesClassFilter(AssetItem item, AssetClassItem classFilter)
     {
-        return sortMember switch
-        {
-            "PathID" => descending
-                ? assets.OrderByDescending(x => x.PathID)
-                : assets.OrderBy(x => x.PathID),
-            "FullSize" or "Size" => descending
-                ? assets.OrderByDescending(x => x.FullSize).ThenBy(x => x.PathID)
-                : assets.OrderBy(x => x.FullSize).ThenBy(x => x.PathID),
-            "Container" => SortByStringAsync(assets, x => x.Container, descending),
-            "DisplayType" or "Type" => SortByStringAsync(assets, x => x.DisplayType, descending),
-            "Name" => SortByStringAsync(assets, x => x.Name, descending),
-            _ => assets
-        };
+        return (int)item.Type == classFilter.ClassID
+            && string.Equals(
+                item.SourceFile?.unityVersion ?? string.Empty,
+                classFilter.UnityVersion ?? string.Empty,
+                StringComparison.Ordinal);
     }
 
-    private IEnumerable<AssetItem> SortByStringAsync(IEnumerable<AssetItem> assets, Func<AssetItem, string?> selector, bool descending)
+    private static bool AssetMatchesTextFilter(AssetItem item, string filterText)
     {
-        return descending
-            ? assets.OrderByDescending(selector, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.PathID)
-            : assets.OrderBy(selector, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.PathID);
+        return ContainsIgnoreCase(item.Name, filterText)
+            || ContainsIgnoreCase(item.Container, filterText)
+            || ContainsIgnoreCase(item.TypeString, filterText)
+            || ContainsIgnoreCase(item.DisplayType, filterText)
+            || ContainsIgnoreCase(item.PathIDString, filterText);
+    }
+
+    private static bool ContainsIgnoreCase(string? value, string filterText)
+    {
+        return !string.IsNullOrEmpty(value)
+            && value.Contains(filterText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<AssetItem> SortAssetList(IEnumerable<AssetItem>? assets, string? sortMember, bool descending)
+    {
+        var sorted = assets?
+            .Where(static x => x != null)
+            .ToList() ?? new List<AssetItem>();
+
+        if (sorted.Count <= 1 || string.IsNullOrEmpty(sortMember))
+        {
+            return sorted;
+        }
+
+        sorted.Sort((left, right) => CompareAssetItems(left, right, sortMember, descending));
+        return sorted;
+    }
+
+    private static int CompareAssetItems(AssetItem? left, AssetItem? right, string sortMember, bool descending)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return 0;
+        }
+        if (left == null)
+        {
+            return 1;
+        }
+        if (right == null)
+        {
+            return -1;
+        }
+
+        int result = sortMember switch
+        {
+            "PathID" => left.PathID.CompareTo(right.PathID),
+            "FullSize" or "Size" => left.FullSize.CompareTo(right.FullSize),
+            "Container" => CompareNullableText(left.Container, right.Container),
+            "DisplayType" or "Type" => CompareNullableText(left.DisplayType, right.DisplayType),
+            "Name" => CompareNullableText(left.Name, right.Name),
+            _ => 0
+        };
+
+        if (descending)
+        {
+            result = -result;
+        }
+
+        if (result != 0)
+        {
+            return result;
+        }
+
+        result = left.PathID.CompareTo(right.PathID);
+        if (result != 0)
+        {
+            return result;
+        }
+
+        result = CompareNullableText(left.UniqueID, right.UniqueID);
+        if (result != 0)
+        {
+            return result;
+        }
+
+        return CompareNullableText(left.Name, right.Name);
+    }
+
+    private static int CompareNullableText(string? left, string? right)
+    {
+        var leftMissing = string.IsNullOrEmpty(left);
+        var rightMissing = string.IsNullOrEmpty(right);
+        if (leftMissing && rightMissing)
+        {
+            return 0;
+        }
+        if (leftMissing)
+        {
+            return 1;
+        }
+        if (rightMissing)
+        {
+            return -1;
+        }
+
+        return StringComparer.OrdinalIgnoreCase.Compare(left, right);
     }
 
     private static string GetAssetCellText(AssetItem item, string? member)
     {
         return member switch
         {
-            "Container" => item.Container,
-            "DisplayType" or "Type" => item.DisplayType,
-            "PathID" => item.PathIDString,
+            "Container" => item.Container ?? string.Empty,
+            "DisplayType" or "Type" => item.DisplayType ?? string.Empty,
+            "PathID" => item.PathIDString ?? string.Empty,
             "FullSize" or "Size" => item.FullSize.ToString(CultureInfo.InvariantCulture),
-            _ => item.Name
+            _ => item.Name ?? string.Empty
         };
     }
 
     private void ReplaceVisibleAssets(IReadOnlyList<AssetItem>? items)
     {
         visibleAssets = items is { Count: > 0 }
-            ? new System.Collections.ObjectModel.ObservableCollection<AssetItem>(items)
-            : new System.Collections.ObjectModel.ObservableCollection<AssetItem>();
+            ? items.Where(static x => x != null).ToList()
+            : new List<AssetItem>();
+        ResetAssetListItemsSource();
+    }
+
+    private void ResetAssetListItemsSource()
+    {
+        AssetListDataGrid.ItemsSource = null;
         AssetListDataGrid.ItemsSource = visibleAssets;
+    }
+
+    private void UpdateAssetListSortHeaderIndicators()
+    {
+        foreach (var column in AssetListDataGrid.Columns)
+        {
+            var sortMember = column.SortMemberPath ?? column.Header?.ToString();
+            var baseHeader = sortMember switch
+            {
+                "Name" => "Name",
+                "Container" => "Container",
+                "DisplayType" or "Type" => "Type",
+                "PathID" => "PathID",
+                "FullSize" or "Size" => "Size",
+                _ => column.Header?.ToString() ?? string.Empty
+            };
+
+            column.Header = sortMember == assetListSortMember
+                ? $"{baseHeader} {(assetListSortDescending ? "(desc)" : "(asc)")}"
+                : baseHeader;
+        }
     }
 
     private static void SyncObservableCollection<T>(System.Collections.ObjectModel.ObservableCollection<T> collection, IReadOnlyList<T>? targetList)
@@ -5710,35 +5816,40 @@ public partial class MainWindow : Window
 
         foreach (var x in newItems)
         {
+            if (x == null)
+            {
+                continue;
+            }
+
             if (classFilter != null)
             {
-                if ((int)x.Type != classFilter.ClassID || x.SourceFile.unityVersion != classFilter.UnityVersion)
+                if (!AssetMatchesClassFilter(x, classFilter))
+                {
                     continue;
+                }
             }
             else if (selectedTypes != null)
             {
                 if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
-                    continue;
-            }
-
-            if (!string.IsNullOrEmpty(filterText))
-            {
-                if (!x.Name.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
-                    !x.Container.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
-                    !x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
-                    !x.PathIDString.Contains(filterText, StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
             }
 
+            if (!string.IsNullOrEmpty(filterText) && !AssetMatchesTextFilter(x, filterText))
+            {
+                continue;
+            }
+
             visibleAssets.Add(x);
         }
 
-        if (AssetListDataGrid.ItemsSource != visibleAssets)
+        if (!string.IsNullOrEmpty(assetListSortMember))
         {
-            AssetListDataGrid.ItemsSource = visibleAssets;
+            visibleAssets = SortAssetList(visibleAssets, assetListSortMember, assetListSortDescending);
         }
+
+        ResetAssetListItemsSource();
         StatusStripUpdate($"Showing {visibleAssets.Count} assets");
     }
 
@@ -8859,7 +8970,7 @@ public class AssetItem
     {
         Asset = asset;
         SourceFile = asset.assetsFile;
-        TypeString = asset.type.ToString();
+        TypeString = asset.type.ToString() ?? string.Empty;
         Type = asset.type;
         PathID = asset.m_PathID;
         PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
@@ -8871,19 +8982,19 @@ public class AssetItem
     {
         Handle = handle;
         SourceFile = handle.SourceFile;
-        TypeString = handle.Type.ToString();
+        TypeString = handle.Type.ToString() ?? string.Empty;
         Type = handle.Type;
         PathID = handle.PathID;
         PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
         Size = handle.ByteSize;
         FullSize = handle.ByteSize;
-        Name = handle.Name;
-        Container = handle.Container;
+        Name = handle.Name ?? string.Empty;
+        Container = handle.Container ?? string.Empty;
     }
 
     private string GetDisplayType()
     {
-        var display = TypeString;
+        var display = TypeString ?? string.Empty;
         if (Type == ClassIDType.PrefabInstance)
         {
             display = "Prefab (Composite)";
@@ -8914,7 +9025,7 @@ public class AssetItem
             return $"{display} (FBX sub-asset)";
         }
 
-        return display;
+        return display ?? string.Empty;
     }
 
     private bool IsComponentType(ClassIDType type)

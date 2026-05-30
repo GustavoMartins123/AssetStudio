@@ -5,21 +5,23 @@ namespace AssetStudio.Avalonia
 {
     using Vector3 = OpenTK.Mathematics.Vector3;
 
-internal sealed class AvatarReferenceMesh
+internal sealed class PreviewMeshGeometry
 {
-    public AvatarReferenceMesh(Vector3[] vertices, int[] indices, int[] sourceVertexIndices)
+    public PreviewMeshGeometry(Vector3[] vertices, int[] indices, int[] sourceVertexIndices, int[]? subMeshIndexCounts = null)
     {
         Vertices = vertices;
         Indices = indices;
         SourceVertexIndices = sourceVertexIndices;
+        SubMeshIndexCounts = subMeshIndexCounts;
     }
 
     public Vector3[] Vertices { get; }
     public int[] Indices { get; }
     public int[] SourceVertexIndices { get; }
+    public int[]? SubMeshIndexCounts { get; }
 }
 
-internal static class AvatarReferenceMeshSimplifier
+internal static class PreviewMeshSimplifier
 {
     public const float DefaultDensityPercent = 70f;
     public const float MinDensityPercent = 1f;
@@ -29,23 +31,24 @@ internal static class AvatarReferenceMeshSimplifier
     private const int PreferredMinimumPreviewVertices = 32;
     private const int MaximumGridAxisResolution = 1024;
 
-    public static AvatarReferenceMesh Build(Vector3[] sourceVertices, List<uint> sourceIndices, Vector3 min, Vector3 max, float densityPercent)
+    public static PreviewMeshGeometry Build(Vector3[] sourceVertices, List<uint> sourceIndices, Vector3 min, Vector3 max, float densityPercent, IReadOnlyList<int>? subMeshIndexCounts = null)
     {
         if (sourceVertices.Length == 0 || sourceIndices.Count < 3)
         {
-            return Empty();
+            return Empty(subMeshIndexCounts);
         }
 
-        var triangles = CollectTriangles(sourceVertices, sourceIndices);
+        var triangles = CollectTriangles(sourceVertices, sourceIndices, subMeshIndexCounts);
         if (triangles.Count == 0)
         {
-            return Empty();
+            return Empty(subMeshIndexCounts);
         }
 
         densityPercent = Math.Clamp(densityPercent, MinDensityPercent, MaxDensityPercent);
+        int sectionCount = subMeshIndexCounts?.Count ?? 0;
         if (densityPercent >= MaxDensityPercent - 0.01f)
         {
-            return CompactOriginalTriangles(sourceVertices, triangles);
+            return CompactOriginalTriangles(sourceVertices, triangles, sectionCount);
         }
 
         var sourceVertexScores = BuildVertexScores(sourceVertices, triangles);
@@ -53,40 +56,61 @@ internal static class AvatarReferenceMeshSimplifier
         int targetVertexCount = ComputeTargetVertexCount(usedVertexIndices.Count, densityPercent);
         if (targetVertexCount >= usedVertexIndices.Count)
         {
-            return CompactOriginalTriangles(sourceVertices, triangles);
+            return CompactOriginalTriangles(sourceVertices, triangles, sectionCount);
         }
 
         var axisResolution = FindGridAxisResolution(sourceVertices, usedVertexIndices, min, max, targetVertexCount);
-        var clustered = BuildClusteredMesh(sourceVertices, triangles, usedVertexIndices, sourceVertexScores, min, max, axisResolution);
+        var clustered = BuildClusteredMesh(sourceVertices, triangles, usedVertexIndices, sourceVertexScores, min, max, axisResolution, sectionCount);
         if (clustered.Indices.Length > 0)
         {
             return clustered;
         }
 
-        return CompactOriginalTriangles(sourceVertices, triangles);
+        return CompactOriginalTriangles(sourceVertices, triangles, sectionCount);
     }
 
-    private static AvatarReferenceMesh Empty()
+    private static PreviewMeshGeometry Empty(IReadOnlyList<int>? subMeshIndexCounts = null)
     {
-        return new AvatarReferenceMesh(Array.Empty<Vector3>(), Array.Empty<int>(), Array.Empty<int>());
+        var emptySectionCounts = subMeshIndexCounts == null || subMeshIndexCounts.Count == 0
+            ? null
+            : new int[subMeshIndexCounts.Count];
+        return new PreviewMeshGeometry(Array.Empty<Vector3>(), Array.Empty<int>(), Array.Empty<int>(), emptySectionCounts);
     }
 
-    private static List<Triangle> CollectTriangles(Vector3[] sourceVertices, List<uint> sourceIndices)
+    private static List<Triangle> CollectTriangles(Vector3[] sourceVertices, List<uint> sourceIndices, IReadOnlyList<int>? subMeshIndexCounts)
     {
         var triangles = new List<Triangle>(sourceIndices.Count / 3);
-        for (int offset = 0; offset + 2 < sourceIndices.Count; offset += 3)
+        if (subMeshIndexCounts == null || subMeshIndexCounts.Count == 0)
+        {
+            CollectTriangleRange(sourceVertices, sourceIndices, 0, sourceIndices.Count, 0, triangles);
+            return triangles;
+        }
+
+        int offset = 0;
+        for (int section = 0; section < subMeshIndexCounts.Count && offset < sourceIndices.Count; section++)
+        {
+            int sectionIndexCount = Math.Max(0, subMeshIndexCounts[section]);
+            int end = Math.Min(sourceIndices.Count, offset + sectionIndexCount);
+            CollectTriangleRange(sourceVertices, sourceIndices, offset, end, section, triangles);
+            offset = end;
+        }
+
+        return triangles;
+    }
+
+    private static void CollectTriangleRange(Vector3[] sourceVertices, List<uint> sourceIndices, int start, int end, int section, List<Triangle> triangles)
+    {
+        for (int offset = start; offset + 2 < end; offset += 3)
         {
             if (TryReadTriangle(sourceIndices, offset, sourceVertices.Length, out int i0, out int i1, out int i2))
             {
                 var area = GetTriangleArea(sourceVertices[i0], sourceVertices[i1], sourceVertices[i2]);
                 if (area > 1e-12f)
                 {
-                    triangles.Add(new Triangle(i0, i1, i2, area));
+                    triangles.Add(new Triangle(i0, i1, i2, area, section));
                 }
             }
         }
-
-        return triangles;
     }
 
     private static bool TryReadTriangle(List<uint> sourceIndices, int offset, int vertexCount, out int i0, out int i1, out int i2)
@@ -211,14 +235,15 @@ internal static class AvatarReferenceMeshSimplifier
         return occupied.Count;
     }
 
-    private static AvatarReferenceMesh BuildClusteredMesh(
+    private static PreviewMeshGeometry BuildClusteredMesh(
         Vector3[] sourceVertices,
         List<Triangle> triangles,
         List<int> usedVertexIndices,
         double[] sourceVertexScores,
         Vector3 min,
         Vector3 max,
-        int axisResolution)
+        int axisResolution,
+        int sectionCount)
     {
         var grid = CreateGrid(min, max, axisResolution);
         var cells = new Dictionary<long, VertexCell>();
@@ -257,6 +282,7 @@ internal static class AvatarReferenceMeshSimplifier
         }
 
         var previewIndices = new List<int>(triangles.Count * 3);
+        var previewSectionIndexCounts = sectionCount > 0 ? new int[sectionCount] : null;
         var emittedTriangles = new HashSet<TriangleKey>();
         foreach (var triangle in triangles)
         {
@@ -268,7 +294,7 @@ internal static class AvatarReferenceMeshSimplifier
                 continue;
             }
 
-            if (!emittedTriangles.Add(TriangleKey.Create(i0, i1, i2)))
+            if (!emittedTriangles.Add(TriangleKey.Create(i0, i1, i2, triangle.Section)))
             {
                 continue;
             }
@@ -276,9 +302,13 @@ internal static class AvatarReferenceMeshSimplifier
             previewIndices.Add(i0);
             previewIndices.Add(i1);
             previewIndices.Add(i2);
+            if (previewSectionIndexCounts != null && triangle.Section >= 0 && triangle.Section < previewSectionIndexCounts.Length)
+            {
+                previewSectionIndexCounts[triangle.Section] += 3;
+            }
         }
 
-        return CompactPreviewVertices(previewVertices, previewSourceIndices, previewIndices);
+        return CompactPreviewVertices(previewVertices, previewSourceIndices, previewIndices, previewSectionIndexCounts);
     }
 
     private static int ChooseRepresentativeVertex(Vector3[] sourceVertices, double[] sourceVertexScores, VertexCell cell, float cellSize)
@@ -305,12 +335,13 @@ internal static class AvatarReferenceMeshSimplifier
         return bestIndex;
     }
 
-    private static AvatarReferenceMesh CompactOriginalTriangles(Vector3[] sourceVertices, List<Triangle> triangles)
+    private static PreviewMeshGeometry CompactOriginalTriangles(Vector3[] sourceVertices, List<Triangle> triangles, int sectionCount)
     {
         var vertexRemap = new Dictionary<int, int>();
         var previewVertices = new List<Vector3>();
         var previewSourceIndices = new List<int>();
         var previewIndices = new List<int>(triangles.Count * 3);
+        var previewSectionIndexCounts = sectionCount > 0 ? new int[sectionCount] : null;
 
         int GetPreviewVertexIndex(int sourceIndex)
         {
@@ -331,16 +362,20 @@ internal static class AvatarReferenceMeshSimplifier
             previewIndices.Add(GetPreviewVertexIndex(triangle.A));
             previewIndices.Add(GetPreviewVertexIndex(triangle.B));
             previewIndices.Add(GetPreviewVertexIndex(triangle.C));
+            if (previewSectionIndexCounts != null && triangle.Section >= 0 && triangle.Section < previewSectionIndexCounts.Length)
+            {
+                previewSectionIndexCounts[triangle.Section] += 3;
+            }
         }
 
-        return new AvatarReferenceMesh(previewVertices.ToArray(), previewIndices.ToArray(), previewSourceIndices.ToArray());
+        return new PreviewMeshGeometry(previewVertices.ToArray(), previewIndices.ToArray(), previewSourceIndices.ToArray(), previewSectionIndexCounts);
     }
 
-    private static AvatarReferenceMesh CompactPreviewVertices(List<Vector3> vertices, List<int> sourceIndices, List<int> indices)
+    private static PreviewMeshGeometry CompactPreviewVertices(List<Vector3> vertices, List<int> sourceIndices, List<int> indices, int[]? sectionIndexCounts)
     {
         if (indices.Count == 0)
         {
-            return Empty();
+            return new PreviewMeshGeometry(Array.Empty<Vector3>(), Array.Empty<int>(), Array.Empty<int>(), sectionIndexCounts);
         }
 
         var remap = new int[vertices.Count];
@@ -364,7 +399,7 @@ internal static class AvatarReferenceMeshSimplifier
             compactIndices[i] = newIndex;
         }
 
-        return new AvatarReferenceMesh(compactVertices.ToArray(), compactIndices, compactSourceIndices.ToArray());
+        return new PreviewMeshGeometry(compactVertices.ToArray(), compactIndices, compactSourceIndices.ToArray(), sectionIndexCounts);
     }
 
     private static UniformGrid CreateGrid(Vector3 min, Vector3 max, int axisResolution)
@@ -380,11 +415,11 @@ internal static class AvatarReferenceMeshSimplifier
         return new UniformGrid(min, cellSize);
     }
 
-    private readonly record struct Triangle(int A, int B, int C, float Area);
+    private readonly record struct Triangle(int A, int B, int C, float Area, int Section);
 
-    private readonly record struct TriangleKey(int A, int B, int C)
+    private readonly record struct TriangleKey(int A, int B, int C, int Section)
     {
-        public static TriangleKey Create(int a, int b, int c)
+        public static TriangleKey Create(int a, int b, int c, int section)
         {
             if (a > b)
             {
@@ -399,7 +434,7 @@ internal static class AvatarReferenceMeshSimplifier
                 (a, b) = (b, a);
             }
 
-            return new TriangleKey(a, b, c);
+            return new TriangleKey(a, b, c, section);
         }
     }
 
