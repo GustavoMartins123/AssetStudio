@@ -974,7 +974,7 @@ namespace AssetStudio
             }
         }
 
-        private static int GetConfiguredThreadCount(string environmentVariable, double defaultRatio)
+        public static int GetConfiguredThreadCount(string environmentVariable, double defaultRatio)
         {
             var value = Environment.GetEnvironmentVariable(environmentVariable);
             if (int.TryParse(value, out var configuredValue) && configuredValue > 0)

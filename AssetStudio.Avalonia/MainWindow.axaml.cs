@@ -97,6 +97,9 @@ public partial class MainWindow : Window
     private List<string> pendingFilesToIndex = new List<string>();
 
     private string? _pendingStatusText;
+    private string? _currentlySelectedUniqueID;
+    private bool isRefreshingFilterList;
+    private bool isRefreshingClassesList;
     private bool _statusUpdatePending;
 
     public MainWindow()
@@ -336,6 +339,22 @@ public partial class MainWindow : Window
 
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
         Title = $"AssetStudio v{version}";
+
+        _currentlySelectedUniqueID = null;
+        isRefreshingFilterList = false;
+        isRefreshingClassesList = false;
+    }
+
+    private static T? FindVisualChild<T>(global::Avalonia.Visual? visual) where T : class
+    {
+        if (visual == null) return null;
+        if (visual is T target) return target;
+        foreach (var child in global::Avalonia.VisualTree.VisualExtensions.GetVisualChildren(visual))
+        {
+            var result = FindVisualChild<T>(child);
+            if (result != null) return result;
+        }
+        return null;
     }
 
     private void ApplyUnityVersionOption()
@@ -673,6 +692,12 @@ public partial class MainWindow : Window
     private void BuildFilterTypeMenu()
     {
         updatingFilterTypeMenu = true;
+        var checkedTypes = GetFilterTypeItems()
+            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+            .Select(x => (ClassIDType)x.Tag!)
+            .ToHashSet();
+        bool wasAllChecked = filterTypeAll.IsChecked == true;
+
         while (filterTypeMenu.Items.Count > 1)
         {
             filterTypeMenu.Items.RemoveAt(1);
@@ -689,14 +714,21 @@ public partial class MainWindow : Window
             {
                 Header = type.ToString(),
                 ToggleType = MenuItemToggleType.CheckBox,
-                IsChecked = false,
+                IsChecked = checkedTypes.Contains(type),
                 Tag = type
             };
             item.Click += FilterType_Click;
             filterTypeMenu.Items.Add(item);
         }
 
-        filterTypeAll.IsChecked = true;
+        if (wasAllChecked)
+        {
+            filterTypeAll.IsChecked = true;
+        }
+        else
+        {
+            filterTypeAll.IsChecked = !GetFilterTypeItems().Any(x => x.IsChecked == true);
+        }
         updatingFilterTypeMenu = false;
     }
 
@@ -814,12 +846,56 @@ public partial class MainWindow : Window
                 || x.SourceKind.Contains(filter, StringComparison.OrdinalIgnoreCase));
         }
 
+        // Save selection and scroll state
+        var selectedItem = AssetClassesDataGrid.SelectedItem as AssetClassItem;
+        (int ClassID, string UnityVersion, string SourceFile, string SourceKind)? selectedKey = selectedItem != null
+            ? (selectedItem.ClassID, selectedItem.UnityVersion, selectedItem.SourceFile, selectedItem.SourceKind)
+            : null;
+
+        var scrollViewer = FindVisualChild<ScrollViewer>(AssetClassesDataGrid);
+        var scrollOffset = scrollViewer?.Offset ?? default;
+
         visibleAssetClassItems = classes.ToList();
-        AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
+
+        isRefreshingClassesList = true;
+        try
+        {
+            AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
+
+            // Restore selection
+            if (selectedKey != null)
+            {
+                var newSelected = visibleAssetClassItems.FirstOrDefault(x =>
+                    x.ClassID == selectedKey.Value.ClassID &&
+                    x.UnityVersion == selectedKey.Value.UnityVersion &&
+                    x.SourceFile == selectedKey.Value.SourceFile &&
+                    x.SourceKind == selectedKey.Value.SourceKind);
+
+                if (newSelected != null)
+                {
+                    AssetClassesDataGrid.SelectedItem = newSelected;
+                }
+            }
+        }
+        finally
+        {
+            isRefreshingClassesList = false;
+        }
+
+        // Restore scroll position
+        if (scrollViewer != null && scrollOffset != default)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                scrollViewer.Offset = scrollOffset;
+            }, DispatcherPriority.Background);
+        }
     }
 
     private void AssetClassesDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
+        if (isRefreshingClassesList) return;
+
         var selectedItem = sender is DataGrid grid ? grid.SelectedItem : AssetClassesDataGrid.SelectedItem;
         if (selectedItem is not AssetClassItem item)
         {
@@ -2211,9 +2287,14 @@ public partial class MainWindow : Window
 
     private async void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
+        if (isRefreshingFilterList) return;
+
         var selectedItem = sender is DataGrid grid ? grid.SelectedItem : AssetListDataGrid.SelectedItem;
         if (selectedItem is AssetItem assetItem)
         {
+            var id = assetItem.Handle != null ? assetItem.Handle.UniqueID : assetItem.UniqueID;
+            _currentlySelectedUniqueID = id;
+
             if (RightTabControl.SelectedIndex == 1)
             {
                 await UpdateDumpForSelectedAsset();
@@ -2222,6 +2303,7 @@ public partial class MainWindow : Window
         }
         else
         {
+            _currentlySelectedUniqueID = null;
             DumpTextBox.Text = string.Empty;
             previewDebounce?.Cancel();
             ClearPreview("Preview Panel");
@@ -5285,6 +5367,7 @@ public partial class MainWindow : Window
 
         // Capture selection before filtering
         var selectedUniqueIds = new HashSet<string>();
+        string? oldSelectedUniqueId = null;
         if (AssetListDataGrid.SelectedItems != null)
         {
             foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
@@ -5295,7 +5378,17 @@ public partial class MainWindow : Window
                     selectedUniqueIds.Add(id);
                 }
             }
+
+            var selectedItem = AssetListDataGrid.SelectedItem as AssetItem;
+            if (selectedItem != null)
+            {
+                oldSelectedUniqueId = selectedItem.Handle != null ? selectedItem.Handle.UniqueID : selectedItem.UniqueID;
+            }
         }
+
+        // Find scroll viewer and save scroll offset
+        var scrollViewer = FindVisualChild<ScrollViewer>(AssetListDataGrid);
+        var scrollOffset = scrollViewer?.Offset ?? default;
 
         try
         {
@@ -5336,26 +5429,66 @@ public partial class MainWindow : Window
             }, token);
 
             visibleAssets = result;
-            AssetListDataGrid.ItemsSource = visibleAssets;
-            StatusStripUpdate($"Showing {visibleAssets.Count} assets");
 
-            // Restore selection
-            if (selectedUniqueIds.Count > 0)
+            isRefreshingFilterList = true;
+            try
             {
-                var newSelectedItems = new List<AssetItem>();
-                foreach (var item in visibleAssets)
+                AssetListDataGrid.ItemsSource = visibleAssets;
+                StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+
+                // Restore selection
+                if (selectedUniqueIds.Count > 0)
                 {
-                    var id = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
-                    if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+                    var newSelectedItems = new List<AssetItem>();
+                    foreach (var item in visibleAssets)
                     {
-                        newSelectedItems.Add(item);
+                        var id = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
+                        if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+                        {
+                            newSelectedItems.Add(item);
+                        }
+                    }
+
+                    AssetListDataGrid.SelectedItems.Clear();
+                    foreach (var item in newSelectedItems)
+                    {
+                        AssetListDataGrid.SelectedItems.Add(item);
                     }
                 }
+            }
+            finally
+            {
+                isRefreshingFilterList = false;
+            }
 
-                AssetListDataGrid.SelectedItems.Clear();
-                foreach (var item in newSelectedItems)
+            // Restore scroll position
+            if (scrollViewer != null && scrollOffset != default)
+            {
+                Dispatcher.UIThread.Post(() =>
                 {
-                    AssetListDataGrid.SelectedItems.Add(item);
+                    scrollViewer.Offset = scrollOffset;
+                }, DispatcherPriority.Background);
+            }
+
+            // Trigger selection changed logic if the selected item actually changed
+            var newSelectedItem = AssetListDataGrid.SelectedItem as AssetItem;
+            var newSelectedUniqueId = newSelectedItem != null ? (newSelectedItem.Handle != null ? newSelectedItem.Handle.UniqueID : newSelectedItem.UniqueID) : null;
+            if (newSelectedUniqueId != oldSelectedUniqueId)
+            {
+                _currentlySelectedUniqueID = newSelectedUniqueId;
+                if (newSelectedItem != null)
+                {
+                    if (RightTabControl.SelectedIndex == 1)
+                    {
+                        _ = UpdateDumpForSelectedAsset();
+                    }
+                    QueuePreviewAsset(newSelectedItem);
+                }
+                else
+                {
+                    DumpTextBox.Text = string.Empty;
+                    previewDebounce?.Cancel();
+                    ClearPreview("Preview Panel");
                 }
             }
         }

@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -93,74 +95,131 @@ namespace AssetStudio
                 RootPath = Path.GetFullPath(path)
             };
 
-            int scannedCount = 0;
-            int lastReportedCount = 0;
+            var files = ImportHelper.GetFilesSafe(path, "*.*", true);
+            int totalFilesCount = files.Length;
+
+            var filesBag = new ConcurrentBag<ScannedFileInfo>();
+            var sampleBundles = new ConcurrentBag<string>();
+
+            int totalFiles = 0;
+            long totalBytes = 0;
+            int unityBundleCount = 0;
+            int serializedFileCount = 0;
+            int resourceFileCount = 0;
+            int otherFileCount = 0;
+            int errorCount = 0;
             long bundleBytesOnDisk = 0;
 
-            foreach (var file in ImportHelper.GetFilesSafe(path, "*.*", true))
+            int scannedCount = 0;
+            int lastReportedCount = 0;
+
+            var parallelOptions = new System.Threading.Tasks.ParallelOptions
+            {
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = AssetsManager.GetConfiguredThreadCount("ASSETSTUDIO_SCAN_THREADS", 0.6)
+            };
+
+            System.Threading.Tasks.Parallel.ForEach(files, parallelOptions, file =>
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                scannedCount++;
-                result.TotalFiles++;
-
                 var fileInfo = new ScannedFileInfo { Path = file };
+                bool isError = false;
+                long length = 0;
+                ProjectFileKind kind = ProjectFileKind.Other;
+                string bundleSig = null;
+                uint bundleVer = 0;
+                string bundleUnityVer = null;
 
                 try
                 {
                     var info = new FileInfo(file);
-                    fileInfo.Size = info.Length;
-                    result.TotalBytes += info.Length;
+                    length = info.Length;
 
-                    var detection = DetectFileKindExtended(file, info.Length);
-                    fileInfo.Kind = detection.Kind;
-                    fileInfo.BundleSignature = detection.BundleSignature;
-                    fileInfo.BundleVersion = detection.BundleVersion;
-                    fileInfo.BundleUnityVersion = detection.BundleUnityVersion;
-                    fileInfo.AddressablesGroup = InferAddressablesGroup(file);
-
-                    switch (detection.Kind)
-                    {
-                        case ProjectFileKind.UnityBundle:
-                            result.UnityBundleCount++;
-                            bundleBytesOnDisk += info.Length;
-                            if (result.SampleUnityBundles.Count < MaxSamples)
-                                result.SampleUnityBundles.Add(file);
-                            break;
-                        case ProjectFileKind.SerializedFile:
-                            result.SerializedFileCount++;
-                            break;
-                        case ProjectFileKind.ResourceFile:
-                            result.ResourceFileCount++;
-                            break;
-                        default:
-                            result.OtherFileCount++;
-                            break;
-                    }
+                    var detection = DetectFileKindExtended(file, length);
+                    kind = detection.Kind;
+                    bundleSig = detection.BundleSignature;
+                    bundleVer = detection.BundleVersion;
+                    bundleUnityVer = detection.BundleUnityVersion;
                 }
                 catch (IOException)
                 {
-                    result.ErrorCount++;
+                    isError = true;
                 }
                 catch (UnauthorizedAccessException)
                 {
-                    result.ErrorCount++;
+                    isError = true;
                 }
 
-                result.Files.Add(fileInfo);
+                fileInfo.Size = length;
+                fileInfo.Kind = kind;
+                fileInfo.BundleSignature = bundleSig;
+                fileInfo.BundleVersion = bundleVer;
+                fileInfo.BundleUnityVersion = bundleUnityVer;
+                fileInfo.AddressablesGroup = InferAddressablesGroup(file);
 
-                if (progress != null && (scannedCount - lastReportedCount) >= ProgressReportInterval)
+                filesBag.Add(fileInfo);
+
+                Interlocked.Increment(ref totalFiles);
+                if (isError)
                 {
-                    lastReportedCount = scannedCount;
-                    progress.Report(new ScanProgress
-                    {
-                        ScannedFiles = scannedCount,
-                        TotalFiles = -1,
-                        ScannedBytes = result.TotalBytes,
-                        UnityBundleCount = result.UnityBundleCount
-                    });
+                    Interlocked.Increment(ref errorCount);
                 }
-            }
+                else
+                {
+                    Interlocked.Add(ref totalBytes, length);
+                    switch (kind)
+                    {
+                        case ProjectFileKind.UnityBundle:
+                            Interlocked.Increment(ref unityBundleCount);
+                            Interlocked.Add(ref bundleBytesOnDisk, length);
+                            if (sampleBundles.Count < MaxSamples)
+                            {
+                                sampleBundles.Add(file);
+                            }
+                            break;
+                        case ProjectFileKind.SerializedFile:
+                            Interlocked.Increment(ref serializedFileCount);
+                            break;
+                        case ProjectFileKind.ResourceFile:
+                            Interlocked.Increment(ref resourceFileCount);
+                            break;
+                        default:
+                            Interlocked.Increment(ref otherFileCount);
+                            break;
+                    }
+                }
+
+                var currentScanned = Interlocked.Increment(ref scannedCount);
+                if (progress != null)
+                {
+                    var lastReported = Volatile.Read(ref lastReportedCount);
+                    if (currentScanned - lastReported >= ProgressReportInterval)
+                    {
+                        if (Interlocked.CompareExchange(ref lastReportedCount, currentScanned, lastReported) == lastReported)
+                        {
+                            progress.Report(new ScanProgress
+                            {
+                                ScannedFiles = currentScanned,
+                                TotalFiles = totalFilesCount,
+                                ScannedBytes = Volatile.Read(ref totalBytes),
+                                UnityBundleCount = Volatile.Read(ref unityBundleCount)
+                            });
+                        }
+                    }
+                }
+            });
+
+            result.TotalFiles = totalFiles;
+            result.TotalBytes = totalBytes;
+            result.UnityBundleCount = unityBundleCount;
+            result.SerializedFileCount = serializedFileCount;
+            result.ResourceFileCount = resourceFileCount;
+            result.OtherFileCount = otherFileCount;
+            result.ErrorCount = errorCount;
+
+            result.Files.AddRange(filesBag);
+            result.SampleUnityBundles.AddRange(sampleBundles.Take(MaxSamples));
 
             result.EstimatedMemoryBytes = (long)(bundleBytesOnDisk * MemoryMultiplier);
             result.AvailableMemoryBytes = GetAvailableMemoryBytes();
@@ -169,10 +228,10 @@ namespace AssetStudio
 
             progress?.Report(new ScanProgress
             {
-                ScannedFiles = scannedCount,
-                TotalFiles = scannedCount,
-                ScannedBytes = result.TotalBytes,
-                UnityBundleCount = result.UnityBundleCount
+                ScannedFiles = totalFiles,
+                TotalFiles = totalFiles,
+                ScannedBytes = totalBytes,
+                UnityBundleCount = unityBundleCount
             });
 
             return result;
