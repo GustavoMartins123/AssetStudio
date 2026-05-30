@@ -371,8 +371,16 @@ namespace AssetStudio
 
         public void AddObject(Object obj)
         {
-            Objects.Add(obj);
-            ObjectsDic.Add(obj.m_PathID, obj);
+            lock (this)
+            {
+                if (ObjectsDic.ContainsKey(obj.m_PathID))
+                {
+                    return;
+                }
+
+                Objects.Add(obj);
+                ObjectsDic.Add(obj.m_PathID, obj);
+            }
         }
 
         public bool IsVersionStripped => unityVersion == strippedVersion;

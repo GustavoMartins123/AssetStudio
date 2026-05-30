@@ -24,6 +24,7 @@ namespace AssetStudio
 
         public static bool DisableMemoryPressureCheck = false;
         public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;
+        public static Func<bool> ShouldYieldForUserInteraction;
         public static volatile bool ShouldStopLoading = false;
 
         public string SpecifyUnityVersion;
@@ -93,6 +94,20 @@ namespace AssetStudio
             Load(toReadFile);
         }
 
+        private static void YieldForUserInteractionIfNeeded()
+        {
+            var shouldYield = ShouldYieldForUserInteraction;
+            if (shouldYield == null)
+            {
+                return;
+            }
+
+            while (!ShouldStopLoading && shouldYield())
+            {
+                System.Threading.Thread.Sleep(40);
+            }
+        }
+
         private void Load(string[] files)
         {
             loadQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
@@ -123,6 +138,8 @@ namespace AssetStudio
                     bool isWorkerActive = true;
                     while (true)
                     {
+                        YieldForUserInteractionIfNeeded();
+
                         if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                         {
                             if (isWorkerActive)
@@ -669,35 +686,43 @@ namespace AssetStudio
             {
                 if (handle.RealObject != null) return handle.RealObject;
 
-                var assetsFile = handle.SourceFile;
-                using (var localReader = assetsFile.reader.Clone())
+                try
                 {
-                    var objectInfo = new ObjectInfo
+                    var assetsFile = handle.SourceFile;
+                    if (assetsFile?.reader == null)
                     {
-                        m_PathID = handle.PathID,
-                        byteStart = handle.ByteStart,
-                        byteSize = (uint)handle.ByteSize,
-                        classID = (int)handle.Type,
-                        serializedType = assetsFile.m_Objects.FirstOrDefault(x => x.m_PathID == handle.PathID)?.serializedType
-                    };
+                        return null;
+                    }
 
-                    var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
-                    try
+                    using (var localReader = assetsFile.reader.Clone())
                     {
+                        var objectInfo = new ObjectInfo
+                        {
+                            m_PathID = handle.PathID,
+                            byteStart = handle.ByteStart,
+                            byteSize = (uint)handle.ByteSize,
+                            classID = (int)handle.Type,
+                            serializedType = assetsFile.m_Objects.FirstOrDefault(x => x.m_PathID == handle.PathID)?.serializedType
+                        };
+
+                        var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                         var obj = CreateObjectFromReader(objectReader);
                         handle.RealObject = obj;
                         
-                        if (!assetsFile.ObjectsDic.ContainsKey(obj.m_PathID))
+                        lock (assetsFile)
                         {
-                            assetsFile.AddObject(obj);
+                            if (!assetsFile.ObjectsDic.ContainsKey(obj.m_PathID))
+                            {
+                                assetsFile.AddObject(obj);
+                            }
                         }
                         return obj;
                     }
-                    catch (Exception ex)
-                    {
-                        Logger.Error($"Error materializing object {handle.TypeString} PathID={handle.PathID}", ex);
-                        return null;
-                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Error materializing object {handle.TypeString} PathID={handle.PathID}", ex);
+                    return null;
                 }
             }
         }
@@ -721,6 +746,8 @@ namespace AssetStudio
 
                 System.Threading.Tasks.Parallel.ForEach(unprocessedFiles, parallelOptions, assetsFile =>
                 {
+                    YieldForUserInteractionIfNeeded();
+
                     assetsFile.IsProcessed = true;
 
                     // Lookup cached handles using O(1) dictionary index
@@ -737,6 +764,8 @@ namespace AssetStudio
                         // so container mapping works.
                         foreach (var objectInfo in assetsFile.m_Objects)
                         {
+                            YieldForUserInteractionIfNeeded();
+
                             var classID = objectInfo.classID;
                             ClassIDType type = ClassIDType.UnknownType;
                             if (Enum.IsDefined(typeof(ClassIDType), classID))
@@ -774,6 +803,11 @@ namespace AssetStudio
 
                         foreach (var objectInfo in assetsFile.m_Objects)
                         {
+                            if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
+                            {
+                                YieldForUserInteractionIfNeeded();
+                            }
+
                             if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                             {
                                 break;
@@ -856,6 +890,8 @@ namespace AssetStudio
 
             foreach (var assetsFile in assetsFileList)
             {
+                YieldForUserInteractionIfNeeded();
+
                 if (assetsFile.IsProcessed) continue;
                 assetsFile.IsProcessed = true;
                 var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
@@ -871,6 +907,11 @@ namespace AssetStudio
                     () => assetsFile.reader.Clone(),
                     (objectInfo, state, localReader) =>
                     {
+                        if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
+                        {
+                            YieldForUserInteractionIfNeeded();
+                        }
+
                         if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                         {
                             state.Stop();

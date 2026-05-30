@@ -46,6 +46,10 @@ public partial class MainWindow : Window
     private const int PreviewDebounceMilliseconds = 180;
     private const int MaxInlinePreviewTextureDimension = 1024;
     private const int ProgressiveIndexingUiThrottleMilliseconds = 2500;
+    private const int UserInteractionPriorityMilliseconds = 1200;
+    private const int UserPreviewPriorityMilliseconds = 1800;
+    private const int UserInteractionYieldDelayMilliseconds = 40;
+    private long userInteractionPriorityUntilTimestamp;
     private System.Collections.ObjectModel.ObservableCollection<AssetItem> visibleAssets = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
@@ -127,6 +131,7 @@ public partial class MainWindow : Window
         SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
         ApplyUnityVersionOption();
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
+        AssetsManager.ShouldYieldForUserInteraction = IsUserInteractionPriorityActive;
         Progress.Default = new Progress<int>(SetProgressBarValue);
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
@@ -281,6 +286,48 @@ public partial class MainWindow : Window
     private void SetProgressBarValue(int value)
     {
         Dispatcher.UIThread.Post(() => progressBar.Value = value);
+    }
+
+    private void PrioritizeUserInteraction(int milliseconds = UserInteractionPriorityMilliseconds)
+    {
+        var now = Stopwatch.GetTimestamp();
+        var extensionTicks = (long)(milliseconds / 1000.0 * Stopwatch.Frequency);
+        var until = now + Math.Max(extensionTicks, 1);
+
+        while (true)
+        {
+            var current = Interlocked.Read(ref userInteractionPriorityUntilTimestamp);
+            if (current >= until)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref userInteractionPriorityUntilTimestamp, until, current) == current)
+            {
+                return;
+            }
+        }
+    }
+
+    private bool IsUserInteractionPriorityActive()
+    {
+        return Interlocked.Read(ref userInteractionPriorityUntilTimestamp) > Stopwatch.GetTimestamp();
+    }
+
+    private async Task WaitForUserInteractionPriorityToClearAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested && IsUserInteractionPriorityActive())
+        {
+            await Task.Delay(UserInteractionYieldDelayMilliseconds);
+        }
+    }
+
+    private void YieldBackgroundWorkForUserInteraction()
+    {
+        while (IsUserInteractionPriorityActive())
+        {
+            Thread.Sleep(UserInteractionYieldDelayMilliseconds);
+        }
     }
 
     private void ResetForm()
@@ -614,6 +661,7 @@ public partial class MainWindow : Window
 
     private void EnablePreview_Click(object? sender, RoutedEventArgs e)
     {
+        PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         appSettings.EnablePreview = enablePreview.IsChecked == true;
         appSettings.Save();
         if (enablePreview.IsChecked != true)
@@ -622,7 +670,7 @@ public partial class MainWindow : Window
         }
         else if (AssetListDataGrid.SelectedItem is AssetItem selected)
         {
-            PreviewAsset(selected);
+            QueuePreviewAsset(selected, immediate: true);
         }
     }
 
@@ -738,6 +786,7 @@ public partial class MainWindow : Window
     {
         if (updatingFilterTypeMenu) return;
 
+        PrioritizeUserInteraction();
         updatingFilterTypeMenu = true;
         if (filterTypeAll.IsChecked == true)
         {
@@ -754,6 +803,7 @@ public partial class MainWindow : Window
     {
         if (updatingFilterTypeMenu) return;
 
+        PrioritizeUserInteraction();
         updatingFilterTypeMenu = true;
         filterTypeAll.IsChecked = !GetFilterTypeItems().Any(x => x.IsChecked == true);
         updatingFilterTypeMenu = false;
@@ -762,6 +812,7 @@ public partial class MainWindow : Window
 
     private void ClassSearch_TextChanged(object? sender, TextChangedEventArgs e)
     {
+        PrioritizeUserInteraction();
         FilterAssetClasses();
     }
 
@@ -904,6 +955,7 @@ public partial class MainWindow : Window
     {
         if (isRefreshingClassesList) return;
 
+        PrioritizeUserInteraction();
         var selectedItem = sender is DataGrid grid ? grid.SelectedItem : AssetClassesDataGrid.SelectedItem;
         if (selectedItem is not AssetClassItem item)
         {
@@ -1347,6 +1399,10 @@ public partial class MainWindow : Window
                 if (token.IsCancellationRequested)
                     break;
 
+                await WaitForUserInteractionPriorityToClearAsync(token);
+                if (token.IsCancellationRequested)
+                    break;
+
                 try
                 {
                     AssetsManager.ThrowIfMemoryPressureTooHigh("progressive indexing");
@@ -1369,19 +1425,18 @@ public partial class MainWindow : Window
                     continue;
                 }
 
-                List<ClassIDType> activeFilters = new List<ClassIDType>();
-                Dispatcher.UIThread.Post(() =>
+                var activeFilters = await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     if (filterTypeAll.IsChecked != true)
                     {
-                        activeFilters = GetFilterTypeItems()
+                        return GetFilterTypeItems()
                             .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
                             .Select(x => (ClassIDType)x.Tag!)
                             .ToList();
                     }
-                });
 
-                await Task.Delay(50);
+                    return new List<ClassIDType>();
+                });
 
                 var batch = new List<string>();
                 lock (pendingFilesToIndex)
@@ -1423,6 +1478,10 @@ public partial class MainWindow : Window
                 }
 
                 if (batch.Count == 0)
+                    break;
+
+                await WaitForUserInteractionPriorityToClearAsync(token);
+                if (token.IsCancellationRequested)
                     break;
 
                 try
@@ -1477,6 +1536,11 @@ public partial class MainWindow : Window
 
     private bool ShouldUpdateProgressiveIndexingUi(bool force = false)
     {
+        if (!force && IsUserInteractionPriorityActive())
+        {
+            return false;
+        }
+
         var stopwatch = _indexingUiThrottleStopwatch;
         if (stopwatch == null)
         {
@@ -1928,6 +1992,8 @@ public partial class MainWindow : Window
             {
                 foreach (var assetsFile in filesListSnapshot)
                 {
+                    YieldBackgroundWorkForUserInteraction();
+
                     foreach (var asset in assetsFile.Objects)
                     {
                         if (asset is AssetBundle m_AssetBundle)
@@ -1954,8 +2020,14 @@ public partial class MainWindow : Window
                 }
 
                 var handles = assetsManager.ProjectIndex.GetHandles();
+                var handleIndex = 0;
                 foreach (var handle in handles)
                 {
+                    if ((handleIndex++ & 0x1ff) == 0)
+                    {
+                        YieldBackgroundWorkForUserInteraction();
+                    }
+
                     AssetItem assetItem;
                     if (handle.Tag is AssetItem existingItem)
                     {
@@ -2006,10 +2078,17 @@ public partial class MainWindow : Window
             {
                 foreach (var assetsFile in filesListSnapshot)
                 {
+                    YieldBackgroundWorkForUserInteraction();
+
                     var fileNode = new GameObjectNode { Name = assetsFile.fileName };
 
                     foreach (var asset in assetsFile.Objects)
                     {
+                        if ((i & 0x1ff) == 0)
+                        {
+                            YieldBackgroundWorkForUserInteraction();
+                        }
+
                         var assetItem = new AssetItem(asset);
                         assetItem.UniqueID = " #" + i;
                         localObjectAssetItemDic[asset] = assetItem;
@@ -2243,6 +2322,7 @@ public partial class MainWindow : Window
             var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var assetsFile in filesListSnapshot)
             {
+                YieldBackgroundWorkForUserInteraction();
                 AddSerializedTypesBackground(assetsFile, assetsFile.m_Types, "Native", objectCounts, seen, localAssetClassItems);
                 AddSerializedTypesBackground(assetsFile, assetsFile.m_RefTypes, "Reference", objectCounts, seen, localAssetClassItems);
             }
@@ -2272,6 +2352,8 @@ public partial class MainWindow : Window
                 AssetClassItems = localAssetClassItems
             };
         });
+
+        await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
 
         // Apply results back on the UI thread
         exportableAssets = result.ExportableAssets;
@@ -2338,6 +2420,7 @@ public partial class MainWindow : Window
     {
         if (isRefreshingFilterList) return;
 
+        PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         var selectedItem = sender is DataGrid grid ? grid.SelectedItem : AssetListDataGrid.SelectedItem;
         if (selectedItem is AssetItem assetItem)
         {
@@ -2363,6 +2446,7 @@ public partial class MainWindow : Window
     {
         if (e.Source == RightTabControl)
         {
+            PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
             if (RightTabControl.SelectedIndex == 1)
             {
                 CancelPendingPreview();
@@ -2389,16 +2473,17 @@ public partial class MainWindow : Window
         }
 
         CancelPendingPreview();
-        PreviewAsset(assetItem);
+        QueuePreviewAsset(assetItem, immediate: true);
     }
 
-    private void QueuePreviewAsset(AssetItem assetItem)
+    private void QueuePreviewAsset(AssetItem assetItem, bool immediate = false)
     {
         if (RightTabControl.SelectedIndex != 0)
         {
             return;
         }
 
+        PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         previewDebounce?.Cancel();
         previewDebounce?.Dispose();
         previewDebounce = new CancellationTokenSource();
@@ -2415,7 +2500,14 @@ public partial class MainWindow : Window
         {
             try
             {
-                await Task.Delay(PreviewDebounceMilliseconds, token);
+                if (!immediate)
+                {
+                    await Task.Delay(PreviewDebounceMilliseconds, token);
+                }
+
+                PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
+                var resolvedAsset = await Task.Run(() => ResolveAssetForPreview(assetItem), token);
+
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     if (!token.IsCancellationRequested
@@ -2423,12 +2515,23 @@ public partial class MainWindow : Window
                         && RightTabControl.SelectedIndex == 0
                         && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
                     {
-                        PreviewAsset(assetItem);
+                        PreviewAsset(assetItem, resolvedAsset, assetResolutionAttempted: true);
                     }
                 });
             }
             catch (OperationCanceledException)
             {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Preview queue failed for {assetItem.Name}: {ex}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        StatusStripUpdate($"Preview error: {ex.Message}");
+                    }
+                });
             }
         }, token);
     }
@@ -2461,10 +2564,23 @@ public partial class MainWindow : Window
             return;
         }
 
+        PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         DumpTextBox.Text = "Loading dump...";
         try
         {
-            var dump = await DumpAsset(assetItem.Asset);
+            var asset = await Task.Run(() => assetItem.Asset);
+            if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+            {
+                return;
+            }
+
+            if (asset == null)
+            {
+                DumpTextBox.Text = "No Dump Available";
+                return;
+            }
+
+            var dump = await DumpAsset(asset);
             if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
             {
                 return;
@@ -2527,12 +2643,40 @@ public partial class MainWindow : Window
         return monoBehaviour.ConvertToTypeTree(assemblyLoader);
     }
 
-    private void PreviewAsset(AssetItem assetItem)
+    private AssetStudio.Object? ResolveAssetForPreview(AssetItem assetItem)
+    {
+        try
+        {
+            return assetItem.Asset;
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Error resolving asset for preview {assetItem.Name}: {ex}");
+            return null;
+        }
+    }
+
+    private void PreviewAsset(AssetItem assetItem, AssetStudio.Object? resolvedAsset = null, bool assetResolutionAttempted = false)
     {
         ++texturePreviewIdCounter;
         if (enablePreview.IsChecked != true)
         {
             ClearPreview("Preview disabled");
+            return;
+        }
+
+        var asset = assetResolutionAttempted ? resolvedAsset : (resolvedAsset ?? ResolveAssetForPreview(assetItem));
+        if (asset == null)
+        {
+            ClearPreview("Preview Panel");
+            SetTextWithTruncation(TextPreviewBox,
+                $"Preview unavailable while this asset is still loading.{Environment.NewLine}" +
+                $"Asset: {assetItem.Name}{Environment.NewLine}" +
+                $"Type: {assetItem.DisplayType}{Environment.NewLine}" +
+                $"PathID: {assetItem.PathID}");
+            TextPreviewBox.IsVisible = true;
+            PreviewLabel.IsVisible = false;
+            StatusStripUpdate($"Preview unavailable for {assetItem.Name}.");
             return;
         }
 
@@ -2545,7 +2689,7 @@ public partial class MainWindow : Window
             ImagePreviewBox.Source = null;
             ImagePreviewBox.IsVisible = false;
         }
-        if (GLPreviewControl != null && assetItem.Asset is not Material)
+        if (GLPreviewControl != null && asset is not Material)
         {
             GLPreviewControl.IsVisible = false;
         }
@@ -2567,7 +2711,7 @@ public partial class MainWindow : Window
             VideoClipPanel.IsVisible = false;
             VideoReset();
         }
-        if (assetItem.Asset is not AnimationClip)
+        if (asset is not AnimationClip)
         {
             HideAnimationPlayback();
             GLPreviewControl?.StopAnimation();
@@ -2594,7 +2738,7 @@ public partial class MainWindow : Window
 
         try
         {
-            switch (assetItem.Asset)
+            switch (asset)
             {
                 case AudioClip m_AudioClip:
                     PreviewAudioClip(assetItem, m_AudioClip);
@@ -2810,7 +2954,7 @@ public partial class MainWindow : Window
                     string? rawDump = null;
                     try
                     {
-                        rawDump = assetItem.Asset.Dump();
+                        rawDump = asset.Dump();
                     }
                     catch (Exception dumpEx)
                     {
@@ -4502,7 +4646,7 @@ public partial class MainWindow : Window
         }
         
         Shader? shader = null;
-        if (displayMaterial.m_Shader.TryGet(out var s))
+        if (displayMaterial.m_Shader != null && displayMaterial.m_Shader.TryGet(out var s))
         {
             shader = s;
         }
@@ -4614,42 +4758,53 @@ public partial class MainWindow : Window
 
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (currentId == texturePreviewIdCounter)
+                        try
                         {
-                            if (GLPreviewControl != null)
+                            if (currentId == texturePreviewIdCounter)
                             {
-                                GLPreviewControl.SetMaterialTexture(image);
-                                image.Dispose();
-                                GLPreviewControl.IsVisible = true;
-                                if (BoneSizeContainer != null)
+                                if (GLPreviewControl != null)
                                 {
-                                    BoneSizeContainer.IsVisible = false;
+                                    GLPreviewControl.SetMaterialTexture(image);
+                                    GLPreviewControl.IsVisible = true;
+                                    if (BoneSizeContainer != null)
+                                    {
+                                        BoneSizeContainer.IsVisible = false;
+                                    }
+                                    GLPreviewControl.Focus();
                                 }
-                                GLPreviewControl.Focus();
-                            }
-                            else
-                            {
-                                image.Dispose();
-                            }
 
-                            ImagePreviewBox.IsVisible = false;
-                            TextPreviewBox.IsVisible = false;
-                            PreviewLabel.IsVisible = false;
+                                ImagePreviewBox.IsVisible = false;
+                                TextPreviewBox.IsVisible = false;
+                                PreviewLabel.IsVisible = false;
 
-                            if (displayInfo.IsChecked == true)
-                            {
-                                PreviewInfoOverlay.Text = materialPreviewWasDownscaled
-                                    ? infoText + $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}"
-                                    : infoText;
-                                PreviewInfoBorder.IsVisible = true;
+                                if (displayInfo.IsChecked == true)
+                                {
+                                    PreviewInfoOverlay.Text = materialPreviewWasDownscaled
+                                        ? infoText + $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}"
+                                        : infoText;
+                                    PreviewInfoBorder.IsVisible = true;
+                                }
+                                else
+                                {
+                                    PreviewInfoBorder.IsVisible = false;
+                                }
+                                StatusStripUpdate($"Material preview loaded: {previewTexture.m_Name}");
                             }
-                            else
-                            {
-                                PreviewInfoBorder.IsVisible = false;
-                            }
-                            StatusStripUpdate($"Material preview loaded: {previewTexture.m_Name}");
                         }
-                        else
+                        catch (Exception ex)
+                        {
+                            logger.Log(LoggerEvent.Error, $"Material preview UI failed for {m_Material.m_Name}: {ex}");
+                            if (currentId == texturePreviewIdCounter)
+                            {
+                                TextPreviewBox.Text = infoText + "\n[Error showing preview texture: " + ex.Message + "]";
+                                TextPreviewBox.IsVisible = true;
+                                ImagePreviewBox.IsVisible = false;
+                                PreviewInfoBorder.IsVisible = false;
+                                if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                                StatusStripUpdate("Material preview UI error.");
+                            }
+                        }
+                        finally
                         {
                             image.Dispose();
                         }
@@ -5265,6 +5420,7 @@ public partial class MainWindow : Window
 
     private async void ListSearch_TextChanged(object? sender, TextChangedEventArgs e)
     {
+        PrioritizeUserInteraction();
         listSearchDebounce?.Cancel();
         var debounce = new CancellationTokenSource();
         listSearchDebounce = debounce;
@@ -5274,6 +5430,7 @@ public partial class MainWindow : Window
             await Task.Delay(800, debounce.Token);
             if (!debounce.IsCancellationRequested)
             {
+                PrioritizeUserInteraction();
                 await FilterAssetListAsync(debounce.Token);
             }
         }
@@ -5286,6 +5443,7 @@ public partial class MainWindow : Window
     private async void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
     {
         if (isSorting) return;
+        PrioritizeUserInteraction();
         isSorting = true;
         try
         {
@@ -7042,6 +7200,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        PrioritizeUserInteraction();
         classFilterOverride = item;
         ClearClassFilterButton.Content = $"Clear Class Filter ({item.Name} v{item.UnityVersion})";
         ClearClassFilterButton.IsVisible = true;
@@ -7052,6 +7211,7 @@ public partial class MainWindow : Window
 
     private void ClearClassFilter_Click(object? sender, RoutedEventArgs e)
     {
+        PrioritizeUserInteraction();
         classFilterOverride = null;
         ClearClassFilterButton.IsVisible = false;
         _ = FilterAssetListAsync(CancellationToken.None);
@@ -7445,6 +7605,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        AssetsManager.ShouldYieldForUserInteraction = null;
         FlushAvatarPreviewSettingsSave();
         AudioReset();
         VideoReset();

@@ -96,10 +96,13 @@ namespace AssetStudio
 
         private bool TryGetObject<TObject>(SerializedFile sourceFile, out TObject result) where TObject : Object
         {
-            if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj) && obj is TObject variable)
+            lock (sourceFile)
             {
-                result = variable;
-                return true;
+                if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj) && obj is TObject variable)
+                {
+                    result = variable;
+                    return true;
+                }
             }
 
             result = null;
