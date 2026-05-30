@@ -1505,7 +1505,7 @@ public partial class MainWindow : Window
                     {
                         progressBar.Value = progressPercent;
                         StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%)");
-                        BuildAssetStructures();
+                        BuildAssetStructures(incremental: true);
                     });
                 }
             }
@@ -1529,7 +1529,7 @@ public partial class MainWindow : Window
                     SaveIndexCache(paths[0], currentScanResult);
                 }
 
-                BuildAssetStructures();
+                BuildAssetStructures(incremental: true);
             });
         }, token);
     }
@@ -1565,7 +1565,7 @@ public partial class MainWindow : Window
         pauseIndexingMenu.IsEnabled = false;
         resumeIndexingMenu.IsEnabled = true;
         StatusStripUpdate("Indexing paused.");
-        BuildAssetStructures();
+        BuildAssetStructures(incremental: true);
     }
 
     private void ResumeIndexing_Click(object? sender, RoutedEventArgs e)
@@ -1953,7 +1953,7 @@ public partial class MainWindow : Window
         return extractedCount;
     }
 
-    private async void BuildAssetStructures()
+    private async void BuildAssetStructures(bool incremental = false)
     {
         if (isBuildingAssetStructures) return;
         isBuildingAssetStructures = true;
@@ -1985,6 +1985,7 @@ public partial class MainWindow : Window
             var localObjectAssetItemDic = new Dictionary<Object, AssetItem>();
             var localPathIDAssetItemDic = new Dictionary<string, AssetItem>();
             var localContainers = new List<(PPtr<Object>, string)>();
+            var localNewExportableAssets = new List<AssetItem>();
 
             int i = 0;
 
@@ -2029,6 +2030,7 @@ public partial class MainWindow : Window
                     }
 
                     AssetItem assetItem;
+                    bool isNewHandle = false;
                     if (handle.Tag is AssetItem existingItem)
                     {
                         assetItem = existingItem;
@@ -2037,6 +2039,7 @@ public partial class MainWindow : Window
                     {
                         assetItem = new AssetItem(handle);
                         handle.Tag = assetItem;
+                        isNewHandle = true;
                     }
                     assetItem.UniqueID = " #" + i;
                     
@@ -2070,6 +2073,10 @@ public partial class MainWindow : Window
                     if (displayAllChecked || exportable)
                     {
                         localExportableAssets.Add(assetItem);
+                        if (isNewHandle)
+                        {
+                            localNewExportableAssets.Add(assetItem);
+                        }
                     }
                     i++;
                 }
@@ -2337,6 +2344,7 @@ public partial class MainWindow : Window
             {
                 ProductName = localProductName,
                 ExportableAssets = localExportableAssets,
+                NewExportableAssets = localNewExportableAssets,
                 SceneTreeNodes = localSceneTreeNodes,
                 ObjectToAssetItemCache = localObjectToAssetItemCache,
                 MeshToMaterialsCache = localMeshToMaterialsCache,
@@ -2356,27 +2364,47 @@ public partial class MainWindow : Window
         await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
 
         // Apply results back on the UI thread
-        exportableAssets = result.ExportableAssets;
-        sceneTreeNodes = result.SceneTreeNodes;
-        treeSearchResults.Clear();
-        nextGameObjectSearchIndex = 0;
-        objectToAssetItemCache = result.ObjectToAssetItemCache;
-        meshToMaterialsCache = result.MeshToMaterialsCache;
-        meshAssociatedRenderersCache = result.MeshAssociatedRenderersCache;
-        meshSourceTypesCache = result.MeshSourceTypesCache;
-        materialMainTextureCache = result.MaterialMainTextureCache;
-        materialPreviewMaterialCache = result.MaterialPreviewMaterialCache;
-        materialTextureSlotsCache = result.MaterialTextureSlotsCache;
-        animationClipAvatarCache = result.AnimationClipAvatarCache;
-        avatarMeshCache = result.AvatarMeshCache;
-        meshAvatarCache = result.MeshAvatarCache;
-        animationClipTransformBindingsCache = result.AnimationClipTransformBindingsCache;
-        assetClassItems = result.AssetClassItems;
+        bool useIncrementalPath = incremental && exportableAssets.Count > 0 && result.NewExportableAssets != null;
 
-        BuildFilterTypeMenu();
-        _ = FilterAssetListAsync(CancellationToken.None);
-        FilterAssetClasses();
-        SceneTreeView.ItemsSource = sceneTreeNodes;
+        if (useIncrementalPath && result.NewExportableAssets.Count == 0)
+        {
+            // Nothing new to add — skip UI update entirely
+        }
+        else if (useIncrementalPath)
+        {
+            // Incremental path: only append new items to avoid O(n) DataGrid notifications
+            exportableAssets = result.ExportableAssets;
+            assetClassItems = result.AssetClassItems;
+
+            BuildFilterTypeMenu();
+            AppendFilteredAssetsToVisible(result.NewExportableAssets);
+            UpdateAssetClassesIncremental(result.AssetClassItems);
+        }
+        else
+        {
+            // Full rebuild path (initial load, display all toggle, etc.)
+            exportableAssets = result.ExportableAssets;
+            sceneTreeNodes = result.SceneTreeNodes;
+            treeSearchResults.Clear();
+            nextGameObjectSearchIndex = 0;
+            objectToAssetItemCache = result.ObjectToAssetItemCache;
+            meshToMaterialsCache = result.MeshToMaterialsCache;
+            meshAssociatedRenderersCache = result.MeshAssociatedRenderersCache;
+            meshSourceTypesCache = result.MeshSourceTypesCache;
+            materialMainTextureCache = result.MaterialMainTextureCache;
+            materialPreviewMaterialCache = result.MaterialPreviewMaterialCache;
+            materialTextureSlotsCache = result.MaterialTextureSlotsCache;
+            animationClipAvatarCache = result.AnimationClipAvatarCache;
+            avatarMeshCache = result.AvatarMeshCache;
+            meshAvatarCache = result.MeshAvatarCache;
+            animationClipTransformBindingsCache = result.AnimationClipTransformBindingsCache;
+            assetClassItems = result.AssetClassItems;
+
+            BuildFilterTypeMenu();
+            _ = FilterAssetListAsync(CancellationToken.None);
+            FilterAssetClasses();
+            SceneTreeView.ItemsSource = sceneTreeNodes;
+        }
 
         var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {exportableAssets.Count} exportable assets";
         var m_ObjectsCount = assetsManager.assetsFileList.Sum(x => x.m_Objects.Count);
@@ -5854,6 +5882,103 @@ public partial class MainWindow : Window
         if (existingItem is AssetClassItem existingClass && targetItem is AssetClassItem targetClass)
         {
             existingClass.CopyFrom(targetClass);
+        }
+    }
+
+    private void AppendFilteredAssetsToVisible(List<AssetItem> newItems)
+    {
+        if (newItems == null || newItems.Count == 0) return;
+
+        var filterText = listSearch?.Text?.Trim();
+        var classFilter = classFilterOverride;
+        var filterTypeChecked = filterTypeAll.IsChecked != true;
+        var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
+            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+            .Select(x => (ClassIDType)x.Tag!)
+            .ToHashSet() : null;
+
+        foreach (var x in newItems)
+        {
+            if (classFilter != null)
+            {
+                if ((int)x.Type != classFilter.ClassID || x.SourceFile.unityVersion != classFilter.UnityVersion)
+                    continue;
+            }
+            else if (selectedTypes != null)
+            {
+                if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
+                    continue;
+            }
+
+            if (!string.IsNullOrEmpty(filterText))
+            {
+                if (!x.Name.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
+                    !x.Container.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
+                    !x.TypeString.Contains(filterText, StringComparison.OrdinalIgnoreCase) &&
+                    !x.PathIDString.Contains(filterText, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+            }
+
+            visibleAssets.Add(x);
+        }
+
+        if (AssetListDataGrid.ItemsSource != visibleAssets)
+        {
+            AssetListDataGrid.ItemsSource = visibleAssets;
+        }
+        StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+    }
+
+    /// <summary>
+    /// Incrementally updates the visible class items by updating counts on existing items
+    /// and appending only new class entries. Avoids the full SyncObservableCollection diff.
+    /// </summary>
+    private void UpdateAssetClassesIncremental(List<AssetClassItem> updatedClassItems)
+    {
+        if (updatedClassItems == null) return;
+
+        // Build lookup from updated class items
+        var updatedLookup = new Dictionary<(int ClassID, string Name, string Namespace, string Assembly, string UnityVersion, string SourceFile, string SourceKind), AssetClassItem>();
+        foreach (var item in updatedClassItems)
+        {
+            var key = (item.ClassID, item.Name, item.Namespace, item.Assembly, item.UnityVersion, item.SourceFile, item.SourceKind);
+            updatedLookup[key] = item;
+        }
+
+        // Update counts for existing visible items
+        foreach (var existing in visibleAssetClassItems)
+        {
+            var key = (existing.ClassID, existing.Name, existing.Namespace, existing.Assembly, existing.UnityVersion, existing.SourceFile, existing.SourceKind);
+            if (updatedLookup.TryGetValue(key, out var updated))
+            {
+                existing.CopyFrom(updated);
+                updatedLookup.Remove(key);
+            }
+        }
+
+        // Append any genuinely new class items (filtered)
+        var filter = classSearch.Text?.Trim();
+        foreach (var newItem in updatedLookup.Values)
+        {
+            if (!string.IsNullOrEmpty(filter))
+            {
+                if (!newItem.ClassID.ToString(CultureInfo.InvariantCulture).Contains(filter, StringComparison.OrdinalIgnoreCase)
+                    && !newItem.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                    && !newItem.Namespace.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                    && !newItem.Assembly.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                    && !newItem.SourceKind.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+            }
+            visibleAssetClassItems.Add(newItem);
+        }
+
+        if (AssetClassesDataGrid.ItemsSource != visibleAssetClassItems)
+        {
+            AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
         }
     }
 

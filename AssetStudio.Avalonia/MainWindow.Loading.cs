@@ -14,6 +14,7 @@ namespace AssetStudio.Avalonia
         {
             public string? ProductName;
             public List<AssetItem> ExportableAssets;
+            public List<AssetItem> NewExportableAssets;
             public List<GameObjectNode> SceneTreeNodes;
             public Dictionary<AssetStudio.Object, AssetItem> ObjectToAssetItemCache;
             public Dictionary<Mesh, List<Material?>> MeshToMaterialsCache;
