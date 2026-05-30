@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -30,20 +31,20 @@ namespace AssetStudio
         public string SpecifyUnityVersion;
         public string ProjectRoot;
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
-        public List<Stream> bundleStreams = new List<Stream>();
+        public ConcurrentBag<Stream> bundleStreams = new ConcurrentBag<Stream>();
         public ProjectIndex ProjectIndex = new ProjectIndex();
         public bool LazyLoading = false;
 
         internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        internal Dictionary<string, BinaryReader> resourceFileReaders = new Dictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
+        internal ConcurrentDictionary<string, BinaryReader> resourceFileReaders = new ConcurrentDictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
 
-        private List<string> importFiles = new List<string>();
-        private HashSet<string> importFilesHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private HashSet<string> noexistFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private HashSet<string> assetsFileListHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private ConcurrentBag<string> importFiles = new ConcurrentBag<string>();
+        private ConcurrentDictionary<string, byte> importFilesHash = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        private ConcurrentDictionary<string, byte> noexistFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        private ConcurrentDictionary<string, byte> assetsFileListHash = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
 
         public readonly object loadLock = new object();
-        private System.Collections.Concurrent.ConcurrentQueue<string> loadQueue;
+        private ConcurrentQueue<string> loadQueue;
         private int loadTotalCount;
 
         private static string NormalizeResourceKey(string value)
@@ -68,6 +69,11 @@ namespace AssetStudio
 
         public void LoadFiles(params string[] files)
         {
+            LoadFilesAsync(files).GetAwaiter().GetResult();
+        }
+
+        public async System.Threading.Tasks.Task LoadFilesAsync(params string[] files)
+        {
             DisableMemoryPressureCheck = false;
             ShouldStopLoading = false;
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
@@ -77,10 +83,15 @@ namespace AssetStudio
             }
             MergeSplitAssets(path);
             var toReadFile = ProcessingSplitFiles(files);
-            Load(toReadFile);
+            await LoadAsync(toReadFile);
         }
 
         public void LoadFolder(string path)
+        {
+            LoadFolderAsync(path).GetAwaiter().GetResult();
+        }
+
+        public async System.Threading.Tasks.Task LoadFolderAsync(string path)
         {
             DisableMemoryPressureCheck = false;
             ShouldStopLoading = false;
@@ -91,11 +102,16 @@ namespace AssetStudio
             MergeSplitAssets(path, true);
             var files = ImportHelper.GetFilesSafe(path, "*.*", true);
             var toReadFile = ProcessingSplitFiles(files);
-            Load(toReadFile);
+            await LoadAsync(toReadFile);
         }
 
-        private static void YieldForUserInteractionIfNeeded()
+        private async System.Threading.Tasks.Task YieldForUserInteractionIfNeededAsync()
         {
+            if (!LazyLoading)
+            {
+                return;
+            }
+
             var shouldYield = ShouldYieldForUserInteraction;
             if (shouldYield == null)
             {
@@ -104,23 +120,20 @@ namespace AssetStudio
 
             while (!ShouldStopLoading && shouldYield())
             {
-                System.Threading.Thread.Sleep(40);
+                await System.Threading.Tasks.Task.Delay(40);
             }
         }
 
-        private void Load(string[] files)
+        private async System.Threading.Tasks.Task LoadAsync(string[] files)
         {
             loadQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
             loadTotalCount = files.Length;
 
-            lock (loadLock)
+            foreach (var file in files)
             {
-                foreach (var file in files)
-                {
-                    importFiles.Add(file);
-                    importFilesHash.Add(Path.GetFileName(file));
-                    loadQueue.Enqueue(file);
-                }
+                importFiles.Add(file);
+                importFilesHash.TryAdd(Path.GetFileName(file), 0);
+                loadQueue.Enqueue(file);
             }
 
             Progress.Reset();
@@ -133,12 +146,12 @@ namespace AssetStudio
             var tasks = new System.Threading.Tasks.Task[threadCount];
             for (int t = 0; t < threadCount; t++)
             {
-                tasks[t] = System.Threading.Tasks.Task.Run(() =>
+                tasks[t] = System.Threading.Tasks.Task.Run(async () =>
                 {
                     bool isWorkerActive = true;
                     while (true)
                     {
-                        YieldForUserInteractionIfNeeded();
+                        await YieldForUserInteractionIfNeededAsync();
 
                         if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                         {
@@ -195,21 +208,21 @@ namespace AssetStudio
                                 break;
                             }
 
-                            System.Threading.Thread.Sleep(10);
+                            await System.Threading.Tasks.Task.Delay(10);
                         }
                     }
                 });
             }
-            System.Threading.Tasks.Task.WaitAll(tasks);
+            await System.Threading.Tasks.Task.WhenAll(tasks);
 
             loadQueue = null;
 
-            importFiles.Clear();
+            importFiles = new ConcurrentBag<string>();
             importFilesHash.Clear();
             noexistFiles.Clear();
             assetsFileListHash.Clear();
 
-            ReadAssets();
+            await ReadAssetsAsync();
             ProcessAssets();
         }
 
@@ -249,11 +262,7 @@ namespace AssetStudio
 
         private void LoadAssetsFile(FileReader reader)
         {
-            bool alreadyLoaded;
-            lock (loadLock)
-            {
-                alreadyLoaded = assetsFileListHash.Contains(reader.FileName);
-            }
+            bool alreadyLoaded = assetsFileListHash.ContainsKey(reader.FileName);
 
             if (!alreadyLoaded)
             {
@@ -266,28 +275,20 @@ namespace AssetStudio
                     lock (loadLock)
                     {
                         assetsFileList.Add(assetsFile);
-                        assetsFileListHash.Add(assetsFile.fileName);
                     }
+                    assetsFileListHash.TryAdd(assetsFile.fileName, 0);
 
                     foreach (var sharedFile in assetsFile.m_Externals)
                     {
                         var sharedFileName = sharedFile.fileName;
 
-                        bool containsShared;
-                        lock (loadLock)
-                        {
-                            containsShared = importFilesHash.Contains(sharedFileName);
-                        }
+                        bool containsShared = importFilesHash.ContainsKey(sharedFileName);
 
                         if (!containsShared)
                         {
                             var sharedFilePath = Path.Combine(Path.GetDirectoryName(reader.FullPath), sharedFileName);
                             
-                            bool containsNoExist;
-                            lock (loadLock)
-                            {
-                                containsNoExist = noexistFiles.Contains(sharedFilePath);
-                            }
+                            bool containsNoExist = noexistFiles.ContainsKey(sharedFilePath);
 
                             if (!containsNoExist)
                             {
@@ -301,20 +302,14 @@ namespace AssetStudio
                                 }
                                 if (File.Exists(sharedFilePath))
                                 {
-                                    lock (loadLock)
-                                    {
-                                        importFiles.Add(sharedFilePath);
-                                        importFilesHash.Add(sharedFileName);
-                                        loadQueue?.Enqueue(sharedFilePath);
-                                        System.Threading.Interlocked.Increment(ref loadTotalCount);
-                                    }
+                                    importFiles.Add(sharedFilePath);
+                                    importFilesHash.TryAdd(sharedFileName, 0);
+                                    loadQueue?.Enqueue(sharedFilePath);
+                                    System.Threading.Interlocked.Increment(ref loadTotalCount);
                                 }
                                 else
                                 {
-                                    lock (loadLock)
-                                    {
-                                        noexistFiles.Add(sharedFilePath);
-                                    }
+                                    noexistFiles.TryAdd(sharedFilePath, 0);
                                 }
                             }
                         }
@@ -335,11 +330,7 @@ namespace AssetStudio
 
         private void LoadAssetsFromMemory(FileReader reader, string originalPath, string unityVersion = null)
         {
-            bool alreadyLoaded;
-            lock (loadLock)
-            {
-                alreadyLoaded = assetsFileListHash.Contains(reader.FileName);
-            }
+            bool alreadyLoaded = assetsFileListHash.ContainsKey(reader.FileName);
 
             if (!alreadyLoaded)
             {
@@ -356,16 +347,13 @@ namespace AssetStudio
                     lock (loadLock)
                     {
                         assetsFileList.Add(assetsFile);
-                        assetsFileListHash.Add(assetsFile.fileName);
                     }
+                    assetsFileListHash.TryAdd(assetsFile.fileName, 0);
                 }
                 catch (Exception e)
                 {
                     Logger.Error($"Error while reading assets file {reader.FullPath} from {Path.GetFileName(originalPath)}", e);
-                    lock (loadLock)
-                    {
-                        RegisterResourceFileReader(reader, reader.FileName, reader.FullPath);
-                    }
+                    RegisterResourceFileReader(reader, reader.FileName, reader.FullPath);
                 }
             }
             else
@@ -382,10 +370,7 @@ namespace AssetStudio
                 var bundleFile = new BundleFile(reader);
                 if (bundleFile.BlocksStream != null)
                 {
-                    lock (loadLock)
-                    {
-                        bundleStreams.Add(bundleFile.BlocksStream);
-                    }
+                    bundleStreams.Add(bundleFile.BlocksStream);
                 }
                 foreach (var file in bundleFile.fileList)
                 {
@@ -397,10 +382,7 @@ namespace AssetStudio
                     }
                     else
                     {
-                        lock (loadLock)
-                        {
-                            RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
-                        }
+                        RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
                     }
                 }
             }
@@ -441,10 +423,7 @@ namespace AssetStudio
                             LoadWebFile(subReader);
                             break;
                         case FileType.ResourceFile:
-                            lock (loadLock)
-                            {
-                                RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
-                            }
+                            RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
                             break;
                     }
                 }
@@ -478,18 +457,12 @@ namespace AssetStudio
                             if (!splitFiles.Contains(basePath))
                             {
                                 splitFiles.Add(basePath);
-                                lock (loadLock)
-                                {
-                                    importFilesHash.Add(baseName);
-                                }
+                                importFilesHash.TryAdd(baseName, 0);
                             }
                         }
                         else
                         {
-                            lock (loadLock)
-                            {
-                                importFilesHash.Add(entry.Name);
-                            }
+                            importFilesHash.TryAdd(entry.Name, 0);
                         }
                     }
 
@@ -541,10 +514,7 @@ namespace AssetStudio
                             if (entryReader.FileType == FileType.ResourceFile)
                             {
                                 entryReader.Position = 0;
-                                lock (loadLock)
-                                {
-                                    RegisterResourceFileReader(entryReader, entry.Name, entry.FullName, entryReader.FullPath);
-                                }
+                                RegisterResourceFileReader(entryReader, entry.Name, entry.FullName, entryReader.FullPath);
                             }
                             else
                             {
@@ -598,14 +568,11 @@ namespace AssetStudio
             }
             resourceFileReaders.Clear();
 
-            lock (loadLock)
+            foreach (var stream in bundleStreams)
             {
-                foreach (var stream in bundleStreams)
-                {
-                    stream.Dispose();
-                }
-                bundleStreams.Clear();
+                stream.Dispose();
             }
+            bundleStreams = new ConcurrentBag<Stream>();
 
             assetsFileIndexCache.Clear();
         }
@@ -727,7 +694,7 @@ namespace AssetStudio
             }
         }
 
-        private void ReadAssets()
+        private async System.Threading.Tasks.Task ReadAssetsAsync()
         {
             Logger.Info("Read assets...");
 
@@ -739,159 +706,165 @@ namespace AssetStudio
             if (LazyLoading)
             {
                 var unprocessedFiles = assetsFileList.Where(x => !x.IsProcessed).ToList();
-                var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                var maxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio);
+                using (var semaphore = new System.Threading.SemaphoreSlim(maxDegreeOfParallelism))
                 {
-                    MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
-                };
-
-                System.Threading.Tasks.Parallel.ForEach(unprocessedFiles, parallelOptions, assetsFile =>
-                {
-                    YieldForUserInteractionIfNeeded();
-
-                    assetsFile.IsProcessed = true;
-
-                    // Lookup cached handles using O(1) dictionary index
-                    bool hasCachedHandles = false;
-                    foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
+                    var tasks = unprocessedFiles.Select(async assetsFile =>
                     {
-                        handle.SourceFile = assetsFile;
-                        hasCachedHandles = true;
-                    }
-
-                    if (hasCachedHandles)
-                    {
-                        // Eagerly materialize containers (AssetBundle / ResourceManager)
-                        // so container mapping works.
-                        foreach (var objectInfo in assetsFile.m_Objects)
+                        await semaphore.WaitAsync();
+                        try
                         {
-                            YieldForUserInteractionIfNeeded();
+                            await YieldForUserInteractionIfNeededAsync();
 
-                            var classID = objectInfo.classID;
-                            ClassIDType type = ClassIDType.UnknownType;
-                            if (Enum.IsDefined(typeof(ClassIDType), classID))
+                            assetsFile.IsProcessed = true;
+
+                            // Lookup cached handles using O(1) dictionary index
+                            bool hasCachedHandles = false;
+                            foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
                             {
-                                type = (ClassIDType)classID;
+                                handle.SourceFile = assetsFile;
+                                hasCachedHandles = true;
                             }
 
-                            if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
+                            if (hasCachedHandles)
                             {
-                                try
+                                // Eagerly materialize containers (AssetBundle / ResourceManager)
+                                // so container mapping works.
+                                foreach (var objectInfo in assetsFile.m_Objects)
                                 {
-                                    using var localReader = assetsFile.reader.Clone();
-                                    var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
-                                    var obj = CreateObjectFromReader(objectReader);
-                                    assetsFile.AddObject(obj);
+                                    await YieldForUserInteractionIfNeededAsync();
 
-                                    // Link to the handle
-                                    var handle = ProjectIndex.GetHandle($"{assetsFile.fileName}#{objectInfo.m_PathID}");
-                                    if (handle != null)
+                                    var classID = objectInfo.classID;
+                                    ClassIDType type = ClassIDType.UnknownType;
+                                    if (Enum.IsDefined(typeof(ClassIDType), classID))
                                     {
-                                        handle.RealObject = obj;
+                                        type = (ClassIDType)classID;
                                     }
-                                }
-                                catch
-                                {
-                                    // Skip container loading errors
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        var localObjects = new List<Object>();
-                        using var localReader = assetsFile.reader.Clone();
 
-                        foreach (var objectInfo in assetsFile.m_Objects)
-                        {
-                            if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
-                            {
-                                YieldForUserInteractionIfNeeded();
-                            }
+                                    if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
+                                    {
+                                        try
+                                        {
+                                            using var localReader = assetsFile.reader.Clone();
+                                            var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
+                                            var obj = CreateObjectFromReader(objectReader);
+                                            assetsFile.AddObject(obj);
 
-                            if (System.Threading.Volatile.Read(ref ShouldStopLoading))
-                            {
-                                break;
-                            }
-
-                            if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
-                            {
-                                ThrowIfMemoryPressureTooHigh("reading assets (lazy)");
-                            }
-
-                            if (System.Threading.Volatile.Read(ref ShouldStopLoading))
-                            {
-                                break;
-                            }
-
-                            var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
-                            
-                            ClassIDType type = ClassIDType.UnknownType;
-                            if (Enum.IsDefined(typeof(ClassIDType), objectInfo.classID))
-                            {
-                                type = (ClassIDType)objectInfo.classID;
-                            }
-
-                            var handle = new AssetHandle
-                            {
-                                UniqueID = $"{assetsFile.fileName}#{objectInfo.m_PathID}",
-                                Type = type,
-                                OriginalPath = assetsFile.originalPath,
-                                SerializedFileName = assetsFile.fileName,
-                                SourceFile = assetsFile,
-                                PathID = objectInfo.m_PathID,
-                                ByteStart = objectInfo.byteStart,
-                                ByteSize = objectInfo.byteSize
-                            };
-
-                            string name = null;
-                            if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
-                            {
-                                try
-                                {
-                                    var obj = CreateObjectFromReader(objectReader);
-                                    handle.RealObject = obj;
-                                    localObjects.Add(obj);
-                                    if (obj is AssetBundle bundle)
-                                        name = bundle.m_Name;
-                                    else if (obj is ResourceManager rm)
-                                        name = "ResourceManager";
-                                }
-                                catch
-                                {
-                                    // Fallback if container loading fails
+                                            // Link to the handle
+                                            var handle = ProjectIndex.GetHandle($"{assetsFile.fileName}#{objectInfo.m_PathID}");
+                                            if (handle != null)
+                                            {
+                                                handle.RealObject = obj;
+                                            }
+                                        }
+                                        catch
+                                        {
+                                            // Skip container loading errors
+                                        }
+                                    }
                                 }
                             }
                             else
                             {
-                                name = AssetHandle.TryReadObjectName(objectReader);
+                                var localObjects = new List<Object>();
+                                using var localReader = assetsFile.reader.Clone();
+
+                                foreach (var objectInfo in assetsFile.m_Objects)
+                                {
+                                    if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
+                                    {
+                                        await YieldForUserInteractionIfNeededAsync();
+                                    }
+
+                                    if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                                    {
+                                        break;
+                                    }
+
+                                    if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
+                                    {
+                                        ThrowIfMemoryPressureTooHigh("reading assets (lazy)");
+                                    }
+
+                                    if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                                    {
+                                        break;
+                                    }
+
+                                    var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
+                                    
+                                    ClassIDType type = ClassIDType.UnknownType;
+                                    if (Enum.IsDefined(typeof(ClassIDType), objectInfo.classID))
+                                    {
+                                        type = (ClassIDType)objectInfo.classID;
+                                    }
+
+                                    var handle = new AssetHandle
+                                    {
+                                        UniqueID = $"{assetsFile.fileName}#{objectInfo.m_PathID}",
+                                        Type = type,
+                                        OriginalPath = assetsFile.originalPath,
+                                        SerializedFileName = assetsFile.fileName,
+                                        SourceFile = assetsFile,
+                                        PathID = objectInfo.m_PathID,
+                                        ByteStart = objectInfo.byteStart,
+                                        ByteSize = objectInfo.byteSize
+                                    };
+
+                                    string name = null;
+                                    if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
+                                    {
+                                        try
+                                        {
+                                            var obj = CreateObjectFromReader(objectReader);
+                                            handle.RealObject = obj;
+                                            localObjects.Add(obj);
+                                            if (obj is AssetBundle bundle)
+                                                name = bundle.m_Name;
+                                            else if (obj is ResourceManager rm)
+                                                name = "ResourceManager";
+                                        }
+                                        catch
+                                        {
+                                            // Fallback if container loading fails
+                                        }
+                                    }
+                                    else
+                                    {
+                                        name = AssetHandle.TryReadObjectName(objectReader);
+                                    }
+
+                                    handle.Name = name ?? $"Unnamed_{type}_{objectInfo.m_PathID}";
+                                    ProjectIndex.AddHandle(handle);
+
+                                    var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
+                                    Progress.Report(currentProgress, progressCount);
+                                }
+
+                                var pathIdToIndex = new Dictionary<long, int>();
+                                for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                                {
+                                    pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
+                                }
+                                var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
+                                foreach (var obj in sortedObjects)
+                                {
+                                    assetsFile.AddObject(obj);
+                                }
                             }
-
-                            handle.Name = name ?? $"Unnamed_{type}_{objectInfo.m_PathID}";
-                            ProjectIndex.AddHandle(handle);
-
-                            var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
-                            Progress.Report(currentProgress, progressCount);
                         }
-
-                        var pathIdToIndex = new Dictionary<long, int>();
-                        for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                        finally
                         {
-                            pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
+                            semaphore.Release();
                         }
-                        var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
-                        foreach (var obj in sortedObjects)
-                        {
-                            assetsFile.AddObject(obj);
-                        }
-                    }
-                });
+                    });
+                    await System.Threading.Tasks.Task.WhenAll(tasks);
+                }
                 return;
             }
 
             foreach (var assetsFile in assetsFileList)
             {
-                YieldForUserInteractionIfNeeded();
-
                 if (assetsFile.IsProcessed) continue;
                 assetsFile.IsProcessed = true;
                 var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
@@ -907,11 +880,6 @@ namespace AssetStudio
                     () => assetsFile.reader.Clone(),
                     (objectInfo, state, localReader) =>
                     {
-                        if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
-                        {
-                            YieldForUserInteractionIfNeeded();
-                        }
-
                         if (System.Threading.Volatile.Read(ref ShouldStopLoading))
                         {
                             state.Stop();

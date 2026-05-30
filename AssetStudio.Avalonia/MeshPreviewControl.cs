@@ -143,9 +143,6 @@ void main()
         private const int LocationTexCoord = 3;
         private const float PreviewFitScale = 1.35f;
         private const float PreviewDepthScale = 0.02f;
-        private const float DefaultAvatarReferenceMeshDensityPercent = 70f;
-        private const float MinAvatarReferenceMeshDensityPercent = 1f;
-        private const float MaxAvatarReferenceMeshDensityPercent = 100f;
 
         // Programs
         private int pgmID;
@@ -201,7 +198,7 @@ void main()
         private Vector3[][]? animatedMeshVertices;
         private Vector3[]? pendingMeshVertices;
         private readonly object meshLock = new object();
-        private float avatarReferenceMeshDensityPercent = DefaultAvatarReferenceMeshDensityPercent;
+        private float avatarReferenceMeshDensityPercent = AvatarReferenceMeshSimplifier.DefaultDensityPercent;
         private Mesh? avatarReferenceMeshSource;
         private Vector3[]? avatarReferenceSourceVertices;
         private List<uint>? avatarReferenceSourceIndices;
@@ -258,7 +255,7 @@ void main()
             get => avatarReferenceMeshDensityPercent;
             set
             {
-                var clamped = Math.Clamp(value, MinAvatarReferenceMeshDensityPercent, MaxAvatarReferenceMeshDensityPercent);
+                var clamped = Math.Clamp(value, AvatarReferenceMeshSimplifier.MinDensityPercent, AvatarReferenceMeshSimplifier.MaxDensityPercent);
                 if (Math.Abs(avatarReferenceMeshDensityPercent - clamped) < 0.01f)
                 {
                     return;
@@ -375,220 +372,6 @@ void main()
             return Matrix4.CreateTranslation(-center) * Matrix4.CreateScale(PreviewFitScale / diagonal);
         }
 
-        private sealed class AvatarReferenceMesh
-        {
-            public AvatarReferenceMesh(Vector3[] vertices, int[] indices, int[] sourceVertexIndices)
-            {
-                Vertices = vertices;
-                Indices = indices;
-                SourceVertexIndices = sourceVertexIndices;
-            }
-
-            public Vector3[] Vertices { get; }
-            public int[] Indices { get; }
-            public int[] SourceVertexIndices { get; }
-        }
-
-        private static AvatarReferenceMesh BuildAvatarReferenceMesh(Vector3[] sourceVertices, List<uint> sourceIndices, Vector3 min, Vector3 max, float densityPercent)
-        {
-            if (sourceVertices.Length == 0 || sourceIndices.Count < 3)
-            {
-                return new AvatarReferenceMesh(Array.Empty<Vector3>(), Array.Empty<int>(), Array.Empty<int>());
-            }
-
-            int sourceTriangleCount = sourceIndices.Count / 3;
-            densityPercent = Math.Clamp(densityPercent, MinAvatarReferenceMeshDensityPercent, MaxAvatarReferenceMeshDensityPercent);
-            var triangleOffsets = densityPercent >= MaxAvatarReferenceMeshDensityPercent - 0.01f
-                ? CollectAvatarReferenceTriangles(sourceVertices, sourceIndices)
-                : SelectAvatarReferenceTriangles(sourceVertices, sourceIndices, min, max, sourceTriangleCount, densityPercent);
-
-            if (triangleOffsets.Count == 0)
-            {
-                return new AvatarReferenceMesh(Array.Empty<Vector3>(), Array.Empty<int>(), Array.Empty<int>());
-            }
-
-            return CompactAvatarReferenceMesh(sourceVertices, sourceIndices, triangleOffsets);
-        }
-
-        private static List<int> CollectAvatarReferenceTriangles(Vector3[] sourceVertices, List<uint> sourceIndices)
-        {
-            var triangleOffsets = new List<int>(sourceIndices.Count / 3);
-            for (int offset = 0; offset + 2 < sourceIndices.Count; offset += 3)
-            {
-                if (TryReadAvatarTriangle(sourceIndices, offset, sourceVertices.Length, out _, out _, out _))
-                {
-                    triangleOffsets.Add(offset);
-                }
-            }
-
-            return triangleOffsets;
-        }
-
-        private static List<int> SelectAvatarReferenceTriangles(Vector3[] sourceVertices, List<uint> sourceIndices, Vector3 min, Vector3 max, int sourceTriangleCount, float densityPercent)
-        {
-            int targetTriangleCount = Math.Clamp((int)Math.Ceiling(sourceTriangleCount * densityPercent / 100f), 1, sourceTriangleCount);
-            int targetVertexCount = Math.Clamp((int)Math.Ceiling(sourceVertices.Length * densityPercent / 100f), 3, sourceVertices.Length);
-            var selectedOffsets = new List<int>(targetTriangleCount * 2);
-            var selectedSet = new HashSet<int>();
-            var selectedSourceVertices = new HashSet<int>();
-            var occupiedCells = new HashSet<long>();
-            int gridResolution = Math.Clamp((int)Math.Ceiling(Math.Pow(targetTriangleCount, 1.0 / 3.0) * 2.25), 6, 28);
-            var size = max - min;
-
-            for (int offset = 0; selectedOffsets.Count < targetTriangleCount && offset + 2 < sourceIndices.Count; offset += 3)
-            {
-                if (!TryReadAvatarTriangle(sourceIndices, offset, sourceVertices.Length, out int i0, out int i1, out int i2))
-                {
-                    continue;
-                }
-
-                var centroid = (sourceVertices[i0] + sourceVertices[i1] + sourceVertices[i2]) / 3f;
-                if (!IsFinitePoint(centroid))
-                {
-                    continue;
-                }
-
-                int cellX = QuantizeAvatarReferenceCell(centroid.X, min.X, size.X, gridResolution);
-                int cellY = QuantizeAvatarReferenceCell(centroid.Y, min.Y, size.Y, gridResolution);
-                int cellZ = QuantizeAvatarReferenceCell(centroid.Z, min.Z, size.Z, gridResolution);
-                long cellKey = PackAvatarReferenceCellKey(cellX, cellY, cellZ);
-
-                if (occupiedCells.Add(cellKey))
-                {
-                    TryAddAvatarReferenceTriangle(sourceVertices, sourceIndices, offset, selectedOffsets, selectedSet, selectedSourceVertices, targetVertexCount, selectedOffsets.Count == 0);
-                }
-            }
-
-            if (selectedOffsets.Count < targetTriangleCount)
-            {
-                FillAvatarReferenceTriangleSample(sourceVertices, sourceIndices, targetTriangleCount, targetVertexCount, selectedOffsets, selectedSet, selectedSourceVertices);
-            }
-
-            return selectedOffsets;
-        }
-
-        private static bool TryReadAvatarTriangle(List<uint> sourceIndices, int offset, int vertexCount, out int i0, out int i1, out int i2)
-        {
-            i0 = i1 = i2 = 0;
-            if (offset < 0 || offset + 2 >= sourceIndices.Count)
-            {
-                return false;
-            }
-
-            uint u0 = sourceIndices[offset];
-            uint u1 = sourceIndices[offset + 1];
-            uint u2 = sourceIndices[offset + 2];
-            uint vertexLimit = (uint)vertexCount;
-            if (u0 >= vertexLimit || u1 >= vertexLimit || u2 >= vertexLimit)
-            {
-                return false;
-            }
-
-            i0 = (int)u0;
-            i1 = (int)u1;
-            i2 = (int)u2;
-            return i0 != i1 && i1 != i2 && i2 != i0;
-        }
-
-        private static int QuantizeAvatarReferenceCell(float value, float min, float extent, int resolution)
-        {
-            if (!float.IsFinite(value) || !float.IsFinite(min) || !float.IsFinite(extent) || extent <= 1e-5f)
-            {
-                return 0;
-            }
-
-            float normalized = (value - min) / extent;
-            if (!float.IsFinite(normalized))
-            {
-                return 0;
-            }
-
-            return Math.Clamp((int)(normalized * resolution), 0, resolution - 1);
-        }
-
-        private static long PackAvatarReferenceCellKey(int x, int y, int z)
-        {
-            return ((long)x << 32) | ((long)y << 16) | (uint)z;
-        }
-
-        private static void FillAvatarReferenceTriangleSample(Vector3[] sourceVertices, List<uint> sourceIndices, int targetTriangleCount, int targetVertexCount, List<int> selectedOffsets, HashSet<int> selectedSet, HashSet<int> selectedSourceVertices)
-        {
-            int sourceTriangleCount = sourceIndices.Count / 3;
-            double stride = Math.Max(1.0, (double)sourceTriangleCount / targetTriangleCount);
-
-            for (int sample = 0; selectedOffsets.Count < targetTriangleCount && sample < targetTriangleCount; sample++)
-            {
-                int offset = Math.Min(sourceTriangleCount - 1, (int)Math.Floor(sample * stride)) * 3;
-                TryAddAvatarReferenceTriangle(sourceVertices, sourceIndices, offset, selectedOffsets, selectedSet, selectedSourceVertices, targetVertexCount, selectedOffsets.Count == 0);
-            }
-
-            for (int offset = 0; selectedOffsets.Count < targetTriangleCount && offset + 2 < sourceIndices.Count; offset += 3)
-            {
-                TryAddAvatarReferenceTriangle(sourceVertices, sourceIndices, offset, selectedOffsets, selectedSet, selectedSourceVertices, targetVertexCount, selectedOffsets.Count == 0);
-            }
-        }
-
-        private static void TryAddAvatarReferenceTriangle(Vector3[] sourceVertices, List<uint> sourceIndices, int offset, List<int> selectedOffsets, HashSet<int> selectedSet, HashSet<int> selectedSourceVertices, int targetVertexCount, bool allowOverflow)
-        {
-            if (selectedSet.Contains(offset)
-                || !TryReadAvatarTriangle(sourceIndices, offset, sourceVertices.Length, out int i0, out int i1, out int i2))
-            {
-                return;
-            }
-
-            int newVertices = 0;
-            if (!selectedSourceVertices.Contains(i0)) newVertices++;
-            if (!selectedSourceVertices.Contains(i1)) newVertices++;
-            if (!selectedSourceVertices.Contains(i2)) newVertices++;
-
-            if (!allowOverflow && selectedSourceVertices.Count + newVertices > targetVertexCount)
-            {
-                return;
-            }
-
-            selectedOffsets.Add(offset);
-            selectedSet.Add(offset);
-            selectedSourceVertices.Add(i0);
-            selectedSourceVertices.Add(i1);
-            selectedSourceVertices.Add(i2);
-        }
-
-        private static AvatarReferenceMesh CompactAvatarReferenceMesh(Vector3[] sourceVertices, List<uint> sourceIndices, List<int> triangleOffsets)
-        {
-            var vertexRemap = new Dictionary<int, int>();
-            var previewVertices = new List<Vector3>();
-            var previewSourceIndices = new List<int>();
-            var previewIndices = new List<int>(triangleOffsets.Count * 3);
-
-            int GetPreviewVertexIndex(int sourceIndex)
-            {
-                if (vertexRemap.TryGetValue(sourceIndex, out int previewIndex))
-                {
-                    return previewIndex;
-                }
-
-                previewIndex = previewVertices.Count;
-                vertexRemap[sourceIndex] = previewIndex;
-                previewVertices.Add(sourceVertices[sourceIndex]);
-                previewSourceIndices.Add(sourceIndex);
-                return previewIndex;
-            }
-
-            foreach (var offset in triangleOffsets)
-            {
-                if (!TryReadAvatarTriangle(sourceIndices, offset, sourceVertices.Length, out int i0, out int i1, out int i2))
-                {
-                    continue;
-                }
-
-                previewIndices.Add(GetPreviewVertexIndex(i0));
-                previewIndices.Add(GetPreviewVertexIndex(i1));
-                previewIndices.Add(GetPreviewVertexIndex(i2));
-            }
-
-            return new AvatarReferenceMesh(previewVertices.ToArray(), previewIndices.ToArray(), previewSourceIndices.ToArray());
-        }
-
         private static Vector3[][]? BuildAnimatedAvatarReferenceVertices(Mesh mesh, Vector3[] sourceVertexData, AvatarReferenceMesh referenceMesh, Matrix4[][] boneMatrices, int[] parentIndices, ref Vector3 min, ref Vector3 max, bool expandBounds)
         {
             if (referenceMesh.SourceVertexIndices.Length == 0
@@ -684,7 +467,7 @@ void main()
 
             System.Threading.Tasks.Task.Run(() =>
             {
-                var referenceMesh = BuildAvatarReferenceMesh(sourceVertices, sourceIndices, min, max, densityPercent);
+                var referenceMesh = AvatarReferenceMeshSimplifier.Build(sourceVertices, sourceIndices, min, max, densityPercent);
                 Vector3[][]? rebuiltAnimatedVertices = null;
 
                 if (sourceMesh != null && boneMatrices != null && parentIndices != null)
@@ -2032,7 +1815,7 @@ void main()
 
                 var sourceMeshMin = min;
                 var sourceMeshMax = max;
-                var referenceMesh = BuildAvatarReferenceMesh(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, avatarReferenceMeshDensityPercent);
+                var referenceMesh = AvatarReferenceMeshSimplifier.Build(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, avatarReferenceMeshDensityPercent);
                 var localIndiceData = referenceMesh.Indices;
 
                 var skeletonVerts = new List<Vector3>();
@@ -2129,7 +1912,7 @@ void main()
 
                 var sourceMeshMin = min;
                 var sourceMeshMax = max;
-                var referenceMesh = BuildAvatarReferenceMesh(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, avatarReferenceMeshDensityPercent);
+                var referenceMesh = AvatarReferenceMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, avatarReferenceMeshDensityPercent);
                 var localVertexData = referenceMesh.Vertices;
                 var localIndiceData = referenceMesh.Indices;
 

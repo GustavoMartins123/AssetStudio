@@ -257,18 +257,27 @@ namespace AssetStudio
             var isCompressed = m_Header.signature == "UnityWeb";
             foreach (var blockInfo in m_BlocksInfo)
             {
-                var uncompressedBytes = reader.ReadBytes((int)blockInfo.compressedSize);
+                var compressedSize = (int)blockInfo.compressedSize;
                 if (isCompressed)
                 {
-                    using (var memoryStream = new MemoryStream(uncompressedBytes))
+                    var compressedBytes = BigArrayPool<byte>.Shared.Rent(compressedSize);
+                    reader.Read(compressedBytes, 0, compressedSize);
+                    using (var memoryStream = new MemoryStream(compressedBytes, 0, compressedSize))
                     {
                         using (var decompressStream = SevenZipHelper.StreamDecompress(memoryStream))
                         {
-                            uncompressedBytes = decompressStream.ToArray();
+                            decompressStream.CopyTo(blocksStream);
                         }
                     }
+                    BigArrayPool<byte>.Shared.Return(compressedBytes);
                 }
-                blocksStream.Write(uncompressedBytes, 0, uncompressedBytes.Length);
+                else
+                {
+                    var buffer = BigArrayPool<byte>.Shared.Rent(compressedSize);
+                    reader.Read(buffer, 0, compressedSize);
+                    blocksStream.Write(buffer, 0, compressedSize);
+                    BigArrayPool<byte>.Shared.Return(buffer);
+                }
             }
             blocksStream.Position = 0;
             var blocksReader = new EndianBinaryReader(blocksStream);

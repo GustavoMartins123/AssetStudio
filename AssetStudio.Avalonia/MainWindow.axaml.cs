@@ -316,6 +316,11 @@ public partial class MainWindow : Window
 
     private async Task WaitForUserInteractionPriorityToClearAsync(CancellationToken token)
     {
+        if (!assetsManager.LazyLoading)
+        {
+            return;
+        }
+
         while (!token.IsCancellationRequested && IsUserInteractionPriorityActive())
         {
             await Task.Delay(UserInteractionYieldDelayMilliseconds);
@@ -324,6 +329,11 @@ public partial class MainWindow : Window
 
     private void YieldBackgroundWorkForUserInteraction()
     {
+        if (!assetsManager.LazyLoading)
+        {
+            return;
+        }
+
         while (IsUserInteractionPriorityActive())
         {
             Thread.Sleep(UserInteractionYieldDelayMilliseconds);
@@ -5664,15 +5674,10 @@ public partial class MainWindow : Window
                 return SortAssetListAsync(matches, sortMember, sortDescending).ToList();
             }, token);
 
-            SyncObservableCollection(visibleAssets, result);
-
             isRefreshingFilterList = true;
             try
             {
-                if (AssetListDataGrid.ItemsSource != visibleAssets)
-                {
-                    AssetListDataGrid.ItemsSource = visibleAssets;
-                }
+                ReplaceVisibleAssets(result);
                 StatusStripUpdate($"Showing {visibleAssets.Count} assets");
 
                 // Restore selection
@@ -5750,11 +5755,7 @@ public partial class MainWindow : Window
         try
         {
             var sorted = await Task.Run(() => SortAssetListAsync(currentAssets, sortMember, sortDescending).ToList());
-            SyncObservableCollection(visibleAssets, sorted);
-            if (AssetListDataGrid.ItemsSource != visibleAssets)
-            {
-                AssetListDataGrid.ItemsSource = visibleAssets;
-            }
+            ReplaceVisibleAssets(sorted);
             StatusStripUpdate($"Showing {visibleAssets.Count} assets");
         }
         catch (Exception ex)
@@ -5797,6 +5798,14 @@ public partial class MainWindow : Window
             "FullSize" or "Size" => item.FullSize.ToString(CultureInfo.InvariantCulture),
             _ => item.Name
         };
+    }
+
+    private void ReplaceVisibleAssets(IReadOnlyList<AssetItem>? items)
+    {
+        visibleAssets = items is { Count: > 0 }
+            ? new System.Collections.ObjectModel.ObservableCollection<AssetItem>(items)
+            : new System.Collections.ObjectModel.ObservableCollection<AssetItem>();
+        AssetListDataGrid.ItemsSource = visibleAssets;
     }
 
     private static void SyncObservableCollection<T>(System.Collections.ObjectModel.ObservableCollection<T> collection, IReadOnlyList<T>? targetList)
