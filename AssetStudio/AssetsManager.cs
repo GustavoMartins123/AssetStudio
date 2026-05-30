@@ -35,7 +35,7 @@ namespace AssetStudio
         public ProjectIndex ProjectIndex = new ProjectIndex();
         public bool LazyLoading = false;
 
-        internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        internal ConcurrentDictionary<string, int> assetsFileIndexCache = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         internal ConcurrentDictionary<string, BinaryReader> resourceFileReaders = new ConcurrentDictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
 
         private ConcurrentBag<string> importFiles = new ConcurrentBag<string>();
@@ -1163,57 +1163,87 @@ namespace AssetStudio
         {
             Logger.Info("Process Assets...");
 
-            var spriteAtlasCache = new Dictionary<KeyValuePair<Guid, long>, SpriteAtlas>();
-
-            foreach (var assetsFile in assetsFileList)
+            var processOptions = new System.Threading.Tasks.ParallelOptions
             {
+                MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_PROCESS_THREADS", DefaultReadThreadRatio)
+            };
+
+            var spriteAtlasEntries = new List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>>[assetsFileList.Count];
+
+            System.Threading.Tasks.Parallel.For(0, assetsFileList.Count, processOptions, fileIndex =>
+            {
+                var assetsFile = assetsFileList[fileIndex];
+                List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>> entries = null;
                 foreach (var obj in assetsFile.Objects)
                 {
                     if (obj is SpriteAtlas m_SpriteAtlas && m_SpriteAtlas.m_RenderDataMap != null)
                     {
+                        entries ??= new List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>>(m_SpriteAtlas.m_RenderDataMap.Count);
                         foreach (var key in m_SpriteAtlas.m_RenderDataMap.Keys)
                         {
-                            spriteAtlasCache[key] = m_SpriteAtlas;
+                            entries.Add(new KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>(key, m_SpriteAtlas));
                         }
                     }
                 }
+
+                spriteAtlasEntries[fileIndex] = entries;
+            });
+
+            var spriteAtlasCache = new Dictionary<KeyValuePair<Guid, long>, SpriteAtlas>();
+            foreach (var entries in spriteAtlasEntries)
+            {
+                if (entries == null)
+                {
+                    continue;
+                }
+
+                foreach (var entry in entries)
+                {
+                    spriteAtlasCache[entry.Key] = entry.Value;
+                }
             }
+
+            var gameObjects = assetsFileList
+                .SelectMany(assetsFile => assetsFile.Objects)
+                .OfType<GameObject>()
+                .ToArray();
+
+            System.Threading.Tasks.Parallel.ForEach(gameObjects, processOptions, m_GameObject =>
+            {
+                foreach (var pptr in m_GameObject.m_Components)
+                {
+                    if (pptr.TryGet(out var m_Component))
+                    {
+                        switch (m_Component)
+                        {
+                            case Transform m_Transform:
+                                m_GameObject.m_Transform = m_Transform;
+                                break;
+                            case MeshRenderer m_MeshRenderer:
+                                m_GameObject.m_MeshRenderer = m_MeshRenderer;
+                                break;
+                            case MeshFilter m_MeshFilter:
+                                m_GameObject.m_MeshFilter = m_MeshFilter;
+                                break;
+                            case SkinnedMeshRenderer m_SkinnedMeshRenderer:
+                                m_GameObject.m_SkinnedMeshRenderer = m_SkinnedMeshRenderer;
+                                break;
+                            case Animator m_Animator:
+                                m_GameObject.m_Animator = m_Animator;
+                                break;
+                            case Animation m_Animation:
+                                m_GameObject.m_Animation = m_Animation;
+                                break;
+                        }
+                    }
+                }
+            });
 
             foreach (var assetsFile in assetsFileList)
             {
                 foreach (var obj in assetsFile.Objects)
                 {
-                    if (obj is GameObject m_GameObject)
-                    {
-                        foreach (var pptr in m_GameObject.m_Components)
-                        {
-                            if (pptr.TryGet(out var m_Component))
-                            {
-                                switch (m_Component)
-                                {
-                                    case Transform m_Transform:
-                                        m_GameObject.m_Transform = m_Transform;
-                                        break;
-                                    case MeshRenderer m_MeshRenderer:
-                                        m_GameObject.m_MeshRenderer = m_MeshRenderer;
-                                        break;
-                                    case MeshFilter m_MeshFilter:
-                                        m_GameObject.m_MeshFilter = m_MeshFilter;
-                                        break;
-                                    case SkinnedMeshRenderer m_SkinnedMeshRenderer:
-                                        m_GameObject.m_SkinnedMeshRenderer = m_SkinnedMeshRenderer;
-                                        break;
-                                    case Animator m_Animator:
-                                        m_GameObject.m_Animator = m_Animator;
-                                        break;
-                                    case Animation m_Animation:
-                                        m_GameObject.m_Animation = m_Animation;
-                                        break;
-                                }
-                            }
-                        }
-                    }
-                    else if (obj is SpriteAtlas m_SpriteAtlas)
+                    if (obj is SpriteAtlas m_SpriteAtlas)
                     {
                         foreach (var m_PackedSprite in m_SpriteAtlas.m_PackedSprites)
                         {

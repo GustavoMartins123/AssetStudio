@@ -264,7 +264,7 @@ public partial class MainWindow : Window
             ClampPreviewColor(color.R),
             ClampPreviewColor(color.G),
             ClampPreviewColor(color.B),
-            1f);
+            ClampPreviewColor(color.A));
     }
 
     private static float ClampPreviewColor(float value)

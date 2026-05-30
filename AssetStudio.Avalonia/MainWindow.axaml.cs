@@ -448,6 +448,7 @@ public partial class MainWindow : Window
         {
             BoneSizeContainer.IsVisible = false;
         }
+        ClearMeshMaterialControls();
         if (AnimationPlaybackPanel != null)
         {
             AnimationPlaybackPanel.IsVisible = false;
@@ -2030,230 +2031,28 @@ public partial class MainWindow : Window
                     }
                 }
 
-                var handles = assetsManager.ProjectIndex.GetHandles();
-                var handleIndex = 0;
-                foreach (var handle in handles)
-                {
-                    if ((handleIndex++ & 0x1ff) == 0)
-                    {
-                        YieldBackgroundWorkForUserInteraction();
-                    }
-
-                    AssetItem assetItem;
-                    bool isNewHandle = false;
-                    if (handle.Tag is AssetItem existingItem)
-                    {
-                        assetItem = existingItem;
-                    }
-                    else
-                    {
-                        assetItem = new AssetItem(handle);
-                        handle.Tag = assetItem;
-                        isNewHandle = true;
-                    }
-                    assetItem.UniqueID = " #" + i;
-                    
-                    localPathIDAssetItemDic[handle.UniqueID] = assetItem;
-                    if (handle.RealObject != null)
-                    {
-                        localObjectAssetItemDic[handle.RealObject] = assetItem;
-                    }
-
-                    bool exportable = false;
-                    switch (handle.Type)
-                    {
-                        case ClassIDType.Texture2D:
-                        case ClassIDType.AudioClip:
-                        case ClassIDType.VideoClip:
-                        case ClassIDType.VideoPlayer:
-                        case ClassIDType.Shader:
-                        case ClassIDType.Mesh:
-                        case ClassIDType.Material:
-                        case ClassIDType.TextAsset:
-                        case ClassIDType.MonoBehaviour:
-                        case ClassIDType.Font:
-                        case ClassIDType.Sprite:
-                        case ClassIDType.MovieTexture:
-                        case ClassIDType.AnimationClip:
-                        case ClassIDType.Animator:
-                            exportable = true;
-                            break;
-                    }
-
-                    if (displayAllChecked || exportable)
-                    {
-                        localExportableAssets.Add(assetItem);
-                        if (isNewHandle)
-                        {
-                            localNewExportableAssets.Add(assetItem);
-                        }
-                    }
-                    i++;
-                }
+                var handles = assetsManager.ProjectIndex.GetHandles().ToArray();
+                BuildLazyAssetItemsBackground(
+                    handles,
+                    displayAllChecked,
+                    localPathIDAssetItemDic,
+                    localObjectAssetItemDic,
+                    localExportableAssets,
+                    localNewExportableAssets);
+                i += handles.Length;
             }
             else
             {
-                foreach (var assetsFile in filesListSnapshot)
-                {
-                    YieldBackgroundWorkForUserInteraction();
-
-                    var fileNode = new GameObjectNode { Name = assetsFile.fileName };
-
-                    foreach (var asset in assetsFile.Objects)
-                    {
-                        if ((i & 0x1ff) == 0)
-                        {
-                            YieldBackgroundWorkForUserInteraction();
-                        }
-
-                        var assetItem = new AssetItem(asset);
-                        assetItem.UniqueID = " #" + i;
-                        localObjectAssetItemDic[asset] = assetItem;
-                        localPathIDAssetItemDic[$"{assetsFile.fileName}#{asset.m_PathID}"] = assetItem;
-                        var exportable = false;
-
-                        switch (asset)
-                        {
-                            case GameObject m_GameObject:
-                                assetItem.Name = m_GameObject.m_Name;
-
-                                if (!localTreeNodeDictionary.TryGetValue(m_GameObject, out var currentNode))
-                                {
-                                    currentNode = new GameObjectNode { Name = m_GameObject.m_Name, GameObject = m_GameObject };
-                                    localTreeNodeDictionary.Add(m_GameObject, currentNode);
-                                }
-
-                                var parentNode = fileNode;
-
-                                if (m_GameObject.m_Transform != null && m_GameObject.m_Transform.m_Father.TryGet(out var m_Father))
-                                {
-                                    if (m_Father.m_GameObject.TryGet(out var parentGameObject))
-                                    {
-                                        if (!localTreeNodeDictionary.TryGetValue(parentGameObject, out var parentGameObjectNode))
-                                        {
-                                            parentGameObjectNode = new GameObjectNode { Name = parentGameObject.m_Name, GameObject = parentGameObject };
-                                            localTreeNodeDictionary.Add(parentGameObject, parentGameObjectNode);
-                                        }
-                                        parentNode = parentGameObjectNode;
-                                    }
-                                }
-
-                                parentNode.AddChild(currentNode);
-                                break;
-
-                            case Texture2D m_Texture2D:
-                                if (!string.IsNullOrEmpty(m_Texture2D.m_StreamData?.path))
-                                    assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
-                                assetItem.Name = m_Texture2D.m_Name;
-                                exportable = true;
-                                break;
-                            case AudioClip m_AudioClip:
-                                if (!string.IsNullOrEmpty(m_AudioClip.m_Source))
-                                    assetItem.FullSize = asset.byteSize + m_AudioClip.m_Size;
-                                assetItem.Name = m_AudioClip.m_Name;
-                                exportable = true;
-                                break;
-                            case VideoClip m_VideoClip:
-                                if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
-                                    assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
-                                assetItem.Name = m_VideoClip.m_Name;
-                                exportable = true;
-                                break;
-                            case VideoPlayer m_VideoPlayer:
-                                if (m_VideoPlayer.m_VideoClip.TryGet(out var resolvedClip) && resolvedClip != null)
-                                {
-                                    if (!string.IsNullOrEmpty(resolvedClip.m_OriginalPath))
-                                        assetItem.FullSize = asset.byteSize + (long)resolvedClip.m_ExternalResources.m_Size;
-                                    assetItem.Name = $"{(m_VideoPlayer.m_GameObject.TryGet(out var go) ? go.m_Name : "VideoPlayer")} (Clip: {resolvedClip.m_Name})";
-                                }
-                                else
-                                {
-                                    assetItem.Name = m_VideoPlayer.m_GameObject.TryGet(out var go) ? go.m_Name : "VideoPlayer";
-                                }
-                                exportable = true;
-                                break;
-                            case Shader m_Shader:
-                                assetItem.Name = m_Shader.m_ParsedForm?.m_Name ?? m_Shader.m_Name;
-                                exportable = true;
-                                break;
-                            case Mesh _:
-                            case Material _:
-                            case TextAsset _:
-                            case AnimationClip _:
-                            case Font _:
-                            case MovieTexture _:
-                            case Sprite _:
-                            case Avatar _:
-                            case RuntimeAnimatorController _:
-                                assetItem.Name = ((NamedObject)asset).m_Name;
-                                exportable = true;
-                                break;
-                            case MonoScript m_MonoScript:
-                                assetItem.Name = m_MonoScript.m_Name;
-                                exportable = true;
-                                break;
-                            case Animator m_Animator:
-                                if (m_Animator.m_GameObject.TryGet(out var gameObject))
-                                {
-                                    assetItem.Name = gameObject.m_Name;
-                                }
-                                exportable = true;
-                                break;
-                            case MonoBehaviour m_MonoBehaviour:
-                                if (m_MonoBehaviour.m_Name == "" && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
-                                {
-                                    assetItem.Name = m_Script.m_ClassName;
-                                }
-                                else
-                                {
-                                    assetItem.Name = m_MonoBehaviour.m_Name;
-                                }
-                                exportable = true;
-                                break;
-                            case AssetBundle m_AssetBundle:
-                                foreach (var m_Container in m_AssetBundle.m_Container)
-                                {
-                                    var preloadIndex = m_Container.Value.preloadIndex;
-                                    var preloadSize = m_Container.Value.preloadSize;
-                                    var preloadEnd = preloadIndex + preloadSize;
-                                    for (int k = preloadIndex; k < preloadEnd; k++)
-                                    {
-                                        localContainers.Add((m_AssetBundle.m_PreloadTable[k], m_Container.Key));
-                                    }
-                                }
-                                assetItem.Name = m_AssetBundle.m_Name;
-                                break;
-                            case ResourceManager m_ResourceManager:
-                                foreach (var m_Container in m_ResourceManager.m_Container)
-                                {
-                                    localContainers.Add((m_Container.Value, m_Container.Key));
-                                }
-                                break;
-                            case PlayerSettings m_PlayerSettings:
-                                localProductName = m_PlayerSettings.productName;
-                                break;
-                            case NamedObject m_NamedObject:
-                                assetItem.Name = m_NamedObject.m_Name;
-                                break;
-                        }
-
-                        if (string.IsNullOrEmpty(assetItem.Name))
-                        {
-                            assetItem.Name = assetItem.TypeString + assetItem.UniqueID;
-                        }
-
-                        if (displayAllChecked || exportable)
-                        {
-                            localExportableAssets.Add(assetItem);
-                        }
-                        i++;
-                    }
-
-                    if (fileNode.ChildCount > 0)
-                    {
-                        localSceneTreeNodes.Add(fileNode);
-                    }
-                }
+                BuildEagerAssetItemsBackground(
+                    filesListSnapshot,
+                    displayAllChecked,
+                    localTreeNodeDictionary,
+                    localObjectAssetItemDic,
+                    localPathIDAssetItemDic,
+                    localContainers,
+                    localExportableAssets,
+                    localSceneTreeNodes,
+                    out localProductName);
             }
 
             if (!assetsManager.LazyLoading)
@@ -2311,23 +2110,24 @@ public partial class MainWindow : Window
 
             if (!assetsManager.LazyLoading)
             {
-                BuildAssetReferenceIndexesBackground(
-                    filesListSnapshot,
-                    localExportableAssets,
-                    out localObjectToAssetItemCache,
-                    out localMeshToMaterialsCache,
-                    out localMeshAssociatedRenderersCache,
-                    out localMeshSourceTypesCache,
-                    out localMaterialMainTextureCache,
-                    out localMaterialPreviewMaterialCache,
-                    out localMaterialTextureSlotsCache);
-
-                BuildAnimationPreviewIndexesBackground(
-                    filesListSnapshot,
-                    out localAnimationClipAvatarCache,
-                    out localAvatarMeshCache,
-                    out localMeshAvatarCache,
-                    out localAnimationClipTransformBindingsCache);
+                Parallel.Invoke(
+                    CreateStructureBuildParallelOptions(),
+                    () => BuildAssetReferenceIndexesBackground(
+                        filesListSnapshot,
+                        localExportableAssets,
+                        out localObjectToAssetItemCache,
+                        out localMeshToMaterialsCache,
+                        out localMeshAssociatedRenderersCache,
+                        out localMeshSourceTypesCache,
+                        out localMaterialMainTextureCache,
+                        out localMaterialPreviewMaterialCache,
+                        out localMaterialTextureSlotsCache),
+                    () => BuildAnimationPreviewIndexesBackground(
+                        filesListSnapshot,
+                        out localAnimationClipAvatarCache,
+                        out localAvatarMeshCache,
+                        out localMeshAvatarCache,
+                        out localAnimationClipTransformBindingsCache));
             }
 
             var localAssetClassItems = new List<AssetClassItem>();
@@ -2749,6 +2549,7 @@ public partial class MainWindow : Window
             VideoClipPanel.IsVisible = false;
             VideoReset();
         }
+        ClearMeshMaterialControls();
         if (asset is not AnimationClip)
         {
             HideAnimationPlayback();
@@ -2923,6 +2724,7 @@ public partial class MainWindow : Window
                                     currentPreviewMesh = m_Mesh;
                                     GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                                     GLPreviewControl.IsVisible = true;
+                                    BuildMeshMaterialControls(m_Mesh, allMaterials);
                                     if (BoneSizeContainer != null)
                                     {
                                         BoneSizeContainer.IsVisible = false;

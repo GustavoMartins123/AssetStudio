@@ -30,6 +30,381 @@ namespace AssetStudio.Avalonia
             public List<AssetClassItem> AssetClassItems;
         }
 
+        private static ParallelOptions CreateStructureBuildParallelOptions()
+        {
+            return new ParallelOptions
+            {
+                MaxDegreeOfParallelism = AssetsManager.GetConfiguredThreadCount("ASSETSTUDIO_STRUCTURE_THREADS", 0.4)
+            };
+        }
+
+        private static bool IsLazyExportableType(ClassIDType type)
+        {
+            return type
+                is ClassIDType.Texture2D
+                or ClassIDType.AudioClip
+                or ClassIDType.VideoClip
+                or ClassIDType.VideoPlayer
+                or ClassIDType.Shader
+                or ClassIDType.Mesh
+                or ClassIDType.Material
+                or ClassIDType.TextAsset
+                or ClassIDType.MonoBehaviour
+                or ClassIDType.Font
+                or ClassIDType.Sprite
+                or ClassIDType.MovieTexture
+                or ClassIDType.AnimationClip
+                or ClassIDType.Animator;
+        }
+
+        private static void BuildLazyAssetItemsBackground(
+            IReadOnlyList<AssetHandle> handles,
+            bool displayAllChecked,
+            Dictionary<string, AssetItem> pathIDAssetItemDic,
+            Dictionary<AssetStudio.Object, AssetItem> objectAssetItemDic,
+            List<AssetItem> exportableAssets,
+            List<AssetItem> newExportableAssets)
+        {
+            var assetItems = new AssetItem?[handles.Count];
+            var includeItems = new bool[handles.Count];
+            var newItems = new bool[handles.Count];
+
+            Parallel.For(0, handles.Count, CreateStructureBuildParallelOptions(), index =>
+            {
+                var handle = handles[index];
+                AssetItem assetItem;
+                bool isNewHandle = false;
+                if (handle.Tag is AssetItem existingItem)
+                {
+                    assetItem = existingItem;
+                }
+                else
+                {
+                    assetItem = new AssetItem(handle);
+                    handle.Tag = assetItem;
+                    isNewHandle = true;
+                }
+
+                assetItem.UniqueID = " #" + index.ToString(CultureInfo.InvariantCulture);
+                assetItems[index] = assetItem;
+                includeItems[index] = displayAllChecked || IsLazyExportableType(handle.Type);
+                newItems[index] = isNewHandle;
+            });
+
+            for (int index = 0; index < handles.Count; index++)
+            {
+                var handle = handles[index];
+                var assetItem = assetItems[index];
+                if (assetItem == null)
+                {
+                    continue;
+                }
+
+                pathIDAssetItemDic[handle.UniqueID] = assetItem;
+                if (handle.RealObject != null)
+                {
+                    objectAssetItemDic[handle.RealObject] = assetItem;
+                }
+
+                if (!includeItems[index])
+                {
+                    continue;
+                }
+
+                exportableAssets.Add(assetItem);
+                if (newItems[index])
+                {
+                    newExportableAssets.Add(assetItem);
+                }
+            }
+        }
+
+        private static void BuildEagerAssetItemsBackground(
+            IReadOnlyList<SerializedFile> assetsFileList,
+            bool displayAllChecked,
+            Dictionary<GameObject, GameObjectNode> treeNodeDictionary,
+            Dictionary<AssetStudio.Object, AssetItem> objectAssetItemDic,
+            Dictionary<string, AssetItem> pathIDAssetItemDic,
+            List<(PPtr<AssetStudio.Object>, string)> containers,
+            List<AssetItem> exportableAssets,
+            List<GameObjectNode> sceneTreeNodes,
+            out string? productName)
+        {
+            var workItems = new List<EagerAssetWorkItem>();
+            foreach (var assetsFile in assetsFileList)
+            {
+                foreach (var asset in assetsFile.Objects)
+                {
+                    workItems.Add(new EagerAssetWorkItem(assetsFile, asset, workItems.Count));
+                }
+            }
+
+            var records = new EagerAssetRecord[workItems.Count];
+            Parallel.For(0, workItems.Count, CreateStructureBuildParallelOptions(), index =>
+            {
+                records[index] = BuildEagerAssetRecord(workItems[index], displayAllChecked);
+            });
+
+            productName = null;
+            for (int index = 0; index < records.Length; index++)
+            {
+                var record = records[index];
+                var item = record.Item;
+                objectAssetItemDic[record.Asset] = item;
+                pathIDAssetItemDic[$"{record.File.fileName}#{record.Asset.m_PathID}"] = item;
+
+                if (record.GameObject != null && !treeNodeDictionary.ContainsKey(record.GameObject))
+                {
+                    treeNodeDictionary[record.GameObject] = new GameObjectNode
+                    {
+                        Name = record.GameObject.m_Name,
+                        GameObject = record.GameObject
+                    };
+                }
+
+                if (record.Containers != null)
+                {
+                    containers.AddRange(record.Containers);
+                }
+
+                if (productName == null && !string.IsNullOrEmpty(record.ProductName))
+                {
+                    productName = record.ProductName;
+                }
+
+                if (record.IncludeInExportable)
+                {
+                    exportableAssets.Add(item);
+                }
+            }
+
+            SerializedFile? currentFile = null;
+            GameObjectNode? fileNode = null;
+            for (int index = 0; index < records.Length; index++)
+            {
+                var record = records[index];
+                if (!ReferenceEquals(currentFile, record.File))
+                {
+                    if (fileNode?.ChildCount > 0)
+                    {
+                        sceneTreeNodes.Add(fileNode);
+                    }
+
+                    currentFile = record.File;
+                    fileNode = new GameObjectNode { Name = record.File.fileName };
+                }
+
+                if (record.GameObject == null || fileNode == null)
+                {
+                    continue;
+                }
+
+                var currentNode = treeNodeDictionary[record.GameObject];
+                var parentNode = fileNode;
+
+                if (record.GameObject.m_Transform != null
+                    && record.GameObject.m_Transform.m_Father.TryGet(out var father)
+                    && father.m_GameObject.TryGet(out var parentGameObject)
+                    && treeNodeDictionary.TryGetValue(parentGameObject, out var parentGameObjectNode))
+                {
+                    parentNode = parentGameObjectNode;
+                }
+
+                parentNode.AddChild(currentNode);
+            }
+
+            if (fileNode?.ChildCount > 0)
+            {
+                sceneTreeNodes.Add(fileNode);
+            }
+        }
+
+        private static EagerAssetRecord BuildEagerAssetRecord(EagerAssetWorkItem workItem, bool displayAllChecked)
+        {
+            var asset = workItem.Asset;
+            var assetItem = new AssetItem(asset)
+            {
+                UniqueID = " #" + workItem.Index.ToString(CultureInfo.InvariantCulture)
+            };
+            var exportable = false;
+            string? productName = null;
+            GameObject? gameObject = null;
+            List<(PPtr<AssetStudio.Object>, string)>? containers = null;
+
+            switch (asset)
+            {
+                case GameObject m_GameObject:
+                    assetItem.Name = m_GameObject.m_Name;
+                    gameObject = m_GameObject;
+                    break;
+                case Texture2D m_Texture2D:
+                    if (!string.IsNullOrEmpty(m_Texture2D.m_StreamData?.path))
+                    {
+                        assetItem.FullSize = asset.byteSize + m_Texture2D.m_StreamData.size;
+                    }
+                    assetItem.Name = m_Texture2D.m_Name;
+                    exportable = true;
+                    break;
+                case AudioClip m_AudioClip:
+                    if (!string.IsNullOrEmpty(m_AudioClip.m_Source))
+                    {
+                        assetItem.FullSize = asset.byteSize + m_AudioClip.m_Size;
+                    }
+                    assetItem.Name = m_AudioClip.m_Name;
+                    exportable = true;
+                    break;
+                case VideoClip m_VideoClip:
+                    if (!string.IsNullOrEmpty(m_VideoClip.m_OriginalPath))
+                    {
+                        assetItem.FullSize = asset.byteSize + (long)m_VideoClip.m_ExternalResources.m_Size;
+                    }
+                    assetItem.Name = m_VideoClip.m_Name;
+                    exportable = true;
+                    break;
+                case VideoPlayer m_VideoPlayer:
+                    if (TryResolveLocalObject(workItem.File, m_VideoPlayer.m_VideoClip, out VideoClip? resolvedClip) && resolvedClip != null)
+                    {
+                        if (!string.IsNullOrEmpty(resolvedClip.m_OriginalPath))
+                        {
+                            assetItem.FullSize = asset.byteSize + (long)resolvedClip.m_ExternalResources.m_Size;
+                        }
+                        assetItem.Name = $"{(TryResolveLocalObject(workItem.File, m_VideoPlayer.m_GameObject, out GameObject? go) && go != null ? go.m_Name : "VideoPlayer")} (Clip: {resolvedClip.m_Name})";
+                    }
+                    else
+                    {
+                        assetItem.Name = TryResolveLocalObject(workItem.File, m_VideoPlayer.m_GameObject, out GameObject? go) && go != null
+                            ? go.m_Name
+                            : "VideoPlayer";
+                    }
+                    exportable = true;
+                    break;
+                case Shader m_Shader:
+                    assetItem.Name = m_Shader.m_ParsedForm?.m_Name ?? m_Shader.m_Name;
+                    exportable = true;
+                    break;
+                case Mesh _:
+                case Material _:
+                case TextAsset _:
+                case AnimationClip _:
+                case Font _:
+                case MovieTexture _:
+                case Sprite _:
+                case Avatar _:
+                case RuntimeAnimatorController _:
+                    assetItem.Name = ((NamedObject)asset).m_Name;
+                    exportable = true;
+                    break;
+                case MonoScript m_MonoScript:
+                    assetItem.Name = m_MonoScript.m_Name;
+                    exportable = true;
+                    break;
+                case Animator m_Animator:
+                    if (TryResolveLocalObject(workItem.File, m_Animator.m_GameObject, out GameObject? animatorGameObject) && animatorGameObject != null)
+                    {
+                        assetItem.Name = animatorGameObject.m_Name;
+                    }
+                    exportable = true;
+                    break;
+                case MonoBehaviour m_MonoBehaviour:
+                    if (m_MonoBehaviour.m_Name == ""
+                        && TryResolveLocalObject(workItem.File, m_MonoBehaviour.m_Script, out MonoScript? script)
+                        && script != null)
+                    {
+                        assetItem.Name = script.m_ClassName;
+                    }
+                    else
+                    {
+                        assetItem.Name = m_MonoBehaviour.m_Name;
+                    }
+                    exportable = true;
+                    break;
+                case AssetBundle m_AssetBundle:
+                    containers = CollectAssetBundleContainers(m_AssetBundle);
+                    assetItem.Name = m_AssetBundle.m_Name;
+                    break;
+                case ResourceManager m_ResourceManager:
+                    containers = CollectResourceManagerContainers(m_ResourceManager);
+                    break;
+                case PlayerSettings m_PlayerSettings:
+                    productName = m_PlayerSettings.productName;
+                    break;
+                case NamedObject m_NamedObject:
+                    assetItem.Name = m_NamedObject.m_Name;
+                    break;
+            }
+
+            if (string.IsNullOrEmpty(assetItem.Name))
+            {
+                assetItem.Name = assetItem.TypeString + assetItem.UniqueID;
+            }
+
+            return new EagerAssetRecord(
+                workItem.File,
+                asset,
+                assetItem,
+                gameObject,
+                containers,
+                productName,
+                displayAllChecked || exportable);
+        }
+
+        private static List<(PPtr<AssetStudio.Object>, string)> CollectAssetBundleContainers(AssetBundle assetBundle)
+        {
+            var containers = new List<(PPtr<AssetStudio.Object>, string)>();
+            foreach (var container in assetBundle.m_Container)
+            {
+                var preloadIndex = container.Value.preloadIndex;
+                var preloadSize = container.Value.preloadSize;
+                var preloadEnd = preloadIndex + preloadSize;
+                for (int k = preloadIndex; k < preloadEnd; k++)
+                {
+                    containers.Add((assetBundle.m_PreloadTable[k], container.Key));
+                }
+            }
+
+            return containers;
+        }
+
+        private static List<(PPtr<AssetStudio.Object>, string)> CollectResourceManagerContainers(ResourceManager resourceManager)
+        {
+            var containers = new List<(PPtr<AssetStudio.Object>, string)>();
+            foreach (var container in resourceManager.m_Container)
+            {
+                containers.Add((container.Value, container.Key));
+            }
+
+            return containers;
+        }
+
+        private static bool TryResolveLocalObject<T>(SerializedFile file, PPtr<T> pointer, out T? result)
+            where T : AssetStudio.Object
+        {
+            result = null;
+            if (pointer.m_FileID != 0)
+            {
+                return false;
+            }
+
+            if (file.ObjectsDic.TryGetValue(pointer.m_PathID, out var obj) && obj is T typed)
+            {
+                result = typed;
+                return true;
+            }
+
+            return false;
+        }
+
+        private readonly record struct EagerAssetWorkItem(SerializedFile File, AssetStudio.Object Asset, int Index);
+
+        private sealed record EagerAssetRecord(
+            SerializedFile File,
+            AssetStudio.Object Asset,
+            AssetItem Item,
+            GameObject? GameObject,
+            List<(PPtr<AssetStudio.Object>, string)>? Containers,
+            string? ProductName,
+            bool IncludeInExportable);
+
         private static void LinkAssetItemsToSceneNodesBackground(
             List<SerializedFile> assetsFileList,
             Dictionary<GameObject, GameObjectNode> treeNodeDictionary,
@@ -161,18 +536,22 @@ namespace AssetStudio.Avalonia
             out Dictionary<Material, Material?> materialPreviewMaterialCacheOut,
             out Dictionary<Material, Dictionary<string, Texture2D?>> materialTextureSlotsCacheOut)
         {
+            var localObjectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>(localExportableAssets.Count);
+            foreach (var item in localExportableAssets)
+            {
+                var asset = item.Asset;
+                if (asset != null)
+                {
+                    localObjectToAssetItemCache[asset] = item;
+                }
+            }
+
             var localMeshToMaterialsCache = new Dictionary<Mesh, List<Material?>>();
             var localMeshAssociatedRenderersCache = new Dictionary<Mesh, List<string>>();
             var localMeshSourceTypesCache = new Dictionary<Mesh, HashSet<string>>();
             var localMaterialMainTextureCache = new Dictionary<Material, Texture2D?>();
             var localMaterialPreviewMaterialCache = new Dictionary<Material, Material?>();
             var localMaterialTextureSlotsCache = new Dictionary<Material, Dictionary<string, Texture2D?>>();
-
-            var localObjectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>(localExportableAssets.Count);
-            foreach (var item in localExportableAssets)
-            {
-                localObjectToAssetItemCache[item.Asset] = item;
-            }
 
             void AddMeshMaterials(Mesh mesh, List<Material?> materials)
             {
@@ -206,116 +585,56 @@ namespace AssetStudio.Avalonia
                 renderers.Add(description);
             }
 
-            GameObject? ResolveGameObject(SerializedFile sourceFile, PPtr<GameObject> pptr)
+            var fileResults = new AssetReferenceIndexBuildResult?[assetsFileList.Count];
+            Parallel.For(0, assetsFileList.Count, CreateStructureBuildParallelOptions(), index =>
             {
-                if (pptr.TryGet(out var go))
-                {
-                    return go;
-                }
-                return pptr.m_FileID == 0 ? ResolveObject(sourceFile, pptr.m_PathID) as GameObject : null;
-            }
+                fileResults[index] = BuildAssetReferenceIndexForFile(assetsFileList[index]);
+            });
 
-            Mesh? ResolveMesh(SerializedFile sourceFile, PPtr<Mesh> pptr)
+            foreach (var fileResult in fileResults)
             {
-                if (pptr.TryGet(out var mesh))
+                if (fileResult == null)
                 {
-                    return mesh;
+                    continue;
                 }
-                return pptr.m_FileID == 0 ? ResolveObject(sourceFile, pptr.m_PathID) as Mesh : null;
-            }
 
-            Material? ResolveRendererMaterial(PPtr<Material> pptr)
-            {
-                if (pptr.TryGet(out var material))
+                foreach (var entry in fileResult.MaterialPreviewMaterialCache)
                 {
-                    return material;
+                    localMaterialPreviewMaterialCache[entry.Key] = entry.Value;
                 }
-                return null;
-            }
 
-            AssetStudio.Object? ResolveObject(SerializedFile sourceFile, long pathID)
-            {
-                if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj))
+                foreach (var entry in fileResult.MaterialTextureSlotsCache)
                 {
-                    return obj;
+                    localMaterialTextureSlotsCache[entry.Key] = entry.Value;
                 }
-                return null;
-            }
 
-            foreach (var file in assetsFileList)
-            {
-                foreach (var obj in file.Objects)
+                foreach (var entry in fileResult.MaterialMainTextureCache)
                 {
-                    if (obj is Material material)
+                    localMaterialMainTextureCache[entry.Key] = entry.Value;
+                }
+
+                foreach (var entry in fileResult.MeshToMaterialsCache)
+                {
+                    AddMeshMaterials(entry.Key, entry.Value);
+                }
+
+                foreach (var entry in fileResult.MeshSourceTypesCache)
+                {
+                    foreach (var sourceType in entry.Value)
                     {
-                        IndexMaterialTexturesBackground(material, localMaterialPreviewMaterialCache, localMaterialTextureSlotsCache, localMaterialMainTextureCache);
+                        AddMeshAssociation(entry.Key, sourceType, null);
                     }
-                    else if (obj is SkinnedMeshRenderer smr)
+                }
+
+                foreach (var entry in fileResult.MeshAssociatedRenderersCache)
+                {
+                    if (!localMeshAssociatedRenderersCache.TryGetValue(entry.Key, out var renderers))
                     {
-                        var smrMesh = ResolveMesh(file, smr.m_Mesh);
-
-                        if (smrMesh != null)
-                        {
-                            var go = ResolveGameObject(file, smr.m_GameObject);
-                            AddMeshAssociation(
-                                smrMesh,
-                                "SkinnedMeshRenderer",
-                                go != null ? $"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})" : null);
-
-                            if (smr.m_Materials != null)
-                            {
-                                var list = new List<Material?>();
-                                foreach (var matPtr in smr.m_Materials)
-                                {
-                                    list.Add(ResolveRendererMaterial(matPtr));
-                                }
-                                AddMeshMaterials(smrMesh, list);
-                            }
-                        }
+                        renderers = new List<string>();
+                        localMeshAssociatedRenderersCache[entry.Key] = renderers;
                     }
-                    else if (obj is MeshRenderer mr)
-                    {
-                        var go = ResolveGameObject(file, mr.m_GameObject);
 
-                        if (go?.m_Components != null)
-                        {
-                            foreach (var compPtr in go.m_Components)
-                            {
-                                Component? comp = null;
-                                if (compPtr.TryGet(out var cp))
-                                {
-                                    comp = cp;
-                                }
-                                else if (compPtr.m_FileID == 0)
-                                {
-                                    comp = ResolveObject(file, compPtr.m_PathID) as Component;
-                                }
-
-                                if (comp is MeshFilter mf)
-                                {
-                                    var mfMesh = ResolveMesh(file, mf.m_Mesh);
-
-                                    if (mfMesh != null)
-                                    {
-                                        AddMeshAssociation(
-                                            mfMesh,
-                                            "MeshFilter",
-                                            $"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
-
-                                        if (mr.m_Materials != null)
-                                        {
-                                            var list = new List<Material?>();
-                                            foreach (var matPtr in mr.m_Materials)
-                                            {
-                                                list.Add(ResolveRendererMaterial(matPtr));
-                                            }
-                                            AddMeshMaterials(mfMesh, list);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    renderers.AddRange(entry.Value);
                 }
             }
 
@@ -326,6 +645,169 @@ namespace AssetStudio.Avalonia
             materialMainTextureCacheOut = localMaterialMainTextureCache;
             materialPreviewMaterialCacheOut = localMaterialPreviewMaterialCache;
             materialTextureSlotsCacheOut = localMaterialTextureSlotsCache;
+        }
+
+        private static AssetReferenceIndexBuildResult BuildAssetReferenceIndexForFile(SerializedFile file)
+        {
+            var result = new AssetReferenceIndexBuildResult();
+
+            void AddMeshMaterials(Mesh mesh, List<Material?> materials)
+            {
+                if (!result.MeshToMaterialsCache.TryGetValue(mesh, out var existingList)
+                    || ScoreMaterialsStatic(materials) > ScoreMaterialsStatic(existingList))
+                {
+                    result.MeshToMaterialsCache[mesh] = materials;
+                }
+            }
+
+            void AddMeshAssociation(Mesh mesh, string sourceType, string? description)
+            {
+                if (!result.MeshSourceTypesCache.TryGetValue(mesh, out var sourceTypes))
+                {
+                    sourceTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    result.MeshSourceTypesCache[mesh] = sourceTypes;
+                }
+                sourceTypes.Add(sourceType);
+
+                if (string.IsNullOrEmpty(description))
+                {
+                    return;
+                }
+
+                if (!result.MeshAssociatedRenderersCache.TryGetValue(mesh, out var renderers))
+                {
+                    renderers = new List<string>();
+                    result.MeshAssociatedRenderersCache[mesh] = renderers;
+                }
+
+                renderers.Add(description);
+            }
+
+            foreach (var obj in file.Objects)
+            {
+                if (obj is Material material)
+                {
+                    IndexMaterialTexturesBackground(material, result.MaterialPreviewMaterialCache, result.MaterialTextureSlotsCache, result.MaterialMainTextureCache);
+                }
+                else if (obj is SkinnedMeshRenderer smr)
+                {
+                    var smrMesh = ResolveMeshBackground(file, smr.m_Mesh);
+
+                    if (smrMesh != null)
+                    {
+                        var go = ResolveGameObjectBackground(file, smr.m_GameObject);
+                        AddMeshAssociation(
+                            smrMesh,
+                            "SkinnedMeshRenderer",
+                            go != null ? $"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})" : null);
+
+                        if (smr.m_Materials != null)
+                        {
+                            var list = new List<Material?>();
+                            foreach (var matPtr in smr.m_Materials)
+                            {
+                                list.Add(ResolveRendererMaterialBackground(matPtr));
+                            }
+                            AddMeshMaterials(smrMesh, list);
+                        }
+                    }
+                }
+                else if (obj is MeshRenderer mr)
+                {
+                    var go = ResolveGameObjectBackground(file, mr.m_GameObject);
+
+                    if (go?.m_Components != null)
+                    {
+                        foreach (var compPtr in go.m_Components)
+                        {
+                            Component? comp = null;
+                            if (compPtr.TryGet(out var cp))
+                            {
+                                comp = cp;
+                            }
+                            else if (compPtr.m_FileID == 0)
+                            {
+                                comp = ResolveObjectBackground(file, compPtr.m_PathID) as Component;
+                            }
+
+                            if (comp is MeshFilter mf)
+                            {
+                                var mfMesh = ResolveMeshBackground(file, mf.m_Mesh);
+
+                                if (mfMesh != null)
+                                {
+                                    AddMeshAssociation(
+                                        mfMesh,
+                                        "MeshFilter",
+                                        $"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
+
+                                    if (mr.m_Materials != null)
+                                    {
+                                        var list = new List<Material?>();
+                                        foreach (var matPtr in mr.m_Materials)
+                                        {
+                                            list.Add(ResolveRendererMaterialBackground(matPtr));
+                                        }
+                                        AddMeshMaterials(mfMesh, list);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static GameObject? ResolveGameObjectBackground(SerializedFile sourceFile, PPtr<GameObject> pptr)
+        {
+            if (pptr.TryGet(out var go))
+            {
+                return go;
+            }
+            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as GameObject : null;
+        }
+
+        private static Mesh? ResolveMeshBackground(SerializedFile sourceFile, PPtr<Mesh> pptr)
+        {
+            if (pptr.TryGet(out var mesh))
+            {
+                return mesh;
+            }
+            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Mesh : null;
+        }
+
+        private static Material? ResolveRendererMaterialBackground(PPtr<Material> pptr)
+        {
+            if (pptr.TryGet(out var material))
+            {
+                return material;
+            }
+            return null;
+        }
+
+        private static AssetStudio.Object? ResolveObjectBackground(SerializedFile sourceFile, long pathID)
+        {
+            lock (sourceFile)
+            {
+                if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj))
+                {
+                    return obj;
+                }
+            }
+
+            return null;
+        }
+
+        private sealed class AssetReferenceIndexBuildResult
+        {
+            public Dictionary<Mesh, List<Material?>> MeshToMaterialsCache { get; } = new();
+            public Dictionary<Mesh, List<string>> MeshAssociatedRenderersCache { get; } = new();
+            public Dictionary<Mesh, HashSet<string>> MeshSourceTypesCache { get; } = new();
+            public Dictionary<Material, Texture2D?> MaterialMainTextureCache { get; } = new();
+            public Dictionary<Material, Material?> MaterialPreviewMaterialCache { get; } = new();
+            public Dictionary<Material, Dictionary<string, Texture2D?>> MaterialTextureSlotsCache { get; } = new();
         }
 
         private static void BuildAnimationPreviewIndexesBackground(
