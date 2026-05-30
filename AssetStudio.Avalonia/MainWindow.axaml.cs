@@ -131,13 +131,13 @@ public partial class MainWindow : Window
         {
             if (global::Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
             {
-                return true;
+                return MemoryPressureResult.Continue;
             }
             return global::Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
             {
                 var msg = $"Memory usage has reached {loadPercent}% (limit: {limitPercent}%) during {operation}.\n\n" +
                           "Continuing may slow down your system or cause it to run out of memory.\n\n" +
-                          "Do you want to ignore this warning and continue loading?";
+                          "What would you like to do?";
                 return await ShowMemoryPressureWarningDialog(msg);
             }).GetAwaiter().GetResult();
         };
@@ -1600,14 +1600,14 @@ public partial class MainWindow : Window
         return $"{value:0.##} {units[unit]}";
     }
 
-    private async Task<bool> ShowMemoryPressureWarningDialog(string message)
+    private async Task<MemoryPressureResult> ShowMemoryPressureWarningDialog(string message)
     {
         var dialog = new Window
         {
             Title = "Memory pressure warning",
-            Width = 550,
-            Height = 220,
-            MinWidth = 400,
+            Width = 600,
+            Height = 240,
+            MinWidth = 450,
             MinHeight = 180,
             WindowStartupLocation = WindowStartupLocation.CenterOwner
         };
@@ -1642,7 +1642,14 @@ public partial class MainWindow : Window
             Content = "Cancel loading",
             MinWidth = 120
         };
-        cancelButton.Click += (_, _) => dialog.Close(false);
+        cancelButton.Click += (_, _) => dialog.Close(MemoryPressureResult.Cancel);
+
+        var stopButton = new Button
+        {
+            Content = "Stop and keep loaded",
+            MinWidth = 150
+        };
+        stopButton.Click += (_, _) => dialog.Close(MemoryPressureResult.StopAndKeep);
 
         var continueButton = new Button
         {
@@ -1650,9 +1657,10 @@ public partial class MainWindow : Window
             MinWidth = 150,
             FontWeight = global::Avalonia.Media.FontWeight.Bold
         };
-        continueButton.Click += (_, _) => dialog.Close(true);
+        continueButton.Click += (_, _) => dialog.Close(MemoryPressureResult.Continue);
 
         buttonPanel.Children.Add(cancelButton);
+        buttonPanel.Children.Add(stopButton);
         buttonPanel.Children.Add(continueButton);
 
         Grid.SetRow(scrollViewer, 0);
@@ -1661,7 +1669,7 @@ public partial class MainWindow : Window
         grid.Children.Add(buttonPanel);
         dialog.Content = grid;
 
-        return await dialog.ShowDialog<bool>(this);
+        return await dialog.ShowDialog<MemoryPressureResult>(this);
     }
 
     private void ShowMemoryPressureError(MemoryPressureException ex)

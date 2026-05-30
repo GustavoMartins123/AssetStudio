@@ -40,6 +40,7 @@ void main()
         private const string fsSource = @"
 in vec3 normal;
 layout(location = 0) out vec4 outputColor;
+uniform vec4 materialTint;
 void main()
 {
 	vec3 unitNormal = normalize(normal);
@@ -49,7 +50,7 @@ void main()
 	vec3 color = nDotProduct * vec3(1.0, 0.957, 0.839) / 3.14159;
 	color += vec3(0.779, 0.716, 0.453) * ContributionWeights.y;
 	color += vec3(0.368, 0.477, 0.735) * ContributionWeights.x;
-	outputColor = vec4(sqrt(color), 1.0);
+	outputColor = vec4(sqrt(color) * materialTint.rgb, materialTint.a);
 }";
 
         private const string fsBlackSource = @"
@@ -93,9 +94,10 @@ void main()
         private const string fsColorSource = @"
 layout(location = 0) out vec4 outputColor;
 in vec4 color;
+uniform vec4 materialTint;
 void main()
 {
-	outputColor = color;
+	outputColor = vec4(color.rgb * materialTint.rgb, color.a * materialTint.a);
 }";
 
         private const string vsTexSource = @"
@@ -119,6 +121,7 @@ in vec3 normal;
 in vec2 texCoord;
 layout(location = 0) out vec4 outputColor;
 uniform sampler2D mainTex;
+uniform vec4 materialTint;
 void main()
 {
 	vec3 unitNormal = normalize(normal);
@@ -131,7 +134,7 @@ void main()
 	vec4 texColor = texture(mainTex, texCoord);
 	if (texColor.a < 0.25)
 		discard;
-	outputColor = vec4(texColor.rgb * lightColor, texColor.a);
+	outputColor = vec4(texColor.rgb * materialTint.rgb * lightColor, texColor.a * materialTint.a);
 }";
 
         private const int LocationPosition = 0;
@@ -139,6 +142,7 @@ void main()
         private const int LocationColor = 2;
         private const int LocationTexCoord = 3;
         private const float PreviewFitScale = 1.35f;
+        private const float PreviewDepthScale = 0.02f;
         private const float DefaultAvatarReferenceMeshDensityPercent = 70f;
         private const float MinAvatarReferenceMeshDensityPercent = 1f;
         private const float MaxAvatarReferenceMeshDensityPercent = 100f;
@@ -153,10 +157,12 @@ void main()
         private int uniformModelMatrix;
         private int uniformViewMatrix;
         private int uniformProjMatrix;
+        private int uniformMaterialTint;
 
         private int uniformModelMatrixColor;
         private int uniformViewMatrixColor;
         private int uniformProjMatrixColor;
+        private int uniformMaterialTintColor;
 
         private int uniformModelMatrixBlack;
         private int uniformViewMatrixBlack;
@@ -166,6 +172,7 @@ void main()
         private int uniformModelMatrixTex;
         private int uniformViewMatrixTex;
         private int uniformProjMatrixTex;
+        private int uniformMaterialTintTex;
 
         private int pgmGreenID;
         private int uniformModelMatrixGreen;
@@ -268,6 +275,7 @@ void main()
         private int normalMode = 0;
         private bool previewMaterialMode = false;
         private int previewTextureId = 0;
+        private Vector4[]? materialTintOverrides;
 
         // Interaction state
         private global::Avalonia.Point mpos;
@@ -333,6 +341,14 @@ void main()
                 vao = 0;
                 RequestNextFrameRendering();
             }
+        }
+
+        public void SetMaterialOverrides(IReadOnlyList<Vector4>? materialTints)
+        {
+            materialTintOverrides = materialTints == null || materialTints.Count == 0
+                ? null
+                : materialTints.ToArray();
+            RequestNextFrameRendering();
         }
 
         private static void ExpandBounds(Vector3 point, ref Vector3 min, ref Vector3 max)
@@ -821,6 +837,7 @@ void main()
         {
             ClearAvatarPreviewState();
             previewMaterialMode = false;
+            materialTintOverrides = null;
             m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0) return;
 
@@ -1001,6 +1018,7 @@ void main()
         {
             ++meshLoadCounter;
             ClearAvatarPreviewState();
+            materialTintOverrides = null;
 
             lock (textureLock)
             {
@@ -1146,10 +1164,12 @@ void main()
                 uniformModelMatrix = GL.GetUniformLocation(pgmID, "modelMatrix");
                 uniformViewMatrix = GL.GetUniformLocation(pgmID, "viewMatrix");
                 uniformProjMatrix = GL.GetUniformLocation(pgmID, "projMatrix");
+                uniformMaterialTint = GL.GetUniformLocation(pgmID, "materialTint");
 
                 uniformModelMatrixColor = GL.GetUniformLocation(pgmColorID, "modelMatrix");
                 uniformViewMatrixColor = GL.GetUniformLocation(pgmColorID, "viewMatrix");
                 uniformProjMatrixColor = GL.GetUniformLocation(pgmColorID, "projMatrix");
+                uniformMaterialTintColor = GL.GetUniformLocation(pgmColorID, "materialTint");
 
                 uniformModelMatrixBlack = GL.GetUniformLocation(pgmBlackID, "modelMatrix");
                 uniformViewMatrixBlack = GL.GetUniformLocation(pgmBlackID, "viewMatrix");
@@ -1159,6 +1179,7 @@ void main()
                 uniformModelMatrixTex = GL.GetUniformLocation(pgmTexID, "modelMatrix");
                 uniformViewMatrixTex = GL.GetUniformLocation(pgmTexID, "viewMatrix");
                 uniformProjMatrixTex = GL.GetUniformLocation(pgmTexID, "projMatrix");
+                uniformMaterialTintTex = GL.GetUniformLocation(pgmTexID, "materialTint");
 
                 pgmGreenID = GL.CreateProgram();
                 LoadShaderFromString($"{glslVersion}\n{vsSkeletonSource}", ShaderType.VertexShader, pgmGreenID, out _);
@@ -1442,16 +1463,24 @@ void main()
                     }
 
                     var localTextureIds = previewTextureIds;
-                    if (previewMaterialMode && localTextureIds != null && currentMesh != null && currentMesh.m_SubMeshes != null && currentMesh.m_SubMeshes.Length > 0 && !isAvatarMode)
+                    var localMaterialTints = materialTintOverrides;
+                    var localSubMeshes = currentMesh?.m_SubMeshes;
+                    bool drawBySubMesh = localSubMeshes != null
+                        && localSubMeshes.Length > 0
+                        && !isAvatarMode
+                        && ((previewMaterialMode && localTextureIds != null) || (localMaterialTints != null && localMaterialTints.Length > 0));
+
+                    if (drawBySubMesh && localSubMeshes != null)
                     {
                         int flatOffsetElements = 0;
-                        for (int i = 0; i < currentMesh.m_SubMeshes.Length; i++)
+                        for (int i = 0; i < localSubMeshes.Length; i++)
                         {
-                            var subMesh = currentMesh.m_SubMeshes[i];
-                            int texIndex = i < localTextureIds.Length ? i : 0;
-                            int texId = texIndex < localTextureIds.Length ? localTextureIds[texIndex] : 0;
+                            var subMesh = localSubMeshes[i];
+                            int texIndex = localTextureIds != null && i < localTextureIds.Length ? i : 0;
+                            int texId = localTextureIds != null && texIndex < localTextureIds.Length ? localTextureIds[texIndex] : 0;
+                            var tint = GetMaterialTint(i);
 
-                            if (texId != 0)
+                            if (previewMaterialMode && texId != 0)
                             {
                                 GL.UseProgram(pgmTexID);
                                 GL.ActiveTexture(TextureUnit.Texture0);
@@ -1460,6 +1489,7 @@ void main()
                                 GL.UniformMatrix4(uniformModelMatrixTex, false, ref modelMatrixData);
                                 GL.UniformMatrix4(uniformViewMatrixTex, false, ref viewMatrixData);
                                 GL.UniformMatrix4(uniformProjMatrixTex, false, ref projMatrixData);
+                                SetMaterialTint(uniformMaterialTintTex, tint);
                             }
                             else
                             {
@@ -1469,6 +1499,7 @@ void main()
                                     GL.UniformMatrix4(uniformModelMatrix, false, ref modelMatrixData);
                                     GL.UniformMatrix4(uniformViewMatrix, false, ref viewMatrixData);
                                     GL.UniformMatrix4(uniformProjMatrix, false, ref projMatrixData);
+                                    SetMaterialTint(uniformMaterialTint, tint);
                                 }
                                 else
                                 {
@@ -1476,6 +1507,7 @@ void main()
                                     GL.UniformMatrix4(uniformModelMatrixColor, false, ref modelMatrixData);
                                     GL.UniformMatrix4(uniformViewMatrixColor, false, ref viewMatrixData);
                                     GL.UniformMatrix4(uniformProjMatrixColor, false, ref projMatrixData);
+                                    SetMaterialTint(uniformMaterialTintColor, tint);
                                 }
                             }
 
@@ -1485,6 +1517,7 @@ void main()
                     }
                     else
                     {
+                        var tint = GetMaterialTint(0);
                         if (previewMaterialMode && localTextureIds != null && localTextureIds.Length > 0 && localTextureIds[0] != 0)
                         {
                             GL.UseProgram(pgmTexID);
@@ -1494,6 +1527,7 @@ void main()
                             GL.UniformMatrix4(uniformModelMatrixTex, false, ref modelMatrixData);
                             GL.UniformMatrix4(uniformViewMatrixTex, false, ref viewMatrixData);
                             GL.UniformMatrix4(uniformProjMatrixTex, false, ref projMatrixData);
+                            SetMaterialTint(uniformMaterialTintTex, tint);
                         }
                         else
                         {
@@ -1503,6 +1537,7 @@ void main()
                                 GL.UniformMatrix4(uniformModelMatrix, false, ref modelMatrixData);
                                 GL.UniformMatrix4(uniformViewMatrix, false, ref viewMatrixData);
                                 GL.UniformMatrix4(uniformProjMatrix, false, ref projMatrixData);
+                                SetMaterialTint(uniformMaterialTint, tint);
                             }
                             else
                             {
@@ -1510,6 +1545,7 @@ void main()
                                 GL.UniformMatrix4(uniformModelMatrixColor, false, ref modelMatrixData);
                                 GL.UniformMatrix4(uniformViewMatrixColor, false, ref viewMatrixData);
                                 GL.UniformMatrix4(uniformProjMatrixColor, false, ref projMatrixData);
+                                SetMaterialTint(uniformMaterialTintColor, tint);
                             }
                         }
                         GL.DrawElements(PrimitiveType.Triangles, indiceData.Length, DrawElementsType.UnsignedInt, 0);
@@ -1555,12 +1591,12 @@ void main()
             if (width <= height)
             {
                 float k = (float)(width / (height == 0 ? 1 : height));
-                projMatrixData = Matrix4.CreateScale(1, k, 1);
+                projMatrixData = Matrix4.CreateScale(1, k, PreviewDepthScale);
             }
             else
             {
                 float k = (float)(height / (width == 0 ? 1 : width));
-                projMatrixData = Matrix4.CreateScale(k, 1, 1);
+                projMatrixData = Matrix4.CreateScale(k, 1, PreviewDepthScale);
             }
         }
 
@@ -1682,6 +1718,25 @@ void main()
                 CreateEBO(out _, indiceData);
             }
             GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+        }
+
+        private Vector4 GetMaterialTint(int materialIndex)
+        {
+            var tints = materialTintOverrides;
+            if (tints != null && materialIndex >= 0 && materialIndex < tints.Length)
+            {
+                return tints[materialIndex];
+            }
+
+            return Vector4.One;
+        }
+
+        private static void SetMaterialTint(int uniformLocation, Vector4 tint)
+        {
+            if (uniformLocation >= 0)
+            {
+                GL.Uniform4(uniformLocation, tint.X, tint.Y, tint.Z, tint.W);
+            }
         }
 
         private void CreateVAO()

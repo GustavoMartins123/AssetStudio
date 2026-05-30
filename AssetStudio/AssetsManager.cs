@@ -3,11 +3,19 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using static AssetStudio.ImportHelper;
 
 namespace AssetStudio
 {
+    public enum MemoryPressureResult
+    {
+        Cancel,
+        Continue,
+        StopAndKeep
+    }
+
     public class AssetsManager
     {
         private const double DefaultLoadThreadRatio = 0.4;
@@ -15,7 +23,8 @@ namespace AssetStudio
         private const int DefaultMemoryLimitPercent = 90;
 
         public static bool DisableMemoryPressureCheck = false;
-        public static Func<string, int, int, bool> MemoryPressureCallback;
+        public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;
+        public static volatile bool ShouldStopLoading = false;
 
         public string SpecifyUnityVersion;
         public string ProjectRoot;
@@ -59,6 +68,7 @@ namespace AssetStudio
         public void LoadFiles(params string[] files)
         {
             DisableMemoryPressureCheck = false;
+            ShouldStopLoading = false;
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
             if (string.IsNullOrEmpty(ProjectRoot))
             {
@@ -72,6 +82,7 @@ namespace AssetStudio
         public void LoadFolder(string path)
         {
             DisableMemoryPressureCheck = false;
+            ShouldStopLoading = false;
             if (string.IsNullOrEmpty(ProjectRoot))
             {
                 ProjectRoot = Path.GetFullPath(path);
@@ -112,10 +123,30 @@ namespace AssetStudio
                     bool isWorkerActive = true;
                     while (true)
                     {
+                        if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                        {
+                            if (isWorkerActive)
+                            {
+                                System.Threading.Interlocked.Decrement(ref activeWorkers);
+                                isWorkerActive = false;
+                            }
+                            break;
+                        }
+
                         string file = null;
                         if (loadQueue.TryDequeue(out file))
                         {
                             ThrowIfMemoryPressureTooHigh("loading files");
+
+                            if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                            {
+                                if (isWorkerActive)
+                                {
+                                    System.Threading.Interlocked.Decrement(ref activeWorkers);
+                                    isWorkerActive = false;
+                                }
+                                break;
+                            }
 
                             if (!isWorkerActive)
                             {
@@ -535,6 +566,7 @@ namespace AssetStudio
         public void Clear()
         {
             DisableMemoryPressureCheck = false;
+            ShouldStopLoading = false;
             ProjectIndex.Clear();
             foreach (var assetsFile in assetsFileList)
             {
@@ -747,9 +779,21 @@ namespace AssetStudio
                         () => assetsFile.reader.Clone(),
                         (objectInfo, state, localReader) =>
                         {
+                            if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                            {
+                                state.Stop();
+                                return localReader;
+                            }
+
                             if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
                             {
                                 ThrowIfMemoryPressureTooHigh("reading assets (lazy)");
+                            }
+
+                            if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                            {
+                                state.Stop();
+                                return localReader;
                             }
 
                             var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
@@ -837,9 +881,21 @@ namespace AssetStudio
                     () => assetsFile.reader.Clone(),
                     (objectInfo, state, localReader) =>
                     {
+                        if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                        {
+                            state.Stop();
+                            return localReader;
+                        }
+
                         if ((System.Threading.Volatile.Read(ref progressValue) & 0xff) == 0)
                         {
                             ThrowIfMemoryPressureTooHigh("reading assets");
+                        }
+
+                        if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                        {
+                            state.Stop();
+                            return localReader;
                         }
 
                         var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
@@ -946,6 +1002,71 @@ namespace AssetStudio
             return DefaultMemoryLimitPercent;
         }
 
+#if NET6_0_OR_GREATER
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private class MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+            public MEMORYSTATUSEX()
+            {
+                dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+            }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX lpBuffer);
+
+        private static bool TryGetLinuxAvailableMemory(out ulong availableBytes)
+        {
+            availableBytes = 0;
+            try
+            {
+                if (File.Exists("/proc/meminfo"))
+                {
+                    ulong memAvailable = 0;
+                    ulong swapFree = 0;
+                    foreach (var line in File.ReadLines("/proc/meminfo"))
+                    {
+                        if (line.StartsWith("MemAvailable:"))
+                        {
+                            memAvailable = ParseMeminfoValue(line);
+                        }
+                        else if (line.StartsWith("SwapFree:"))
+                        {
+                            swapFree = ParseMeminfoValue(line);
+                        }
+                    }
+                    availableBytes = memAvailable + swapFree;
+                    return true;
+                }
+            }
+            catch
+            {
+                // Ignore and fallback
+            }
+            return false;
+        }
+
+        private static ulong ParseMeminfoValue(string line)
+        {
+            var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var kb))
+            {
+                return kb * 1024;
+            }
+            return 0;
+        }
+#endif
+
         public static void ThrowIfMemoryPressureTooHigh(string operation)
         {
 #if NET6_0_OR_GREATER
@@ -974,15 +1095,50 @@ namespace AssetStudio
 
             if (TryGetMemoryLoadPercent(out memoryLoadPercent) && memoryLoadPercent >= limitPercent)
             {
-                if (MemoryPressureCallback != null)
+                bool isRealPressure = true;
+                const ulong minAvailableCommitBytes = 1536UL * 1024UL * 1024UL; // 1.5 GB
+
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    if (MemoryPressureCallback(operation, memoryLoadPercent, limitPercent))
+                    var memStatus = new MEMORYSTATUSEX();
+                    if (GlobalMemoryStatusEx(memStatus))
                     {
-                        DisableMemoryPressureCheck = true;
-                        return;
+                        if (memStatus.ullAvailPageFile >= minAvailableCommitBytes)
+                        {
+                            isRealPressure = false;
+                        }
                     }
                 }
-                throw new MemoryPressureException(operation, memoryLoadPercent, limitPercent);
+                else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                {
+                    if (TryGetLinuxAvailableMemory(out var availableBytes))
+                    {
+                        if (availableBytes >= minAvailableCommitBytes)
+                        {
+                            isRealPressure = false;
+                        }
+                    }
+                }
+
+                if (isRealPressure)
+                {
+                    if (MemoryPressureCallback != null)
+                    {
+                        var result = MemoryPressureCallback(operation, memoryLoadPercent, limitPercent);
+                        if (result == MemoryPressureResult.Continue)
+                        {
+                            DisableMemoryPressureCheck = true;
+                            return;
+                        }
+                        else if (result == MemoryPressureResult.StopAndKeep)
+                        {
+                            ShouldStopLoading = true;
+                            DisableMemoryPressureCheck = true;
+                            return;
+                        }
+                    }
+                    throw new MemoryPressureException(operation, memoryLoadPercent, limitPercent);
+                }
             }
 #endif
         }

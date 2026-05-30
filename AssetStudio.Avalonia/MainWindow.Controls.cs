@@ -1,7 +1,10 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Threading;
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace AssetStudio.Avalonia;
 
@@ -13,6 +16,21 @@ public partial class MainWindow : Window
     private const double MaxAvatarPreviewMeshDensityPercent = 100.0;
     private bool updatingAvatarPreviewControls;
     private DispatcherTimer? avatarPreviewSettingsSaveTimer;
+    private readonly List<MeshMaterialPreviewSlot> meshMaterialPreviewSlots = new();
+    private bool updatingMeshMaterialControls;
+
+    private sealed class MeshMaterialPreviewSlot
+    {
+        public int SlotIndex { get; init; }
+        public string MaterialName { get; init; } = string.Empty;
+        public global::OpenTK.Mathematics.Vector4 BaseColor { get; init; } = global::OpenTK.Mathematics.Vector4.One;
+        public global::OpenTK.Mathematics.Vector4 CurrentColor { get; set; } = global::OpenTK.Mathematics.Vector4.One;
+
+        public override string ToString()
+        {
+            return $"{SlotIndex + 1}: {MaterialName}";
+        }
+    }
 
     private void ResetViewBtn_Click(object? sender, RoutedEventArgs e)
     {
@@ -142,5 +160,224 @@ public partial class MainWindow : Window
     {
         avatarPreviewSettingsSaveTimer?.Stop();
         appSettings.Save();
+    }
+
+    private void ClearMeshMaterialControls()
+    {
+        updatingMeshMaterialControls = true;
+        try
+        {
+            meshMaterialPreviewSlots.Clear();
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.ItemsSource = null;
+                MeshMaterialSelector.SelectedIndex = -1;
+            }
+            if (MeshMaterialControlsContainer != null)
+            {
+                MeshMaterialControlsContainer.IsVisible = false;
+            }
+        }
+        finally
+        {
+            updatingMeshMaterialControls = false;
+        }
+
+        GLPreviewControl?.SetMaterialOverrides(null);
+    }
+
+    private void BuildMeshMaterialControls(AssetStudio.Mesh mesh, IReadOnlyList<AssetStudio.Material?> materials)
+    {
+        updatingMeshMaterialControls = true;
+        try
+        {
+            meshMaterialPreviewSlots.Clear();
+            int slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
+
+            for (int i = 0; i < slotCount; i++)
+            {
+                var material = i < materials.Count ? materials[i] : null;
+                var baseColor = GetMeshMaterialBaseColor(material);
+                meshMaterialPreviewSlots.Add(new MeshMaterialPreviewSlot
+                {
+                    SlotIndex = i,
+                    MaterialName = string.IsNullOrEmpty(material?.m_Name) ? "No Material" : material!.m_Name,
+                    BaseColor = baseColor,
+                    CurrentColor = baseColor
+                });
+            }
+
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.ItemsSource = null;
+                MeshMaterialSelector.ItemsSource = meshMaterialPreviewSlots;
+                MeshMaterialSelector.SelectedIndex = meshMaterialPreviewSlots.Count > 0 ? 0 : -1;
+            }
+
+            if (MeshMaterialControlsContainer != null)
+            {
+                MeshMaterialControlsContainer.IsVisible = meshMaterialPreviewSlots.Count > 0;
+            }
+        }
+        finally
+        {
+            updatingMeshMaterialControls = false;
+        }
+
+        UpdateMeshMaterialControlValues();
+        ApplyMeshMaterialOverrides();
+    }
+
+    private global::OpenTK.Mathematics.Vector4 GetMeshMaterialBaseColor(AssetStudio.Material? material)
+    {
+        var displayMaterial = material == null ? null : ResolveMaterialForPreview(material) ?? material;
+        var colors = displayMaterial?.m_SavedProperties?.m_Colors;
+        if (colors == null || colors.Length == 0)
+        {
+            return global::OpenTK.Mathematics.Vector4.One;
+        }
+
+        string[] preferredNames = { "_BaseColor", "_Color", "_TintColor", "_MainColor", "Color" };
+        foreach (var preferred in preferredNames)
+        {
+            var match = colors.FirstOrDefault(x => string.Equals(x.Key, preferred, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(match.Key))
+            {
+                return ToPreviewTint(match.Value);
+            }
+        }
+
+        var fallback = colors.FirstOrDefault(x =>
+            !string.IsNullOrEmpty(x.Key)
+            && x.Key.Contains("color", StringComparison.OrdinalIgnoreCase)
+            && !x.Key.Contains("emission", StringComparison.OrdinalIgnoreCase)
+            && !x.Key.Contains("spec", StringComparison.OrdinalIgnoreCase));
+
+        return string.IsNullOrEmpty(fallback.Key)
+            ? global::OpenTK.Mathematics.Vector4.One
+            : ToPreviewTint(fallback.Value);
+    }
+
+    private static global::OpenTK.Mathematics.Vector4 ToPreviewTint(AssetStudio.Color color)
+    {
+        return new global::OpenTK.Mathematics.Vector4(
+            ClampPreviewColor(color.R),
+            ClampPreviewColor(color.G),
+            ClampPreviewColor(color.B),
+            1f);
+    }
+
+    private static float ClampPreviewColor(float value)
+    {
+        return float.IsFinite(value) ? Math.Clamp(value, 0f, 1f) : 1f;
+    }
+
+    private MeshMaterialPreviewSlot? SelectedMeshMaterialSlot =>
+        MeshMaterialSelector?.SelectedItem as MeshMaterialPreviewSlot;
+
+    private void MeshMaterialSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (updatingMeshMaterialControls)
+        {
+            return;
+        }
+
+        UpdateMeshMaterialControlValues();
+    }
+
+    private void MeshMaterialSlider_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (updatingMeshMaterialControls)
+        {
+            return;
+        }
+
+        var slot = SelectedMeshMaterialSlot;
+        if (slot == null)
+        {
+            return;
+        }
+
+        slot.CurrentColor = new global::OpenTK.Mathematics.Vector4(
+            (float)((MeshMaterialRedSlider?.Value ?? 100) / 100.0),
+            (float)((MeshMaterialGreenSlider?.Value ?? 100) / 100.0),
+            (float)((MeshMaterialBlueSlider?.Value ?? 100) / 100.0),
+            (float)((MeshMaterialAlphaSlider?.Value ?? 100) / 100.0));
+
+        UpdateMeshMaterialLabels(slot.CurrentColor);
+        ApplyMeshMaterialOverrides();
+    }
+
+    private void MeshMaterialResetColorButton_Click(object? sender, RoutedEventArgs e)
+    {
+        var slot = SelectedMeshMaterialSlot;
+        if (slot == null)
+        {
+            return;
+        }
+
+        slot.CurrentColor = new global::OpenTK.Mathematics.Vector4(
+            slot.BaseColor.X,
+            slot.BaseColor.Y,
+            slot.BaseColor.Z,
+            slot.CurrentColor.W);
+
+        UpdateMeshMaterialControlValues();
+        ApplyMeshMaterialOverrides();
+    }
+
+    private void UpdateMeshMaterialControlValues()
+    {
+        var slot = SelectedMeshMaterialSlot;
+        if (slot == null)
+        {
+            UpdateMeshMaterialLabels(global::OpenTK.Mathematics.Vector4.One);
+            return;
+        }
+
+        updatingMeshMaterialControls = true;
+        try
+        {
+            if (MeshMaterialAlphaSlider != null) MeshMaterialAlphaSlider.Value = slot.CurrentColor.W * 100.0;
+            if (MeshMaterialRedSlider != null) MeshMaterialRedSlider.Value = slot.CurrentColor.X * 100.0;
+            if (MeshMaterialGreenSlider != null) MeshMaterialGreenSlider.Value = slot.CurrentColor.Y * 100.0;
+            if (MeshMaterialBlueSlider != null) MeshMaterialBlueSlider.Value = slot.CurrentColor.Z * 100.0;
+        }
+        finally
+        {
+            updatingMeshMaterialControls = false;
+        }
+
+        UpdateMeshMaterialLabels(slot.CurrentColor);
+    }
+
+    private void UpdateMeshMaterialLabels(global::OpenTK.Mathematics.Vector4 color)
+    {
+        if (MeshMaterialAlphaLabel != null) MeshMaterialAlphaLabel.Text = $"{color.W * 100f:0}%";
+        if (MeshMaterialRedLabel != null) MeshMaterialRedLabel.Text = $"{color.X * 100f:0}%";
+        if (MeshMaterialGreenLabel != null) MeshMaterialGreenLabel.Text = $"{color.Y * 100f:0}%";
+        if (MeshMaterialBlueLabel != null) MeshMaterialBlueLabel.Text = $"{color.Z * 100f:0}%";
+        if (MeshMaterialColorSwatch != null)
+        {
+            MeshMaterialColorSwatch.Background = new SolidColorBrush(global::Avalonia.Media.Color.FromArgb(
+                255,
+                (byte)Math.Clamp((int)Math.Round(color.X * 255), 0, 255),
+                (byte)Math.Clamp((int)Math.Round(color.Y * 255), 0, 255),
+                (byte)Math.Clamp((int)Math.Round(color.Z * 255), 0, 255)));
+        }
+    }
+
+    private void ApplyMeshMaterialOverrides()
+    {
+        if (meshMaterialPreviewSlots.Count == 0)
+        {
+            GLPreviewControl?.SetMaterialOverrides(null);
+            return;
+        }
+
+        GLPreviewControl?.SetMaterialOverrides(meshMaterialPreviewSlots
+            .OrderBy(x => x.SlotIndex)
+            .Select(x => x.CurrentColor)
+            .ToArray());
     }
 }
