@@ -35,7 +35,7 @@ namespace AssetStudio.Avalonia
         private void SetThemeOption(string themeName)
         {
             appSettings.SelectedTheme = themeName;
-            appSettings.Save();
+            SaveAppSettings();
 
             if (themeDefault != null) themeDefault.IsChecked = themeName == "Default";
             if (themeLight != null) themeLight.IsChecked = themeName == "Light";

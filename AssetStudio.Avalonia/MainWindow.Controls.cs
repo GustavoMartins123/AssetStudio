@@ -184,13 +184,13 @@ public partial class MainWindow : Window
     private void AvatarPreviewSettingsSaveTimer_Tick(object? sender, EventArgs e)
     {
         avatarPreviewSettingsSaveTimer?.Stop();
-        appSettings.Save();
+        SaveAppSettings();
     }
 
     private void FlushAvatarPreviewSettingsSave()
     {
         avatarPreviewSettingsSaveTimer?.Stop();
-        appSettings.Save();
+        SaveAppSettings();
     }
 
     private void ClearMeshMaterialControls()

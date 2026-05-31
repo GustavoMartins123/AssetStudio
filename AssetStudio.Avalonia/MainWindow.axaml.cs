@@ -55,7 +55,8 @@ public partial class MainWindow : Window
     private List<GameObjectNode> sceneTreeNodes = new List<GameObjectNode>();
     private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
     private readonly ExportOptionsState exportOptions = new();
-    private readonly AvaloniaAppSettings appSettings = AvaloniaAppSettings.Load();
+    private readonly AvaloniaAppSettings appSettings;
+    private readonly ProjectLaunchContext? projectContext;
     private readonly AssemblyLoader assemblyLoader = new AssemblyLoader();
     private readonly GUILogger logger;
     private CancellationTokenSource? listSearchDebounce;
@@ -105,8 +106,14 @@ public partial class MainWindow : Window
     private readonly HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
 
-    public MainWindow()
+    public MainWindow() : this(null)
     {
+    }
+
+    public MainWindow(ProjectLaunchContext? projectContext)
+    {
+        this.projectContext = projectContext;
+        appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
         InitializeTheme();
@@ -169,6 +176,10 @@ public partial class MainWindow : Window
 
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
         Title = $"AssetStudio v{version}";
+        if (projectContext != null)
+        {
+            Title = $"AssetStudio v{version} - {projectContext.Project.DisplayName}";
+        }
 
         try
         {
@@ -430,6 +441,25 @@ public partial class MainWindow : Window
         if (appSettings.SpecifyUnityVersion != assetsManager.SpecifyUnityVersion)
         {
             appSettings.SpecifyUnityVersion = assetsManager.SpecifyUnityVersion;
+            SaveAppSettings();
+        }
+    }
+
+    private void SaveAppSettings()
+    {
+        try
+        {
+            if (projectContext != null)
+            {
+                projectContext.Store.SaveProjectSettings(projectContext.Project.Id, appSettings);
+            }
+            else
+            {
+                ProjectManagerStore.Shared.SaveGlobalSettings(appSettings);
+            }
+        }
+        catch
+        {
             appSettings.Save();
         }
     }
@@ -596,14 +626,14 @@ public partial class MainWindow : Window
         var folder = Directory.Exists(path) ? path : Path.GetDirectoryName(path);
         if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return;
         appSettings.LoadFolderPath = folder;
-        appSettings.Save();
+        SaveAppSettings();
     }
 
     private void SaveExportFolder(string path)
     {
         if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return;
         appSettings.ExportFolderPath = path;
-        appSettings.Save();
+        SaveAppSettings();
     }
 
     private void TreeSearch_TextChanged(object? sender, TextChangedEventArgs e)
@@ -668,7 +698,7 @@ public partial class MainWindow : Window
     private void DisplayAll_Click(object? sender, RoutedEventArgs e)
     {
         appSettings.DisplayAll = displayAll.IsChecked == true;
-        appSettings.Save();
+        SaveAppSettings();
         if (assetsManager.assetsFileList.Count > 0)
         {
             BuildAssetStructures();
@@ -679,7 +709,7 @@ public partial class MainWindow : Window
     {
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         appSettings.EnablePreview = enablePreview.IsChecked == true;
-        appSettings.Save();
+        SaveAppSettings();
         if (enablePreview.IsChecked != true)
         {
             ClearPreview("Preview disabled");
@@ -693,7 +723,7 @@ public partial class MainWindow : Window
     private void DisplayInfo_Click(object? sender, RoutedEventArgs e)
     {
         appSettings.DisplayInfo = displayInfo.IsChecked == true;
-        appSettings.Save();
+        SaveAppSettings();
         if (AssetListDataGrid.SelectedItem is AssetItem selected)
         {
             PreviewLabel.Text = displayInfo.IsChecked == true
@@ -728,7 +758,7 @@ public partial class MainWindow : Window
         assetsManager.ProjectRoot = folders[0].Path.LocalPath;
         SaveLoadFolder(assetsManager.ProjectRoot);
         appSettings.ProjectRoot = assetsManager.ProjectRoot;
-        appSettings.Save();
+        SaveAppSettings();
         StatusStripUpdate($"Project root set to: {assetsManager.ProjectRoot}");
     }
 
@@ -740,7 +770,7 @@ public partial class MainWindow : Window
 
         exportOptions.CopyFrom(result);
         appSettings.ExportOptions.CopyFrom(result);
-        appSettings.Save();
+        SaveAppSettings();
         StatusStripUpdate("Export options updated.");
     }
 
@@ -1064,6 +1094,7 @@ public partial class MainWindow : Window
         if (files != null && files.Count > 0)
         {
             var filePaths = files.Select(f => f.Path.LocalPath).ToArray();
+            currentScanResult = null;
             SaveLoadFolder(filePaths[0]);
             ResetForm();
             StatusStripUpdate("Loading files...");
@@ -1205,10 +1236,18 @@ public partial class MainWindow : Window
 
         if (loadChoice == RiskyLoadChoice.LazyLoad)
         {
+            if (!(paths.Length == 1 && Directory.Exists(paths[0])))
+            {
+                currentScanResult = null;
+            }
             LoadPathsProgressiveAsync(paths);
         }
         else
         {
+            if (!(paths.Length == 1 && Directory.Exists(paths[0])))
+            {
+                currentScanResult = null;
+            }
             ResetForm();
             assetsManager.Clear();
             assetsManager.LazyLoading = false;
@@ -1281,13 +1320,12 @@ public partial class MainWindow : Window
         }
 
         StatusStripUpdate($"Scan complete: {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
+        currentScanResult = scanResult;
 
         if (!scanResult.IsRisky)
         {
             return RiskyLoadChoice.EagerLoad;
         }
-
-        currentScanResult = scanResult;
 
         var message = BuildRiskyProjectMessage(scanResult);
         return await ShowRiskyProjectDialog(message);
@@ -2312,12 +2350,43 @@ public partial class MainWindow : Window
         }
         else
         {
-            Title = $"AssetStudio v{version}";
+            Title = projectContext == null
+                ? $"AssetStudio v{version}"
+                : $"AssetStudio v{version} - {projectContext.Project.DisplayName}";
         }
+
+        var assetCountForStats = assetsManager.LazyLoading
+            ? assetsManager.ProjectIndex.GetHandles().Count()
+            : m_ObjectsCount;
+        SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count);
         }
         finally
         {
             isBuildingAssetStructures = false;
+        }
+    }
+
+    private void SaveCurrentProjectAfterLoad(string? productName, int assetCount, int exportableAssetCount)
+    {
+        if (projectContext == null)
+        {
+            return;
+        }
+
+        try
+        {
+            var scanSignature = currentScanResult == null ? null : _sqliteCache.GetFolderSignature(currentScanResult);
+            projectContext.Store.UpdateProjectAfterLoad(
+                projectContext.Project.Id,
+                currentScanResult,
+                scanSignature,
+                productName,
+                assetCount,
+                exportableAssetCount);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to update project metadata: {ex.Message}");
         }
     }
 
@@ -8050,7 +8119,7 @@ public partial class MainWindow : Window
         {
             logger.ShowErrorMessage = menuItem.IsChecked;
             appSettings.ShowErrorMessage = menuItem.IsChecked;
-            appSettings.Save();
+            SaveAppSettings();
         }
     }
 
@@ -8901,6 +8970,11 @@ public sealed class AvaloniaAppSettings
     public string SelectedTheme { get; set; } = "Default";
 
     public static AvaloniaAppSettings Load()
+    {
+        return ProjectManagerStore.Shared.LoadGlobalSettings();
+    }
+
+    internal static AvaloniaAppSettings LoadLegacyJson()
     {
         try
         {
