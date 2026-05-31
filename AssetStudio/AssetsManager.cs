@@ -224,7 +224,7 @@ namespace AssetStudio
                     {
                         await YieldForUserInteractionIfNeededAsync();
 
-                        if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                        if (ShouldStopLoading)
                         {
                             if (isWorkerActive)
                             {
@@ -239,7 +239,7 @@ namespace AssetStudio
                         {
                             ThrowIfMemoryPressureTooHigh("loading files");
 
-                            if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                            if (ShouldStopLoading)
                             {
                                 if (isWorkerActive)
                                 {
@@ -868,7 +868,7 @@ namespace AssetStudio
                                         await YieldForUserInteractionIfNeededAsync();
                                     }
 
-                                    if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                                    if (ShouldStopLoading)
                                     {
                                         break;
                                     }
@@ -878,7 +878,7 @@ namespace AssetStudio
                                         ThrowIfMemoryPressureTooHigh("reading assets (lazy)");
                                     }
 
-                                    if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                                    if (ShouldStopLoading)
                                     {
                                         break;
                                     }
@@ -975,7 +975,7 @@ namespace AssetStudio
                     () => assetsFile.reader.Clone(),
                     (objectInfo, state, localReader) =>
                     {
-                        if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                        if (ShouldStopLoading)
                         {
                             state.Stop();
                             return localReader;
@@ -986,7 +986,7 @@ namespace AssetStudio
                             ThrowIfMemoryPressureTooHigh("reading assets");
                         }
 
-                        if (System.Threading.Volatile.Read(ref ShouldStopLoading))
+                        if (ShouldStopLoading)
                         {
                             state.Stop();
                             return localReader;

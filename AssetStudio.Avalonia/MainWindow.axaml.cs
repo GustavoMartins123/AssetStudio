@@ -6898,6 +6898,12 @@ public partial class MainWindow : Window
 
     private void ShowOriginalFile(AssetItem item)
     {
+        if (item.SourceFile == null)
+        {
+            StatusStripUpdate("Original file path is unavailable.");
+            return;
+        }
+
         var sourcePath = !string.IsNullOrEmpty(item.SourceFile.originalPath)
             ? item.SourceFile.originalPath
             : item.SourceFile.fullName;
@@ -6940,7 +6946,7 @@ public partial class MainWindow : Window
         return exportOptions.AssetGrouping switch
         {
             AssetGroupOption.Container when !string.IsNullOrEmpty(asset.Container) => Path.Combine(savePath, Path.GetDirectoryName(asset.Container) ?? string.Empty),
-            AssetGroupOption.SourceFile => Path.Combine(savePath, asset.SourceFile.fileName + "_export"),
+            AssetGroupOption.SourceFile => Path.Combine(savePath, (asset.SourceFile?.fileName ?? "Unknown") + "_export"),
             AssetGroupOption.TypeName => Path.Combine(savePath, asset.TypeString),
             _ => savePath
         };
@@ -8752,7 +8758,7 @@ public class AssetItem
     }
 
     public AssetHandle? Handle { get; set; }
-    public SerializedFile SourceFile { get; set; }
+    public SerializedFile? SourceFile { get; set; }
     public GameObjectNode? TreeNode { get; set; }
     public string Name { get; set; } = string.Empty;
     public string Container { get; set; } = string.Empty;

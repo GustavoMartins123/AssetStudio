@@ -1,3 +1,4 @@
+#nullable enable
 using K4os.Compression.LZ4;
 using System;
 using System.IO;
@@ -35,14 +36,14 @@ namespace AssetStudio
     {
         public static bool LowMemoryMode { get; set; } = true;
         public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
-        public static string TemporaryDirectory { get; set; }
+        public static string TemporaryDirectory { get; set; } = "";
 
         public class Header
         {
-            public string signature;
+            public string signature = "";
             public uint version;
-            public string unityVersion;
-            public string unityRevision;
+            public string unityVersion = "";
+            public string unityRevision = "";
             public long size;
             public uint compressedBlocksInfoSize;
             public uint uncompressedBlocksInfoSize;
@@ -61,14 +62,14 @@ namespace AssetStudio
             public long offset;
             public long size;
             public uint flags;
-            public string path;
+            public string path = "";
         }
 
-        public Header m_Header;
-        private StorageBlock[] m_BlocksInfo;
-        private Node[] m_DirectoryInfo;
+        public Header m_Header = null!;
+        private StorageBlock[] m_BlocksInfo = null!;
+        private Node[] m_DirectoryInfo = null!;
 
-        public StreamFile[] fileList;
+        public StreamFile[] fileList = null!;
         public Stream? BlocksStream { get; set; }
 
         public BundleFile(FileReader reader)

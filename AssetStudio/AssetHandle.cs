@@ -1,3 +1,4 @@
+#nullable enable
 using System;
 using System.IO;
 
@@ -15,13 +16,13 @@ namespace AssetStudio
         public string OriginalPath { get; set; } = string.Empty; // bundle/file of origin path
         public string SerializedFileName { get; set; } = string.Empty; // e.g. "level0"
         
-        public SerializedFile SourceFile { get; set; } // Reference to SerializedFile
+        public SerializedFile? SourceFile { get; set; } // Reference to SerializedFile
         public long PathID { get; set; }
         public long ByteStart { get; set; }
         public long ByteSize { get; set; }
         
         public bool IsMaterialized => RealObject != null;
-        public Object RealObject { get; set; }
+        public Object? RealObject { get; set; }
         public object? Tag { get; set; }
 
         public string DisplayType => GetDisplayType();
@@ -40,7 +41,7 @@ namespace AssetStudio
             return display;
         }
 
-        public static string TryReadObjectName(ObjectReader reader)
+        public static string? TryReadObjectName(ObjectReader reader)
         {
             if (reader == null) return null;
             try

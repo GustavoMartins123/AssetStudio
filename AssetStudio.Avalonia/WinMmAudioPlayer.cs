@@ -109,6 +109,8 @@ namespace AssetStudio.Avalonia
 
         #region State Fields
         private readonly object _lock = new();
+        private readonly object _waveOutLock = new();
+        private int _activeBufferCount;
         private bool _isDisposed;
 
         // Streaming (FFmpeg) mode fields
@@ -162,15 +164,18 @@ namespace AssetStudio.Avalonia
                 cbSize = 0
             };
 
-            var res = waveOutOpen(out _hWaveOut, WAVE_MAPPER, ref waveFormat, IntPtr.Zero, IntPtr.Zero, CALLBACK_NULL);
-            if (res != MMSYSERR_NOERROR)
+            lock (_waveOutLock)
             {
-                _hWaveOut = IntPtr.Zero;
-            }
-            else
-            {
-                SetVolumeInternal(_volume);
-                _playbackClock.Start();
+                var res = waveOutOpen(out _hWaveOut, WAVE_MAPPER, ref waveFormat, IntPtr.Zero, IntPtr.Zero, CALLBACK_NULL);
+                if (res != MMSYSERR_NOERROR)
+                {
+                    _hWaveOut = IntPtr.Zero;
+                }
+                else
+                {
+                    SetVolumeInternal(_volume);
+                    _playbackClock.Start();
+                }
             }
         }
 
@@ -189,46 +194,62 @@ namespace AssetStudio.Avalonia
 
         private void SetVolumeInternal(float volume)
         {
-            if (_hWaveOut == IntPtr.Zero) return;
-            ushort val = (ushort)(volume * 0xFFFF);
-            uint combined = val | ((uint)val << 16);
-            waveOutSetVolume(_hWaveOut, combined);
+            lock (_waveOutLock)
+            {
+                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+                ushort val = (ushort)(volume * 0xFFFF);
+                uint combined = val | ((uint)val << 16);
+                waveOutSetVolume(_hWaveOut, combined);
+            }
         }
 
         public void Resume()
         {
-            if (_hWaveOut == IntPtr.Zero) return;
-            waveOutRestart(_hWaveOut);
+            lock (_waveOutLock)
+            {
+                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+                waveOutRestart(_hWaveOut);
+            }
             _playbackClock.Start();
         }
 
         public void Pause()
         {
-            if (_hWaveOut == IntPtr.Zero) return;
-            waveOutPause(_hWaveOut);
+            lock (_waveOutLock)
+            {
+                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+                waveOutPause(_hWaveOut);
+            }
             _playbackClock.Stop();
         }
 
         public void Stop()
         {
-            if (_hWaveOut == IntPtr.Zero) return;
-            waveOutReset(_hWaveOut);
+            lock (_waveOutLock)
+            {
+                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+                waveOutReset(_hWaveOut);
+            }
             _playbackClock.Reset();
             _playbackTimeBaseSec = 0;
         }
 
         public double GetPlaybackTime()
         {
-            if (_hWaveOut == IntPtr.Zero) return 0;
-
-            MmTime time = new MmTime { wType = TIME_BYTES };
-            if (waveOutGetPosition(_hWaveOut, ref time, Marshal.SizeOf<MmTime>()) == MMSYSERR_NOERROR)
+            lock (_waveOutLock)
             {
-                var bytes = time.cb;
-                var bytesPerSec = _sampleRate * _channels * 2;
-                if (bytesPerSec > 0)
+                if (_hWaveOut != IntPtr.Zero && !_isDisposed)
                 {
-                    return (double)bytes / bytesPerSec;
+                    MmTime time = new MmTime { wType = TIME_BYTES };
+                    if (waveOutGetPosition(_hWaveOut, ref time, Marshal.SizeOf<MmTime>()) == MMSYSERR_NOERROR)
+                    {
+                        var bytes = time.cb;
+                        var bytesPerSec = _sampleRate * _channels * 2;
+                        if (bytesPerSec > 0)
+                        {
+                            return (double)bytes / bytesPerSec;
+                        }
+                    }
                 }
             }
 
@@ -237,7 +258,10 @@ namespace AssetStudio.Avalonia
 
         public unsafe void QueueSamplesS16(short* samples, int count)
         {
-            if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+            lock (_waveOutLock)
+            {
+                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+            }
 
             int byteCount = count * 2;
             byte[] managedBuffer = new byte[byteCount];
@@ -248,7 +272,10 @@ namespace AssetStudio.Avalonia
 
         public void QueueSamples(float[] samples)
         {
-            if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+            lock (_waveOutLock)
+            {
+                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+            }
 
             short[] shortSamples = new short[samples.Length];
             for (int i = 0; i < samples.Length; i++)
@@ -265,7 +292,11 @@ namespace AssetStudio.Avalonia
 
         private void PlayBuffer(byte[] buffer)
         {
-            if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
+            lock (_waveOutLock)
+            {
+                if (_isDisposed || _hWaveOut == IntPtr.Zero) return;
+                _activeBufferCount++;
+            }
 
             var bufferHandle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
             var headerPtr = IntPtr.Zero;
@@ -281,7 +312,7 @@ namespace AssetStudio.Avalonia
                 headerPtr = Marshal.AllocHGlobal(headerSize);
                 Marshal.StructureToPtr(header, headerPtr, false);
 
-                lock (_hWaveOut.ToString())
+                lock (_waveOutLock)
                 {
                     if (_isDisposed || _hWaveOut == IntPtr.Zero) return;
                     if (waveOutPrepareHeader(_hWaveOut, headerPtr, headerSize) != MMSYSERR_NOERROR)
@@ -309,29 +340,37 @@ namespace AssetStudio.Avalonia
             catch {}
             finally
             {
-                if (headerPrepared && !_isDisposed && _hWaveOut != IntPtr.Zero)
+                lock (_waveOutLock)
                 {
-                    try
+                    if (headerPrepared && _hWaveOut != IntPtr.Zero)
                     {
-                        lock (_hWaveOut.ToString())
+                        try
                         {
-                            if (!_isDisposed && _hWaveOut != IntPtr.Zero)
-                            {
-                                waveOutUnprepareHeader(_hWaveOut, headerPtr, Marshal.SizeOf<WaveHeader>());
-                            }
+                            waveOutUnprepareHeader(_hWaveOut, headerPtr, Marshal.SizeOf<WaveHeader>());
                         }
+                        catch {}
                     }
-                    catch {}
-                }
 
-                if (headerPtr != IntPtr.Zero)
-                {
-                    Marshal.FreeHGlobal(headerPtr);
-                }
+                    if (headerPtr != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            Marshal.FreeHGlobal(headerPtr);
+                        }
+                        catch {}
+                    }
 
-                if (bufferHandle.IsAllocated)
-                {
-                    bufferHandle.Free();
+                    if (bufferHandle.IsAllocated)
+                    {
+                        try
+                        {
+                            bufferHandle.Free();
+                        }
+                        catch {}
+                    }
+
+                    _activeBufferCount--;
+                    Monitor.PulseAll(_waveOutLock);
                 }
             }
         }
@@ -420,24 +459,30 @@ namespace AssetStudio.Avalonia
 
         public void PauseWav()
         {
-            if (_waveOut == IntPtr.Zero)
+            lock (_lock)
             {
-                return;
-            }
+                if (_waveOut == IntPtr.Zero)
+                {
+                    return;
+                }
 
-            waveOutPause(_waveOut);
-            _isPaused = true;
+                waveOutPause(_waveOut);
+                _isPaused = true;
+            }
         }
 
         public void ResumeWav()
         {
-            if (_waveOut == IntPtr.Zero)
+            lock (_lock)
             {
-                return;
-            }
+                if (_waveOut == IntPtr.Zero)
+                {
+                    return;
+                }
 
-            waveOutRestart(_waveOut);
-            _isPaused = false;
+                waveOutRestart(_waveOut);
+                _isPaused = false;
+            }
         }
 
         public void StopWav()
@@ -465,13 +510,16 @@ namespace AssetStudio.Avalonia
         public long GetPositionMs()
         {
             var bytes = _startByte;
-            var handle = _waveOut;
-            if (handle != IntPtr.Zero)
+            lock (_lock)
             {
-                var time = new MmTime { wType = TIME_BYTES };
-                if (waveOutGetPosition(handle, ref time, Marshal.SizeOf<MmTime>()) == MMSYSERR_NOERROR)
+                var handle = _waveOut;
+                if (handle != IntPtr.Zero)
                 {
-                    bytes = _startByte + time.cb;
+                    var time = new MmTime { wType = TIME_BYTES };
+                    if (waveOutGetPosition(handle, ref time, Marshal.SizeOf<MmTime>()) == MMSYSERR_NOERROR)
+                    {
+                        bytes = _startByte + time.cb;
+                    }
                 }
             }
 
@@ -486,11 +534,14 @@ namespace AssetStudio.Avalonia
 
         public void SetVolume(int volume)
         {
-            _wavVolume = Math.Clamp(volume, 0, 100);
-            var handle = _waveOut;
-            if (handle != IntPtr.Zero)
+            lock (_lock)
             {
-                waveOutSetVolume(handle, BuildWinMmVolume(_wavVolume));
+                _wavVolume = Math.Clamp(volume, 0, 100);
+                var handle = _waveOut;
+                if (handle != IntPtr.Zero)
+                {
+                    waveOutSetVolume(handle, BuildWinMmVolume(_wavVolume));
+                }
             }
         }
 
@@ -499,18 +550,17 @@ namespace AssetStudio.Avalonia
             _stopRequested = true;
             _playbackSerial++;
             var handle = _waveOut;
+            _waveOut = IntPtr.Zero;
             if (handle != IntPtr.Zero)
             {
-                waveOutReset(handle);
-            }
-
-            if (_playThread != null && _playThread.IsAlive && _playThread != Thread.CurrentThread)
-            {
-                _playThread.Join(1000);
+                try
+                {
+                    waveOutReset(handle);
+                }
+                catch {}
             }
 
             _playThread = null;
-            _waveOut = IntPtr.Zero;
             _isPlaying = false;
             _isPaused = false;
         }
@@ -531,23 +581,29 @@ namespace AssetStudio.Avalonia
             var result = waveOutOpen(out var handle, WAVE_MAPPER, ref waveFormat, IntPtr.Zero, IntPtr.Zero, CALLBACK_NULL);
             if (result != MMSYSERR_NOERROR)
             {
-                if (state.Serial == _playbackSerial)
+                lock (_lock)
                 {
-                    _isPlaying = false;
-                    _isCompleted = true;
+                    if (state.Serial == _playbackSerial)
+                    {
+                        _isPlaying = false;
+                        _isCompleted = true;
+                    }
                 }
                 return;
             }
 
-            if (state.Serial != _playbackSerial)
+            lock (_lock)
             {
-                waveOutClose(handle);
-                return;
-            }
+                if (state.Serial != _playbackSerial)
+                {
+                    waveOutClose(handle);
+                    return;
+                }
 
-            _waveOut = handle;
-            waveOutSetVolume(handle, BuildWinMmVolume(_wavVolume));
-            _isPlaying = true;
+                _waveOut = handle;
+                waveOutSetVolume(handle, BuildWinMmVolume(_wavVolume));
+                _isPlaying = true;
+            }
 
             try
             {
@@ -562,20 +618,30 @@ namespace AssetStudio.Avalonia
                     offset = state.PcmData.Length;
                 }
 
-                if (state.Serial == _playbackSerial)
+                lock (_lock)
                 {
-                    _isCompleted = !_stopRequested && offset >= state.PcmData.Length;
+                    if (state.Serial == _playbackSerial)
+                    {
+                        _isCompleted = !_stopRequested && offset >= state.PcmData.Length;
+                    }
                 }
             }
             finally
             {
-                waveOutReset(handle);
-                waveOutClose(handle);
-                if (state.Serial == _playbackSerial)
+                lock (_lock)
                 {
-                    _waveOut = IntPtr.Zero;
-                    _isPlaying = false;
-                    _isPaused = false;
+                    try
+                    {
+                        waveOutReset(handle);
+                        waveOutClose(handle);
+                    }
+                    catch {}
+                    if (state.Serial == _playbackSerial)
+                    {
+                        _waveOut = IntPtr.Zero;
+                        _isPlaying = false;
+                        _isPaused = false;
+                    }
                 }
             }
         }
@@ -722,26 +788,38 @@ namespace AssetStudio.Avalonia
         #region IDisposable Implementation
         public void Dispose()
         {
-            lock (this)
+            lock (_lock)
             {
                 if (_isDisposed) return;
                 _isDisposed = true;
+                StopWavLocked();
             }
 
-            // Stop and clean up streaming mode resources
-            if (_hWaveOut != IntPtr.Zero)
+            // Stop and clean up streaming mode resources under _waveOutLock
+            lock (_waveOutLock)
             {
-                lock (_hWaveOut.ToString())
+                if (_hWaveOut != IntPtr.Zero)
                 {
-                    waveOutReset(_hWaveOut);
-                    waveOutClose(_hWaveOut);
+                    try
+                    {
+                        waveOutReset(_hWaveOut);
+                    }
+                    catch {}
+
+                    while (_activeBufferCount > 0)
+                    {
+                        Monitor.Wait(_waveOutLock, 100);
+                    }
+
+                    try
+                    {
+                        waveOutClose(_hWaveOut);
+                    }
+                    catch {}
                     _hWaveOut = IntPtr.Zero;
                 }
             }
             _playbackClock.Stop();
-
-            // Stop static WAV mode resources
-            StopWav();
         }
         #endregion
     }
