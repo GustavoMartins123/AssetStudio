@@ -45,9 +45,9 @@ namespace AssetStudio
                         moduleDic.Add(nameWithoutExt, assembly.MainModule);
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // ignored
+                    Logger.Debug($"Failed to load assembly {file}: {ex.Message}");
                 }
             }
             Loaded = true;

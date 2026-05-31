@@ -69,8 +69,9 @@ namespace AssetStudio
                 }
                 return image;
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.Warning($"Failed to decode encoded image for Texture2D {m_Texture2D.m_Name}: {ex.Message}");
                 return null;
             }
         }

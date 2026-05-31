@@ -129,6 +129,14 @@ public partial class MainWindow : Window
         ApplyUnityVersionOption();
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
         AssetsManager.ShouldYieldForUserInteraction = IsUserInteractionPriorityActive;
+        assetsManager.ShouldKeepFileCallback = fileName =>
+        {
+            lock (preloaderLock)
+            {
+                return preloadedUniqueIds.Any(uid => uid.StartsWith(fileName + "#")) 
+                    || (_currentlySelectedUniqueID != null && _currentlySelectedUniqueID.StartsWith(fileName + "#"));
+            }
+        };
         Progress.Default = new Progress<int>(SetProgressBarValue);
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
@@ -326,6 +334,13 @@ public partial class MainWindow : Window
     private void ResetForm()
     {
         BundleFile.CacheDirectory = "";
+        lock (preloaderLock)
+        {
+            preloaderCts?.Cancel();
+            preloaderCts?.Dispose();
+            preloaderCts = null;
+            preloadedUniqueIds.Clear();
+        }
         lock (previewCacheLock)
         {
             meshToMaterialsCache = null;
@@ -1340,7 +1355,7 @@ public partial class MainWindow : Window
             List<AssetHandle>? cachedHandles = null;
             if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
             {
-                cachedHandles = LoadIndexCache(paths[0], currentScanResult);
+                cachedHandles = await Task.Run(() => LoadIndexCache(paths[0], currentScanResult));
             }
 
             if (cachedHandles != null)
@@ -1527,6 +1542,19 @@ public partial class MainWindow : Window
             var finalProgressPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
             var wasCancelled = token.IsCancellationRequested;
 
+            if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !wasCancelled)
+            {
+                Dispatcher.UIThread.Post(() => StatusStripUpdate("Saving index cache to SQLite..."));
+                try
+                {
+                    SaveIndexCache(paths[0], currentScanResult);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to save index cache: {ex.Message}");
+                }
+            }
+
             Dispatcher.UIThread.Post(() =>
             {
                 _indexingUiThrottleStopwatch?.Stop();
@@ -1537,12 +1565,6 @@ public partial class MainWindow : Window
                     ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalProgressPercent}%)"
                     : $"Indexing finished. Total files: {originalTotal:N0}");
                 AppendNewLazyAssetsFromProjectIndex();
-
-                if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !token.IsCancellationRequested)
-                {
-                    SaveIndexCache(paths[0], currentScanResult);
-                }
-
                 BuildAssetStructures(incremental: true);
             });
         }, token);
@@ -2319,6 +2341,7 @@ public partial class MainWindow : Window
             {
                 await UpdateDumpForSelectedAsset();
             }
+            UpdatePreloadWindow(assetItem);
             QueuePreviewAsset(assetItem);
         }
         else
@@ -2327,6 +2350,10 @@ public partial class MainWindow : Window
             DumpTextBox.Text = string.Empty;
             previewDebounce?.Cancel();
             ClearPreview("Preview Panel");
+            lock (preloaderLock)
+            {
+                preloaderCts?.Cancel();
+            }
         }
     }
 
@@ -2629,6 +2656,29 @@ public partial class MainWindow : Window
         }
     }
 
+    private string? ResolvePathBySuffix(string originalPath, string projectRoot)
+    {
+        if (string.IsNullOrEmpty(originalPath) || string.IsNullOrEmpty(projectRoot))
+        {
+            return null;
+        }
+
+        var cleanOriginal = Path.GetFullPath(originalPath).Replace('/', '\\');
+        var cleanRoot = Path.GetFullPath(projectRoot).Replace('/', '\\');
+
+        var parts = cleanOriginal.Split('\\');
+        for (int i = 1; i < parts.Length; i++)
+        {
+            var suffix = string.Join("\\", parts.Skip(i));
+            var candidate = Path.Combine(cleanRoot, suffix);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
     private string? ResolveLazyHandleSourcePath(AssetHandle handle)
     {
         var candidates = new List<string>();
@@ -2659,10 +2709,26 @@ public partial class MainWindow : Window
             }
         }
 
-        return candidates
+        var resolved = candidates
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Select(path => Path.GetFullPath(path))
             .FirstOrDefault(File.Exists);
+
+        if (resolved != null)
+        {
+            return resolved;
+        }
+
+        if (!string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsManager.ProjectRoot))
+        {
+            var suffixMatch = ResolvePathBySuffix(handle.OriginalPath, assetsManager.ProjectRoot);
+            if (suffixMatch != null)
+            {
+                return suffixMatch;
+            }
+        }
+
+        return null;
     }
 
     private void RemovePendingFileFromProgressiveQueue(string sourcePath)
@@ -5766,6 +5832,17 @@ public partial class MainWindow : Window
 
             // Trigger selection changed logic if the selected item actually changed
             var newSelectedItem = AssetListDataGrid.SelectedItem as AssetItem;
+            if (newSelectedItem != null)
+            {
+                UpdatePreloadWindow(newSelectedItem);
+            }
+            else
+            {
+                lock (preloaderLock)
+                {
+                    preloaderCts?.Cancel();
+                }
+            }
             var newSelectedUniqueId = newSelectedItem != null ? (newSelectedItem.Handle != null ? newSelectedItem.Handle.UniqueID : newSelectedItem.UniqueID) : null;
             if (newSelectedUniqueId != oldSelectedUniqueId)
             {
@@ -8626,6 +8703,157 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.RestartAnimation();
             AnimPlayPauseBtn.Content = "Pause";
+        }
+    }
+
+    private CancellationTokenSource? preloaderCts;
+    private readonly object preloaderLock = new();
+    private readonly HashSet<string> preloadedUniqueIds = new();
+
+    private void UnloadAsset(AssetHandle handle)
+    {
+        if (handle == null) return;
+
+        lock (handle)
+        {
+            var obj = handle.RealObject;
+            handle.RealObject = null;
+
+            if (handle.Tag is AssetItem assetItem)
+            {
+                assetItem.Asset = null;
+            }
+
+            if (obj != null)
+            {
+                var assetsFile = handle.SourceFile;
+                if (assetsFile != null)
+                {
+                    lock (assetsFile)
+                    {
+                        assetsFile.Objects.Remove(obj);
+                        assetsFile.ObjectsDic.Remove(obj.m_PathID);
+                    }
+                }
+            }
+        }
+    }
+
+    private void UpdatePreloadWindow(AssetItem currentItem)
+    {
+        if (!assetsManager.LazyLoading) return;
+
+        lock (preloaderLock)
+        {
+            preloaderCts?.Cancel();
+            preloaderCts?.Dispose();
+            preloaderCts = new CancellationTokenSource();
+            var token = preloaderCts.Token;
+
+            var currentIdx = visibleAssetItems.IndexOf(currentItem);
+            if (currentIdx < 0) return;
+
+            int total = visibleAssetItems.Count;
+            int windowSize = Math.Min(50, total);
+            int start = currentIdx - windowSize / 2;
+            if (start < 0) start = 0;
+            if (start + windowSize > total) start = total - windowSize;
+            int end = start + windowSize - 1;
+
+            var itemsToKeep = new HashSet<string>();
+            var itemsToLoad = new List<AssetItem>();
+
+            for (int i = start; i <= end; i++)
+            {
+                var item = visibleAssetItems[i];
+                if (item.Handle != null && !string.IsNullOrEmpty(item.Handle.UniqueID))
+                {
+                    itemsToKeep.Add(item.Handle.UniqueID);
+                    if (item.Handle.RealObject == null)
+                    {
+                        itemsToLoad.Add(item);
+                    }
+                }
+            }
+
+            var toUnload = new List<string>();
+            foreach (var uid in preloadedUniqueIds)
+            {
+                if (!itemsToKeep.Contains(uid))
+                {
+                    toUnload.Add(uid);
+                }
+            }
+
+            foreach (var uid in toUnload)
+            {
+                preloadedUniqueIds.Remove(uid);
+                var handle = assetsManager.ProjectIndex.GetHandle(uid);
+                if (handle != null)
+                {
+                    UnloadAsset(handle);
+                }
+            }
+
+            var sortedItemsToLoad = itemsToLoad
+                .OrderBy(item =>
+                {
+                    var idx = visibleAssetItems.IndexOf(item);
+                    return idx >= 0 ? Math.Abs(idx - currentIdx) : int.MaxValue;
+                })
+                .ToList();
+
+            _ = Task.Run(async () =>
+            {
+                foreach (var item in sortedItemsToLoad)
+                {
+                    if (token.IsCancellationRequested) break;
+
+                    try
+                    {
+                        if (token.IsCancellationRequested) break;
+
+                        if (item.Handle?.UniqueID == null) continue;
+
+                        bool alreadyLoaded;
+                        lock (preloaderLock)
+                        {
+                            alreadyLoaded = preloadedUniqueIds.Contains(item.Handle.UniqueID);
+                        }
+
+                        if (alreadyLoaded)
+                        {
+                            continue;
+                        }
+
+                        if (item.Handle.RealObject != null)
+                        {
+                            lock (preloaderLock)
+                            {
+                                preloadedUniqueIds.Add(item.Handle.UniqueID);
+                            }
+                            continue;
+                        }
+
+                        EnsureLazyAssetReadyForPreview(item);
+                        assetsManager.ResolveHandle(item.Handle);
+
+                        if (item.Handle?.UniqueID != null && item.Handle.RealObject != null)
+                        {
+                            lock (preloaderLock)
+                            {
+                                preloadedUniqueIds.Add(item.Handle.UniqueID);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore individual load errors
+                    }
+
+                    await Task.Delay(15, token);
+                }
+            }, token);
         }
     }
 }

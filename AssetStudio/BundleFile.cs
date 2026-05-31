@@ -92,12 +92,55 @@ namespace AssetStudio
                             goto case "UnityFS";
                         }
                         ReadHeaderAndBlocksInfo(reader);
-                        var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached);
+                        var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached, out var tempCachePath, out var targetCachePath);
                         try
                         {
                             if (!isCached)
                             {
                                 ReadBlocksAndDirectory(reader, blocksStream);
+                                if (!string.IsNullOrEmpty(targetCachePath) && !string.IsNullOrEmpty(tempCachePath))
+                                {
+                                    blocksStream.Flush();
+                                    blocksStream.Dispose();
+
+                                    bool useExisting = false;
+                                    try
+                                    {
+                                        if (File.Exists(targetCachePath))
+                                        {
+                                            useExisting = true;
+                                        }
+                                        else
+                                        {
+                                            File.Move(tempCachePath, targetCachePath);
+                                        }
+                                    }
+                                    catch (IOException)
+                                    {
+                                        if (File.Exists(targetCachePath))
+                                        {
+                                            useExisting = true;
+                                        }
+                                        else
+                                        {
+                                            throw;
+                                        }
+                                    }
+
+                                    if (useExisting)
+                                    {
+                                        try
+                                        {
+                                            File.Delete(tempCachePath);
+                                        }
+                                        catch
+                                        {
+                                            // Ignore failure to delete temp file
+                                        }
+                                    }
+
+                                    blocksStream = new FileStream(targetCachePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                                }
                             }
                             else
                             {
@@ -108,6 +151,20 @@ namespace AssetStudio
                         catch
                         {
                             blocksStream.Dispose();
+                            if (!isCached && !string.IsNullOrEmpty(tempCachePath))
+                            {
+                                try
+                                {
+                                    if (File.Exists(tempCachePath))
+                                    {
+                                        File.Delete(tempCachePath);
+                                    }
+                                }
+                                catch
+                                {
+                                    // Ignore cleanup errors
+                                }
+                            }
                             throw;
                         }
                         if (blocksStream is MemoryStream)
@@ -124,18 +181,75 @@ namespace AssetStudio
                     {
                         ReadHeader(reader);
                         ReadBlocksInfoAndDirectory(reader);
-                        var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached);
+                        var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached, out var tempCachePath, out var targetCachePath);
                         try
                         {
                             if (!isCached)
                             {
                                 ReadBlocks(reader, blocksStream);
+                                if (!string.IsNullOrEmpty(targetCachePath) && !string.IsNullOrEmpty(tempCachePath))
+                                {
+                                    blocksStream.Flush();
+                                    blocksStream.Dispose();
+
+                                    bool useExisting = false;
+                                    try
+                                    {
+                                        if (File.Exists(targetCachePath))
+                                        {
+                                            useExisting = true;
+                                        }
+                                        else
+                                        {
+                                            File.Move(tempCachePath, targetCachePath);
+                                        }
+                                    }
+                                    catch (IOException)
+                                    {
+                                        if (File.Exists(targetCachePath))
+                                        {
+                                            useExisting = true;
+                                        }
+                                        else
+                                        {
+                                            throw;
+                                        }
+                                    }
+
+                                    if (useExisting)
+                                    {
+                                        try
+                                        {
+                                            File.Delete(tempCachePath);
+                                        }
+                                        catch
+                                        {
+                                            // Ignore failure to delete temp file
+                                        }
+                                    }
+
+                                    blocksStream = new FileStream(targetCachePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                                }
                             }
                             ReadFiles(blocksStream, reader.FullPath);
                         }
                         catch
                         {
                             blocksStream.Dispose();
+                            if (!isCached && !string.IsNullOrEmpty(tempCachePath))
+                            {
+                                try
+                                {
+                                    if (File.Exists(tempCachePath))
+                                    {
+                                        File.Delete(tempCachePath);
+                                    }
+                                }
+                                catch
+                                {
+                                    // Ignore cleanup errors
+                                }
+                            }
                             throw;
                         }
                         if (blocksStream is MemoryStream)
@@ -186,10 +300,12 @@ namespace AssetStudio
             reader.Position = m_Header.size;
         }
 
-        private Stream CreateBlocksStream(string path, out bool isCached)
+        private Stream CreateBlocksStream(string path, out bool isCached, out string? tempCachePath, out string? targetCachePath)
         {
             isCached = false;
-            var uncompressedSizeSum = m_BlocksInfo.Sum(x => x.uncompressedSize);
+            tempCachePath = null;
+            targetCachePath = null;
+            var uncompressedSizeSum = m_BlocksInfo.Sum(x => (long)x.uncompressedSize);
             if (!string.IsNullOrEmpty(CacheDirectory) && !string.IsNullOrEmpty(path))
             {
                 try
@@ -208,9 +324,22 @@ namespace AssetStudio
                             isCached = true;
                             return new FileStream(cachedFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                         }
+                        else
+                        {
+                            try
+                            {
+                                File.Delete(cachedFilePath);
+                            }
+                            catch
+                            {
+                                // Ignore if locked
+                            }
+                        }
                     }
 
-                    return new FileStream(cachedFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
+                    targetCachePath = cachedFilePath;
+                    tempCachePath = cachedFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    return new FileStream(tempCachePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
                 }
                 catch (Exception ex)
                 {

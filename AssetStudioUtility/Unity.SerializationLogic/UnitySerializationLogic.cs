@@ -399,8 +399,9 @@ namespace Unity.SerializationLogic
                 // type defined in a winmd cannot be serialized.
                 typeReference.Resolve();
             }
-            catch
+            catch (Exception ex)
             {
+                AssetStudio.Logger.Debug($"Resolve failed during ShouldNotTryToResolve check for type {typeReference?.Name}: {ex.Message}");
                 return true;
             }
 
@@ -603,8 +604,9 @@ namespace Unity.SerializationLogic
                         resolvedTypeDeclaration.IsSubclassOf(UnityEngineTypePredicates.MonoBehaviour, UnityEngineTypePredicates.ScriptableObject);
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                AssetStudio.Logger.Debug($"ShouldImplementIDeserializable failed for {typeDeclaration?.FullName ?? "unknown type"}: {ex.Message}");
                 return false;
             }
         }

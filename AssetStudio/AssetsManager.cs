@@ -29,6 +29,7 @@ namespace AssetStudio
         public static bool DisableMemoryPressureCheck = false;
         public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;
         public static Func<bool> ShouldYieldForUserInteraction;
+        public Func<string, bool> ShouldKeepFileCallback;
         public static volatile bool ShouldStopLoading = false;
 
         public string SpecifyUnityVersion;
@@ -678,16 +679,27 @@ namespace AssetStudio
         {
             lock (loadLock)
             {
+                var filesToRemove = new List<SerializedFile>();
                 foreach (var assetsFile in assetsFileList)
                 {
+                    if (ShouldKeepFileCallback != null && ShouldKeepFileCallback(assetsFile.fileName))
+                    {
+                        continue;
+                    }
+
                     assetsFile.Objects.Clear();
                     if (assetsFile.reader != null)
                     {
                         assetsFile.reader.Close();
                     }
+                    filesToRemove.Add(assetsFile);
                 }
-                assetsFileList.Clear();
-                assetsFileListHash.Clear();
+
+                foreach (var file in filesToRemove)
+                {
+                    assetsFileList.Remove(file);
+                    assetsFileListHash.TryRemove(file.fileName, out _);
+                }
 
                 foreach (var eventHandle in assetsFileLoadEvents.Values)
                 {

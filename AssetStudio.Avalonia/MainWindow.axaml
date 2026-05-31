@@ -188,7 +188,7 @@
             <TextBlock x:Name="statusLabel" Grid.Column="1" VerticalAlignment="Center" Margin="6,0,4,0" Text="Ready" />
         </Grid>
 
-        <Grid ColumnDefinitions="3*, 5, 7*">
+        <Grid ColumnDefinitions="7*, 5, 3*">
             
             <TabControl x:Name="LeftTabControl" Grid.Column="0" Margin="2">
                 <TabItem Header="Scene Hierarchy">

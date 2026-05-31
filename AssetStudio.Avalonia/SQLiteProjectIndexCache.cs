@@ -63,7 +63,7 @@ namespace AssetStudio.Avalonia
 
                             CREATE INDEX IF NOT EXISTS idx_projects_path ON Projects(FolderPath);
                             CREATE INDEX IF NOT EXISTS idx_handles_project ON AssetHandles(ProjectId);
-                            CREATE INDEX IF NOT EXISTS idx_handles_unique ON AssetHandles(UniqueID);
+                            DROP INDEX IF EXISTS idx_handles_unique;
                         ";
                         cmd.ExecuteNonQuery();
                     }

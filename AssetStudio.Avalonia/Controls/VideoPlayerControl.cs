@@ -9,6 +9,7 @@ using Avalonia.Threading;
 using FFmpegVideoPlayer.Core;
 using Avalonia.FFmpegVideoPlayer;
 using AssetStudio.Avalonia;
+using Logger = AssetStudio.Logger;
 
 namespace AssetStudio.Avalonia.Controls
 {
@@ -23,6 +24,7 @@ namespace AssetStudio.Avalonia.Controls
         private int _previousVolume = 100;
         private Func<int, int, IAudioPlayer?>? _audioPlayerFactoryFunc;
         private bool _autoPlayCached;
+        private bool _frameRenderErrorLogged;
 
         public static readonly StyledProperty<int> VolumeProperty =
             AvaloniaProperty.Register<VideoPlayerControl, int>(nameof(Volume), defaultValue: 100);
@@ -216,14 +218,15 @@ namespace AssetStudio.Avalonia.Controls
                         }
                         return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
                     }
-                    catch
+                    catch (Exception ex)
                     {
                         try
                         {
                             return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
                         }
-                        catch
+                        catch (Exception innerEx)
                         {
+                            Logger.Warning($"Failed to initialize audio player for video: WinMm failed with ({ex.Message}), OpenTK failed with ({innerEx.Message})");
                             return null;
                         }
                     }
@@ -274,8 +277,9 @@ namespace AssetStudio.Avalonia.Controls
                     Open(Source);
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Logger.Error("Failed to initialize video player", ex);
             }
         }
 
@@ -307,16 +311,18 @@ namespace AssetStudio.Avalonia.Controls
                             _videoRenderer = new OpenGLVideoRenderer();
                             rendererControl = (Control)_videoRenderer;
                         }
-                        catch
+                        catch (Exception ex)
                         {
+                            Logger.Warning($"OpenGL video renderer failed to initialize, falling back to CPU: {ex.Message}");
                             _videoRenderer = new CpuVideoRenderer();
                             rendererControl = (Control)_videoRenderer;
                         }
                         break;
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.Warning($"Failed to setup video renderer, falling back to CPU: {ex.Message}");
                 _videoRenderer = new CpuVideoRenderer();
                 rendererControl = (Control)_videoRenderer;
             }
@@ -425,8 +431,13 @@ namespace AssetStudio.Avalonia.Controls
             {
                 _videoRenderer?.RenderFrame(e.Data, e.Width, e.Height, e.Stride);
             }
-            catch
+            catch (Exception ex)
             {
+                if (!_frameRenderErrorLogged)
+                {
+                    _frameRenderErrorLogged = true;
+                    Logger.Warning($"Failed to render video frame (suppressing future render errors): {ex.Message}");
+                }
             }
             finally
             {
@@ -437,6 +448,7 @@ namespace AssetStudio.Avalonia.Controls
         public void Open(string path)
         {
             _hasMediaLoaded = false;
+            _frameRenderErrorLogged = false;
 
             var oldPlayer = _mediaPlayer;
             if (oldPlayer != null)
@@ -456,7 +468,10 @@ namespace AssetStudio.Avalonia.Controls
                         oldPlayer.Close();
                         oldPlayer.Dispose();
                     }
-                    catch {}
+                    catch (Exception ex)
+                    {
+                        Logger.Debug($"Error closing/disposing old video player: {ex.Message}");
+                    }
                 });
             }
 
@@ -497,7 +512,14 @@ namespace AssetStudio.Avalonia.Controls
             {
                 ThreadPool.QueueUserWorkItem(_ =>
                 {
-                    try { oldPlayer.Stop(); } catch {}
+                    try
+                    {
+                        oldPlayer.Stop();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug($"Error stopping video player: {ex.Message}");
+                    }
                 });
             }
             Dispatcher.UIThread.Post(() => _videoRenderer?.Clear());

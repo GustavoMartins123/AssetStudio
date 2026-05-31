@@ -35,9 +35,9 @@ namespace AssetStudio
                     return dataBytes;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // Fallback or ignore
+                Logger.Error($"AudioClip conversion to WAV failed for {m_AudioClip.m_Name}", ex);
             }
             return null;
         }
@@ -130,8 +130,9 @@ namespace AssetStudio
                     }
                     return bank.Samples[0].RebuildAsStandardFileFormat(out _, out _);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Logger.Debug($"AudioClip IsSupport check failed for {m_AudioClip.m_Name}: {ex.Message}");
                     return false;
                 }
             }

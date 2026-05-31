@@ -1,4 +1,4 @@
-﻿using SixLabors.ImageSharp;
+using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing;
 using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.ImageSharp.PixelFormats;
@@ -102,9 +102,9 @@ namespace AssetStudio
                                 return spriteImage;
                             }
                         }
-                        catch
+                        catch (Exception ex)
                         {
-                            // ignored
+                            Logger.Warning($"Failed to apply Tight packing mode for Sprite {m_Sprite.m_Name}, falling back to Rectangle packing mode: {ex.Message}");
                         }
                     }
 
