@@ -325,6 +325,7 @@ public partial class MainWindow : Window
 
     private void ResetForm()
     {
+        BundleFile.CacheDirectory = "";
         lock (previewCacheLock)
         {
             meshToMaterialsCache = null;
@@ -1285,6 +1286,22 @@ public partial class MainWindow : Window
         ApplyUnityVersionOption();
         StatusStripUpdate("Loading progressively...");
 
+        string cacheTargetFolder = "";
+        if (paths.Length == 1 && Directory.Exists(paths[0]))
+        {
+            cacheTargetFolder = paths[0];
+        }
+        else if (paths.Length > 0)
+        {
+            cacheTargetFolder = Path.GetDirectoryName(Path.GetFullPath(paths[0])) ?? string.Empty;
+        }
+
+        if (!string.IsNullOrEmpty(cacheTargetFolder))
+        {
+            var folderCacheKey = GetFolderCacheKey(cacheTargetFolder);
+            BundleFile.CacheDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "DecompressedCache", folderCacheKey);
+        }
+
         try
         {
             var files = new List<string>();
@@ -1482,6 +1499,11 @@ public partial class MainWindow : Window
                 catch (Exception ex)
                 {
                     Logger.Error($"Error loading batch of {batch.Count} files", ex);
+                }
+
+                if (assetsManager.LazyLoading)
+                {
+                    assetsManager.ClearLoadedFilesKeepIndex();
                 }
 
                 loadedCount += batch.Count;

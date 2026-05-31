@@ -674,6 +674,43 @@ namespace AssetStudio
             assetsFileIndexCache.Clear();
         }
 
+        public void ClearLoadedFilesKeepIndex()
+        {
+            lock (loadLock)
+            {
+                foreach (var assetsFile in assetsFileList)
+                {
+                    assetsFile.Objects.Clear();
+                    if (assetsFile.reader != null)
+                    {
+                        assetsFile.reader.Close();
+                    }
+                }
+                assetsFileList.Clear();
+                assetsFileListHash.Clear();
+
+                foreach (var eventHandle in assetsFileLoadEvents.Values)
+                {
+                    eventHandle.Dispose();
+                }
+                assetsFileLoadEvents.Clear();
+
+                foreach (var resourceFileReader in resourceFileReaders)
+                {
+                    resourceFileReader.Value.Close();
+                }
+                resourceFileReaders.Clear();
+
+                foreach (var stream in bundleStreams)
+                {
+                    stream.Dispose();
+                }
+                bundleStreams = new ConcurrentBag<Stream>();
+
+                assetsFileIndexCache.Clear();
+            }
+        }
+
         public static Object CreateObjectFromReader(ObjectReader objectReader)
         {
             switch (objectReader.type)

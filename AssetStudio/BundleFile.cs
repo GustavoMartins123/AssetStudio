@@ -37,6 +37,7 @@ namespace AssetStudio
         public static bool LowMemoryMode { get; set; } = true;
         public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
         public static string TemporaryDirectory { get; set; } = "";
+        public static string CacheDirectory { get; set; } = "";
 
         public class Header
         {
@@ -91,10 +92,17 @@ namespace AssetStudio
                             goto case "UnityFS";
                         }
                         ReadHeaderAndBlocksInfo(reader);
-                        var blocksStream = CreateBlocksStream(reader.FullPath);
+                        var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached);
                         try
                         {
-                            ReadBlocksAndDirectory(reader, blocksStream);
+                            if (!isCached)
+                            {
+                                ReadBlocksAndDirectory(reader, blocksStream);
+                            }
+                            else
+                            {
+                                ReadDirectoryInfoOnly(blocksStream);
+                            }
                             ReadFiles(blocksStream, reader.FullPath);
                         }
                         catch
@@ -116,10 +124,13 @@ namespace AssetStudio
                     {
                         ReadHeader(reader);
                         ReadBlocksInfoAndDirectory(reader);
-                        var blocksStream = CreateBlocksStream(reader.FullPath);
+                        var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached);
                         try
                         {
-                            ReadBlocks(reader, blocksStream);
+                            if (!isCached)
+                            {
+                                ReadBlocks(reader, blocksStream);
+                            }
                             ReadFiles(blocksStream, reader.FullPath);
                         }
                         catch
@@ -175,10 +186,39 @@ namespace AssetStudio
             reader.Position = m_Header.size;
         }
 
-        private Stream CreateBlocksStream(string path)
+        private Stream CreateBlocksStream(string path, out bool isCached)
         {
-            Stream blocksStream;
+            isCached = false;
             var uncompressedSizeSum = m_BlocksInfo.Sum(x => x.uncompressedSize);
+            if (!string.IsNullOrEmpty(CacheDirectory) && !string.IsNullOrEmpty(path))
+            {
+                try
+                {
+                    var fileInfo = new FileInfo(path);
+                    var cachedFileName = $"{SanitizeTempFilePart(Path.GetFileName(path))}_{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}.blocks";
+                    var cachedFilePath = Path.Combine(CacheDirectory, cachedFileName);
+
+                    Directory.CreateDirectory(CacheDirectory);
+
+                    if (File.Exists(cachedFilePath))
+                    {
+                        var cacheFileInfo = new FileInfo(cachedFilePath);
+                        if (cacheFileInfo.Length == uncompressedSizeSum)
+                        {
+                            isCached = true;
+                            return new FileStream(cachedFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        }
+                    }
+
+                    return new FileStream(cachedFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to use persistent cache for {path}: {ex.Message}. Falling back to default stream.");
+                }
+            }
+
+            Stream blocksStream;
             if (ShouldUseTemporaryStream(uncompressedSizeSum))
             {
                 /*var memoryMappedFile = MemoryMappedFile.CreateNew(null, uncompressedSizeSum);
@@ -190,6 +230,23 @@ namespace AssetStudio
                 blocksStream = new MemoryStream((int)uncompressedSizeSum);
             }
             return blocksStream;
+        }
+
+        private void ReadDirectoryInfoOnly(Stream blocksStream)
+        {
+            blocksStream.Position = 0;
+            var blocksReader = new EndianBinaryReader(blocksStream);
+            var nodesCount = blocksReader.ReadInt32();
+            m_DirectoryInfo = new Node[nodesCount];
+            for (int i = 0; i < nodesCount; i++)
+            {
+                m_DirectoryInfo[i] = new Node
+                {
+                    path = blocksReader.ReadStringToNull(),
+                    offset = blocksReader.ReadUInt32(),
+                    size = blocksReader.ReadUInt32()
+                };
+            }
         }
 
         private static bool ShouldUseTemporaryStream(long size)
