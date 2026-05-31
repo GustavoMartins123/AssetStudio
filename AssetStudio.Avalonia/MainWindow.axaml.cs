@@ -87,6 +87,7 @@ public partial class MainWindow : Window
     private volatile int _targetVolume = 80;
     private DispatcherTimer? _ffmpegVideoTimer;
 
+    private readonly SQLiteProjectIndexCache _sqliteCache = new();
     private ProjectScanResult? currentScanResult;
     private bool isBuildingAssetStructures;
     private CancellationTokenSource? indexingCts;
@@ -1319,31 +1320,24 @@ public partial class MainWindow : Window
             }
 
             // Check cache
-            ProjectIndexCache? cachedIndex = null;
+            List<AssetHandle>? cachedHandles = null;
             if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
             {
-                cachedIndex = LoadIndexCache(paths[0], currentScanResult);
+                cachedHandles = LoadIndexCache(paths[0], currentScanResult);
             }
 
-            if (cachedIndex != null)
+            if (cachedHandles != null)
             {
-                StatusStripUpdate("Loading project index from cache...");
-                foreach (var ch in cachedIndex.Handles)
+                StatusStripUpdate("Loading project index from SQLite cache...");
+                foreach (var handle in cachedHandles)
                 {
-                    var handle = new AssetHandle
-                    {
-                        UniqueID = ch.UniqueID,
-                        Name = ch.Name,
-                        Type = (ClassIDType)ch.Type,
-                        Container = ch.Container,
-                        OriginalPath = ch.OriginalPath,
-                        SerializedFileName = ch.SerializedFileName,
-                        PathID = ch.PathID,
-                        ByteStart = ch.ByteStart,
-                        ByteSize = ch.ByteSize
-                    };
                     assetsManager.ProjectIndex.AddHandle(handle);
                 }
+                progressBar.Value = 100;
+                var count = AppendNewLazyAssetsFromProjectIndex();
+                StatusStripUpdate($"Loaded from cache. Total assets: {count:N0}");
+                BuildAssetStructures(incremental: false);
+                return;
             }
 
             StartProgressiveIndexing(files, paths);
@@ -1674,38 +1668,10 @@ public partial class MainWindow : Window
     {
         try
         {
-            var cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
-            if (!Directory.Exists(cacheDir))
-            {
-                Directory.CreateDirectory(cacheDir);
-            }
-
-            var cacheKey = GetFolderCacheKey(folderPath);
-            var cachePath = Path.Combine(cacheDir, $"{cacheKey}.json");
-
-            var cache = new ProjectIndexCache
-            {
-                RootPath = folderPath,
-                TotalFiles = scanResult.TotalFiles,
-                TotalBytes = scanResult.TotalBytes,
-                UnityBundleCount = scanResult.UnityBundleCount,
-                Handles = assetsManager.ProjectIndex.GetHandles().Select(h => new CachedAssetHandle
-                {
-                    UniqueID = h.UniqueID,
-                    Name = h.Name,
-                    Type = (int)h.Type,
-                    Container = h.Container,
-                    OriginalPath = h.OriginalPath,
-                    SerializedFileName = h.SerializedFileName,
-                    PathID = h.PathID,
-                    ByteStart = h.ByteStart,
-                    ByteSize = h.ByteSize
-                }).ToList()
-            };
-
-            var json = System.Text.Json.JsonSerializer.Serialize(cache);
-            File.WriteAllText(cachePath, json);
-            Logger.Info($"Saved index cache to {cachePath}");
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            var unityVersion = assetsManager.SpecifyUnityVersion;
+            var handles = assetsManager.ProjectIndex.GetHandles();
+            _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles);
         }
         catch (Exception ex)
         {
@@ -1713,35 +1679,18 @@ public partial class MainWindow : Window
         }
     }
 
-    private ProjectIndexCache? LoadIndexCache(string folderPath, ProjectScanResult scanResult)
+    private List<AssetHandle>? LoadIndexCache(string folderPath, ProjectScanResult scanResult)
     {
         try
         {
-            var cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
-            var cacheKey = GetFolderCacheKey(folderPath);
-            var cachePath = Path.Combine(cacheDir, $"{cacheKey}.json");
-
-            if (!File.Exists(cachePath))
-            {
-                return null;
-            }
-
-            var json = File.ReadAllText(cachePath);
-            var cache = System.Text.Json.JsonSerializer.Deserialize<ProjectIndexCache>(json);
-
-            if (cache != null &&
-                cache.TotalFiles == scanResult.TotalFiles &&
-                cache.TotalBytes == scanResult.TotalBytes &&
-                cache.UnityBundleCount == scanResult.UnityBundleCount)
-            {
-                return cache;
-            }
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            return _sqliteCache.LoadIndexCache(folderPath, signature);
         }
         catch (Exception ex)
         {
             Logger.Warning($"Failed to load index cache: {ex.Message}");
+            return null;
         }
-        return null;
     }
 
     private static string BuildRiskyProjectMessage(ProjectScanResult scanResult)
@@ -2039,7 +1988,7 @@ public partial class MainWindow : Window
         isBuildingAssetStructures = true;
         try
         {
-            if (assetsManager.assetsFileList.Count == 0)
+            if (assetsManager.assetsFileList.Count == 0 && (!assetsManager.LazyLoading || !assetsManager.ProjectIndex.GetHandles().Any()))
             {
                 StatusStripUpdate("No Unity file can be loaded.");
                 return;
@@ -2718,6 +2667,55 @@ public partial class MainWindow : Window
         if (assetsManager.TryFindSerializedFile(handle.SerializedFileName, handle.OriginalPath, out var sourceFile) && sourceFile != null)
         {
             handle.SourceFile = sourceFile;
+        }
+    }
+
+    private void EnsureLazyAssetsLoadedForExport(List<AssetItem> items)
+    {
+        if (!assetsManager.LazyLoading)
+        {
+            return;
+        }
+
+        var unloadedItems = items
+            .Where(x => x.Handle != null && x.Handle.SourceFile?.reader == null)
+            .ToList();
+
+        if (unloadedItems.Count == 0)
+        {
+            return;
+        }
+
+        var uniqueSourcePaths = unloadedItems
+            .Select(x => ResolveLazyHandleSourcePath(x.Handle!))
+            .Where(path => !string.IsNullOrEmpty(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (uniqueSourcePaths.Count > 0)
+        {
+            Dispatcher.UIThread.Post(() => StatusStripUpdate($"Loading {uniqueSourcePaths.Count} source file(s) for export..."));
+            foreach (var path in uniqueSourcePaths)
+            {
+                try
+                {
+                    assetsManager.LoadFilesForPreview(path);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to load source file {path} for export: {ex.Message}");
+                }
+            }
+
+            foreach (var item in unloadedItems)
+            {
+                if (item.Handle != null)
+                {
+                    assetsManager.WaitForAssetsFileLoaded(item.Handle.SerializedFileName, 5000);
+                    TryAttachLoadedSourceFile(item.Handle);
+                    UpdateLazyAssetItemHandle(item, item.Handle);
+                }
+            }
         }
     }
 
@@ -6308,7 +6306,7 @@ public partial class MainWindow : Window
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump) && toExport.Any(x => x.Asset is MonoBehaviour))
+        if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump) && toExport.Any(x => x.Type == ClassIDType.MonoBehaviour))
         {
             var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
             if (folders != null && folders.Count > 0)
@@ -6342,6 +6340,7 @@ public partial class MainWindow : Window
 
         await Task.Run(() =>
         {
+            EnsureLazyAssetsLoadedForExport(toExport);
             var currentExportPath = Path.Combine(savePath, "export-current.txt");
             for (int j = 0; j < total; j++)
             {
@@ -6454,7 +6453,6 @@ public partial class MainWindow : Window
         var exportPath = Path.Combine(selectedExportRoot, "Animator");
         Directory.CreateDirectory(exportPath);
         var exportFile = Path.Combine(exportPath, FixFileName(animator.Name) + ".fbx");
-        var clips = animationList.Select(x => (AnimationClip)x.Asset!).ToArray();
         var selectedGameObjects = GetTopLevelSelectedGameObjects(selectedAssets
             .Where(x => x.Type != ClassIDType.AnimationClip && x.TreeNode?.GameObject != null)
             .Select(x => x.TreeNode!.GameObject!)
@@ -6469,6 +6467,8 @@ public partial class MainWindow : Window
         {
             try
             {
+                EnsureLazyAssetsLoadedForExport(selectedAssets);
+                var clips = animationList.Select(x => (AnimationClip)x.Asset!).ToArray();
                 WriteCurrentExport(currentExportPath, animator, 1, 1);
                 IImported convert = selectedGameObjects.Count > 0
                     ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
@@ -8985,27 +8985,7 @@ public enum ExportMode
     Dump
 }
 
-public class ProjectIndexCache
-{
-    public string RootPath { get; set; } = string.Empty;
-    public int TotalFiles { get; set; }
-    public long TotalBytes { get; set; }
-    public int UnityBundleCount { get; set; }
-    public List<CachedAssetHandle> Handles { get; set; } = new List<CachedAssetHandle>();
-}
 
-public class CachedAssetHandle
-{
-    public string UniqueID { get; set; } = string.Empty;
-    public string Name { get; set; } = string.Empty;
-    public int Type { get; set; }
-    public string Container { get; set; } = string.Empty;
-    public string OriginalPath { get; set; } = string.Empty;
-    public string SerializedFileName { get; set; } = string.Empty;
-    public long PathID { get; set; }
-    public long ByteStart { get; set; }
-    public long ByteSize { get; set; }
-}
 
 public class BulkObservableCollection<T> : System.Collections.ObjectModel.ObservableCollection<T>
 {
