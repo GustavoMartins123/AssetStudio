@@ -17,7 +17,7 @@ namespace AssetStudio
         StopAndKeep
     }
 
-    public class AssetsManager
+    public class AssetsManager : IDisposable
     {
         private const double DefaultLoadThreadRatio = 0.4;
         private const double DefaultReadThreadRatio = 0.4;
@@ -666,13 +666,17 @@ namespace AssetStudio
             }
             resourceFileReaders.Clear();
 
-            foreach (var stream in bundleStreams)
+            while (bundleStreams.TryTake(out var stream))
             {
                 stream.Dispose();
             }
-            bundleStreams = new ConcurrentBag<Stream>();
 
             assetsFileIndexCache.Clear();
+        }
+
+        public void Dispose()
+        {
+            Clear();
         }
 
         public void ClearLoadedFilesKeepIndex()
@@ -713,11 +717,10 @@ namespace AssetStudio
                 }
                 resourceFileReaders.Clear();
 
-                foreach (var stream in bundleStreams)
+                while (bundleStreams.TryTake(out var stream))
                 {
                     stream.Dispose();
                 }
-                bundleStreams = new ConcurrentBag<Stream>();
 
                 assetsFileIndexCache.Clear();
             }

@@ -86,12 +86,14 @@ namespace AssetStudioGUI
         private static int ExtractBundleFile(FileReader reader, string savePath)
         {
             StatusStripUpdate($"Decompressing {reader.FileName} ...");
-            var bundleFile = new BundleFile(reader);
-            reader.Dispose();
-            if (bundleFile.fileList.Length > 0)
+            using (var bundleFile = new BundleFile(reader))
             {
-                var extractPath = Path.Combine(savePath, reader.FileName + "_unpacked");
-                return ExtractStreamFile(extractPath, bundleFile.fileList);
+                reader.Dispose();
+                if (bundleFile.fileList.Length > 0)
+                {
+                    var extractPath = Path.Combine(savePath, reader.FileName + "_unpacked");
+                    return ExtractStreamFile(extractPath, bundleFile.fileList);
+                }
             }
             return 0;
         }

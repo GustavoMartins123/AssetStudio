@@ -1985,7 +1985,7 @@ public partial class MainWindow : Window
     {
         StatusStripUpdate($"Decompressing {reader.FileName} ...");
         var fileName = reader.FileName;
-        var bundleFile = new BundleFile(reader);
+        using var bundleFile = new BundleFile(reader);
         if (bundleFile.fileList.Length == 0) return 0;
 
         var extractPath = Path.Combine(savePath, fileName + "_unpacked");
@@ -7012,22 +7012,43 @@ public partial class MainWindow : Window
             return;
         }
 
+        var resolvedPath = sourcePath;
+        if (!File.Exists(resolvedPath) && item.Handle != null)
+        {
+            var resolved = ResolveLazyHandleSourcePath(item.Handle);
+            if (resolved != null)
+            {
+                resolvedPath = resolved;
+            }
+        }
+
+        if (!File.Exists(resolvedPath) && !Directory.Exists(resolvedPath))
+        {
+            StatusStripUpdate($"Original file does not exist on disk: {resolvedPath}");
+            return;
+        }
+
         try
         {
             if (OperatingSystem.IsWindows())
             {
-                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{sourcePath}\"") { UseShellExecute = true });
+                var cleanPath = resolvedPath.Replace("\"", "");
+                if (cleanPath.EndsWith("\\"))
+                {
+                    cleanPath += ".";
+                }
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{cleanPath}\"") { UseShellExecute = true });
             }
             else if (OperatingSystem.IsMacOS())
             {
                 var startInfo = new ProcessStartInfo("open") { UseShellExecute = false };
                 startInfo.ArgumentList.Add("-R");
-                startInfo.ArgumentList.Add(sourcePath);
+                startInfo.ArgumentList.Add(resolvedPath);
                 Process.Start(startInfo);
             }
             else
             {
-                var folder = Directory.Exists(sourcePath) ? sourcePath : Path.GetDirectoryName(sourcePath);
+                var folder = Directory.Exists(resolvedPath) ? resolvedPath : Path.GetDirectoryName(resolvedPath);
                 if (string.IsNullOrEmpty(folder)) return;
                 var startInfo = new ProcessStartInfo("xdg-open") { UseShellExecute = false };
                 startInfo.ArgumentList.Add(folder);
@@ -8071,6 +8092,7 @@ public partial class MainWindow : Window
         AudioReset(recreateAudioPlayer: false);
         VideoReset();
         _pcmWavePreviewPlayer?.Dispose();
+        assetsManager.Dispose();
         base.OnClosing(e);
     }
 

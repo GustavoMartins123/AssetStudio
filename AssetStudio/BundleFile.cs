@@ -32,7 +32,7 @@ namespace AssetStudio
         Lzham
     }
 
-    public class BundleFile
+    public class BundleFile : IDisposable
     {
         public static bool LowMemoryMode { get; set; } = true;
         public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
@@ -682,6 +682,12 @@ namespace AssetStudio
                 }
             }
             blocksStream.Position = 0;
+        }
+
+        public void Dispose()
+        {
+            BlocksStream?.Dispose();
+            BlocksStream = null;
         }
     }
 }
