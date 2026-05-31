@@ -169,7 +169,6 @@ namespace AssetStudio.Avalonia.Controls
 
         public long Duration => _mediaPlayer?.Length ?? 0L;
 
-        public event EventHandler? FullscreenToggle;
         public event EventHandler? PlaybackStarted;
         public event EventHandler<MediaOpenedEventArgs>? MediaOpened;
         public event EventHandler? PlaybackPaused;
@@ -352,10 +351,6 @@ namespace AssetStudio.Avalonia.Controls
             else if (e.Property == RenderingModeProperty)
             {
                 SetupVideoRenderer();
-            }
-            else if (e.Property == IsFullscreenProperty)
-            {
-                FullscreenToggle?.Invoke(this, EventArgs.Empty);
             }
         }
 

@@ -83,10 +83,15 @@ public partial class MainWindow : Window
     private readonly object previewCacheLock = new object();
 
     private FFmpegMediaPlayer? _audioMediaPlayer;
+    private PcmWavePreviewPlayer? _pcmWavePreviewPlayer;
     private string? _currentTempAudioPath;
+    private string? _currentTempAudioAssetId;
+    private CancellationTokenSource? _audioPreviewLoadCts;
+    private bool _usingPcmWavePreview;
     private long _audioLengthMs;
     private DispatcherTimer? _audioTimer;
     private const long PrematureAudioEndToleranceMs = 1500;
+    private const long AudioLengthMismatchToleranceMs = 250;
     private readonly System.Diagnostics.Stopwatch _audioPlaybackClock = new();
     private long _audioPlaybackBaseMs;
     private volatile int _targetAudioVolume = 80;
@@ -95,6 +100,8 @@ public partial class MainWindow : Window
     private string _audioPreviewSourceDescription = string.Empty;
 
     private string? _currentTempVideoPath;
+    private string? _currentTempVideoAssetId;
+    private CancellationTokenSource? _videoPreviewLoadCts;
     private bool _isUpdatingVideoProgress = false;
     private bool _isVideoDragging = false;
     private long _videoLengthMs = 0;
@@ -179,21 +186,7 @@ public partial class MainWindow : Window
 
         try
         {
-            _audioMediaPlayer = new FFmpegMediaPlayer(action =>
-            {
-                Dispatcher.UIThread.Post(action);
-            }, (sr, ch) => {
-                try
-                {
-                    return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
-                }
-                catch
-                {
-                    return null;
-                }
-            });
-
-            _audioMediaPlayer.EndReached += AudioMediaPlayer_EndReached;
+            _audioMediaPlayer = CreateAudioMediaPlayer();
             _audioTimer = new DispatcherTimer
             {
                 Interval = TimeSpan.FromMilliseconds(100)
@@ -2799,12 +2792,18 @@ public partial class MainWindow : Window
         if (FMODPanel != null)
         {
             FMODPanel.IsVisible = false;
-            AudioReset();
+            if (asset is not AudioClip)
+            {
+                AudioReset();
+            }
         }
         if (VideoClipPanel != null)
         {
             VideoClipPanel.IsVisible = false;
-            VideoReset();
+            if (asset is not VideoClip && asset is not VideoPlayer)
+            {
+                VideoReset();
+            }
         }
         ClearMeshMaterialControls();
         if (asset is not AnimationClip)
@@ -7987,22 +7986,89 @@ public partial class MainWindow : Window
     {
         AssetsManager.ShouldYieldForUserInteraction = null;
         FlushAvatarPreviewSettingsSave();
-        AudioReset();
+        AudioReset(recreateAudioPlayer: false);
         VideoReset();
-        _audioMediaPlayer?.Dispose();
+        _pcmWavePreviewPlayer?.Dispose();
         base.OnClosing(e);
     }
 
     #region Audio Preview
+    private FFmpegMediaPlayer CreateAudioMediaPlayer()
+    {
+        var mediaPlayer = new FFmpegMediaPlayer(action =>
+        {
+            Dispatcher.UIThread.Post(action);
+        }, (sr, ch) =>
+        {
+            try
+            {
+                return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+            }
+            catch
+            {
+                return null;
+            }
+        });
+
+        mediaPlayer.EndReached += AudioMediaPlayer_EndReached;
+        return mediaPlayer;
+    }
+
+    private void ResetAudioMediaPlayer(bool recreate)
+    {
+        var oldPlayer = _audioMediaPlayer;
+        if (oldPlayer != null)
+        {
+            oldPlayer.EndReached -= AudioMediaPlayer_EndReached;
+            try { oldPlayer.Stop(); } catch {}
+            try { oldPlayer.Close(); } catch {}
+            try { oldPlayer.Dispose(); } catch {}
+            _audioMediaPlayer = null;
+        }
+
+        if (!recreate)
+        {
+            return;
+        }
+
+        try
+        {
+            _audioMediaPlayer = CreateAudioMediaPlayer();
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"Failed to initialize FFmpeg audio player: {ex.Message}");
+        }
+    }
+
     private void AudioTimer_Tick(object? sender, EventArgs e)
     {
-        if (_audioMediaPlayer == null)
+        if (_audioMediaPlayer == null && !_usingPcmWavePreview)
             return;
 
         long currentMs = 0;
         long totalMs = 0;
 
-        if (useLinuxAudioFallback)
+        if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+        {
+            currentMs = _pcmWavePreviewPlayer.GetPositionMs();
+            totalMs = _pcmWavePreviewPlayer.DurationMs;
+            _audioLengthMs = totalMs;
+
+            if (_pcmWavePreviewPlayer.IsCompleted)
+            {
+                if (FMODloopButton.IsChecked == true)
+                {
+                    RestartAudioPreviewPlayback();
+                }
+                else
+                {
+                    AudioStop();
+                }
+                return;
+            }
+        }
+        else if (useLinuxAudioFallback)
         {
             if (_linuxAudioStopwatch != null)
             {
@@ -8026,26 +8092,33 @@ public partial class MainWindow : Window
         }
         else
         {
-            if (_audioLengthMs <= 0 && _audioMediaPlayer.Length > 0)
+            var mediaPlayer = _audioMediaPlayer;
+            if (mediaPlayer == null)
             {
-                _audioLengthMs = _audioMediaPlayer.Length;
+                return;
             }
 
+            UpdateAudioLengthFromMediaPlayer();
+
             currentMs = GetAudioClockPositionMs();
-            totalMs = _audioLengthMs > 0 ? _audioLengthMs : _audioMediaPlayer.Length;
+            totalMs = _audioLengthMs > 0 ? _audioLengthMs : mediaPlayer.Length;
             _audioLengthMs = totalMs;
 
             if (totalMs > 0 && currentMs >= totalMs)
             {
-                if (FMODloopButton.IsChecked == true)
+                currentMs = totalMs;
+                if (!mediaPlayer.IsPlaying)
                 {
-                    RestartAudioPreviewPlayback();
+                    if (FMODloopButton.IsChecked == true)
+                    {
+                        RestartAudioPreviewPlayback();
+                    }
+                    else
+                    {
+                        AudioStop();
+                    }
+                    return;
                 }
-                else
-                {
-                    AudioStop();
-                }
-                return;
             }
         }
 
@@ -8061,9 +8134,13 @@ public partial class MainWindow : Window
         {
             FMODstatusLabel.Text = (_linuxAudioStopwatch != null && _linuxAudioStopwatch.IsRunning) ? "Playing" : "Paused";
         }
+        else if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+        {
+            FMODstatusLabel.Text = _pcmWavePreviewPlayer.IsPlaying ? "Playing" : "Paused";
+        }
         else
         {
-            FMODstatusLabel.Text = _audioPlaybackClock.IsRunning || _audioMediaPlayer.IsPlaying ? "Playing" : "Paused";
+            FMODstatusLabel.Text = _audioPlaybackClock.IsRunning || _audioMediaPlayer!.IsPlaying ? "Playing" : "Paused";
         }
     }
 
@@ -8086,6 +8163,25 @@ public partial class MainWindow : Window
         }
 
         return Math.Max(0, currentMs);
+    }
+
+    private void UpdateAudioLengthFromMediaPlayer()
+    {
+        if (_audioMediaPlayer == null || useLinuxAudioFallback || _usingPcmWavePreview)
+        {
+            return;
+        }
+
+        var playerLengthMs = _audioMediaPlayer.Length;
+        if (playerLengthMs <= 0)
+        {
+            return;
+        }
+
+        if (_audioLengthMs <= 0 || Math.Abs(playerLengthMs - _audioLengthMs) > AudioLengthMismatchToleranceMs)
+        {
+            _audioLengthMs = playerLengthMs;
+        }
     }
 
     private void StartAudioClock(long? positionMs = null)
@@ -8133,21 +8229,28 @@ public partial class MainWindow : Window
         return Math.Max(0, positionMs);
     }
 
-    private void AudioReset()
+    private void CancelAudioPreviewLoad()
     {
+        try
+        {
+            _audioPreviewLoadCts?.Cancel();
+        }
+        catch {}
+    }
+
+    private void AudioReset(bool recreateAudioPlayer = true)
+    {
+        CancelAudioPreviewLoad();
         _audioTimer?.Stop();
         try
         {
+            _pcmWavePreviewPlayer?.Stop();
             if (useLinuxAudioFallback)
             {
                 _linuxAudioStopwatch?.Reset();
                 StopLinuxAudioFallback();
             }
-            else if (_audioMediaPlayer != null)
-            {
-                _audioMediaPlayer.Stop();
-                _audioMediaPlayer.Close();
-            }
+            ResetAudioMediaPlayer(recreateAudioPlayer);
         }
         catch {}
 
@@ -8161,6 +8264,8 @@ public partial class MainWindow : Window
             _currentTempAudioPath = null;
         }
 
+        _currentTempAudioAssetId = null;
+        _usingPcmWavePreview = false;
         _audioLengthMs = 0;
         _audioPreviewSourceDescription = string.Empty;
         ResetAudioClock();
@@ -8169,16 +8274,24 @@ public partial class MainWindow : Window
         if (FMODstatusLabel != null) FMODstatusLabel.Text = "Stopped";
         if (FMODinfoLabel != null) FMODinfoLabel.Text = "";
         if (FMODpauseButton != null) FMODpauseButton.Content = "Pause";
+        if (FMODplayButton != null) FMODplayButton.IsEnabled = true;
+        if (FMODpauseButton != null) FMODpauseButton.IsEnabled = true;
     }
 
-    private void FMODplayButton_Click(object? sender, RoutedEventArgs e)
+    private async void FMODplayButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (_audioMediaPlayer == null || currentPreviewAudioClip == null)
+        var audioClip = currentPreviewAudioClip;
+        if (audioClip == null)
             return;
 
         try
         {
-            if (!EnsureAudioPreviewFile(currentPreviewAudioClip))
+            if (!await EnsureAudioPreviewFileAsync(audioClip))
+            {
+                return;
+            }
+
+            if (!ReferenceEquals(currentPreviewAudioClip, audioClip))
             {
                 return;
             }
@@ -8190,14 +8303,36 @@ public partial class MainWindow : Window
                 StartAudioClock(0);
                 PlayLinuxAudioFallback(_currentTempAudioPath!);
             }
-            else
+            else if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
             {
-                _audioMediaPlayer.Stop();
+                _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
+                _pcmWavePreviewPlayer.Play(0);
+                ResetAudioClock();
+            }
+            else if (_audioMediaPlayer != null)
+            {
+                var previewPath = _currentTempAudioPath;
+                ResetAudioMediaPlayer(recreate: true);
+                if (_audioMediaPlayer == null)
+                {
+                    FMODstatusLabel.Text = "Unsupported";
+                    StatusStripUpdate("Audio preview player is unavailable.");
+                    return;
+                }
+
                 try
                 {
                     _audioMediaPlayer.Volume = _targetAudioVolume;
                 }
                 catch {}
+                if (string.IsNullOrEmpty(previewPath)
+                    || !_audioMediaPlayer.Open(previewPath)
+                    || _audioMediaPlayer.AudioPlayer == null)
+                {
+                    FMODstatusLabel.Text = "Unsupported";
+                    StatusStripUpdate("Audio preview could not reopen this AudioClip.");
+                    return;
+                }
                 StartAudioClock(0);
                 _audioMediaPlayer.Play();
             }
@@ -8321,127 +8456,453 @@ public partial class MainWindow : Window
         catch {}
     }
 
-    private bool EnsureAudioPreviewFile(AudioClip audioClip)
+    private async Task<bool> EnsureAudioPreviewFileAsync(AudioClip audioClip)
     {
-        if (!string.IsNullOrEmpty(_currentTempAudioPath) && File.Exists(_currentTempAudioPath))
+        var assetId = GetPreviewAssetId(audioClip);
+        if (_currentTempAudioAssetId == assetId
+            && !string.IsNullOrEmpty(_currentTempAudioPath)
+            && File.Exists(_currentTempAudioPath))
         {
             return true;
         }
 
+        _audioPreviewLoadCts?.Cancel();
+        var loadCts = new CancellationTokenSource();
+        _audioPreviewLoadCts = loadCts;
+        var token = loadCts.Token;
+
+        try
+        {
+            if (FMODplayButton != null) FMODplayButton.IsEnabled = false;
+            if (FMODpauseButton != null) FMODpauseButton.IsEnabled = false;
+            if (FMODstatusLabel != null) FMODstatusLabel.Text = "Loading";
+            StatusStripUpdate($"Preparing audio preview: {audioClip.m_Name}");
+
+            var prepared = await Task.Run(() => PrepareAudioPreviewFiles(audioClip, token), token);
+            token.ThrowIfCancellationRequested();
+
+            if (!ReferenceEquals(currentPreviewAudioClip, audioClip))
+            {
+                return false;
+            }
+
+            if (prepared.Candidates.Count == 0)
+            {
+                StatusStripUpdate("AudioClip data is empty or invalid.");
+                if (FMODstatusLabel != null) FMODstatusLabel.Text = "Missing";
+                return false;
+            }
+
+            _audioLengthMs = prepared.LengthMs;
+            _audioPreviewSourceDescription = string.Empty;
+
+            foreach (var candidate in prepared.Candidates)
+            {
+                token.ThrowIfCancellationRequested();
+
+                if (useLinuxAudioFallback)
+                {
+                    _currentTempAudioPath = candidate.Path;
+                    _currentTempAudioAssetId = assetId;
+                    _audioPreviewSourceDescription = candidate.Description;
+                    UpdateAudioPreviewSourceLabel();
+                    return true;
+                }
+
+                if (TryUsePcmWavePreviewCandidate(candidate, assetId))
+                {
+                    return true;
+                }
+
+                if (TryUseFfmpegAudioPreviewCandidate(candidate, assetId, prepared.LengthMs))
+                {
+                    return true;
+                }
+            }
+
+            StatusStripUpdate("Audio preview could not open this AudioClip.");
+            if (FMODstatusLabel != null) FMODstatusLabel.Text = "Unsupported";
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            StatusStripUpdate($"Failed to prepare audio preview: {ex.Message}");
+            if (FMODstatusLabel != null) FMODstatusLabel.Text = "Error";
+            return false;
+        }
+        finally
+        {
+            if (ReferenceEquals(_audioPreviewLoadCts, loadCts))
+            {
+                _audioPreviewLoadCts = null;
+            }
+            loadCts.Dispose();
+            if (ReferenceEquals(currentPreviewAudioClip, audioClip))
+            {
+                if (FMODplayButton != null) FMODplayButton.IsEnabled = true;
+                if (FMODpauseButton != null) FMODpauseButton.IsEnabled = true;
+                if (FMODstatusLabel != null && FMODstatusLabel.Text == "Loading")
+                {
+                    FMODstatusLabel.Text = "Ready";
+                }
+            }
+        }
+    }
+
+    private bool TryUseFfmpegAudioPreviewCandidate(PreparedAudioPreviewCandidate candidate, string assetId, long fallbackDurationMs)
+    {
+        if (_audioMediaPlayer == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            _pcmWavePreviewPlayer?.Stop();
+            _audioMediaPlayer.Close();
+            if (!_audioMediaPlayer.Open(candidate.Path))
+            {
+                return false;
+            }
+            if (_audioMediaPlayer.AudioPlayer == null)
+            {
+                _audioMediaPlayer.Close();
+                return false;
+            }
+
+            _usingPcmWavePreview = false;
+            _currentTempAudioPath = candidate.Path;
+            _currentTempAudioAssetId = assetId;
+            _audioPreviewSourceDescription = candidate.Description;
+            _audioLengthMs = candidate.DurationMs > 0 ? candidate.DurationMs : fallbackDurationMs;
+            UpdateAudioLengthFromMediaPlayer();
+            UpdateAudioPreviewSourceLabel();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Warning, $"FFmpeg audio preview could not open {candidate.Description}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private bool TryUsePcmWavePreviewCandidate(PreparedAudioPreviewCandidate candidate, string assetId)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            || !candidate.Path.EndsWith(".wav", StringComparison.OrdinalIgnoreCase)
+            || !PcmWavePreviewPlayer.IsSupportedWave(candidate.Path))
+        {
+            return false;
+        }
+
+        try
+        {
+            _audioMediaPlayer?.Close();
+            _pcmWavePreviewPlayer ??= new PcmWavePreviewPlayer();
+            if (!_pcmWavePreviewPlayer.Load(candidate.Path))
+            {
+                return false;
+            }
+
+            _usingPcmWavePreview = true;
+            _currentTempAudioPath = candidate.Path;
+            _currentTempAudioAssetId = assetId;
+            _audioPreviewSourceDescription = candidate.Description + " | PCM";
+            _audioLengthMs = _pcmWavePreviewPlayer.DurationMs > 0
+                ? _pcmWavePreviewPlayer.DurationMs
+                : candidate.DurationMs;
+            _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
+            UpdateAudioPreviewSourceLabel();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Warning, $"PCM WAV preview could not open {candidate.Description}: {ex.Message}");
+            _usingPcmWavePreview = false;
+            return false;
+        }
+    }
+
+    private PreparedAudioPreview PrepareAudioPreviewFiles(AudioClip audioClip, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
         var currentAudioData = audioClip.m_AudioData.GetData();
         if (currentAudioData == null || currentAudioData.Length == 0)
         {
-            StatusStripUpdate("AudioClip data is empty or invalid.");
-            return false;
+            return new PreparedAudioPreview(new List<PreparedAudioPreviewCandidate>(), 0);
         }
 
         var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
         Directory.CreateDirectory(tempDir);
 
+        var converter = new AudioClipConverter(audioClip);
+        var extension = NormalizeAudioExtension(converter.GetExtensionName());
+        var analysis = AnalyzeAudioPreviewData(audioClip, currentAudioData, extension);
+        var previewDurationMs = analysis.DurationMs;
+        var isFsbSource = IsFsbData(currentAudioData);
+        var candidatePayloads = new List<(byte[] Data, string Extension, string Description, bool OriginalData, bool PreferTranscode)>();
+
+        if (analysis.RebuiltData != null && analysis.RebuiltData.Length > 4)
+        {
+            var rebuiltExtension = NormalizeAudioExtension(analysis.RebuiltExtension);
+            var preferTranscode = isFsbSource && !rebuiltExtension.Equals(".wav", StringComparison.OrdinalIgnoreCase);
+            var description = isFsbSource ? "FSB subsound rebuilt stream" : "Rebuilt standard audio stream";
+            candidatePayloads.Add((analysis.RebuiltData, rebuiltExtension, description, false, preferTranscode));
+        }
+
+        if (!isFsbSource && CanPreviewRawAudioData(currentAudioData, extension))
+        {
+            candidatePayloads.Add((currentAudioData, extension, "Original audio stream", true, false));
+        }
+
+        var candidates = new List<PreparedAudioPreviewCandidate>(candidatePayloads.Count);
+        var safeName = FixFileName(audioClip.m_Name);
+        DeletePreviewTempFiles(tempDir, $"temp_audio_{safeName}_{audioClip.m_PathID}_*");
+        foreach (var payload in candidatePayloads)
+        {
+            token.ThrowIfCancellationRequested();
+            var sourceKind = payload.OriginalData ? "original" : "rebuilt";
+            var sourcePath = Path.Combine(tempDir, $"temp_audio_{safeName}_{audioClip.m_PathID}_{sourceKind}{payload.Extension}");
+            File.WriteAllBytes(sourcePath, payload.Data);
+
+            var candidatePath = sourcePath;
+            var description = payload.Description;
+            var candidateDurationMs = previewDurationMs;
+            if (ShouldTranscodeAudioForPreview(payload.Extension, payload.PreferTranscode))
+            {
+                var wavPath = Path.Combine(tempDir, $"temp_audio_{safeName}_{audioClip.m_PathID}_{sourceKind}_preview.wav");
+                var transcode = FFmpegAudioTranscoder.TryTranscodeToPcmWav(sourcePath, wavPath, token);
+                token.ThrowIfCancellationRequested();
+                if (transcode.Success && File.Exists(wavPath))
+                {
+                    candidatePath = wavPath;
+                    description += " -> PCM WAV";
+                    if (transcode.DurationMs > 0)
+                    {
+                        previewDurationMs = transcode.DurationMs;
+                        candidateDurationMs = transcode.DurationMs;
+                    }
+
+                    try { File.Delete(sourcePath); } catch {}
+                }
+                else
+                {
+                    logger.Log(LoggerEvent.Warning, $"Audio preview transcode failed for {description}: {transcode.Error}");
+                    if (IsFsbData(payload.Data))
+                    {
+                        try { File.Delete(sourcePath); } catch {}
+                        try { if (File.Exists(wavPath)) File.Delete(wavPath); } catch {}
+                        continue;
+                    }
+
+                    description += " (direct fallback)";
+                }
+            }
+            else if (payload.Extension.Equals(".wav", StringComparison.OrdinalIgnoreCase))
+            {
+                var waveDurationMs = TryGetWaveDurationMs(payload.Data);
+                if (waveDurationMs > 0)
+                {
+                    previewDurationMs = waveDurationMs;
+                    candidateDurationMs = waveDurationMs;
+                }
+            }
+
+            candidates.Add(new PreparedAudioPreviewCandidate(candidatePath, description, payload.OriginalData, candidateDurationMs));
+        }
+
+        return new PreparedAudioPreview(candidates, previewDurationMs);
+    }
+
+    private AudioPreviewAnalysis AnalyzeAudioPreviewData(AudioClip audioClip, byte[] audioData, string fallbackExtension)
+    {
+        byte[]? rebuiltData = null;
+        var rebuiltExtension = fallbackExtension;
+        long durationMs = audioClip.version[0] >= 5 && audioClip.m_Length > 0
+            ? (long)(audioClip.m_Length * 1000.0f)
+            : 0;
+
         try
         {
-            foreach (var oldFile in Directory.GetFiles(tempDir, "temp_audio_*"))
+            var bank = Fmod5Sharp.FsbLoader.LoadFsbFromByteArray(audioData);
+            if (bank.Samples != null && bank.Samples.Count > 0)
             {
-                try { File.Delete(oldFile); } catch {}
+                var sample = bank.Samples[0];
+                if (durationMs <= 0 && sample.Metadata != null && sample.Metadata.Frequency > 0)
+                {
+                    durationMs = (long)((double)sample.Metadata.SampleCount / sample.Metadata.Frequency * 1000.0);
+                }
+
+                if (bank.Header.AudioType == Fmod5Sharp.FmodTypes.FmodAudioType.MPEG)
+                {
+                    if (sample.SampleBytes != null && sample.SampleBytes.Length > 4)
+                    {
+                        var detected = DetectAudioExtension(sample.SampleBytes, ".mp3");
+                        if (!detected.Equals(".bin", StringComparison.OrdinalIgnoreCase)
+                            && !detected.Equals(".fsb", StringComparison.OrdinalIgnoreCase))
+                        {
+                            rebuiltData = sample.SampleBytes;
+                            rebuiltExtension = detected;
+                        }
+                    }
+                }
+                else if (sample.RebuildAsStandardFileFormat(out var dataBytes, out var fileExtension))
+                {
+                    rebuiltData = TrimWaveContainer(dataBytes);
+                    rebuiltExtension = NormalizeAudioExtension(fileExtension ?? fallbackExtension);
+                }
             }
         }
-        catch {}
-
-        var converter = new AudioClipConverter(audioClip);
-        var extension = converter.GetExtensionName();
-        var candidates = new List<AudioPreviewCandidate>
+        catch (Exception ex)
         {
-            new AudioPreviewCandidate(currentAudioData, NormalizeAudioExtension(extension), "Original Unity audio stream", true)
+            logger.Log(LoggerEvent.Debug, $"Audio preview FSB analysis skipped for {audioClip.m_Name}: {ex.Message}");
+        }
+
+        if (rebuiltData != null && rebuiltData.Length > 4)
+        {
+            rebuiltExtension = DetectAudioExtension(rebuiltData, rebuiltExtension);
+        }
+
+        return new AudioPreviewAnalysis(rebuiltData, rebuiltExtension, durationMs);
+    }
+
+    private static bool ShouldTranscodeAudioForPreview(string extension, bool preferTranscode)
+    {
+        if (preferTranscode)
+        {
+            return true;
+        }
+
+        return NormalizeAudioExtension(extension).ToLowerInvariant() switch
+        {
+            ".wav" => false,
+            ".aac" or ".aif" or ".aiff" or ".flac" or ".m4a" or ".mp3" or ".ogg"
+                or ".it" or ".mod" or ".s3m" or ".xm" => true,
+            _ => false
         };
+    }
 
-        if (converter.IsSupport)
+    private static byte[] TrimWaveContainer(byte[] data)
+    {
+        if (data.Length < 12
+            || data[0] != (byte)'R'
+            || data[1] != (byte)'I'
+            || data[2] != (byte)'F'
+            || data[3] != (byte)'F'
+            || data[8] != (byte)'W'
+            || data[9] != (byte)'A'
+            || data[10] != (byte)'V'
+            || data[11] != (byte)'E')
         {
-            try
-            {
-                var convertedData = converter.ConvertToWav();
-                if (convertedData != null && convertedData.Length > 4)
-                {
-                    var convertedExtension = extension;
-                    if (convertedData[0] == 0x52 && convertedData[1] == 0x49 && convertedData[2] == 0x46 && convertedData[3] == 0x46)
-                    {
-                        convertedExtension = ".wav";
-                    }
-                    else if (convertedData[0] == 0x4F && convertedData[1] == 0x67 && convertedData[2] == 0x67 && convertedData[3] == 0x53)
-                    {
-                        convertedExtension = ".ogg";
-                    }
-                    else if (convertedData[0] == 0x49 && convertedData[1] == 0x44 && convertedData[2] == 0x33)
-                    {
-                        convertedExtension = ".mp3";
-                    }
-                    else if (convertedData[0] == 0xFF && (convertedData[1] & 0xE0) == 0xE0)
-                    {
-                        convertedExtension = ".mp3";
-                    }
+            return data;
+        }
 
-                    candidates.Add(new AudioPreviewCandidate(convertedData, NormalizeAudioExtension(convertedExtension), "Rebuilt standard audio stream", false));
-                }
-            }
-            catch (Exception ex)
+        var riffSize = BitConverter.ToUInt32(data, 4);
+        var containerSize = riffSize + 8UL;
+        if (containerSize > 12 && containerSize < (ulong)data.Length)
+        {
+            var trimmed = new byte[(int)containerSize];
+            Buffer.BlockCopy(data, 0, trimmed, 0, trimmed.Length);
+            return trimmed;
+        }
+
+        return data;
+    }
+
+    private static long TryGetWaveDurationMs(byte[] data)
+    {
+        if (data.Length < 44
+            || data[0] != (byte)'R'
+            || data[1] != (byte)'I'
+            || data[2] != (byte)'F'
+            || data[3] != (byte)'F'
+            || data[8] != (byte)'W'
+            || data[9] != (byte)'A'
+            || data[10] != (byte)'V'
+            || data[11] != (byte)'E')
+        {
+            return 0;
+        }
+
+        var offset = 12;
+        uint byteRate = 0;
+        uint dataSize = 0;
+        while (offset + 8 <= data.Length)
+        {
+            var chunkId = Encoding.ASCII.GetString(data, offset, 4);
+            var chunkSize = BitConverter.ToUInt32(data, offset + 4);
+            var chunkDataOffset = offset + 8;
+            if (chunkId == "fmt " && chunkSize >= 16 && chunkDataOffset + 12 <= data.Length)
             {
-                logger.Log(LoggerEvent.Warning, $"Failed to convert AudioClip to standard audio format: {ex.Message}. Falling back to raw audio data.");
+                byteRate = BitConverter.ToUInt32(data, chunkDataOffset + 8);
+            }
+            else if (chunkId == "data")
+            {
+                dataSize = Math.Min(chunkSize, (uint)Math.Max(0, data.Length - chunkDataOffset));
+            }
+
+            if (byteRate > 0 && dataSize > 0)
+            {
+                return (long)(dataSize * 1000.0 / byteRate);
+            }
+
+            offset = chunkDataOffset + (int)chunkSize + ((chunkSize & 1) == 1 ? 1 : 0);
+        }
+
+        return 0;
+    }
+
+    private static bool CanPreviewRawAudioData(byte[] data, string extension)
+    {
+        if (IsFsbData(data))
+        {
+            return false;
+        }
+
+        return NormalizeAudioExtension(extension).ToLowerInvariant() switch
+        {
+            ".aac" or ".aif" or ".aiff" or ".flac" or ".m4a" or ".mp3" or ".ogg" or ".wav"
+                or ".it" or ".mod" or ".s3m" or ".xm" => true,
+            _ => false
+        };
+    }
+
+    private static bool IsFsbData(byte[] data)
+    {
+        return data.Length >= 4
+            && data[0] == (byte)'F'
+            && data[1] == (byte)'S'
+            && data[2] == (byte)'B';
+    }
+
+    private static string DetectAudioExtension(byte[] data, string fallbackExtension)
+    {
+        if (data.Length >= 4)
+        {
+            if (data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46)
+            {
+                return ".wav";
+            }
+            if (data[0] == 0x4F && data[1] == 0x67 && data[2] == 0x67 && data[3] == 0x53)
+            {
+                return ".ogg";
+            }
+            if (data[0] == 0x49 && data[1] == 0x44 && data[2] == 0x33)
+            {
+                return ".mp3";
+            }
+            if (data[0] == 0xFF && (data[1] & 0xE0) == 0xE0)
+            {
+                return ".mp3";
             }
         }
 
-        if (candidates.Count > 1)
-        {
-            // FFmpeg is more reliable with normal media containers than raw Unity/FSB payloads.
-            candidates = candidates
-                .OrderBy(candidate => candidate.OriginalData)
-                .ToList();
-        }
-
-        _audioLengthMs = GetAudioClipDurationMs(audioClip, currentAudioData);
-        _audioPreviewSourceDescription = string.Empty;
-
-        foreach (var candidate in candidates)
-        {
-            var candidatePath = Path.Combine(
-                tempDir,
-                $"temp_audio_{FixFileName(audioClip.m_Name)}_{audioClip.m_PathID}_{(candidate.OriginalData ? "original" : "rebuilt")}{candidate.Extension}");
-            File.WriteAllBytes(candidatePath, candidate.Data);
-
-            if (useLinuxAudioFallback)
-            {
-                _currentTempAudioPath = candidatePath;
-                _audioPreviewSourceDescription = candidate.Description;
-                UpdateAudioPreviewSourceLabel();
-                return true;
-            }
-
-            if (_audioMediaPlayer == null)
-            {
-                continue;
-            }
-
-            try
-            {
-                _audioMediaPlayer.Close();
-                if (_audioMediaPlayer.Open(candidatePath))
-                {
-                    _currentTempAudioPath = candidatePath;
-                    _audioPreviewSourceDescription = candidate.Description;
-                    if (_audioLengthMs <= 0 && _audioMediaPlayer.Length > 0)
-                    {
-                        _audioLengthMs = _audioMediaPlayer.Length;
-                    }
-                    UpdateAudioPreviewSourceLabel();
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.Log(LoggerEvent.Warning, $"Audio preview could not open {candidate.Description}: {ex.Message}");
-            }
-        }
-
-        StatusStripUpdate("Audio preview could not open this AudioClip.");
-        return false;
+        return fallbackExtension;
     }
 
     private void UpdateAudioPreviewSourceLabel()
@@ -8473,46 +8934,45 @@ public partial class MainWindow : Window
             : "." + extension;
     }
 
-    private static long GetAudioClipDurationMs(AudioClip audioClip, byte[]? audioData)
+    private static string GetPreviewAssetId(AssetStudio.Object asset)
     {
-        if (audioClip.version[0] >= 5 && audioClip.m_Length > 0)
-        {
-            return (long)(audioClip.m_Length * 1000.0f);
-        }
+        var source = asset.assetsFile?.fullName ?? asset.assetsFile?.fileName ?? string.Empty;
+        return string.Concat(source, "\u001f", asset.m_PathID.ToString(CultureInfo.InvariantCulture));
+    }
 
+    private static void DeletePreviewTempFiles(string tempDir, string searchPattern)
+    {
         try
         {
-            if (audioData != null && audioData.Length > 0)
+            foreach (var oldFile in Directory.GetFiles(tempDir, searchPattern))
             {
-                var bank = Fmod5Sharp.FsbLoader.LoadFsbFromByteArray(audioData);
-                if (bank.Samples != null && bank.Samples.Count > 0)
-                {
-                    var sample = bank.Samples[0];
-                    if (sample.Metadata != null && sample.Metadata.Frequency > 0)
-                    {
-                        return (long)((double)sample.Metadata.SampleCount / sample.Metadata.Frequency * 1000.0);
-                    }
-                }
+                try { File.Delete(oldFile); } catch {}
             }
         }
         catch {}
-
-        return 0;
     }
 
-    private void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
+    private async void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (_audioMediaPlayer == null || currentPreviewAudioClip == null)
+        var audioClip = currentPreviewAudioClip;
+        if (audioClip == null)
             return;
 
         try
         {
-            if (string.IsNullOrEmpty(_currentTempAudioPath) || !File.Exists(_currentTempAudioPath))
+            if (_currentTempAudioAssetId != GetPreviewAssetId(audioClip)
+                || string.IsNullOrEmpty(_currentTempAudioPath)
+                || !File.Exists(_currentTempAudioPath))
             {
-                if (!EnsureAudioPreviewFile(currentPreviewAudioClip))
+                if (!await EnsureAudioPreviewFileAsync(audioClip))
                 {
                     return;
                 }
+            }
+
+            if (!ReferenceEquals(currentPreviewAudioClip, audioClip))
+            {
+                return;
             }
 
             if (useLinuxAudioFallback)
@@ -8536,7 +8996,24 @@ public partial class MainWindow : Window
                     _audioTimer?.Start();
                 }
             }
-            else
+            else if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+            {
+                if (_pcmWavePreviewPlayer.IsPlaying)
+                {
+                    _pcmWavePreviewPlayer.Pause();
+                    FMODstatusLabel.Text = "Paused";
+                    FMODpauseButton.Content = "Resume";
+                }
+                else
+                {
+                    _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
+                    _pcmWavePreviewPlayer.Resume();
+                    FMODstatusLabel.Text = "Playing";
+                    FMODpauseButton.Content = "Pause";
+                    _audioTimer?.Start();
+                }
+            }
+            else if (_audioMediaPlayer != null)
             {
                 if (_audioMediaPlayer.IsPlaying)
                 {
@@ -8573,11 +9050,29 @@ public partial class MainWindow : Window
 
     private void RestartAudioPreviewPlayback()
     {
-        if (_audioMediaPlayer == null || useLinuxAudioFallback)
+        if (useLinuxAudioFallback)
+        {
             return;
+        }
 
         try
         {
+            if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+            {
+                _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
+                _pcmWavePreviewPlayer.Play(0);
+                ResetAudioClock();
+                _audioTimer?.Start();
+                if (FMODstatusLabel != null) FMODstatusLabel.Text = "Playing";
+                if (FMODpauseButton != null) FMODpauseButton.Content = "Pause";
+                return;
+            }
+
+            if (_audioMediaPlayer == null)
+            {
+                return;
+            }
+
             _audioMediaPlayer.Stop();
             try
             {
@@ -8612,6 +9107,11 @@ public partial class MainWindow : Window
                 ResetAudioClock();
                 StopLinuxAudioFallback();
             }
+            else if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+            {
+                _pcmWavePreviewPlayer.Stop();
+                ResetAudioClock();
+            }
             else if (_audioMediaPlayer != null)
             {
                 _audioMediaPlayer.Stop();
@@ -8633,6 +9133,12 @@ public partial class MainWindow : Window
     private void FMODvolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
         _targetAudioVolume = (int)(FMODvolumeBar.Value * 10);
+        if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+        {
+            _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
+            return;
+        }
+
         if (_audioMediaPlayer != null && !useLinuxAudioFallback)
         {
             try
@@ -8653,7 +9159,15 @@ public partial class MainWindow : Window
             var newMs = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
             FMODtimerLabel.Text = FormatMediaTime(newMs, _audioLengthMs);
 
-            if (!_isAudioDragging && !useLinuxAudioFallback && _audioMediaPlayer != null)
+            if (!_isAudioDragging && _usingPcmWavePreview && _pcmWavePreviewPlayer != null)
+            {
+                try
+                {
+                    _pcmWavePreviewPlayer.Seek(newMs);
+                }
+                catch {}
+            }
+            else if (!_isAudioDragging && !useLinuxAudioFallback && _audioMediaPlayer != null)
             {
                 try
                 {
@@ -8669,7 +9183,12 @@ public partial class MainWindow : Window
     {
         Dispatcher.UIThread.Post(() =>
         {
-            if (useLinuxAudioFallback || _audioMediaPlayer == null)
+            if (!ReferenceEquals(sender, _audioMediaPlayer)
+                || currentPreviewAudioClip == null
+                || string.IsNullOrEmpty(_currentTempAudioPath)
+                || useLinuxAudioFallback
+                || _usingPcmWavePreview
+                || _audioMediaPlayer == null)
             {
                 return;
             }
@@ -8786,12 +9305,6 @@ public partial class MainWindow : Window
             }
         }
 
-        if (_audioMediaPlayer == null)
-        {
-            StatusStripUpdate("Audio preview is unavailable (FFmpeg player is not loaded).");
-            return;
-        }
-
         FMODPanel.IsVisible = true;
         FMODinfoLabel.Text = infoText;
         FMODtimerLabel.Text = "0:00.0 / 0:00.0";
@@ -8808,24 +9321,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        byte[]? data = null;
-        try
-        {
-            data = videoClip.m_VideoData.GetData();
-        }
-        catch {}
-
-        bool fileHasAudio = VideoAudioProber.HasAudio(data);
-
         if (videoClip.HasAudio)
         {
-            if (!fileHasAudio)
-            {
-                VideoAudioLabel.Text = "Audio: yes | No audio stream in file";
-                VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
-                return;
-            }
-
             var sb = new StringBuilder("Audio: yes");
             if (videoClip.m_AudioChannelCount != null)
             {
@@ -8840,6 +9337,7 @@ public partial class MainWindow : Window
                     }
                 }
             }
+            sb.Append(" | Unity metadata");
             VideoAudioLabel.Text = sb.ToString();
             VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#00e676"));
         }
@@ -8847,125 +9345,6 @@ public partial class MainWindow : Window
         {
             VideoAudioLabel.Text = "Audio: no playable track found";
             VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
-        }
-    }
-
-    private static class VideoAudioProber
-    {
-        public static bool HasAudio(byte[]? bytes)
-        {
-            if (bytes == null || bytes.Length < 8)
-            {
-                return false;
-            }
-
-            // 1. Detect format
-            // WebM / Matroska magic: 1A 45 DF A3
-            if (bytes[0] == 0x1A && bytes[1] == 0x45 && bytes[2] == 0xDF && bytes[3] == 0xA3)
-            {
-                return WebMHasAudio(bytes);
-            }
-
-            // MP4 magic: check for 'ftyp' box type in the first 16 bytes
-            if (bytes.Length >= 16 && bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70)
-            {
-                return Mp4HasAudio(bytes);
-            }
-
-            // Fallback: default to true if we don't recognize or support the format
-            return true;
-        }
-
-        private static bool WebMHasAudio(byte[] bytes)
-        {
-            // Scan the first 128KB for the TrackType = Audio EBML element
-            // TrackType ID is 0x83, size is 0x81 (VINT size 1), audio value is 0x02.
-            int scanLength = Math.Min(bytes.Length, 128 * 1024);
-            for (int i = 0; i < scanLength - 2; i++)
-            {
-                if (bytes[i] == 0x83 && bytes[i + 1] == 0x81 && bytes[i + 2] == 0x02)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static bool Mp4HasAudio(byte[] bytes)
-        {
-            int offset = 0;
-            try
-            {
-                return ScanMp4BoxesForAudio(bytes, ref offset, bytes.Length);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static bool ScanMp4BoxesForAudio(byte[] bytes, ref int offset, int endOffset)
-        {
-            while (offset + 8 <= endOffset)
-            {
-                int startOffset = offset;
-                
-                // Read box size (4 bytes)
-                long size = (uint)((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]);
-                
-                // Read box type (4 bytes)
-                string type = Encoding.ASCII.GetString(bytes, offset + 4, 4);
-                offset += 8;
-
-                if (size == 1)
-                {
-                    // 64-bit size
-                    if (offset + 8 <= endOffset)
-                    {
-                        size = ((long)bytes[offset] << 56) | ((long)bytes[offset + 1] << 48) |
-                               ((long)bytes[offset + 2] << 40) | ((long)bytes[offset + 3] << 32) |
-                               ((long)bytes[offset + 4] << 24) | ((long)bytes[offset + 5] << 16) |
-                               ((long)bytes[offset + 6] << 8) | bytes[offset + 7];
-                        offset += 8;
-                    }
-                }
-                else if (size == 0)
-                {
-                    // Extends to the end of the file
-                    size = endOffset - startOffset;
-                }
-
-                long boxContentEnd = startOffset + size;
-                if (boxContentEnd > endOffset || boxContentEnd <= startOffset)
-                {
-                    boxContentEnd = endOffset;
-                }
-
-                if (type == "moov" || type == "trak" || type == "mdia")
-                {
-                    // Recurse into nested container boxes
-                    int localOffset = offset;
-                    if (ScanMp4BoxesForAudio(bytes, ref localOffset, (int)boxContentEnd))
-                    {
-                        return true;
-                    }
-                }
-                else if (type == "hdlr")
-                {
-                    // Handler Reference Box
-                    if (offset + 12 <= boxContentEnd)
-                    {
-                        string handlerType = Encoding.ASCII.GetString(bytes, offset + 8, 4);
-                        if (handlerType == "soun")
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                offset = (int)boxContentEnd;
-            }
-            return false;
         }
     }
 
@@ -8981,8 +9360,18 @@ public partial class MainWindow : Window
         SetVideoStoppedUi();
     }
 
+    private void CancelVideoPreviewLoad()
+    {
+        try
+        {
+            _videoPreviewLoadCts?.Cancel();
+        }
+        catch {}
+    }
+
     private void VideoReset()
     {
+        CancelVideoPreviewLoad();
         try
         {
             _ffmpegVideoTimer?.Stop();
@@ -9000,6 +9389,7 @@ public partial class MainWindow : Window
             _currentTempVideoPath = null;
         }
 
+        _currentTempVideoAssetId = null;
         SetVideoStoppedUi();
     }
 
@@ -9013,6 +9403,16 @@ public partial class MainWindow : Window
 
     private void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
     {
+        var videoAssetId = GetPreviewAssetId(m_VideoClip);
+        if (_currentTempVideoAssetId == videoAssetId)
+        {
+            VideoStop();
+        }
+        else
+        {
+            VideoReset();
+        }
+
         currentPreviewVideoClip = m_VideoClip;
 
         VideoTitleLabel.Text = m_VideoClip.m_Name;
@@ -9026,7 +9426,7 @@ public partial class MainWindow : Window
 
         SetInitialVideoAudioLabel(m_VideoClip);
 
-        VideoInfoLabel.Text = "Ready. Press Play to load embedded native preview.";
+        VideoInfoLabel.Text = "Ready. Press Play to prepare embedded preview.";
         VideoPlayButton.IsEnabled = true;
         VideoStopButton.IsEnabled = true;
         VideoExportButton.IsEnabled = true;
@@ -9034,6 +9434,7 @@ public partial class MainWindow : Window
 
         VideoClipPanel.IsVisible = true;
         PreviewLabel.IsVisible = false;
+        StartVideoThumbnailPreview(m_VideoClip);
         StatusStripUpdate($"Loaded video clip: {m_VideoClip.m_Name}");
     }
 
@@ -9067,9 +9468,10 @@ public partial class MainWindow : Window
         }
     }
 
-    private void VideoPlayButton_Click(object? sender, RoutedEventArgs e)
+    private async void VideoPlayButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (currentPreviewVideoClip == null) return;
+        var videoClip = currentPreviewVideoClip;
+        if (videoClip == null) return;
 
         try
         {
@@ -9082,21 +9484,40 @@ public partial class MainWindow : Window
             }
             else
             {
+                var videoAssetId = GetPreviewAssetId(videoClip);
                 var hasLoadedFile = FfmpegVideoPlayer.HasMediaLoaded
+                    && _currentTempVideoAssetId == videoAssetId
                     && !string.IsNullOrEmpty(_currentTempVideoPath)
                     && File.Exists(_currentTempVideoPath);
 
                 if (!hasLoadedFile)
                 {
-                    if (!EnsureVideoPreviewFile(currentPreviewVideoClip))
+                    if (!await EnsureVideoPreviewFileAsync(videoClip))
+                    {
+                        return;
+                    }
+
+                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
                     {
                         return;
                     }
 
                     FfmpegVideoPlayer.Open(_currentTempVideoPath!);
+                    if (!FfmpegVideoPlayer.HasMediaLoaded)
+                    {
+                        VideoStatusLabel.Text = "Unsupported";
+                        VideoPlayButton.Content = "Play";
+                        VideoInfoLabel.Text = "FFmpeg could not open this VideoClip.";
+                        StatusStripUpdate("Video preview could not open this VideoClip.");
+                        return;
+                    }
                 }
 
                 FfmpegVideoPlayer.Volume = _targetVolume;
+                if (hasLoadedFile && VideoStatusLabel.Text == "Stopped")
+                {
+                    FfmpegVideoPlayer.Seek(0f);
+                }
                 FfmpegVideoPlayer.Play();
                 _ffmpegVideoTimer?.Start();
                 VideoStatusLabel.Text = "Playing";
@@ -9109,45 +9530,151 @@ public partial class MainWindow : Window
         }
     }
 
-    private bool EnsureVideoPreviewFile(VideoClip videoClip)
+    private async Task<bool> EnsureVideoPreviewFileAsync(VideoClip videoClip)
     {
-        if (!string.IsNullOrEmpty(_currentTempVideoPath) && File.Exists(_currentTempVideoPath))
+        var assetId = GetPreviewAssetId(videoClip);
+        if (_currentTempVideoAssetId == assetId
+            && !string.IsNullOrEmpty(_currentTempVideoPath)
+            && File.Exists(_currentTempVideoPath))
         {
             return true;
+        }
+
+        _videoPreviewLoadCts?.Cancel();
+        var loadCts = new CancellationTokenSource();
+        _videoPreviewLoadCts = loadCts;
+        var token = loadCts.Token;
+
+        try
+        {
+            VideoStatusLabel.Text = "Loading";
+            VideoPlayButton.IsEnabled = false;
+            VideoStopButton.IsEnabled = false;
+            VideoInfoLabel.Text = "Preparing embedded preview...";
+            StatusStripUpdate($"Preparing video preview: {videoClip.m_Name}");
+
+            var tempPath = await Task.Run(() => PrepareVideoPreviewFile(videoClip, token), token);
+            token.ThrowIfCancellationRequested();
+
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+            {
+                return false;
+            }
+
+            if (string.IsNullOrEmpty(tempPath) || !File.Exists(tempPath))
+            {
+                VideoInfoLabel.Text = "VideoClip data is empty or invalid.";
+                VideoStatusLabel.Text = "Missing";
+                VideoPlayButton.Content = "Play";
+                StatusStripUpdate("VideoClip data is empty or invalid.");
+                return false;
+            }
+
+            _currentTempVideoPath = tempPath;
+            _currentTempVideoAssetId = assetId;
+            _videoLengthMs = 0;
+            VideoInfoLabel.Text = "Embedded FFmpeg preview loaded.";
+            StatusStripUpdate($"Loaded video clip with FFmpeg backend: {videoClip.m_Name}");
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            VideoInfoLabel.Text = $"Failed to prepare preview: {ex.Message}";
+            VideoStatusLabel.Text = "Error";
+            StatusStripUpdate($"Failed to prepare video preview: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            if (ReferenceEquals(_videoPreviewLoadCts, loadCts))
+            {
+                _videoPreviewLoadCts = null;
+            }
+            loadCts.Dispose();
+            if (ReferenceEquals(currentPreviewVideoClip, videoClip))
+            {
+                VideoPlayButton.IsEnabled = true;
+                VideoStopButton.IsEnabled = true;
+                if (VideoStatusLabel.Text == "Loading")
+                {
+                    VideoStatusLabel.Text = "Ready";
+                }
+            }
+        }
+    }
+
+    private string? PrepareVideoPreviewFile(VideoClip videoClip, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
+        if (videoClip.m_ExternalResources.m_Size <= 0)
+        {
+            return null;
         }
 
         var ext = Path.GetExtension(videoClip.m_OriginalPath);
         if (string.IsNullOrEmpty(ext)) ext = ".mp4";
 
-        var data = videoClip.m_VideoData.GetData();
-        if (data == null || data.Length == 0)
-        {
-            VideoInfoLabel.Text = "VideoClip data is empty or invalid.";
-            VideoStatusLabel.Text = "Missing";
-            VideoPlayButton.Content = "Play";
-            StatusStripUpdate("VideoClip data is empty or invalid.");
-            return false;
-        }
-
         var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
         Directory.CreateDirectory(tempDir);
 
+        token.ThrowIfCancellationRequested();
+        var tempPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}{ext}");
+        videoClip.m_VideoData.WriteData(tempPath);
+
+        token.ThrowIfCancellationRequested();
+        return File.Exists(tempPath) && new FileInfo(tempPath).Length > 0 ? tempPath : null;
+    }
+
+    private async void StartVideoThumbnailPreview(VideoClip videoClip)
+    {
         try
         {
-            foreach (var oldFile in Directory.GetFiles(tempDir, "temp_video_*"))
+            await Task.Delay(120);
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
             {
-                try { File.Delete(oldFile); } catch {}
+                return;
+            }
+
+            if (!await EnsureVideoPreviewFileAsync(videoClip))
+            {
+                return;
+            }
+
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                || string.IsNullOrEmpty(_currentTempVideoPath)
+                || !File.Exists(_currentTempVideoPath))
+            {
+                return;
+            }
+
+            FfmpegVideoPlayer.Open(_currentTempVideoPath);
+            if (FfmpegVideoPlayer.HasMediaLoaded)
+            {
+                VideoStatusLabel.Text = "Ready";
+                VideoPlayButton.Content = "Play";
+                VideoInfoLabel.Text = "Thumbnail ready. Press Play to start preview.";
+                VideoProgressBar.Value = 0;
+                VideoTimerLabel.Text = FormatMediaTime(0, Math.Max(0, FfmpegVideoPlayer.Duration));
+            }
+            else
+            {
+                VideoStatusLabel.Text = "Unsupported";
+                VideoInfoLabel.Text = "FFmpeg could not open this VideoClip.";
             }
         }
-        catch {}
-
-        _currentTempVideoPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}{ext}");
-        File.WriteAllBytes(_currentTempVideoPath, data);
-
-        _videoLengthMs = 0;
-        VideoInfoLabel.Text = "Embedded FFmpeg preview loaded.";
-        StatusStripUpdate($"Loaded video clip with FFmpeg backend: {videoClip.m_Name}");
-        return true;
+        catch (Exception ex)
+        {
+            if (ReferenceEquals(currentPreviewVideoClip, videoClip))
+            {
+                VideoStatusLabel.Text = "Error";
+                VideoInfoLabel.Text = $"Failed to load thumbnail: {ex.Message}";
+            }
+        }
     }
 
     private void VideoStopButton_Click(object? sender, RoutedEventArgs e)
@@ -9227,7 +9754,7 @@ public partial class MainWindow : Window
 
     private void VideoProgressBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
-        if (_isUpdatingVideoProgress)
+        if (_isUpdatingVideoProgress || !FfmpegVideoPlayer.HasMediaLoaded)
             return;
 
         FfmpegVideoPlayer.Seek((float)(VideoProgressBar.Value / 1000.0));
@@ -9241,7 +9768,16 @@ public partial class MainWindow : Window
     private void FMODprogressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
     {
         _isAudioDragging = false;
-        if (_audioMediaPlayer != null && _audioLengthMs > 0 && !useLinuxAudioFallback)
+        if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null && _audioLengthMs > 0)
+        {
+            try
+            {
+                var newMs = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
+                _pcmWavePreviewPlayer.Seek(newMs);
+            }
+            catch {}
+        }
+        else if (_audioMediaPlayer != null && _audioLengthMs > 0 && !useLinuxAudioFallback)
         {
             try
             {
@@ -9261,12 +9797,17 @@ public partial class MainWindow : Window
     private void VideoProgressBar_DragCompleted(object? sender, global::Avalonia.Input.VectorEventArgs e)
     {
         _isVideoDragging = false;
+        if (!FfmpegVideoPlayer.HasMediaLoaded)
+        {
+            return;
+        }
         FfmpegVideoPlayer.Seek((float)(VideoProgressBar.Value / 1000.0));
     }
 
     private async void VideoExportButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (currentPreviewVideoClip == null) return;
+        var videoClip = currentPreviewVideoClip;
+        if (videoClip == null) return;
 
         // Pause playback to prevent event loops and potential UI deadlocks while the modal dialog is open
         try
@@ -9284,26 +9825,32 @@ public partial class MainWindow : Window
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        var extension = Path.GetExtension(currentPreviewVideoClip.m_OriginalPath);
+        var extension = Path.GetExtension(videoClip.m_OriginalPath);
         if (string.IsNullOrEmpty(extension)) extension = ".mp4";
 
         var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
         if (exportFolders == null || exportFolders.Count == 0) return;
 
         var savePath = exportFolders[0].Path.LocalPath;
-        var fileName = FixFileName(currentPreviewVideoClip.m_Name) + extension;
+        var fileName = FixFileName(videoClip.m_Name) + extension;
         var filePath = Path.Combine(savePath, fileName);
 
         try
         {
-            var data = currentPreviewVideoClip.m_VideoData.GetData();
-            if (data == null || data.Length == 0)
+            if (videoClip.m_ExternalResources.m_Size <= 0)
             {
                 StatusStripUpdate("VideoClip data is empty or invalid.");
                 return;
             }
 
-            await File.WriteAllBytesAsync(filePath, data);
+            await Task.Run(() =>
+            {
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+                videoClip.m_VideoData.WriteData(filePath);
+            });
             StatusStripUpdate($"Successfully exported video clip to: {filePath}");
         }
         catch (Exception ex)
@@ -9340,20 +9887,46 @@ public partial class MainWindow : Window
     #endregion
 }
 
-internal sealed class AudioPreviewCandidate
+internal sealed class PreparedAudioPreview
 {
-    public AudioPreviewCandidate(byte[] data, string extension, string description, bool originalData)
+    public PreparedAudioPreview(List<PreparedAudioPreviewCandidate> candidates, long lengthMs)
     {
-        Data = data;
-        Extension = extension;
-        Description = description;
-        OriginalData = originalData;
+        Candidates = candidates;
+        LengthMs = lengthMs;
     }
 
-    public byte[] Data { get; }
-    public string Extension { get; }
+    public List<PreparedAudioPreviewCandidate> Candidates { get; }
+    public long LengthMs { get; }
+}
+
+internal sealed class PreparedAudioPreviewCandidate
+{
+    public PreparedAudioPreviewCandidate(string path, string description, bool originalData, long durationMs)
+    {
+        Path = path;
+        Description = description;
+        OriginalData = originalData;
+        DurationMs = durationMs;
+    }
+
+    public string Path { get; }
     public string Description { get; }
     public bool OriginalData { get; }
+    public long DurationMs { get; }
+}
+
+internal sealed class AudioPreviewAnalysis
+{
+    public AudioPreviewAnalysis(byte[]? rebuiltData, string rebuiltExtension, long durationMs)
+    {
+        RebuiltData = rebuiltData;
+        RebuiltExtension = rebuiltExtension;
+        DurationMs = durationMs;
+    }
+
+    public byte[]? RebuiltData { get; }
+    public string RebuiltExtension { get; }
+    public long DurationMs { get; }
 }
 
 public sealed class AvaloniaAppSettings
