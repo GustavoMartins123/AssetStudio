@@ -105,6 +105,7 @@ public partial class MainWindow : Window
     private readonly HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
     private readonly HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
+    private bool projectAutoIndexStarted;
 
     public MainWindow() : this(null)
     {
@@ -269,6 +270,39 @@ public partial class MainWindow : Window
         ApplyAvatarPreviewControlSettings();
     }
 
+    public void StartProjectIndexingOnOpen()
+    {
+        if (projectContext == null || projectAutoIndexStarted)
+        {
+            return;
+        }
+
+        projectAutoIndexStarted = true;
+        Dispatcher.UIThread.Post(async () => await StartProjectIndexingOnOpenAsync(), DispatcherPriority.Background);
+    }
+
+    private async Task StartProjectIndexingOnOpenAsync()
+    {
+        var root = projectContext?.Project.ProjectRoot;
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            StatusStripUpdate("Project opened. Set a project root to index assets.");
+            return;
+        }
+
+        if (!Directory.Exists(root))
+        {
+            StatusStripUpdate($"Project root not found: {root}");
+            return;
+        }
+
+        assetsManager.ProjectRoot = root;
+        appSettings.ProjectRoot = root;
+        SaveAppSettings();
+
+        await BeginProgressiveLoadAsync(new[] { root }, "Opening project");
+    }
+
     private void StatusStripUpdate(string text)
     {
         _pendingStatusText = text;
@@ -416,7 +450,9 @@ public partial class MainWindow : Window
         StatusStripUpdate("Ready");
 
         var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
-        Title = $"AssetStudio v{version}";
+        Title = projectContext == null
+            ? $"AssetStudio v{version}"
+            : $"AssetStudio v{version} - {projectContext.Project.DisplayName}";
 
         _currentlySelectedUniqueID = null;
         isRefreshingFilterList = false;
@@ -1122,42 +1158,7 @@ public partial class MainWindow : Window
         if (folders != null && folders.Count > 0)
         {
             var folderPath = folders[0].Path.LocalPath;
-            var loadChoice = await ConfirmFolderLoadIfRisky(folderPath);
-            if (loadChoice == RiskyLoadChoice.Cancel)
-            {
-                StatusStripUpdate("Folder load cancelled.");
-                return;
-            }
-
-            if (loadChoice == RiskyLoadChoice.LazyLoad)
-            {
-                LoadPathsProgressiveAsync(new[] { folderPath });
-            }
-            else
-            {
-                SaveLoadFolder(folderPath);
-                ResetForm();
-                StatusStripUpdate("Loading folder...");
-                assetsManager.Clear();
-                assetsManager.LazyLoading = false;
-                ApplyUnityVersionOption();
-                try
-                {
-                    await Task.Run(() => assetsManager.LoadFolder(folderPath));
-                }
-                catch (MemoryPressureException ex)
-                {
-                    ShowMemoryPressureError(ex);
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show(this, $"Error loading folder:\n{ex.Message}", "Load failed");
-                    StatusStripUpdate("Folder load failed.");
-                    return;
-                }
-                BuildAssetStructures();
-            }
+            await BeginProgressiveLoadAsync(new[] { folderPath }, "Indexing folder");
         }
     }
 
@@ -1223,62 +1224,36 @@ public partial class MainWindow : Window
 
     private async Task LoadDroppedPaths(string[] paths)
     {
-        var loadChoice = RiskyLoadChoice.EagerLoad;
         if (paths.Length == 1 && Directory.Exists(paths[0]))
         {
-            loadChoice = await ConfirmFolderLoadIfRisky(paths[0]);
-            if (loadChoice == RiskyLoadChoice.Cancel)
-            {
-                StatusStripUpdate("Dropped folder load cancelled.");
-                return;
-            }
+            await BeginProgressiveLoadAsync(paths, "Indexing dropped folder");
+            return;
         }
 
-        if (loadChoice == RiskyLoadChoice.LazyLoad)
+        if (paths.Any(Directory.Exists))
         {
-            if (!(paths.Length == 1 && Directory.Exists(paths[0])))
-            {
-                currentScanResult = null;
-            }
-            LoadPathsProgressiveAsync(paths);
+            await BeginProgressiveLoadAsync(paths, "Indexing dropped paths");
+            return;
         }
-        else
+
+        currentScanResult = null;
+        ResetForm();
+        assetsManager.Clear();
+        assetsManager.LazyLoading = false;
+        ApplyUnityVersionOption();
+        StatusStripUpdate("Loading dropped files...");
+
+        try
         {
-            if (!(paths.Length == 1 && Directory.Exists(paths[0])))
-            {
-                currentScanResult = null;
-            }
-            ResetForm();
-            assetsManager.Clear();
-            assetsManager.LazyLoading = false;
-            ApplyUnityVersionOption();
-            StatusStripUpdate("Loading dropped files...");
-
-            try
-            {
-                if (paths.Length == 1 && Directory.Exists(paths[0]))
-                {
-                    await Task.Run(() => assetsManager.LoadFolder(paths[0]));
-                }
-                else
-                {
-                    var files = paths
-                        .SelectMany(path => Directory.Exists(path)
-                            ? ImportHelper.GetFilesSafe(path, "*.*", true)
-                            : new[] { path })
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .ToArray();
-                    await Task.Run(() => assetsManager.LoadFiles(files));
-                }
-            }
-            catch (MemoryPressureException ex)
-            {
-                ShowMemoryPressureError(ex);
-                return;
-            }
-
-            BuildAssetStructures();
+            await Task.Run(() => assetsManager.LoadFiles(paths));
         }
+        catch (MemoryPressureException ex)
+        {
+            ShowMemoryPressureError(ex);
+            return;
+        }
+
+        BuildAssetStructures();
     }
 
     public enum RiskyLoadChoice
@@ -1286,6 +1261,46 @@ public partial class MainWindow : Window
         Cancel,
         EagerLoad,
         LazyLoad
+    }
+
+    private async Task BeginProgressiveLoadAsync(string[] paths, string statusPrefix)
+    {
+        currentScanResult = null;
+        if (paths.Length == 1 && Directory.Exists(paths[0]))
+        {
+            currentScanResult = await ScanFolderForProgressiveIndexAsync(paths[0], statusPrefix);
+        }
+
+        LoadPathsProgressiveAsync(paths);
+    }
+
+    private async Task<ProjectScanResult?> ScanFolderForProgressiveIndexAsync(string folderPath, string statusPrefix)
+    {
+        StatusStripUpdate($"{statusPrefix}: scanning folder...");
+        var scanProgress = new Progress<ScanProgress>(p =>
+        {
+            if (p.TotalFiles > 0)
+            {
+                StatusStripUpdate($"{statusPrefix}: scanning... {p.ScannedFiles:N0}/{p.TotalFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
+            }
+            else
+            {
+                StatusStripUpdate($"{statusPrefix}: scanning... {p.ScannedFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
+            }
+        });
+
+        try
+        {
+            var scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath, CancellationToken.None, scanProgress));
+            StatusStripUpdate($"{statusPrefix}: scan complete. {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
+            return scanResult;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"{statusPrefix}: folder scan failed; continuing without SQLite cache validation. {ex.Message}");
+            StatusStripUpdate($"{statusPrefix}: scan failed; indexing without cache validation.");
+            return null;
+        }
     }
 
     private async Task<RiskyLoadChoice> ConfirmFolderLoadIfRisky(string folderPath)
@@ -1337,7 +1352,7 @@ public partial class MainWindow : Window
         assetsManager.Clear();
         assetsManager.LazyLoading = true;
         ApplyUnityVersionOption();
-        StatusStripUpdate("Loading progressively...");
+        StatusStripUpdate("Indexing assets with SQLite cache...");
 
         string cacheTargetFolder = "";
         if (paths.Length == 1 && Directory.Exists(paths[0]))

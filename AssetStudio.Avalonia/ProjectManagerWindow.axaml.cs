@@ -232,6 +232,7 @@ public partial class ProjectManagerWindow : Window
         }
 
         mainWindow.Show();
+        mainWindow.StartProjectIndexingOnOpen();
         Close();
     }
 
