@@ -21,6 +21,8 @@ namespace AssetStudio.Avalonia.Controls
         private bool _hasMediaLoaded;
         private bool _isInitialized;
         private int _previousVolume = 100;
+        private Func<int, int, IAudioPlayer?>? _audioPlayerFactoryFunc;
+        private bool _autoPlayCached;
 
         public static readonly StyledProperty<int> VolumeProperty =
             AvaloniaProperty.Register<VideoPlayerControl, int>(nameof(Volume), defaultValue: 100);
@@ -202,6 +204,47 @@ namespace AssetStudio.Avalonia.Controls
             Cleanup();
         }
 
+        private FFmpegMediaPlayer CreateMediaPlayerInstance()
+        {
+            Func<int, int, IAudioPlayer?> func = _audioPlayerFactoryFunc ?? 
+                ((sr, ch) => {
+                    try
+                    {
+                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        {
+                            return new WinMmAudioPlayer(sr, ch);
+                        }
+                        return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+                    }
+                    catch
+                    {
+                        try
+                        {
+                            return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+                    }
+                });
+
+            var mediaPlayer = new FFmpegMediaPlayer(action =>
+            {
+                Dispatcher.UIThread.Post(action);
+            }, func);
+
+            mediaPlayer.PositionChanged += OnPositionChanged;
+            mediaPlayer.LengthChanged += OnLengthChanged;
+            mediaPlayer.Playing += OnPlaying;
+            mediaPlayer.Paused += OnPaused;
+            mediaPlayer.Stopped += OnStopped;
+            mediaPlayer.EndReached += OnEndReached;
+            mediaPlayer.FrameReady += OnFrameReady;
+
+            return mediaPlayer;
+        }
+
         private void InitializePlayer()
         {
             if (_isInitialized)
@@ -214,41 +257,9 @@ namespace AssetStudio.Avalonia.Controls
                     FFmpegInitializer.Initialize(null, true, true);
                 }
 
-                Func<int, int, IAudioPlayer?> func = AudioPlayerFactory ?? 
-                    ((sr, ch) => {
-                        try
-                        {
-                            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                            {
-                                return new WinMmAudioPlayer(sr, ch);
-                            }
-                            return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
-                        }
-                        catch
-                        {
-                            try
-                            {
-                                return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
-                            }
-                            catch
-                            {
-                                return null;
-                            }
-                        }
-                    });
-
-                _mediaPlayer = new FFmpegMediaPlayer(action =>
-                {
-                    Dispatcher.UIThread.Post(action);
-                }, func);
-
-                _mediaPlayer.PositionChanged += OnPositionChanged;
-                _mediaPlayer.LengthChanged += OnLengthChanged;
-                _mediaPlayer.Playing += OnPlaying;
-                _mediaPlayer.Paused += OnPaused;
-                _mediaPlayer.Stopped += OnStopped;
-                _mediaPlayer.EndReached += OnEndReached;
-                _mediaPlayer.FrameReady += OnFrameReady;
+                _audioPlayerFactoryFunc = AudioPlayerFactory;
+                _autoPlayCached = AutoPlay;
+                _mediaPlayer = CreateMediaPlayerInstance();
 
                 _isInitialized = true;
                 SetupVideoRenderer();
@@ -335,7 +346,7 @@ namespace AssetStudio.Avalonia.Controls
                 if (!string.IsNullOrEmpty(text) && _isInitialized)
                 {
                     Open(text);
-                    if (AutoPlay)
+                    if (_autoPlayCached)
                     {
                         Play();
                     }
@@ -365,6 +376,14 @@ namespace AssetStudio.Avalonia.Controls
             else if (e.Property == RenderingModeProperty)
             {
                 SetupVideoRenderer();
+            }
+            else if (e.Property == AutoPlayProperty)
+            {
+                _autoPlayCached = (bool)(e.NewValue ?? false);
+            }
+            else if (e.Property == AudioPlayerFactoryProperty)
+            {
+                _audioPlayerFactoryFunc = e.NewValue as Func<int, int, IAudioPlayer?>;
             }
         }
 
@@ -417,17 +436,39 @@ namespace AssetStudio.Avalonia.Controls
 
         public void Open(string path)
         {
-            if (_mediaPlayer == null)
-                return;
-
             _hasMediaLoaded = false;
+
+            var oldPlayer = _mediaPlayer;
+            if (oldPlayer != null)
+            {
+                oldPlayer.PositionChanged -= OnPositionChanged;
+                oldPlayer.LengthChanged -= OnLengthChanged;
+                oldPlayer.Playing -= OnPlaying;
+                oldPlayer.Paused -= OnPaused;
+                oldPlayer.Stopped -= OnStopped;
+                oldPlayer.EndReached -= OnEndReached;
+                oldPlayer.FrameReady -= OnFrameReady;
+
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        oldPlayer.Close();
+                        oldPlayer.Dispose();
+                    }
+                    catch {}
+                });
+            }
+
+            _mediaPlayer = CreateMediaPlayerInstance();
+
             if (_mediaPlayer.Open(path))
             {
                 _currentMediaPath = path;
                 _hasMediaLoaded = true;
                 MediaOpened?.Invoke(this, new MediaOpenedEventArgs(path));
                 _mediaPlayer.DecodeFirstFrame();
-                if (AutoPlay)
+                if (_autoPlayCached)
                 {
                     _mediaPlayer.Play();
                 }
@@ -451,8 +492,15 @@ namespace AssetStudio.Avalonia.Controls
         
         public void Stop()
         {
-            _mediaPlayer?.Stop();
-            _videoRenderer?.Clear();
+            var oldPlayer = _mediaPlayer;
+            if (oldPlayer != null)
+            {
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { oldPlayer.Stop(); } catch {}
+                });
+            }
+            Dispatcher.UIThread.Post(() => _videoRenderer?.Clear());
         }
 
         public bool StepForward() => _mediaPlayer?.StepForward() ?? false;

@@ -8026,6 +8026,18 @@ public partial class MainWindow : Window
         SetVideoStoppedUi();
     }
 
+    private async Task VideoStopAsync()
+    {
+        try
+        {
+            _ffmpegVideoTimer?.Stop();
+            await Task.Run(() => FfmpegVideoPlayer.Stop());
+        }
+        catch {}
+
+        SetVideoStoppedUi();
+    }
+
     private void CancelVideoPreviewLoad()
     {
         try
@@ -8059,6 +8071,37 @@ public partial class MainWindow : Window
         SetVideoStoppedUi();
     }
 
+    private async Task VideoResetAsync()
+    {
+        CancelVideoPreviewLoad();
+        try
+        {
+            _ffmpegVideoTimer?.Stop();
+            await Task.Run(() => FfmpegVideoPlayer.Stop());
+        }
+        catch {}
+
+        if (!string.IsNullOrEmpty(_currentTempVideoPath))
+        {
+            var pathToDelete = _currentTempVideoPath;
+            _currentTempVideoPath = null;
+            await Task.Run(() =>
+            {
+                try
+                {
+                    if (File.Exists(pathToDelete))
+                    {
+                        File.Delete(pathToDelete);
+                    }
+                }
+                catch {}
+            });
+        }
+
+        _currentTempVideoAssetId = null;
+        SetVideoStoppedUi();
+    }
+
     private void SetVideoStoppedUi()
     {
         VideoStatusLabel.Text = "Stopped";
@@ -8067,16 +8110,16 @@ public partial class MainWindow : Window
         VideoTimerLabel.Text = "0:00.0 / 0:00.0";
     }
 
-    private void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
+    private async void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
     {
         var videoAssetId = GetPreviewAssetId(m_VideoClip);
         if (_currentTempVideoAssetId == videoAssetId)
         {
-            VideoStop();
+            await VideoStopAsync();
         }
         else
         {
-            VideoReset();
+            await VideoResetAsync();
         }
 
         currentPreviewVideoClip = m_VideoClip;
@@ -8168,8 +8211,26 @@ public partial class MainWindow : Window
                         return;
                     }
 
-                    FfmpegVideoPlayer.Open(_currentTempVideoPath!);
-                    if (!FfmpegVideoPlayer.HasMediaLoaded)
+                    var path = _currentTempVideoPath!;
+                    bool opened = await Task.Run(() =>
+                    {
+                        try
+                        {
+                            FfmpegVideoPlayer.Open(path);
+                            return FfmpegVideoPlayer.HasMediaLoaded;
+                        }
+                        catch
+                        {
+                            return false;
+                        }
+                    });
+
+                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+                    {
+                        return;
+                    }
+
+                    if (!opened)
                     {
                         VideoStatusLabel.Text = "Unsupported";
                         VideoPlayButton.Content = "Play";
@@ -8318,8 +8379,26 @@ public partial class MainWindow : Window
                 return;
             }
 
-            FfmpegVideoPlayer.Open(_currentTempVideoPath);
-            if (FfmpegVideoPlayer.HasMediaLoaded)
+            var path = _currentTempVideoPath;
+            bool opened = await Task.Run(() =>
+            {
+                try
+                {
+                    FfmpegVideoPlayer.Open(path);
+                    return FfmpegVideoPlayer.HasMediaLoaded;
+                }
+                catch
+                {
+                    return false;
+                }
+            });
+
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+            {
+                return;
+            }
+
+            if (opened)
             {
                 VideoStatusLabel.Text = "Ready";
                 VideoPlayButton.Content = "Play";
@@ -8343,9 +8422,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private void VideoStopButton_Click(object? sender, RoutedEventArgs e)
+    private async void VideoStopButton_Click(object? sender, RoutedEventArgs e)
     {
-        VideoStop();
+        await VideoStopAsync();
     }
 
     private void VideoVolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)

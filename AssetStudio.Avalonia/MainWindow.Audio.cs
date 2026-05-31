@@ -92,9 +92,12 @@ public partial class MainWindow : Window
         if (oldPlayer != null)
         {
             oldPlayer.EndReached -= AudioMediaPlayer_EndReached;
-            try { oldPlayer.Stop(); } catch {}
-            try { oldPlayer.Close(); } catch {}
-            try { oldPlayer.Dispose(); } catch {}
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { oldPlayer.Stop(); } catch {}
+                try { oldPlayer.Close(); } catch {}
+                try { oldPlayer.Dispose(); } catch {}
+            });
             _audioMediaPlayer = null;
         }
 
