@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.InteropServices;
+using System.Threading;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
@@ -6,6 +8,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using FFmpegVideoPlayer.Core;
 using Avalonia.FFmpegVideoPlayer;
+using AssetStudio.Avalonia;
 
 namespace AssetStudio.Avalonia.Controls
 {
@@ -215,11 +218,22 @@ namespace AssetStudio.Avalonia.Controls
                     ((sr, ch) => {
                         try
                         {
+                            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                            {
+                                return new WinMmAudioPlayer(sr, ch);
+                            }
                             return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
                         }
                         catch
                         {
-                            return null;
+                            try
+                            {
+                                return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+                            }
+                            catch
+                            {
+                                return null;
+                            }
                         }
                     });
 

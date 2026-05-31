@@ -18,7 +18,7 @@ public partial class MainWindow : Window
     private System.Diagnostics.Stopwatch? _linuxAudioStopwatch;
 
     private FFmpegMediaPlayer? _audioMediaPlayer;
-    private PcmWavePreviewPlayer? _pcmWavePreviewPlayer;
+    private WinMmAudioPlayer? _pcmWavePreviewPlayer;
     private string? _currentTempAudioPath;
     private string? _currentTempAudioAssetId;
     private CancellationTokenSource? _audioPreviewLoadCts;
@@ -63,11 +63,22 @@ public partial class MainWindow : Window
         {
             try
             {
+                if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+                {
+                    return new WinMmAudioPlayer(sr, ch);
+                }
                 return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
             }
             catch
             {
-                return null;
+                try
+                {
+                    return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
+                }
+                catch
+                {
+                    return null;
+                }
             }
         });
 
@@ -255,7 +266,7 @@ public partial class MainWindow : Window
         ResetAudioMediaPlayer(recreateAudioPlayer);
         try
         {
-            _pcmWavePreviewPlayer?.Stop();
+            _pcmWavePreviewPlayer?.StopWav();
         }
         catch {}
 
@@ -645,7 +656,7 @@ public partial class MainWindow : Window
                 _currentTempAudioPath = audioTempPath;
 
                 _usingPcmWavePreview = true;
-                _pcmWavePreviewPlayer ??= new PcmWavePreviewPlayer();
+                _pcmWavePreviewPlayer ??= new WinMmAudioPlayer();
                 if (!_pcmWavePreviewPlayer.Load(audioTempPath))
                 {
                     _usingPcmWavePreview = false;
@@ -791,36 +802,6 @@ public partial class MainWindow : Window
 
     private static byte[] TrimWaveContainer(byte[] data)
     {
-        if (data.Length < 12
-            || data[0] != (byte)'R'
-            || data[1] != (byte)'I'
-            || data[2] != (byte)'F'
-            || data[3] != (byte)'F'
-            || data[8] != (byte)'W'
-            || data[9] != (byte)'A'
-            || data[10] != (byte)'V'
-            || data[11] != (byte)'E')
-        {
-            return data;
-        }
-
-        int chunkOffset = 12;
-        while (chunkOffset + 8 < data.Length)
-        {
-            var chunkId = System.Text.Encoding.ASCII.GetString(data, chunkOffset, 4);
-            int chunkSize = BitConverter.ToInt32(data, chunkOffset + 4);
-            if (chunkId.Equals("data", StringComparison.OrdinalIgnoreCase))
-            {
-                if (chunkOffset + 8 + chunkSize <= data.Length)
-                {
-                    var payload = new byte[chunkSize];
-                    Buffer.BlockCopy(data, chunkOffset + 8, payload, 0, chunkSize);
-                    return payload;
-                }
-                break;
-            }
-            chunkOffset += 8 + chunkSize;
-        }
         return data;
     }
 
@@ -973,14 +954,14 @@ public partial class MainWindow : Window
             {
                 if (_pcmWavePreviewPlayer.IsPlaying)
                 {
-                    _pcmWavePreviewPlayer.Pause();
+                    _pcmWavePreviewPlayer.PauseWav();
                     AudioStatusLabel.Text = "Paused";
                     AudioPauseButton.Content = "Resume";
                 }
                 else
                 {
                     _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
-                    _pcmWavePreviewPlayer.Resume();
+                    _pcmWavePreviewPlayer.ResumeWav();
                     AudioStatusLabel.Text = "Playing";
                     AudioPauseButton.Content = "Pause";
                     _audioTimer?.Start();
@@ -1082,7 +1063,7 @@ public partial class MainWindow : Window
             }
             else if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
             {
-                _pcmWavePreviewPlayer.Stop();
+                _pcmWavePreviewPlayer.StopWav();
                 ResetAudioClock();
             }
             else if (_audioMediaPlayer != null)
