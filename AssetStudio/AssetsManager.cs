@@ -56,10 +56,14 @@ namespace AssetStudio
         }
         private const double DefaultLoadThreadRatio = 0.4;
         private const double DefaultReadThreadRatio = 0.4;
+        private const double DefaultLazyLoadThreadRatio = 0.4;
+        private const double DefaultLazyReadThreadRatio = 0.4;
         private const int DefaultMemoryLimitPercent = 90;
-        private const int DefaultLazyLoadThreadCount = 2;
-        private const int DefaultLazyReadThreadCount = 2;
+        private static readonly int DefaultLazyLoadThreadCount = GetConfiguredThreadCount("ASSETSTUDIO_LAZY_LOAD_THREADS", DefaultLazyLoadThreadRatio);
+        private static readonly int DefaultLazyReadThreadCount = GetConfiguredThreadCount("ASSETSTUDIO_LAZY_READ_THREADS", DefaultLazyReadThreadRatio);
+#if NET6_0_OR_GREATER
         private static long lastGCCollectTime = 0;
+#endif
 
         public static bool DisableMemoryPressureCheck = false;
         public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;

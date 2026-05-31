@@ -31,6 +31,22 @@ namespace AssetStudio
             {
                 return false;
             }
+
+            if (outPutSize >= 16 * 1024 * 1024 && GetFormatParams(m_TextureFormat, out _))
+            {
+                try
+                {
+                    if (DecodeTexture2DStreaming(bytes))
+                    {
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Streaming texture decode failed, falling back to standard: {ex.Message}");
+                }
+            }
+
             var minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
             var truncated = minDataSize > 0 && reader.Size < minDataSize;
             if (truncated)
@@ -983,6 +999,379 @@ namespace AssetStudio
                     return 0;
                 default:
                     return 0;
+            }
+        }
+        private struct FormatParam
+        {
+            public bool IsCompressed;
+            public int BlockWidth;
+            public int BlockHeight;
+            public int BytesPerBlock; // or bytes per pixel if uncompressed
+        }
+
+        private bool GetFormatParams(TextureFormat format, out FormatParam param)
+        {
+            param = new FormatParam();
+            switch (format)
+            {
+                // Uncompressed
+                case TextureFormat.RGBA32:
+                case TextureFormat.ARGB32:
+                case TextureFormat.BGRA32:
+                    param.IsCompressed = false;
+                    param.BytesPerBlock = 4;
+                    return true;
+                case TextureFormat.RGB24:
+                case TextureFormat.BGR24:
+                    param.IsCompressed = false;
+                    param.BytesPerBlock = 3;
+                    return true;
+                case TextureFormat.RG16:
+                    param.IsCompressed = false;
+                    param.BytesPerBlock = 2;
+                    return true;
+                case TextureFormat.Alpha8:
+                case TextureFormat.R8:
+                    param.IsCompressed = false;
+                    param.BytesPerBlock = 1;
+                    return true;
+
+                case TextureFormat.DXT1:
+                case TextureFormat.BC4:
+                case TextureFormat.ETC_RGB4:
+                case TextureFormat.ETC_RGB4_3DS:
+                case TextureFormat.ETC2_RGB:
+                case TextureFormat.ETC2_RGBA1:
+                case TextureFormat.EAC_R:
+                case TextureFormat.EAC_R_SIGNED:
+                case TextureFormat.ATC_RGB4:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 4;
+                    param.BlockHeight = 4;
+                    param.BytesPerBlock = 8;
+                    return true;
+
+                case TextureFormat.DXT3:
+                case TextureFormat.DXT5:
+                case TextureFormat.BC5:
+                case TextureFormat.BC6H:
+                case TextureFormat.BC7:
+                case TextureFormat.ETC2_RGBA8:
+                case TextureFormat.ETC_RGBA8_3DS:
+                case TextureFormat.EAC_RG:
+                case TextureFormat.EAC_RG_SIGNED:
+                case TextureFormat.ATC_RGBA8:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 4;
+                    param.BlockHeight = 4;
+                    param.BytesPerBlock = 16;
+                    return true;
+
+                case TextureFormat.ASTC_RGB_4x4:
+                case TextureFormat.ASTC_RGBA_4x4:
+                case TextureFormat.ASTC_HDR_4x4:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 4;
+                    param.BlockHeight = 4;
+                    param.BytesPerBlock = 16;
+                    return true;
+
+                case TextureFormat.ASTC_RGB_5x5:
+                case TextureFormat.ASTC_RGBA_5x5:
+                case TextureFormat.ASTC_HDR_5x5:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 5;
+                    param.BlockHeight = 5;
+                    param.BytesPerBlock = 16;
+                    return true;
+
+                case TextureFormat.ASTC_RGB_6x6:
+                case TextureFormat.ASTC_RGBA_6x6:
+                case TextureFormat.ASTC_HDR_6x6:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 6;
+                    param.BlockHeight = 6;
+                    param.BytesPerBlock = 16;
+                    return true;
+
+                case TextureFormat.ASTC_RGB_8x8:
+                case TextureFormat.ASTC_RGBA_8x8:
+                case TextureFormat.ASTC_HDR_8x8:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 8;
+                    param.BlockHeight = 8;
+                    param.BytesPerBlock = 16;
+                    return true;
+
+                case TextureFormat.ASTC_RGB_10x10:
+                case TextureFormat.ASTC_RGBA_10x10:
+                case TextureFormat.ASTC_HDR_10x10:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 10;
+                    param.BlockHeight = 10;
+                    param.BytesPerBlock = 16;
+                    return true;
+
+                case TextureFormat.ASTC_RGB_12x12:
+                case TextureFormat.ASTC_RGBA_12x12:
+                case TextureFormat.ASTC_HDR_12x12:
+                    param.IsCompressed = true;
+                    param.BlockWidth = 12;
+                    param.BlockHeight = 12;
+                    param.BytesPerBlock = 16;
+                    return true;
+            }
+            return false;
+        }
+
+        private bool DecodeBlockRow(TextureFormat format, byte[] compressedRow, int width, int height, int blockWidth, int blockHeight, byte[] outputRow)
+        {
+            switch (format)
+            {
+                case TextureFormat.DXT1:
+                    return TextureDecoder.DecodeDXT1(compressedRow, width, height, outputRow);
+                case TextureFormat.DXT3:
+                    {
+                        var originalHeight = m_Height;
+                        m_Height = height;
+                        var res = DecodeDXT3(compressedRow, outputRow);
+                        m_Height = originalHeight;
+                        return res;
+                    }
+                case TextureFormat.DXT5:
+                    return TextureDecoder.DecodeDXT5(compressedRow, width, height, outputRow);
+                case TextureFormat.BC4:
+                    return TextureDecoder.DecodeBC4(compressedRow, width, height, outputRow);
+                case TextureFormat.BC5:
+                    return TextureDecoder.DecodeBC5(compressedRow, width, height, outputRow);
+                case TextureFormat.BC6H:
+                    return TextureDecoder.DecodeBC6(compressedRow, width, height, outputRow);
+                case TextureFormat.BC7:
+                    return TextureDecoder.DecodeBC7(compressedRow, width, height, outputRow);
+                case TextureFormat.ETC_RGB4:
+                case TextureFormat.ETC_RGB4_3DS:
+                    return TextureDecoder.DecodeETC1(compressedRow, width, height, outputRow);
+                case TextureFormat.ETC2_RGB:
+                    return TextureDecoder.DecodeETC2(compressedRow, width, height, outputRow);
+                case TextureFormat.ETC2_RGBA1:
+                    return TextureDecoder.DecodeETC2A1(compressedRow, width, height, outputRow);
+                case TextureFormat.ETC2_RGBA8:
+                case TextureFormat.ETC_RGBA8_3DS:
+                    return TextureDecoder.DecodeETC2A8(compressedRow, width, height, outputRow);
+                case TextureFormat.EAC_R:
+                    return TextureDecoder.DecodeEACR(compressedRow, width, height, outputRow);
+                case TextureFormat.EAC_R_SIGNED:
+                    return TextureDecoder.DecodeEACRSigned(compressedRow, width, height, outputRow);
+                case TextureFormat.EAC_RG:
+                    return TextureDecoder.DecodeEACRG(compressedRow, width, height, outputRow);
+                case TextureFormat.EAC_RG_SIGNED:
+                    return TextureDecoder.DecodeEACRGSigned(compressedRow, width, height, outputRow);
+                case TextureFormat.ATC_RGB4:
+                    return TextureDecoder.DecodeATCRGB4(compressedRow, width, height, outputRow);
+                case TextureFormat.ATC_RGBA8:
+                    return TextureDecoder.DecodeATCRGBA8(compressedRow, width, height, outputRow);
+
+                case TextureFormat.ASTC_RGB_4x4:
+                case TextureFormat.ASTC_RGBA_4x4:
+                case TextureFormat.ASTC_HDR_4x4:
+                    return TextureDecoder.DecodeASTC(compressedRow, width, height, 4, 4, outputRow);
+
+                case TextureFormat.ASTC_RGB_5x5:
+                case TextureFormat.ASTC_RGBA_5x5:
+                case TextureFormat.ASTC_HDR_5x5:
+                    return TextureDecoder.DecodeASTC(compressedRow, width, height, 5, 5, outputRow);
+
+                case TextureFormat.ASTC_RGB_6x6:
+                case TextureFormat.ASTC_RGBA_6x6:
+                case TextureFormat.ASTC_HDR_6x6:
+                    return TextureDecoder.DecodeASTC(compressedRow, width, height, 6, 6, outputRow);
+
+                case TextureFormat.ASTC_RGB_8x8:
+                case TextureFormat.ASTC_RGBA_8x8:
+                case TextureFormat.ASTC_HDR_8x8:
+                    return TextureDecoder.DecodeASTC(compressedRow, width, height, 8, 8, outputRow);
+
+                case TextureFormat.ASTC_RGB_10x10:
+                case TextureFormat.ASTC_RGBA_10x10:
+                case TextureFormat.ASTC_HDR_10x10:
+                    return TextureDecoder.DecodeASTC(compressedRow, width, height, 10, 10, outputRow);
+
+                case TextureFormat.ASTC_RGB_12x12:
+                case TextureFormat.ASTC_RGBA_12x12:
+                case TextureFormat.ASTC_HDR_12x12:
+                    return TextureDecoder.DecodeASTC(compressedRow, width, height, 12, 12, outputRow);
+            }
+            return false;
+        }
+
+        private bool DecodeTexture2DStreaming(byte[] bytes)
+        {
+            if (!GetFormatParams(m_TextureFormat, out var param))
+            {
+                return false;
+            }
+
+            if (param.IsCompressed)
+            {
+                int blockWidth = param.BlockWidth;
+                int blockHeight = param.BlockHeight;
+                int bytesPerBlock = param.BytesPerBlock;
+
+                int blocksX = (m_Width + blockWidth - 1) / blockWidth;
+                int blocksY = (m_Height + blockHeight - 1) / blockHeight;
+                int rowBytes = blocksX * bytesPerBlock;
+
+                byte[] compressedRow = BigArrayPool<byte>.Shared.Rent(rowBytes);
+                try
+                {
+                    for (int by = 0; by < blocksY; by++)
+                    {
+                        int chunkHeight = Math.Min(blockHeight, m_Height - by * blockHeight);
+                        long offset = (long)by * rowBytes;
+                        
+                        // Read row of blocks
+                        reader.ReadSegment(offset, compressedRow, 0, rowBytes);
+
+                        // Xbox 360 swap bytes
+                        if (platform == BuildTarget.XBOX360)
+                        {
+                            for (var i = 0; i < rowBytes / 2; i++)
+                            {
+                                var b = compressedRow[i * 2];
+                                compressedRow[i * 2] = compressedRow[i * 2 + 1];
+                                compressedRow[i * 2 + 1] = b;
+                            }
+                        }
+
+                        // Temp decoded buffer for this block row
+                        int chunkOutputSize = m_Width * chunkHeight * 4;
+                        byte[] chunkDecoded = BigArrayPool<byte>.Shared.Rent(chunkOutputSize);
+                        try
+                        {
+                            if (!DecodeBlockRow(m_TextureFormat, compressedRow, m_Width, chunkHeight, blockWidth, blockHeight, chunkDecoded))
+                            {
+                                return false;
+                            }
+
+                            // Copy back to final buffer
+                            for (int row = 0; row < chunkHeight; row++)
+                            {
+                                int srcOffset = row * m_Width * 4;
+                                int dstOffset = ((by * blockHeight) + row) * m_Width * 4;
+                                Buffer.BlockCopy(chunkDecoded, srcOffset, bytes, dstOffset, m_Width * 4);
+                            }
+                        }
+                        finally
+                        {
+                            BigArrayPool<byte>.Shared.Return(chunkDecoded);
+                        }
+                    }
+                    return true;
+                }
+                finally
+                {
+                    BigArrayPool<byte>.Shared.Return(compressedRow);
+                }
+            }
+            else
+            {
+                // Uncompressed format decoded row-by-row
+                int bytesPerPixel = param.BytesPerBlock;
+                int rowBytes = m_Width * bytesPerPixel;
+                byte[] tempRow = BigArrayPool<byte>.Shared.Rent(rowBytes);
+                try
+                {
+                    for (int y = 0; y < m_Height; y++)
+                    {
+                        reader.ReadSegment((long)y * rowBytes, tempRow, 0, rowBytes);
+
+                        switch (m_TextureFormat)
+                        {
+                            case TextureFormat.Alpha8:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = 0xFF;
+                                        bytes[outIdx + 1] = 0xFF;
+                                        bytes[outIdx + 2] = 0xFF;
+                                        bytes[outIdx + 3] = tempRow[x];
+                                    }
+                                }
+                                break;
+                            case TextureFormat.RGB24:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = tempRow[x * 3 + 2];
+                                        bytes[outIdx + 1] = tempRow[x * 3 + 1];
+                                        bytes[outIdx + 2] = tempRow[x * 3 + 0];
+                                        bytes[outIdx + 3] = 255;
+                                    }
+                                }
+                                break;
+                            case TextureFormat.RGBA32:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = tempRow[x * 4 + 2];
+                                        bytes[outIdx + 1] = tempRow[x * 4 + 1];
+                                        bytes[outIdx + 2] = tempRow[x * 4 + 0];
+                                        bytes[outIdx + 3] = tempRow[x * 4 + 3];
+                                    }
+                                }
+                                break;
+                            case TextureFormat.ARGB32:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = tempRow[x * 4 + 3];
+                                        bytes[outIdx + 1] = tempRow[x * 4 + 2];
+                                        bytes[outIdx + 2] = tempRow[x * 4 + 1];
+                                        bytes[outIdx + 3] = tempRow[x * 4 + 0];
+                                    }
+                                }
+                                break;
+                            case TextureFormat.BGRA32:
+                                {
+                                    Buffer.BlockCopy(tempRow, 0, bytes, y * m_Width * 4, rowBytes);
+                                }
+                                break;
+                            case TextureFormat.RG16:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = 0;
+                                        bytes[outIdx + 1] = tempRow[x * 2 + 1];
+                                        bytes[outIdx + 2] = tempRow[x * 2];
+                                        bytes[outIdx + 3] = 255;
+                                    }
+                                }
+                                break;
+                            case TextureFormat.R8:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = 0;
+                                        bytes[outIdx + 1] = 0;
+                                        bytes[outIdx + 2] = tempRow[x];
+                                        bytes[outIdx + 3] = 255;
+                                    }
+                                }
+                                break;
+                        }
+                    }
+                    return true;
+                }
+                finally
+                {
+                    BigArrayPool<byte>.Shared.Return(tempRow);
+                }
             }
         }
     }
