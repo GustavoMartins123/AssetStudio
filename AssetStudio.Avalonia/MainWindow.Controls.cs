@@ -58,6 +58,16 @@ public partial class MainWindow : Window
         GLPreviewControl?.RotateDown90();
     }
 
+    private void ToggleMeshControlsBtn_Click(object? sender, RoutedEventArgs e)
+    {
+        if (MeshViewerControlsContent != null && ToggleMeshControlsBtn != null)
+        {
+            bool isVisible = MeshViewerControlsContent.IsVisible;
+            MeshViewerControlsContent.IsVisible = !isVisible;
+            ToggleMeshControlsBtn.Content = !isVisible ? "▲" : "▼";
+        }
+    }
+
     private void BoneSizeSlider_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
         if (updatingAvatarPreviewControls || BoneSizeSlider == null)
