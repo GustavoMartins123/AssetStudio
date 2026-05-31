@@ -8,12 +8,14 @@ namespace AssetStudio
     {
         private readonly ConcurrentDictionary<string, AssetHandle> _handles = new ConcurrentDictionary<string, AssetHandle>();
         private readonly ConcurrentDictionary<string, ConcurrentBag<AssetHandle>> _handlesByFile = new ConcurrentDictionary<string, ConcurrentBag<AssetHandle>>();
+        private readonly ConcurrentQueue<AssetHandle> _pendingHandles = new ConcurrentQueue<AssetHandle>();
         
         public void AddHandle(AssetHandle handle)
         {
             if (handle != null && !string.IsNullOrEmpty(handle.UniqueID))
             {
                 _handles[handle.UniqueID] = handle;
+                _pendingHandles.Enqueue(handle);
 
                 if (!string.IsNullOrEmpty(handle.SerializedFileName))
                 {
@@ -35,6 +37,14 @@ namespace AssetStudio
             return _handles.Values;
         }
 
+        public IEnumerable<AssetHandle> DrainPendingHandles()
+        {
+            while (_pendingHandles.TryDequeue(out var handle))
+            {
+                yield return handle;
+            }
+        }
+
         public IEnumerable<AssetHandle> GetHandlesForFile(string fileName)
         {
             if (string.IsNullOrEmpty(fileName)) return Array.Empty<AssetHandle>();
@@ -46,6 +56,9 @@ namespace AssetStudio
         {
             _handles.Clear();
             _handlesByFile.Clear();
+            while (_pendingHandles.TryDequeue(out _))
+            {
+            }
         }
     }
 }

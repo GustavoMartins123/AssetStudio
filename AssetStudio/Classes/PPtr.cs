@@ -105,6 +105,17 @@ namespace AssetStudio
                 }
             }
 
+            var handle = sourceFile.assetsManager?.ProjectIndex?.GetHandle($"{sourceFile.fileName}#{m_PathID}");
+            if (handle != null)
+            {
+                var obj = sourceFile.assetsManager.ResolveHandle(handle);
+                if (obj is TObject variable)
+                {
+                    result = variable;
+                    return true;
+                }
+            }
+
             result = null;
             return false;
         }

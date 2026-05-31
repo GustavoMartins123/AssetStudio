@@ -299,6 +299,7 @@ void main()
         private bool previewMaterialMode = false;
         private int previewTextureId = 0;
         private Vector4[]? materialTintOverrides;
+        private bool keepExistingTextures = false;
 
         // Interaction state
         private global::Avalonia.Point mpos;
@@ -655,6 +656,7 @@ void main()
             meshPreviewSourceSubMeshTexWidths = null;
             meshPreviewSourceSubMeshTexHeights = null;
             previewSubMeshIndexCounts = null;
+            keepExistingTextures = false;
         }
 
         private static Vector3[] BuildCalculatedNormals(Vector3[] vertices, int[] indices)
@@ -790,10 +792,15 @@ void main()
         private void SetMesh(Mesh m_Mesh, Vector2[]? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
         {
             ClearAvatarPreviewState();
-            previewMaterialMode = false;
             if (resetMaterialOverrides)
             {
+                previewMaterialMode = false;
                 materialTintOverrides = null;
+                keepExistingTextures = false;
+            }
+            else
+            {
+                keepExistingTextures = true;
             }
             meshPreviewSource = m_Mesh;
             meshPreviewSourceUvs = uvs;
@@ -927,7 +934,7 @@ void main()
                     }
                 }
 
-                if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
+                if (resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null))
                 {
                     lock (textureLock)
                     {
@@ -943,18 +950,21 @@ void main()
                 {
                     if (currentLoadId != meshLoadCounter) return;
 
-                    viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
+                    if (resetMaterialOverrides)
+                    {
+                        viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
+                        modelMatrixData = localModelMatrixData;
+                        initialViewMatrix = viewMatrixData;
+                        initialModelMatrix = modelMatrixData;
+                    }
                     vertexData = localVertexData;
-                    modelMatrixData = localModelMatrixData;
-                    initialViewMatrix = viewMatrixData;
-                    initialModelMatrix = modelMatrixData;
                     indiceData = localIndiceData;
                     normalData = localNormalData;
                     normal2Data = localNormal2Data;
                     colorData = localColorData;
                     uvData = localUvData;
                     previewSubMeshIndexCounts = localPreviewSubMeshIndexCounts;
-                    if (subMeshTextures != null && subMeshTextures.Any(t => t != null))
+                    if (resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null))
                     {
                         previewMaterialMode = true;
                     }
@@ -1304,7 +1314,7 @@ void main()
 
                 if (vao == 0)
                 {
-                    if (!updateTex)
+                    if (!updateTex && !keepExistingTextures)
                     {
                         if (previewTextureId != 0)
                         {

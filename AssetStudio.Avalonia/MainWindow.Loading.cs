@@ -85,7 +85,10 @@ namespace AssetStudio.Avalonia
                     isNewHandle = true;
                 }
 
-                assetItem.UniqueID = " #" + index.ToString(CultureInfo.InvariantCulture);
+                if (string.IsNullOrEmpty(assetItem.UniqueID))
+                {
+                    assetItem.UniqueID = " #" + index.ToString(CultureInfo.InvariantCulture);
+                }
                 assetItems[index] = assetItem;
                 includeItems[index] = displayAllChecked || IsLazyExportableType(handle.Type);
                 newItems[index] = isNewHandle;

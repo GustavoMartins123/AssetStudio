@@ -45,12 +45,13 @@ public partial class MainWindow : Window
     private CancellationTokenSource? previewDebounce;
     private const int PreviewDebounceMilliseconds = 180;
     private const int MaxInlinePreviewTextureDimension = 1024;
-    private const int ProgressiveIndexingUiThrottleMilliseconds = 2500;
+    private const int ProgressiveIndexingUiThrottleMilliseconds = 500;
     private const int UserInteractionPriorityMilliseconds = 1200;
     private const int UserPreviewPriorityMilliseconds = 1800;
     private const int UserInteractionYieldDelayMilliseconds = 40;
     private long userInteractionPriorityUntilTimestamp;
     private List<AssetItem> visibleAssets = new();
+    private readonly BulkObservableCollection<AssetItem> visibleAssetItems = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
     private System.Diagnostics.Stopwatch? _indexingUiThrottleStopwatch;
@@ -79,14 +80,19 @@ public partial class MainWindow : Window
     private Dictionary<Avatar, Mesh?>? avatarMeshCache;
     private Dictionary<Mesh, Avatar?>? meshAvatarCache;
     private Dictionary<AnimationClip, HashSet<uint>>? animationClipTransformBindingsCache;
+    private readonly object previewCacheLock = new object();
 
     private FFmpegMediaPlayer? _audioMediaPlayer;
     private string? _currentTempAudioPath;
     private long _audioLengthMs;
     private DispatcherTimer? _audioTimer;
+    private const long PrematureAudioEndToleranceMs = 1500;
+    private readonly System.Diagnostics.Stopwatch _audioPlaybackClock = new();
+    private long _audioPlaybackBaseMs;
     private volatile int _targetAudioVolume = 80;
     private bool _isUpdatingAudioProgress = false;
     private bool _isAudioDragging = false;
+    private string _audioPreviewSourceDescription = string.Empty;
 
     private string? _currentTempVideoPath;
     private bool _isUpdatingVideoProgress = false;
@@ -107,6 +113,9 @@ public partial class MainWindow : Window
     private bool isRefreshingFilterList;
     private bool isRefreshingClassesList;
     private bool _statusUpdatePending;
+    private readonly Dictionary<string, AssetItem> lazyAssetItemsByHandleId = new(StringComparer.Ordinal);
+    private readonly HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
+    private int lazyAssetItemOrdinal;
 
     public MainWindow()
     {
@@ -314,6 +323,8 @@ public partial class MainWindow : Window
         return Interlocked.Read(ref userInteractionPriorityUntilTimestamp) > Stopwatch.GetTimestamp();
     }
 
+
+
     private async Task WaitForUserInteractionPriorityToClearAsync(CancellationToken token)
     {
         if (!assetsManager.LazyLoading)
@@ -342,20 +353,27 @@ public partial class MainWindow : Window
 
     private void ResetForm()
     {
-        meshToMaterialsCache = null;
-        meshAssociatedRenderersCache = null;
-        meshSourceTypesCache = null;
-        materialMainTextureCache = null;
-        materialPreviewMaterialCache = null;
-        materialTextureSlotsCache = null;
-        objectToAssetItemCache = null;
-        animationClipAvatarCache = null;
-        avatarMeshCache = null;
-        meshAvatarCache = null;
-        animationClipTransformBindingsCache = null;
+        lock (previewCacheLock)
+        {
+            meshToMaterialsCache = null;
+            meshAssociatedRenderersCache = null;
+            meshSourceTypesCache = null;
+            materialMainTextureCache = null;
+            materialPreviewMaterialCache = null;
+            materialTextureSlotsCache = null;
+            objectToAssetItemCache = null;
+            animationClipAvatarCache = null;
+            avatarMeshCache = null;
+            meshAvatarCache = null;
+            animationClipTransformBindingsCache = null;
+        }
         logger.ClearErrors();
         exportableAssets.Clear();
         visibleAssets.Clear();
+        visibleAssetItems.Clear();
+        lazyAssetItemsByHandleId.Clear();
+        exportableAssetHandleIds.Clear();
+        lazyAssetItemOrdinal = 0;
         assetClassItems.Clear();
         visibleAssetClassItems.Clear();
         classFilterOverride = null;
@@ -363,7 +381,8 @@ public partial class MainWindow : Window
         {
             ClearClassFilterButton.IsVisible = false;
         }
-        AssetListDataGrid.ItemsSource = null;
+        AssetListDataGrid.SelectedItem = null;
+        AssetListDataGrid.ItemsSource = visibleAssetItems;
         AssetClassesDataGrid.ItemsSource = null;
         sceneTreeNodes.Clear();
         treeSearchResults.Clear();
@@ -1389,7 +1408,7 @@ public partial class MainWindow : Window
 
         indexingTask = Task.Run(async () =>
         {
-            int batchSize = 100;
+            int batchSize = 40;
             int loadedCount = 0;
 
             while (pendingFilesToIndex.Count > 0)
@@ -1512,8 +1531,8 @@ public partial class MainWindow : Window
                     Dispatcher.UIThread.Post(() =>
                     {
                         progressBar.Value = progressPercent;
-                        StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%)");
-                        BuildAssetStructures(incremental: true);
+                        var addedAssets = AppendNewLazyAssetsFromProjectIndex();
+                        StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%) | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})");
                     });
                 }
             }
@@ -1531,6 +1550,7 @@ public partial class MainWindow : Window
                 StatusStripUpdate(wasCancelled
                     ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalProgressPercent}%)"
                     : $"Indexing finished. Total files: {originalTotal:N0}");
+                AppendNewLazyAssetsFromProjectIndex();
 
                 if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !token.IsCancellationRequested)
                 {
@@ -1540,6 +1560,91 @@ public partial class MainWindow : Window
                 BuildAssetStructures(incremental: true);
             });
         }, token);
+    }
+
+    private int AppendNewLazyAssetsFromProjectIndex()
+    {
+        if (!assetsManager.LazyLoading)
+        {
+            return 0;
+        }
+
+        var displayAllChecked = displayAll.IsChecked == true;
+        var existingTypes = exportableAssets
+            .Select(x => x.Type)
+            .ToHashSet();
+        var filterTypesChanged = false;
+        var newExportableItems = new List<AssetItem>();
+
+        foreach (var handle in assetsManager.ProjectIndex.DrainPendingHandles())
+        {
+            if (handle == null || string.IsNullOrEmpty(handle.UniqueID))
+            {
+                continue;
+            }
+
+            if (!lazyAssetItemsByHandleId.TryGetValue(handle.UniqueID, out var assetItem))
+            {
+                assetItem = handle.Tag as AssetItem;
+                if (assetItem == null)
+                {
+                    assetItem = new AssetItem(handle)
+                    {
+                        UniqueID = " #" + lazyAssetItemOrdinal.ToString(CultureInfo.InvariantCulture)
+                    };
+                    lazyAssetItemOrdinal++;
+                }
+
+                lazyAssetItemsByHandleId[handle.UniqueID] = assetItem;
+            }
+            else if (string.IsNullOrEmpty(assetItem.UniqueID))
+            {
+                assetItem.UniqueID = " #" + lazyAssetItemOrdinal.ToString(CultureInfo.InvariantCulture);
+                lazyAssetItemOrdinal++;
+            }
+
+            UpdateLazyAssetItemHandle(assetItem, handle);
+            handle.Tag = assetItem;
+
+            if (!displayAllChecked && !IsLazyExportableType(handle.Type))
+            {
+                continue;
+            }
+
+            if (!exportableAssetHandleIds.Add(handle.UniqueID))
+            {
+                continue;
+            }
+
+            exportableAssets.Add(assetItem);
+            newExportableItems.Add(assetItem);
+            if (existingTypes.Add(assetItem.Type))
+            {
+                filterTypesChanged = true;
+            }
+        }
+
+        if (filterTypesChanged)
+        {
+            BuildFilterTypeMenu();
+        }
+
+        AppendFilteredAssetsToVisible(newExportableItems);
+        return newExportableItems.Count;
+    }
+
+    private static void UpdateLazyAssetItemHandle(AssetItem assetItem, AssetHandle handle)
+    {
+        assetItem.Handle = handle;
+        assetItem.SourceFile = handle.SourceFile;
+        assetItem.TypeString = handle.Type.ToString() ?? string.Empty;
+        assetItem.Type = handle.Type;
+        assetItem.PathID = handle.PathID;
+        assetItem.PathIDString = handle.PathID.ToString(CultureInfo.InvariantCulture);
+        assetItem.Size = handle.ByteSize;
+        assetItem.FullSize = handle.ByteSize;
+        assetItem.Name = handle.Name ?? string.Empty;
+        assetItem.Container = handle.Container ?? string.Empty;
     }
 
     private bool ShouldUpdateProgressiveIndexingUi(bool force = false)
@@ -2171,26 +2276,33 @@ public partial class MainWindow : Window
         await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
 
         // Apply results back on the UI thread
-        bool useIncrementalPath = incremental && exportableAssets.Count > 0 && result.NewExportableAssets != null;
+        var newExportableAssets = result.NewExportableAssets;
+        bool useIncrementalPath = incremental && exportableAssets.Count > 0 && newExportableAssets != null;
 
-        if (useIncrementalPath && result.NewExportableAssets.Count == 0)
+        if (useIncrementalPath && newExportableAssets!.Count == 0)
         {
-            // Nothing new to add — skip UI update entirely
+            exportableAssets = result.ExportableAssets;
+            SyncExportableAssetHandleIds();
+            assetClassItems = result.AssetClassItems;
+            BuildFilterTypeMenu();
+            UpdateAssetClassesIncremental(result.AssetClassItems);
         }
         else if (useIncrementalPath)
         {
             // Incremental path: only append new items to avoid O(n) DataGrid notifications
             exportableAssets = result.ExportableAssets;
+            SyncExportableAssetHandleIds();
             assetClassItems = result.AssetClassItems;
 
             BuildFilterTypeMenu();
-            AppendFilteredAssetsToVisible(result.NewExportableAssets);
+            AppendFilteredAssetsToVisible(newExportableAssets!);
             UpdateAssetClassesIncremental(result.AssetClassItems);
         }
         else
         {
             // Full rebuild path (initial load, display all toggle, etc.)
             exportableAssets = result.ExportableAssets;
+            SyncExportableAssetHandleIds();
             sceneTreeNodes = result.SceneTreeNodes;
             treeSearchResults.Clear();
             nextGameObjectSearchIndex = 0;
@@ -2218,7 +2330,10 @@ public partial class MainWindow : Window
         var objectsCount = assetsManager.assetsFileList.Sum(x => x.Objects.Count);
         if (m_ObjectsCount != objectsCount)
         {
-            log += $" and {m_ObjectsCount - objectsCount} assets failed to read";
+            var deferredCount = m_ObjectsCount - objectsCount;
+            log += assetsManager.LazyLoading
+                ? $" and {deferredCount:N0} objects indexed for lazy loading"
+                : $" and {deferredCount:N0} assets failed to read";
         }
         StatusStripUpdate(log);
 
@@ -2403,7 +2518,15 @@ public partial class MainWindow : Window
         DumpTextBox.Text = "Loading dump...";
         try
         {
-            var asset = await Task.Run(() => assetItem.Asset);
+            var asset = await Task.Run(() =>
+            {
+                if (assetsManager.LazyLoading && assetItem.Handle != null)
+                {
+                    EnsureLazyAssetReadyForPreview(assetItem);
+                }
+
+                return assetItem.Asset;
+            });
             if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
             {
                 return;
@@ -2482,12 +2605,152 @@ public partial class MainWindow : Window
     {
         try
         {
+            if (assetsManager.LazyLoading && assetItem.Handle != null)
+            {
+                EnsureLazyAssetReadyForPreview(assetItem);
+            }
+
             return assetItem.Asset;
         }
         catch (Exception ex)
         {
             logger.Log(LoggerEvent.Error, $"Error resolving asset for preview {assetItem.Name}: {ex}");
             return null;
+        }
+    }
+
+    private void EnsureLazyAssetReadyForPreview(AssetItem assetItem)
+    {
+        var handle = assetItem.Handle;
+        if (handle == null || handle.RealObject != null)
+        {
+            return;
+        }
+
+        lock (handle)
+        {
+            if (handle.RealObject != null)
+            {
+                return;
+            }
+
+            if (handle.SourceFile?.reader != null)
+            {
+                return;
+            }
+
+            TryAttachLoadedSourceFile(handle);
+            if (handle.SourceFile?.reader != null)
+            {
+                UpdateLazyAssetItemHandle(assetItem, handle);
+                return;
+            }
+
+            var sourcePath = ResolveLazyHandleSourcePath(handle);
+            if (string.IsNullOrEmpty(sourcePath) || !File.Exists(sourcePath))
+            {
+                logger.Log(LoggerEvent.Warning, $"Lazy preview source file not found for {handle.TypeString} PathID={handle.PathID}: {handle.OriginalPath}");
+                return;
+            }
+
+            RemovePendingFileFromProgressiveQueue(sourcePath);
+            Dispatcher.UIThread.Post(() => StatusStripUpdate($"Loading preview source: {Path.GetFileName(sourcePath)}"));
+
+            TryAttachLoadedSourceFile(handle);
+            if (handle.SourceFile?.reader == null)
+            {
+                assetsManager.LoadFilesForPreview(sourcePath);
+                assetsManager.WaitForAssetsFileLoaded(handle.SerializedFileName, 5000);
+                TryAttachLoadedSourceFile(handle);
+            }
+            UpdateLazyAssetItemHandle(assetItem, handle);
+
+            lock (previewCacheLock)
+            {
+                meshToMaterialsCache = null;
+                meshAssociatedRenderersCache = null;
+                meshSourceTypesCache = null;
+                materialMainTextureCache = null;
+                materialPreviewMaterialCache = null;
+                materialTextureSlotsCache = null;
+                objectToAssetItemCache = null;
+                animationClipAvatarCache = null;
+                avatarMeshCache = null;
+                meshAvatarCache = null;
+                animationClipTransformBindingsCache = null;
+            }
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                var addedAssets = AppendNewLazyAssetsFromProjectIndex();
+                if (addedAssets > 0)
+                {
+                    StatusStripUpdate($"Loaded preview source: {Path.GetFileName(sourcePath)} | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})");
+                }
+            });
+        }
+    }
+
+    private string? ResolveLazyHandleSourcePath(AssetHandle handle)
+    {
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(handle.OriginalPath))
+        {
+            candidates.Add(handle.OriginalPath);
+            if (!Path.IsPathRooted(handle.OriginalPath) && !string.IsNullOrEmpty(assetsManager.ProjectRoot))
+            {
+                candidates.Add(Path.Combine(assetsManager.ProjectRoot, handle.OriginalPath));
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(handle.SerializedFileName) && !string.IsNullOrEmpty(assetsManager.ProjectRoot))
+        {
+            candidates.Add(Path.Combine(assetsManager.ProjectRoot, handle.SerializedFileName));
+        }
+
+        lock (pendingFilesToIndex)
+        {
+            foreach (var pending in pendingFilesToIndex)
+            {
+                if (string.Equals(pending, handle.OriginalPath, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(Path.GetFileName(pending), Path.GetFileName(handle.OriginalPath), StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(Path.GetFileName(pending), handle.SerializedFileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidates.Add(pending);
+                }
+            }
+        }
+
+        return candidates
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Path.GetFullPath(path))
+            .FirstOrDefault(File.Exists);
+    }
+
+    private void RemovePendingFileFromProgressiveQueue(string sourcePath)
+    {
+        lock (pendingFilesToIndex)
+        {
+            for (int i = pendingFilesToIndex.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(Path.GetFullPath(pendingFilesToIndex[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
+                {
+                    pendingFilesToIndex.RemoveAt(i);
+                }
+            }
+        }
+    }
+
+    private void TryAttachLoadedSourceFile(AssetHandle handle)
+    {
+        if (handle.SourceFile?.reader != null)
+        {
+            return;
+        }
+
+        if (assetsManager.TryFindSerializedFile(handle.SerializedFileName, handle.OriginalPath, out var sourceFile) && sourceFile != null)
+        {
+            handle.SourceFile = sourceFile;
         }
     }
 
@@ -2505,7 +2768,7 @@ public partial class MainWindow : Window
         {
             ClearPreview("Preview Panel");
             SetTextWithTruncation(TextPreviewBox,
-                $"Preview unavailable while this asset is still loading.{Environment.NewLine}" +
+                $"Preview could not load this asset on demand.{Environment.NewLine}" +
                 $"Asset: {assetItem.Name}{Environment.NewLine}" +
                 $"Type: {assetItem.DisplayType}{Environment.NewLine}" +
                 $"PathID: {assetItem.PathID}");
@@ -5686,13 +5949,36 @@ public partial class MainWindow : Window
         visibleAssets = items is { Count: > 0 }
             ? items.Where(static x => x != null).ToList()
             : new List<AssetItem>();
-        ResetAssetListItemsSource();
+        RefreshAssetListItems();
     }
 
-    private void ResetAssetListItemsSource()
+    private void SyncExportableAssetHandleIds()
     {
-        AssetListDataGrid.ItemsSource = null;
-        AssetListDataGrid.ItemsSource = visibleAssets;
+        lazyAssetItemsByHandleId.Clear();
+        exportableAssetHandleIds.Clear();
+        foreach (var item in exportableAssets)
+        {
+            if (!string.IsNullOrEmpty(item.Handle?.UniqueID))
+            {
+                lazyAssetItemsByHandleId[item.Handle.UniqueID] = item;
+                exportableAssetHandleIds.Add(item.Handle.UniqueID);
+            }
+        }
+    }
+
+    private void EnsureAssetListItemsSource()
+    {
+        if (AssetListDataGrid.ItemsSource != visibleAssetItems)
+        {
+            AssetListDataGrid.ItemsSource = visibleAssetItems;
+        }
+    }
+
+    private void RefreshAssetListItems()
+    {
+        EnsureAssetListItemsSource();
+        visibleAssetItems.Clear();
+        visibleAssetItems.AddRange(visibleAssets);
     }
 
     private void UpdateAssetListSortHeaderIndicators()
@@ -5806,6 +6092,7 @@ public partial class MainWindow : Window
     {
         if (newItems == null || newItems.Count == 0) return;
 
+        EnsureAssetListItemsSource();
         var filterText = listSearch?.Text?.Trim();
         var classFilter = classFilterOverride;
         var filterTypeChecked = filterTypeAll.IsChecked != true;
@@ -5841,16 +6128,44 @@ public partial class MainWindow : Window
                 continue;
             }
 
-            visibleAssets.Add(x);
+            AddVisibleAssetItem(x);
         }
 
-        if (!string.IsNullOrEmpty(assetListSortMember))
-        {
-            visibleAssets = SortAssetList(visibleAssets, assetListSortMember, assetListSortDescending);
-        }
-
-        ResetAssetListItemsSource();
         StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+    }
+
+    private void AddVisibleAssetItem(AssetItem item)
+    {
+        if (string.IsNullOrEmpty(assetListSortMember))
+        {
+            visibleAssets.Add(item);
+            visibleAssetItems.Add(item);
+            return;
+        }
+
+        var insertIndex = FindSortedInsertIndex(visibleAssets, item, assetListSortMember, assetListSortDescending);
+        visibleAssets.Insert(insertIndex, item);
+        visibleAssetItems.Insert(insertIndex, item);
+    }
+
+    private static int FindSortedInsertIndex(List<AssetItem> items, AssetItem item, string sortMember, bool descending)
+    {
+        var low = 0;
+        var high = items.Count;
+        while (low < high)
+        {
+            var mid = low + ((high - low) / 2);
+            if (CompareAssetItems(items[mid], item, sortMember, descending) <= 0)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        return low;
     }
 
     /// <summary>
@@ -7693,9 +8008,27 @@ public partial class MainWindow : Window
         }
         else
         {
-            currentMs = (long)(_audioMediaPlayer.Position * (float)_audioMediaPlayer.Length);
+            if (_audioLengthMs <= 0 && _audioMediaPlayer.Length > 0)
+            {
+                _audioLengthMs = _audioMediaPlayer.Length;
+            }
+
+            currentMs = GetAudioClockPositionMs();
             totalMs = _audioLengthMs > 0 ? _audioLengthMs : _audioMediaPlayer.Length;
             _audioLengthMs = totalMs;
+
+            if (totalMs > 0 && currentMs >= totalMs)
+            {
+                if (FMODloopButton.IsChecked == true)
+                {
+                    RestartAudioPreviewPlayback();
+                }
+                else
+                {
+                    AudioStop();
+                }
+                return;
+            }
         }
 
         if (FMODprogressBar != null && !_isAudioDragging && totalMs > 0)
@@ -7712,13 +8045,74 @@ public partial class MainWindow : Window
         }
         else
         {
-            FMODstatusLabel.Text = _audioMediaPlayer.IsPlaying ? "Playing" : "Paused";
+            FMODstatusLabel.Text = _audioPlaybackClock.IsRunning || _audioMediaPlayer.IsPlaying ? "Playing" : "Paused";
         }
     }
 
     private static string FormatMediaTime(long currentMs, long totalMs)
     {
         return $"{currentMs / 1000 / 60}:{currentMs / 1000 % 60:D2}.{currentMs / 10 % 100:D2} / {totalMs / 1000 / 60}:{totalMs / 1000 % 60:D2}.{totalMs / 10 % 100:D2}";
+    }
+
+    private long GetAudioClockPositionMs()
+    {
+        var currentMs = _audioPlaybackBaseMs;
+        if (_audioPlaybackClock.IsRunning)
+        {
+            currentMs += _audioPlaybackClock.ElapsedMilliseconds;
+        }
+
+        if (_audioLengthMs > 0 && currentMs > _audioLengthMs)
+        {
+            return _audioLengthMs;
+        }
+
+        return Math.Max(0, currentMs);
+    }
+
+    private void StartAudioClock(long? positionMs = null)
+    {
+        if (positionMs.HasValue)
+        {
+            _audioPlaybackBaseMs = ClampAudioPosition(positionMs.Value);
+        }
+
+        _audioPlaybackClock.Restart();
+    }
+
+    private void PauseAudioClock()
+    {
+        _audioPlaybackBaseMs = GetAudioClockPositionMs();
+        _audioPlaybackClock.Reset();
+    }
+
+    private void ResetAudioClock()
+    {
+        _audioPlaybackClock.Reset();
+        _audioPlaybackBaseMs = 0;
+    }
+
+    private void SetAudioClockPosition(long positionMs)
+    {
+        _audioPlaybackBaseMs = ClampAudioPosition(positionMs);
+        if (_audioPlaybackClock.IsRunning)
+        {
+            _audioPlaybackClock.Restart();
+        }
+        else
+        {
+            _audioPlaybackClock.Reset();
+        }
+    }
+
+    private long ClampAudioPosition(long positionMs)
+    {
+        if (_audioLengthMs > 0)
+        {
+            return Math.Clamp(positionMs, 0, _audioLengthMs);
+        }
+
+        return Math.Max(0, positionMs);
     }
 
     private void AudioReset()
@@ -7750,6 +8144,8 @@ public partial class MainWindow : Window
         }
 
         _audioLengthMs = 0;
+        _audioPreviewSourceDescription = string.Empty;
+        ResetAudioClock();
         if (FMODprogressBar != null) FMODprogressBar.Value = 0;
         if (FMODtimerLabel != null) FMODtimerLabel.Text = "0:00.0 / 0:00.0";
         if (FMODstatusLabel != null) FMODstatusLabel.Text = "Stopped";
@@ -7773,6 +8169,7 @@ public partial class MainWindow : Window
             {
                 _linuxAudioStopwatch ??= new System.Diagnostics.Stopwatch();
                 _linuxAudioStopwatch.Restart();
+                StartAudioClock(0);
                 PlayLinuxAudioFallback(_currentTempAudioPath!);
             }
             else
@@ -7783,6 +8180,7 @@ public partial class MainWindow : Window
                     _audioMediaPlayer.Volume = _targetAudioVolume;
                 }
                 catch {}
+                StartAudioClock(0);
                 _audioMediaPlayer.Play();
             }
 
@@ -7933,31 +8331,37 @@ public partial class MainWindow : Window
 
         var converter = new AudioClipConverter(audioClip);
         var extension = converter.GetExtensionName();
-        byte[]? audioData = null;
+        var candidates = new List<AudioPreviewCandidate>
+        {
+            new AudioPreviewCandidate(currentAudioData, NormalizeAudioExtension(extension), "Original Unity audio stream", true)
+        };
 
         if (converter.IsSupport)
         {
             try
             {
-                audioData = converter.ConvertToWav();
-                if (audioData != null && audioData.Length > 4)
+                var convertedData = converter.ConvertToWav();
+                if (convertedData != null && convertedData.Length > 4)
                 {
-                    if (audioData[0] == 0x52 && audioData[1] == 0x49 && audioData[2] == 0x46 && audioData[3] == 0x46)
+                    var convertedExtension = extension;
+                    if (convertedData[0] == 0x52 && convertedData[1] == 0x49 && convertedData[2] == 0x46 && convertedData[3] == 0x46)
                     {
-                        extension = ".wav";
+                        convertedExtension = ".wav";
                     }
-                    else if (audioData[0] == 0x4F && audioData[1] == 0x67 && audioData[2] == 0x67 && audioData[3] == 0x53)
+                    else if (convertedData[0] == 0x4F && convertedData[1] == 0x67 && convertedData[2] == 0x67 && convertedData[3] == 0x53)
                     {
-                        extension = ".ogg";
+                        convertedExtension = ".ogg";
                     }
-                    else if (audioData[0] == 0x49 && audioData[1] == 0x44 && audioData[2] == 0x33)
+                    else if (convertedData[0] == 0x49 && convertedData[1] == 0x44 && convertedData[2] == 0x33)
                     {
-                        extension = ".mp3";
+                        convertedExtension = ".mp3";
                     }
-                    else if (audioData[0] == 0xFF && (audioData[1] & 0xE0) == 0xE0)
+                    else if (convertedData[0] == 0xFF && (convertedData[1] & 0xE0) == 0xE0)
                     {
-                        extension = ".mp3";
+                        convertedExtension = ".mp3";
                     }
+
+                    candidates.Add(new AudioPreviewCandidate(convertedData, NormalizeAudioExtension(convertedExtension), "Rebuilt standard audio stream", false));
                 }
             }
             catch (Exception ex)
@@ -7966,47 +8370,116 @@ public partial class MainWindow : Window
             }
         }
 
-        if (audioData == null)
+        if (candidates.Count > 1)
         {
-            audioData = currentAudioData;
-            if (extension.Equals(".AudioClip", StringComparison.OrdinalIgnoreCase))
+            // FFmpeg is more reliable with normal media containers than raw Unity/FSB payloads.
+            candidates = candidates
+                .OrderBy(candidate => candidate.OriginalData)
+                .ToList();
+        }
+
+        _audioLengthMs = GetAudioClipDurationMs(audioClip, currentAudioData);
+        _audioPreviewSourceDescription = string.Empty;
+
+        foreach (var candidate in candidates)
+        {
+            var candidatePath = Path.Combine(
+                tempDir,
+                $"temp_audio_{FixFileName(audioClip.m_Name)}_{audioClip.m_PathID}_{(candidate.OriginalData ? "original" : "rebuilt")}{candidate.Extension}");
+            File.WriteAllBytes(candidatePath, candidate.Data);
+
+            if (useLinuxAudioFallback)
             {
-                extension = ".bin";
+                _currentTempAudioPath = candidatePath;
+                _audioPreviewSourceDescription = candidate.Description;
+                UpdateAudioPreviewSourceLabel();
+                return true;
+            }
+
+            if (_audioMediaPlayer == null)
+            {
+                continue;
+            }
+
+            try
+            {
+                _audioMediaPlayer.Close();
+                if (_audioMediaPlayer.Open(candidatePath))
+                {
+                    _currentTempAudioPath = candidatePath;
+                    _audioPreviewSourceDescription = candidate.Description;
+                    if (_audioLengthMs <= 0 && _audioMediaPlayer.Length > 0)
+                    {
+                        _audioLengthMs = _audioMediaPlayer.Length;
+                    }
+                    UpdateAudioPreviewSourceLabel();
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Warning, $"Audio preview could not open {candidate.Description}: {ex.Message}");
             }
         }
 
-        _currentTempAudioPath = Path.Combine(tempDir, $"temp_audio_{FixFileName(audioClip.m_Name)}_{audioClip.m_PathID}{extension}");
-        File.WriteAllBytes(_currentTempAudioPath, audioData);
+        StatusStripUpdate("Audio preview could not open this AudioClip.");
+        return false;
+    }
 
-        // Retrieve duration from FSB bank if available to support simulated progress bar on Linux
+    private void UpdateAudioPreviewSourceLabel()
+    {
+        if (FMODinfoLabel == null || string.IsNullOrEmpty(_audioPreviewSourceDescription))
+        {
+            return;
+        }
+
+        var baseText = FMODinfoLabel.Text ?? string.Empty;
+        var separatorIndex = baseText.IndexOf(" | Preview:", StringComparison.OrdinalIgnoreCase);
+        if (separatorIndex >= 0)
+        {
+            baseText = baseText[..separatorIndex];
+        }
+
+        FMODinfoLabel.Text = $"{baseText} | Preview: {_audioPreviewSourceDescription}";
+    }
+
+    private static string NormalizeAudioExtension(string extension)
+    {
+        if (string.IsNullOrWhiteSpace(extension) || extension.Equals(".AudioClip", StringComparison.OrdinalIgnoreCase))
+        {
+            return ".bin";
+        }
+
+        return extension.StartsWith(".", StringComparison.Ordinal)
+            ? extension
+            : "." + extension;
+    }
+
+    private static long GetAudioClipDurationMs(AudioClip audioClip, byte[]? audioData)
+    {
+        if (audioClip.version[0] >= 5 && audioClip.m_Length > 0)
+        {
+            return (long)(audioClip.m_Length * 1000.0f);
+        }
+
         try
         {
-            var m_AudioData = audioClip.m_AudioData.GetData();
-            if (m_AudioData != null && m_AudioData.Length > 0)
+            if (audioData != null && audioData.Length > 0)
             {
-                var bank = Fmod5Sharp.FsbLoader.LoadFsbFromByteArray(m_AudioData);
+                var bank = Fmod5Sharp.FsbLoader.LoadFsbFromByteArray(audioData);
                 if (bank.Samples != null && bank.Samples.Count > 0)
                 {
                     var sample = bank.Samples[0];
                     if (sample.Metadata != null && sample.Metadata.Frequency > 0)
                     {
-                        _audioLengthMs = (long)((double)sample.Metadata.SampleCount / sample.Metadata.Frequency * 1000.0);
+                        return (long)((double)sample.Metadata.SampleCount / sample.Metadata.Frequency * 1000.0);
                     }
                 }
             }
         }
         catch {}
 
-        if (_audioMediaPlayer != null && !useLinuxAudioFallback)
-        {
-            try
-            {
-                _audioMediaPlayer.Open(_currentTempAudioPath);
-            }
-            catch {}
-        }
-
-        return true;
+        return 0;
     }
 
     private void FMODpauseButton_Click(object? sender, RoutedEventArgs e)
@@ -8029,6 +8502,7 @@ public partial class MainWindow : Window
                 if (_linuxAudioStopwatch != null && _linuxAudioStopwatch.IsRunning)
                 {
                     _linuxAudioStopwatch.Stop();
+                    PauseAudioClock();
                     PauseLinuxAudioFallback();
                     FMODstatusLabel.Text = "Paused";
                     FMODpauseButton.Content = "Resume";
@@ -8037,6 +8511,7 @@ public partial class MainWindow : Window
                 {
                     _linuxAudioStopwatch ??= new System.Diagnostics.Stopwatch();
                     _linuxAudioStopwatch.Start();
+                    StartAudioClock();
                     ResumeLinuxAudioFallback();
                     FMODstatusLabel.Text = "Playing";
                     FMODpauseButton.Content = "Pause";
@@ -8048,6 +8523,7 @@ public partial class MainWindow : Window
                 if (_audioMediaPlayer.IsPlaying)
                 {
                     _audioMediaPlayer.Pause();
+                    PauseAudioClock();
                     FMODstatusLabel.Text = "Paused";
                     FMODpauseButton.Content = "Resume";
                 }
@@ -8058,6 +8534,7 @@ public partial class MainWindow : Window
                         _audioMediaPlayer.Volume = _targetAudioVolume;
                     }
                     catch {}
+                    StartAudioClock();
                     _audioMediaPlayer.Play();
                     FMODstatusLabel.Text = "Playing";
                     FMODpauseButton.Content = "Pause";
@@ -8076,6 +8553,37 @@ public partial class MainWindow : Window
         AudioStop();
     }
 
+    private void RestartAudioPreviewPlayback()
+    {
+        if (_audioMediaPlayer == null || useLinuxAudioFallback)
+            return;
+
+        try
+        {
+            _audioMediaPlayer.Stop();
+            try
+            {
+                _audioMediaPlayer.Seek(0f);
+            }
+            catch {}
+            try
+            {
+                _audioMediaPlayer.Volume = _targetAudioVolume;
+            }
+            catch {}
+
+            StartAudioClock(0);
+            _audioMediaPlayer.Play();
+            _audioTimer?.Start();
+            if (FMODstatusLabel != null) FMODstatusLabel.Text = "Playing";
+            if (FMODpauseButton != null) FMODpauseButton.Content = "Pause";
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Warning, $"Failed to restart audio preview: {ex.Message}");
+        }
+    }
+
     private void AudioStop()
     {
         try
@@ -8083,11 +8591,13 @@ public partial class MainWindow : Window
             if (useLinuxAudioFallback)
             {
                 _linuxAudioStopwatch?.Reset();
+                ResetAudioClock();
                 StopLinuxAudioFallback();
             }
             else if (_audioMediaPlayer != null)
             {
                 _audioMediaPlayer.Stop();
+                ResetAudioClock();
             }
             _audioTimer?.Stop();
             if (FMODprogressBar != null) FMODprogressBar.Value = 0;
@@ -8129,6 +8639,7 @@ public partial class MainWindow : Window
             {
                 try
                 {
+                    SetAudioClockPosition(newMs);
                     _audioMediaPlayer.Seek(newMs / (float)_audioLengthMs);
                 }
                 catch {}
@@ -8140,18 +8651,24 @@ public partial class MainWindow : Window
     {
         Dispatcher.UIThread.Post(() =>
         {
-            if (FMODloopButton.IsChecked == true && !useLinuxAudioFallback && _audioMediaPlayer != null)
+            if (useLinuxAudioFallback || _audioMediaPlayer == null)
             {
-                Task.Run(() =>
+                return;
+            }
+
+            if (_audioLengthMs > 0)
+            {
+                var currentMs = GetAudioClockPositionMs();
+                if (currentMs + PrematureAudioEndToleranceMs < _audioLengthMs)
                 {
-                    try
-                    {
-                        _audioMediaPlayer.Stop();
-                        _audioMediaPlayer.Play();
-                        _audioMediaPlayer.Volume = _targetAudioVolume;
-                    }
-                    catch {}
-                });
+                    logger.Log(LoggerEvent.Warning, $"Ignored premature audio end event at {currentMs} ms of {_audioLengthMs} ms.");
+                    return;
+                }
+            }
+
+            if (FMODloopButton.IsChecked == true)
+            {
+                RestartAudioPreviewPlayback();
             }
             else
             {
@@ -8710,6 +9227,8 @@ public partial class MainWindow : Window
         {
             try
             {
+                var newMs = (long)(_audioLengthMs * (FMODprogressBar.Value / 1000.0));
+                SetAudioClockPosition(newMs);
                 _audioMediaPlayer.Seek((float)(FMODprogressBar.Value / 1000.0));
             }
             catch {}
@@ -8801,6 +9320,22 @@ public partial class MainWindow : Window
         }
     }
     #endregion
+}
+
+internal sealed class AudioPreviewCandidate
+{
+    public AudioPreviewCandidate(byte[] data, string extension, string description, bool originalData)
+    {
+        Data = data;
+        Extension = extension;
+        Description = description;
+        OriginalData = originalData;
+    }
+
+    public byte[] Data { get; }
+    public string Extension { get; }
+    public string Description { get; }
+    public bool OriginalData { get; }
 }
 
 public sealed class AvaloniaAppSettings
@@ -9200,4 +9735,43 @@ public class CachedAssetHandle
     public long PathID { get; set; }
     public long ByteStart { get; set; }
     public long ByteSize { get; set; }
+}
+
+public class BulkObservableCollection<T> : System.Collections.ObjectModel.ObservableCollection<T>
+{
+    private bool _suppressNotification = false;
+
+    protected override void OnCollectionChanged(System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        if (!_suppressNotification)
+            base.OnCollectionChanged(e);
+    }
+
+    protected override void OnPropertyChanged(System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (!_suppressNotification)
+            base.OnPropertyChanged(e);
+    }
+
+    public void AddRange(IEnumerable<T> list)
+    {
+        if (list == null)
+            throw new ArgumentNullException(nameof(list));
+
+        _suppressNotification = true;
+        try
+        {
+            foreach (T item in list)
+            {
+                Add(item);
+            }
+        }
+        finally
+        {
+            _suppressNotification = false;
+            OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Count"));
+            OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Item[]"));
+            OnCollectionChanged(new System.Collections.Specialized.NotifyCollectionChangedEventArgs(System.Collections.Specialized.NotifyCollectionChangedAction.Reset));
+        }
+    }
 }

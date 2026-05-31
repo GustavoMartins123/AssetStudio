@@ -4,6 +4,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Linq;
 
 namespace AssetStudio.Avalonia;
@@ -16,7 +17,7 @@ public partial class MainWindow : Window
     private const double MaxAvatarPreviewMeshDensityPercent = 100.0;
     private bool updatingAvatarPreviewControls;
     private DispatcherTimer? avatarPreviewSettingsSaveTimer;
-    private readonly List<MeshMaterialPreviewSlot> meshMaterialPreviewSlots = new();
+    private readonly ObservableCollection<MeshMaterialPreviewSlot> meshMaterialPreviewSlots = new();
     private bool updatingMeshMaterialControls;
 
     private sealed class MeshMaterialPreviewSlot
@@ -187,12 +188,16 @@ public partial class MainWindow : Window
         updatingMeshMaterialControls = true;
         try
         {
-            meshMaterialPreviewSlots.Clear();
             if (MeshMaterialSelector != null)
             {
-                MeshMaterialSelector.ItemsSource = null;
+                MeshMaterialSelector.SelectedItem = null;
                 MeshMaterialSelector.SelectedIndex = -1;
+                if (MeshMaterialSelector.ItemsSource != meshMaterialPreviewSlots)
+                {
+                    MeshMaterialSelector.ItemsSource = meshMaterialPreviewSlots;
+                }
             }
+            meshMaterialPreviewSlots.Clear();
             if (MeshMaterialControlsContainer != null)
             {
                 MeshMaterialControlsContainer.IsVisible = false;
@@ -211,6 +216,16 @@ public partial class MainWindow : Window
         updatingMeshMaterialControls = true;
         try
         {
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.SelectedItem = null;
+                MeshMaterialSelector.SelectedIndex = -1;
+                if (MeshMaterialSelector.ItemsSource != meshMaterialPreviewSlots)
+                {
+                    MeshMaterialSelector.ItemsSource = meshMaterialPreviewSlots;
+                }
+            }
+
             meshMaterialPreviewSlots.Clear();
             int slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
 
@@ -229,8 +244,6 @@ public partial class MainWindow : Window
 
             if (MeshMaterialSelector != null)
             {
-                MeshMaterialSelector.ItemsSource = null;
-                MeshMaterialSelector.ItemsSource = meshMaterialPreviewSlots;
                 MeshMaterialSelector.SelectedIndex = meshMaterialPreviewSlots.Count > 0 ? 0 : -1;
             }
 
