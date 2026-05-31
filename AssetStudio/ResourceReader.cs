@@ -402,6 +402,43 @@ namespace AssetStudio
             }
         }
 
+        public void ReadSegment(long segmentOffset, byte[] buffer, int bufferOffset, int count)
+        {
+            var binaryReader = GetReader(out var shouldDispose);
+            try
+            {
+                binaryReader.BaseStream.Position = this.offset + segmentOffset;
+                var read = binaryReader.Read(buffer, bufferOffset, count);
+                if (read != count)
+                {
+                    throw new EndOfStreamException($"Unable to read {count} bytes from resource {path} at segment offset {segmentOffset}. Read {read} bytes.");
+                }
+
+                int sampleSize = Math.Min(count, 1024);
+                int count01 = 0;
+                for (int i = 0; i < sampleSize; i++)
+                {
+                    if (buffer[bufferOffset + i] == 0x01)
+                        count01++;
+                }
+
+                if (sampleSize > 0 && count01 > sampleSize * 0.5)
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        buffer[bufferOffset + i] ^= 0xFF;
+                    }
+                }
+            }
+            finally
+            {
+                if (shouldDispose)
+                {
+                    binaryReader.Dispose();
+                }
+            }
+        }
+
         public void WriteData(string path)
         {
             var binaryReader = GetReader(out var shouldDispose);

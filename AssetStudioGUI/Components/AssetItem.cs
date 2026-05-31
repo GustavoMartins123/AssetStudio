@@ -1,11 +1,16 @@
-﻿using System.Windows.Forms;
+using System.Windows.Forms;
 using AssetStudio;
 
 namespace AssetStudioGUI
 {
-    internal class AssetItem : ListViewItem
+    internal class AssetItem : ListViewItem, IAssetHandleTag
     {
         public Object Asset;
+
+        public void ClearAsset()
+        {
+            Asset = null;
+        }
         public SerializedFile SourceFile;
         public string Container = string.Empty;
         public string TypeString;

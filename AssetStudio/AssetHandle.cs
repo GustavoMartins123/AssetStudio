@@ -132,4 +132,9 @@ namespace AssetStudio
             }
         }
     }
+
+    public interface IAssetHandleTag
+    {
+        void ClearAsset();
+    }
 }

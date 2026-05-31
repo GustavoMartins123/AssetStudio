@@ -19,6 +19,41 @@ namespace AssetStudio
 
     public class AssetsManager : IDisposable
     {
+        private static readonly List<WeakReference<AssetsManager>> activeManagers = new List<WeakReference<AssetsManager>>();
+        private static readonly object activeManagersLock = new object();
+
+        private void RegisterManager()
+        {
+            lock (activeManagersLock)
+            {
+                activeManagers.Add(new WeakReference<AssetsManager>(this));
+            }
+        }
+
+        private static void EvictLruCachesAcrossAllManagers(int count)
+        {
+            lock (activeManagersLock)
+            {
+                activeManagers.RemoveAll(w => !w.TryGetTarget(out _));
+                foreach (var weakRef in activeManagers)
+                {
+                    if (weakRef.TryGetTarget(out var manager))
+                    {
+                        if (manager.LazyLoading)
+                        {
+                            manager.LruCache.EvictCount(count);
+                        }
+                    }
+                }
+            }
+        }
+
+        public readonly AssetLruCache LruCache = new AssetLruCache(500);
+
+        public AssetsManager()
+        {
+            RegisterManager();
+        }
         private const double DefaultLoadThreadRatio = 0.4;
         private const double DefaultReadThreadRatio = 0.4;
         private const int DefaultMemoryLimitPercent = 90;
@@ -796,11 +831,25 @@ namespace AssetStudio
         public Object ResolveHandle(AssetHandle handle)
         {
             if (handle == null) return null;
-            if (handle.RealObject != null) return handle.RealObject;
+            if (handle.RealObject != null)
+            {
+                if (LazyLoading)
+                {
+                    LruCache.RecordAccess(handle);
+                }
+                return handle.RealObject;
+            }
 
             lock (handle)
             {
-                if (handle.RealObject != null) return handle.RealObject;
+                if (handle.RealObject != null)
+                {
+                    if (LazyLoading)
+                    {
+                        LruCache.RecordAccess(handle);
+                    }
+                    return handle.RealObject;
+                }
 
                 try
                 {
@@ -831,6 +880,11 @@ namespace AssetStudio
                             {
                                 assetsFile.AddObject(obj);
                             }
+                        }
+
+                        if (LazyLoading)
+                        {
+                            LruCache.RecordAccess(handle);
                         }
                         return obj;
                     }
@@ -1277,6 +1331,7 @@ namespace AssetStudio
             if (currentTime - lastGCCollectTime >= 5000)
             {
                 lastGCCollectTime = currentTime;
+                EvictLruCachesAcrossAllManagers(150);
                 GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
             }
 
@@ -1459,6 +1514,125 @@ namespace AssetStudio
                             if (spriteAtlasCache.TryGetValue(m_Sprite.m_RenderDataKey, out var atlas))
                             {
                                 m_Sprite.m_SpriteAtlas.Set(atlas);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        public class AssetLruCache
+        {
+            private readonly int maxCapacity;
+            private readonly LinkedList<AssetHandle> list = new LinkedList<AssetHandle>();
+            private readonly Dictionary<string, LinkedListNode<AssetHandle>> map = new Dictionary<string, LinkedListNode<AssetHandle>>(StringComparer.Ordinal);
+            private readonly object cacheLock = new object();
+
+            public AssetLruCache(int capacity)
+            {
+                maxCapacity = capacity;
+            }
+
+            public int Count
+            {
+                get
+                {
+                    lock (cacheLock)
+                    {
+                        return list.Count;
+                    }
+                }
+            }
+
+            public void RecordAccess(AssetHandle handle)
+            {
+                if (handle == null || string.IsNullOrEmpty(handle.UniqueID)) return;
+
+                lock (cacheLock)
+                {
+                    if (map.TryGetValue(handle.UniqueID, out var node))
+                    {
+                        list.Remove(node);
+                        list.AddFirst(node);
+                    }
+                    else
+                    {
+                        if (list.Count >= maxCapacity)
+                        {
+                            EvictLeastRecentlyUsed();
+                        }
+
+                        var newNode = new LinkedListNode<AssetHandle>(handle);
+                        list.AddFirst(newNode);
+                        map[handle.UniqueID] = newNode;
+                    }
+                }
+            }
+
+            public void EvictLeastRecentlyUsed()
+            {
+                lock (cacheLock)
+                {
+                    if (list.Count == 0) return;
+                    var lastNode = list.Last;
+                    if (lastNode != null)
+                    {
+                        var handle = lastNode.Value;
+                        EvictHandle(handle);
+                        list.RemoveLast();
+                        map.Remove(handle.UniqueID);
+                    }
+                }
+            }
+
+            public void EvictCount(int count)
+            {
+                lock (cacheLock)
+                {
+                    for (int i = 0; i < count && list.Count > 0; i++)
+                    {
+                        var lastNode = list.Last;
+                        if (lastNode != null)
+                        {
+                            var handle = lastNode.Value;
+                            EvictHandle(handle);
+                            list.RemoveLast();
+                            map.Remove(handle.UniqueID);
+                        }
+                    }
+                }
+            }
+
+            public void Clear()
+            {
+                lock (cacheLock)
+                {
+                    list.Clear();
+                    map.Clear();
+                }
+            }
+
+            private void EvictHandle(AssetHandle handle)
+            {
+                lock (handle)
+                {
+                    var obj = handle.RealObject;
+                    handle.RealObject = null;
+
+                    if (handle.Tag is IAssetHandleTag tag)
+                    {
+                        tag.ClearAsset();
+                    }
+
+                    if (obj != null)
+                    {
+                        var assetsFile = handle.SourceFile;
+                        if (assetsFile != null)
+                        {
+                            lock (assetsFile)
+                            {
+                                assetsFile.Objects.Remove(obj);
+                                assetsFile.ObjectsDic.Remove(obj.m_PathID);
                             }
                         }
                     }

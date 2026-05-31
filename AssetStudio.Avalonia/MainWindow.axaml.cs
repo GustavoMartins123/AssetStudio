@@ -9013,7 +9013,7 @@ public class GameObjectNode : INotifyPropertyChanged
     }
 }
 
-public class AssetItem
+public class AssetItem : IAssetHandleTag
 {
     private Object? _asset;
     public Object? Asset
@@ -9027,6 +9027,11 @@ public class AssetItem
             return _asset;
         }
         set => _asset = value;
+    }
+
+    public void ClearAsset()
+    {
+        _asset = null;
     }
 
     public AssetHandle? Handle { get; set; }
