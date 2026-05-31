@@ -353,6 +353,10 @@ namespace AssetStudio.Avalonia.Controls
             {
                 SetupVideoRenderer();
             }
+            else if (e.Property == IsFullscreenProperty)
+            {
+                FullscreenToggle?.Invoke(this, EventArgs.Empty);
+            }
         }
 
         private void OnPlaying(object? sender, EventArgs e)

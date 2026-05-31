@@ -115,6 +115,7 @@ public partial class MainWindow : Window
     private bool _statusUpdatePending;
     private readonly Dictionary<string, AssetItem> lazyAssetItemsByHandleId = new(StringComparer.Ordinal);
     private readonly HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
+    private readonly HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
 
     public MainWindow()
@@ -373,6 +374,7 @@ public partial class MainWindow : Window
         visibleAssetItems.Clear();
         lazyAssetItemsByHandleId.Clear();
         exportableAssetHandleIds.Clear();
+        exportableAssetTypes.Clear();
         lazyAssetItemOrdinal = 0;
         assetClassItems.Clear();
         visibleAssetClassItems.Clear();
@@ -780,9 +782,7 @@ public partial class MainWindow : Window
             filterTypeMenu.Items.RemoveAt(1);
         }
 
-        var types = exportableAssets
-            .Select(x => x.Type)
-            .Distinct()
+        var types = exportableAssetTypes
             .OrderBy(x => x.ToString());
 
         foreach (var type in types)
@@ -1570,9 +1570,6 @@ public partial class MainWindow : Window
         }
 
         var displayAllChecked = displayAll.IsChecked == true;
-        var existingTypes = exportableAssets
-            .Select(x => x.Type)
-            .ToHashSet();
         var filterTypesChanged = false;
         var newExportableItems = new List<AssetItem>();
 
@@ -1618,7 +1615,7 @@ public partial class MainWindow : Window
 
             exportableAssets.Add(assetItem);
             newExportableItems.Add(assetItem);
-            if (existingTypes.Add(assetItem.Type))
+            if (exportableAssetTypes.Add(assetItem.Type))
             {
                 filterTypesChanged = true;
             }
@@ -5956,6 +5953,7 @@ public partial class MainWindow : Window
     {
         lazyAssetItemsByHandleId.Clear();
         exportableAssetHandleIds.Clear();
+        exportableAssetTypes.Clear();
         foreach (var item in exportableAssets)
         {
             if (!string.IsNullOrEmpty(item.Handle?.UniqueID))
@@ -5963,6 +5961,7 @@ public partial class MainWindow : Window
                 lazyAssetItemsByHandleId[item.Handle.UniqueID] = item;
                 exportableAssetHandleIds.Add(item.Handle.UniqueID);
             }
+            exportableAssetTypes.Add(item.Type);
         }
     }
 
@@ -6101,34 +6100,42 @@ public partial class MainWindow : Window
             .Select(x => (ClassIDType)x.Tag!)
             .ToHashSet() : null;
 
-        foreach (var x in newItems)
+        visibleAssetItems.BeginUpdate();
+        try
         {
-            if (x == null)
+            foreach (var x in newItems)
             {
-                continue;
-            }
-
-            if (classFilter != null)
-            {
-                if (!AssetMatchesClassFilter(x, classFilter))
+                if (x == null)
                 {
                     continue;
                 }
-            }
-            else if (selectedTypes != null)
-            {
-                if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
+
+                if (classFilter != null)
+                {
+                    if (!AssetMatchesClassFilter(x, classFilter))
+                    {
+                        continue;
+                    }
+                }
+                else if (selectedTypes != null)
+                {
+                    if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
+                    {
+                        continue;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(filterText) && !AssetMatchesTextFilter(x, filterText))
                 {
                     continue;
                 }
-            }
 
-            if (!string.IsNullOrEmpty(filterText) && !AssetMatchesTextFilter(x, filterText))
-            {
-                continue;
+                AddVisibleAssetItem(x);
             }
-
-            AddVisibleAssetItem(x);
+        }
+        finally
+        {
+            visibleAssetItems.EndUpdate();
         }
 
         StatusStripUpdate($"Showing {visibleAssets.Count} assets");
@@ -6377,8 +6384,12 @@ public partial class MainWindow : Window
                             filePath += GetRawExtension(asset);
                             if (!File.Exists(filePath))
                             {
-                                File.WriteAllBytes(filePath, asset.Asset.GetRawData());
-                                exported++;
+                                var assetObj = asset.Asset;
+                                if (assetObj != null)
+                                {
+                                    File.WriteAllBytes(filePath, assetObj.GetRawData());
+                                    exported++;
+                                }
                             }
                             break;
                         case ExportMode.Dump:
@@ -6386,7 +6397,8 @@ public partial class MainWindow : Window
                             if (!File.Exists(filePath))
                             {
                                 string? dump = null;
-                                if (asset.Asset is MonoBehaviour m_MonoBehaviour)
+                                var assetObj = asset.Asset;
+                                if (assetObj is MonoBehaviour m_MonoBehaviour)
                                 {
                                     dump = m_MonoBehaviour.Dump();
                                     if (dump == null && assemblyLoader.Loaded)
@@ -6398,9 +6410,9 @@ public partial class MainWindow : Window
                                         }
                                     }
                                 }
-                                else
+                                else if (assetObj != null)
                                 {
-                                    dump = asset.Asset.Dump();
+                                    dump = assetObj.Dump();
                                 }
                                 File.WriteAllText(filePath, dump ?? "");
                                 exported++;
@@ -6466,7 +6478,7 @@ public partial class MainWindow : Window
         var exportPath = Path.Combine(selectedExportRoot, "Animator");
         Directory.CreateDirectory(exportPath);
         var exportFile = Path.Combine(exportPath, FixFileName(animator.Name) + ".fbx");
-        var clips = animationList.Select(x => (AnimationClip)x.Asset).ToArray();
+        var clips = animationList.Select(x => (AnimationClip)x.Asset!).ToArray();
         var selectedGameObjects = GetTopLevelSelectedGameObjects(selectedAssets
             .Where(x => x.Type != ClassIDType.AnimationClip && x.TreeNode?.GameObject != null)
             .Select(x => x.TreeNode!.GameObject!)
@@ -6484,7 +6496,7 @@ public partial class MainWindow : Window
                 WriteCurrentExport(currentExportPath, animator, 1, 1);
                 IImported convert = selectedGameObjects.Count > 0
                     ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
-                    : new ModelConverter((Animator)animator.Asset, exportOptions.ConvertTextureFormat, clips);
+                    : new ModelConverter((Animator)animator.Asset!, exportOptions.ConvertTextureFormat, clips);
                 ExportFbx(convert, exportFile);
                 success = true;
             }
@@ -6746,7 +6758,7 @@ public partial class MainWindow : Window
     {
         var clips = GetSelectedAssets()
             .Where(x => x.Type == ClassIDType.AnimationClip)
-            .Select(x => (AnimationClip)x.Asset)
+            .Select(x => (AnimationClip)x.Asset!)
             .ToArray();
         return clips.Length == 0 ? null : clips;
     }
@@ -6952,7 +6964,7 @@ public partial class MainWindow : Window
         return exportOptions.AssetGrouping switch
         {
             AssetGroupOption.Container when !string.IsNullOrEmpty(asset.Container) => Path.Combine(savePath, Path.GetDirectoryName(asset.Container) ?? string.Empty),
-            AssetGroupOption.SourceFile => Path.Combine(savePath, asset.Asset.assetsFile.fileName + "_export"),
+            AssetGroupOption.SourceFile => Path.Combine(savePath, asset.SourceFile.fileName + "_export"),
             AssetGroupOption.TypeName => Path.Combine(savePath, asset.TypeString),
             _ => savePath
         };
@@ -7076,10 +7088,16 @@ public partial class MainWindow : Window
             return false;
         }
 
+        var assetObj = item.Asset;
+        if (assetObj == null)
+        {
+            return false;
+        }
+
         Directory.CreateDirectory(exportPath);
         var fileName = FixFileName(GetExportFileName(item));
 
-        switch (item.Asset)
+        switch (assetObj)
         {
             case Animator m_Animator:
             {
@@ -7306,7 +7324,7 @@ public partial class MainWindow : Window
             {
                 var filePath = Path.Combine(exportPath, fileName + ".dat");
                 if (File.Exists(filePath)) return false;
-                File.WriteAllBytes(filePath, item.Asset.GetRawData());
+                File.WriteAllBytes(filePath, assetObj.GetRawData());
                 return true;
             }
         }
@@ -9751,6 +9769,19 @@ public class BulkObservableCollection<T> : System.Collections.ObjectModel.Observ
     {
         if (!_suppressNotification)
             base.OnPropertyChanged(e);
+    }
+
+    public void BeginUpdate()
+    {
+        _suppressNotification = true;
+    }
+
+    public void EndUpdate()
+    {
+        _suppressNotification = false;
+        OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Count"));
+        OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Item[]"));
+        OnCollectionChanged(new System.Collections.Specialized.NotifyCollectionChangedEventArgs(System.Collections.Specialized.NotifyCollectionChangedAction.Reset));
     }
 
     public void AddRange(IEnumerable<T> list)
