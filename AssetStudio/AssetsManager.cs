@@ -24,6 +24,7 @@ namespace AssetStudio
         private const int DefaultMemoryLimitPercent = 90;
         private const int DefaultLazyLoadThreadCount = 2;
         private const int DefaultLazyReadThreadCount = 2;
+        private static long lastGCCollectTime = 0;
 
         public static bool DisableMemoryPressureCheck = false;
         public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;
@@ -1220,7 +1221,12 @@ namespace AssetStudio
                 return;
             }
 
-            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            var currentTime = Environment.TickCount64;
+            if (currentTime - lastGCCollectTime >= 5000)
+            {
+                lastGCCollectTime = currentTime;
+                GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            }
 
             if (TryGetMemoryLoadPercent(out memoryLoadPercent) && memoryLoadPercent >= limitPercent)
             {

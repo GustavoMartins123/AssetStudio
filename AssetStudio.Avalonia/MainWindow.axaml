@@ -430,30 +430,30 @@
                         </Border>
 
 
-                        <Border x:Name="FMODPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Center" MaxWidth="450" Margin="10" IsVisible="False" BoxShadow="0 8 32 0 #40000000">
+                        <Border x:Name="AudioPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Center" MaxWidth="450" Margin="10" IsVisible="False" BoxShadow="0 8 32 0 #40000000">
                             <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="FMODTitleLabel" Text="Audio Player" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="FMODstatusLabel" Grid.Column="1" Text="Stopped" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioTitleLabel" Text="Audio Player" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioStatusLabel" Grid.Column="1" Text="Stopped" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
                                 <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="FMODinfoLabel" Text="44100 Hz" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="FMODtimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioInfoLabel" Text="44100 Hz" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioTimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
-                                <Slider x:Name="FMODprogressBar" Grid.Row="2" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32" 
-                                        ValueChanged="FMODprogressBar_ValueChanged"/>
+                                <Slider x:Name="AudioProgressBar" Grid.Row="2" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32" 
+                                        ValueChanged="AudioProgressBar_ValueChanged"/>
                                 
                                 <WrapPanel Grid.Row="3" Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Button x:Name="FMODplayButton" Content="Play" Click="FMODplayButton_Click" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="FMODpauseButton" Content="Pause" Click="FMODpauseButton_Click" Width="65" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="FMODstopButton" Content="Stop" Click="FMODstopButton_Click" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <CheckBox x:Name="FMODloopButton" Content="Loop" Click="FMODloopButton_Click" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
+                                    <Button x:Name="AudioPlayButton" Content="Play" Click="AudioPlayButton_Click" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="AudioPauseButton" Content="Pause" Click="AudioPauseButton_Click" Width="65" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="AudioStopButton" Content="Stop" Click="AudioStopButton_Click" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <CheckBox x:Name="AudioloopButton" Content="Loop" Click="AudioLoopButton_Click" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
                                     
                                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,4">
                                         <TextBlock Text="Vol" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="11"/>
-                                        <Slider x:Name="FMODvolumeBar" Minimum="0" Maximum="10" Value="8" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="FMODvolumeBar_ValueChanged"/>
+                                        <Slider x:Name="AudioVolumeBar" Minimum="0" Maximum="10" Value="8" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="AudioVolumeBar_ValueChanged"/>
                                     </StackPanel>
                                 </WrapPanel>
                             </Grid>
