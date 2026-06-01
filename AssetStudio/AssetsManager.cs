@@ -213,9 +213,9 @@ namespace AssetStudio
             await LoadAsync(toReadFile, highPriority: false);
         }
 
-        private async System.Threading.Tasks.Task YieldForUserInteractionIfNeededAsync()
+        private async System.Threading.Tasks.Task YieldForUserInteractionIfNeededAsync(bool highPriority = false)
         {
-            if (!LazyLoading)
+            if (!LazyLoading || highPriority)
             {
                 return;
             }
@@ -262,7 +262,7 @@ namespace AssetStudio
                     bool isWorkerActive = true;
                     while (true)
                     {
-                        await YieldForUserInteractionIfNeededAsync();
+                        await YieldForUserInteractionIfNeededAsync(highPriority);
 
                         if (ShouldStopLoading)
                         {
@@ -463,7 +463,10 @@ namespace AssetStudio
                 try
                 {
                     var assetsFile = new SerializedFile(reader, this);
-                    assetsFile.originalPath = originalPath;
+                    if (!string.IsNullOrEmpty(originalPath))
+                    {
+                        assetsFile.originalPath = originalPath;
+                    }
                     if (!string.IsNullOrEmpty(unityVersion) && assetsFile.header.m_Version < SerializedFileFormatVersion.Unknown_7)
                     {
                         assetsFile.SetVersion(unityVersion);
@@ -730,6 +733,19 @@ namespace AssetStudio
                         continue;
                     }
 
+                    foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
+                    {
+                        if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
+                        {
+                            handle.OriginalPath = assetsFile.originalPath;
+                        }
+
+                        if (ReferenceEquals(handle.SourceFile, assetsFile))
+                        {
+                            handle.SourceFile = null;
+                        }
+                    }
+
                     assetsFile.Objects.Clear();
                     if (assetsFile.reader != null)
                     {
@@ -952,12 +968,22 @@ namespace AssetStudio
 
                             try
                             {
-                            await YieldForUserInteractionIfNeededAsync();
+                            await YieldForUserInteractionIfNeededAsync(highPriority);
 
                             // Lookup cached handles using O(1) dictionary index
                             bool hasCachedHandles = false;
                             foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
                             {
+                                if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
+                                {
+                                    handle.OriginalPath = assetsFile.originalPath;
+                                }
+
+                                if (string.IsNullOrEmpty(handle.SerializedFileName))
+                                {
+                                    handle.SerializedFileName = assetsFile.fileName;
+                                }
+
                                 handle.SourceFile = assetsFile;
                                 hasCachedHandles = true;
                             }
@@ -975,7 +1001,7 @@ namespace AssetStudio
                                 {
                                     if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
                                     {
-                                        await YieldForUserInteractionIfNeededAsync();
+                                        await YieldForUserInteractionIfNeededAsync(highPriority);
                                     }
 
                                     if (ShouldStopLoading)

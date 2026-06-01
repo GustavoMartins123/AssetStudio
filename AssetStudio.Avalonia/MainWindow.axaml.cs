@@ -10,6 +10,7 @@ using Avalonia.Threading;
 using System.Diagnostics;
 using AssetStudio;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
@@ -95,6 +96,8 @@ public partial class MainWindow : Window
     private bool isIndexingPaused;
     private Task? indexingTask;
     private List<string> pendingFilesToIndex = new List<string>();
+    private readonly ConcurrentDictionary<string, string> lazySourcePathBySerializedFile = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> lazySourceFileSearchCache = new(StringComparer.OrdinalIgnoreCase);
 
     private string? _pendingStatusText;
     private string? _currentlySelectedUniqueID;
@@ -106,6 +109,7 @@ public partial class MainWindow : Window
     private readonly HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
     private bool projectAutoIndexStarted;
+    private int foregroundLazyLoadCount;
 
     public MainWindow() : this(null)
     {
@@ -136,7 +140,7 @@ public partial class MainWindow : Window
         SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
         ApplyUnityVersionOption();
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
-        AssetsManager.ShouldYieldForUserInteraction = IsUserInteractionPriorityActive;
+        AssetsManager.ShouldYieldForUserInteraction = ShouldPauseBackgroundWork;
         assetsManager.ShouldKeepFileCallback = fileName =>
         {
             lock (preloaderLock)
@@ -348,6 +352,18 @@ public partial class MainWindow : Window
         return Interlocked.Read(ref userInteractionPriorityUntilTimestamp) > Stopwatch.GetTimestamp();
     }
 
+    private bool ShouldPauseBackgroundWork()
+    {
+        return IsUserInteractionPriorityActive() || Volatile.Read(ref foregroundLazyLoadCount) > 0;
+    }
+
+    private bool IsProgressiveIndexingActive()
+    {
+        return indexingTask is { IsCompleted: false }
+            && indexingCts != null
+            && !indexingCts.IsCancellationRequested;
+    }
+
 
 
     private async Task WaitForUserInteractionPriorityToClearAsync(CancellationToken token)
@@ -357,7 +373,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        while (!token.IsCancellationRequested && IsUserInteractionPriorityActive())
+        while (!token.IsCancellationRequested && ShouldPauseBackgroundWork())
         {
             await Task.Delay(UserInteractionYieldDelayMilliseconds);
         }
@@ -370,7 +386,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        while (IsUserInteractionPriorityActive())
+        while (ShouldPauseBackgroundWork())
         {
             Thread.Sleep(UserInteractionYieldDelayMilliseconds);
         }
@@ -407,6 +423,8 @@ public partial class MainWindow : Window
         lazyAssetItemsByHandleId.Clear();
         exportableAssetHandleIds.Clear();
         exportableAssetTypes.Clear();
+        lazySourcePathBySerializedFile.Clear();
+        lazySourceFileSearchCache.Clear();
         lazyAssetItemOrdinal = 0;
         assetClassItems.Clear();
         visibleAssetClassItems.Clear();
@@ -1368,6 +1386,7 @@ public partial class MainWindow : Window
         {
             var folderCacheKey = GetFolderCacheKey(cacheTargetFolder);
             BundleFile.CacheDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "DecompressedCache", folderCacheKey);
+            Directory.CreateDirectory(BundleFile.CacheDirectory);
         }
 
         try
@@ -1404,6 +1423,11 @@ public partial class MainWindow : Window
                 return;
             }
 
+            foreach (var file in files)
+            {
+                RememberLazySourcePath(file);
+            }
+
             // Check cache
             List<AssetHandle>? cachedHandles = null;
             if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
@@ -1411,11 +1435,18 @@ public partial class MainWindow : Window
                 cachedHandles = await Task.Run(() => LoadIndexCache(paths[0], currentScanResult));
             }
 
+            if (cachedHandles != null && cachedHandles.Any(handle => string.IsNullOrWhiteSpace(handle.OriginalPath)))
+            {
+                Logger.Info("SQLite index cache is missing source paths; rebuilding it once.");
+                cachedHandles = null;
+            }
+
             if (cachedHandles != null)
             {
                 StatusStripUpdate("Loading project index from SQLite cache...");
                 foreach (var handle in cachedHandles)
                 {
+                    RememberLazyHandleSourcePath(handle);
                     assetsManager.ProjectIndex.AddHandle(handle);
                 }
                 progressBar.Value = 100;
@@ -1641,6 +1672,8 @@ public partial class MainWindow : Window
                 continue;
             }
 
+            RememberLazyHandleSourcePath(handle);
+
             if (!lazyAssetItemsByHandleId.TryGetValue(handle.UniqueID, out var assetItem))
             {
                 assetItem = handle.Tag as AssetItem;
@@ -1707,7 +1740,7 @@ public partial class MainWindow : Window
 
     private bool ShouldUpdateProgressiveIndexingUi(bool force = false)
     {
-        if (!force && IsUserInteractionPriorityActive())
+        if (!force && ShouldPauseBackgroundWork())
         {
             return false;
         }
@@ -2565,6 +2598,11 @@ public partial class MainWindow : Window
 
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         DumpTextBox.Text = "Loading dump...";
+        var shouldPauseIndexing = assetsManager.LazyLoading && assetItem.Handle != null;
+        if (shouldPauseIndexing)
+        {
+            Interlocked.Increment(ref foregroundLazyLoadCount);
+        }
         try
         {
             var asset = await Task.Run(() =>
@@ -2601,6 +2639,13 @@ public partial class MainWindow : Window
                 return;
             }
             DumpTextBox.Text = $"Dump {assetItem.Type}:{assetItem.Name} error{Environment.NewLine}{ex.Message}{Environment.NewLine}{ex.StackTrace}";
+        }
+        finally
+        {
+            if (shouldPauseIndexing)
+            {
+                Interlocked.Decrement(ref foregroundLazyLoadCount);
+            }
         }
     }
 
@@ -2652,6 +2697,12 @@ public partial class MainWindow : Window
 
     private AssetStudio.Object? ResolveAssetForPreview(AssetItem assetItem)
     {
+        var shouldPauseIndexing = assetsManager.LazyLoading && assetItem.Handle != null;
+        if (shouldPauseIndexing)
+        {
+            Interlocked.Increment(ref foregroundLazyLoadCount);
+        }
+
         try
         {
             if (assetsManager.LazyLoading && assetItem.Handle != null)
@@ -2665,6 +2716,13 @@ public partial class MainWindow : Window
         {
             logger.Log(LoggerEvent.Error, $"Error resolving asset for preview {assetItem.Name}: {ex}");
             return null;
+        }
+        finally
+        {
+            if (shouldPauseIndexing)
+            {
+                Interlocked.Decrement(ref foregroundLazyLoadCount);
+            }
         }
     }
 
@@ -2740,6 +2798,103 @@ public partial class MainWindow : Window
         }
     }
 
+    private void RememberLazySourcePath(string? sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath))
+        {
+            return;
+        }
+
+        var fileName = GetSafeFileName(sourcePath);
+        RememberLazySourcePathForSerializedFile(fileName, sourcePath);
+    }
+
+    private void RememberLazyHandleSourcePath(AssetHandle handle)
+    {
+        if (handle == null || string.IsNullOrWhiteSpace(handle.OriginalPath))
+        {
+            return;
+        }
+
+        RememberLazySourcePathForSerializedFile(handle.SerializedFileName, handle.OriginalPath);
+        RememberLazySourcePathForSerializedFile(GetSafeFileName(handle.OriginalPath), handle.OriginalPath);
+    }
+
+    private void RememberLazySourcePathForSerializedFile(string? serializedFileName, string? sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(serializedFileName) || string.IsNullOrWhiteSpace(sourcePath))
+        {
+            return;
+        }
+
+        lazySourcePathBySerializedFile[serializedFileName] = sourcePath;
+    }
+
+    private static string? GetSafeFileName(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFileName(path);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? TryResolveExistingPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            return File.Exists(fullPath) ? fullPath : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string? FindSourceFileByNameInProjectRoot(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrEmpty(assetsManager.ProjectRoot))
+        {
+            return null;
+        }
+
+        var cached = lazySourceFileSearchCache.GetOrAdd(fileName, key =>
+        {
+            var direct = TryResolveExistingPath(Path.Combine(assetsManager.ProjectRoot, key));
+            if (!string.IsNullOrEmpty(direct))
+            {
+                return direct;
+            }
+
+            try
+            {
+                return ImportHelper.GetFilesSafe(assetsManager.ProjectRoot, key, true)
+                    .Select(TryResolveExistingPath)
+                    .FirstOrDefault(path => !string.IsNullOrEmpty(path)) ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        });
+
+        return string.IsNullOrEmpty(cached) ? null : cached;
+    }
+
     private string? ResolvePathBySuffix(string originalPath, string projectRoot)
     {
         if (string.IsNullOrEmpty(originalPath) || string.IsNullOrEmpty(projectRoot))
@@ -2747,8 +2902,17 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var cleanOriginal = Path.GetFullPath(originalPath).Replace('/', '\\');
-        var cleanRoot = Path.GetFullPath(projectRoot).Replace('/', '\\');
+        string cleanOriginal;
+        string cleanRoot;
+        try
+        {
+            cleanOriginal = Path.GetFullPath(originalPath).Replace('/', '\\');
+            cleanRoot = Path.GetFullPath(projectRoot).Replace('/', '\\');
+        }
+        catch
+        {
+            return null;
+        }
 
         var parts = cleanOriginal.Split('\\');
         for (int i = 1; i < parts.Length; i++)
@@ -2766,6 +2930,16 @@ public partial class MainWindow : Window
     private string? ResolveLazyHandleSourcePath(AssetHandle handle)
     {
         var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(handle.SourceFile?.originalPath))
+        {
+            candidates.Add(handle.SourceFile.originalPath);
+        }
+
+        if (!string.IsNullOrWhiteSpace(handle.SourceFile?.fullName))
+        {
+            candidates.Add(handle.SourceFile.fullName);
+        }
+
         if (!string.IsNullOrWhiteSpace(handle.OriginalPath))
         {
             candidates.Add(handle.OriginalPath);
@@ -2773,6 +2947,19 @@ public partial class MainWindow : Window
             {
                 candidates.Add(Path.Combine(assetsManager.ProjectRoot, handle.OriginalPath));
             }
+        }
+
+        if (!string.IsNullOrWhiteSpace(handle.SerializedFileName)
+            && lazySourcePathBySerializedFile.TryGetValue(handle.SerializedFileName, out var mappedSourcePath))
+        {
+            candidates.Add(mappedSourcePath);
+        }
+
+        var originalFileName = GetSafeFileName(handle.OriginalPath);
+        if (!string.IsNullOrWhiteSpace(originalFileName)
+            && lazySourcePathBySerializedFile.TryGetValue(originalFileName, out var mappedOriginalFilePath))
+        {
+            candidates.Add(mappedOriginalFilePath);
         }
 
         if (!string.IsNullOrWhiteSpace(handle.SerializedFileName) && !string.IsNullOrEmpty(assetsManager.ProjectRoot))
@@ -2784,23 +2971,23 @@ public partial class MainWindow : Window
         {
             foreach (var pending in pendingFilesToIndex)
             {
+                var pendingFileName = GetSafeFileName(pending);
                 if (string.Equals(pending, handle.OriginalPath, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(Path.GetFileName(pending), Path.GetFileName(handle.OriginalPath), StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(Path.GetFileName(pending), handle.SerializedFileName, StringComparison.OrdinalIgnoreCase))
+                    || string.Equals(pendingFileName, originalFileName, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(pendingFileName, handle.SerializedFileName, StringComparison.OrdinalIgnoreCase))
                 {
                     candidates.Add(pending);
                 }
             }
         }
 
-        var resolved = candidates
-            .Where(path => !string.IsNullOrWhiteSpace(path))
-            .Select(path => Path.GetFullPath(path))
-            .FirstOrDefault(File.Exists);
-
-        if (resolved != null)
+        foreach (var candidate in candidates)
         {
-            return resolved;
+            var resolved = TryResolveExistingPath(candidate);
+            if (resolved != null)
+            {
+                return resolved;
+            }
         }
 
         if (!string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsManager.ProjectRoot))
@@ -2810,6 +2997,18 @@ public partial class MainWindow : Window
             {
                 return suffixMatch;
             }
+        }
+
+        var foundByOriginalName = FindSourceFileByNameInProjectRoot(originalFileName);
+        if (foundByOriginalName != null)
+        {
+            return foundByOriginalName;
+        }
+
+        var foundBySerializedName = FindSourceFileByNameInProjectRoot(handle.SerializedFileName);
+        if (foundBySerializedName != null)
+        {
+            return foundBySerializedName;
         }
 
         return null;
@@ -2839,6 +3038,11 @@ public partial class MainWindow : Window
         if (assetsManager.TryFindSerializedFile(handle.SerializedFileName, handle.OriginalPath, out var sourceFile) && sourceFile != null)
         {
             handle.SourceFile = sourceFile;
+            if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(sourceFile.originalPath))
+            {
+                handle.OriginalPath = sourceFile.originalPath;
+            }
+            RememberLazyHandleSourcePath(handle);
         }
     }
 
@@ -8848,6 +9052,7 @@ public partial class MainWindow : Window
     private void UpdatePreloadWindow(AssetItem currentItem)
     {
         if (!assetsManager.LazyLoading) return;
+        if (IsProgressiveIndexingActive()) return;
 
         lock (preloaderLock)
         {

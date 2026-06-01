@@ -37,6 +37,7 @@ namespace AssetStudio
             this.assetsManager = assetsManager;
             this.reader = reader;
             fullName = reader.FullPath;
+            originalPath = reader.FullPath;
             fileName = reader.FileName;
 
             // ReadHeader
