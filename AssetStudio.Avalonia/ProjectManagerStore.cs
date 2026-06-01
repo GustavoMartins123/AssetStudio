@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
@@ -126,6 +127,7 @@ public sealed class ProjectManagerStore
 
     private readonly string _dbPath;
     private readonly string _iconsDirectory;
+    private readonly SQLiteProjectIndexCache _indexCache = new();
 
     public ProjectManagerStore()
     {
@@ -381,6 +383,7 @@ public sealed class ProjectManagerStore
     public void RemoveProject(string projectId)
     {
         var project = GetProject(projectId);
+        var iconSourcePath = GetProjectIconSourcePath(projectId);
         using var conn = CreateConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "DELETE FROM ManagedProjects WHERE Id = @id";
@@ -389,8 +392,13 @@ public sealed class ProjectManagerStore
 
         if (project != null)
         {
+            _indexCache.DeleteIndexCache(project.ProjectRoot);
+            DeleteDecompressedCacheFolder(project.ProjectRoot);
             DeleteStoredIcon(project.IconPath);
         }
+
+        DeleteStoredIconFilesForProject(projectId);
+        DeleteExecutableIconPreview(iconSourcePath);
     }
 
     public void TouchProject(string projectId)
@@ -824,6 +832,124 @@ public sealed class ProjectManagerStore
         catch
         {
         }
+    }
+
+    private void DeleteStoredIconFilesForProject(string projectId)
+    {
+        if (string.IsNullOrWhiteSpace(projectId))
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(_iconsDirectory, projectId + ".*", SearchOption.TopDirectoryOnly))
+            {
+                DeleteStoredIcon(path);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private void DeleteExecutableIconPreview(string sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath)
+            || !string.Equals(Path.GetExtension(sourcePath), ".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            if (!File.Exists(sourcePath))
+            {
+                return;
+            }
+
+            var hash = ComputeFileHash(sourcePath);
+            var previewPath = Path.Combine(_iconsDirectory, "detected-" + hash[..Math.Min(hash.Length, 16)] + ".png");
+            DeleteStoredIcon(previewPath);
+        }
+        catch
+        {
+        }
+    }
+
+    private string GetProjectIconSourcePath(string projectId)
+    {
+        if (string.IsNullOrWhiteSpace(projectId))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            using var conn = CreateConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT SourcePath FROM ManagedProjectIcons WHERE ProjectId = @projectId LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            return cmd.ExecuteScalar() as string ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static void DeleteDecompressedCacheFolder(string projectRoot)
+    {
+        if (string.IsNullOrWhiteSpace(projectRoot))
+        {
+            return;
+        }
+
+        try
+        {
+            var cacheRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio",
+                "DecompressedCache");
+            var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(projectRoot));
+            DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void DeleteDirectoryInsideRoot(string rootDirectory, string targetDirectory)
+    {
+        try
+        {
+            var root = EnsureTrailingSeparator(Path.GetFullPath(rootDirectory));
+            var target = Path.GetFullPath(targetDirectory);
+            if (target.StartsWith(root, StringComparison.OrdinalIgnoreCase) && Directory.Exists(target))
+            {
+                Directory.Delete(target, recursive: true);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static string EnsureTrailingSeparator(string path)
+    {
+        if (path.EndsWith(Path.DirectorySeparatorChar) || path.EndsWith(Path.AltDirectorySeparatorChar))
+        {
+            return path;
+        }
+
+        return path + Path.DirectorySeparatorChar;
+    }
+
+    private static string GetFolderCacheKey(string folderPath)
+    {
+        using var md5 = MD5.Create();
+        var hashBytes = md5.ComputeHash(Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
+        return Convert.ToHexString(hashBytes).ToLowerInvariant();
     }
 
     private string? FindIconInDirectory(string directory, bool recursive, int maxFiles)

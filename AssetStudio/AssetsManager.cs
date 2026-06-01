@@ -155,14 +155,42 @@ namespace AssetStudio
         {
             lock (loadLock)
             {
-                result = assetsFileList.FirstOrDefault(file =>
-                    (!string.IsNullOrEmpty(serializedFileName) && string.Equals(file.fileName, serializedFileName, StringComparison.OrdinalIgnoreCase))
-                    || (!string.IsNullOrEmpty(originalPath)
-                        && (string.Equals(file.originalPath, originalPath, StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(file.fullName, originalPath, StringComparison.OrdinalIgnoreCase))));
+                result = null;
+                if (!string.IsNullOrEmpty(originalPath))
+                {
+                    result = assetsFileList.FirstOrDefault(file => IsSameAssetSource(file.originalPath, originalPath)
+                        || IsSameAssetSource(file.fullName, originalPath));
+                    if (result != null)
+                    {
+                        return true;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(originalPath) && !string.IsNullOrEmpty(serializedFileName))
+                {
+                    result = assetsFileList.FirstOrDefault(file =>
+                        string.Equals(file.fileName, serializedFileName, StringComparison.OrdinalIgnoreCase));
+                }
             }
 
             return result != null;
+        }
+
+        private static bool IsSameAssetSource(string left, string right)
+        {
+            if (string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right))
+            {
+                return false;
+            }
+
+            try
+            {
+                return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+            }
         }
 
         public void LoadFiles(params string[] files)
@@ -974,6 +1002,12 @@ namespace AssetStudio
                             bool hasCachedHandles = false;
                             foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
                             {
+                                if (!string.IsNullOrEmpty(handle.OriginalPath)
+                                    && !IsSameAssetSource(handle.OriginalPath, assetsFile.originalPath))
+                                {
+                                    continue;
+                                }
+
                                 if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
                                 {
                                     handle.OriginalPath = assetsFile.originalPath;

@@ -107,7 +107,7 @@
                         <Button x:Name="RemoveProjectButton" Click="RemoveProject_Click" MinWidth="100" IsEnabled="False">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
-                                <TextBlock Text="Remove" />
+                                <TextBlock Text="Delete" />
                             </StackPanel>
                         </Button>
                         <Button x:Name="OpenProjectButton" Click="OpenProject_Click" MinWidth="112" IsEnabled="False">

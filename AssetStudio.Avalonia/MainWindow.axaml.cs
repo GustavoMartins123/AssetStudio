@@ -2743,6 +2743,7 @@ public partial class MainWindow : Window
 
             if (handle.SourceFile?.reader != null)
             {
+                UpdateLazyAssetItemHandle(assetItem, handle);
                 return;
             }
 
@@ -9316,7 +9317,8 @@ public class AssetItem : IAssetHandleTag
         {
             if (_asset == null && Handle != null)
             {
-                _asset = SourceFile?.assetsManager?.ResolveHandle(Handle);
+                var sourceFile = Handle.SourceFile ?? SourceFile;
+                _asset = sourceFile?.assetsManager?.ResolveHandle(Handle);
             }
             return _asset;
         }

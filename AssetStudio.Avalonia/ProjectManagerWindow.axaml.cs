@@ -3,6 +3,8 @@ using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using System;
@@ -10,6 +12,7 @@ using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
@@ -107,10 +110,15 @@ public partial class ProjectManagerWindow : Window
         }
     }
 
-    private void RemoveProject_Click(object? sender, RoutedEventArgs e)
+    private async void RemoveProject_Click(object? sender, RoutedEventArgs e)
     {
         var selected = GetSelectedProject();
         if (selected == null)
+        {
+            return;
+        }
+
+        if (!await ConfirmProjectDelete(selected))
         {
             return;
         }
@@ -120,12 +128,88 @@ public partial class ProjectManagerWindow : Window
             var name = selected.DisplayName;
             _store.RemoveProject(selected.Project.Id);
             RefreshProjects();
-            StatusText.Text = $"Removed from list: {name}";
+            StatusText.Text = $"Deleted AssetStudio project data: {name}";
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Unable to remove project:\n{ex.Message}", "Project manager");
+            MessageBox.Show(this, $"Unable to delete project:\n{ex.Message}", "Project manager");
         }
+    }
+
+    private async Task<bool> ConfirmProjectDelete(ProjectListItem selected)
+    {
+        var dialog = new Window
+        {
+            Title = "Delete project",
+            Width = 560,
+            Height = 300,
+            MinWidth = 460,
+            MinHeight = 260,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Padding = new global::Avalonia.Thickness(18)
+        };
+
+        var grid = new Grid
+        {
+            RowDefinitions = new RowDefinitions("*,Auto"),
+            RowSpacing = 16
+        };
+
+        var project = selected.Project;
+        var rootText = string.IsNullOrWhiteSpace(project.ProjectRoot)
+            ? "Project root: -"
+            : $"Project root: {project.ProjectRoot}";
+
+        var message = new TextBlock
+        {
+            Text =
+                $"Delete \"{selected.DisplayName}\" from AssetStudio?\n\n" +
+                "This removes the project entry, saved settings, SQLite index cache, decompressed cache folder, and copied icons.\n\n" +
+                "The real game/project folder is not deleted.\n\n" +
+                rootText,
+            TextWrapping = TextWrapping.Wrap
+        };
+        var messageScroller = new ScrollViewer
+        {
+            Content = message,
+            VerticalScrollBarVisibility = global::Avalonia.Controls.Primitives.ScrollBarVisibility.Auto
+        };
+
+        var buttons = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Spacing = 8
+        };
+
+        var cancelButton = new Button
+        {
+            Content = "Cancel",
+            MinWidth = 92,
+            HorizontalContentAlignment = HorizontalAlignment.Center
+        };
+        cancelButton.Click += (_, _) => dialog.Close(false);
+
+        var deleteButton = new Button
+        {
+            Content = "Delete",
+            MinWidth = 92,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Foreground = Brushes.OrangeRed
+        };
+        deleteButton.Click += (_, _) => dialog.Close(true);
+
+        buttons.Children.Add(cancelButton);
+        buttons.Children.Add(deleteButton);
+
+        Grid.SetRow(messageScroller, 0);
+        Grid.SetRow(buttons, 1);
+        grid.Children.Add(messageScroller);
+        grid.Children.Add(buttons);
+        dialog.Content = grid;
+
+        return await dialog.ShowDialog<bool>(this);
     }
 
     private void OpenProject_Click(object? sender, RoutedEventArgs e)

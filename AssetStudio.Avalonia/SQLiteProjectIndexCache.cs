@@ -21,6 +21,9 @@ namespace AssetStudio.Avalonia
         {
             var conn = new SqliteConnection($"Data Source={_dbPath}");
             conn.Open();
+            using var pragma = conn.CreateCommand();
+            pragma.CommandText = "PRAGMA foreign_keys = ON;";
+            pragma.ExecuteNonQuery();
             return conn;
         }
 
@@ -232,6 +235,63 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to save SQLite index cache: {ex.Message}");
+            }
+        }
+
+        public void DeleteIndexCache(string folderPath)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return;
+            }
+
+            var fullPath = GetFullPathOrOriginal(folderPath);
+
+            try
+            {
+                using var conn = CreateConnection();
+                using var transaction = conn.BeginTransaction();
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        DELETE FROM AssetHandles
+                        WHERE ProjectId IN (
+                            SELECT Id FROM Projects
+                            WHERE FolderPath = @path OR FolderPath = @fullPath
+                        )";
+                    cmd.Parameters.AddWithValue("@path", folderPath);
+                    cmd.Parameters.AddWithValue("@fullPath", fullPath);
+                    cmd.ExecuteNonQuery();
+                }
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path OR FolderPath = @fullPath";
+                    cmd.Parameters.AddWithValue("@path", folderPath);
+                    cmd.Parameters.AddWithValue("@fullPath", fullPath);
+                    cmd.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to delete SQLite index cache: {ex.Message}");
+            }
+        }
+
+        private static string GetFullPathOrOriginal(string path)
+        {
+            try
+            {
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return path;
             }
         }
     }
