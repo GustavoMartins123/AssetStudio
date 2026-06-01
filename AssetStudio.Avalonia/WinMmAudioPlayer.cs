@@ -3,6 +3,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using FFmpegVideoPlayer.Core;
 
 namespace AssetStudio.Avalonia
@@ -256,6 +257,11 @@ namespace AssetStudio.Avalonia
             return _playbackTimeBaseSec + _playbackClock.Elapsed.TotalSeconds;
         }
 
+        private void QueueBufferPlayback(byte[] buffer)
+        {
+            _ = Task.Run(async () => await PlayBufferAsync(buffer));
+        }
+
         public unsafe void QueueSamplesS16(short* samples, int count)
         {
             lock (_waveOutLock)
@@ -267,7 +273,7 @@ namespace AssetStudio.Avalonia
             byte[] managedBuffer = new byte[byteCount];
             Marshal.Copy((IntPtr)samples, managedBuffer, 0, byteCount);
 
-            ThreadPool.QueueUserWorkItem(_ => PlayBuffer(managedBuffer));
+            QueueBufferPlayback(managedBuffer);
         }
 
         public void QueueSamples(float[] samples)
@@ -287,10 +293,10 @@ namespace AssetStudio.Avalonia
             byte[] managedBuffer = new byte[byteCount];
             Buffer.BlockCopy(shortSamples, 0, managedBuffer, 0, byteCount);
 
-            ThreadPool.QueueUserWorkItem(_ => PlayBuffer(managedBuffer));
+            QueueBufferPlayback(managedBuffer);
         }
 
-        private void PlayBuffer(byte[] buffer)
+        private async Task PlayBufferAsync(byte[] buffer)
         {
             lock (_waveOutLock)
             {
@@ -334,7 +340,7 @@ namespace AssetStudio.Avalonia
                     {
                         break;
                     }
-                    Thread.Sleep(5);
+                    await Task.Delay(5);
                 }
             }
             catch {}

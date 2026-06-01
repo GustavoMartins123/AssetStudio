@@ -39,10 +39,11 @@ public partial class ProjectManagerWindow : Window
         RefreshProjects();
     }
 
-    private void RefreshProjects(string? selectProjectId = null)
+    private async void RefreshProjects(string? selectProjectId = null)
     {
         _projects.Clear();
-        foreach (var project in _store.GetProjects())
+        var projects = await Task.Run(() => _store.GetProjects());
+        foreach (var project in projects)
         {
             _projects.Add(new ProjectListItem(project, _defaultIcon));
         }
@@ -73,7 +74,7 @@ public partial class ProjectManagerWindow : Window
 
         try
         {
-            _store.SaveProject(result);
+            await Task.Run(() => _store.SaveProject(result));
             RefreshProjects(result.Id);
             StatusText.Text = $"Project added: {result.DisplayName}";
         }
@@ -100,7 +101,7 @@ public partial class ProjectManagerWindow : Window
 
         try
         {
-            _store.SaveProject(result);
+            await Task.Run(() => _store.SaveProject(result));
             RefreshProjects(result.Id);
             StatusText.Text = $"Project updated: {result.DisplayName}";
         }
@@ -126,7 +127,8 @@ public partial class ProjectManagerWindow : Window
         try
         {
             var name = selected.DisplayName;
-            _store.RemoveProject(selected.Project.Id);
+            var projectId = selected.Project.Id;
+            await Task.Run(() => _store.RemoveProject(projectId));
             RefreshProjects();
             StatusText.Text = $"Deleted AssetStudio project data: {name}";
         }
@@ -284,12 +286,16 @@ public partial class ProjectManagerWindow : Window
         DetailStats.Text = selected.StatsDetail;
     }
 
-    private void OpenProject(string projectId)
+    private async void OpenProject(string projectId)
     {
         try
         {
-            _store.TouchProject(projectId);
-            var project = _store.GetProject(projectId);
+            var project = await Task.Run(() =>
+            {
+                _store.TouchProject(projectId);
+                return _store.GetProject(projectId);
+            });
+
             if (project == null)
             {
                 RefreshProjects();
@@ -297,7 +303,7 @@ public partial class ProjectManagerWindow : Window
                 return;
             }
 
-            var settings = _store.LoadProjectSettings(project);
+            var settings = await Task.Run(() => _store.LoadProjectSettings(project));
             LaunchMainWindow(new ProjectLaunchContext(_store, project, settings));
         }
         catch (Exception ex)

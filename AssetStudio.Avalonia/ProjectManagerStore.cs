@@ -3,6 +3,7 @@ using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading.Tasks;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -128,6 +129,7 @@ public sealed class ProjectManagerStore
     private readonly string _dbPath;
     private readonly string _iconsDirectory;
     private readonly SQLiteProjectIndexCache _indexCache = new();
+    private readonly Task _initTask;
 
     public ProjectManagerStore()
     {
@@ -141,14 +143,23 @@ public sealed class ProjectManagerStore
         Directory.CreateDirectory(_iconsDirectory);
         _dbPath = Path.Combine(baseDirectory, "projects.db");
 
-        InitializeDatabase();
+        _initTask = Task.Run(InitializeDatabase);
+    }
+
+    private void EnsureInitialized()
+    {
+        _initTask.Wait();
     }
 
     public string DatabasePath => _dbPath;
     public string IconsDirectory => _iconsDirectory;
 
-    private SqliteConnection CreateConnection()
+    private SqliteConnection CreateConnection(bool skipCheck = false)
     {
+        if (!skipCheck)
+        {
+            EnsureInitialized();
+        }
         var conn = new SqliteConnection($"Data Source={_dbPath}");
         conn.Open();
         using var pragma = conn.CreateCommand();
@@ -159,7 +170,7 @@ public sealed class ProjectManagerStore
 
     private void InitializeDatabase()
     {
-        using var conn = CreateConnection();
+        using var conn = CreateConnection(skipCheck: true);
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             PRAGMA journal_mode = WAL;

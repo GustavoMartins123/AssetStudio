@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
 namespace AssetStudio.Avalonia
@@ -9,12 +10,19 @@ namespace AssetStudio.Avalonia
     {
         private readonly string _dbPath;
 
+        private readonly Task _initTask;
+
         public SQLiteProjectIndexCache()
         {
             var cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
             Directory.CreateDirectory(cacheDir);
             _dbPath = Path.Combine(cacheDir, "project_index.db");
-            InitializeDatabase();
+            _initTask = Task.Run(InitializeDatabase);
+        }
+
+        private void EnsureInitialized()
+        {
+            _initTask.Wait();
         }
 
         private SqliteConnection CreateConnection()
@@ -85,6 +93,7 @@ namespace AssetStudio.Avalonia
 
         public List<AssetHandle>? LoadIndexCache(string folderPath, string signature)
         {
+            EnsureInitialized();
             try
             {
                 using (var conn = CreateConnection())
@@ -156,6 +165,7 @@ namespace AssetStudio.Avalonia
 
         public void SaveIndexCache(string folderPath, string signature, ProjectScanResult scanResult, string unityVersion, IEnumerable<AssetHandle> handles)
         {
+            EnsureInitialized();
             try
             {
                 using (var conn = CreateConnection())
@@ -247,6 +257,7 @@ namespace AssetStudio.Avalonia
 
             var fullPath = GetFullPathOrOriginal(folderPath);
 
+            EnsureInitialized();
             try
             {
                 using var conn = CreateConnection();
