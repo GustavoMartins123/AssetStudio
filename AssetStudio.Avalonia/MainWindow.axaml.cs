@@ -3256,6 +3256,11 @@ public partial class MainWindow : Window
                                 throw new Exception("Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.");
                             }
 
+                            if (assetsManager.LazyLoading)
+                            {
+                                EnsureMeshPreviewDependenciesLoaded(m_Mesh);
+                            }
+
                             var subMeshTextures = new List<byte[]?>();
                             var subMeshTexWidths = new List<int>();
                             var subMeshTexHeights = new List<int>();
@@ -5373,6 +5378,24 @@ public partial class MainWindow : Window
         return FindMaterialsForMesh(mesh).FirstOrDefault();
     }
 
+    private static readonly HashSet<ClassIDType> MeshPreviewReferenceTypes = new()
+    {
+        ClassIDType.GameObject,
+        ClassIDType.Transform,
+        ClassIDType.RectTransform,
+        ClassIDType.MeshFilter,
+        ClassIDType.MeshRenderer,
+        ClassIDType.SkinnedMeshRenderer,
+        ClassIDType.Material,
+        ClassIDType.Texture2D
+    };
+
+    private static readonly HashSet<ClassIDType> MaterialPreviewReferenceTypes = new()
+    {
+        ClassIDType.Material,
+        ClassIDType.Texture2D
+    };
+
     private static readonly HashSet<string> NonDiffuseSlots = new(StringComparer.OrdinalIgnoreCase)
     {
         "_BumpMap", "_NormalMap", "_DetailNormalMap", "_DetailNormalMapScale",
@@ -5383,6 +5406,11 @@ public partial class MainWindow : Window
 
     private Texture2D? FindTextureForMaterial(Material material)
     {
+        if (assetsManager.LazyLoading)
+        {
+            EnsureMaterialPreviewDependenciesLoaded(material);
+        }
+
         materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
 
         if (materialMainTextureCache.TryGetValue(material, out var directCachedTexture))
@@ -5416,6 +5444,159 @@ public partial class MainWindow : Window
         materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
 
         IndexMaterialTexturesBackground(material, materialPreviewMaterialCache, materialTextureSlotsCache, materialMainTextureCache);
+    }
+
+    private void EnsureMeshPreviewDependenciesLoaded(Mesh mesh)
+    {
+        if (!assetsManager.LazyLoading || mesh.assetsFile == null)
+        {
+            return;
+        }
+
+        EnsureIndexedExternalSourcesLoaded(mesh.assetsFile);
+        MaterializeReferenceObjects(mesh.assetsFile, MeshPreviewReferenceTypes);
+
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        foreach (var file in filesSnapshot)
+        {
+            MaterializeReferenceObjects(file, MeshPreviewReferenceTypes);
+        }
+
+        BuildLazyPreviewReferenceIndexes(filesSnapshot);
+    }
+
+    private void EnsureMaterialPreviewDependenciesLoaded(Material material)
+    {
+        if (!assetsManager.LazyLoading || material.assetsFile == null)
+        {
+            return;
+        }
+
+        EnsureIndexedExternalSourcesLoaded(material.assetsFile);
+
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        foreach (var file in filesSnapshot)
+        {
+            MaterializeReferenceObjects(file, MaterialPreviewReferenceTypes);
+        }
+    }
+
+    private void EnsureIndexedExternalSourcesLoaded(SerializedFile sourceFile)
+    {
+        if (sourceFile.m_Externals == null || sourceFile.m_Externals.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var external in sourceFile.m_Externals)
+        {
+            if (external == null || string.IsNullOrWhiteSpace(external.fileName))
+            {
+                continue;
+            }
+
+            if (assetsManager.TryFindSerializedFile(external.fileName, string.Empty, out _))
+            {
+                continue;
+            }
+
+            var sourcePath = assetsManager.ProjectIndex
+                .GetHandlesForFile(external.fileName)
+                .Select(ResolveLazyHandleSourcePath)
+                .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
+
+            if (string.IsNullOrWhiteSpace(sourcePath))
+            {
+                continue;
+            }
+
+            try
+            {
+                RemovePendingFileFromProgressiveQueue(sourcePath);
+                assetsManager.LoadFilesForPreview(sourcePath);
+                assetsManager.WaitForAssetsFileLoaded(external.fileName, 5000);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load external preview source {Path.GetFileName(sourcePath)}: {ex.Message}");
+            }
+        }
+    }
+
+    private void MaterializeReferenceObjects(SerializedFile sourceFile, HashSet<ClassIDType> referenceTypes)
+    {
+        var handles = assetsManager.ProjectIndex
+            .GetHandlesForFile(sourceFile.fileName)
+            .Where(handle => referenceTypes.Contains(handle.Type)
+                && (ReferenceEquals(handle.SourceFile, sourceFile)
+                    || IsSameLazySource(handle.OriginalPath, sourceFile.originalPath)
+                    || string.IsNullOrEmpty(handle.OriginalPath)))
+            .ToList();
+
+        foreach (var handle in handles)
+        {
+            if (handle.SourceFile?.reader == null)
+            {
+                handle.SourceFile = sourceFile;
+            }
+
+            var obj = assetsManager.ResolveHandle(handle);
+            if (obj != null && handle.Tag is AssetItem item)
+            {
+                UpdateLazyAssetItemHandle(item, handle);
+            }
+        }
+    }
+
+    private void BuildLazyPreviewReferenceIndexes(List<SerializedFile> filesSnapshot)
+    {
+        BuildAssetReferenceIndexesBackground(
+            filesSnapshot,
+            new List<AssetItem>(),
+            out _,
+            out var localMeshToMaterialsCache,
+            out var localMeshAssociatedRenderersCache,
+            out var localMeshSourceTypesCache,
+            out var localMaterialMainTextureCache,
+            out var localMaterialPreviewMaterialCache,
+            out var localMaterialTextureSlotsCache);
+
+        lock (previewCacheLock)
+        {
+            meshToMaterialsCache = localMeshToMaterialsCache;
+            meshAssociatedRenderersCache = localMeshAssociatedRenderersCache;
+            meshSourceTypesCache = localMeshSourceTypesCache;
+            materialMainTextureCache = localMaterialMainTextureCache;
+            materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
+            materialTextureSlotsCache = localMaterialTextureSlotsCache;
+        }
+    }
+
+    private static bool IsSameLazySource(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private Texture2D? ResolveTexturePPtr(Material material, PPtr<Texture> textureRef)
@@ -8235,7 +8416,19 @@ public partial class MainWindow : Window
     {
         if (meshToMaterialsCache == null)
         {
-            BuildAssetReferenceIndexes();
+            if (assetsManager.LazyLoading)
+            {
+                List<SerializedFile> filesSnapshot;
+                lock (assetsManager.loadLock)
+                {
+                    filesSnapshot = assetsManager.assetsFileList.ToList();
+                }
+                BuildLazyPreviewReferenceIndexes(filesSnapshot);
+            }
+            else
+            {
+                BuildAssetReferenceIndexes();
+            }
         }
 
         if (meshToMaterialsCache!.TryGetValue(mesh, out var cachedList))
@@ -9054,6 +9247,7 @@ public partial class MainWindow : Window
     {
         if (!assetsManager.LazyLoading) return;
         if (IsProgressiveIndexingActive()) return;
+        if (currentItem.Type == ClassIDType.Mesh) return;
 
         lock (preloaderLock)
         {
@@ -9066,7 +9260,7 @@ public partial class MainWindow : Window
             if (currentIdx < 0) return;
 
             int total = visibleAssetItems.Count;
-            int windowSize = Math.Min(50, total);
+            int windowSize = Math.Min(12, total);
             int start = currentIdx - windowSize / 2;
             if (start < 0) start = 0;
             if (start + windowSize > total) start = total - windowSize;
