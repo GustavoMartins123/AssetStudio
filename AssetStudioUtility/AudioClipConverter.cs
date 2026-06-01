@@ -1,6 +1,4 @@
 #nullable enable
-using Fmod5Sharp;
-using System;
 
 namespace AssetStudio
 {
@@ -15,30 +13,6 @@ namespace AssetStudio
 
         public byte[]? ConvertToWav()
         {
-            var m_AudioData = m_AudioClip.m_AudioData.GetData();
-            if (m_AudioData == null || m_AudioData.Length == 0)
-                return null;
-
-            try
-            {
-                var bank = FsbLoader.LoadFsbFromByteArray(m_AudioData);
-                if (bank.Samples == null || bank.Samples.Count == 0)
-                    return null;
-
-                var sample = bank.Samples[0];
-                if (bank.Header.AudioType == Fmod5Sharp.FmodTypes.FmodAudioType.MPEG)
-                {
-                    return sample.SampleBytes;
-                }
-                if (sample.RebuildAsStandardFileFormat(out var dataBytes, out _))
-                {
-                    return dataBytes;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"AudioClip conversion to WAV failed for {m_AudioClip.m_Name}", ex);
-            }
             return null;
         }
 
@@ -110,31 +84,7 @@ namespace AssetStudio
         {
             get
             {
-                if (m_AudioClip.version[0] < 5)
-                {
-                    return false;
-                }
-                try
-                {
-                    var m_AudioData = m_AudioClip.m_AudioData.GetData();
-                    if (m_AudioData == null || m_AudioData.Length == 0)
-                        return false;
-                    
-                    var bank = FsbLoader.LoadFsbFromByteArray(m_AudioData);
-                    if (bank.Samples == null || bank.Samples.Count == 0)
-                        return false;
-
-                    if (bank.Header.AudioType == Fmod5Sharp.FmodTypes.FmodAudioType.MPEG)
-                    {
-                        return true;
-                    }
-                    return bank.Samples[0].RebuildAsStandardFileFormat(out _, out _);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Debug($"AudioClip IsSupport check failed for {m_AudioClip.m_Name}: {ex.Message}");
-                    return false;
-                }
+                return false;
             }
         }
     }

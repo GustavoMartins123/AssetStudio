@@ -43,17 +43,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Remove="Libraries\x64\fmod.dll" />
-    <None Remove="Libraries\x64\libfmod.so" />
-    <None Remove="Libraries\x86\fmod.dll" />
-    <Content Remove="Libraries\x64\fmod.dll" />
-    <Content Remove="Libraries\x64\libfmod.so" />
-    <Content Remove="Libraries\x86\fmod.dll" />
-    <None Include="Libraries\x64\**\*" Exclude="Libraries\x64\fmod.dll;Libraries\x64\libfmod.so">
+    <None Include="Libraries\x64\**\*">
       <Link>x64\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="Libraries\x86\**\*" Exclude="Libraries\x86\fmod.dll">
+    <None Include="Libraries\x86\**\*">
       <Link>x86\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

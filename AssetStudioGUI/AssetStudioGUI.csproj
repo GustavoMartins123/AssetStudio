@@ -46,17 +46,6 @@
 		</Compile>
 	</ItemGroup>
 
-	<ItemGroup>
-		<ContentWithTargetPath Include="Libraries\x86\fmod.dll">
-			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-			<TargetPath>x86\fmod.dll</TargetPath>
-		</ContentWithTargetPath>
-		<ContentWithTargetPath Include="Libraries\x64\fmod.dll">
-			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-			<TargetPath>x64\fmod.dll</TargetPath>
-		</ContentWithTargetPath>
-	</ItemGroup>
-
 	<ItemGroup Condition=" '$(TargetFramework)' != 'net472' ">
 		<PackageReference Include="OpenTK" Version="4.6.7" />
 		<Reference Include="OpenTK.WinForms">

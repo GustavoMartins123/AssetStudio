@@ -5454,6 +5454,11 @@ public partial class MainWindow : Window
         }
 
         EnsureIndexedExternalSourcesLoaded(mesh.assetsFile);
+        if (ArePreviewReferenceIndexesReady())
+        {
+            return;
+        }
+
         MaterializeReferenceObjects(mesh.assetsFile, MeshPreviewReferenceTypes);
 
         List<SerializedFile> filesSnapshot;
@@ -9213,6 +9218,66 @@ public partial class MainWindow : Window
     private CancellationTokenSource? preloaderCts;
     private readonly object preloaderLock = new();
     private readonly HashSet<string> preloadedUniqueIds = new();
+    private const int AssetPreloadWindowSize = 50;
+
+    private bool ArePreviewReferenceIndexesReady()
+    {
+        lock (previewCacheLock)
+        {
+            return meshToMaterialsCache != null
+                && meshAssociatedRenderersCache != null
+                && meshSourceTypesCache != null
+                && materialMainTextureCache != null
+                && materialPreviewMaterialCache != null
+                && materialTextureSlotsCache != null;
+        }
+    }
+
+    private void WarmPreloadedMeshPreviewReferences(CancellationToken token)
+    {
+        if (!assetsManager.LazyLoading || token.IsCancellationRequested || ArePreviewReferenceIndexesReady())
+        {
+            return;
+        }
+
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        foreach (var file in filesSnapshot)
+        {
+            if (token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            MaterializeReferenceObjects(file, MeshPreviewReferenceTypes);
+        }
+
+        if (!token.IsCancellationRequested)
+        {
+            BuildLazyPreviewReferenceIndexes(filesSnapshot);
+        }
+    }
+
+    private bool PreprocessPreloadedAssetForPreview(AssetItem item, CancellationToken token, bool warmedMeshPreviewReferences)
+    {
+        if (token.IsCancellationRequested || item.Handle?.RealObject is not Mesh mesh)
+        {
+            return warmedMeshPreviewReferences;
+        }
+
+        mesh.EnsureProcessed();
+        if (!warmedMeshPreviewReferences || !ArePreviewReferenceIndexesReady())
+        {
+            WarmPreloadedMeshPreviewReferences(token);
+            warmedMeshPreviewReferences = ArePreviewReferenceIndexesReady();
+        }
+
+        return warmedMeshPreviewReferences;
+    }
 
     private void UnloadAsset(AssetHandle handle)
     {
@@ -9247,7 +9312,6 @@ public partial class MainWindow : Window
     {
         if (!assetsManager.LazyLoading) return;
         if (IsProgressiveIndexingActive()) return;
-        if (currentItem.Type == ClassIDType.Mesh) return;
 
         lock (preloaderLock)
         {
@@ -9256,11 +9320,15 @@ public partial class MainWindow : Window
             preloaderCts = new CancellationTokenSource();
             var token = preloaderCts.Token;
 
-            var currentIdx = visibleAssetItems.IndexOf(currentItem);
+            var preloadItems = visibleAssetItems
+                .Where(item => item.Type == currentItem.Type)
+                .ToList();
+
+            var currentIdx = preloadItems.IndexOf(currentItem);
             if (currentIdx < 0) return;
 
-            int total = visibleAssetItems.Count;
-            int windowSize = Math.Min(12, total);
+            int total = preloadItems.Count;
+            int windowSize = Math.Min(AssetPreloadWindowSize, total);
             int start = currentIdx - windowSize / 2;
             if (start < 0) start = 0;
             if (start + windowSize > total) start = total - windowSize;
@@ -9271,7 +9339,7 @@ public partial class MainWindow : Window
 
             for (int i = start; i <= end; i++)
             {
-                var item = visibleAssetItems[i];
+                var item = preloadItems[i];
                 if (item.Handle != null && !string.IsNullOrEmpty(item.Handle.UniqueID))
                 {
                     itemsToKeep.Add(item.Handle.UniqueID);
@@ -9304,13 +9372,14 @@ public partial class MainWindow : Window
             var sortedItemsToLoad = itemsToLoad
                 .OrderBy(item =>
                 {
-                    var idx = visibleAssetItems.IndexOf(item);
+                    var idx = preloadItems.IndexOf(item);
                     return idx >= 0 ? Math.Abs(idx - currentIdx) : int.MaxValue;
                 })
                 .ToList();
 
             _ = Task.Run(async () =>
             {
+                var warmedMeshPreviewReferences = false;
                 foreach (var item in sortedItemsToLoad)
                 {
                     if (token.IsCancellationRequested) break;
@@ -9334,6 +9403,7 @@ public partial class MainWindow : Window
 
                         if (item.Handle.RealObject != null)
                         {
+                            warmedMeshPreviewReferences = PreprocessPreloadedAssetForPreview(item, token, warmedMeshPreviewReferences);
                             lock (preloaderLock)
                             {
                                 preloadedUniqueIds.Add(item.Handle.UniqueID);
@@ -9346,6 +9416,7 @@ public partial class MainWindow : Window
 
                         if (item.Handle?.UniqueID != null && item.Handle.RealObject != null)
                         {
+                            warmedMeshPreviewReferences = PreprocessPreloadedAssetForPreview(item, token, warmedMeshPreviewReferences);
                             lock (preloaderLock)
                             {
                                 preloadedUniqueIds.Add(item.Handle.UniqueID);

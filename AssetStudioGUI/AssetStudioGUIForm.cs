@@ -37,14 +37,6 @@ namespace AssetStudioGUI
         private DirectBitmap imageTexture;
         private string tempClipboard;
 
-        private FMOD.System system;
-        private FMOD.Sound sound;
-        private FMOD.Channel channel;
-        private FMOD.SoundGroup masterSoundGroup;
-        private FMOD.MODE loopMode = FMOD.MODE.LOOP_OFF;
-        private uint FMODlenms;
-        private float FMODVolume = 0.8f;
-
         #region TexControl
         private static char[] textureChannelNames = new[] { 'B', 'G', 'R', 'A' };
         private bool[] textureChannels = new[] { true, true, true, true };
@@ -113,8 +105,6 @@ namespace AssetStudioGUI
             enablePreview.Checked = Properties.Settings.Default.enablePreview;
             openDirectoryBackup = GetExistingFolder(Properties.Settings.Default.loadFolderPath);
             saveDirectoryBackup = GetExistingFolder(Properties.Settings.Default.exportFolderPath);
-            FMODinit();
-
             logger = new GUILogger(StatusStripUpdate);
             Logger.Default = logger;
             toolStripMenuItem15.Checked = false;
@@ -594,18 +584,9 @@ namespace AssetStudioGUI
                         break;
                     case ClassIDType.AudioClip:
                         {
-                            FMODpanel.Visible = !FMODpanel.Visible;
-
-                            if (sound.hasHandle() && channel.hasHandle())
-                            {
-                                var result = channel.isPlaying(out var playing);
-                                if (result == FMOD.RESULT.OK && playing)
-                                {
-                                    channel.stop();
-                                    FMODreset();
-                                }
-                            }
-                            else if (FMODpanel.Visible)
+                            AudioPreviewReset();
+                            AudioPanel.Visible = !AudioPanel.Visible;
+                            if (AudioPanel.Visible)
                             {
                                 PreviewAsset(lastSelectedItem);
                             }
@@ -839,11 +820,11 @@ namespace AssetStudioGUI
             assetInfoLabel.Text = null;
             textPreviewBox.Visible = false;
             fontPreviewBox.Visible = false;
-            FMODpanel.Visible = false;
+            AudioPanel.Visible = false;
             glControl1.Visible = false;
             StatusStripUpdate("");
 
-            FMODreset();
+            AudioPreviewReset();
 
             lastSelectedItem = (AssetItem)e.Item;
 
@@ -872,7 +853,7 @@ namespace AssetStudioGUI
             assetInfoLabel.Text = null;
             textPreviewBox.Visible = false;
             fontPreviewBox.Visible = false;
-            FMODpanel.Visible = false;
+            AudioPanel.Visible = false;
             glControl1.Visible = false;
             StatusStripUpdate("");
             if (e.IsSelected)
@@ -1220,41 +1201,9 @@ namespace AssetStudioGUI
                 }
             }
 
-            var m_AudioData = m_AudioClip.m_AudioData.GetData();
-            if (m_AudioData == null || m_AudioData.Length == 0)
-                return;
-            var exinfo = new FMOD.CREATESOUNDEXINFO();
-
-            exinfo.cbsize = Marshal.SizeOf(exinfo);
-            exinfo.length = (uint)m_AudioClip.m_Size;
-
-            var result = system.createSound(m_AudioData, FMOD.MODE.OPENMEMORY | loopMode, ref exinfo, out sound);
-            if (ERRCHECK(result)) return;
-
-            sound.getNumSubSounds(out var numsubsounds);
-
-            if (numsubsounds > 0)
-            {
-                result = sound.getSubSound(0, out var subsound);
-                if (result == FMOD.RESULT.OK)
-                {
-                    sound = subsound;
-                }
-            }
-
-            result = sound.getLength(out FMODlenms, FMOD.TIMEUNIT.MS);
-            if (ERRCHECK(result)) return;
-
-            result = system.playSound(sound, default, true, out channel);
-            if (ERRCHECK(result)) return;
-
-            FMODpanel.Visible = true;
-
-            result = channel.getFrequency(out var frequency);
-            if (ERRCHECK(result)) return;
-
-            FMODinfoLabel.Text = frequency + " Hz";
-            FMODtimerLabel.Text = $"0:0.0 / {FMODlenms / 1000 / 60}:{FMODlenms / 1000 % 60}.{FMODlenms / 10 % 100}";
+            AudioPanel.Visible = true;
+            AudioStatusLabel.Text = "Unsupported";
+            AudioInfoLabel.Text = "Audio preview is available in the Avalonia UI.";
         }
 
         private void PreviewShader(Shader m_Shader)
@@ -1638,7 +1587,7 @@ namespace AssetStudioGUI
                 filterTypeToolStripMenuItem.DropDownItems.RemoveAt(1);
             }
 
-            FMODreset();
+            AudioPreviewReset();
         }
 
         private void assetListView_MouseClick(object sender, MouseEventArgs e)
@@ -2049,273 +1998,54 @@ namespace AssetStudioGUI
             }
         }
 
-        #region FMOD
-        private void FMODinit()
-        {
-            FMODreset();
-
-            var result = FMOD.Factory.System_Create(out system);
-            if (ERRCHECK(result)) { return; }
-
-            result = system.getVersion(out var version);
-            ERRCHECK(result);
-            if (version < FMOD.VERSION.number)
-            {
-                MessageBox.Show($"Error!  You are using an old version of FMOD {version:X}.  This program requires {FMOD.VERSION.number:X}.");
-                Application.Exit();
-            }
-
-            result = system.init(2, FMOD.INITFLAGS.NORMAL, IntPtr.Zero);
-            if (ERRCHECK(result)) { return; }
-
-            result = system.getMasterSoundGroup(out masterSoundGroup);
-            if (ERRCHECK(result)) { return; }
-
-            result = masterSoundGroup.setVolume(FMODVolume);
-            if (ERRCHECK(result)) { return; }
-        }
-
-        private void FMODreset()
+        #region Audio Preview
+        private void AudioPreviewReset()
         {
             timer.Stop();
-            FMODprogressBar.Value = 0;
-            FMODtimerLabel.Text = "0:00.0 / 0:00.0";
-            FMODstatusLabel.Text = "Stopped";
-            FMODinfoLabel.Text = "";
-
-            if (sound.hasHandle())
-            {
-                var result = sound.release();
-                ERRCHECK(result);
-                sound.clearHandle();
-            }
+            AudioProgressBar.Value = 0;
+            AudioTimerLabel.Text = "0:00.0 / 0:00.0";
+            AudioStatusLabel.Text = "Stopped";
+            AudioInfoLabel.Text = "";
         }
 
-        private void FMODplayButton_Click(object sender, EventArgs e)
+        private void AudioPlayButton_Click(object sender, EventArgs e)
         {
-            if (sound.hasHandle() && channel.hasHandle())
-            {
-                timer.Start();
-                var result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing)
-                {
-                    result = channel.stop();
-                    if (ERRCHECK(result)) { return; }
-
-                    result = system.playSound(sound, default, false, out channel);
-                    if (ERRCHECK(result)) { return; }
-
-                    FMODpauseButton.Text = "Pause";
-                }
-                else
-                {
-                    result = system.playSound(sound, default, false, out channel);
-                    if (ERRCHECK(result)) { return; }
-                    FMODstatusLabel.Text = "Playing";
-
-                    if (FMODprogressBar.Value > 0)
-                    {
-                        uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
-
-                        result = channel.setPosition(newms, FMOD.TIMEUNIT.MS);
-                        if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                        {
-                            if (ERRCHECK(result)) { return; }
-                        }
-
-                    }
-                }
-            }
+            AudioStatusLabel.Text = "Unsupported";
         }
 
-        private void FMODpauseButton_Click(object sender, EventArgs e)
+        private void AudioPauseButton_Click(object sender, EventArgs e)
         {
-            if (sound.hasHandle() && channel.hasHandle())
-            {
-                var result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing)
-                {
-                    result = channel.getPaused(out var paused);
-                    if (ERRCHECK(result)) { return; }
-                    result = channel.setPaused(!paused);
-                    if (ERRCHECK(result)) { return; }
-
-                    if (paused)
-                    {
-                        FMODstatusLabel.Text = "Playing";
-                        FMODpauseButton.Text = "Pause";
-                        timer.Start();
-                    }
-                    else
-                    {
-                        FMODstatusLabel.Text = "Paused";
-                        FMODpauseButton.Text = "Resume";
-                        timer.Stop();
-                    }
-                }
-            }
+            AudioStatusLabel.Text = "Unsupported";
         }
 
-        private void FMODstopButton_Click(object sender, EventArgs e)
+        private void AudioStopButton_Click(object sender, EventArgs e)
         {
-            if (channel.hasHandle())
-            {
-                var result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing)
-                {
-                    result = channel.stop();
-                    if (ERRCHECK(result)) { return; }
-                    //channel = null;
-                    //don't FMODreset, it will nullify the sound
-                    timer.Stop();
-                    FMODprogressBar.Value = 0;
-                    FMODtimerLabel.Text = "0:00.0 / 0:00.0";
-                    FMODstatusLabel.Text = "Stopped";
-                    FMODpauseButton.Text = "Pause";
-                }
-            }
+            AudioPreviewReset();
         }
 
-        private void FMODloopButton_CheckedChanged(object sender, EventArgs e)
+        private void AudioLoopButton_CheckedChanged(object sender, EventArgs e)
         {
-            FMOD.RESULT result;
-
-            loopMode = FMODloopButton.Checked ? FMOD.MODE.LOOP_NORMAL : FMOD.MODE.LOOP_OFF;
-
-            if (sound.hasHandle())
-            {
-                result = sound.setMode(loopMode);
-                if (ERRCHECK(result)) { return; }
-            }
-
-            if (channel.hasHandle())
-            {
-                result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                result = channel.getPaused(out var paused);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing || paused)
-                {
-                    result = channel.setMode(loopMode);
-                    if (ERRCHECK(result)) { return; }
-                }
-            }
         }
 
-        private void FMODvolumeBar_ValueChanged(object sender, EventArgs e)
+        private void AudioVolumeBar_ValueChanged(object sender, EventArgs e)
         {
-            FMODVolume = Convert.ToSingle(FMODvolumeBar.Value) / 10;
-
-            var result = masterSoundGroup.setVolume(FMODVolume);
-            if (ERRCHECK(result)) { return; }
         }
 
-        private void FMODprogressBar_Scroll(object sender, EventArgs e)
+        private void AudioProgressBar_Scroll(object sender, EventArgs e)
         {
-            if (channel.hasHandle())
-            {
-                uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
-                FMODtimerLabel.Text = $"{newms / 1000 / 60}:{newms / 1000 % 60}.{newms / 10 % 100}/{FMODlenms / 1000 / 60}:{FMODlenms / 1000 % 60}.{FMODlenms / 10 % 100}";
-            }
         }
 
-        private void FMODprogressBar_MouseDown(object sender, MouseEventArgs e)
+        private void AudioProgressBar_MouseDown(object sender, MouseEventArgs e)
         {
             timer.Stop();
         }
 
-        private void FMODprogressBar_MouseUp(object sender, MouseEventArgs e)
+        private void AudioProgressBar_MouseUp(object sender, MouseEventArgs e)
         {
-            if (channel.hasHandle())
-            {
-                uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
-
-                var result = channel.setPosition(newms, FMOD.TIMEUNIT.MS);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-
-                result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing) { timer.Start(); }
-            }
         }
 
         private void timer_Tick(object sender, EventArgs e)
         {
-            uint ms = 0;
-            bool playing = false;
-            bool paused = false;
-
-            if (channel.hasHandle())
-            {
-                var result = channel.getPosition(out ms, FMOD.TIMEUNIT.MS);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    ERRCHECK(result);
-                }
-
-                result = channel.isPlaying(out playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    ERRCHECK(result);
-                }
-
-                result = channel.getPaused(out paused);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    ERRCHECK(result);
-                }
-            }
-
-            FMODtimerLabel.Text = $"{ms / 1000 / 60}:{ms / 1000 % 60}.{ms / 10 % 100} / {FMODlenms / 1000 / 60}:{FMODlenms / 1000 % 60}.{FMODlenms / 10 % 100}";
-            FMODprogressBar.Value = (int)(ms * 1000 / FMODlenms);
-            FMODstatusLabel.Text = paused ? "Paused " : playing ? "Playing" : "Stopped";
-
-            if (system.hasHandle() && channel.hasHandle())
-            {
-                system.update();
-            }
-        }
-
-        private bool ERRCHECK(FMOD.RESULT result)
-        {
-            if (result != FMOD.RESULT.OK)
-            {
-                FMODreset();
-                StatusStripUpdate($"FMOD error! {result} - {FMOD.Error.String(result)}");
-                return true;
-            }
-            return false;
         }
         #endregion
 

@@ -1,5 +1,4 @@
 using Avalonia;
-using FFmpegVideoPlayer.Core;
 using System;
 using System.IO;
 using System.Text;
@@ -19,7 +18,7 @@ class Program
 
         try
         {
-            FFmpegInitializer.Initialize();
+            FFmpegRuntime.Initialize();
         }
         catch (Exception ex)
         {

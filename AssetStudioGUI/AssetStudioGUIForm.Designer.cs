@@ -100,17 +100,17 @@
             this.tabPage4 = new System.Windows.Forms.TabPage();
             this.previewPanel = new System.Windows.Forms.Panel();
             this.assetInfoLabel = new System.Windows.Forms.Label();
-            this.FMODpanel = new System.Windows.Forms.Panel();
-            this.FMODcopyright = new System.Windows.Forms.Label();
-            this.FMODinfoLabel = new System.Windows.Forms.Label();
-            this.FMODtimerLabel = new System.Windows.Forms.Label();
-            this.FMODstatusLabel = new System.Windows.Forms.Label();
-            this.FMODprogressBar = new System.Windows.Forms.TrackBar();
-            this.FMODvolumeBar = new System.Windows.Forms.TrackBar();
-            this.FMODloopButton = new System.Windows.Forms.CheckBox();
-            this.FMODstopButton = new System.Windows.Forms.Button();
-            this.FMODpauseButton = new System.Windows.Forms.Button();
-            this.FMODplayButton = new System.Windows.Forms.Button();
+            this.AudioPanel = new System.Windows.Forms.Panel();
+            this.AudioPreviewNote = new System.Windows.Forms.Label();
+            this.AudioInfoLabel = new System.Windows.Forms.Label();
+            this.AudioTimerLabel = new System.Windows.Forms.Label();
+            this.AudioStatusLabel = new System.Windows.Forms.Label();
+            this.AudioProgressBar = new System.Windows.Forms.TrackBar();
+            this.AudioVolumeBar = new System.Windows.Forms.TrackBar();
+            this.AudioLoopButton = new System.Windows.Forms.CheckBox();
+            this.AudioStopButton = new System.Windows.Forms.Button();
+            this.AudioPauseButton = new System.Windows.Forms.Button();
+            this.AudioPlayButton = new System.Windows.Forms.Button();
             this.fontPreviewBox = new System.Windows.Forms.RichTextBox();
             this.glControl1 = new OpenTK.GLControl();
             this.textPreviewBox = new System.Windows.Forms.TextBox();
@@ -140,9 +140,9 @@
             this.tabControl2.SuspendLayout();
             this.tabPage4.SuspendLayout();
             this.previewPanel.SuspendLayout();
-            this.FMODpanel.SuspendLayout();
-            ((System.ComponentModel.ISupportInitialize)(this.FMODprogressBar)).BeginInit();
-            ((System.ComponentModel.ISupportInitialize)(this.FMODvolumeBar)).BeginInit();
+            this.AudioPanel.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.AudioProgressBar)).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)(this.AudioVolumeBar)).BeginInit();
             this.tabPage5.SuspendLayout();
             this.statusStrip1.SuspendLayout();
             this.contextMenuStrip1.SuspendLayout();
@@ -765,7 +765,7 @@
             this.previewPanel.BackgroundImage = global::AssetStudioGUI.Properties.Resources.preview;
             this.previewPanel.BackgroundImageLayout = System.Windows.Forms.ImageLayout.Center;
             this.previewPanel.Controls.Add(this.assetInfoLabel);
-            this.previewPanel.Controls.Add(this.FMODpanel);
+            this.previewPanel.Controls.Add(this.AudioPanel);
             this.previewPanel.Controls.Add(this.fontPreviewBox);
             this.previewPanel.Controls.Add(this.glControl1);
             this.previewPanel.Controls.Add(this.textPreviewBox);
@@ -787,130 +787,130 @@
             this.assetInfoLabel.Size = new System.Drawing.Size(0, 12);
             this.assetInfoLabel.TabIndex = 0;
             // 
-            // FMODpanel
+            // AudioPanel
             // 
-            this.FMODpanel.BackColor = System.Drawing.SystemColors.ControlDark;
-            this.FMODpanel.Controls.Add(this.FMODcopyright);
-            this.FMODpanel.Controls.Add(this.FMODinfoLabel);
-            this.FMODpanel.Controls.Add(this.FMODtimerLabel);
-            this.FMODpanel.Controls.Add(this.FMODstatusLabel);
-            this.FMODpanel.Controls.Add(this.FMODprogressBar);
-            this.FMODpanel.Controls.Add(this.FMODvolumeBar);
-            this.FMODpanel.Controls.Add(this.FMODloopButton);
-            this.FMODpanel.Controls.Add(this.FMODstopButton);
-            this.FMODpanel.Controls.Add(this.FMODpauseButton);
-            this.FMODpanel.Controls.Add(this.FMODplayButton);
-            this.FMODpanel.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.FMODpanel.Location = new System.Drawing.Point(0, 0);
-            this.FMODpanel.Name = "FMODpanel";
-            this.FMODpanel.Size = new System.Drawing.Size(768, 606);
-            this.FMODpanel.TabIndex = 2;
-            this.FMODpanel.Visible = false;
+            this.AudioPanel.BackColor = System.Drawing.SystemColors.ControlDark;
+            this.AudioPanel.Controls.Add(this.AudioPreviewNote);
+            this.AudioPanel.Controls.Add(this.AudioInfoLabel);
+            this.AudioPanel.Controls.Add(this.AudioTimerLabel);
+            this.AudioPanel.Controls.Add(this.AudioStatusLabel);
+            this.AudioPanel.Controls.Add(this.AudioProgressBar);
+            this.AudioPanel.Controls.Add(this.AudioVolumeBar);
+            this.AudioPanel.Controls.Add(this.AudioLoopButton);
+            this.AudioPanel.Controls.Add(this.AudioStopButton);
+            this.AudioPanel.Controls.Add(this.AudioPauseButton);
+            this.AudioPanel.Controls.Add(this.AudioPlayButton);
+            this.AudioPanel.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.AudioPanel.Location = new System.Drawing.Point(0, 0);
+            this.AudioPanel.Name = "AudioPanel";
+            this.AudioPanel.Size = new System.Drawing.Size(768, 606);
+            this.AudioPanel.TabIndex = 2;
+            this.AudioPanel.Visible = false;
             // 
-            // FMODcopyright
+            // AudioPreviewNote
             // 
-            this.FMODcopyright.AutoSize = true;
-            this.FMODcopyright.ForeColor = System.Drawing.SystemColors.ControlLight;
-            this.FMODcopyright.Location = new System.Drawing.Point(214, 337);
-            this.FMODcopyright.Name = "FMODcopyright";
-            this.FMODcopyright.Size = new System.Drawing.Size(341, 12);
-            this.FMODcopyright.TabIndex = 9;
-            this.FMODcopyright.Text = "Audio Engine supplied by FMOD by Firelight Technologies.";
+            this.AudioPreviewNote.AutoSize = true;
+            this.AudioPreviewNote.ForeColor = System.Drawing.SystemColors.ControlLight;
+            this.AudioPreviewNote.Location = new System.Drawing.Point(214, 337);
+            this.AudioPreviewNote.Name = "AudioPreviewNote";
+            this.AudioPreviewNote.Size = new System.Drawing.Size(341, 12);
+            this.AudioPreviewNote.TabIndex = 9;
+            this.AudioPreviewNote.Text = "Audio preview is available in the Avalonia UI.";
             // 
-            // FMODinfoLabel
+            // AudioInfoLabel
             // 
-            this.FMODinfoLabel.AutoSize = true;
-            this.FMODinfoLabel.ForeColor = System.Drawing.SystemColors.ControlLightLight;
-            this.FMODinfoLabel.Location = new System.Drawing.Point(269, 235);
-            this.FMODinfoLabel.Name = "FMODinfoLabel";
-            this.FMODinfoLabel.Size = new System.Drawing.Size(0, 12);
-            this.FMODinfoLabel.TabIndex = 8;
+            this.AudioInfoLabel.AutoSize = true;
+            this.AudioInfoLabel.ForeColor = System.Drawing.SystemColors.ControlLightLight;
+            this.AudioInfoLabel.Location = new System.Drawing.Point(269, 235);
+            this.AudioInfoLabel.Name = "AudioInfoLabel";
+            this.AudioInfoLabel.Size = new System.Drawing.Size(0, 12);
+            this.AudioInfoLabel.TabIndex = 8;
             // 
-            // FMODtimerLabel
+            // AudioTimerLabel
             // 
-            this.FMODtimerLabel.AutoSize = true;
-            this.FMODtimerLabel.ForeColor = System.Drawing.SystemColors.ControlLightLight;
-            this.FMODtimerLabel.Location = new System.Drawing.Point(460, 235);
-            this.FMODtimerLabel.Name = "FMODtimerLabel";
-            this.FMODtimerLabel.Size = new System.Drawing.Size(95, 12);
-            this.FMODtimerLabel.TabIndex = 7;
-            this.FMODtimerLabel.Text = "0:00.0 / 0:00.0";
+            this.AudioTimerLabel.AutoSize = true;
+            this.AudioTimerLabel.ForeColor = System.Drawing.SystemColors.ControlLightLight;
+            this.AudioTimerLabel.Location = new System.Drawing.Point(460, 235);
+            this.AudioTimerLabel.Name = "AudioTimerLabel";
+            this.AudioTimerLabel.Size = new System.Drawing.Size(95, 12);
+            this.AudioTimerLabel.TabIndex = 7;
+            this.AudioTimerLabel.Text = "0:00.0 / 0:00.0";
             // 
-            // FMODstatusLabel
+            // AudioStatusLabel
             // 
-            this.FMODstatusLabel.AutoSize = true;
-            this.FMODstatusLabel.ForeColor = System.Drawing.SystemColors.ControlLightLight;
-            this.FMODstatusLabel.Location = new System.Drawing.Point(213, 235);
-            this.FMODstatusLabel.Name = "FMODstatusLabel";
-            this.FMODstatusLabel.Size = new System.Drawing.Size(47, 12);
-            this.FMODstatusLabel.TabIndex = 6;
-            this.FMODstatusLabel.Text = "Stopped";
+            this.AudioStatusLabel.AutoSize = true;
+            this.AudioStatusLabel.ForeColor = System.Drawing.SystemColors.ControlLightLight;
+            this.AudioStatusLabel.Location = new System.Drawing.Point(213, 235);
+            this.AudioStatusLabel.Name = "AudioStatusLabel";
+            this.AudioStatusLabel.Size = new System.Drawing.Size(47, 12);
+            this.AudioStatusLabel.TabIndex = 6;
+            this.AudioStatusLabel.Text = "Stopped";
             // 
-            // FMODprogressBar
+            // AudioProgressBar
             // 
-            this.FMODprogressBar.AutoSize = false;
-            this.FMODprogressBar.Location = new System.Drawing.Point(213, 253);
-            this.FMODprogressBar.Maximum = 1000;
-            this.FMODprogressBar.Name = "FMODprogressBar";
-            this.FMODprogressBar.Size = new System.Drawing.Size(350, 22);
-            this.FMODprogressBar.TabIndex = 5;
-            this.FMODprogressBar.TickStyle = System.Windows.Forms.TickStyle.None;
-            this.FMODprogressBar.Scroll += new System.EventHandler(this.FMODprogressBar_Scroll);
-            this.FMODprogressBar.MouseDown += new System.Windows.Forms.MouseEventHandler(this.FMODprogressBar_MouseDown);
-            this.FMODprogressBar.MouseUp += new System.Windows.Forms.MouseEventHandler(this.FMODprogressBar_MouseUp);
+            this.AudioProgressBar.AutoSize = false;
+            this.AudioProgressBar.Location = new System.Drawing.Point(213, 253);
+            this.AudioProgressBar.Maximum = 1000;
+            this.AudioProgressBar.Name = "AudioProgressBar";
+            this.AudioProgressBar.Size = new System.Drawing.Size(350, 22);
+            this.AudioProgressBar.TabIndex = 5;
+            this.AudioProgressBar.TickStyle = System.Windows.Forms.TickStyle.None;
+            this.AudioProgressBar.Scroll += new System.EventHandler(this.AudioProgressBar_Scroll);
+            this.AudioProgressBar.MouseDown += new System.Windows.Forms.MouseEventHandler(this.AudioProgressBar_MouseDown);
+            this.AudioProgressBar.MouseUp += new System.Windows.Forms.MouseEventHandler(this.AudioProgressBar_MouseUp);
             // 
-            // FMODvolumeBar
+            // AudioVolumeBar
             // 
-            this.FMODvolumeBar.LargeChange = 2;
-            this.FMODvolumeBar.Location = new System.Drawing.Point(460, 280);
-            this.FMODvolumeBar.Name = "FMODvolumeBar";
-            this.FMODvolumeBar.Size = new System.Drawing.Size(104, 45);
-            this.FMODvolumeBar.TabIndex = 4;
-            this.FMODvolumeBar.TickStyle = System.Windows.Forms.TickStyle.Both;
-            this.FMODvolumeBar.Value = 8;
-            this.FMODvolumeBar.ValueChanged += new System.EventHandler(this.FMODvolumeBar_ValueChanged);
+            this.AudioVolumeBar.LargeChange = 2;
+            this.AudioVolumeBar.Location = new System.Drawing.Point(460, 280);
+            this.AudioVolumeBar.Name = "AudioVolumeBar";
+            this.AudioVolumeBar.Size = new System.Drawing.Size(104, 45);
+            this.AudioVolumeBar.TabIndex = 4;
+            this.AudioVolumeBar.TickStyle = System.Windows.Forms.TickStyle.Both;
+            this.AudioVolumeBar.Value = 8;
+            this.AudioVolumeBar.ValueChanged += new System.EventHandler(this.AudioVolumeBar_ValueChanged);
             // 
-            // FMODloopButton
+            // AudioLoopButton
             // 
-            this.FMODloopButton.Appearance = System.Windows.Forms.Appearance.Button;
-            this.FMODloopButton.Location = new System.Drawing.Point(399, 280);
-            this.FMODloopButton.Name = "FMODloopButton";
-            this.FMODloopButton.Size = new System.Drawing.Size(55, 42);
-            this.FMODloopButton.TabIndex = 3;
-            this.FMODloopButton.Text = "Loop";
-            this.FMODloopButton.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
-            this.FMODloopButton.UseVisualStyleBackColor = true;
-            this.FMODloopButton.CheckedChanged += new System.EventHandler(this.FMODloopButton_CheckedChanged);
+            this.AudioLoopButton.Appearance = System.Windows.Forms.Appearance.Button;
+            this.AudioLoopButton.Location = new System.Drawing.Point(399, 280);
+            this.AudioLoopButton.Name = "AudioLoopButton";
+            this.AudioLoopButton.Size = new System.Drawing.Size(55, 42);
+            this.AudioLoopButton.TabIndex = 3;
+            this.AudioLoopButton.Text = "Loop";
+            this.AudioLoopButton.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
+            this.AudioLoopButton.UseVisualStyleBackColor = true;
+            this.AudioLoopButton.CheckedChanged += new System.EventHandler(this.AudioLoopButton_CheckedChanged);
             // 
-            // FMODstopButton
+            // AudioStopButton
             // 
-            this.FMODstopButton.Location = new System.Drawing.Point(338, 280);
-            this.FMODstopButton.Name = "FMODstopButton";
-            this.FMODstopButton.Size = new System.Drawing.Size(55, 42);
-            this.FMODstopButton.TabIndex = 2;
-            this.FMODstopButton.Text = "Stop";
-            this.FMODstopButton.UseVisualStyleBackColor = true;
-            this.FMODstopButton.Click += new System.EventHandler(this.FMODstopButton_Click);
+            this.AudioStopButton.Location = new System.Drawing.Point(338, 280);
+            this.AudioStopButton.Name = "AudioStopButton";
+            this.AudioStopButton.Size = new System.Drawing.Size(55, 42);
+            this.AudioStopButton.TabIndex = 2;
+            this.AudioStopButton.Text = "Stop";
+            this.AudioStopButton.UseVisualStyleBackColor = true;
+            this.AudioStopButton.Click += new System.EventHandler(this.AudioStopButton_Click);
             // 
-            // FMODpauseButton
+            // AudioPauseButton
             // 
-            this.FMODpauseButton.Location = new System.Drawing.Point(277, 280);
-            this.FMODpauseButton.Name = "FMODpauseButton";
-            this.FMODpauseButton.Size = new System.Drawing.Size(55, 42);
-            this.FMODpauseButton.TabIndex = 1;
-            this.FMODpauseButton.Text = "Pause";
-            this.FMODpauseButton.UseVisualStyleBackColor = true;
-            this.FMODpauseButton.Click += new System.EventHandler(this.FMODpauseButton_Click);
+            this.AudioPauseButton.Location = new System.Drawing.Point(277, 280);
+            this.AudioPauseButton.Name = "AudioPauseButton";
+            this.AudioPauseButton.Size = new System.Drawing.Size(55, 42);
+            this.AudioPauseButton.TabIndex = 1;
+            this.AudioPauseButton.Text = "Pause";
+            this.AudioPauseButton.UseVisualStyleBackColor = true;
+            this.AudioPauseButton.Click += new System.EventHandler(this.AudioPauseButton_Click);
             // 
-            // FMODplayButton
+            // AudioPlayButton
             // 
-            this.FMODplayButton.Location = new System.Drawing.Point(216, 280);
-            this.FMODplayButton.Name = "FMODplayButton";
-            this.FMODplayButton.Size = new System.Drawing.Size(55, 42);
-            this.FMODplayButton.TabIndex = 0;
-            this.FMODplayButton.Text = "Play";
-            this.FMODplayButton.UseVisualStyleBackColor = true;
-            this.FMODplayButton.Click += new System.EventHandler(this.FMODplayButton_Click);
+            this.AudioPlayButton.Location = new System.Drawing.Point(216, 280);
+            this.AudioPlayButton.Name = "AudioPlayButton";
+            this.AudioPlayButton.Size = new System.Drawing.Size(55, 42);
+            this.AudioPlayButton.TabIndex = 0;
+            this.AudioPlayButton.Text = "Play";
+            this.AudioPlayButton.UseVisualStyleBackColor = true;
+            this.AudioPlayButton.Click += new System.EventHandler(this.AudioPlayButton_Click);
             // 
             // fontPreviewBox
             // 
@@ -1106,10 +1106,10 @@
             this.tabPage4.ResumeLayout(false);
             this.previewPanel.ResumeLayout(false);
             this.previewPanel.PerformLayout();
-            this.FMODpanel.ResumeLayout(false);
-            this.FMODpanel.PerformLayout();
-            ((System.ComponentModel.ISupportInitialize)(this.FMODprogressBar)).EndInit();
-            ((System.ComponentModel.ISupportInitialize)(this.FMODvolumeBar)).EndInit();
+            this.AudioPanel.ResumeLayout(false);
+            this.AudioPanel.PerformLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.AudioProgressBar)).EndInit();
+            ((System.ComponentModel.ISupportInitialize)(this.AudioVolumeBar)).EndInit();
             this.tabPage5.ResumeLayout(false);
             this.tabPage5.PerformLayout();
             this.statusStrip1.ResumeLayout(false);
@@ -1149,16 +1149,16 @@
         private System.Windows.Forms.Label assetInfoLabel;
         private System.Windows.Forms.TextBox textPreviewBox;
         private System.Windows.Forms.RichTextBox fontPreviewBox;
-        private System.Windows.Forms.Panel FMODpanel;
-        private System.Windows.Forms.TrackBar FMODvolumeBar;
-        private System.Windows.Forms.CheckBox FMODloopButton;
-        private System.Windows.Forms.Button FMODstopButton;
-        private System.Windows.Forms.Button FMODpauseButton;
-        private System.Windows.Forms.Button FMODplayButton;
-        private System.Windows.Forms.TrackBar FMODprogressBar;
-        private System.Windows.Forms.Label FMODstatusLabel;
-        private System.Windows.Forms.Label FMODtimerLabel;
-        private System.Windows.Forms.Label FMODinfoLabel;
+        private System.Windows.Forms.Panel AudioPanel;
+        private System.Windows.Forms.TrackBar AudioVolumeBar;
+        private System.Windows.Forms.CheckBox AudioLoopButton;
+        private System.Windows.Forms.Button AudioStopButton;
+        private System.Windows.Forms.Button AudioPauseButton;
+        private System.Windows.Forms.Button AudioPlayButton;
+        private System.Windows.Forms.TrackBar AudioProgressBar;
+        private System.Windows.Forms.Label AudioStatusLabel;
+        private System.Windows.Forms.Label AudioTimerLabel;
+        private System.Windows.Forms.Label AudioInfoLabel;
         private System.Windows.Forms.Timer timer;
         private System.Windows.Forms.ToolStripMenuItem optionsToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem displayAll;
@@ -1178,7 +1178,7 @@
         private System.Windows.Forms.ColumnHeader columnHeader1;
         private System.Windows.Forms.TextBox classTextBox;
         private System.Windows.Forms.ToolStripMenuItem exportClassStructuresMenuItem;
-        private System.Windows.Forms.Label FMODcopyright;
+        private System.Windows.Forms.Label AudioPreviewNote;
         private OpenTK.GLControl glControl1;
         private System.Windows.Forms.ContextMenuStrip contextMenuStrip1;
         private System.Windows.Forms.ToolStripMenuItem showOriginalFileToolStripMenuItem;
@@ -1221,4 +1221,3 @@
         private System.Windows.Forms.ToolStripMenuItem toolStripMenuItem15;
     }
 }
-

@@ -255,10 +255,7 @@ namespace AssetStudio.Avalonia.Controls
 
             try
             {
-                if (!FFmpegInitializer.IsInitialized)
-                {
-                    FFmpegInitializer.Initialize(null, true, true);
-                }
+                FFmpegRuntime.Initialize();
 
                 _audioPlayerFactoryFunc = AudioPlayerFactory;
                 _autoPlayCached = AutoPlay;

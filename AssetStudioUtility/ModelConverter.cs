@@ -1319,10 +1319,16 @@ namespace AssetStudio
                     var m_Clip = animationClip.m_MuscleClip.m_Clip;
                     var streamedFrames = m_Clip.m_StreamedClip.ReadData();
                     var m_ClipBindingConstant = animationClip.m_ClipBindingConstant ?? m_Clip.ConvertValueArrayToGenericBinding();
+                    float[] streamedValues = null;
                     for (int frameIndex = 1; frameIndex < streamedFrames.Count - 1; frameIndex++)
                     {
                         var frame = streamedFrames[frameIndex];
-                        var streamedValues = frame.keyList.Select(x => x.value).ToArray();
+                        if (streamedValues == null || streamedValues.Length < frame.keyList.Length)
+                            streamedValues = new float[frame.keyList.Length];
+
+                        for (int i = 0; i < frame.keyList.Length; i++)
+                            streamedValues[i] = frame.keyList[i].value;
+
                         for (int curveIndex = 0; curveIndex < frame.keyList.Length;)
                         {
                             ReadCurveData(iAnim, m_ClipBindingConstant, frame.keyList[curveIndex].index, frame.time, streamedValues, 0, ref curveIndex);

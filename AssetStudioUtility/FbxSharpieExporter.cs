@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
 using UkooLabs.FbxSharpie;
 using UkooLabs.FbxSharpie.Tokens;
@@ -349,13 +348,15 @@ namespace AssetStudio
 
         private void BuildPolygonVertexIndex(FbxNode geo, ImportedMesh mesh)
         {
-            var indices = new List<int>();
+            var faceCount = GetFaceCount(mesh);
+            var indices = new List<int>(faceCount * 3);
             var skippedFaces = 0;
             var meshDiag = new MeshDiagnosticInfo
             {
                 Path = mesh.Path ?? "<no path>",
                 VertexCount = mesh.VertexList.Count,
-                PolygonCount = 0
+                PolygonCount = 0,
+                Submeshes = new List<SubmeshDiagnosticInfo>(mesh.SubmeshList.Count)
             };
 
             for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
@@ -459,7 +460,7 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var normalData = new List<double>();
+            var normalData = new List<double>(GetFaceCount(mesh) * 9);
             for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
                 var sub = mesh.SubmeshList[subIdx];
@@ -492,7 +493,7 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "IndexToDirect");
 
-            var uvData = new List<double>();
+            var uvData = new List<double>(mesh.VertexList.Count * 2);
             for (int i = 0; i < mesh.VertexList.Count; i++)
             {
                 if (mesh.VertexList[i].UV?[uvIndex] != null)
@@ -510,7 +511,7 @@ namespace AssetStudio
             uvNode.AddProperty(new DoubleArrayToken(uvData.ToArray()));
             layer.AddNode(uvNode);
 
-            var uvIndices = new List<int>();
+            var uvIndices = new List<int>(GetFaceCount(mesh) * 3);
             for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
                 var sub = mesh.SubmeshList[subIdx];
@@ -540,7 +541,7 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var tangentData = new List<double>();
+            var tangentData = new List<double>(GetFaceCount(mesh) * 9);
             for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
                 var sub = mesh.SubmeshList[subIdx];
@@ -573,7 +574,7 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var colorData = new List<double>();
+            var colorData = new List<double>(GetFaceCount(mesh) * 12);
             for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
             {
                 var sub = mesh.SubmeshList[subIdx];
@@ -606,11 +607,11 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygon");
             AddSimpleNode(layer, "ReferenceInformationType", "IndexToDirect");
 
-            var materialIndexByName = new Dictionary<string, int>();
+            var materialIndexByName = new Dictionary<string, int>(materialOrder.Count);
             for (var i = 0; i < materialOrder.Count; i++)
                 materialIndexByName[materialOrder[i]] = i;
 
-            var materialIndices = new List<int>();
+            var materialIndices = new List<int>(GetFaceCount(mesh));
             foreach (var sub in mesh.SubmeshList)
             {
                 var materialIndex = 0;
@@ -681,7 +682,7 @@ namespace AssetStudio
 
         private static List<string> GetMeshMaterialOrder(ImportedMesh mesh)
         {
-            var materials = new List<string>();
+            var materials = new List<string>(mesh.SubmeshList.Count);
             var seen = new HashSet<string>();
             foreach (var sub in mesh.SubmeshList)
             {
@@ -726,8 +727,8 @@ namespace AssetStudio
                 AddSimpleNode(cluster, "Mode", "TotalOne");
                 AddSimpleNode(cluster, "UserData", "");
 
-                var indices = new List<int>();
-                var weights = new List<double>();
+                var indices = new List<int>(mesh.VertexList.Count);
+                var weights = new List<double>(mesh.VertexList.Count);
                 for (int v = 0; v < mesh.VertexList.Count; v++)
                 {
                     var vert = mesh.VertexList[v];
@@ -887,7 +888,21 @@ namespace AssetStudio
 
         private static string FixTextureFileName(string name)
         {
-            return Path.GetInvalidFileNameChars().Aggregate(name, (current, c) => current.Replace(c, '_'));
+            foreach (var c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
+
+        private static int GetFaceCount(ImportedMesh mesh)
+        {
+            var count = 0;
+            if (mesh.SubmeshList == null)
+                return count;
+
+            for (int i = 0; i < mesh.SubmeshList.Count; i++)
+                count += mesh.SubmeshList[i].FaceList?.Count ?? 0;
+
+            return count;
         }
 
         private static string GetMaterialTextureProperty(int dest)

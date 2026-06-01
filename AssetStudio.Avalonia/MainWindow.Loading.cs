@@ -686,7 +686,13 @@ namespace AssetStudio.Avalonia
                 renderers.Add(description);
             }
 
-            foreach (var obj in file.Objects)
+            AssetStudio.Object[] objectsSnapshot;
+            lock (file)
+            {
+                objectsSnapshot = file.Objects.ToArray();
+            }
+
+            foreach (var obj in objectsSnapshot)
             {
                 if (obj is Material material)
                 {

@@ -8,6 +8,8 @@ RUNTIME="linux-x64"
 SELF_CONTAINED="true"
 OUTPUT_DIR=""
 SKIP_NATIVE="false"
+SKIP_FFMPEG="false"
+FFMPEG_SOURCE_OVERRIDE="${ASSETSTUDIO_FFMPEG_SOURCE_DIR:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,8 +37,16 @@ while [[ $# -gt 0 ]]; do
             SKIP_NATIVE="true"
             shift
             ;;
+        --skip-ffmpeg)
+            SKIP_FFMPEG="true"
+            shift
+            ;;
+        --ffmpeg-source)
+            FFMPEG_SOURCE_OVERRIDE="$2"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: $0 [-c Release|Debug] [-f net10.0] [-r linux-x64] [--self-contained true|false] [-o output-dir] [--skip-native]"
+            echo "Usage: $0 [-c Release|Debug] [-f net10.0] [-r linux-x64] [--self-contained true|false] [-o output-dir] [--skip-native] [--skip-ffmpeg] [--ffmpeg-source DIR]"
             exit 0
             ;;
         *)
@@ -52,6 +62,8 @@ PUBLISH_DIR="${OUTPUT_DIR:-$DEFAULT_PUBLISH_DIR}"
 RUNTIME_FOLDER="x64"
 NATIVE_TARGET_DIR="$PUBLISH_DIR/$RUNTIME_FOLDER"
 NATIVE_BUILD_DIR="$REPO_ROOT/Texture2DDecoderNative/build"
+FFMPEG_TARGET_DIR="$NATIVE_TARGET_DIR/ffmpeg"
+FFMPEG_SOURCE_DIR="$REPO_ROOT/AssetStudio.Avalonia/Libraries/x64/ffmpeg"
 
 echo "Publishing AssetStudio.Avalonia ($CONFIGURATION, $FRAMEWORK, $RUNTIME, self-contained=$SELF_CONTAINED)"
 
@@ -80,6 +92,104 @@ if [[ "$SKIP_NATIVE" != "true" ]]; then
     cp "$NATIVE_BUILD_DIR/libTexture2DDecoderNative.so" "$PUBLISH_DIR/"
     echo "Copied libTexture2DDecoderNative.so to $NATIVE_TARGET_DIR and $PUBLISH_DIR"
 fi
+
+copy_ffmpeg_libs() {
+    local source_dir="$1"
+    local target_dir="$2"
+
+    if [[ ! -d "$source_dir" ]]; then
+        return 1
+    fi
+
+    local codec
+    codec="$(find "$source_dir" -maxdepth 3 \( -name 'libavcodec.so.62' -o -name 'libavcodec.so.62.*' \) -print -quit)"
+    if [[ -z "$codec" ]]; then
+        return 1
+    fi
+
+    rm -rf "$target_dir"
+    mkdir -p "$target_dir"
+    while IFS= read -r lib; do
+        cp -P "$lib" "$target_dir/"
+    done < <(find "$source_dir" -maxdepth 3 \( \
+        -name 'libavcodec.so*' -o \
+        -name 'libavdevice.so*' -o \
+        -name 'libavfilter.so*' -o \
+        -name 'libavformat.so*' -o \
+        -name 'libavutil.so*' -o \
+        -name 'libswscale.so*' -o \
+        -name 'libswresample.so*' \
+    \))
+
+    while IFS= read -r tool; do
+        cp -P "$tool" "$target_dir/"
+    done < <(find "$source_dir" -maxdepth 3 -type f -name 'ffplay' -perm -111)
+
+    while IFS= read -r notice; do
+        cp "$notice" "$target_dir/"
+    done < <(find "$source_dir" -maxdepth 1 -type f \( \
+        -iname 'LICENSE*' -o \
+        -iname 'COPYING*' -o \
+        -iname 'NOTICE*' -o \
+        -iname 'README*' \
+    \))
+
+    ensure_ffmpeg_soname_alias "$target_dir" "libavcodec.so.62" "libavcodec.so.62.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavdevice.so.62" "libavdevice.so.62.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavfilter.so.11" "libavfilter.so.11.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavformat.so.62" "libavformat.so.62.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavutil.so.60" "libavutil.so.60.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libswscale.so.9" "libswscale.so.9.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libswresample.so.6" "libswresample.so.6.*"
+
+    return 0
+}
+
+ensure_ffmpeg_soname_alias() {
+    local target_dir="$1"
+    local alias_name="$2"
+    local version_pattern="$3"
+    local source_file
+
+    if [[ -e "$target_dir/$alias_name" ]]; then
+        return
+    fi
+
+    source_file="$(find "$target_dir" -maxdepth 1 -name "$version_pattern" -print -quit)"
+    if [[ -n "$source_file" ]]; then
+        cp "$source_file" "$target_dir/$alias_name"
+    fi
+}
+
+ensure_ffmpeg_libs() {
+    if [[ "$RUNTIME" != "linux-x64" || "$SKIP_FFMPEG" == "true" ]]; then
+        return
+    fi
+
+    if [[ -n "$FFMPEG_SOURCE_OVERRIDE" ]]; then
+        if copy_ffmpeg_libs "$FFMPEG_SOURCE_OVERRIDE" "$FFMPEG_TARGET_DIR"; then
+            echo "Copied bundled FFmpeg libraries from $FFMPEG_SOURCE_OVERRIDE to $FFMPEG_TARGET_DIR"
+            return
+        fi
+
+        echo "FFmpeg libraries were not found in --ffmpeg-source '$FFMPEG_SOURCE_OVERRIDE'." >&2
+        echo "Expected libavcodec.so.62, libavformat.so.*, libavutil.so.*, libswscale.so.*, and libswresample.so.*." >&2
+        exit 1
+    fi
+
+    if copy_ffmpeg_libs "$FFMPEG_SOURCE_DIR" "$FFMPEG_TARGET_DIR"; then
+        echo "Copied bundled FFmpeg libraries from $FFMPEG_SOURCE_DIR to $FFMPEG_TARGET_DIR"
+        return
+    fi
+
+    echo "Bundled FFmpeg libraries were not found in $FFMPEG_SOURCE_DIR" >&2
+    echo "Place the ready-to-ship Linux x64 FFmpeg shared libraries there, or pass --ffmpeg-source DIR." >&2
+    echo "Required ABI for FFmpegVideoPlayer 2.8.0: libavcodec.so.62 plus matching libavformat/libavutil/libswscale/libswresample." >&2
+    echo "Use --skip-ffmpeg only if you intentionally want to rely on system FFmpeg." >&2
+    exit 1
+}
+
+ensure_ffmpeg_libs
 
 ICON_SRC="$REPO_ROOT/AssetStudio.Avalonia/Assets/as.png"
 if [[ -f "$ICON_SRC" ]]; then

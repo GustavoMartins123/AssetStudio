@@ -67,6 +67,11 @@ public partial class MainWindow : Window
                 {
                     return new WinMmAudioPlayer(sr, ch);
                 }
+                if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux))
+                {
+                    return null;
+                }
+
                 return FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(sr, ch);
             }
             catch
@@ -335,9 +340,14 @@ public partial class MainWindow : Window
             if (useLinuxAudioFallback)
             {
                 _linuxAudioStopwatch ??= new System.Diagnostics.Stopwatch();
+                if (!PlayLinuxAudioFallback(_currentTempAudioPath!))
+                {
+                    AudioStatusLabel.Text = "Unsupported";
+                    StatusStripUpdate("Linux audio preview could not start a bundled or system audio player.");
+                    return;
+                }
                 _linuxAudioStopwatch.Restart();
                 StartAudioClock(0);
-                PlayLinuxAudioFallback(_currentTempAudioPath!);
             }
             else if (_usingPcmWavePreview && _pcmWavePreviewPlayer != null)
             {
@@ -383,36 +393,21 @@ public partial class MainWindow : Window
         }
     }
 
-    private bool useLinuxAudioFallback => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux) && !isOpenAlSupportedCached;
-    private static bool? isOpenAlSupportedCachedVal;
-    private static bool isOpenAlSupportedCached
-    {
-        get
-        {
-            if (!isOpenAlSupportedCachedVal.HasValue)
-            {
-                isOpenAlSupportedCachedVal = IsOpenAlSupported();
-            }
-            return isOpenAlSupportedCachedVal.Value;
-        }
-    }
-
-    private static bool IsOpenAlSupported()
-    {
-        try
-        {
-            using var test = FFmpegVideoPlayer.Audio.OpenTK.AudioPlayerFactory.Create(44100, 2);
-            return test != null;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private bool useLinuxAudioFallback => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux);
 
     private static string? GetLinuxAudioPlayerCommand()
     {
-        string[] candidates = { "/usr/bin/pw-play", "/usr/bin/paplay", "/usr/bin/aplay", "/bin/aplay" };
+        var baseDir = AppContext.BaseDirectory;
+        string[] candidates =
+        {
+            Path.Combine(baseDir, "x64", "ffmpeg", "ffplay"),
+            Path.Combine(baseDir, "ffmpeg", "ffplay"),
+            Path.Combine(baseDir, "ffplay"),
+            "/usr/bin/pw-play",
+            "/usr/bin/paplay",
+            "/usr/bin/aplay",
+            "/bin/aplay"
+        };
         foreach (var c in candidates)
         {
             if (File.Exists(c)) return c;
@@ -436,10 +431,30 @@ public partial class MainWindow : Window
             var startInfo = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = playerCmd,
-                Arguments = $"\"{path}\"",
                 CreateNoWindow = true,
                 UseShellExecute = false
             };
+
+            var isFfplay = string.Equals(Path.GetFileName(playerCmd), "ffplay", StringComparison.OrdinalIgnoreCase);
+            if (isFfplay)
+            {
+                startInfo.ArgumentList.Add("-nodisp");
+                startInfo.ArgumentList.Add("-autoexit");
+                startInfo.ArgumentList.Add("-loglevel");
+                startInfo.ArgumentList.Add("error");
+            }
+            startInfo.ArgumentList.Add(path);
+
+            if (isFfplay)
+            {
+                var ffmpegDir = Path.GetDirectoryName(playerCmd);
+                if (!string.IsNullOrEmpty(ffmpegDir))
+                {
+                    startInfo.Environment["LD_LIBRARY_PATH"] = string.IsNullOrEmpty(startInfo.Environment["LD_LIBRARY_PATH"])
+                        ? ffmpegDir
+                        : ffmpegDir + Path.PathSeparator + startInfo.Environment["LD_LIBRARY_PATH"];
+                }
+            }
 
             _linuxAudioProcess = System.Diagnostics.Process.Start(startInfo);
             _isLinuxAudioPaused = false;
@@ -599,7 +614,7 @@ public partial class MainWindow : Window
             _usingPcmWavePreview = false;
             _audioPreviewSourceDescription = formatExtension.ToUpperInvariant().TrimStart('.');
 
-            var preferTranscode = Environment.GetEnvironmentVariable("ASSETSTUDIO_PREFER_TRANSCODE_PREVIEW") == "1";
+            var preferTranscode = useLinuxAudioFallback || Environment.GetEnvironmentVariable("ASSETSTUDIO_PREFER_TRANSCODE_PREVIEW") == "1";
             var shouldTranscode = ShouldTranscodeAudioForPreview(formatExtension, preferTranscode);
 
             if (shouldTranscode)
@@ -743,46 +758,7 @@ public partial class MainWindow : Window
             ? (long)(audioClip.m_Length * 1000.0f)
             : 0;
 
-        try
-        {
-            var bank = Fmod5Sharp.FsbLoader.LoadFsbFromByteArray(audioData);
-            if (bank.Samples != null && bank.Samples.Count > 0)
-            {
-                var sample = bank.Samples[0];
-                if (durationMs <= 0 && sample.Metadata != null && sample.Metadata.Frequency > 0)
-                {
-                    durationMs = (long)((double)sample.Metadata.SampleCount / sample.Metadata.Frequency * 1000.0);
-                }
-
-                if (bank.Header.AudioType == Fmod5Sharp.FmodTypes.FmodAudioType.MPEG)
-                {
-                    if (sample.SampleBytes != null && sample.SampleBytes.Length > 4)
-                    {
-                        var detected = DetectAudioExtension(sample.SampleBytes, ".mp3");
-                        if (!detected.Equals(".bin", StringComparison.OrdinalIgnoreCase)
-                            && !detected.Equals(".fsb", StringComparison.OrdinalIgnoreCase))
-                        {
-                            rebuiltData = sample.SampleBytes;
-                            rebuiltExtension = detected;
-                        }
-                    }
-                }
-                else if (sample.RebuildAsStandardFileFormat(out var dataBytes, out var fileExtension))
-                {
-                    rebuiltData = TrimWaveContainer(dataBytes);
-                    rebuiltExtension = NormalizeAudioExtension(fileExtension ?? fallbackExtension);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.Log(LoggerEvent.Debug, $"Audio preview FSB analysis skipped for {audioClip.m_Name}: {ex.Message}");
-        }
-
-        if (rebuiltData != null && rebuiltData.Length > 4)
-        {
-            rebuiltExtension = DetectAudioExtension(rebuiltData, rebuiltExtension);
-        }
+        rebuiltExtension = DetectAudioExtension(audioData, rebuiltExtension);
 
         return new AudioPreviewAnalysis(rebuiltData, rebuiltExtension, durationMs);
     }
@@ -797,7 +773,7 @@ public partial class MainWindow : Window
         return NormalizeAudioExtension(extension).ToLowerInvariant() switch
         {
             ".wav" => false,
-            ".aac" or ".aif" or ".aiff" or ".flac" or ".m4a" or ".mp3" or ".ogg"
+            ".aac" or ".aif" or ".aiff" or ".flac" or ".fsb" or ".m4a" or ".mp3" or ".ogg"
                 or ".it" or ".mod" or ".s3m" or ".xm" => true,
             _ => false
         };

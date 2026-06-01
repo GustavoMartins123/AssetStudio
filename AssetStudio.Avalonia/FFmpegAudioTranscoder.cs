@@ -1,5 +1,4 @@
 using FFmpeg.AutoGen;
-using FFmpegVideoPlayer.Core;
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -38,7 +37,7 @@ internal static unsafe class FFmpegAudioTranscoder
 
         try
         {
-            FFmpegInitializer.Initialize();
+            FFmpegRuntime.Initialize();
 
             var openInputResult = ffmpeg.avformat_open_input(&formatContext, inputPath, null, null);
             if (openInputResult < 0)
