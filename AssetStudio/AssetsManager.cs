@@ -631,10 +631,30 @@ namespace AssetStudio
                     // merge split files and load the result
                     foreach (string basePath in splitFiles)
                     {
+                        Stream splitStream = null;
                         try
                         {
-                            Stream splitStream = new MemoryStream();
+                            long totalSize = 0;
                             int i = 0;
+                            while (true)
+                            {
+                                string path = $"{basePath}.split{i++}";
+                                ZipArchiveEntry entry = archive.GetEntry(path);
+                                if (entry == null)
+                                    break;
+                                totalSize += entry.Length;
+                            }
+
+                            if (BundleFile.ShouldUseTemporaryStream(totalSize))
+                            {
+                                splitStream = BundleFile.CreateTemporaryStream(basePath, "split");
+                            }
+                            else
+                            {
+                                splitStream = new MemoryStream((int)totalSize);
+                            }
+
+                            i = 0;
                             while (true)
                             {
                                 string path = $"{basePath}.split{i++}";
@@ -652,6 +672,7 @@ namespace AssetStudio
                         }
                         catch (Exception e)
                         {
+                            splitStream?.Dispose();
                             Logger.Error($"Error while reading zip split file {basePath}", e);
                         }
                     }
@@ -659,13 +680,20 @@ namespace AssetStudio
                     // load all entries
                     foreach (ZipArchiveEntry entry in archive.Entries)
                     {
+                        Stream streamReader = null;
                         try
                         {
                             string dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), reader.FileName, entry.FullName);
-                            // create a new stream
-                            // - to store the deflated stream in
-                            // - to keep the data for later extraction
-                            Stream streamReader = new MemoryStream((int)entry.Length);
+                            
+                            if (BundleFile.ShouldUseTemporaryStream(entry.Length))
+                            {
+                                streamReader = BundleFile.CreateTemporaryStream(dummyPath, "zipentry");
+                            }
+                            else
+                            {
+                                streamReader = new MemoryStream((int)entry.Length);
+                            }
+
                             using (Stream entryStream = entry.Open())
                             {
                                 entryStream.CopyTo(streamReader);
@@ -685,6 +713,7 @@ namespace AssetStudio
                         }
                         catch (Exception e)
                         {
+                            streamReader?.Dispose();
                             Logger.Error($"Error while reading zip entry {entry.FullName}", e);
                         }
                     }

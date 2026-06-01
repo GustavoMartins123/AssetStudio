@@ -378,12 +378,12 @@ namespace AssetStudio
             }
         }
 
-        private static bool ShouldUseTemporaryStream(long size)
+        internal static bool ShouldUseTemporaryStream(long size)
         {
             return size >= int.MaxValue || (LowMemoryMode && size >= LowMemoryThreshold);
         }
 
-        private static FileStream CreateTemporaryStream(string sourcePath, string kind)
+        internal static FileStream CreateTemporaryStream(string sourcePath, string kind)
         {
             var tempDirectory = GetTemporaryDirectory();
             Directory.CreateDirectory(tempDirectory);

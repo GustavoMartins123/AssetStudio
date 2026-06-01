@@ -77,16 +77,17 @@ namespace AssetStudio
             }
             try
             {
-                reader.GetData(buff);
-            }
-            catch (Exception ex)
-            {
-                BigArrayPool<byte>.Shared.Return(buff);
-                Logger.Warning($"Failed to read texture data: {ex.Message}");
-                return false;
-            }
-            switch (m_TextureFormat)
-            {
+                try
+                {
+                    reader.GetData(buff);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to read texture data: {ex.Message}");
+                    return false;
+                }
+                switch (m_TextureFormat)
+                {
                 case TextureFormat.Alpha8: //test pass
                     flag = DecodeAlpha8(buff, bytes);
                     break;
@@ -271,7 +272,11 @@ namespace AssetStudio
                     flag = DecodeRGBA64(buff, bytes);
                     break;
             }
-            BigArrayPool<byte>.Shared.Return(buff);
+            }
+            finally
+            {
+                BigArrayPool<byte>.Shared.Return(buff);
+            }
             return flag;
         }
 
