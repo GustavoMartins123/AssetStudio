@@ -312,6 +312,11 @@ public sealed class ProjectManagerStore
         return reader.Read() ? ReadProject(reader) : null;
     }
 
+    internal ProjectIndexingState? LoadLatestIndexingState(string projectRoot)
+    {
+        return _indexCache.LoadLatestIndexingState(projectRoot);
+    }
+
     public void SaveProject(ManagedProject project)
     {
         if (string.IsNullOrWhiteSpace(project.Id))

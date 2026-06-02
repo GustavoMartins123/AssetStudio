@@ -8,6 +8,7 @@ using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
@@ -42,10 +43,12 @@ public partial class ProjectManagerWindow : Window
     private async void RefreshProjects(string? selectProjectId = null)
     {
         _projects.Clear();
-        var projects = await Task.Run(() => _store.GetProjects());
+        var projects = await Task.Run(() => _store.GetProjects()
+            .Select(project => (Project: project, IndexingState: _store.LoadLatestIndexingState(project.ProjectRoot)))
+            .ToList());
         foreach (var project in projects)
         {
-            _projects.Add(new ProjectListItem(project, _defaultIcon));
+            _projects.Add(new ProjectListItem(project.Project, _defaultIcon, project.IndexingState));
         }
 
         EmptyProjectsText.IsVisible = _projects.Count == 0;
@@ -267,6 +270,7 @@ public partial class ProjectManagerWindow : Window
             DetailLastExport.Text = "-";
             DetailDates.Text = "-";
             DetailStats.Text = "-";
+            DetailIndexing.Text = "-";
             return;
         }
 
@@ -284,6 +288,7 @@ public partial class ProjectManagerWindow : Window
             $"Updated: {FormatDate(project.UpdatedAtUtc)}  |  " +
             $"Last accessed: {FormatNullableDate(project.LastAccessedAtUtc)}";
         DetailStats.Text = selected.StatsDetail;
+        DetailIndexing.Text = selected.IndexingDetail;
     }
 
     private async void OpenProject(string projectId)
@@ -356,9 +361,14 @@ public partial class ProjectManagerWindow : Window
 
     private sealed class ProjectListItem
     {
-        public ProjectListItem(ManagedProject project, Bitmap? defaultIcon)
+        private readonly ProjectIndexingState? _indexingState;
+        private readonly string _indexingListDisplay;
+
+        public ProjectListItem(ManagedProject project, Bitmap? defaultIcon, ProjectIndexingState? indexingState)
         {
             Project = project;
+            _indexingState = indexingState;
+            _indexingListDisplay = FormatIndexingListDisplay(indexingState);
             Icon = LoadBitmap(project.IconPath) ?? defaultIcon;
         }
 
@@ -369,6 +379,9 @@ public partial class ProjectManagerWindow : Window
         public string LastAccessedDisplay => Project.LastAccessedAtUtc.HasValue
             ? "Last opened " + FormatDate(Project.LastAccessedAtUtc.Value)
             : "Never opened";
+        public string IndexingListDisplay => _indexingListDisplay;
+        public bool HasIndexingDisplay => !string.IsNullOrWhiteSpace(_indexingListDisplay);
+        public string IndexingDetail => FormatIndexingDetail(_indexingState);
 
         public string StatsDetail
         {
@@ -395,6 +408,83 @@ public partial class ProjectManagerWindow : Window
 
                 return $"{files} | {bundles} | {assets} | {scanned}";
             }
+        }
+
+        private static string FormatIndexingListDisplay(ProjectIndexingState? state)
+        {
+            if (state == null)
+            {
+                return string.Empty;
+            }
+
+            var counts = state.TotalFiles > 0
+                ? $"{state.ProcessedFiles:N0}/{state.TotalFiles:N0}"
+                : $"{state.ProcessedFiles:N0}";
+            return $"Indexing: {FormatIndexingStatus(state.Status)} {state.PercentComplete:0.#}% ({counts})";
+        }
+
+        private static string FormatIndexingDetail(ProjectIndexingState? state)
+        {
+            if (state == null)
+            {
+                return "No indexing state saved yet.";
+            }
+
+            var lines = new List<string>
+            {
+                $"{FormatIndexingStatus(state.Status)}, {state.PercentComplete:0.#}% ({FormatIndexingCounts(state)})"
+            };
+
+            if (!string.IsNullOrWhiteSpace(state.CurrentFile))
+            {
+                lines.Add("Current file: " + Path.GetFileName(state.CurrentFile));
+            }
+
+            if (!string.IsNullOrWhiteSpace(state.LastReadFile))
+            {
+                lines.Add("Last read file: " + Path.GetFileName(state.LastReadFile));
+            }
+
+            if (state.UpdatedAt.HasValue)
+            {
+                lines.Add("Updated: " + FormatDate(state.UpdatedAt.Value));
+            }
+
+            if (state.CompletedAt.HasValue)
+            {
+                lines.Add("Completed: " + FormatDate(state.CompletedAt.Value));
+            }
+
+            if (state.ReadFiles.Count > 0)
+            {
+                lines.Add($"Read file list saved: {state.ReadFiles.Count:N0}");
+            }
+
+            return string.Join(Environment.NewLine, lines);
+        }
+
+        private static string FormatIndexingCounts(ProjectIndexingState state)
+        {
+            if (state.TotalFiles <= 0)
+            {
+                return $"{state.ProcessedFiles:N0} files";
+            }
+
+            return $"{state.ProcessedFiles:N0}/{state.TotalFiles:N0} files, {state.PendingFiles:N0} pending";
+        }
+
+        private static string FormatIndexingStatus(string status)
+        {
+            return (status ?? string.Empty).Trim().ToLowerInvariant() switch
+            {
+                "running" => "Running",
+                "paused" => "Paused",
+                "cancelling" => "Stopping",
+                "cancelled" => "Cancelled",
+                "completed" => "Complete",
+                "failed" => "Failed",
+                _ => "Unknown"
+            };
         }
 
         private static Bitmap? LoadBitmap(string path)

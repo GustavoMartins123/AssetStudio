@@ -48,6 +48,7 @@
                                             <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
                                             <TextBlock Text="{Binding RootDisplay}" FontSize="12" Opacity="0.72" TextTrimming="CharacterEllipsis" />
                                             <TextBlock Text="{Binding LastAccessedDisplay}" FontSize="12" Opacity="0.62" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{Binding IndexingListDisplay}" FontSize="12" Opacity="0.7" TextTrimming="CharacterEllipsis" IsVisible="{Binding HasIndexingDisplay}" />
                                         </StackPanel>
                                     </Grid>
                                 </DataTemplate>
@@ -63,7 +64,7 @@
             </Border>
 
             <Border Grid.Column="1" BorderThickness="1" BorderBrush="Gray" Padding="16">
-                <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,*" RowSpacing="12">
+                <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,*" RowSpacing="12">
                     <DockPanel Grid.Row="0" LastChildFill="True">
                         <Image x:Name="DetailIcon" DockPanel.Dock="Right" Width="72" Height="72" Stretch="Uniform" />
                         <StackPanel>
@@ -97,7 +98,12 @@
                         <TextBlock x:Name="DetailStats" Grid.Column="1" Text="-" TextWrapping="Wrap" />
                     </Grid>
 
-                    <StackPanel Grid.Row="6" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+                    <Grid Grid.Row="6" ColumnDefinitions="150,*" ColumnSpacing="12">
+                        <TextBlock Text="Indexing" FontWeight="SemiBold" />
+                        <TextBlock x:Name="DetailIndexing" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                    </Grid>
+
+                    <StackPanel Grid.Row="7" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" VerticalAlignment="Bottom">
                         <Button x:Name="EditProjectButton" Click="EditProject_Click" MinWidth="92" IsEnabled="False">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />

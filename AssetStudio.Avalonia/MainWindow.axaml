@@ -273,7 +273,16 @@
 
             <TabControl x:Name="RightTabControl" Grid.Column="2" Margin="2" SelectionChanged="RightTabControl_SelectionChanged">
                 <TabItem Header="Preview">
-                    <Panel Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
+                    <Grid RowDefinitions="Auto,*" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
+                        <Border x:Name="IndexingProgressPanel" Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="10,7" IsVisible="False">
+                            <Grid RowDefinitions="Auto,4" ColumnDefinitions="*,Auto" RowSpacing="5" ColumnSpacing="12">
+                                <TextBlock x:Name="IndexingProgressText" Text="Indexing" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                <TextBlock x:Name="IndexingProgressPercentText" Grid.Column="1" Text="0%" FontSize="12" FontFamily="Monospace" Opacity="0.82" VerticalAlignment="Center" />
+                                <ProgressBar x:Name="IndexingProgressBar" Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="0" Height="4" />
+                            </Grid>
+                        </Border>
+
+                        <Panel Grid.Row="1" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
                         <Border x:Name="TextAssetPreviewPanel" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False">
                             <Grid RowDefinitions="Auto,*">
@@ -465,7 +474,8 @@
                                 </WrapPanel>
                             </Grid>
                         </Border>
-                    </Panel>
+                        </Panel>
+                    </Grid>
                 </TabItem>
                 <TabItem Header="Dump">
                     <TextBox x:Name="DumpTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" FontFamily="Monospace" />

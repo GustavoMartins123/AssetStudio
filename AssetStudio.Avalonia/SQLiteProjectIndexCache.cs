@@ -653,6 +653,23 @@ namespace AssetStudio.Avalonia
             return id == null ? null : Convert.ToInt64(id);
         }
 
+        private static long? FindLatestProjectId(SqliteConnection conn, SqliteTransaction transaction, string folderPath)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT Id
+                FROM Projects
+                WHERE FolderPath = @path COLLATE NOCASE
+                   OR FolderPath = @trimmedPath COLLATE NOCASE
+                ORDER BY LastIndexed DESC, Id DESC
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@path", folderPath);
+            cmd.Parameters.AddWithValue("@trimmedPath", folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            var id = cmd.ExecuteScalar();
+            return id == null ? null : Convert.ToInt64(id);
+        }
+
         internal void SaveIndexingProgress(
             string folderPath,
             string signature,
@@ -772,57 +789,7 @@ namespace AssetStudio.Avalonia
                     return null;
                 }
 
-                ProjectIndexingState? state = null;
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        SELECT Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
-                               CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt
-                        FROM ProjectIndexingState
-                        WHERE ProjectId = @projectId
-                        LIMIT 1";
-                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
-                    using var reader = cmd.ExecuteReader();
-                    if (reader.Read())
-                    {
-                        state = new ProjectIndexingState
-                        {
-                            Status = reader.GetString(0),
-                            TotalFiles = reader.GetInt32(1),
-                            ProcessedFiles = reader.GetInt32(2),
-                            PendingFiles = reader.GetInt32(3),
-                            PercentComplete = reader.GetDouble(4),
-                            CurrentFile = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
-                            LastReadFile = reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
-                            StartedAt = ReadNullableDateTime(reader, 7),
-                            UpdatedAt = ReadNullableDateTime(reader, 8),
-                            CompletedAt = ReadNullableDateTime(reader, 9)
-                        };
-                    }
-                }
-
-                if (state == null)
-                {
-                    return null;
-                }
-
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        SELECT FilePath
-                        FROM IndexingReadFiles
-                        WHERE ProjectId = @projectId
-                        ORDER BY ReadOrder, Id";
-                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
-                    using var reader = cmd.ExecuteReader();
-                    while (reader.Read())
-                    {
-                        state.ReadFiles.Add(reader.IsDBNull(0) ? string.Empty : reader.GetString(0));
-                    }
-                }
-
+                var state = LoadIndexingState(conn, transaction, projectId.Value);
                 transaction.Commit();
                 return state;
             }
@@ -831,6 +798,91 @@ namespace AssetStudio.Avalonia
                 Logger.Warning($"Failed to load indexing progress: {ex.Message}");
                 return null;
             }
+        }
+
+        internal ProjectIndexingState? LoadLatestIndexingState(string folderPath)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return null;
+            }
+
+            EnsureInitialized();
+            try
+            {
+                using var conn = CreateConnection();
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindLatestProjectId(conn, transaction, folderPath);
+                if (projectId == null)
+                {
+                    return null;
+                }
+
+                var state = LoadIndexingState(conn, transaction, projectId.Value);
+                transaction.Commit();
+                return state;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load latest indexing progress: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static ProjectIndexingState? LoadIndexingState(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            ProjectIndexingState? state = null;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                           CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt
+                    FROM ProjectIndexingState
+                    WHERE ProjectId = @projectId
+                    LIMIT 1";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                using var reader = cmd.ExecuteReader();
+                if (reader.Read())
+                {
+                    state = new ProjectIndexingState
+                    {
+                        Status = reader.GetString(0),
+                        TotalFiles = reader.GetInt32(1),
+                        ProcessedFiles = reader.GetInt32(2),
+                        PendingFiles = reader.GetInt32(3),
+                        PercentComplete = reader.GetDouble(4),
+                        CurrentFile = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                        LastReadFile = reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+                        StartedAt = ReadNullableDateTime(reader, 7),
+                        UpdatedAt = ReadNullableDateTime(reader, 8),
+                        CompletedAt = ReadNullableDateTime(reader, 9)
+                    };
+                }
+            }
+
+            if (state == null)
+            {
+                return null;
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT FilePath
+                    FROM IndexingReadFiles
+                    WHERE ProjectId = @projectId
+                    ORDER BY ReadOrder, Id";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    state.ReadFiles.Add(reader.IsDBNull(0) ? string.Empty : reader.GetString(0));
+                }
+            }
+
+            return state;
         }
 
         private static bool IsTerminalIndexingStatus(string? status)

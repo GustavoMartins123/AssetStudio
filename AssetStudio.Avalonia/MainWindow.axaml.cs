@@ -333,6 +333,113 @@ public partial class MainWindow : Window
         Dispatcher.UIThread.Post(() => ViewModel.LoadingProgress = value);
     }
 
+    private void ShowIndexingProgressPanel(IndexingProgressUpdate update)
+    {
+        if (update == null)
+        {
+            return;
+        }
+
+        ShowIndexingProgressPanel(
+            update.Status,
+            update.ProcessedFiles,
+            update.TotalFiles,
+            update.PendingFiles,
+            update.PercentComplete,
+            update.CurrentFile,
+            update.LastReadFile,
+            null);
+    }
+
+    private void ShowIndexingProgressPanel(ProjectIndexingState state)
+    {
+        if (state == null)
+        {
+            return;
+        }
+
+        ShowIndexingProgressPanel(
+            state.Status,
+            state.ProcessedFiles,
+            state.TotalFiles,
+            state.PendingFiles,
+            state.PercentComplete,
+            state.CurrentFile,
+            state.LastReadFile,
+            state.UpdatedAt);
+    }
+
+    private void ShowIndexingProgressPanel(
+        string status,
+        int processedFiles,
+        int totalFiles,
+        int pendingFiles,
+        double percentComplete,
+        string currentFile,
+        string lastReadFile,
+        DateTime? updatedAt)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => ShowIndexingProgressPanel(
+                status,
+                processedFiles,
+                totalFiles,
+                pendingFiles,
+                percentComplete,
+                currentFile,
+                lastReadFile,
+                updatedAt));
+            return;
+        }
+
+        var percent = Math.Clamp(percentComplete, 0, 100);
+        var filePath = !string.IsNullOrWhiteSpace(currentFile) ? currentFile : lastReadFile;
+        var fileName = string.IsNullOrWhiteSpace(filePath) ? string.Empty : Path.GetFileName(filePath);
+        var countText = totalFiles > 0
+            ? $"{processedFiles:N0}/{totalFiles:N0} files"
+            : $"{processedFiles:N0} files";
+        var pendingText = pendingFiles > 0 ? $" | {pendingFiles:N0} pending" : string.Empty;
+        var fileText = string.IsNullOrWhiteSpace(fileName)
+            ? string.Empty
+            : $" | {(string.IsNullOrWhiteSpace(currentFile) ? "Last" : "Now")}: {fileName}";
+        var updatedText = updatedAt.HasValue
+            ? $" | Updated {updatedAt.Value.ToLocalTime():HH:mm:ss}"
+            : string.Empty;
+
+        IndexingProgressPanel.IsVisible = true;
+        IndexingProgressText.Text = $"{BuildIndexingProgressTitle(status)}: {countText}{pendingText}{fileText}{updatedText}";
+        IndexingProgressPercentText.Text = $"{percent:0.#}%";
+        IndexingProgressBar.Value = percent;
+    }
+
+    private void HideIndexingProgressPanel()
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(HideIndexingProgressPanel);
+            return;
+        }
+
+        IndexingProgressPanel.IsVisible = false;
+        IndexingProgressText.Text = string.Empty;
+        IndexingProgressPercentText.Text = "0%";
+        IndexingProgressBar.Value = 0;
+    }
+
+    private static string BuildIndexingProgressTitle(string status)
+    {
+        return (status ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "paused" => "Indexing paused",
+            "cancelling" => "Stopping indexing",
+            "cancelled" => "Indexing cancelled",
+            "completed" => "Indexing complete",
+            "failed" => "Indexing failed",
+            _ => "Indexing"
+        };
+    }
+
     private void PrioritizeUserInteraction(int milliseconds = UserInteractionPriorityMilliseconds)
     {
         var now = Stopwatch.GetTimestamp();
@@ -1436,6 +1543,7 @@ public partial class MainWindow : Window
                         : Path.GetFileName(previousIndexingState.LastReadFile);
                     StatusStripUpdate(
                         $"Previous indexing state: {previousIndexingState.Status}, {previousIndexingState.PercentComplete:0.##}% complete, last file: {lastReadFile}");
+                    ShowIndexingProgressPanel(previousIndexingState);
                 }
             }
 
@@ -1463,6 +1571,7 @@ public partial class MainWindow : Window
                 progressBar.Value = 100;
                 var count = AppendNewLazyAssetsFromProjectIndex();
                 StatusStripUpdate($"Loaded from cache. Total assets: {count:N0}");
+                HideIndexingProgressPanel();
                 BuildAssetStructures(incremental: false);
                 return;
             }
@@ -1482,6 +1591,7 @@ public partial class MainWindow : Window
         ViewModel.IsPauseEnabled = true;
         ViewModel.IsResumeEnabled = false;
         ViewModel.IsStopEnabled = true;
+        ShowIndexingProgressPanel("running", 0, files.Count, files.Count, 0, string.Empty, string.Empty, null);
 
         var activeFilters = filterTypeAll.IsChecked != true
             ? GetFilterTypeItems()
@@ -1531,6 +1641,7 @@ public partial class MainWindow : Window
             update =>
             {
                 TrySaveIndexingProgress(paths, update);
+                ShowIndexingProgressPanel(update);
             },
             (wasCancelled, finalLoadedCount, originalTotal) =>
             {
