@@ -3,9 +3,11 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="using:AssetStudio.Avalonia"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
         xmlns:ffmpeg="using:AssetStudio.Avalonia.Controls"
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
         Title="AssetStudio (Avalonia Linux Port)"
         Icon="/Assets/as.png"
         Width="1264" Height="681"
@@ -61,7 +63,7 @@
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
-                    <TextBox x:Name="SpecifyUnityVersionTextBox" Width="140" PlaceholderText="2020.3.48f1" />
+                    <TextBox x:Name="SpecifyUnityVersionTextBox" Width="140" PlaceholderText="2020.3.48f1" Text="{Binding SpecifyUnityVersion, Mode=TwoWay}" />
                 </MenuItem>
                 <MenuItem Header="Export options" Click="ShowExportOptions_Click">
                     <MenuItem.Icon>
@@ -181,16 +183,16 @@
                     </MenuItem.Icon>
                 </MenuItem>
             </MenuItem>
-            <MenuItem x:Name="indexingMenu" Header="_Indexing" IsVisible="False">
-                <MenuItem x:Name="pauseIndexingMenu" Header="Pause Indexing" Click="PauseIndexing_Click" />
-                <MenuItem x:Name="resumeIndexingMenu" Header="Resume Indexing" Click="ResumeIndexing_Click" IsEnabled="False" />
-                <MenuItem x:Name="stopIndexingMenu" Header="Stop/Cancel Indexing" Click="StopIndexing_Click" />
+            <MenuItem x:Name="indexingMenu" Header="_Indexing" IsVisible="{Binding IsIndexingActive}">
+                <MenuItem x:Name="pauseIndexingMenu" Header="Pause Indexing" Click="PauseIndexing_Click" IsEnabled="{Binding IsPauseEnabled}" />
+                <MenuItem x:Name="resumeIndexingMenu" Header="Resume Indexing" Click="ResumeIndexing_Click" IsEnabled="{Binding IsResumeEnabled}" />
+                <MenuItem x:Name="stopIndexingMenu" Header="Stop/Cancel Indexing" Click="StopIndexing_Click" IsEnabled="{Binding IsStopEnabled}" />
             </MenuItem>
         </Menu>
 
         <Grid DockPanel.Dock="Bottom" ColumnDefinitions="*, Auto" Height="24" Margin="2,0">
-            <ProgressBar x:Name="progressBar" Grid.Column="0" Height="20" Minimum="0" Maximum="100" Value="0" />
-            <TextBlock x:Name="statusLabel" Grid.Column="1" VerticalAlignment="Center" Margin="6,0,4,0" Text="Ready" />
+            <ProgressBar x:Name="progressBar" Grid.Column="0" Height="20" Minimum="0" Maximum="100" Value="{Binding LoadingProgress}" />
+            <TextBlock x:Name="statusLabel" Grid.Column="1" VerticalAlignment="Center" Margin="6,0,4,0" Text="{Binding StatusText}" />
         </Grid>
 
         <Grid ColumnDefinitions="7*, 5, 3*">

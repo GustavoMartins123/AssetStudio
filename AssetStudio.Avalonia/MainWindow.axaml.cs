@@ -24,11 +24,14 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using FFmpegVideoPlayer.Core;
+using AssetStudio.Avalonia.ViewModels;
+using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia;
 
 public partial class MainWindow : Window
 {
+    public MainWindowViewModel ViewModel { get; }
     private AssetsManager assetsManager = new AssetsManager();
     private List<AssetItem> exportableAssets = new List<AssetItem>();
     private Texture2D? currentPreviewTexture;
@@ -53,7 +56,7 @@ public partial class MainWindow : Window
     private readonly BulkObservableCollection<AssetItem> visibleAssetItems = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
-    private System.Diagnostics.Stopwatch? _indexingUiThrottleStopwatch;
+
     private AssetClassItem? classFilterOverride;
     private List<GameObjectNode> sceneTreeNodes = new List<GameObjectNode>();
     private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
@@ -94,10 +97,6 @@ public partial class MainWindow : Window
     private readonly SQLiteProjectIndexCache _sqliteCache = new();
     private ProjectScanResult? currentScanResult;
     private bool isBuildingAssetStructures;
-    private CancellationTokenSource? indexingCts;
-    private bool isIndexingPaused;
-    private Task? indexingTask;
-    private List<string> pendingFilesToIndex = new List<string>();
     private readonly ConcurrentDictionary<string, string> lazySourcePathBySerializedFile = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> lazySourceFileSearchCache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -119,6 +118,10 @@ public partial class MainWindow : Window
 
     public MainWindow(ProjectLaunchContext? projectContext)
     {
+        var loadingService = new AssetLoadingService();
+        ViewModel = new MainWindowViewModel(loadingService);
+        DataContext = ViewModel;
+
         this.projectContext = projectContext;
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
@@ -140,7 +143,7 @@ public partial class MainWindow : Window
         displayAll.IsChecked = appSettings.DisplayAll;
         displayInfo.IsChecked = appSettings.DisplayInfo;
         enablePreview.IsChecked = appSettings.EnablePreview;
-        SpecifyUnityVersionTextBox.Text = appSettings.SpecifyUnityVersion;
+        ViewModel.SpecifyUnityVersion = appSettings.SpecifyUnityVersion ?? string.Empty;
         SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
         ApplyUnityVersionOption();
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
@@ -319,7 +322,7 @@ public partial class MainWindow : Window
             _statusUpdatePending = true;
             Dispatcher.UIThread.Post(() =>
             {
-                statusLabel.Text = _pendingStatusText;
+                ViewModel.StatusText = _pendingStatusText ?? string.Empty;
                 _statusUpdatePending = false;
             }, DispatcherPriority.Background);
         }
@@ -327,7 +330,7 @@ public partial class MainWindow : Window
 
     private void SetProgressBarValue(int value)
     {
-        Dispatcher.UIThread.Post(() => progressBar.Value = value);
+        Dispatcher.UIThread.Post(() => ViewModel.LoadingProgress = value);
     }
 
     private void PrioritizeUserInteraction(int milliseconds = UserInteractionPriorityMilliseconds)
@@ -363,9 +366,7 @@ public partial class MainWindow : Window
 
     private bool IsProgressiveIndexingActive()
     {
-        return indexingTask is { IsCompleted: false }
-            && indexingCts != null
-            && !indexingCts.IsCancellationRequested;
+        return ViewModel.LoadingService.IsIndexingActive;
     }
 
 
@@ -457,17 +458,9 @@ public partial class MainWindow : Window
         classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
-        if (indexingCts != null)
-        {
-            indexingCts.Cancel();
-            indexingCts.Dispose();
-            indexingCts = null;
-        }
-        if (indexingMenu != null)
-        {
-            indexingMenu.IsVisible = false;
-        }
-        progressBar.Value = 0;
+        ViewModel.LoadingService.StopIndexing();
+        ViewModel.IsIndexingActive = false;
+        ViewModel.LoadingProgress = 0;
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
 
@@ -495,7 +488,7 @@ public partial class MainWindow : Window
 
     private void ApplyUnityVersionOption()
     {
-        assetsManager.SpecifyUnityVersion = SpecifyUnityVersionTextBox.Text?.Trim() ?? string.Empty;
+        assetsManager.SpecifyUnityVersion = ViewModel.SpecifyUnityVersion?.Trim() ?? string.Empty;
         if (appSettings.SpecifyUnityVersion != assetsManager.SpecifyUnityVersion)
         {
             appSettings.SpecifyUnityVersion = assetsManager.SpecifyUnityVersion;
@@ -1471,191 +1464,70 @@ public partial class MainWindow : Window
 
     private void StartProgressiveIndexing(List<string> files, string[] paths)
     {
-        if (indexingCts != null)
-        {
-            indexingCts.Cancel();
-            indexingCts.Dispose();
-        }
+        ViewModel.IsIndexingActive = true;
+        ViewModel.IsPauseEnabled = true;
+        ViewModel.IsResumeEnabled = false;
+        ViewModel.IsStopEnabled = true;
 
-        indexingCts = new CancellationTokenSource();
-        var token = indexingCts.Token;
-        isIndexingPaused = false;
-        pendingFilesToIndex = files.ToList();
-        _indexingUiThrottleStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var activeFilters = filterTypeAll.IsChecked != true
+            ? GetFilterTypeItems()
+                .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+                .Select(x => (ClassIDType)x.Tag!)
+                .ToList()
+            : new List<ClassIDType>();
 
-        indexingMenu.IsVisible = true;
-        pauseIndexingMenu.IsEnabled = true;
-        resumeIndexingMenu.IsEnabled = false;
-        stopIndexingMenu.IsEnabled = true;
-
-        var originalTotal = pendingFilesToIndex.Count;
-
-        indexingTask = Task.Run(async () =>
-        {
-            int batchSize = 40;
-            int loadedCount = 0;
-
-            while (pendingFilesToIndex.Count > 0)
+        ViewModel.LoadingService.StartProgressiveIndexing(
+            assetsManager,
+            files,
+            paths,
+            currentScanResult,
+            activeFilters,
+            ShouldPauseBackgroundWork,
+            WaitForUserInteractionPriorityToClearAsync,
+            (progressPercent, statusText) =>
             {
-                if (token.IsCancellationRequested)
+                Dispatcher.UIThread.Post(() =>
                 {
-                    break;
-                }
-
-                while (isIndexingPaused && !token.IsCancellationRequested)
-                {
-                    await Task.Delay(200);
-                }
-
-                if (token.IsCancellationRequested)
-                    break;
-
-                await WaitForUserInteractionPriorityToClearAsync(token);
-                if (token.IsCancellationRequested)
-                    break;
-
-                try
-                {
-                    AssetsManager.ThrowIfMemoryPressureTooHigh("progressive indexing");
-                }
-                catch (MemoryPressureException ex)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        ShowMemoryPressureError(ex);
-                        isIndexingPaused = true;
-                        pauseIndexingMenu.IsEnabled = false;
-                        resumeIndexingMenu.IsEnabled = true;
-                        StatusStripUpdate("Indexing paused due to high memory pressure.");
-                    });
-
-                    while (isIndexingPaused && !token.IsCancellationRequested)
-                    {
-                        await Task.Delay(500);
-                    }
-                    continue;
-                }
-
-                var activeFilters = await Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    if (filterTypeAll.IsChecked != true)
-                    {
-                        return GetFilterTypeItems()
-                            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
-                            .Select(x => (ClassIDType)x.Tag!)
-                            .ToList();
-                    }
-
-                    return new List<ClassIDType>();
+                    ViewModel.LoadingProgress = progressPercent;
+                    var addedAssets = AppendNewLazyAssetsFromProjectIndex();
+                    StatusStripUpdate($"{statusText} | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})");
                 });
-
-                var batch = new List<string>();
-                lock (pendingFilesToIndex)
-                {
-                    var keywords = new List<string>();
-                    if (activeFilters.Contains(ClassIDType.Texture2D) || activeFilters.Contains(ClassIDType.Sprite))
-                        keywords.AddRange(new[] { "texture", "sprite", "atlas", "image", "pic" });
-                    if (activeFilters.Contains(ClassIDType.AudioClip))
-                        keywords.AddRange(new[] { "audio", "sound", "music", "sfx", "clip" });
-                    if (activeFilters.Contains(ClassIDType.Mesh))
-                        keywords.AddRange(new[] { "mesh", "model", "geom", "3d" });
-                    if (activeFilters.Contains(ClassIDType.AnimationClip) || activeFilters.Contains(ClassIDType.Animator))
-                        keywords.AddRange(new[] { "anim", "motion", "controller" });
-                    if (activeFilters.Contains(ClassIDType.Shader))
-                        keywords.Add("shader");
-                    if (activeFilters.Contains(ClassIDType.MonoBehaviour))
-                        keywords.AddRange(new[] { "script", "behavior", "mono" });
-
-                    if (keywords.Count > 0)
-                    {
-                        for (int i = 0; i < pendingFilesToIndex.Count && batch.Count < batchSize; i++)
-                        {
-                            var file = pendingFilesToIndex[i];
-                            var fileName = Path.GetFileName(file).ToLowerInvariant();
-                            if (keywords.Any(k => fileName.Contains(k)))
-                            {
-                                batch.Add(file);
-                                pendingFilesToIndex.RemoveAt(i);
-                                i--;
-                            }
-                        }
-                    }
-
-                    while (pendingFilesToIndex.Count > 0 && batch.Count < batchSize)
-                    {
-                        batch.Add(pendingFilesToIndex[0]);
-                        pendingFilesToIndex.RemoveAt(0);
-                    }
-                }
-
-                if (batch.Count == 0)
-                    break;
-
-                await WaitForUserInteractionPriorityToClearAsync(token);
-                if (token.IsCancellationRequested)
-                    break;
-
-                try
-                {
-                    assetsManager.LoadFiles(batch.ToArray());
-                }
-                catch (Exception ex)
-                {
-                    Logger.Error($"Error loading batch of {batch.Count} files", ex);
-                }
-
-                if (assetsManager.LazyLoading)
-                {
-                    assetsManager.ClearLoadedFilesKeepIndex();
-                }
-
-                loadedCount += batch.Count;
-                var currentLoaded = loadedCount;
-                var progressPercent = (int)((double)currentLoaded / originalTotal * 100);
-
-                var shouldUpdateUi = currentLoaded < originalTotal && ShouldUpdateProgressiveIndexingUi();
-
-                if (shouldUpdateUi)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        progressBar.Value = progressPercent;
-                        var addedAssets = AppendNewLazyAssetsFromProjectIndex();
-                        StatusStripUpdate($"Indexed: {currentLoaded:N0} / {originalTotal:N0} files ({progressPercent}%) | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})");
-                    });
-                }
-            }
-
-            var finalLoadedCount = loadedCount;
-            var finalProgressPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
-            var wasCancelled = token.IsCancellationRequested;
-
-            if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !wasCancelled)
+            },
+            (ex) =>
             {
-                Dispatcher.UIThread.Post(() => StatusStripUpdate("Saving index cache to SQLite..."));
-                try
+                Dispatcher.UIThread.Post(() =>
                 {
-                    SaveIndexCache(paths[0], currentScanResult);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to save index cache: {ex.Message}");
-                }
-            }
-
-            Dispatcher.UIThread.Post(() =>
+                    ShowMemoryPressureError(ex);
+                    ViewModel.IsPauseEnabled = false;
+                    ViewModel.IsResumeEnabled = true;
+                    StatusStripUpdate("Indexing paused due to high memory pressure.");
+                });
+            },
+            () =>
             {
-                _indexingUiThrottleStopwatch?.Stop();
-                _indexingUiThrottleStopwatch = null;
-                indexingMenu.IsVisible = false;
-                progressBar.Value = wasCancelled ? finalProgressPercent : 100;
-                StatusStripUpdate(wasCancelled
-                    ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalProgressPercent}%)"
-                    : $"Indexing finished. Total files: {originalTotal:N0}");
-                AppendNewLazyAssetsFromProjectIndex();
-                BuildAssetStructures(incremental: true);
+                Dispatcher.UIThread.Post(() =>
+                {
+                    AppendNewLazyAssetsFromProjectIndex();
+                });
+            },
+            (folderPath, scanResult) =>
+            {
+                SaveIndexCache(folderPath, scanResult);
+            },
+            (wasCancelled, finalLoadedCount, originalTotal) =>
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    ViewModel.IsIndexingActive = false;
+                    var finalPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
+                    ViewModel.LoadingProgress = wasCancelled ? finalPercent : 100;
+                    StatusStripUpdate(wasCancelled
+                        ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalPercent}%)"
+                        : $"Indexing finished. Total files: {originalTotal:N0}");
+                    AppendNewLazyAssetsFromProjectIndex();
+                    BuildAssetStructures(incremental: true);
+                });
             });
-        }, token);
     }
 
     private int AppendNewLazyAssetsFromProjectIndex()
@@ -1742,52 +1614,27 @@ public partial class MainWindow : Window
         assetItem.Container = handle.Container ?? string.Empty;
     }
 
-    private bool ShouldUpdateProgressiveIndexingUi(bool force = false)
-    {
-        if (!force && ShouldPauseBackgroundWork())
-        {
-            return false;
-        }
-
-        var stopwatch = _indexingUiThrottleStopwatch;
-        if (stopwatch == null)
-        {
-            return force;
-        }
-
-        lock (stopwatch)
-        {
-            if (!force && stopwatch.ElapsedMilliseconds < ProgressiveIndexingUiThrottleMilliseconds)
-            {
-                return false;
-            }
-
-            stopwatch.Restart();
-            return true;
-        }
-    }
-
     private void PauseIndexing_Click(object? sender, RoutedEventArgs e)
     {
-        isIndexingPaused = true;
-        pauseIndexingMenu.IsEnabled = false;
-        resumeIndexingMenu.IsEnabled = true;
+        ViewModel.LoadingService.PauseIndexing();
+        ViewModel.IsPauseEnabled = false;
+        ViewModel.IsResumeEnabled = true;
         StatusStripUpdate("Indexing paused.");
         BuildAssetStructures(incremental: true);
     }
 
     private void ResumeIndexing_Click(object? sender, RoutedEventArgs e)
     {
-        isIndexingPaused = false;
-        pauseIndexingMenu.IsEnabled = true;
-        resumeIndexingMenu.IsEnabled = false;
+        ViewModel.LoadingService.ResumeIndexing();
+        ViewModel.IsPauseEnabled = true;
+        ViewModel.IsResumeEnabled = false;
         StatusStripUpdate("Resuming indexing...");
     }
 
     private void StopIndexing_Click(object? sender, RoutedEventArgs e)
     {
-        indexingCts?.Cancel();
-        indexingMenu.IsVisible = false;
+        ViewModel.LoadingService.StopIndexing();
+        ViewModel.IsIndexingActive = false;
         StatusStripUpdate("Stopping/cancelling indexing...");
     }
 
@@ -3405,17 +3252,14 @@ public partial class MainWindow : Window
             candidates.Add(Path.Combine(assetsManager.ProjectRoot, handle.SerializedFileName));
         }
 
-        lock (pendingFilesToIndex)
+        foreach (var pending in ViewModel.LoadingService.PendingFilesToIndex)
         {
-            foreach (var pending in pendingFilesToIndex)
+            var pendingFileName = GetSafeFileName(pending);
+            if (string.Equals(pending, handle.OriginalPath, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(pendingFileName, originalFileName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(pendingFileName, handle.SerializedFileName, StringComparison.OrdinalIgnoreCase))
             {
-                var pendingFileName = GetSafeFileName(pending);
-                if (string.Equals(pending, handle.OriginalPath, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(pendingFileName, originalFileName, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(pendingFileName, handle.SerializedFileName, StringComparison.OrdinalIgnoreCase))
-                {
-                    candidates.Add(pending);
-                }
+                candidates.Add(pending);
             }
         }
 
@@ -3454,16 +3298,7 @@ public partial class MainWindow : Window
 
     private void RemovePendingFileFromProgressiveQueue(string sourcePath)
     {
-        lock (pendingFilesToIndex)
-        {
-            for (int i = pendingFilesToIndex.Count - 1; i >= 0; i--)
-            {
-                if (string.Equals(Path.GetFullPath(pendingFilesToIndex[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
-                {
-                    pendingFilesToIndex.RemoveAt(i);
-                }
-            }
-        }
+        ViewModel.LoadingService.RemovePendingFile(sourcePath);
     }
 
     private void TryAttachLoadedSourceFile(AssetHandle handle)
