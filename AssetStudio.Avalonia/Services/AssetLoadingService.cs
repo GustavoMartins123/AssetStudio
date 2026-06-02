@@ -15,6 +15,12 @@ namespace AssetStudio.Avalonia.Services
         private bool _isIndexingPaused;
         private List<string> _pendingFilesToIndex = new();
         private System.Diagnostics.Stopwatch? _uiThrottleStopwatch;
+        private Action<IndexingProgressUpdate>? _indexingProgressCallback;
+        private readonly object _indexingStateLock = new();
+        private int _indexingTotalFiles;
+        private int _indexingProcessedFiles;
+        private string _currentIndexingFile = string.Empty;
+        private string _lastReadIndexingFile = string.Empty;
 
         public bool IsIndexingActive => _indexingTask != null && !_indexingTask.IsCompleted;
         public bool IsIndexingPaused => _isIndexingPaused;
@@ -32,6 +38,7 @@ namespace AssetStudio.Avalonia.Services
 
         public void RemovePendingFile(string sourcePath)
         {
+            var removed = false;
             lock (_pendingFilesToIndex)
             {
                 for (int i = _pendingFilesToIndex.Count - 1; i >= 0; i--)
@@ -39,8 +46,14 @@ namespace AssetStudio.Avalonia.Services
                     if (string.Equals(Path.GetFullPath(_pendingFilesToIndex[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
                     {
                         _pendingFilesToIndex.RemoveAt(i);
+                        removed = true;
                     }
                 }
+            }
+
+            if (removed)
+            {
+                EmitIndexingProgress(_isIndexingPaused ? "paused" : "running");
             }
         }
 
@@ -56,6 +69,7 @@ namespace AssetStudio.Avalonia.Services
             Action<MemoryPressureException> onMemoryPressureError,
             Action onBatchLoaded,
             Action<string, ProjectScanResult> saveCacheCallback,
+            Action<IndexingProgressUpdate> onIndexingProgressChanged,
             Action<bool, int, int> onFinished)
         {
             if (_indexingCts != null)
@@ -71,6 +85,15 @@ namespace AssetStudio.Avalonia.Services
             _uiThrottleStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             var originalTotal = _pendingFilesToIndex.Count;
+            lock (_indexingStateLock)
+            {
+                _indexingProgressCallback = onIndexingProgressChanged;
+                _indexingTotalFiles = originalTotal;
+                _indexingProcessedFiles = 0;
+                _currentIndexingFile = string.Empty;
+                _lastReadIndexingFile = string.Empty;
+            }
+            EmitIndexingProgress("running");
 
             _indexingTask = Task.Run(async () =>
             {
@@ -108,10 +131,16 @@ namespace AssetStudio.Avalonia.Services
                     {
                         onMemoryPressureError(ex);
                         _isIndexingPaused = true;
+                        EmitIndexingProgress("paused");
 
                         while (_isIndexingPaused && !token.IsCancellationRequested)
                         {
                             await Task.Delay(500);
+                        }
+
+                        if (!token.IsCancellationRequested)
+                        {
+                            EmitIndexingProgress("running");
                         }
                         continue;
                     }
@@ -160,6 +189,12 @@ namespace AssetStudio.Avalonia.Services
                         break;
                     }
 
+                    lock (_indexingStateLock)
+                    {
+                        _currentIndexingFile = batch[0];
+                    }
+                    EmitIndexingProgress("running");
+
                     await waitPriorityAsync(token);
                     if (token.IsCancellationRequested)
                     {
@@ -181,6 +216,14 @@ namespace AssetStudio.Avalonia.Services
                     }
 
                     loadedCount += batch.Count;
+                    lock (_indexingStateLock)
+                    {
+                        _indexingProcessedFiles = loadedCount;
+                        _lastReadIndexingFile = batch[batch.Count - 1];
+                        _currentIndexingFile = string.Empty;
+                    }
+                    EmitIndexingProgress("running", batch);
+
                     var progressPercent = (int)((double)loadedCount / originalTotal * 100);
 
                     if (loadedCount < originalTotal && ShouldUpdateUi(shouldPauseBackgroundWork))
@@ -191,6 +234,7 @@ namespace AssetStudio.Avalonia.Services
                 }
 
                 var wasCancelled = token.IsCancellationRequested;
+                EmitIndexingProgress(wasCancelled ? "cancelled" : "completed");
 
                 if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]) && !wasCancelled)
                 {
@@ -214,16 +258,62 @@ namespace AssetStudio.Avalonia.Services
         public void PauseIndexing()
         {
             _isIndexingPaused = true;
+            EmitIndexingProgress("paused");
         }
 
         public void ResumeIndexing()
         {
             _isIndexingPaused = false;
+            EmitIndexingProgress("running");
         }
 
         public void StopIndexing()
         {
+            EmitIndexingProgress("cancelling");
             _indexingCts?.Cancel();
+        }
+
+        private void EmitIndexingProgress(string status, IReadOnlyList<string>? newlyReadFiles = null)
+        {
+            Action<IndexingProgressUpdate>? callback;
+            IndexingProgressUpdate update;
+            lock (_indexingStateLock)
+            {
+                callback = _indexingProgressCallback;
+                var pendingCount = 0;
+                lock (_pendingFilesToIndex)
+                {
+                    pendingCount = _pendingFilesToIndex.Count;
+                }
+
+                update = new IndexingProgressUpdate
+                {
+                    Status = status,
+                    TotalFiles = _indexingTotalFiles,
+                    ProcessedFiles = _indexingProcessedFiles,
+                    PendingFiles = pendingCount,
+                    PercentComplete = _indexingTotalFiles <= 0
+                        ? 100
+                        : Math.Min(100, Math.Max(0, _indexingProcessedFiles * 100.0 / _indexingTotalFiles)),
+                    CurrentFile = _currentIndexingFile,
+                    LastReadFile = _lastReadIndexingFile,
+                    NewlyReadFiles = newlyReadFiles == null ? Array.Empty<string>() : newlyReadFiles.ToList()
+                };
+            }
+
+            if (callback == null)
+            {
+                return;
+            }
+
+            try
+            {
+                callback(update);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to publish indexing progress: {ex.Message}");
+            }
         }
 
         private bool ShouldUpdateUi(Func<bool> shouldPauseBackgroundWork)

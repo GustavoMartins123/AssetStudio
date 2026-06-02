@@ -1425,6 +1425,20 @@ public partial class MainWindow : Window
                 RememberLazySourcePath(file);
             }
 
+            if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
+            {
+                var previousIndexingState = TryLoadIndexingProgress(paths[0], currentScanResult);
+                if (previousIndexingState != null
+                    && !string.Equals(previousIndexingState.Status, "completed", StringComparison.OrdinalIgnoreCase))
+                {
+                    var lastReadFile = string.IsNullOrWhiteSpace(previousIndexingState.LastReadFile)
+                        ? "none"
+                        : Path.GetFileName(previousIndexingState.LastReadFile);
+                    StatusStripUpdate(
+                        $"Previous indexing state: {previousIndexingState.Status}, {previousIndexingState.PercentComplete:0.##}% complete, last file: {lastReadFile}");
+                }
+            }
+
             // Check cache
             List<AssetHandle>? cachedHandles = null;
             if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
@@ -1513,6 +1527,10 @@ public partial class MainWindow : Window
             (folderPath, scanResult) =>
             {
                 SaveIndexCache(folderPath, scanResult);
+            },
+            update =>
+            {
+                TrySaveIndexingProgress(paths, update);
             },
             (wasCancelled, finalLoadedCount, originalTotal) =>
             {
@@ -2037,6 +2055,43 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Logger.Warning($"Failed to save semantic relation cache: {ex.Message}");
+        }
+    }
+
+    private void TrySaveIndexingProgress(string[] paths, IndexingProgressUpdate update)
+    {
+        if (update == null || currentScanResult == null || paths.Length != 1 || !Directory.Exists(paths[0]))
+        {
+            return;
+        }
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+            _sqliteCache.SaveIndexingProgress(paths[0], signature, currentScanResult, update);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to persist indexing progress: {ex.Message}");
+        }
+    }
+
+    private ProjectIndexingState? TryLoadIndexingProgress(string folderPath, ProjectScanResult scanResult)
+    {
+        if (scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            return _sqliteCache.LoadIndexingState(folderPath, signature);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to load indexing progress: {ex.Message}");
+            return null;
         }
     }
 
@@ -9057,9 +9112,10 @@ public partial class MainWindow : Window
         {
             meshToMaterialsCache ??= new Dictionary<Mesh, List<Material?>>();
             meshToMaterialsCache[mesh] = materials;
+            return materials;
         }
 
-        return materials;
+        return new List<Material?>();
     }
 
     private static HashSet<string> GetPathTokens(string path)

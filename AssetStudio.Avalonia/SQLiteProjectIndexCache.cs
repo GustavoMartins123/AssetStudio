@@ -3,13 +3,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using AssetStudio.Avalonia.Services;
 using Microsoft.Data.Sqlite;
 
 namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 2;
+        private const int SemanticSchemaVersion = 3;
         private readonly string _dbPath;
 
         private readonly Task _initTask;
@@ -101,6 +102,8 @@ namespace AssetStudio.Avalonia
             {
                 cmd.CommandText = @"
                     PRAGMA foreign_keys = OFF;
+                    DROP TABLE IF EXISTS IndexingReadFiles;
+                    DROP TABLE IF EXISTS ProjectIndexingState;
                     DROP TABLE IF EXISTS PreviewCacheEntries;
                     DROP TABLE IF EXISTS MaterialTextures;
                     DROP TABLE IF EXISTS MeshMaterials;
@@ -235,6 +238,30 @@ namespace AssetStudio.Avalonia
                                 LastAccessed DATETIME DEFAULT CURRENT_TIMESTAMP
                             );
 
+                            CREATE TABLE IF NOT EXISTS ProjectIndexingState (
+                                ProjectId INTEGER PRIMARY KEY REFERENCES Projects(Id) ON DELETE CASCADE,
+                                Status TEXT NOT NULL DEFAULT 'not_started',
+                                TotalFiles INTEGER NOT NULL DEFAULT 0,
+                                ProcessedFiles INTEGER NOT NULL DEFAULT 0,
+                                PendingFiles INTEGER NOT NULL DEFAULT 0,
+                                PercentComplete REAL NOT NULL DEFAULT 0,
+                                CurrentFile TEXT NOT NULL DEFAULT '',
+                                LastReadFile TEXT NOT NULL DEFAULT '',
+                                StartedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                CompletedAt DATETIME
+                            );
+
+                            CREATE TABLE IF NOT EXISTS IndexingReadFiles (
+                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                FilePath TEXT NOT NULL,
+                                FileName TEXT NOT NULL DEFAULT '',
+                                ReadOrder INTEGER NOT NULL DEFAULT 0,
+                                ReadAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                Status TEXT NOT NULL DEFAULT 'read'
+                            );
+
                             CREATE TABLE IF NOT EXISTS CacheSchema (
                                 Key TEXT PRIMARY KEY,
                                 Value TEXT NOT NULL
@@ -257,6 +284,8 @@ namespace AssetStudio.Avalonia
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_material ON MaterialTextures(ProjectId, MaterialAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
+                            CREATE INDEX IF NOT EXISTS idx_indexing_read_files_project ON IndexingReadFiles(ProjectId, ReadOrder);
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_indexing_read_files_unique ON IndexingReadFiles(ProjectId, FilePath);
                         ";
                 cmd.ExecuteNonQuery();
             }
@@ -349,35 +378,10 @@ namespace AssetStudio.Avalonia
                 {
                     using (var transaction = conn.BeginTransaction())
                     {
-                        // 1. Delete old project entry (which deletes handles cascadingly)
-                        using (var cmd = conn.CreateCommand())
-                        {
-                            cmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path";
-                            cmd.Parameters.AddWithValue("@path", folderPath);
-                            cmd.Transaction = transaction;
-                            cmd.ExecuteNonQuery();
-                        }
+                        var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
+                        ClearIndexTablesForProject(conn, transaction, projectId);
 
-                        // 2. Insert new project entry
-                        long projectId;
-                        using (var cmd = conn.CreateCommand())
-                        {
-                            cmd.CommandText = @"
-                                INSERT INTO Projects (FolderPath, SignatureHash, TotalFiles, TotalBytes, UnityBundleCount, UnityVersion)
-                                VALUES (@path, @signature, @totalFiles, @totalBytes, @unityBundles, @unityVer);
-                                SELECT last_insert_rowid();";
-                            cmd.Parameters.AddWithValue("@path", folderPath);
-                            cmd.Parameters.AddWithValue("@signature", signature);
-                            cmd.Parameters.AddWithValue("@totalFiles", scanResult.TotalFiles);
-                            cmd.Parameters.AddWithValue("@totalBytes", scanResult.TotalBytes);
-                            cmd.Parameters.AddWithValue("@unityBundles", scanResult.UnityBundleCount);
-                            cmd.Parameters.AddWithValue("@unityVer", unityVersion ?? (object)DBNull.Value);
-                            cmd.Transaction = transaction;
-                            var scalarResult = cmd.ExecuteScalar();
-                            projectId = scalarResult != null ? Convert.ToInt64(scalarResult) : 0L;
-                        }
-
-                        // 3. Insert handles in batch using parameterized query
+                        // Insert handles in batch using parameterized query
                         using (var cmd = conn.CreateCommand())
                         {
                             cmd.CommandText = @"
@@ -424,6 +428,82 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to save SQLite index cache: {ex.Message}");
+            }
+        }
+
+        private static long EnsureProject(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            string folderPath,
+            string signature,
+            ProjectScanResult scanResult,
+            string? unityVersion = null)
+        {
+            var existingProjectId = FindProjectId(conn, transaction, folderPath, signature);
+            if (existingProjectId != null)
+            {
+                using var updateCmd = conn.CreateCommand();
+                updateCmd.Transaction = transaction;
+                updateCmd.CommandText = @"
+                    UPDATE Projects
+                    SET TotalFiles = @totalFiles,
+                        TotalBytes = @totalBytes,
+                        UnityBundleCount = @unityBundles,
+                        UnityVersion = @unityVersion,
+                        LastIndexed = CURRENT_TIMESTAMP
+                    WHERE Id = @projectId";
+                updateCmd.Parameters.AddWithValue("@projectId", existingProjectId.Value);
+                updateCmd.Parameters.AddWithValue("@totalFiles", scanResult.TotalFiles);
+                updateCmd.Parameters.AddWithValue("@totalBytes", scanResult.TotalBytes);
+                updateCmd.Parameters.AddWithValue("@unityBundles", scanResult.UnityBundleCount);
+                updateCmd.Parameters.AddWithValue("@unityVersion", unityVersion ?? string.Empty);
+                updateCmd.ExecuteNonQuery();
+                return existingProjectId.Value;
+            }
+
+            using (var deleteOldCmd = conn.CreateCommand())
+            {
+                deleteOldCmd.Transaction = transaction;
+                deleteOldCmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path";
+                deleteOldCmd.Parameters.AddWithValue("@path", folderPath);
+                deleteOldCmd.ExecuteNonQuery();
+            }
+
+            using var insertCmd = conn.CreateCommand();
+            insertCmd.Transaction = transaction;
+            insertCmd.CommandText = @"
+                INSERT INTO Projects (FolderPath, SignatureHash, TotalFiles, TotalBytes, UnityBundleCount, UnityVersion)
+                VALUES (@path, @signature, @totalFiles, @totalBytes, @unityBundles, @unityVersion);
+                SELECT last_insert_rowid();";
+            insertCmd.Parameters.AddWithValue("@path", folderPath);
+            insertCmd.Parameters.AddWithValue("@signature", signature);
+            insertCmd.Parameters.AddWithValue("@totalFiles", scanResult.TotalFiles);
+            insertCmd.Parameters.AddWithValue("@totalBytes", scanResult.TotalBytes);
+            insertCmd.Parameters.AddWithValue("@unityBundles", scanResult.UnityBundleCount);
+            insertCmd.Parameters.AddWithValue("@unityVersion", unityVersion ?? string.Empty);
+            return Convert.ToInt64(insertCmd.ExecuteScalar());
+        }
+
+        private static void ClearIndexTablesForProject(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            var tables = new[]
+            {
+                "AssetHandles",
+                "MaterialTextures",
+                "MeshMaterials",
+                "MeshRenderers",
+                "AssetEdges",
+                "Assets",
+                "SourceFiles"
+            };
+
+            foreach (var table in tables)
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = $"DELETE FROM {table} WHERE ProjectId = @projectId";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                cmd.ExecuteNonQuery();
             }
         }
 
@@ -571,6 +651,205 @@ namespace AssetStudio.Avalonia
             cmd.Parameters.AddWithValue("@signature", signature);
             var id = cmd.ExecuteScalar();
             return id == null ? null : Convert.ToInt64(id);
+        }
+
+        internal void SaveIndexingProgress(
+            string folderPath,
+            string signature,
+            ProjectScanResult scanResult,
+            IndexingProgressUpdate update)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath) || scanResult == null || update == null)
+            {
+                return;
+            }
+
+            EnsureInitialized();
+            try
+            {
+                using var conn = CreateConnection();
+                using var transaction = conn.BeginTransaction();
+                var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
+
+                if (update.ProcessedFiles == 0
+                    && update.NewlyReadFiles.Count == 0
+                    && string.Equals(update.Status, "running", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var clearCmd = conn.CreateCommand();
+                    clearCmd.Transaction = transaction;
+                    clearCmd.CommandText = "DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId";
+                    clearCmd.Parameters.AddWithValue("@projectId", projectId);
+                    clearCmd.ExecuteNonQuery();
+                }
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        INSERT INTO ProjectIndexingState (
+                            ProjectId, Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                            CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt)
+                        VALUES (
+                            @projectId, @status, @totalFiles, @processedFiles, @pendingFiles, @percentComplete,
+                            @currentFile, @lastReadFile, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, @completedAt)
+                        ON CONFLICT(ProjectId)
+                        DO UPDATE SET
+                            Status = excluded.Status,
+                            TotalFiles = excluded.TotalFiles,
+                            ProcessedFiles = excluded.ProcessedFiles,
+                            PendingFiles = excluded.PendingFiles,
+                            PercentComplete = excluded.PercentComplete,
+                            CurrentFile = excluded.CurrentFile,
+                            LastReadFile = excluded.LastReadFile,
+                            UpdatedAt = CURRENT_TIMESTAMP,
+                            CompletedAt = excluded.CompletedAt";
+                    cmd.Parameters.AddWithValue("@projectId", projectId);
+                    cmd.Parameters.AddWithValue("@status", update.Status ?? string.Empty);
+                    cmd.Parameters.AddWithValue("@totalFiles", update.TotalFiles);
+                    cmd.Parameters.AddWithValue("@processedFiles", update.ProcessedFiles);
+                    cmd.Parameters.AddWithValue("@pendingFiles", update.PendingFiles);
+                    cmd.Parameters.AddWithValue("@percentComplete", update.PercentComplete);
+                    cmd.Parameters.AddWithValue("@currentFile", update.CurrentFile ?? string.Empty);
+                    cmd.Parameters.AddWithValue("@lastReadFile", update.LastReadFile ?? string.Empty);
+                    cmd.Parameters.AddWithValue("@completedAt", IsTerminalIndexingStatus(update.Status) ? DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss") : DBNull.Value);
+                    cmd.ExecuteNonQuery();
+                }
+
+                if (update.NewlyReadFiles.Count > 0)
+                {
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        INSERT INTO IndexingReadFiles (ProjectId, FilePath, FileName, ReadOrder, Status)
+                        VALUES (@projectId, @filePath, @fileName, @readOrder, 'read')
+                        ON CONFLICT(ProjectId, FilePath)
+                        DO UPDATE SET
+                            FileName = excluded.FileName,
+                            ReadOrder = excluded.ReadOrder,
+                            ReadAt = CURRENT_TIMESTAMP,
+                            Status = excluded.Status";
+
+                    var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+                    var pFilePath = cmd.Parameters.Add("@filePath", SqliteType.Text);
+                    var pFileName = cmd.Parameters.Add("@fileName", SqliteType.Text);
+                    var pReadOrder = cmd.Parameters.Add("@readOrder", SqliteType.Integer);
+                    pProjectId.Value = projectId;
+
+                    var firstReadOrder = Math.Max(1, update.ProcessedFiles - update.NewlyReadFiles.Count + 1);
+                    for (var i = 0; i < update.NewlyReadFiles.Count; i++)
+                    {
+                        var filePath = update.NewlyReadFiles[i] ?? string.Empty;
+                        pFilePath.Value = filePath;
+                        pFileName.Value = Path.GetFileName(filePath);
+                        pReadOrder.Value = firstReadOrder + i;
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to save indexing progress: {ex.Message}");
+            }
+        }
+
+        internal ProjectIndexingState? LoadIndexingState(string folderPath, string signature)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return null;
+            }
+
+            EnsureInitialized();
+            try
+            {
+                using var conn = CreateConnection();
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return null;
+                }
+
+                ProjectIndexingState? state = null;
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        SELECT Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                               CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt
+                        FROM ProjectIndexingState
+                        WHERE ProjectId = @projectId
+                        LIMIT 1";
+                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                    using var reader = cmd.ExecuteReader();
+                    if (reader.Read())
+                    {
+                        state = new ProjectIndexingState
+                        {
+                            Status = reader.GetString(0),
+                            TotalFiles = reader.GetInt32(1),
+                            ProcessedFiles = reader.GetInt32(2),
+                            PendingFiles = reader.GetInt32(3),
+                            PercentComplete = reader.GetDouble(4),
+                            CurrentFile = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                            LastReadFile = reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+                            StartedAt = ReadNullableDateTime(reader, 7),
+                            UpdatedAt = ReadNullableDateTime(reader, 8),
+                            CompletedAt = ReadNullableDateTime(reader, 9)
+                        };
+                    }
+                }
+
+                if (state == null)
+                {
+                    return null;
+                }
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        SELECT FilePath
+                        FROM IndexingReadFiles
+                        WHERE ProjectId = @projectId
+                        ORDER BY ReadOrder, Id";
+                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        state.ReadFiles.Add(reader.IsDBNull(0) ? string.Empty : reader.GetString(0));
+                    }
+                }
+
+                transaction.Commit();
+                return state;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load indexing progress: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static bool IsTerminalIndexingStatus(string? status)
+        {
+            return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static DateTime? ReadNullableDateTime(SqliteDataReader reader, int ordinal)
+        {
+            if (reader.IsDBNull(ordinal))
+            {
+                return null;
+            }
+
+            return DateTime.TryParse(reader.GetString(ordinal), out var value)
+                ? value
+                : null;
         }
 
         private static void InsertSemanticSourceFiles(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticSourceFileEntry> sourceFiles)
@@ -808,16 +1087,31 @@ namespace AssetStudio.Avalonia
                           AND MeshAssetUniqueID = @meshAssetId
                         GROUP BY RendererAssetUniqueID
                         ORDER BY
-                            MAX(MaterialScore) DESC,
                             SUM(CASE WHEN MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) DESC,
+                            COUNT(*) DESC,
+                            MAX(MaterialScore) DESC,
                             RendererAssetUniqueID
                         LIMIT 1
+                    ),
+                    RankedMaterials AS (
+                        SELECT
+                            SubMeshIndex,
+                            MaterialAssetUniqueID,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY SubMeshIndex
+                                ORDER BY
+                                    CASE WHEN MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                    MaterialScore DESC,
+                                    MaterialAssetUniqueID
+                            ) AS RowNumber
+                        FROM MeshMaterials
+                        WHERE ProjectId = @projectId
+                          AND MeshAssetUniqueID = @meshAssetId
+                          AND RendererAssetUniqueID = (SELECT RendererAssetUniqueID FROM BestRenderer)
                     )
                     SELECT SubMeshIndex, MaterialAssetUniqueID
-                    FROM MeshMaterials
-                    WHERE ProjectId = @projectId
-                      AND MeshAssetUniqueID = @meshAssetId
-                      AND RendererAssetUniqueID = (SELECT RendererAssetUniqueID FROM BestRenderer)
+                    FROM RankedMaterials
+                    WHERE RowNumber = 1
                     ORDER BY SubMeshIndex";
                 cmd.Parameters.AddWithValue("@projectId", projectId.Value);
                 cmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
