@@ -42,6 +42,8 @@ public partial class MainWindow : Window
     private CancellationTokenSource? previewDebounce;
     private const int PreviewDebounceMilliseconds = 180;
     private const int MaxInlinePreviewTextureDimension = 1024;
+    private const int MaxCachedPreviewTextureDimension = 512;
+    private const int TexturePreviewThumbnailAlgorithmVersion = 1;
     private const int ProgressiveIndexingUiThrottleMilliseconds = 500;
     private const int UserInteractionPriorityMilliseconds = 1200;
     private const int UserPreviewPriorityMilliseconds = 1800;
@@ -1972,6 +1974,107 @@ public partial class MainWindow : Window
         }
     }
 
+    private TexturePreviewImageResult? LoadTexturePreviewThumbnail(Texture2D texture, int maxDimension)
+    {
+        if (texture == null)
+        {
+            return null;
+        }
+
+        var sourceWidth = texture.m_Width;
+        var sourceHeight = texture.m_Height;
+        var folderPath = GetCurrentCacheFolderPath();
+        var canUsePersistentCache = texture.assetsFile != null
+            && currentScanResult != null
+            && !string.IsNullOrWhiteSpace(folderPath)
+            && Directory.Exists(folderPath);
+
+        if (canUsePersistentCache)
+        {
+            try
+            {
+                var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
+                var signature = _sqliteCache.GetFolderSignature(currentScanResult!);
+                var parameters = BuildTexturePreviewCacheParameters(texture, maxDimension);
+                var entry = _sqliteCache.LoadPreviewCacheEntry(
+                    folderPath,
+                    signature,
+                    assetId,
+                    "texture-thumbnail-png",
+                    TexturePreviewThumbnailAlgorithmVersion,
+                    parameters);
+
+                if (entry != null
+                    && !string.IsNullOrWhiteSpace(entry.PayloadPath)
+                    && File.Exists(entry.PayloadPath)
+                    && IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))
+                {
+                    var bytes = File.ReadAllBytes(entry.PayloadPath);
+                    if (string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var cachedImage = SixLabors.ImageSharp.Image.Load<Bgra32>(bytes);
+                        return new TexturePreviewImageResult(
+                            cachedImage,
+                            fromCache: true,
+                            downscaled: sourceWidth > cachedImage.Width || sourceHeight > cachedImage.Height,
+                            sourceWidth,
+                            sourceHeight);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load texture thumbnail cache: {ex.Message}");
+            }
+        }
+
+        var image = texture.ConvertToImage(true);
+        if (image == null)
+        {
+            return null;
+        }
+
+        var downscaled = LimitPreviewImage(image, maxDimension);
+        if (canUsePersistentCache)
+        {
+            try
+            {
+                using var stream = new MemoryStream();
+                image.SaveAsPng(stream);
+                var bytes = stream.ToArray();
+                var hash = ComputeSha256Hex(bytes);
+                var payloadPath = GetPreviewCachePayloadPath(folderPath, hash, ".texturepreview.png");
+                Directory.CreateDirectory(Path.GetDirectoryName(payloadPath)!);
+
+                if (!File.Exists(payloadPath))
+                {
+                    var tempPath = payloadPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    File.WriteAllBytes(tempPath, bytes);
+                    File.Move(tempPath, payloadPath, overwrite: true);
+                }
+
+                var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
+                var signature = _sqliteCache.GetFolderSignature(currentScanResult!);
+                _sqliteCache.SavePreviewCacheEntry(
+                    folderPath,
+                    signature,
+                    assetId,
+                    "texture-thumbnail-png",
+                    TexturePreviewThumbnailAlgorithmVersion,
+                    BuildTexturePreviewCacheParameters(texture, maxDimension),
+                    hash,
+                    payloadPath,
+                    bytes.LongLength);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to save texture thumbnail cache: {ex.Message}");
+            }
+        }
+
+        return new TexturePreviewImageResult(image, fromCache: false, downscaled, sourceWidth, sourceHeight);
+    }
+
     private static string BuildMeshPreviewCacheParameters(Mesh mesh, float densityPercent)
     {
         return string.Join("|",
@@ -1980,6 +2083,19 @@ public partial class MainWindow : Window
             "indices=" + (mesh.m_Indices?.Count ?? 0).ToString(CultureInfo.InvariantCulture),
             "submeshes=" + (mesh.m_SubMeshes?.Length ?? 0).ToString(CultureInfo.InvariantCulture),
             "bytes=" + mesh.byteSize.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static string BuildTexturePreviewCacheParameters(Texture2D texture, int maxDimension)
+    {
+        return string.Join("|",
+            "max=" + maxDimension.ToString(CultureInfo.InvariantCulture),
+            "width=" + texture.m_Width.ToString(CultureInfo.InvariantCulture),
+            "height=" + texture.m_Height.ToString(CultureInfo.InvariantCulture),
+            "format=" + texture.m_TextureFormat,
+            "mips=" + texture.m_MipCount.ToString(CultureInfo.InvariantCulture),
+            "bytes=" + texture.byteSize.ToString(CultureInfo.InvariantCulture),
+            "streamSize=" + (texture.m_StreamData?.size ?? 0).ToString(CultureInfo.InvariantCulture),
+            "streamOffset=" + (texture.m_StreamData?.offset ?? 0).ToString(CultureInfo.InvariantCulture));
     }
 
     private static string GetPreviewCacheRoot(string folderPath)
@@ -1993,9 +2109,20 @@ public partial class MainWindow : Window
 
     private static string GetPreviewCachePayloadPath(string folderPath, string hash)
     {
+        return GetPreviewCachePayloadPath(folderPath, hash, ".meshpreview");
+    }
+
+    private static string GetPreviewCachePayloadPath(string folderPath, string hash, string extension)
+    {
         var safeHash = string.IsNullOrWhiteSpace(hash) ? "empty" : hash.ToLowerInvariant();
         var prefix = safeHash.Length >= 2 ? safeHash.Substring(0, 2) : "00";
-        return Path.Combine(GetPreviewCacheRoot(folderPath), prefix, safeHash + ".meshpreview");
+        var safeExtension = string.IsNullOrWhiteSpace(extension) ? ".cache" : extension;
+        if (!safeExtension.StartsWith(".", StringComparison.Ordinal))
+        {
+            safeExtension = "." + safeExtension;
+        }
+
+        return Path.Combine(GetPreviewCacheRoot(folderPath), prefix, safeHash + safeExtension);
     }
 
     private static string ComputeSha256Hex(byte[] bytes)
@@ -3630,11 +3757,11 @@ public partial class MainWindow : Window
                                         {
                                             try
                                             {
-                                                using (var image = tex.ConvertToImage(true))
+                                                using (var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension))
                                                 {
+                                                    var image = previewImage?.Image;
                                                     if (image != null)
                                                     {
-                                                        LimitInlinePreviewImage(image);
                                                         tw = image.Width;
                                                         th = image.Height;
                                                         tb = new byte[tw * th * 4];
@@ -5413,6 +5540,200 @@ public partial class MainWindow : Window
             GLPreviewControl.IsVisible = false;
         }
 
+        if (TextureGLPreview != null)
+        {
+            TextureGLPreview.IsVisible = false;
+        }
+
+        currentPreviewTexture = null;
+        var currentId = ++texturePreviewIdCounter;
+        TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\nLoading material preview...";
+        TextPreviewBox.IsVisible = true;
+        ImagePreviewBox.IsVisible = false;
+        PreviewLabel.IsVisible = false;
+        PreviewInfoBorder.IsVisible = false;
+        StatusStripUpdate("Loading material preview...");
+
+        Task.Run(() =>
+        {
+            TexturePreviewImageResult? previewImage = null;
+            try
+            {
+                var previewData = BuildMaterialPreviewData(m_Material);
+                if (currentId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                if (previewData.PreviewTexture == null)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                        {
+                            return;
+                        }
+
+                        TextPreviewBox.Text = previewData.InfoText;
+                        TextPreviewBox.IsVisible = true;
+                        ImagePreviewBox.IsVisible = false;
+                        PreviewInfoBorder.IsVisible = false;
+                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        StatusStripUpdate("Material loaded (no texture).");
+                    });
+                    return;
+                }
+
+                previewImage = LoadTexturePreviewThumbnail(previewData.PreviewTexture, MaxCachedPreviewTextureDimension);
+                var loadedPreviewImage = previewImage;
+                var image = loadedPreviewImage?.Image;
+                if (image == null)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                        {
+                            return;
+                        }
+
+                        TextPreviewBox.Text = previewData.InfoText;
+                        TextPreviewBox.IsVisible = true;
+                        ImagePreviewBox.IsVisible = false;
+                        PreviewInfoBorder.IsVisible = false;
+                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        StatusStripUpdate("Material loaded (no preview texture support).");
+                    });
+                    return;
+                }
+
+                var activePreviewImage = loadedPreviewImage!;
+                var materialPreviewWasDownscaled = activePreviewImage.Downscaled;
+                var materialPreviewFromCache = activePreviewImage.FromCache;
+                var materialPreviewWidth = image.Width;
+                var materialPreviewHeight = image.Height;
+
+                int validChannel = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    if (textureChannels[i])
+                    {
+                        validChannel++;
+                    }
+                }
+
+                if (validChannel != 4)
+                {
+                    image.ProcessPixelRows(accessor =>
+                    {
+                        for (int y = 0; y < accessor.Height; y++)
+                        {
+                            var row = accessor.GetRowSpan(y);
+                            for (int x = 0; x < accessor.Width; x++)
+                            {
+                                ref Bgra32 pixel = ref row[x];
+                                pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
+                                pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
+                            }
+                        }
+                    });
+                }
+                else
+                {
+                    MakeAlphaOnlyTextureVisible(image);
+                }
+
+                var postedPreviewImage = activePreviewImage;
+                var postedPreviewTexture = previewData.PreviewTexture!;
+                previewImage = null;
+                Dispatcher.UIThread.Post(() =>
+                {
+                    try
+                    {
+                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                        {
+                            return;
+                        }
+
+                        currentPreviewTexture = postedPreviewTexture;
+                        if (GLPreviewControl != null)
+                        {
+                            GLPreviewControl.SetMaterialTexture(postedPreviewImage.Image);
+                            GLPreviewControl.IsVisible = true;
+                            HidePreviewGeometryControls();
+                            GLPreviewControl.Focus();
+                        }
+
+                        ImagePreviewBox.IsVisible = false;
+                        TextPreviewBox.IsVisible = false;
+                        PreviewLabel.IsVisible = false;
+
+                        if (displayInfo.IsChecked == true)
+                        {
+                            var previewInfoText = previewData.InfoText;
+                            if (materialPreviewWasDownscaled)
+                            {
+                                previewInfoText += $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}";
+                            }
+                            if (materialPreviewFromCache)
+                            {
+                                previewInfoText += "\nPreview texture loaded from cache";
+                            }
+
+                            PreviewInfoOverlay.Text = previewInfoText;
+                            PreviewInfoBorder.IsVisible = true;
+                        }
+                        else
+                        {
+                            PreviewInfoBorder.IsVisible = false;
+                        }
+
+                        StatusStripUpdate($"Material preview loaded: {postedPreviewTexture.m_Name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.Log(LoggerEvent.Error, $"Material preview UI failed for {m_Material.m_Name}: {ex}");
+                        if (currentId == texturePreviewIdCounter)
+                        {
+                            TextPreviewBox.Text = previewData.InfoText + "\n[Error showing preview texture: " + ex.Message + "]";
+                            TextPreviewBox.IsVisible = true;
+                            ImagePreviewBox.IsVisible = false;
+                            PreviewInfoBorder.IsVisible = false;
+                            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                            StatusStripUpdate("Material preview UI error.");
+                        }
+                    }
+                    finally
+                    {
+                        postedPreviewImage.Dispose();
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\n[Error loading material preview: {ex.Message}]";
+                        TextPreviewBox.IsVisible = true;
+                        ImagePreviewBox.IsVisible = false;
+                        PreviewInfoBorder.IsVisible = false;
+                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        StatusStripUpdate("Material preview error.");
+                    }
+                });
+            }
+            finally
+            {
+                previewImage?.Dispose();
+            }
+        });
+    }
+
+    private (string InfoText, Texture2D? PreviewTexture) BuildMaterialPreviewData(Material m_Material)
+    {
         var displayMaterial = ResolveMaterialForPreview(m_Material) ?? m_Material;
         var sb = new StringBuilder();
         sb.AppendLine($"Material: {m_Material.m_Name}");
@@ -5467,148 +5788,7 @@ public partial class MainWindow : Window
             previewTexture = FindTextureForMaterial(displayMaterial);
         }
 
-        string infoText = sb.ToString();
-
-        if (previewTexture != null)
-        {
-            currentPreviewTexture = previewTexture;
-            long currentId = ++texturePreviewIdCounter;
-            StatusStripUpdate("Loading material texture preview...");
-
-            Task.Run(() =>
-            {
-                try
-                {
-                    var image = previewTexture.ConvertToImage(true);
-                    if (image == null)
-                    {
-                        Dispatcher.UIThread.Post(() =>
-                        {
-                            if (currentId == texturePreviewIdCounter)
-                            {
-                                TextPreviewBox.Text = infoText;
-                                TextPreviewBox.IsVisible = true;
-                                ImagePreviewBox.IsVisible = false;
-                                PreviewInfoBorder.IsVisible = false;
-                                if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                                StatusStripUpdate("Material loaded (no preview texture support).");
-                            }
-                        });
-                        return;
-                    }
-                    var materialPreviewWasDownscaled = LimitInlinePreviewImage(image);
-                    var materialPreviewWidth = image.Width;
-                    var materialPreviewHeight = image.Height;
-
-                    int validChannel = 0;
-                    for (int i = 0; i < 4; i++)
-                    {
-                        if (textureChannels[i])
-                        {
-                            validChannel++;
-                        }
-                    }
-
-                    if (validChannel != 4)
-                    {
-                        image.ProcessPixelRows(accessor =>
-                        {
-                            for (int y = 0; y < accessor.Height; y++)
-                            {
-                                var row = accessor.GetRowSpan(y);
-                                for (int x = 0; x < accessor.Width; x++)
-                                {
-                                    ref Bgra32 pixel = ref row[x];
-                                    pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                    pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                    pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                    pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
-                                }
-                            }
-                        });
-                    }
-                    else
-                    {
-                        MakeAlphaOnlyTextureVisible(image);
-                    }
-
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        try
-                        {
-                            if (currentId == texturePreviewIdCounter)
-                            {
-                                if (GLPreviewControl != null)
-                                {
-                                    GLPreviewControl.SetMaterialTexture(image);
-                                    GLPreviewControl.IsVisible = true;
-                                    HidePreviewGeometryControls();
-                                    GLPreviewControl.Focus();
-                                }
-
-                                ImagePreviewBox.IsVisible = false;
-                                TextPreviewBox.IsVisible = false;
-                                PreviewLabel.IsVisible = false;
-
-                                if (displayInfo.IsChecked == true)
-                                {
-                                    PreviewInfoOverlay.Text = materialPreviewWasDownscaled
-                                        ? infoText + $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}"
-                                        : infoText;
-                                    PreviewInfoBorder.IsVisible = true;
-                                }
-                                else
-                                {
-                                    PreviewInfoBorder.IsVisible = false;
-                                }
-                                StatusStripUpdate($"Material preview loaded: {previewTexture.m_Name}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.Log(LoggerEvent.Error, $"Material preview UI failed for {m_Material.m_Name}: {ex}");
-                            if (currentId == texturePreviewIdCounter)
-                            {
-                                TextPreviewBox.Text = infoText + "\n[Error showing preview texture: " + ex.Message + "]";
-                                TextPreviewBox.IsVisible = true;
-                                ImagePreviewBox.IsVisible = false;
-                                PreviewInfoBorder.IsVisible = false;
-                                if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                                StatusStripUpdate("Material preview UI error.");
-                            }
-                        }
-                        finally
-                        {
-                            image.Dispose();
-                        }
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (currentId == texturePreviewIdCounter)
-                        {
-                            TextPreviewBox.Text = infoText + "\n[Error loading preview texture: " + ex.Message + "]";
-                            TextPreviewBox.IsVisible = true;
-                            ImagePreviewBox.IsVisible = false;
-                            PreviewInfoBorder.IsVisible = false;
-                            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                            StatusStripUpdate($"Material loaded with preview texture error.");
-                        }
-                    });
-                }
-            });
-        }
-        else
-        {
-            TextPreviewBox.Text = infoText;
-            TextPreviewBox.IsVisible = true;
-            ImagePreviewBox.IsVisible = false;
-            PreviewInfoBorder.IsVisible = false;
-            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-            StatusStripUpdate("Material loaded (no texture).");
-        }
+        return (sb.ToString(), previewTexture);
     }
 
     private static void MakeAlphaOnlyTextureVisible(Image<Bgra32> image)
@@ -5666,13 +5846,18 @@ public partial class MainWindow : Window
 
     private static bool LimitInlinePreviewImage(Image<Bgra32> image)
     {
+        return LimitPreviewImage(image, MaxInlinePreviewTextureDimension);
+    }
+
+    private static bool LimitPreviewImage(Image<Bgra32> image, int maxDimension)
+    {
         var maxSide = Math.Max(image.Width, image.Height);
-        if (maxSide <= MaxInlinePreviewTextureDimension)
+        if (maxSide <= maxDimension)
         {
             return false;
         }
 
-        var scale = MaxInlinePreviewTextureDimension / (float)maxSide;
+        var scale = maxDimension / (float)maxSide;
         var width = Math.Max(1, (int)Math.Round(image.Width * scale));
         var height = Math.Max(1, (int)Math.Round(image.Height * scale));
         image.Mutate(x => x.Resize(new ResizeOptions
@@ -5752,11 +5937,6 @@ public partial class MainWindow : Window
         if (semanticTexture != null)
         {
             return semanticTexture;
-        }
-
-        if (assetsManager.LazyLoading)
-        {
-            EnsureMaterialPreviewDependenciesLoaded(material);
         }
 
         IndexMaterialTextures(material);
@@ -5854,7 +6034,32 @@ public partial class MainWindow : Window
         materialTextureSlotsCache ??= new Dictionary<Material, Dictionary<string, Texture2D?>>();
         materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
 
-        IndexMaterialTexturesBackground(material, materialPreviewMaterialCache, materialTextureSlotsCache, materialMainTextureCache);
+        if (materialTextureSlotsCache.ContainsKey(material) && materialMainTextureCache.ContainsKey(material))
+        {
+            return;
+        }
+
+        var displayMaterial = ResolveMaterialForPreview(material) ?? material;
+        if (!materialTextureSlotsCache.TryGetValue(displayMaterial, out var slots))
+        {
+            slots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+            {
+                var textureRef = texEnv.Value?.m_Texture;
+                slots[texEnv.Key] = textureRef != null && !textureRef.IsNull
+                    ? ResolveTexturePPtrForPreview(displayMaterial, textureRef)
+                    : null;
+            }
+
+            materialTextureSlotsCache[displayMaterial] = slots;
+            materialMainTextureCache[displayMaterial] = SelectMainTextureForMaterial(displayMaterial, slots);
+        }
+
+        if (!ReferenceEquals(displayMaterial, material))
+        {
+            materialTextureSlotsCache[material] = slots;
+            materialMainTextureCache[material] = materialMainTextureCache[displayMaterial];
+        }
     }
 
     private void EnsureMeshPreviewDependenciesLoaded(Mesh mesh)
@@ -6020,7 +6225,106 @@ public partial class MainWindow : Window
 
     private Texture2D? ResolveTexturePPtr(Material material, PPtr<Texture> textureRef)
     {
-        return ResolveTexturePPtrBackground(material, textureRef);
+        return ResolveTexturePPtrForPreview(material, textureRef);
+    }
+
+    private Texture2D? ResolveTexturePPtrForPreview(Material material, PPtr<Texture> textureRef)
+    {
+        if (textureRef == null || textureRef.IsNull)
+        {
+            return null;
+        }
+
+        var directTexture = ResolveTexturePPtrBackground(material, textureRef);
+        if (directTexture != null)
+        {
+            return directTexture;
+        }
+
+        if (!assetsManager.LazyLoading || material.assetsFile == null)
+        {
+            return null;
+        }
+
+        var handle = FindTextureHandleForPPtr(material, textureRef);
+        if (handle == null)
+        {
+            return null;
+        }
+
+        return ResolveSemanticRelationHandleForPreview(handle) as Texture2D;
+    }
+
+    private AssetHandle? FindTextureHandleForPPtr(Material material, PPtr<Texture> textureRef)
+    {
+        if (material.assetsFile == null || textureRef == null || textureRef.IsNull)
+        {
+            return null;
+        }
+
+        if (textureRef.TryGetAssetsFile(out var loadedSourceFile))
+        {
+            var handle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(loadedSourceFile, textureRef.m_PathID));
+            if (IsTexture2DHandleForPath(handle, textureRef.m_PathID))
+            {
+                return handle;
+            }
+        }
+
+        var candidateFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (textureRef.m_FileID == 0)
+        {
+            candidateFileNames.Add(material.assetsFile.fileName);
+        }
+        else if (textureRef.m_FileID > 0 && textureRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
+        {
+            var external = material.assetsFile.m_Externals[textureRef.m_FileID - 1];
+            AddCandidateFileName(candidateFileNames, external.fileName);
+            AddCandidateFileName(candidateFileNames, external.pathName);
+
+            if (assetsManager.TryFindSerializedFile(external.fileName, external.pathName, out var sourceFile))
+            {
+                AddCandidateFileName(candidateFileNames, sourceFile.fileName);
+                var handle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(sourceFile, textureRef.m_PathID));
+                if (IsTexture2DHandleForPath(handle, textureRef.m_PathID))
+                {
+                    return handle;
+                }
+            }
+        }
+
+        foreach (var fileName in candidateFileNames)
+        {
+            var handle = assetsManager.ProjectIndex
+                .GetHandlesForFile(fileName)
+                .FirstOrDefault(candidate => IsTexture2DHandleForPath(candidate, textureRef.m_PathID));
+            if (handle != null)
+            {
+                return handle;
+            }
+        }
+
+        return null;
+    }
+
+    private static void AddCandidateFileName(HashSet<string> candidates, string? fileNameOrPath)
+    {
+        if (string.IsNullOrWhiteSpace(fileNameOrPath))
+        {
+            return;
+        }
+
+        candidates.Add(fileNameOrPath);
+        var safeName = Path.GetFileName(fileNameOrPath.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar));
+        if (!string.IsNullOrWhiteSpace(safeName))
+        {
+            candidates.Add(safeName);
+        }
+    }
+
+    private static bool IsTexture2DHandleForPath(AssetHandle? handle, long pathId)
+    {
+        return handle != null && handle.PathID == pathId && handle.Type == ClassIDType.Texture2D;
     }
 
     private async void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
