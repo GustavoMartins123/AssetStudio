@@ -1092,7 +1092,7 @@ namespace AssetStudio
 
                                     var handle = new AssetHandle
                                     {
-                                        UniqueID = $"{assetsFile.fileName}#{objectInfo.m_PathID}",
+                                        UniqueID = AssetHandle.BuildUniqueID(assetsFile, objectInfo.m_PathID),
                                         Type = type,
                                         OriginalPath = assetsFile.originalPath,
                                         SerializedFileName = assetsFile.fileName,

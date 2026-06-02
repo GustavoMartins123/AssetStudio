@@ -121,6 +121,8 @@ public partial class MainWindow : Window
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
+        GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
+        GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
         InitializeTheme();
         try
         {
@@ -1794,6 +1796,237 @@ public partial class MainWindow : Window
         return Convert.ToHexString(hashBytes).ToLowerInvariant();
     }
 
+    private void ClearCurrentProjectCache_Click(object? sender, RoutedEventArgs e)
+    {
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            MessageBox.Show(this, "No loaded project folder was found to clear.", "Clear project cache");
+            return;
+        }
+
+        try
+        {
+            _sqliteCache.DeleteIndexCache(folderPath);
+            DeleteDecompressedCacheFolder(folderPath);
+            DeletePreviewCacheFolder(folderPath);
+
+            lock (previewCacheLock)
+            {
+                meshToMaterialsCache = null;
+                meshAssociatedRenderersCache = null;
+                meshSourceTypesCache = null;
+                materialMainTextureCache = null;
+                materialPreviewMaterialCache = null;
+                materialTextureSlotsCache = null;
+            }
+
+            StatusStripUpdate($"Cleared project cache for: {folderPath}");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Failed to clear project cache:\n{ex.Message}", "Clear project cache");
+            StatusStripUpdate("Failed to clear project cache.");
+        }
+    }
+
+    private string GetCurrentCacheFolderPath()
+    {
+        if (!string.IsNullOrWhiteSpace(appSettings.LoadFolderPath) && Directory.Exists(appSettings.LoadFolderPath))
+        {
+            return appSettings.LoadFolderPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(assetsManager.ProjectRoot) && Directory.Exists(assetsManager.ProjectRoot))
+        {
+            return assetsManager.ProjectRoot;
+        }
+
+        return string.Empty;
+    }
+
+    private static void DeleteDecompressedCacheFolder(string folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return;
+        }
+
+        var cacheRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AssetStudio",
+            "DecompressedCache");
+        var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(folderPath));
+        DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
+    }
+
+    private static void DeletePreviewCacheFolder(string folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return;
+        }
+
+        var cacheRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AssetStudio",
+            "PreviewCache");
+        var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(folderPath));
+        DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
+    }
+
+    private MeshPreviewGeometryCache? LoadMeshPreviewGeometryCache(Mesh mesh, float densityPercent)
+    {
+        if (mesh.assetsFile == null || currentScanResult == null)
+        {
+            return null;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+            var parameters = BuildMeshPreviewCacheParameters(mesh, densityPercent);
+            var entry = _sqliteCache.LoadPreviewCacheEntry(
+                folderPath,
+                signature,
+                assetId,
+                "mesh-geometry",
+                MeshPreviewGeometryCache.AlgorithmVersion,
+                parameters);
+
+            if (entry == null || string.IsNullOrWhiteSpace(entry.PayloadPath) || !File.Exists(entry.PayloadPath))
+            {
+                return null;
+            }
+
+            if (!IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))
+            {
+                return null;
+            }
+
+            var bytes = File.ReadAllBytes(entry.PayloadPath);
+            if (!string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            return MeshPreviewGeometryCacheSerializer.Deserialize(bytes);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to load mesh preview geometry cache: {ex.Message}");
+            return null;
+        }
+    }
+
+    private void SaveMeshPreviewGeometryCache(Mesh mesh, float densityPercent, MeshPreviewGeometryCache cache)
+    {
+        if (mesh.assetsFile == null || currentScanResult == null || cache == null)
+        {
+            return;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var bytes = MeshPreviewGeometryCacheSerializer.Serialize(cache);
+            var hash = ComputeSha256Hex(bytes);
+            var payloadPath = GetPreviewCachePayloadPath(folderPath, hash);
+            Directory.CreateDirectory(Path.GetDirectoryName(payloadPath)!);
+
+            if (!File.Exists(payloadPath))
+            {
+                var tempPath = payloadPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllBytes(tempPath, bytes);
+                File.Move(tempPath, payloadPath, overwrite: true);
+            }
+
+            var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+            _sqliteCache.SavePreviewCacheEntry(
+                folderPath,
+                signature,
+                assetId,
+                "mesh-geometry",
+                MeshPreviewGeometryCache.AlgorithmVersion,
+                BuildMeshPreviewCacheParameters(mesh, densityPercent),
+                hash,
+                payloadPath,
+                bytes.LongLength);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to save mesh preview geometry cache: {ex.Message}");
+        }
+    }
+
+    private static string BuildMeshPreviewCacheParameters(Mesh mesh, float densityPercent)
+    {
+        return string.Join("|",
+            "density=" + densityPercent.ToString("0.###", CultureInfo.InvariantCulture),
+            "vertices=" + mesh.m_VertexCount.ToString(CultureInfo.InvariantCulture),
+            "indices=" + (mesh.m_Indices?.Count ?? 0).ToString(CultureInfo.InvariantCulture),
+            "submeshes=" + (mesh.m_SubMeshes?.Length ?? 0).ToString(CultureInfo.InvariantCulture),
+            "bytes=" + mesh.byteSize.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static string GetPreviewCacheRoot(string folderPath)
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AssetStudio",
+            "PreviewCache",
+            GetFolderCacheKey(folderPath));
+    }
+
+    private static string GetPreviewCachePayloadPath(string folderPath, string hash)
+    {
+        var safeHash = string.IsNullOrWhiteSpace(hash) ? "empty" : hash.ToLowerInvariant();
+        var prefix = safeHash.Length >= 2 ? safeHash.Substring(0, 2) : "00";
+        return Path.Combine(GetPreviewCacheRoot(folderPath), prefix, safeHash + ".meshpreview");
+    }
+
+    private static string ComputeSha256Hex(byte[] bytes)
+    {
+        using var sha256 = System.Security.Cryptography.SHA256.Create();
+        return Convert.ToHexString(sha256.ComputeHash(bytes)).ToLowerInvariant();
+    }
+
+    private static bool IsPathInsideDirectory(string root, string path)
+    {
+        var rootFullPath = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var targetFullPath = Path.GetFullPath(path);
+        return targetFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void DeleteDirectoryInsideRoot(string root, string targetDirectory)
+    {
+        var rootFullPath = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var targetFullPath = Path.GetFullPath(targetDirectory);
+
+        if (!targetFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Refusing to delete a cache directory outside the AssetStudio cache root.");
+        }
+
+        if (Directory.Exists(targetFullPath))
+        {
+            Directory.Delete(targetFullPath, recursive: true);
+        }
+    }
+
     private void SaveIndexCache(string folderPath, ProjectScanResult scanResult)
     {
         try
@@ -1806,6 +2039,30 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Logger.Warning($"Failed to save index cache: {ex.Message}");
+        }
+    }
+
+    private void TrySaveSemanticRelations(SemanticAssetRelations relations)
+    {
+        if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0) || currentScanResult == null)
+        {
+            return;
+        }
+
+        var folderPath = appSettings.LoadFolderPath;
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+            _sqliteCache.SaveSemanticRelations(folderPath, signature, relations);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to save semantic relation cache: {ex.Message}");
         }
     }
 
@@ -2212,7 +2469,7 @@ public partial class MainWindow : Window
             {
                 if (pptr.TryGetAssetsFile(out var targetFile))
                 {
-                    var targetKey = $"{targetFile.fileName}#{pptr.m_PathID}";
+                    var targetKey = AssetHandle.BuildUniqueID(targetFile, pptr.m_PathID);
                     if (localPathIDAssetItemDic.TryGetValue(targetKey, out var item))
                     {
                         item.Container = container;
@@ -2250,6 +2507,7 @@ public partial class MainWindow : Window
             var localMaterialMainTextureCache = new Dictionary<Material, Texture2D?>();
             var localMaterialPreviewMaterialCache = new Dictionary<Material, Material?>();
             var localMaterialTextureSlotsCache = new Dictionary<Material, Dictionary<string, Texture2D?>>();
+            var localSemanticRelations = new SemanticAssetRelations();
 
             var localAnimationClipAvatarCache = new Dictionary<AnimationClip, Avatar?>();
             var localAvatarMeshCache = new Dictionary<Avatar, Mesh?>();
@@ -2269,7 +2527,8 @@ public partial class MainWindow : Window
                         out localMeshSourceTypesCache,
                         out localMaterialMainTextureCache,
                         out localMaterialPreviewMaterialCache,
-                        out localMaterialTextureSlotsCache),
+                        out localMaterialTextureSlotsCache,
+                        out localSemanticRelations),
                     () => BuildAnimationPreviewIndexesBackground(
                         filesListSnapshot,
                         out localAnimationClipAvatarCache,
@@ -2311,6 +2570,7 @@ public partial class MainWindow : Window
                 MaterialMainTextureCache = localMaterialMainTextureCache,
                 MaterialPreviewMaterialCache = localMaterialPreviewMaterialCache,
                 MaterialTextureSlotsCache = localMaterialTextureSlotsCache,
+                SemanticRelations = localSemanticRelations,
                 AnimationClipAvatarCache = localAnimationClipAvatarCache,
                 AvatarMeshCache = localAvatarMeshCache,
                 MeshAvatarCache = localMeshAvatarCache,
@@ -2407,6 +2667,7 @@ public partial class MainWindow : Window
             ? assetsManager.ProjectIndex.GetHandles().Count()
             : m_ObjectsCount;
         SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count);
+        TrySaveSemanticRelations(result.SemanticRelations);
         }
         finally
         {
@@ -2796,6 +3057,55 @@ public partial class MainWindow : Window
                     StatusStripUpdate($"Loaded preview source: {Path.GetFileName(sourcePath)} | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})");
                 }
             });
+        }
+    }
+
+    private AssetStudio.Object? ResolveSemanticRelationHandleForPreview(AssetHandle handle)
+    {
+        if (handle == null)
+        {
+            return null;
+        }
+
+        if (handle.Tag is AssetItem assetItem)
+        {
+            EnsureLazyAssetReadyForPreview(assetItem);
+            return assetItem.Asset;
+        }
+
+        if (!assetsManager.LazyLoading)
+        {
+            return assetsManager.ResolveHandle(handle);
+        }
+
+        lock (handle)
+        {
+            if (handle.RealObject != null)
+            {
+                return handle.RealObject;
+            }
+
+            TryAttachLoadedSourceFile(handle);
+            if (handle.SourceFile?.reader == null)
+            {
+                var sourcePath = ResolveLazyHandleSourcePath(handle);
+                if (!string.IsNullOrEmpty(sourcePath) && File.Exists(sourcePath))
+                {
+                    try
+                    {
+                        RemovePendingFileFromProgressiveQueue(sourcePath);
+                        assetsManager.LoadFilesForPreview(sourcePath);
+                        assetsManager.WaitForAssetsFileLoaded(handle.SerializedFileName, 5000);
+                        TryAttachLoadedSourceFile(handle);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Failed to load semantic relation source {Path.GetFileName(sourcePath)}: {ex.Message}");
+                    }
+                }
+            }
+
+            return assetsManager.ResolveHandle(handle);
         }
     }
 
@@ -3256,6 +3566,41 @@ public partial class MainWindow : Window
                                 throw new Exception("Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.");
                             }
 
+                            var uvs = BuildMeshPreviewUvs(m_Mesh);
+                            var quickInfoText = includeMeshInfo
+                                ? FormatMeshPreviewSummary(m_Mesh, localAssetItem) + Environment.NewLine + "Loading material details..."
+                                : string.Empty;
+
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
+                                {
+                                    return;
+                                }
+
+                                if (GLPreviewControl != null)
+                                {
+                                    currentPreviewMesh = m_Mesh;
+                                    GLPreviewControl.SetMesh(m_Mesh, uvs);
+                                    GLPreviewControl.IsVisible = true;
+                                    ShowPreviewGeometryControls(showBoneControls: false);
+                                    GLPreviewControl.Focus();
+                                }
+
+                                if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                                {
+                                    PreviewInfoOverlay.Text = quickInfoText;
+                                    PreviewInfoBorder.IsVisible = true;
+                                }
+
+                                StatusStripUpdate("OpenGL Preview | Mesh loaded | Loading materials...");
+                            });
+
+                            if (meshPreviewId != texturePreviewIdCounter)
+                            {
+                                return;
+                            }
+
                             if (assetsManager.LazyLoading)
                             {
                                 EnsureMeshPreviewDependenciesLoaded(m_Mesh);
@@ -3312,16 +3657,6 @@ public partial class MainWindow : Window
                                 }
                             }
 
-                            global::OpenTK.Mathematics.Vector2[]? uvs = null;
-                            if (m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_Mesh.m_VertexCount * 2)
-                            {
-                                uvs = new global::OpenTK.Mathematics.Vector2[m_Mesh.m_VertexCount];
-                                for (int i = 0; i < m_Mesh.m_VertexCount; i++)
-                                {
-                                    uvs[i] = new global::OpenTK.Mathematics.Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
-                                }
-                            }
-
                             var infoText = includeMeshInfo ? FormatMeshPreview(m_Mesh, localAssetItem) : string.Empty;
                             var hasTextures = subMeshTextures.Any(t => t != null);
 
@@ -3335,7 +3670,7 @@ public partial class MainWindow : Window
                                 if (GLPreviewControl != null)
                                 {
                                     currentPreviewMesh = m_Mesh;
-                                    GLPreviewControl.SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                                    GLPreviewControl.ApplyMeshTextures(subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                                     GLPreviewControl.IsVisible = true;
                                     BuildMeshMaterialControls(m_Mesh, allMaterials);
                                     ShowPreviewGeometryControls(showBoneControls: false);
@@ -5406,16 +5741,22 @@ public partial class MainWindow : Window
 
     private Texture2D? FindTextureForMaterial(Material material)
     {
-        if (assetsManager.LazyLoading)
-        {
-            EnsureMaterialPreviewDependenciesLoaded(material);
-        }
-
         materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
 
         if (materialMainTextureCache.TryGetValue(material, out var directCachedTexture))
         {
             return directCachedTexture;
+        }
+
+        var semanticTexture = TryLoadTextureForMaterialFromSemanticCache(material);
+        if (semanticTexture != null)
+        {
+            return semanticTexture;
+        }
+
+        if (assetsManager.LazyLoading)
+        {
+            EnsureMaterialPreviewDependenciesLoaded(material);
         }
 
         IndexMaterialTextures(material);
@@ -5429,12 +5770,82 @@ public partial class MainWindow : Window
 
     private Texture2D? GetMaterialTextureSlot(Material material, string slotName)
     {
-        IndexMaterialTextures(material);
-        return materialTextureSlotsCache != null
+        var cachedTexture = materialTextureSlotsCache != null
             && materialTextureSlotsCache.TryGetValue(material, out var slots)
             && slots.TryGetValue(slotName, out var texture)
             ? texture
             : null;
+
+        if (cachedTexture != null)
+        {
+            return cachedTexture;
+        }
+
+        var semanticTexture = TryLoadTextureForMaterialFromSemanticCache(material, slotName);
+        if (semanticTexture != null)
+        {
+            return semanticTexture;
+        }
+
+        IndexMaterialTextures(material);
+        return materialTextureSlotsCache != null
+               && materialTextureSlotsCache.TryGetValue(material, out slots)
+               && slots.TryGetValue(slotName, out texture)
+            ? texture
+            : null;
+    }
+
+    private Texture2D? TryLoadTextureForMaterialFromSemanticCache(Material material, string? slotName = null)
+    {
+        if (!assetsManager.LazyLoading || material.assetsFile == null || currentScanResult == null)
+        {
+            return null;
+        }
+
+        var folderPath = appSettings.LoadFolderPath;
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return null;
+        }
+
+        var materialAssetId = AssetHandle.BuildUniqueID(material.assetsFile, material.m_PathID);
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        var textureIds = _sqliteCache.LoadMaterialTextureAssetIds(folderPath, signature, materialAssetId, slotName);
+        foreach (var textureId in textureIds)
+        {
+            var handle = assetsManager.ProjectIndex.GetHandle(textureId);
+            if (handle == null)
+            {
+                continue;
+            }
+
+            var asset = ResolveSemanticRelationHandleForPreview(handle);
+            if (asset is not Texture2D texture)
+            {
+                continue;
+            }
+
+            if (string.IsNullOrEmpty(slotName))
+            {
+                materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
+                materialMainTextureCache[material] = texture;
+            }
+            else
+            {
+                materialTextureSlotsCache ??= new Dictionary<Material, Dictionary<string, Texture2D?>>();
+                if (!materialTextureSlotsCache.TryGetValue(material, out var slots))
+                {
+                    slots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
+                    materialTextureSlotsCache[material] = slots;
+                }
+
+                slots[slotName] = texture;
+            }
+
+            return texture;
+        }
+
+        return null;
     }
 
     private void IndexMaterialTextures(Material material)
@@ -5574,7 +5985,8 @@ public partial class MainWindow : Window
             out var localMeshSourceTypesCache,
             out var localMaterialMainTextureCache,
             out var localMaterialPreviewMaterialCache,
-            out var localMaterialTextureSlotsCache);
+            out var localMaterialTextureSlotsCache,
+            out var semanticRelations);
 
         lock (previewCacheLock)
         {
@@ -5585,6 +5997,8 @@ public partial class MainWindow : Window
             materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
             materialTextureSlotsCache = localMaterialTextureSlotsCache;
         }
+
+        TrySaveSemanticRelations(semanticRelations);
     }
 
     private static bool IsSameLazySource(string? left, string? right)
@@ -8387,7 +8801,8 @@ public partial class MainWindow : Window
             out var localMeshSourceTypesCache,
             out var localMaterialMainTextureCache,
             out var localMaterialPreviewMaterialCache,
-            out var localMaterialTextureSlotsCache);
+            out var localMaterialTextureSlotsCache,
+            out var semanticRelations);
 
         objectToAssetItemCache = localObjectToAssetItemCache;
         meshToMaterialsCache = localMeshToMaterialsCache;
@@ -8396,6 +8811,7 @@ public partial class MainWindow : Window
         materialMainTextureCache = localMaterialMainTextureCache;
         materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
         materialTextureSlotsCache = localMaterialTextureSlotsCache;
+        TrySaveSemanticRelations(semanticRelations);
 
         BuildAnimationPreviewIndexesBackground(
             assetsManager.assetsFileList,
@@ -8421,6 +8837,12 @@ public partial class MainWindow : Window
     {
         if (meshToMaterialsCache == null)
         {
+            var semanticMaterials = TryLoadMaterialsForMeshFromSemanticCache(mesh);
+            if (semanticMaterials.Count > 0)
+            {
+                return semanticMaterials;
+            }
+
             if (assetsManager.LazyLoading)
             {
                 List<SerializedFile> filesSnapshot;
@@ -8444,6 +8866,63 @@ public partial class MainWindow : Window
         return new List<Material?>();
     }
 
+    private List<Material?> TryLoadMaterialsForMeshFromSemanticCache(Mesh mesh)
+    {
+        var materials = new List<Material?>();
+        if (!assetsManager.LazyLoading || mesh.assetsFile == null || currentScanResult == null)
+        {
+            return materials;
+        }
+
+        var folderPath = appSettings.LoadFolderPath;
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return materials;
+        }
+
+        var meshAssetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        var materialIds = _sqliteCache.LoadMeshMaterialAssetIds(folderPath, signature, meshAssetId);
+        if (materialIds.Count == 0)
+        {
+            return materials;
+        }
+
+        foreach (var materialId in materialIds)
+        {
+            if (string.IsNullOrWhiteSpace(materialId))
+            {
+                materials.Add(null);
+                continue;
+            }
+
+            var handle = assetsManager.ProjectIndex.GetHandle(materialId);
+            if (handle == null)
+            {
+                materials.Add(null);
+                continue;
+            }
+
+            var asset = ResolveSemanticRelationHandleForPreview(handle);
+            if (asset is Material material)
+            {
+                materials.Add(material);
+            }
+            else
+            {
+                materials.Add(null);
+            }
+        }
+
+        if (materials.Any(material => material != null))
+        {
+            meshToMaterialsCache ??= new Dictionary<Mesh, List<Material?>>();
+            meshToMaterialsCache[mesh] = materials;
+        }
+
+        return materials;
+    }
+
     private static HashSet<string> GetPathTokens(string path)
     {
         var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -8461,6 +8940,42 @@ public partial class MainWindow : Window
             }
         }
         return tokens;
+    }
+
+    private static global::OpenTK.Mathematics.Vector2[]? BuildMeshPreviewUvs(Mesh mesh)
+    {
+        if (mesh.m_UV0 == null || mesh.m_UV0.Length < mesh.m_VertexCount * 2)
+        {
+            return null;
+        }
+
+        var uvs = new global::OpenTK.Mathematics.Vector2[mesh.m_VertexCount];
+        for (int i = 0; i < mesh.m_VertexCount; i++)
+        {
+            uvs[i] = new global::OpenTK.Mathematics.Vector2(mesh.m_UV0[i * 2], mesh.m_UV0[i * 2 + 1]);
+        }
+
+        return uvs;
+    }
+
+    private string FormatMeshPreviewSummary(Mesh mesh, AssetItem item)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Mesh Asset: {mesh.m_Name} (PathID: {mesh.m_PathID})");
+        sb.AppendLine("==================================================");
+        sb.AppendLine($"Vertex Count: {mesh.m_VertexCount}");
+        sb.AppendLine($"Submesh Count: {mesh.m_SubMeshes?.Length ?? 0}");
+        sb.AppendLine($"Index Count: {mesh.m_Indices?.Count ?? 0}");
+
+        bool isFbx = item.Container.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+            .Any(part => string.Equals(Path.GetExtension(part), ".fbx", StringComparison.OrdinalIgnoreCase));
+        sb.AppendLine($"From FBX Container: {(isFbx ? "Yes" : "No")}");
+        if (isFbx)
+        {
+            sb.AppendLine($"FBX Path: {item.Container}");
+        }
+
+        return sb.ToString();
     }
 
     private string FormatMeshPreview(Mesh mesh, AssetItem item)

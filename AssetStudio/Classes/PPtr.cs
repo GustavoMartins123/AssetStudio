@@ -105,7 +105,7 @@ namespace AssetStudio
                 }
             }
 
-            var handle = sourceFile.assetsManager?.ProjectIndex?.GetHandle($"{sourceFile.fileName}#{m_PathID}");
+            var handle = sourceFile.assetsManager?.ProjectIndex?.GetHandle(AssetHandle.BuildUniqueID(sourceFile, m_PathID));
             if (handle != null)
             {
                 var obj = sourceFile.assetsManager.ResolveHandle(handle);

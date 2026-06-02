@@ -1,6 +1,8 @@
 #nullable enable
 using System;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace AssetStudio
 {
@@ -26,6 +28,65 @@ namespace AssetStudio
         public object? Tag { get; set; }
 
         public string DisplayType => GetDisplayType();
+
+        public static string BuildUniqueID(SerializedFile file, long pathID)
+        {
+            if (file == null)
+            {
+                return BuildUniqueID(string.Empty, string.Empty, pathID);
+            }
+
+            var sourcePath = !string.IsNullOrWhiteSpace(file.originalPath)
+                ? file.originalPath
+                : file.fullName;
+            return BuildUniqueID(file.fileName, sourcePath, pathID);
+        }
+
+        public static string BuildUniqueID(string serializedFileName, string? originalPath, long pathID)
+        {
+            var fileName = string.IsNullOrWhiteSpace(serializedFileName)
+                ? "unknown"
+                : serializedFileName;
+            return $"{fileName}#{BuildSourceHash(serializedFileName, originalPath)}#{pathID}";
+        }
+
+        public static string BuildSourceHash(string serializedFileName, string? originalPath)
+        {
+            var normalizedPath = NormalizeSourcePath(originalPath);
+            var key = string.IsNullOrEmpty(normalizedPath)
+                ? serializedFileName ?? string.Empty
+                : $"{normalizedPath}\u001f{serializedFileName ?? string.Empty}";
+
+            using (var sha256 = SHA256.Create())
+            {
+                var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(key));
+                var sb = new StringBuilder(bytes.Length * 2);
+                foreach (var b in bytes)
+                {
+                    sb.Append(b.ToString("x2"));
+                }
+                return sb.ToString(0, 16);
+            }
+        }
+
+        private static string NormalizeSourcePath(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return Path.GetFullPath(path)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    .ToUpperInvariant();
+            }
+            catch
+            {
+                return path.Replace('\\', '/').Trim().ToUpperInvariant();
+            }
+        }
 
         private string GetDisplayType()
         {

@@ -328,6 +328,8 @@ void main()
         private bool isGles;
 
         public event Action<string>? GpuErrorOccurred;
+        internal Func<Mesh, float, MeshPreviewGeometryCache?>? LoadMeshPreviewGeometryCache { get; set; }
+        internal Action<Mesh, float, MeshPreviewGeometryCache>? SaveMeshPreviewGeometryCache { get; set; }
 
         public MeshPreviewControl()
         {
@@ -789,6 +791,30 @@ void main()
             SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
         }
 
+        public void ApplyMeshTextures(List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
+        {
+            if (subMeshTextures == null || !subMeshTextures.Any(t => t != null))
+            {
+                return;
+            }
+
+            meshPreviewSourceSubMeshTextures = subMeshTextures;
+            meshPreviewSourceSubMeshTexWidths = subMeshTexWidths;
+            meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+            keepExistingTextures = true;
+            previewMaterialMode = true;
+
+            lock (textureLock)
+            {
+                pendingSubMeshTextures = subMeshTextures;
+                pendingSubMeshTexWidths = subMeshTexWidths;
+                pendingSubMeshTexHeights = subMeshTexHeights;
+                hasPendingSubMeshTextures = true;
+            }
+
+            RequestNextFrameRendering();
+        }
+
         private void SetMesh(Mesh m_Mesh, Vector2[]? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
         {
             ClearAvatarPreviewState();
@@ -816,122 +842,158 @@ void main()
             var m_Indices = m_Mesh.m_Indices;
             var m_Normals = m_Mesh.m_Normals;
             var m_Colors = m_Mesh.m_Colors;
+            var densityPercent = previewMeshDensityPercent;
 
             System.Threading.Tasks.Task.Run(() =>
             {
                 if (m_Vertices == null || m_Vertices.Length == 0) return;
 
-                int count = 3;
-                if (m_Vertices.Length == m_VertexCount * 4)
-                {
-                    count = 4;
-                }
-                var localVertexData = new Vector3[m_VertexCount];
-
-                // Calculate Bounding
-                Vector3 min = new Vector3(m_Vertices[0], m_Vertices[1], m_Vertices[2]);
-                Vector3 max = min;
-                for (int v = 0; v < m_VertexCount; v++)
-                {
-                    var vertex = new Vector3(
-                        m_Vertices[v * count],
-                        m_Vertices[v * count + 1],
-                        m_Vertices[v * count + 2]);
-                    localVertexData[v] = vertex;
-                    ExpandBounds(vertex, ref min, ref max);
-                }
-
-                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
-
-                // Indices
-                var localIndiceData = new int[m_Indices.Count];
-                for (int i = 0; i < m_Indices.Count; i = i + 3)
-                {
-                    localIndiceData[i] = (int)m_Indices[i];
-                    localIndiceData[i + 1] = (int)m_Indices[i + 1];
-                    localIndiceData[i + 2] = (int)m_Indices[i + 2];
-                }
-
-                // Normals
-                Vector3[]? localNormalData = null;
-                if (m_Normals != null && m_Normals.Length > 0)
-                {
-                    int nCount = 3;
-                    if (m_Normals.Length == m_VertexCount * 3)
-                        nCount = 3;
-                    else if (m_Normals.Length == m_VertexCount * 4)
-                        nCount = 4;
-                    localNormalData = new Vector3[m_VertexCount];
-                    for (int n = 0; n < m_VertexCount; n++)
-                    {
-                        localNormalData[n] = new Vector3(
-                            m_Normals[n * nCount],
-                            m_Normals[n * nCount + 1],
-                            m_Normals[n * nCount + 2]);
-                    }
-                }
-
-                var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
-
-                // Colors
+                Vector3[] localVertexData;
+                int[] localIndiceData;
+                Vector3[]? localNormalData;
+                Vector3[] localNormal2Data;
                 Vector4[] localColorData;
-                if (m_Colors != null && m_Colors.Length == m_VertexCount * 3)
+                Vector2[]? localUvData;
+                int[]? localPreviewSubMeshIndexCounts;
+                Matrix4 localModelMatrixData;
+
+                var cachedGeometry = LoadMeshPreviewGeometryCache?.Invoke(m_Mesh, densityPercent);
+                if (cachedGeometry != null)
                 {
-                    localColorData = new Vector4[m_VertexCount];
-                    for (int c = 0; c < m_VertexCount; c++)
-                    {
-                        localColorData[c] = new Vector4(
-                            m_Colors[c * 3],
-                            m_Colors[c * 3 + 1],
-                            m_Colors[c * 3 + 2],
-                            1.0f);
-                    }
-                }
-                else if (m_Colors != null && m_Colors.Length == m_VertexCount * 4)
-                {
-                    localColorData = new Vector4[m_VertexCount];
-                    for (int c = 0; c < m_VertexCount; c++)
-                    {
-                        localColorData[c] = new Vector4(
-                            m_Colors[c * 4],
-                            m_Colors[c * 4 + 1],
-                            m_Colors[c * 4 + 2],
-                            m_Colors[c * 4 + 3]);
-                    }
+                    localVertexData = cachedGeometry.Vertices;
+                    localIndiceData = cachedGeometry.Indices;
+                    localNormalData = cachedGeometry.Normals;
+                    localNormal2Data = cachedGeometry.CalculatedNormals ?? BuildCalculatedNormals(cachedGeometry.Vertices, cachedGeometry.Indices);
+                    localColorData = cachedGeometry.Colors;
+                    localUvData = cachedGeometry.Uvs;
+                    localPreviewSubMeshIndexCounts = cachedGeometry.SubMeshIndexCounts;
+                    localModelMatrixData = cachedGeometry.ModelMatrix;
                 }
                 else
                 {
-                    localColorData = new Vector4[m_VertexCount];
-                    for (int c = 0; c < m_VertexCount; c++)
+                    int count = 3;
+                    if (m_Vertices.Length == m_VertexCount * 4)
                     {
-                        localColorData[c] = new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
+                        count = 4;
                     }
-                }
+                    localVertexData = new Vector3[m_VertexCount];
 
-                Vector2[]? localUvData = uvs;
-                if (localUvData == null && m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_VertexCount * 2)
-                {
-                    localUvData = new Vector2[m_VertexCount];
-                    for (int i = 0; i < m_VertexCount; i++)
+                    // Calculate Bounding
+                    Vector3 min = new Vector3(m_Vertices[0], m_Vertices[1], m_Vertices[2]);
+                    Vector3 max = min;
+                    for (int v = 0; v < m_VertexCount; v++)
                     {
-                        localUvData[i] = new Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
+                        var vertex = new Vector3(
+                            m_Vertices[v * count],
+                            m_Vertices[v * count + 1],
+                            m_Vertices[v * count + 2]);
+                        localVertexData[v] = vertex;
+                        ExpandBounds(vertex, ref min, ref max);
                     }
-                }
 
-                var localPreviewSubMeshIndexCounts = BuildSubMeshIndexCounts(m_Mesh, localIndiceData.Length);
-                if (previewMeshDensityPercent < PreviewMeshSimplifier.MaxDensityPercent - 0.01f)
-                {
-                    var simplified = PreviewMeshSimplifier.Build(localVertexData, m_Indices, min, max, previewMeshDensityPercent, localPreviewSubMeshIndexCounts);
-                    if (simplified.Indices.Length > 0)
+                    localModelMatrixData = CreatePreviewModelMatrix(min, max);
+
+                    // Indices
+                    localIndiceData = new int[m_Indices.Count];
+                    for (int i = 0; i < m_Indices.Count; i = i + 3)
                     {
-                        localVertexData = simplified.Vertices;
-                        localIndiceData = simplified.Indices;
-                        localPreviewSubMeshIndexCounts = simplified.SubMeshIndexCounts;
-                        localNormalData = RemapVector3Data(localNormalData, simplified.SourceVertexIndices);
-                        localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
-                        localColorData = RemapVector4Data(localColorData, simplified.SourceVertexIndices) ?? localColorData;
-                        localUvData = RemapVector2Data(localUvData, simplified.SourceVertexIndices);
+                        localIndiceData[i] = (int)m_Indices[i];
+                        localIndiceData[i + 1] = (int)m_Indices[i + 1];
+                        localIndiceData[i + 2] = (int)m_Indices[i + 2];
                     }
+
+                    // Normals
+                    localNormalData = null;
+                    if (m_Normals != null && m_Normals.Length > 0)
+                    {
+                        int nCount = 3;
+                        if (m_Normals.Length == m_VertexCount * 3)
+                            nCount = 3;
+                        else if (m_Normals.Length == m_VertexCount * 4)
+                            nCount = 4;
+                        localNormalData = new Vector3[m_VertexCount];
+                        for (int n = 0; n < m_VertexCount; n++)
+                        {
+                            localNormalData[n] = new Vector3(
+                                m_Normals[n * nCount],
+                                m_Normals[n * nCount + 1],
+                                m_Normals[n * nCount + 2]);
+                        }
+                    }
+
+                    localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
+
+                    // Colors
+                    if (m_Colors != null && m_Colors.Length == m_VertexCount * 3)
+                    {
+                        localColorData = new Vector4[m_VertexCount];
+                        for (int c = 0; c < m_VertexCount; c++)
+                        {
+                            localColorData[c] = new Vector4(
+                                m_Colors[c * 3],
+                                m_Colors[c * 3 + 1],
+                                m_Colors[c * 3 + 2],
+                                1.0f);
+                        }
+                    }
+                    else if (m_Colors != null && m_Colors.Length == m_VertexCount * 4)
+                    {
+                        localColorData = new Vector4[m_VertexCount];
+                        for (int c = 0; c < m_VertexCount; c++)
+                        {
+                            localColorData[c] = new Vector4(
+                                m_Colors[c * 4],
+                                m_Colors[c * 4 + 1],
+                                m_Colors[c * 4 + 2],
+                                m_Colors[c * 4 + 3]);
+                        }
+                    }
+                    else
+                    {
+                        localColorData = new Vector4[m_VertexCount];
+                        for (int c = 0; c < m_VertexCount; c++)
+                        {
+                            localColorData[c] = new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
+                        }
+                    }
+
+                    localUvData = uvs;
+                    if (localUvData == null && m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_VertexCount * 2)
+                    {
+                        localUvData = new Vector2[m_VertexCount];
+                        for (int i = 0; i < m_VertexCount; i++)
+                        {
+                            localUvData[i] = new Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
+                        }
+                    }
+
+                    localPreviewSubMeshIndexCounts = BuildSubMeshIndexCounts(m_Mesh, localIndiceData.Length);
+                    if (densityPercent < PreviewMeshSimplifier.MaxDensityPercent - 0.01f)
+                    {
+                        var simplified = PreviewMeshSimplifier.Build(localVertexData, m_Indices, min, max, densityPercent, localPreviewSubMeshIndexCounts);
+                        if (simplified.Indices.Length > 0)
+                        {
+                            localVertexData = simplified.Vertices;
+                            localIndiceData = simplified.Indices;
+                            localPreviewSubMeshIndexCounts = simplified.SubMeshIndexCounts;
+                            localNormalData = RemapVector3Data(localNormalData, simplified.SourceVertexIndices);
+                            localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
+                            localColorData = RemapVector4Data(localColorData, simplified.SourceVertexIndices) ?? localColorData;
+                            localUvData = RemapVector2Data(localUvData, simplified.SourceVertexIndices);
+                        }
+                    }
+
+                    SaveMeshPreviewGeometryCache?.Invoke(m_Mesh, densityPercent, new MeshPreviewGeometryCache
+                    {
+                        ModelMatrix = localModelMatrixData,
+                        Vertices = localVertexData,
+                        Indices = localIndiceData,
+                        Normals = localNormalData,
+                        CalculatedNormals = localNormal2Data,
+                        Colors = localColorData,
+                        Uvs = localUvData,
+                        SubMeshIndexCounts = localPreviewSubMeshIndexCounts
+                    });
                 }
 
                 if (resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null))

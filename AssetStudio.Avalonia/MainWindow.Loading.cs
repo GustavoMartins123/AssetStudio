@@ -23,6 +23,7 @@ namespace AssetStudio.Avalonia
             public Dictionary<Material, Texture2D?> MaterialMainTextureCache;
             public Dictionary<Material, Material?> MaterialPreviewMaterialCache;
             public Dictionary<Material, Dictionary<string, Texture2D?>> MaterialTextureSlotsCache;
+            public SemanticAssetRelations SemanticRelations;
             public Dictionary<AnimationClip, Avatar?> AnimationClipAvatarCache;
             public Dictionary<Avatar, Mesh?> AvatarMeshCache;
             public Dictionary<Mesh, Avatar?> MeshAvatarCache;
@@ -154,7 +155,7 @@ namespace AssetStudio.Avalonia
                 var record = records[index];
                 var item = record.Item;
                 objectAssetItemDic[record.Asset] = item;
-                pathIDAssetItemDic[$"{record.File.fileName}#{record.Asset.m_PathID}"] = item;
+                pathIDAssetItemDic[AssetHandle.BuildUniqueID(record.File, record.Asset.m_PathID)] = item;
 
                 if (record.GameObject != null && !treeNodeDictionary.ContainsKey(record.GameObject))
                 {
@@ -537,7 +538,8 @@ namespace AssetStudio.Avalonia
             out Dictionary<Mesh, HashSet<string>> meshSourceTypesCacheOut,
             out Dictionary<Material, Texture2D?> materialMainTextureCacheOut,
             out Dictionary<Material, Material?> materialPreviewMaterialCacheOut,
-            out Dictionary<Material, Dictionary<string, Texture2D?>> materialTextureSlotsCacheOut)
+            out Dictionary<Material, Dictionary<string, Texture2D?>> materialTextureSlotsCacheOut,
+            out SemanticAssetRelations semanticRelationsOut)
         {
             var localObjectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>(localExportableAssets.Count);
             foreach (var item in localExportableAssets)
@@ -555,6 +557,7 @@ namespace AssetStudio.Avalonia
             var localMaterialMainTextureCache = new Dictionary<Material, Texture2D?>();
             var localMaterialPreviewMaterialCache = new Dictionary<Material, Material?>();
             var localMaterialTextureSlotsCache = new Dictionary<Material, Dictionary<string, Texture2D?>>();
+            var localSemanticRelations = new SemanticAssetRelations();
 
             void AddMeshMaterials(Mesh mesh, List<Material?> materials)
             {
@@ -616,6 +619,8 @@ namespace AssetStudio.Avalonia
                     localMaterialMainTextureCache[entry.Key] = entry.Value;
                 }
 
+                localSemanticRelations.Merge(fileResult.SemanticRelations);
+
                 foreach (var entry in fileResult.MeshToMaterialsCache)
                 {
                     AddMeshMaterials(entry.Key, entry.Value);
@@ -648,6 +653,7 @@ namespace AssetStudio.Avalonia
             materialMainTextureCacheOut = localMaterialMainTextureCache;
             materialPreviewMaterialCacheOut = localMaterialPreviewMaterialCache;
             materialTextureSlotsCacheOut = localMaterialTextureSlotsCache;
+            semanticRelationsOut = localSemanticRelations;
         }
 
         private static AssetReferenceIndexBuildResult BuildAssetReferenceIndexForFile(SerializedFile file)
@@ -692,11 +698,18 @@ namespace AssetStudio.Avalonia
                 objectsSnapshot = file.Objects.ToArray();
             }
 
+            result.SemanticRelations.SourceFiles.Add(new SemanticSourceFileEntry(
+                file.fileName ?? string.Empty,
+                file.originalPath ?? string.Empty,
+                file.unityVersion ?? string.Empty,
+                file.m_Objects?.Count ?? objectsSnapshot.Length));
+
             foreach (var obj in objectsSnapshot)
             {
                 if (obj is Material material)
                 {
                     IndexMaterialTexturesBackground(material, result.MaterialPreviewMaterialCache, result.MaterialTextureSlotsCache, result.MaterialMainTextureCache);
+                    AddMaterialTextureRelations(result.SemanticRelations, material, result.MaterialPreviewMaterialCache, result.MaterialTextureSlotsCache, result.MaterialMainTextureCache);
                 }
                 else if (obj is SkinnedMeshRenderer smr)
                 {
@@ -705,6 +718,10 @@ namespace AssetStudio.Avalonia
                     if (smrMesh != null)
                     {
                         var go = ResolveGameObjectBackground(file, smr.m_GameObject);
+                        AddRendererMeshRelation(result.SemanticRelations, smrMesh, smr, "SkinnedMeshRenderer", go,
+                            go != null ? $"SkinnedMeshRenderer on GameObject \"{go.m_Name}\" (PathID: {smr.m_PathID})" : string.Empty);
+                        AddAssetEdge(result.SemanticRelations, smr, "Mesh", "m_Mesh", 0, smrMesh, smr.m_Mesh.m_FileID, smr.m_Mesh.m_PathID);
+
                         AddMeshAssociation(
                             smrMesh,
                             "SkinnedMeshRenderer",
@@ -713,9 +730,13 @@ namespace AssetStudio.Avalonia
                         if (smr.m_Materials != null)
                         {
                             var list = new List<Material?>();
-                            foreach (var matPtr in smr.m_Materials)
+                            for (var matIndex = 0; matIndex < smr.m_Materials.Length; matIndex++)
                             {
-                                list.Add(ResolveRendererMaterialBackground(matPtr));
+                                var matPtr = smr.m_Materials[matIndex];
+                                var rendererMaterial = ResolveRendererMaterialBackground(matPtr);
+                                list.Add(rendererMaterial);
+                                AddMeshMaterialRelation(result.SemanticRelations, smrMesh, rendererMaterial, smr, "SkinnedMeshRenderer", matIndex, list);
+                                AddAssetEdge(result.SemanticRelations, smr, "Material", "m_Materials", matIndex, rendererMaterial, matPtr.m_FileID, matPtr.m_PathID);
                             }
                             AddMeshMaterials(smrMesh, list);
                         }
@@ -745,6 +766,10 @@ namespace AssetStudio.Avalonia
 
                                 if (mfMesh != null)
                                 {
+                                    AddRendererMeshRelation(result.SemanticRelations, mfMesh, mr, "MeshRenderer", go,
+                                        $"MeshRenderer on GameObject \"{go.m_Name}\" (PathID: {mr.m_PathID}); MeshFilter PathID: {mf.m_PathID}");
+                                    AddAssetEdge(result.SemanticRelations, mf, "Mesh", "m_Mesh", 0, mfMesh, mf.m_Mesh.m_FileID, mf.m_Mesh.m_PathID);
+
                                     AddMeshAssociation(
                                         mfMesh,
                                         "MeshFilter",
@@ -753,9 +778,13 @@ namespace AssetStudio.Avalonia
                                     if (mr.m_Materials != null)
                                     {
                                         var list = new List<Material?>();
-                                        foreach (var matPtr in mr.m_Materials)
+                                        for (var matIndex = 0; matIndex < mr.m_Materials.Length; matIndex++)
                                         {
-                                            list.Add(ResolveRendererMaterialBackground(matPtr));
+                                            var matPtr = mr.m_Materials[matIndex];
+                                            var rendererMaterial = ResolveRendererMaterialBackground(matPtr);
+                                            list.Add(rendererMaterial);
+                                            AddMeshMaterialRelation(result.SemanticRelations, mfMesh, rendererMaterial, mr, "MeshRenderer", matIndex, list);
+                                            AddAssetEdge(result.SemanticRelations, mr, "Material", "m_Materials", matIndex, rendererMaterial, matPtr.m_FileID, matPtr.m_PathID);
                                         }
                                         AddMeshMaterials(mfMesh, list);
                                     }
@@ -809,6 +838,147 @@ namespace AssetStudio.Avalonia
             return null;
         }
 
+        private static string GetSemanticAssetId(AssetStudio.Object? asset)
+        {
+            return asset?.assetsFile != null
+                ? AssetHandle.BuildUniqueID(asset.assetsFile, asset.m_PathID)
+                : string.Empty;
+        }
+
+        private static void AddRendererMeshRelation(
+            SemanticAssetRelations relations,
+            Mesh mesh,
+            Component renderer,
+            string rendererType,
+            GameObject? gameObject,
+            string description)
+        {
+            var meshId = GetSemanticAssetId(mesh);
+            var rendererId = GetSemanticAssetId(renderer);
+            if (string.IsNullOrEmpty(meshId) || string.IsNullOrEmpty(rendererId))
+            {
+                return;
+            }
+
+            relations.MeshRenderers.Add(new SemanticMeshRendererRelation(
+                meshId,
+                rendererId,
+                rendererType,
+                GetSemanticAssetId(gameObject),
+                gameObject?.m_Name ?? string.Empty,
+                description ?? string.Empty));
+        }
+
+        private static void AddMeshMaterialRelation(
+            SemanticAssetRelations relations,
+            Mesh mesh,
+            Material? material,
+            Component renderer,
+            string rendererType,
+            int subMeshIndex,
+            List<Material?> currentMaterials)
+        {
+            var meshId = GetSemanticAssetId(mesh);
+            var rendererId = GetSemanticAssetId(renderer);
+            if (string.IsNullOrEmpty(meshId) || string.IsNullOrEmpty(rendererId))
+            {
+                return;
+            }
+
+            relations.MeshMaterials.Add(new SemanticMeshMaterialRelation(
+                meshId,
+                GetSemanticAssetId(material),
+                rendererId,
+                rendererType,
+                subMeshIndex,
+                ScoreMaterialsStatic(currentMaterials)));
+        }
+
+        private static void AddMaterialTextureRelations(
+            SemanticAssetRelations relations,
+            Material material,
+            Dictionary<Material, Material?> materialPreviewMaterialCache,
+            Dictionary<Material, Dictionary<string, Texture2D?>> materialTextureSlotsCache,
+            Dictionary<Material, Texture2D?> materialMainTextureCache)
+        {
+            var materialId = GetSemanticAssetId(material);
+            if (string.IsNullOrEmpty(materialId))
+            {
+                return;
+            }
+
+            materialPreviewMaterialCache.TryGetValue(material, out var previewMaterial);
+            previewMaterial ??= material;
+
+            if (!materialTextureSlotsCache.TryGetValue(material, out var slots)
+                && !materialTextureSlotsCache.TryGetValue(previewMaterial, out slots))
+            {
+                return;
+            }
+
+            materialMainTextureCache.TryGetValue(material, out var mainTexture);
+            var previewMaterialId = GetSemanticAssetId(previewMaterial);
+            var slotIndex = 0;
+            foreach (var slot in slots)
+            {
+                var textureId = GetSemanticAssetId(slot.Value);
+                relations.MaterialTextures.Add(new SemanticMaterialTextureRelation(
+                    materialId,
+                    previewMaterialId,
+                    slot.Key,
+                    slotIndex,
+                    textureId,
+                    slot.Value != null && ReferenceEquals(slot.Value, mainTexture)));
+
+                if (slot.Value != null)
+                {
+                    relations.AssetEdges.Add(new SemanticAssetEdgeRelation(
+                        materialId,
+                        "Texture",
+                        slot.Key,
+                        slotIndex,
+                        textureId,
+                        0,
+                        material.m_PathID,
+                        0,
+                        slot.Value.m_PathID,
+                        !string.IsNullOrEmpty(textureId)));
+                }
+
+                slotIndex++;
+            }
+        }
+
+        private static void AddAssetEdge(
+            SemanticAssetRelations relations,
+            AssetStudio.Object source,
+            string edgeKind,
+            string slotName,
+            int slotIndex,
+            AssetStudio.Object? target,
+            int targetFileId,
+            long targetPathId)
+        {
+            var sourceId = GetSemanticAssetId(source);
+            if (string.IsNullOrEmpty(sourceId))
+            {
+                return;
+            }
+
+            var targetId = GetSemanticAssetId(target);
+            relations.AssetEdges.Add(new SemanticAssetEdgeRelation(
+                sourceId,
+                edgeKind,
+                slotName,
+                slotIndex,
+                targetId,
+                0,
+                source.m_PathID,
+                targetFileId,
+                targetPathId,
+                !string.IsNullOrEmpty(targetId)));
+        }
+
         private sealed class AssetReferenceIndexBuildResult
         {
             public Dictionary<Mesh, List<Material?>> MeshToMaterialsCache { get; } = new();
@@ -817,6 +987,7 @@ namespace AssetStudio.Avalonia
             public Dictionary<Material, Texture2D?> MaterialMainTextureCache { get; } = new();
             public Dictionary<Material, Material?> MaterialPreviewMaterialCache { get; } = new();
             public Dictionary<Material, Dictionary<string, Texture2D?>> MaterialTextureSlotsCache { get; } = new();
+            public SemanticAssetRelations SemanticRelations { get; } = new();
         }
 
         private static void BuildAnimationPreviewIndexesBackground(

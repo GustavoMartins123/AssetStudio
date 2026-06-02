@@ -68,6 +68,11 @@
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem Header="Clear project cache" Click="ClearCurrentProjectCache_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
                 <MenuItem Header="Theme">
                     <MenuItem.Icon>
