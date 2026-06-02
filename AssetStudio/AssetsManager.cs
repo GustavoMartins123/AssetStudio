@@ -949,14 +949,20 @@ namespace AssetStudio
 
                         var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                         var obj = CreateObjectFromReader(objectReader);
-                        handle.RealObject = obj;
-                        
+
                         lock (assetsFile)
                         {
-                            if (!assetsFile.ObjectsDic.ContainsKey(obj.m_PathID))
+                            if (assetsFile.ObjectsDic.TryGetValue(obj.m_PathID, out var existing))
                             {
-                                assetsFile.AddObject(obj);
+                                handle.RealObject = existing;
+                                if (LazyLoading)
+                                {
+                                    LruCache.RecordAccess(handle);
+                                }
+                                return existing;
                             }
+                            handle.RealObject = obj;
+                            assetsFile.AddObject(obj);
                         }
 
                         if (LazyLoading)
