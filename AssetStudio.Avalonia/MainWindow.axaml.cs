@@ -98,8 +98,10 @@ public partial class MainWindow : Window
     private ProjectScanResult? currentScanResult;
     private bool isBuildingAssetStructures;
     private bool isBuildingLazyConnections;
+    private long lastConnectionDbWriteTicks;
     private readonly ConcurrentDictionary<string, string> lazySourcePathBySerializedFile = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> lazySourceFileSearchCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> resolvedSourcePathCache = new(StringComparer.OrdinalIgnoreCase);
 
     private string? _pendingStatusText;
     private string? _currentlySelectedUniqueID;
@@ -439,6 +441,7 @@ public partial class MainWindow : Window
             "connections_completed" => "Connections complete",
             "completed" => "Indexing complete",
             "failed" => "Indexing failed",
+            "connections_failed" => "Connections build failed",
             _ => "Indexing"
         };
     }
@@ -2307,6 +2310,11 @@ public partial class MainWindow : Window
         ViewModel.IsPauseEnabled = false;
         ViewModel.IsResumeEnabled = false;
         ViewModel.IsStopEnabled = false;
+        ViewModel.LoadingProgress = 0;
+        
+        // Show connecting progress panel immediately on the UI thread before background scan starts
+        ShowIndexingProgressPanel("connecting", 0, 100, 100, 0, string.Empty, string.Empty, null);
+
         var lastSourcePath = string.Empty;
         var lastProcessedFiles = 0;
         var sourcePaths = new List<string>();
@@ -2319,13 +2327,14 @@ public partial class MainWindow : Window
             {
                 Logger.Warning("Unable to build lazy connections: no source files could be resolved from the project index.");
                 StatusStripUpdate("Connections build skipped: no source files resolved.");
+                HideIndexingProgressPanel();
                 return;
             }
 
             StatusStripUpdate($"Building connections... 0/{sourcePaths.Count:N0} files");
             PublishLazyConnectionProgress(folderPath, scanResult, "connecting", 0, sourcePaths.Count, string.Empty, string.Empty);
 
-            var relations = await Task.Run(() => BuildLazySemanticRelationsForSources(
+            var relations = await Task.Run(async () => await BuildLazySemanticRelationsForSourcesAsync(
                 sourcePaths,
                 (processedFiles, currentSourcePath) =>
                 {
@@ -2353,7 +2362,7 @@ public partial class MainWindow : Window
             var saved = TrySaveSemanticRelations(folderPath, scanResult, relations);
             if (!saved)
             {
-                PublishLazyConnectionProgress(folderPath, scanResult, "failed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
+                PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
                 StatusStripUpdate("Connections build finished, but saving to SQLite failed.");
                 return;
             }
@@ -2365,12 +2374,12 @@ public partial class MainWindow : Window
         }
         catch (MemoryPressureException ex)
         {
-            PublishLazyConnectionProgress(folderPath, scanResult, "failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
+            PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
             ShowMemoryPressureError(ex);
         }
         catch (Exception ex)
         {
-            PublishLazyConnectionProgress(folderPath, scanResult, "failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
+            PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
             Logger.Error($"Failed to build lazy asset connections: {ex}", ex);
             StatusStripUpdate("Connections build failed.");
         }
@@ -2407,14 +2416,25 @@ public partial class MainWindow : Window
             NewlyReadFiles = Array.Empty<string>()
         };
 
-        try
+        var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        var elapsedMs = (nowTicks - lastConnectionDbWriteTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        bool isTerminal = string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase);
+
+        if (processedFiles == 0 || processedFiles == safeTotal || isTerminal || elapsedMs >= 2000)
         {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to persist connection build progress: {ex.Message}");
+            lastConnectionDbWriteTicks = nowTicks;
+            try
+            {
+                var signature = _sqliteCache.GetFolderSignature(scanResult);
+                _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to persist connection build progress: {ex.Message}");
+            }
         }
 
         ShowIndexingProgressPanel(update);
@@ -2424,6 +2444,7 @@ public partial class MainWindow : Window
     {
         var sourcePaths = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var failedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var handle in assetsManager.ProjectIndex.GetHandles())
         {
@@ -2433,9 +2454,31 @@ public partial class MainWindow : Window
             }
 
             RememberLazyHandleSourcePath(handle);
-            var sourcePath = ResolveLazyHandleSourcePath(handle);
-            if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+
+            if (!LazyConnectionReferenceTypes.Contains(handle.Type))
             {
+                continue;
+            }
+
+            var sourcePath = ResolveLazyHandleSourcePath(handle);
+            if (string.IsNullOrWhiteSpace(sourcePath))
+            {
+                continue;
+            }
+
+            if (seen.Contains(sourcePath))
+            {
+                continue;
+            }
+
+            if (failedPaths.Contains(sourcePath))
+            {
+                continue;
+            }
+
+            if (!File.Exists(sourcePath))
+            {
+                failedPaths.Add(sourcePath);
                 continue;
             }
 
@@ -2450,46 +2493,65 @@ public partial class MainWindow : Window
         return sourcePaths;
     }
 
-    private SemanticAssetRelations BuildLazySemanticRelationsForSources(
+    private async Task<SemanticAssetRelations> BuildLazySemanticRelationsForSourcesAsync(
         IReadOnlyList<string> sourcePaths,
         Action<int, string> reportProgress)
     {
         var mergedRelations = new SemanticAssetRelations();
         var failedSources = new List<string>();
-        for (var i = 0; i < sourcePaths.Count; i++)
+        const int batchSize = 32;
+
+        for (var i = 0; i < sourcePaths.Count; i += batchSize)
         {
-            var sourcePath = sourcePaths[i];
+            var batch = sourcePaths.Skip(i).Take(batchSize).ToList();
             try
             {
-                WaitForUserInteractionPriorityToClearAsync(CancellationToken.None).GetAwaiter().GetResult();
+                await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
                 AssetsManager.ThrowIfMemoryPressureTooHigh("building lazy connections");
-                assetsManager.LoadFilesForPreview(sourcePath);
+                await assetsManager.LoadFilesAsync(batch.ToArray());
 
-                var filesForSource = GetLoadedFilesForConnectionSource(sourcePath);
-                if (filesForSource.Count == 0)
+                for (var j = 0; j < batch.Count; j++)
                 {
-                    throw new InvalidOperationException("No serialized files were loaded for connection building.");
+                    var sourcePath = batch[j];
+                    var overallIndex = i + j;
+                    try
+                    {
+                        var filesForSource = GetLoadedFilesForConnectionSource(sourcePath);
+                        if (filesForSource.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        foreach (var file in filesForSource)
+                        {
+                            MaterializeReferenceObjects(file, LazyConnectionReferenceTypes);
+                        }
+
+                        BuildAssetReferenceIndexesBackground(
+                            filesForSource,
+                            new List<AssetItem>(),
+                            out _,
+                            out _,
+                            out _,
+                            out _,
+                            out _,
+                            out _,
+                            out _,
+                            out var semanticRelations);
+
+                        mergedRelations.Merge(semanticRelations);
+                        UnloadConnectionBuildObjects(filesForSource);
+                    }
+                    catch (Exception ex)
+                    {
+                        failedSources.Add(sourcePath);
+                        Logger.Warning($"Failed to build connections for {Path.GetFileName(sourcePath)}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        reportProgress(overallIndex + 1, sourcePath);
+                    }
                 }
-
-                foreach (var file in filesForSource)
-                {
-                    MaterializeReferenceObjects(file, LazyConnectionReferenceTypes);
-                }
-
-                BuildAssetReferenceIndexesBackground(
-                    filesForSource,
-                    new List<AssetItem>(),
-                    out _,
-                    out _,
-                    out _,
-                    out _,
-                    out _,
-                    out _,
-                    out _,
-                    out var semanticRelations);
-
-                mergedRelations.Merge(semanticRelations);
-                UnloadConnectionBuildObjects(filesForSource);
             }
             catch (MemoryPressureException)
             {
@@ -2497,20 +2559,28 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                failedSources.Add(sourcePath);
-                Logger.Warning($"Failed to build connections for {Path.GetFileName(sourcePath)}: {ex.Message}");
+                foreach (var sourcePath in batch)
+                {
+                    failedSources.Add(sourcePath);
+                    Logger.Warning($"Failed to load/build connections for {Path.GetFileName(sourcePath)} in batch: {ex.Message}");
+                }
+                for (var j = 0; j < batch.Count; j++)
+                {
+                    var sourcePath = batch[j];
+                    var overallIndex = i + j;
+                    reportProgress(overallIndex + 1, sourcePath);
+                }
             }
             finally
             {
-                WaitForUserInteractionPriorityToClearAsync(CancellationToken.None).GetAwaiter().GetResult();
+                await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
                 assetsManager.ClearLoadedFilesKeepIndex();
-                reportProgress(i + 1, sourcePath);
             }
         }
 
         if (failedSources.Count > 0)
         {
-            throw new InvalidOperationException($"Connections build failed for {failedSources.Count:N0} source file(s). First failure: {Path.GetFileName(failedSources[0])}");
+            Logger.Warning($"Connections build completed with {failedSources.Count:N0} failed source file(s). First failure: {Path.GetFileName(failedSources[0])}");
         }
 
         return mergedRelations;
@@ -3733,6 +3803,23 @@ public partial class MainWindow : Window
     }
 
     private string? ResolveLazyHandleSourcePath(AssetHandle handle)
+    {
+        if (handle == null)
+        {
+            return null;
+        }
+        var cacheKey = $"{handle.SerializedFileName}|{handle.OriginalPath}";
+        if (resolvedSourcePathCache.TryGetValue(cacheKey, out var cachedPath))
+        {
+            return string.IsNullOrEmpty(cachedPath) ? null : cachedPath;
+        }
+
+        var resolved = ResolveLazyHandleSourcePathInternal(handle);
+        resolvedSourcePathCache[cacheKey] = resolved ?? string.Empty;
+        return resolved;
+    }
+
+    private string? ResolveLazyHandleSourcePathInternal(AssetHandle handle)
     {
         var candidates = new List<string>();
         if (!string.IsNullOrWhiteSpace(handle.SourceFile?.originalPath))

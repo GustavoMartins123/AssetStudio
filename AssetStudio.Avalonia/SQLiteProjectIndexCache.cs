@@ -31,9 +31,10 @@ namespace AssetStudio.Avalonia
         private SqliteConnection CreateConnection()
         {
             var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.DefaultTimeout = 60;
             conn.Open();
             using var pragma = conn.CreateCommand();
-            pragma.CommandText = "PRAGMA foreign_keys = ON;";
+            pragma.CommandText = "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 60000;";
             pragma.ExecuteNonQuery();
             return conn;
         }
@@ -978,7 +979,8 @@ namespace AssetStudio.Avalonia
             return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase);
+                || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase);
         }
 
         private static DateTime? ReadNullableDateTime(SqliteDataReader reader, int ordinal)
