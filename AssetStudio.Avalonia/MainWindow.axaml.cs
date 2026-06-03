@@ -97,6 +97,7 @@ public partial class MainWindow : Window
     private readonly SQLiteProjectIndexCache _sqliteCache = new();
     private ProjectScanResult? currentScanResult;
     private bool isBuildingAssetStructures;
+    private bool isBuildingLazyConnections;
     private readonly ConcurrentDictionary<string, string> lazySourcePathBySerializedFile = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> lazySourceFileSearchCache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -434,6 +435,8 @@ public partial class MainWindow : Window
             "paused" => "Indexing paused",
             "cancelling" => "Stopping indexing",
             "cancelled" => "Indexing cancelled",
+            "connecting" => "Building connections",
+            "connections_completed" => "Connections complete",
             "completed" => "Indexing complete",
             "failed" => "Indexing failed",
             _ => "Indexing"
@@ -1536,7 +1539,7 @@ public partial class MainWindow : Window
             {
                 var previousIndexingState = TryLoadIndexingProgress(paths[0], currentScanResult);
                 if (previousIndexingState != null
-                    && !string.Equals(previousIndexingState.Status, "completed", StringComparison.OrdinalIgnoreCase))
+                    && !IsCompletedLazyIndexingStatus(previousIndexingState.Status))
                 {
                     var lastReadFile = string.IsNullOrWhiteSpace(previousIndexingState.LastReadFile)
                         ? "none"
@@ -1571,8 +1574,12 @@ public partial class MainWindow : Window
                 progressBar.Value = 100;
                 var count = AppendNewLazyAssetsFromProjectIndex();
                 StatusStripUpdate($"Loaded from cache. Total assets: {count:N0}");
-                HideIndexingProgressPanel();
-                BuildAssetStructures(incremental: false);
+                await BuildLazyConnectionsIfNeededAsync(paths);
+                await BuildAssetStructuresAsync(incremental: false);
+                if (currentScanResult != null && HasCompletedLazyConnectionBuild(paths[0], currentScanResult))
+                {
+                    HideIndexingProgressPanel();
+                }
                 return;
             }
 
@@ -1645,16 +1652,30 @@ public partial class MainWindow : Window
             },
             (wasCancelled, finalLoadedCount, originalTotal) =>
             {
-                Dispatcher.UIThread.Post(() =>
+                Dispatcher.UIThread.Post(async () =>
                 {
-                    ViewModel.IsIndexingActive = false;
-                    var finalPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
-                    ViewModel.LoadingProgress = wasCancelled ? finalPercent : 100;
-                    StatusStripUpdate(wasCancelled
-                        ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalPercent}%)"
-                        : $"Indexing finished. Total files: {originalTotal:N0}");
-                    AppendNewLazyAssetsFromProjectIndex();
-                    BuildAssetStructures(incremental: true);
+                    try
+                    {
+                        ViewModel.IsIndexingActive = false;
+                        var finalPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
+                        ViewModel.LoadingProgress = wasCancelled ? finalPercent : 100;
+                        StatusStripUpdate(wasCancelled
+                            ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalPercent}%)"
+                            : $"Indexing finished. Total files: {originalTotal:N0}");
+                        AppendNewLazyAssetsFromProjectIndex();
+
+                        if (!wasCancelled)
+                        {
+                            await BuildLazyConnectionsIfNeededAsync(paths, force: true);
+                        }
+
+                        await BuildAssetStructuresAsync(incremental: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"Failed to finish lazy indexing: {ex}", ex);
+                        StatusStripUpdate("Lazy indexing finalization failed.");
+                    }
                 });
             });
     }
@@ -2145,27 +2166,43 @@ public partial class MainWindow : Window
         }
     }
 
-    private void TrySaveSemanticRelations(SemanticAssetRelations relations)
+    private bool TrySaveSemanticRelations(SemanticAssetRelations relations)
     {
-        if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0) || currentScanResult == null)
+        if (currentScanResult == null)
         {
-            return;
+            return false;
         }
 
         var folderPath = appSettings.LoadFolderPath;
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
         {
-            return;
+            return false;
+        }
+
+        return TrySaveSemanticRelations(folderPath, currentScanResult, relations);
+    }
+
+    private bool TrySaveSemanticRelations(string folderPath, ProjectScanResult scanResult, SemanticAssetRelations relations)
+    {
+        if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0) || scanResult == null)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return false;
         }
 
         try
         {
-            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-            _sqliteCache.SaveSemanticRelations(folderPath, signature, relations);
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            return _sqliteCache.SaveSemanticRelations(folderPath, signature, relations);
         }
         catch (Exception ex)
         {
             Logger.Warning($"Failed to save semantic relation cache: {ex.Message}");
+            return false;
         }
     }
 
@@ -2217,6 +2254,315 @@ public partial class MainWindow : Window
         {
             Logger.Warning($"Failed to load index cache: {ex.Message}");
             return null;
+        }
+    }
+
+    private bool HasCompletedLazyConnectionBuild(string folderPath, ProjectScanResult scanResult)
+    {
+        var state = TryLoadIndexingProgress(folderPath, scanResult);
+        return state != null
+            && string.Equals(state.Status, "connections_completed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCompletedLazyIndexingStatus(string? status)
+    {
+        return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool CanUseLazySemanticRelationCache(string folderPath)
+    {
+        return currentScanResult != null
+            && !string.IsNullOrWhiteSpace(folderPath)
+            && Directory.Exists(folderPath)
+            && HasCompletedLazyConnectionBuild(folderPath, currentScanResult);
+    }
+
+    private async Task BuildLazyConnectionsIfNeededAsync(string[] paths, bool force = false)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || paths.Length != 1 || !Directory.Exists(paths[0]))
+        {
+            return;
+        }
+
+        var folderPath = paths[0];
+        if (!force && HasCompletedLazyConnectionBuild(folderPath, currentScanResult))
+        {
+            StatusStripUpdate("Connections already built for this index.");
+            return;
+        }
+
+        await BuildLazyConnectionsAsync(folderPath, currentScanResult);
+    }
+
+    private async Task BuildLazyConnectionsAsync(string folderPath, ProjectScanResult scanResult)
+    {
+        if (isBuildingLazyConnections)
+        {
+            return;
+        }
+
+        isBuildingLazyConnections = true;
+        ViewModel.IsIndexingActive = true;
+        ViewModel.IsPauseEnabled = false;
+        ViewModel.IsResumeEnabled = false;
+        ViewModel.IsStopEnabled = false;
+        var lastSourcePath = string.Empty;
+        var lastProcessedFiles = 0;
+        var sourcePaths = new List<string>();
+
+        try
+        {
+            StatusStripUpdate("Preparing connection build...");
+            sourcePaths = await Task.Run(GetLazyConnectionSourcePaths);
+            if (sourcePaths.Count == 0)
+            {
+                Logger.Warning("Unable to build lazy connections: no source files could be resolved from the project index.");
+                StatusStripUpdate("Connections build skipped: no source files resolved.");
+                return;
+            }
+
+            StatusStripUpdate($"Building connections... 0/{sourcePaths.Count:N0} files");
+            PublishLazyConnectionProgress(folderPath, scanResult, "connecting", 0, sourcePaths.Count, string.Empty, string.Empty);
+
+            var relations = await Task.Run(() => BuildLazySemanticRelationsForSources(
+                sourcePaths,
+                (processedFiles, currentSourcePath) =>
+                {
+                    lastSourcePath = currentSourcePath;
+                    lastProcessedFiles = processedFiles;
+                    PublishLazyConnectionProgress(
+                        folderPath,
+                        scanResult,
+                        "connecting",
+                        processedFiles,
+                        sourcePaths.Count,
+                        currentSourcePath,
+                        currentSourcePath);
+
+                    var percent = sourcePaths.Count == 0
+                        ? 100
+                        : Math.Min(100, Math.Max(0, processedFiles * 100.0 / sourcePaths.Count));
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        ViewModel.LoadingProgress = (int)percent;
+                        StatusStripUpdate($"Building connections... {processedFiles:N0}/{sourcePaths.Count:N0} files ({percent:0.#}%)");
+                    }, DispatcherPriority.Background);
+                }));
+
+            var saved = TrySaveSemanticRelations(folderPath, scanResult, relations);
+            if (!saved)
+            {
+                PublishLazyConnectionProgress(folderPath, scanResult, "failed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
+                StatusStripUpdate("Connections build finished, but saving to SQLite failed.");
+                return;
+            }
+
+            PublishLazyConnectionProgress(folderPath, scanResult, "connections_completed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
+            ViewModel.LoadingProgress = 100;
+            StatusStripUpdate(
+                $"Connections complete. Edges: {relations.AssetEdges.Count:N0}, mesh materials: {relations.MeshMaterials.Count:N0}, material textures: {relations.MaterialTextures.Count:N0}.");
+        }
+        catch (MemoryPressureException ex)
+        {
+            PublishLazyConnectionProgress(folderPath, scanResult, "failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
+            ShowMemoryPressureError(ex);
+        }
+        catch (Exception ex)
+        {
+            PublishLazyConnectionProgress(folderPath, scanResult, "failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
+            Logger.Error($"Failed to build lazy asset connections: {ex}", ex);
+            StatusStripUpdate("Connections build failed.");
+        }
+        finally
+        {
+            ViewModel.IsIndexingActive = false;
+            ViewModel.IsPauseEnabled = false;
+            ViewModel.IsResumeEnabled = false;
+            ViewModel.IsStopEnabled = false;
+            isBuildingLazyConnections = false;
+        }
+    }
+
+    private void PublishLazyConnectionProgress(
+        string folderPath,
+        ProjectScanResult scanResult,
+        string status,
+        int processedFiles,
+        int totalFiles,
+        string currentFile,
+        string lastReadFile)
+    {
+        var safeTotal = Math.Max(0, totalFiles);
+        var safeProcessed = Math.Clamp(processedFiles, 0, safeTotal == 0 ? processedFiles : safeTotal);
+        var update = new IndexingProgressUpdate
+        {
+            Status = status,
+            TotalFiles = safeTotal,
+            ProcessedFiles = safeProcessed,
+            PendingFiles = Math.Max(0, safeTotal - safeProcessed),
+            PercentComplete = safeTotal <= 0 ? 100 : Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal)),
+            CurrentFile = currentFile ?? string.Empty,
+            LastReadFile = lastReadFile ?? string.Empty,
+            NewlyReadFiles = Array.Empty<string>()
+        };
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to persist connection build progress: {ex.Message}");
+        }
+
+        ShowIndexingProgressPanel(update);
+    }
+
+    private List<string> GetLazyConnectionSourcePaths()
+    {
+        var sourcePaths = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var handle in assetsManager.ProjectIndex.GetHandles())
+        {
+            if (handle == null)
+            {
+                continue;
+            }
+
+            RememberLazyHandleSourcePath(handle);
+            var sourcePath = ResolveLazyHandleSourcePath(handle);
+            if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+            {
+                continue;
+            }
+
+            var fullPath = Path.GetFullPath(sourcePath);
+            if (seen.Add(fullPath))
+            {
+                sourcePaths.Add(fullPath);
+            }
+        }
+
+        sourcePaths.Sort(StringComparer.OrdinalIgnoreCase);
+        return sourcePaths;
+    }
+
+    private SemanticAssetRelations BuildLazySemanticRelationsForSources(
+        IReadOnlyList<string> sourcePaths,
+        Action<int, string> reportProgress)
+    {
+        var mergedRelations = new SemanticAssetRelations();
+        var failedSources = new List<string>();
+        for (var i = 0; i < sourcePaths.Count; i++)
+        {
+            var sourcePath = sourcePaths[i];
+            try
+            {
+                WaitForUserInteractionPriorityToClearAsync(CancellationToken.None).GetAwaiter().GetResult();
+                AssetsManager.ThrowIfMemoryPressureTooHigh("building lazy connections");
+                assetsManager.LoadFilesForPreview(sourcePath);
+
+                var filesForSource = GetLoadedFilesForConnectionSource(sourcePath);
+                if (filesForSource.Count == 0)
+                {
+                    throw new InvalidOperationException("No serialized files were loaded for connection building.");
+                }
+
+                foreach (var file in filesForSource)
+                {
+                    MaterializeReferenceObjects(file, LazyConnectionReferenceTypes);
+                }
+
+                BuildAssetReferenceIndexesBackground(
+                    filesForSource,
+                    new List<AssetItem>(),
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out var semanticRelations);
+
+                mergedRelations.Merge(semanticRelations);
+                UnloadConnectionBuildObjects(filesForSource);
+            }
+            catch (MemoryPressureException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failedSources.Add(sourcePath);
+                Logger.Warning($"Failed to build connections for {Path.GetFileName(sourcePath)}: {ex.Message}");
+            }
+            finally
+            {
+                WaitForUserInteractionPriorityToClearAsync(CancellationToken.None).GetAwaiter().GetResult();
+                assetsManager.ClearLoadedFilesKeepIndex();
+                reportProgress(i + 1, sourcePath);
+            }
+        }
+
+        if (failedSources.Count > 0)
+        {
+            throw new InvalidOperationException($"Connections build failed for {failedSources.Count:N0} source file(s). First failure: {Path.GetFileName(failedSources[0])}");
+        }
+
+        return mergedRelations;
+    }
+
+    private List<SerializedFile> GetLoadedFilesForConnectionSource(string sourcePath)
+    {
+        lock (assetsManager.loadLock)
+        {
+            return assetsManager.assetsFileList
+                .Where(file => file != null
+                    && (IsSameLazySource(file.originalPath, sourcePath)
+                        || IsSameLazySource(file.fullName, sourcePath)))
+                .ToList();
+        }
+    }
+
+    private void UnloadConnectionBuildObjects(IReadOnlyList<SerializedFile> files)
+    {
+        foreach (var file in files)
+        {
+            if (file == null)
+            {
+                continue;
+            }
+
+            foreach (var handle in assetsManager.ProjectIndex.GetHandlesForFile(file.fileName).ToList())
+            {
+                if (handle == null
+                    || !ReferenceEquals(handle.SourceFile, file)
+                    || !LazyConnectionReferenceTypes.Contains(handle.Type)
+                    || IsLazyHandlePinnedForPreview(handle))
+                {
+                    continue;
+                }
+
+                UnloadAsset(handle);
+            }
+        }
+    }
+
+    private bool IsLazyHandlePinnedForPreview(AssetHandle handle)
+    {
+        if (handle == null || string.IsNullOrEmpty(handle.UniqueID))
+        {
+            return false;
+        }
+
+        lock (preloaderLock)
+        {
+            return preloadedUniqueIds.Contains(handle.UniqueID)
+                || string.Equals(_currentlySelectedUniqueID, handle.UniqueID, StringComparison.Ordinal);
         }
     }
 
@@ -2510,6 +2856,11 @@ public partial class MainWindow : Window
     }
 
     private async void BuildAssetStructures(bool incremental = false)
+    {
+        await BuildAssetStructuresAsync(incremental);
+    }
+
+    private async Task BuildAssetStructuresAsync(bool incremental = false)
     {
         if (isBuildingAssetStructures) return;
         isBuildingAssetStructures = true;
@@ -2807,7 +3158,10 @@ public partial class MainWindow : Window
             ? assetsManager.ProjectIndex.GetHandles().Count()
             : m_ObjectsCount;
         SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count);
-        TrySaveSemanticRelations(result.SemanticRelations);
+        if (!assetsManager.LazyLoading)
+        {
+            TrySaveSemanticRelations(result.SemanticRelations);
+        }
         }
         finally
         {
@@ -3729,15 +4083,10 @@ public partial class MainWindow : Window
                                 return;
                             }
 
-                            if (assetsManager.LazyLoading)
-                            {
-                                EnsureMeshPreviewDependenciesLoaded(m_Mesh);
-                            }
-
                             var subMeshTextures = new List<byte[]?>();
                             var subMeshTexWidths = new List<int>();
                             var subMeshTexHeights = new List<int>();
-                            var allMaterials = FindMaterialsForMesh(m_Mesh);
+                            var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
 
                             if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
                             {
@@ -3785,7 +4134,11 @@ public partial class MainWindow : Window
                                 }
                             }
 
-                            var infoText = includeMeshInfo ? FormatMeshPreview(m_Mesh, localAssetItem) : string.Empty;
+                            var infoText = includeMeshInfo
+                                ? assetsManager.LazyLoading
+                                    ? FormatLazyMeshPreview(m_Mesh, localAssetItem, allMaterials)
+                                    : FormatMeshPreview(m_Mesh, localAssetItem)
+                                : string.Empty;
                             var hasTextures = subMeshTextures.Any(t => t != null);
 
                             Dispatcher.UIThread.Post(() =>
@@ -5560,6 +5913,15 @@ public partial class MainWindow : Window
             TexturePreviewImageResult? previewImage = null;
             try
             {
+                try
+                {
+                    EnsureMaterialPreviewDependenciesLoaded(m_Material);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to prepare material preview dependencies for {m_Material.m_Name}: {ex.Message}");
+                }
+
                 var previewData = BuildMaterialPreviewData(m_Material);
                 if (currentId != texturePreviewIdCounter)
                 {
@@ -5899,7 +6261,34 @@ public partial class MainWindow : Window
         return FindMaterialsForMesh(mesh).FirstOrDefault();
     }
 
-    private static readonly HashSet<ClassIDType> MeshPreviewReferenceTypes = new()
+    private List<Material?> FindMaterialsForMeshPreview(Mesh mesh)
+    {
+        if (!assetsManager.LazyLoading)
+        {
+            return FindMaterialsForMesh(mesh);
+        }
+
+        var semanticMaterials = TryLoadMaterialsForMeshFromSemanticCache(mesh);
+        if (semanticMaterials.Count > 0)
+        {
+            return semanticMaterials;
+        }
+
+        if (meshToMaterialsCache != null && meshToMaterialsCache.TryGetValue(mesh, out var cachedList))
+        {
+            return new List<Material?>(cachedList);
+        }
+
+        return new List<Material?>();
+    }
+
+    private static readonly HashSet<ClassIDType> MaterialPreviewReferenceTypes = new()
+    {
+        ClassIDType.Material,
+        ClassIDType.Texture2D
+    };
+
+    private static readonly HashSet<ClassIDType> LazyConnectionReferenceTypes = new()
     {
         ClassIDType.GameObject,
         ClassIDType.Transform,
@@ -5907,12 +6296,7 @@ public partial class MainWindow : Window
         ClassIDType.MeshFilter,
         ClassIDType.MeshRenderer,
         ClassIDType.SkinnedMeshRenderer,
-        ClassIDType.Material,
-        ClassIDType.Texture2D
-    };
-
-    private static readonly HashSet<ClassIDType> MaterialPreviewReferenceTypes = new()
-    {
+        ClassIDType.Mesh,
         ClassIDType.Material,
         ClassIDType.Texture2D
     };
@@ -5984,7 +6368,7 @@ public partial class MainWindow : Window
         }
 
         var folderPath = appSettings.LoadFolderPath;
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        if (!CanUseLazySemanticRelationCache(folderPath))
         {
             return null;
         }
@@ -6061,35 +6445,6 @@ public partial class MainWindow : Window
             materialTextureSlotsCache[material] = slots;
             materialMainTextureCache[material] = materialMainTextureCache[displayMaterial];
         }
-    }
-
-    private void EnsureMeshPreviewDependenciesLoaded(Mesh mesh)
-    {
-        if (!assetsManager.LazyLoading || mesh.assetsFile == null)
-        {
-            return;
-        }
-
-        EnsureIndexedExternalSourcesLoaded(mesh.assetsFile);
-        if (ArePreviewReferenceIndexesReady())
-        {
-            return;
-        }
-
-        MaterializeReferenceObjects(mesh.assetsFile, MeshPreviewReferenceTypes);
-
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
-        {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
-        }
-
-        foreach (var file in filesSnapshot)
-        {
-            MaterializeReferenceObjects(file, MeshPreviewReferenceTypes);
-        }
-
-        BuildLazyPreviewReferenceIndexes(filesSnapshot);
     }
 
     private void EnsureMaterialPreviewDependenciesLoaded(Material material)
@@ -6178,33 +6533,6 @@ public partial class MainWindow : Window
                 UpdateLazyAssetItemHandle(item, handle);
             }
         }
-    }
-
-    private void BuildLazyPreviewReferenceIndexes(List<SerializedFile> filesSnapshot)
-    {
-        BuildAssetReferenceIndexesBackground(
-            filesSnapshot,
-            new List<AssetItem>(),
-            out _,
-            out var localMeshToMaterialsCache,
-            out var localMeshAssociatedRenderersCache,
-            out var localMeshSourceTypesCache,
-            out var localMaterialMainTextureCache,
-            out var localMaterialPreviewMaterialCache,
-            out var localMaterialTextureSlotsCache,
-            out var semanticRelations);
-
-        lock (previewCacheLock)
-        {
-            meshToMaterialsCache = localMeshToMaterialsCache;
-            meshAssociatedRenderersCache = localMeshAssociatedRenderersCache;
-            meshSourceTypesCache = localMeshSourceTypesCache;
-            materialMainTextureCache = localMaterialMainTextureCache;
-            materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
-            materialTextureSlotsCache = localMaterialTextureSlotsCache;
-        }
-
-        TrySaveSemanticRelations(semanticRelations);
     }
 
     private static bool IsSameLazySource(string? left, string? right)
@@ -9116,7 +9444,10 @@ public partial class MainWindow : Window
         materialMainTextureCache = localMaterialMainTextureCache;
         materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
         materialTextureSlotsCache = localMaterialTextureSlotsCache;
-        TrySaveSemanticRelations(semanticRelations);
+        if (!assetsManager.LazyLoading)
+        {
+            TrySaveSemanticRelations(semanticRelations);
+        }
 
         BuildAnimationPreviewIndexesBackground(
             assetsManager.assetsFileList,
@@ -9140,6 +9471,11 @@ public partial class MainWindow : Window
 
     private List<Material?> FindMaterialsForMesh(Mesh mesh)
     {
+        if (assetsManager.LazyLoading)
+        {
+            return FindMaterialsForMeshPreview(mesh);
+        }
+
         if (meshToMaterialsCache == null)
         {
             var semanticMaterials = TryLoadMaterialsForMeshFromSemanticCache(mesh);
@@ -9148,19 +9484,7 @@ public partial class MainWindow : Window
                 return semanticMaterials;
             }
 
-            if (assetsManager.LazyLoading)
-            {
-                List<SerializedFile> filesSnapshot;
-                lock (assetsManager.loadLock)
-                {
-                    filesSnapshot = assetsManager.assetsFileList.ToList();
-                }
-                BuildLazyPreviewReferenceIndexes(filesSnapshot);
-            }
-            else
-            {
-                BuildAssetReferenceIndexes();
-            }
+            BuildAssetReferenceIndexes();
         }
 
         if (meshToMaterialsCache!.TryGetValue(mesh, out var cachedList))
@@ -9180,7 +9504,7 @@ public partial class MainWindow : Window
         }
 
         var folderPath = appSettings.LoadFolderPath;
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        if (!CanUseLazySemanticRelationCache(folderPath))
         {
             return materials;
         }
@@ -9347,6 +9671,34 @@ public partial class MainWindow : Window
             {
                 sb.AppendLine(dump);
             }
+        }
+
+        return sb.ToString();
+    }
+
+    private string FormatLazyMeshPreview(Mesh mesh, AssetItem item, List<Material?> materials)
+    {
+        var sb = new StringBuilder();
+        sb.Append(FormatMeshPreviewSummary(mesh, item));
+
+        var folderPath = appSettings.LoadFolderPath;
+        var connectionsReady = CanUseLazySemanticRelationCache(folderPath);
+        sb.AppendLine($"Connections: {(connectionsReady ? "Complete" : "Not built yet")}");
+
+        if (connectionsReady)
+        {
+            sb.AppendLine($"Associated Materials ({materials.Count}):");
+            foreach (var mat in materials)
+            {
+                if (mat != null)
+                {
+                    sb.AppendLine($"  - {mat.m_Name} (PathID: {mat.m_PathID})");
+                }
+            }
+        }
+        else
+        {
+            sb.AppendLine("Associated Materials: waiting for final connections build.");
         }
 
         return sb.ToString();
@@ -10041,63 +10393,14 @@ public partial class MainWindow : Window
     private readonly HashSet<string> preloadedUniqueIds = new();
     private const int AssetPreloadWindowSize = 50;
 
-    private bool ArePreviewReferenceIndexesReady()
+    private void PreprocessPreloadedAssetForPreview(AssetItem item, CancellationToken token)
     {
-        lock (previewCacheLock)
-        {
-            return meshToMaterialsCache != null
-                && meshAssociatedRenderersCache != null
-                && meshSourceTypesCache != null
-                && materialMainTextureCache != null
-                && materialPreviewMaterialCache != null
-                && materialTextureSlotsCache != null;
-        }
-    }
-
-    private void WarmPreloadedMeshPreviewReferences(CancellationToken token)
-    {
-        if (!assetsManager.LazyLoading || token.IsCancellationRequested || ArePreviewReferenceIndexesReady())
+        if (token.IsCancellationRequested || item.Handle?.RealObject is not Mesh mesh)
         {
             return;
         }
 
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
-        {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
-        }
-
-        foreach (var file in filesSnapshot)
-        {
-            if (token.IsCancellationRequested)
-            {
-                return;
-            }
-
-            MaterializeReferenceObjects(file, MeshPreviewReferenceTypes);
-        }
-
-        if (!token.IsCancellationRequested)
-        {
-            BuildLazyPreviewReferenceIndexes(filesSnapshot);
-        }
-    }
-
-    private bool PreprocessPreloadedAssetForPreview(AssetItem item, CancellationToken token, bool warmedMeshPreviewReferences)
-    {
-        if (token.IsCancellationRequested || item.Handle?.RealObject is not Mesh mesh)
-        {
-            return warmedMeshPreviewReferences;
-        }
-
         mesh.EnsureProcessed();
-        if (!warmedMeshPreviewReferences || !ArePreviewReferenceIndexesReady())
-        {
-            WarmPreloadedMeshPreviewReferences(token);
-            warmedMeshPreviewReferences = ArePreviewReferenceIndexesReady();
-        }
-
-        return warmedMeshPreviewReferences;
     }
 
     private void UnloadAsset(AssetHandle handle)
@@ -10200,7 +10503,6 @@ public partial class MainWindow : Window
 
             _ = Task.Run(async () =>
             {
-                var warmedMeshPreviewReferences = false;
                 foreach (var item in sortedItemsToLoad)
                 {
                     if (token.IsCancellationRequested) break;
@@ -10224,7 +10526,7 @@ public partial class MainWindow : Window
 
                         if (item.Handle.RealObject != null)
                         {
-                            warmedMeshPreviewReferences = PreprocessPreloadedAssetForPreview(item, token, warmedMeshPreviewReferences);
+                            PreprocessPreloadedAssetForPreview(item, token);
                             lock (preloaderLock)
                             {
                                 preloadedUniqueIds.Add(item.Handle.UniqueID);
@@ -10237,7 +10539,7 @@ public partial class MainWindow : Window
 
                         if (item.Handle?.UniqueID != null && item.Handle.RealObject != null)
                         {
-                            warmedMeshPreviewReferences = PreprocessPreloadedAssetForPreview(item, token, warmedMeshPreviewReferences);
+                            PreprocessPreloadedAssetForPreview(item, token);
                             lock (preloaderLock)
                             {
                                 preloadedUniqueIds.Add(item.Handle.UniqueID);

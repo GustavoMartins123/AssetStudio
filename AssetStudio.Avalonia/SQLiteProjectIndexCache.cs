@@ -610,9 +610,44 @@ namespace AssetStudio.Avalonia
             return $"{serializedFileName}\u001f{originalPath}";
         }
 
-        internal void SaveSemanticRelations(string folderPath, string signature, SemanticAssetRelations relations)
+        internal bool SaveSemanticRelations(string folderPath, string signature, SemanticAssetRelations relations)
         {
             if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0))
+            {
+                return false;
+            }
+
+            EnsureInitialized();
+            try
+            {
+                using var conn = CreateConnection();
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return false;
+                }
+
+                ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
+                InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles);
+                InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges);
+                InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers);
+                InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials);
+                InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures);
+
+                transaction.Commit();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to save semantic asset relations: {ex.Message}");
+                return false;
+            }
+        }
+
+        internal void ClearSemanticRelations(string folderPath, string signature)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath) || string.IsNullOrWhiteSpace(signature))
             {
                 return;
             }
@@ -628,17 +663,70 @@ namespace AssetStudio.Avalonia
                     return;
                 }
 
-                InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles);
-                InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges);
-                InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers);
-                InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials);
-                InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures);
-
+                ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
                 transaction.Commit();
             }
             catch (Exception ex)
             {
-                Logger.Warning($"Failed to save semantic asset relations: {ex.Message}");
+                Logger.Warning($"Failed to clear semantic asset relations: {ex.Message}");
+            }
+        }
+
+        internal bool HasSemanticRelations(string folderPath, string signature)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath) || string.IsNullOrWhiteSpace(signature))
+            {
+                return false;
+            }
+
+            EnsureInitialized();
+            try
+            {
+                using var conn = CreateConnection();
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return false;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        (SELECT COUNT(1) FROM AssetEdges WHERE ProjectId = @projectId) +
+                        (SELECT COUNT(1) FROM MeshRenderers WHERE ProjectId = @projectId) +
+                        (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
+                        (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                var count = Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
+                transaction.Commit();
+                return count > 0;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to inspect semantic asset relations: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static void ClearSemanticRelationTablesForProject(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            var tables = new[]
+            {
+                "MaterialTextures",
+                "MeshMaterials",
+                "MeshRenderers",
+                "AssetEdges"
+            };
+
+            foreach (var table in tables)
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = $"DELETE FROM {table} WHERE ProjectId = @projectId";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                cmd.ExecuteNonQuery();
             }
         }
 
@@ -889,7 +977,8 @@ namespace AssetStudio.Avalonia
         {
             return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase);
+                || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase);
         }
 
         private static DateTime? ReadNullableDateTime(SqliteDataReader reader, int ordinal)

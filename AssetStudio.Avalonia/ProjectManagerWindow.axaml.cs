@@ -481,6 +481,8 @@ public partial class ProjectManagerWindow : Window
                 "paused" => "Paused",
                 "cancelling" => "Stopping",
                 "cancelled" => "Cancelled",
+                "connecting" => "Building connections",
+                "connections_completed" => "Connections complete",
                 "completed" => "Complete",
                 "failed" => "Failed",
                 _ => "Unknown"

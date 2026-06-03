@@ -1086,34 +1086,51 @@ namespace AssetStudio.Avalonia
             materialMainTextureCache.TryGetValue(material, out var mainTexture);
             var previewMaterialId = GetSemanticAssetId(previewMaterial);
             var slotIndex = 0;
-            foreach (var slot in slots)
+            foreach (var texEnv in previewMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
             {
-                var textureId = GetSemanticAssetId(slot.Value);
+                slots.TryGetValue(texEnv.Key, out var slotTexture);
+                var textureRef = texEnv.Value?.m_Texture;
+                var textureId = GetSemanticAssetId(slotTexture);
+                if (string.IsNullOrEmpty(textureId))
+                {
+                    textureId = GetSemanticTextureAssetIdFromPPtr(previewMaterial, textureRef);
+                }
+
                 relations.MaterialTextures.Add(new SemanticMaterialTextureRelation(
                     materialId,
                     previewMaterialId,
-                    slot.Key,
+                    texEnv.Key,
                     slotIndex,
                     textureId,
-                    slot.Value != null && ReferenceEquals(slot.Value, mainTexture)));
+                    slotTexture != null && ReferenceEquals(slotTexture, mainTexture)));
 
-                if (slot.Value != null)
+                if (textureRef != null && !textureRef.IsNull)
                 {
                     relations.AssetEdges.Add(new SemanticAssetEdgeRelation(
                         materialId,
                         "Texture",
-                        slot.Key,
+                        texEnv.Key,
                         slotIndex,
                         textureId,
                         0,
                         material.m_PathID,
-                        0,
-                        slot.Value.m_PathID,
+                        textureRef.m_FileID,
+                        textureRef.m_PathID,
                         !string.IsNullOrEmpty(textureId)));
                 }
 
                 slotIndex++;
             }
+        }
+
+        private static string GetSemanticTextureAssetIdFromPPtr(Material material, PPtr<Texture>? textureRef)
+        {
+            if (material.assetsFile == null || textureRef == null || textureRef.IsNull)
+            {
+                return string.Empty;
+            }
+
+            return GetSemanticAssetIdFromPPtr(material.assetsFile, textureRef, ClassIDType.Texture2D);
         }
 
         private static void AddAssetEdge(
@@ -1451,7 +1468,8 @@ namespace AssetStudio.Avalonia
                 return directTex;
             }
 
-            if (textureRef.m_FileID == 0
+            if (material.assetsFile != null
+                && textureRef.m_FileID == 0
                 && material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj)
                 && localObj is Texture2D localTex)
             {
