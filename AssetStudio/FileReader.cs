@@ -8,6 +8,8 @@ namespace AssetStudio
         public string FullPath;
         public string FileName;
         public FileType FileType;
+        private byte[] cachedMemoryBuffer;
+        private readonly object cachedMemoryBufferLock = new object();
 
         private static readonly byte[] gzipMagic = { 0x1f, 0x8b };
         private static readonly byte[] brotliMagic = { 0x62, 0x72, 0x6F, 0x74, 0x6C, 0x69 };
@@ -104,18 +106,30 @@ namespace AssetStudio
         {
             if (BaseStream is MemoryStream memStream)
             {
-                byte[] buffer;
-                try
+                if (memStream.TryGetBuffer(out var segment) && segment.Array != null)
                 {
-                    buffer = memStream.GetBuffer();
+                    var segmentStream = new MemoryStream(segment.Array, segment.Offset, segment.Count, false, true);
+                    var segmentClone = new FileReader(FullPath, segmentStream);
+                    segmentClone.Endian = Endian;
+                    segmentClone.cachedMemoryBuffer = cachedMemoryBuffer;
+                    return segmentClone;
                 }
-                catch (System.UnauthorizedAccessException)
+
+                if (cachedMemoryBuffer == null)
                 {
-                    buffer = memStream.ToArray();
+                    lock (cachedMemoryBufferLock)
+                    {
+                        if (cachedMemoryBuffer == null)
+                        {
+                            cachedMemoryBuffer = memStream.ToArray();
+                        }
+                    }
                 }
-                var newStream = new MemoryStream(buffer, 0, (int)memStream.Length, false);
+
+                var newStream = new MemoryStream(cachedMemoryBuffer, 0, cachedMemoryBuffer.Length, false, true);
                 var clone = new FileReader(FullPath, newStream);
                 clone.Endian = Endian;
+                clone.cachedMemoryBuffer = cachedMemoryBuffer;
                 return clone;
             }
             else if (BaseStream is SubStream subStream)

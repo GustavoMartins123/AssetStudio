@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 3;
+        private const int SemanticSchemaVersion = 4;
         private readonly string _dbPath;
 
         private readonly Task _initTask;
@@ -611,7 +611,7 @@ namespace AssetStudio.Avalonia
             return $"{serializedFileName}\u001f{originalPath}";
         }
 
-        internal bool SaveSemanticRelations(string folderPath, string signature, SemanticAssetRelations relations)
+        internal bool SaveSemanticRelations(string folderPath, string signature, SemanticAssetRelations relations, bool replaceExisting = false)
         {
             if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0))
             {
@@ -629,7 +629,11 @@ namespace AssetStudio.Avalonia
                     return false;
                 }
 
-                ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
+                if (replaceExisting)
+                {
+                    ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
+                }
+
                 InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles);
                 InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges);
                 InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers);
@@ -1037,6 +1041,7 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
+            var assetSourceFileIds = LoadAssetSourceFileIdMap(conn, transaction, projectId);
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = @"
@@ -1071,13 +1076,42 @@ namespace AssetStudio.Avalonia
                 pSlotName.Value = edge.SlotName;
                 pSlotIndex.Value = edge.SlotIndex;
                 pTargetAssetId.Value = edge.TargetAssetId;
-                pSourceFileId.Value = edge.SourceFileId;
+                pSourceFileId.Value = assetSourceFileIds.TryGetValue(edge.SourceAssetId, out var sourceFileId)
+                    ? sourceFileId
+                    : edge.SourceFileId;
                 pSourcePathId.Value = edge.SourcePathId;
-                pTargetFileId.Value = edge.TargetFileId;
+                pTargetFileId.Value = !string.IsNullOrEmpty(edge.TargetAssetId)
+                    && assetSourceFileIds.TryGetValue(edge.TargetAssetId, out var targetFileId)
+                        ? targetFileId
+                        : edge.TargetFileId;
                 pTargetPathId.Value = edge.TargetPathId;
                 pIsResolved.Value = edge.IsResolved ? 1 : 0;
                 cmd.ExecuteNonQuery();
             }
+        }
+
+        private static Dictionary<string, long> LoadAssetSourceFileIdMap(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            var result = new Dictionary<string, long>(StringComparer.Ordinal);
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT UniqueID, SourceFileId
+                FROM Assets
+                WHERE ProjectId = @projectId
+                  AND SourceFileId IS NOT NULL";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var uniqueId = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
+                if (!string.IsNullOrEmpty(uniqueId))
+                {
+                    result[uniqueId] = reader.IsDBNull(1) ? 0 : reader.GetInt64(1);
+                }
+            }
+
+            return result;
         }
 
         private static void InsertMeshRenderers(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticMeshRendererRelation> renderers)
@@ -1230,6 +1264,7 @@ namespace AssetStudio.Avalonia
                           AND MeshAssetUniqueID = @meshAssetId
                         GROUP BY RendererAssetUniqueID
                         ORDER BY
+                            MAX(CASE WHEN RendererType <> 'Container' THEN 1 ELSE 0 END) DESC,
                             SUM(CASE WHEN MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) DESC,
                             COUNT(*) DESC,
                             MAX(MaterialScore) DESC,

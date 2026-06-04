@@ -1626,6 +1626,7 @@ namespace AssetStudio
             private readonly LinkedList<AssetHandle> list = new LinkedList<AssetHandle>();
             private readonly Dictionary<string, LinkedListNode<AssetHandle>> map = new Dictionary<string, LinkedListNode<AssetHandle>>(StringComparer.Ordinal);
             private readonly object cacheLock = new object();
+            private int evictionSuspendCount;
 
             public AssetLruCache(int capacity)
             {
@@ -1656,7 +1657,7 @@ namespace AssetStudio
                     }
                     else
                     {
-                        if (list.Count >= maxCapacity)
+                        if (evictionSuspendCount == 0 && list.Count >= maxCapacity)
                         {
                             EvictLeastRecentlyUsed();
                         }
@@ -1664,6 +1665,32 @@ namespace AssetStudio
                         var newNode = new LinkedListNode<AssetHandle>(handle);
                         list.AddFirst(newNode);
                         map[handle.UniqueID] = newNode;
+                    }
+                }
+            }
+
+            public IDisposable SuspendEviction()
+            {
+                lock (cacheLock)
+                {
+                    evictionSuspendCount++;
+                }
+
+                return new EvictionSuspension(this);
+            }
+
+            private void ResumeEviction()
+            {
+                lock (cacheLock)
+                {
+                    if (evictionSuspendCount > 0)
+                    {
+                        evictionSuspendCount--;
+                    }
+
+                    while (evictionSuspendCount == 0 && list.Count > maxCapacity)
+                    {
+                        EvictLeastRecentlyUsed();
                     }
                 }
             }
@@ -1735,6 +1762,22 @@ namespace AssetStudio
                             }
                         }
                     }
+                }
+            }
+
+            private sealed class EvictionSuspension : IDisposable
+            {
+                private AssetLruCache cache;
+
+                public EvictionSuspension(AssetLruCache cache)
+                {
+                    this.cache = cache;
+                }
+
+                public void Dispose()
+                {
+                    var target = System.Threading.Interlocked.Exchange(ref cache, null);
+                    target?.ResumeEviction();
                 }
             }
         }

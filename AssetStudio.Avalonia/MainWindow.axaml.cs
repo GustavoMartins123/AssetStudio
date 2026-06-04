@@ -2185,7 +2185,7 @@ public partial class MainWindow : Window
         return TrySaveSemanticRelations(folderPath, currentScanResult, relations);
     }
 
-    private bool TrySaveSemanticRelations(string folderPath, ProjectScanResult scanResult, SemanticAssetRelations relations)
+    private bool TrySaveSemanticRelations(string folderPath, ProjectScanResult scanResult, SemanticAssetRelations relations, bool replaceExisting = false)
     {
         if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0) || scanResult == null)
         {
@@ -2200,7 +2200,7 @@ public partial class MainWindow : Window
         try
         {
             var signature = _sqliteCache.GetFolderSignature(scanResult);
-            return _sqliteCache.SaveSemanticRelations(folderPath, signature, relations);
+            return _sqliteCache.SaveSemanticRelations(folderPath, signature, relations, replaceExisting);
         }
         catch (Exception ex)
         {
@@ -2263,8 +2263,21 @@ public partial class MainWindow : Window
     private bool HasCompletedLazyConnectionBuild(string folderPath, ProjectScanResult scanResult)
     {
         var state = TryLoadIndexingProgress(folderPath, scanResult);
-        return state != null
-            && string.Equals(state.Status, "connections_completed", StringComparison.OrdinalIgnoreCase);
+        if (state == null || !string.Equals(state.Status, "connections_completed", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            return _sqliteCache.HasSemanticRelations(folderPath, signature);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to validate lazy connection cache: {ex.Message}");
+            return false;
+        }
     }
 
     private static bool IsCompletedLazyIndexingStatus(string? status)
@@ -2326,8 +2339,8 @@ public partial class MainWindow : Window
             if (sourcePaths.Count == 0)
             {
                 Logger.Warning("Unable to build lazy connections: no source files could be resolved from the project index.");
+                PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", 0, 0, string.Empty, string.Empty);
                 StatusStripUpdate("Connections build skipped: no source files resolved.");
-                HideIndexingProgressPanel();
                 return;
             }
 
@@ -2359,7 +2372,7 @@ public partial class MainWindow : Window
                     }, DispatcherPriority.Background);
                 }));
 
-            var saved = TrySaveSemanticRelations(folderPath, scanResult, relations);
+            var saved = TrySaveSemanticRelations(folderPath, scanResult, relations, replaceExisting: true);
             if (!saved)
             {
                 PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
@@ -2522,24 +2535,27 @@ public partial class MainWindow : Window
                             continue;
                         }
 
-                        foreach (var file in filesForSource)
+                        using (assetsManager.LruCache.SuspendEviction())
                         {
-                            MaterializeReferenceObjects(file, LazyConnectionReferenceTypes);
+                            foreach (var file in filesForSource)
+                            {
+                                MaterializeReferenceObjects(file, LazyConnectionReferenceTypes);
+                            }
+
+                            BuildAssetReferenceIndexesBackground(
+                                filesForSource,
+                                new List<AssetItem>(),
+                                out _,
+                                out _,
+                                out _,
+                                out _,
+                                out _,
+                                out _,
+                                out _,
+                                out var semanticRelations);
+
+                            mergedRelations.Merge(semanticRelations);
                         }
-
-                        BuildAssetReferenceIndexesBackground(
-                            filesForSource,
-                            new List<AssetItem>(),
-                            out _,
-                            out _,
-                            out _,
-                            out _,
-                            out _,
-                            out _,
-                            out _,
-                            out var semanticRelations);
-
-                        mergedRelations.Merge(semanticRelations);
                         UnloadConnectionBuildObjects(filesForSource);
                     }
                     catch (Exception ex)
@@ -3228,6 +3244,15 @@ public partial class MainWindow : Window
             ? assetsManager.ProjectIndex.GetHandles().Count()
             : m_ObjectsCount;
         SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count);
+        if (assetsManager.LazyLoading && currentScanResult != null)
+        {
+            var folderPath = GetCurrentCacheFolderPath();
+            if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
+            {
+                SaveIndexCache(folderPath, currentScanResult);
+            }
+        }
+
         if (!assetsManager.LazyLoading)
         {
             TrySaveSemanticRelations(result.SemanticRelations);
@@ -4169,6 +4194,8 @@ public partial class MainWindow : Window
                             {
                                 return;
                             }
+
+                            EnsureMeshPreviewDependenciesLoaded(m_Mesh);
 
                             var subMeshTextures = new List<byte[]?>();
                             var subMeshTexWidths = new List<int>();
@@ -6366,11 +6393,42 @@ public partial class MainWindow : Window
             return new List<Material?>(cachedList);
         }
 
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        if (filesSnapshot.Count > 0)
+        {
+            using (assetsManager.LruCache.SuspendEviction())
+            {
+                BuildLazyPreviewReferenceIndexes(filesSnapshot);
+            }
+
+            if (meshToMaterialsCache != null && meshToMaterialsCache.TryGetValue(mesh, out cachedList))
+            {
+                return new List<Material?>(cachedList);
+            }
+        }
+
         return new List<Material?>();
     }
 
     private static readonly HashSet<ClassIDType> MaterialPreviewReferenceTypes = new()
     {
+        ClassIDType.Material,
+        ClassIDType.Texture2D
+    };
+
+    private static readonly HashSet<ClassIDType> MeshPreviewReferenceTypes = new()
+    {
+        ClassIDType.GameObject,
+        ClassIDType.Transform,
+        ClassIDType.RectTransform,
+        ClassIDType.MeshFilter,
+        ClassIDType.MeshRenderer,
+        ClassIDType.SkinnedMeshRenderer,
         ClassIDType.Material,
         ClassIDType.Texture2D
     };
@@ -6383,9 +6441,7 @@ public partial class MainWindow : Window
         ClassIDType.MeshFilter,
         ClassIDType.MeshRenderer,
         ClassIDType.SkinnedMeshRenderer,
-        ClassIDType.Mesh,
-        ClassIDType.Material,
-        ClassIDType.Texture2D
+        ClassIDType.Material
     };
 
     private static readonly HashSet<string> NonDiffuseSlots = new(StringComparer.OrdinalIgnoreCase)
@@ -6534,6 +6590,31 @@ public partial class MainWindow : Window
         }
     }
 
+    private void EnsureMeshPreviewDependenciesLoaded(Mesh mesh)
+    {
+        if (!assetsManager.LazyLoading || mesh.assetsFile == null)
+        {
+            return;
+        }
+
+        using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
+        EnsureIndexedExternalSourcesLoaded(mesh.assetsFile);
+        MaterializeReferenceObjects(mesh.assetsFile, MeshPreviewReferenceTypes);
+
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        foreach (var file in filesSnapshot)
+        {
+            MaterializeReferenceObjects(file, MeshPreviewReferenceTypes);
+        }
+
+        BuildLazyPreviewReferenceIndexes(filesSnapshot);
+    }
+
     private void EnsureMaterialPreviewDependenciesLoaded(Material material)
     {
         if (!assetsManager.LazyLoading || material.assetsFile == null)
@@ -6622,6 +6703,31 @@ public partial class MainWindow : Window
         }
     }
 
+    private void BuildLazyPreviewReferenceIndexes(List<SerializedFile> filesSnapshot)
+    {
+        BuildAssetReferenceIndexesBackground(
+            filesSnapshot,
+            new List<AssetItem>(),
+            out _,
+            out var localMeshToMaterialsCache,
+            out var localMeshAssociatedRenderersCache,
+            out var localMeshSourceTypesCache,
+            out var localMaterialMainTextureCache,
+            out var localMaterialPreviewMaterialCache,
+            out var localMaterialTextureSlotsCache,
+            out _);
+
+        lock (previewCacheLock)
+        {
+            meshToMaterialsCache = localMeshToMaterialsCache;
+            meshAssociatedRenderersCache = localMeshAssociatedRenderersCache;
+            meshSourceTypesCache = localMeshSourceTypesCache;
+            materialMainTextureCache = localMaterialMainTextureCache;
+            materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
+            materialTextureSlotsCache = localMaterialTextureSlotsCache;
+        }
+    }
+
     private static bool IsSameLazySource(string? left, string? right)
     {
         if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
@@ -6692,7 +6798,9 @@ public partial class MainWindow : Window
         {
             candidateFileNames.Add(material.assetsFile.fileName);
         }
-        else if (textureRef.m_FileID > 0 && textureRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
+        else if (textureRef.m_FileID > 0
+            && material.assetsFile.m_Externals != null
+            && textureRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
         {
             var external = material.assetsFile.m_Externals[textureRef.m_FileID - 1];
             AddCandidateFileName(candidateFileNames, external.fileName);

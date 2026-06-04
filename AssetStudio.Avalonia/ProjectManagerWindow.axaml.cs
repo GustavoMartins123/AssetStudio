@@ -483,6 +483,7 @@ public partial class ProjectManagerWindow : Window
                 "cancelled" => "Cancelled",
                 "connecting" => "Building connections",
                 "connections_completed" => "Connections complete",
+                "connections_failed" => "Connections failed",
                 "completed" => "Complete",
                 "failed" => "Failed",
                 _ => "Unknown"

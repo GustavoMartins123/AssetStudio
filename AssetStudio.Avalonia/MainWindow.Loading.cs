@@ -698,6 +698,8 @@ namespace AssetStudio.Avalonia
                 objectsSnapshot = file.Objects.ToArray();
             }
 
+            var containerReferences = new List<(string Container, List<PPtr<AssetStudio.Object>> References)>();
+
             result.SemanticRelations.SourceFiles.Add(new SemanticSourceFileEntry(
                 file.fileName ?? string.Empty,
                 file.originalPath ?? string.Empty,
@@ -706,7 +708,15 @@ namespace AssetStudio.Avalonia
 
             foreach (var obj in objectsSnapshot)
             {
-                if (obj is Material material)
+                if (obj is AssetBundle assetBundle)
+                {
+                    AddAssetBundleContainerReferences(containerReferences, assetBundle);
+                }
+                else if (obj is ResourceManager resourceManager)
+                {
+                    AddResourceManagerContainerReferences(containerReferences, resourceManager);
+                }
+                else if (obj is Material material)
                 {
                     IndexMaterialTexturesBackground(material, result.MaterialPreviewMaterialCache, result.MaterialTextureSlotsCache, result.MaterialMainTextureCache);
                     AddMaterialTextureRelations(result.SemanticRelations, material, result.MaterialPreviewMaterialCache, result.MaterialTextureSlotsCache, result.MaterialMainTextureCache);
@@ -835,7 +845,169 @@ namespace AssetStudio.Avalonia
                 }
             }
 
+            AddContainerMaterialRelations(result.SemanticRelations, file, containerReferences);
             return result;
+        }
+
+        private static void AddAssetBundleContainerReferences(
+            List<(string Container, List<PPtr<AssetStudio.Object>> References)> containerReferences,
+            AssetBundle assetBundle)
+        {
+            if (assetBundle?.m_Container == null || assetBundle.m_PreloadTable == null)
+            {
+                return;
+            }
+
+            foreach (var entry in assetBundle.m_Container)
+            {
+                var references = new List<PPtr<AssetStudio.Object>>();
+                var assetInfo = entry.Value;
+                if (assetInfo?.asset != null && !assetInfo.asset.IsNull)
+                {
+                    references.Add(assetInfo.asset);
+                }
+
+                var preloadStart = Math.Max(0, assetInfo?.preloadIndex ?? 0);
+                var preloadEnd = Math.Min(assetBundle.m_PreloadTable.Length, preloadStart + Math.Max(0, assetInfo?.preloadSize ?? 0));
+                for (var i = preloadStart; i < preloadEnd; i++)
+                {
+                    var reference = assetBundle.m_PreloadTable[i];
+                    if (reference != null && !reference.IsNull)
+                    {
+                        references.Add(reference);
+                    }
+                }
+
+                if (references.Count > 0)
+                {
+                    containerReferences.Add((entry.Key ?? string.Empty, references));
+                }
+            }
+        }
+
+        private static void AddResourceManagerContainerReferences(
+            List<(string Container, List<PPtr<AssetStudio.Object>> References)> containerReferences,
+            ResourceManager resourceManager)
+        {
+            if (resourceManager?.m_Container == null)
+            {
+                return;
+            }
+
+            foreach (var entry in resourceManager.m_Container)
+            {
+                if (entry.Value != null && !entry.Value.IsNull)
+                {
+                    containerReferences.Add((entry.Key ?? string.Empty, new List<PPtr<AssetStudio.Object>> { entry.Value }));
+                }
+            }
+        }
+
+        private static void AddContainerMaterialRelations(
+            SemanticAssetRelations relations,
+            SerializedFile sourceFile,
+            List<(string Container, List<PPtr<AssetStudio.Object>> References)> containerReferences)
+        {
+            if (containerReferences.Count == 0)
+            {
+                return;
+            }
+
+            var meshesWithRendererRelations = relations.MeshMaterials
+                .Where(relation => !string.Equals(relation.RendererType, "Container", StringComparison.OrdinalIgnoreCase))
+                .Select(relation => relation.MeshAssetId)
+                .ToHashSet(StringComparer.Ordinal);
+
+            foreach (var container in containerReferences)
+            {
+                var meshIds = new List<string>();
+                var materialIds = new List<string>();
+
+                foreach (var reference in container.References)
+                {
+                    var handle = GetSemanticHandleFromPPtr(sourceFile, reference);
+                    if (handle == null || string.IsNullOrWhiteSpace(handle.UniqueID))
+                    {
+                        continue;
+                    }
+
+                    if (handle.Type == ClassIDType.Mesh && !meshIds.Contains(handle.UniqueID, StringComparer.Ordinal))
+                    {
+                        meshIds.Add(handle.UniqueID);
+                    }
+                    else if (handle.Type == ClassIDType.Material && !materialIds.Contains(handle.UniqueID, StringComparer.Ordinal))
+                    {
+                        materialIds.Add(handle.UniqueID);
+                    }
+                }
+
+                if (meshIds.Count == 0 || materialIds.Count == 0)
+                {
+                    continue;
+                }
+
+                var rendererId = BuildContainerRelationId(sourceFile, container.Container);
+                foreach (var meshId in meshIds)
+                {
+                    if (meshesWithRendererRelations.Contains(meshId))
+                    {
+                        continue;
+                    }
+
+                    relations.MeshRenderers.Add(new SemanticMeshRendererRelation(
+                        meshId,
+                        rendererId,
+                        "Container",
+                        string.Empty,
+                        string.Empty,
+                        string.IsNullOrWhiteSpace(container.Container)
+                            ? "AssetBundle container"
+                            : $"AssetBundle container \"{container.Container}\""));
+
+                    var currentMaterialIds = new List<string>();
+                    for (var index = 0; index < materialIds.Count; index++)
+                    {
+                        currentMaterialIds.Add(materialIds[index]);
+                        relations.MeshMaterials.Add(new SemanticMeshMaterialRelation(
+                            meshId,
+                            materialIds[index],
+                            rendererId,
+                            "Container",
+                            index,
+                            ScoreMaterialIds(currentMaterialIds)));
+                    }
+                }
+            }
+        }
+
+        private static string BuildContainerRelationId(SerializedFile sourceFile, string container)
+        {
+            var sourceHash = AssetHandle.BuildSourceHash(sourceFile?.fileName ?? string.Empty, sourceFile?.originalPath);
+            return $"container:{sourceHash}:{container ?? string.Empty}";
+        }
+
+        private static AssetHandle? GetSemanticHandleFromPPtr(SerializedFile sourceFile, PPtr<AssetStudio.Object> pptr)
+        {
+            if (sourceFile?.assetsManager?.ProjectIndex == null || pptr == null || pptr.IsNull)
+            {
+                return null;
+            }
+
+            if (pptr.TryGetAssetsFile(out var targetFile))
+            {
+                var handle = sourceFile.assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(targetFile, pptr.m_PathID));
+                if (handle != null)
+                {
+                    return handle;
+                }
+            }
+
+            if (pptr.m_FileID == 0)
+            {
+                return sourceFile.assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(sourceFile, pptr.m_PathID));
+            }
+
+            return FindSemanticHandleForPPtr(sourceFile, pptr.m_FileID, pptr.m_PathID, expectedType: null);
         }
 
         private static GameObject? ResolveGameObjectBackground(SerializedFile sourceFile, PPtr<GameObject> pptr)
@@ -907,21 +1079,29 @@ namespace AssetStudio.Avalonia
             return handle?.UniqueID ?? string.Empty;
         }
 
-        private static AssetHandle? FindSemanticHandleForPPtr(SerializedFile sourceFile, int fileId, long pathId, ClassIDType expectedType)
+        private static AssetHandle? FindSemanticHandleForPPtr(SerializedFile sourceFile, int fileId, long pathId, ClassIDType? expectedType)
         {
-            if (sourceFile?.assetsManager?.ProjectIndex == null || fileId <= 0 || fileId - 1 >= sourceFile.m_Externals.Count)
+            if (sourceFile?.assetsManager?.ProjectIndex == null
+                || sourceFile.m_Externals == null
+                || fileId <= 0
+                || fileId - 1 >= sourceFile.m_Externals.Count)
             {
                 return null;
             }
 
             var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var external = sourceFile.m_Externals[fileId - 1];
+            if (external == null)
+            {
+                return null;
+            }
+
             AddSemanticFileNameCandidate(candidates, external.fileName);
             AddSemanticFileNameCandidate(candidates, external.pathName);
 
             return candidates
                 .SelectMany(fileName => sourceFile.assetsManager.ProjectIndex.GetHandlesForFile(fileName))
-                .Where(candidate => candidate.PathID == pathId && candidate.Type == expectedType)
+                .Where(candidate => candidate.PathID == pathId && (expectedType == null || candidate.Type == expectedType.Value))
                 .GroupBy(candidate => candidate.UniqueID, StringComparer.Ordinal)
                 .Select(group => group.First())
                 .OrderByDescending(candidate => ScoreSemanticHandleMatch(candidate, external, sourceFile))
@@ -1468,7 +1648,7 @@ namespace AssetStudio.Avalonia
                 return directTex;
             }
 
-            if (material.assetsFile != null
+            if (material.assetsFile?.ObjectsDic != null
                 && textureRef.m_FileID == 0
                 && material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj)
                 && localObj is Texture2D localTex)
