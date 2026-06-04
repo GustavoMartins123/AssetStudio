@@ -86,13 +86,7 @@ namespace AssetStudio
             reader.Position = position;
 
             m_Shader = new PPtr<Shader>(reader);
-
-            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2))
-            {
-                m_Parent = new PPtr<Material>(reader);
-                var m_ModifiedSerializedProperties = reader.ReadBoolean();
-                reader.AlignStream();
-            }
+            m_Parent = new PPtr<Material>(0, 0, reader.assetsFile);
             if (version[0] == 4 && version[1] >= 1) //4.x
             {
                 var m_ShaderKeywords = reader.ReadStringArray();
@@ -145,11 +139,6 @@ namespace AssetStudio
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
             {
                 var disabledShaderPasses = reader.ReadStringArray();
-            }
-
-            if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 2))
-            {
-                var m_LockedProperties = reader.ReadAlignedString();
             }
 
             m_SavedProperties = new UnityPropertySheet(reader);

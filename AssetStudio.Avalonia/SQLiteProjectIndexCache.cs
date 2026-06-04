@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 4;
+        private const int SemanticSchemaVersion = 5;
         private readonly string _dbPath;
 
         private readonly Task _initTask;
@@ -211,6 +211,7 @@ namespace AssetStudio.Avalonia
                                 RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 RendererType TEXT NOT NULL DEFAULT '',
                                 SubMeshIndex INTEGER NOT NULL,
+                                MaterialSlotIndex INTEGER NOT NULL DEFAULT -1,
                                 MaterialScore INTEGER NOT NULL DEFAULT 0
                             );
 
@@ -222,6 +223,9 @@ namespace AssetStudio.Avalonia
                                 SlotName TEXT NOT NULL,
                                 SlotIndex INTEGER NOT NULL,
                                 TextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                TextureFileId INTEGER NOT NULL DEFAULT 0,
+                                TexturePathID INTEGER NOT NULL DEFAULT 0,
+                                IsResolved INTEGER NOT NULL DEFAULT 0,
                                 IsMainTexture INTEGER NOT NULL DEFAULT 0
                             );
 
@@ -280,9 +284,9 @@ namespace AssetStudio.Avalonia
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_target ON AssetEdges(ProjectId, TargetAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_renderers_unique ON MeshRenderers(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, RendererType);
                             CREATE INDEX IF NOT EXISTS idx_mesh_renderers_mesh ON MeshRenderers(ProjectId, MeshAssetUniqueID);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialAssetUniqueID);
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh ON MeshMaterials(ProjectId, MeshAssetUniqueID);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID);
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_material ON MaterialTextures(ProjectId, MaterialAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
                             CREATE INDEX IF NOT EXISTS idx_indexing_read_files_project ON IndexingReadFiles(ProjectId, ReadOrder);
@@ -1166,10 +1170,10 @@ namespace AssetStudio.Avalonia
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 INSERT INTO MeshMaterials (
-                    ProjectId, MeshAssetUniqueID, MaterialAssetUniqueID, RendererAssetUniqueID, RendererType, SubMeshIndex, MaterialScore)
+                    ProjectId, MeshAssetUniqueID, MaterialAssetUniqueID, RendererAssetUniqueID, RendererType, SubMeshIndex, MaterialSlotIndex, MaterialScore)
                 VALUES (
-                    @projectId, @meshAssetId, @materialAssetId, @rendererAssetId, @rendererType, @subMeshIndex, @materialScore)
-                ON CONFLICT(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialAssetUniqueID)
+                    @projectId, @meshAssetId, @materialAssetId, @rendererAssetId, @rendererType, @subMeshIndex, @materialSlotIndex, @materialScore)
+                ON CONFLICT(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID)
                 DO UPDATE SET
                     RendererType = excluded.RendererType,
                     MaterialScore = excluded.MaterialScore";
@@ -1180,6 +1184,7 @@ namespace AssetStudio.Avalonia
             var pRendererAssetId = cmd.Parameters.Add("@rendererAssetId", SqliteType.Text);
             var pRendererType = cmd.Parameters.Add("@rendererType", SqliteType.Text);
             var pSubMeshIndex = cmd.Parameters.Add("@subMeshIndex", SqliteType.Integer);
+            var pMaterialSlotIndex = cmd.Parameters.Add("@materialSlotIndex", SqliteType.Integer);
             var pMaterialScore = cmd.Parameters.Add("@materialScore", SqliteType.Integer);
 
             pProjectId.Value = projectId;
@@ -1190,6 +1195,7 @@ namespace AssetStudio.Avalonia
                 pRendererAssetId.Value = material.RendererAssetId;
                 pRendererType.Value = material.RendererType;
                 pSubMeshIndex.Value = material.SubMeshIndex;
+                pMaterialSlotIndex.Value = material.MaterialSlotIndex;
                 pMaterialScore.Value = material.MaterialScore;
                 cmd.ExecuteNonQuery();
             }
@@ -1206,12 +1212,13 @@ namespace AssetStudio.Avalonia
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 INSERT INTO MaterialTextures (
-                    ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, IsMainTexture)
+                    ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture)
                 VALUES (
-                    @projectId, @materialAssetId, @previewMaterialAssetId, @slotName, @slotIndex, @textureAssetId, @isMainTexture)
-                ON CONFLICT(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID)
+                    @projectId, @materialAssetId, @previewMaterialAssetId, @slotName, @slotIndex, @textureAssetId, @textureFileId, @texturePathId, @isResolved, @isMainTexture)
+                ON CONFLICT(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID)
                 DO UPDATE SET
                     PreviewMaterialAssetUniqueID = excluded.PreviewMaterialAssetUniqueID,
+                    IsResolved = excluded.IsResolved,
                     IsMainTexture = excluded.IsMainTexture";
 
             var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
@@ -1220,6 +1227,9 @@ namespace AssetStudio.Avalonia
             var pSlotName = cmd.Parameters.Add("@slotName", SqliteType.Text);
             var pSlotIndex = cmd.Parameters.Add("@slotIndex", SqliteType.Integer);
             var pTextureAssetId = cmd.Parameters.Add("@textureAssetId", SqliteType.Text);
+            var pTextureFileId = cmd.Parameters.Add("@textureFileId", SqliteType.Integer);
+            var pTexturePathId = cmd.Parameters.Add("@texturePathId", SqliteType.Integer);
+            var pIsResolved = cmd.Parameters.Add("@isResolved", SqliteType.Integer);
             var pIsMainTexture = cmd.Parameters.Add("@isMainTexture", SqliteType.Integer);
 
             pProjectId.Value = projectId;
@@ -1230,6 +1240,9 @@ namespace AssetStudio.Avalonia
                 pSlotName.Value = texture.SlotName;
                 pSlotIndex.Value = texture.SlotIndex;
                 pTextureAssetId.Value = texture.TextureAssetId;
+                pTextureFileId.Value = texture.TextureFileId;
+                pTexturePathId.Value = texture.TexturePathId;
+                pIsResolved.Value = texture.IsResolved ? 1 : 0;
                 pIsMainTexture.Value = texture.IsMainTexture ? 1 : 0;
                 cmd.ExecuteNonQuery();
             }
@@ -1274,12 +1287,14 @@ namespace AssetStudio.Avalonia
                     RankedMaterials AS (
                         SELECT
                             SubMeshIndex,
+                            MaterialSlotIndex,
                             MaterialAssetUniqueID,
                             ROW_NUMBER() OVER (
                                 PARTITION BY SubMeshIndex
                                 ORDER BY
                                     CASE WHEN MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
                                     MaterialScore DESC,
+                                    MaterialSlotIndex,
                                     MaterialAssetUniqueID
                             ) AS RowNumber
                         FROM MeshMaterials
@@ -1348,10 +1363,13 @@ namespace AssetStudio.Avalonia
                         MIN(CASE SlotName
                             WHEN '_BaseMap' THEN 0
                             WHEN '_MainTex' THEN 1
-                            WHEN '_BaseColorMap' THEN 2
-                            WHEN '_BaseColorTexture' THEN 3
-                            WHEN '_Diffuse' THEN 4
-                            WHEN '_AlbedoMap' THEN 5
+                            WHEN 'texture' THEN 2
+                            WHEN 'Texture' THEN 3
+                            WHEN '_Texture' THEN 4
+                            WHEN '_BaseColorMap' THEN 5
+                            WHEN '_BaseColorTexture' THEN 6
+                            WHEN '_Diffuse' THEN 7
+                            WHEN '_AlbedoMap' THEN 8
                             ELSE 20
                         END),
                         MIN(SlotIndex)";

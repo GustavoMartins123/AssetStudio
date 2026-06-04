@@ -747,27 +747,33 @@ namespace AssetStudio.Avalonia
 
                         if (smr.m_Materials != null)
                         {
-                            var list = new List<Material?>();
-                            var materialIds = new List<string>();
-                            for (var matIndex = 0; matIndex < smr.m_Materials.Length; matIndex++)
+                            var resolvedBindings = ResolveRendererMaterialBindings(file, smr);
+                            var materialIds = resolvedBindings.Select(binding => binding.MaterialId).ToList();
+                            foreach (var binding in resolvedBindings)
                             {
-                                var matPtr = smr.m_Materials[matIndex];
-                                var rendererMaterial = ResolveRendererMaterialBackground(matPtr);
-                                list.Add(rendererMaterial);
-                                var materialId = GetSemanticAssetId(rendererMaterial);
-                                if (string.IsNullOrEmpty(materialId))
-                                {
-                                    materialId = GetSemanticAssetIdFromPPtr(file, matPtr, ClassIDType.Material);
-                                }
-
-                                materialIds.Add(materialId);
-                                AddMeshMaterialRelation(result.SemanticRelations, smrMeshId, materialId, smr, "SkinnedMeshRenderer", matIndex, materialIds);
-                                AddAssetEdge(result.SemanticRelations, smr, "Material", "m_Materials", matIndex, materialId, matPtr.m_FileID, matPtr.m_PathID);
+                                AddMeshMaterialRelation(
+                                    result.SemanticRelations,
+                                    smrMeshId,
+                                    binding.MaterialId,
+                                    smr,
+                                    "SkinnedMeshRenderer",
+                                    binding.Binding.SubMeshIndex,
+                                    binding.Binding.MaterialSlotIndex,
+                                    materialIds);
+                                AddAssetEdge(
+                                    result.SemanticRelations,
+                                    smr,
+                                    "Material",
+                                    "m_Materials",
+                                    binding.Binding.MaterialSlotIndex,
+                                    binding.MaterialId,
+                                    binding.Binding.MaterialPointer?.m_FileID ?? 0,
+                                    binding.Binding.MaterialPointer?.m_PathID ?? 0);
                             }
 
                             if (smrMesh != null)
                             {
-                                AddMeshMaterials(smrMesh, list);
+                                AddMeshMaterials(smrMesh, BuildSubMeshMaterialList(resolvedBindings));
                             }
                         }
                     }
@@ -815,27 +821,33 @@ namespace AssetStudio.Avalonia
 
                                     if (mr.m_Materials != null)
                                     {
-                                        var list = new List<Material?>();
-                                        var materialIds = new List<string>();
-                                        for (var matIndex = 0; matIndex < mr.m_Materials.Length; matIndex++)
+                                        var resolvedBindings = ResolveRendererMaterialBindings(file, mr);
+                                        var materialIds = resolvedBindings.Select(binding => binding.MaterialId).ToList();
+                                        foreach (var binding in resolvedBindings)
                                         {
-                                            var matPtr = mr.m_Materials[matIndex];
-                                            var rendererMaterial = ResolveRendererMaterialBackground(matPtr);
-                                            list.Add(rendererMaterial);
-                                            var materialId = GetSemanticAssetId(rendererMaterial);
-                                            if (string.IsNullOrEmpty(materialId))
-                                            {
-                                                materialId = GetSemanticAssetIdFromPPtr(file, matPtr, ClassIDType.Material);
-                                            }
-
-                                            materialIds.Add(materialId);
-                                            AddMeshMaterialRelation(result.SemanticRelations, mfMeshId, materialId, mr, "MeshRenderer", matIndex, materialIds);
-                                            AddAssetEdge(result.SemanticRelations, mr, "Material", "m_Materials", matIndex, materialId, matPtr.m_FileID, matPtr.m_PathID);
+                                            AddMeshMaterialRelation(
+                                                result.SemanticRelations,
+                                                mfMeshId,
+                                                binding.MaterialId,
+                                                mr,
+                                                "MeshRenderer",
+                                                binding.Binding.SubMeshIndex,
+                                                binding.Binding.MaterialSlotIndex,
+                                                materialIds);
+                                            AddAssetEdge(
+                                                result.SemanticRelations,
+                                                mr,
+                                                "Material",
+                                                "m_Materials",
+                                                binding.Binding.MaterialSlotIndex,
+                                                binding.MaterialId,
+                                                binding.Binding.MaterialPointer?.m_FileID ?? 0,
+                                                binding.Binding.MaterialPointer?.m_PathID ?? 0);
                                         }
 
                                         if (mfMesh != null)
                                         {
-                                            AddMeshMaterials(mfMesh, list);
+                                            AddMeshMaterials(mfMesh, BuildSubMeshMaterialList(resolvedBindings));
                                         }
                                     }
                                 }
@@ -973,6 +985,7 @@ namespace AssetStudio.Avalonia
                             materialIds[index],
                             rendererId,
                             "Container",
+                            index,
                             index,
                             ScoreMaterialIds(currentMaterialIds)));
                     }
@@ -1212,6 +1225,125 @@ namespace AssetStudio.Avalonia
                 description ?? string.Empty));
         }
 
+        private readonly struct RendererMaterialBinding
+        {
+            public RendererMaterialBinding(int materialSlotIndex, int subMeshIndex, PPtr<Material>? materialPointer)
+            {
+                MaterialSlotIndex = materialSlotIndex;
+                SubMeshIndex = subMeshIndex;
+                MaterialPointer = materialPointer;
+            }
+
+            public int MaterialSlotIndex { get; }
+            public int SubMeshIndex { get; }
+            public PPtr<Material>? MaterialPointer { get; }
+        }
+
+        private readonly struct ResolvedRendererMaterialBinding
+        {
+            public ResolvedRendererMaterialBinding(RendererMaterialBinding binding, Material? material, string materialId)
+            {
+                Binding = binding;
+                Material = material;
+                MaterialId = materialId;
+            }
+
+            public RendererMaterialBinding Binding { get; }
+            public Material? Material { get; }
+            public string MaterialId { get; }
+        }
+
+        private static List<ResolvedRendererMaterialBinding> ResolveRendererMaterialBindings(SerializedFile sourceFile, Renderer renderer)
+        {
+            var bindings = GetRendererMaterialBindings(renderer);
+            var result = new List<ResolvedRendererMaterialBinding>(bindings.Count);
+            foreach (var binding in bindings)
+            {
+                var matPtr = binding.MaterialPointer;
+                var rendererMaterial = matPtr != null ? ResolveRendererMaterialBackground(matPtr) : null;
+                var materialId = GetSemanticAssetId(rendererMaterial);
+                if (string.IsNullOrEmpty(materialId) && matPtr != null)
+                {
+                    materialId = GetSemanticAssetIdFromPPtr(sourceFile, matPtr, ClassIDType.Material);
+                }
+
+                result.Add(new ResolvedRendererMaterialBinding(binding, rendererMaterial, materialId));
+            }
+
+            return result;
+        }
+
+        private static List<RendererMaterialBinding> GetRendererMaterialBindings(Renderer renderer)
+        {
+            var materials = renderer.m_Materials;
+            var result = new List<RendererMaterialBinding>(materials?.Length ?? 0);
+            if (materials == null || materials.Length == 0)
+            {
+                return result;
+            }
+
+            if (renderer.m_StaticBatchInfo?.subMeshCount > 0)
+            {
+                var count = Math.Min(materials.Length, renderer.m_StaticBatchInfo.subMeshCount);
+                for (var slotIndex = 0; slotIndex < count; slotIndex++)
+                {
+                    result.Add(new RendererMaterialBinding(
+                        slotIndex,
+                        renderer.m_StaticBatchInfo.firstSubMesh + slotIndex,
+                        materials[slotIndex]));
+                }
+
+                return result;
+            }
+
+            if (renderer.m_SubsetIndices?.Length > 0)
+            {
+                var count = Math.Min(materials.Length, renderer.m_SubsetIndices.Length);
+                for (var slotIndex = 0; slotIndex < count; slotIndex++)
+                {
+                    if (renderer.m_SubsetIndices[slotIndex] > int.MaxValue)
+                    {
+                        continue;
+                    }
+
+                    result.Add(new RendererMaterialBinding(
+                        slotIndex,
+                        (int)renderer.m_SubsetIndices[slotIndex],
+                        materials[slotIndex]));
+                }
+
+                return result;
+            }
+
+            for (var slotIndex = 0; slotIndex < materials.Length; slotIndex++)
+            {
+                result.Add(new RendererMaterialBinding(slotIndex, slotIndex, materials[slotIndex]));
+            }
+
+            return result;
+        }
+
+        private static List<Material?> BuildSubMeshMaterialList(List<ResolvedRendererMaterialBinding> bindings)
+        {
+            var result = new List<Material?>();
+            foreach (var binding in bindings)
+            {
+                if (binding.Binding.SubMeshIndex < 0)
+                {
+                    continue;
+                }
+
+                while (result.Count <= binding.Binding.SubMeshIndex)
+                {
+                    result.Add(null);
+                }
+
+                result[binding.Binding.SubMeshIndex] = binding.Material;
+            }
+
+            return result;
+        }
+
         private static void AddMeshMaterialRelation(
             SemanticAssetRelations relations,
             string meshId,
@@ -1219,6 +1351,7 @@ namespace AssetStudio.Avalonia
             Component renderer,
             string rendererType,
             int subMeshIndex,
+            int materialSlotIndex,
             List<string> currentMaterialIds)
         {
             var rendererId = GetSemanticAssetId(renderer);
@@ -1233,6 +1366,7 @@ namespace AssetStudio.Avalonia
                 rendererId,
                 rendererType,
                 subMeshIndex,
+                materialSlotIndex,
                 ScoreMaterialIds(currentMaterialIds)));
         }
 
@@ -1260,11 +1394,11 @@ namespace AssetStudio.Avalonia
             if (!materialTextureSlotsCache.TryGetValue(material, out var slots)
                 && !materialTextureSlotsCache.TryGetValue(previewMaterial, out slots))
             {
-                return;
+                slots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
             }
 
-            materialMainTextureCache.TryGetValue(material, out var mainTexture);
             var previewMaterialId = GetSemanticAssetId(previewMaterial);
+            var mainTextureSlotName = SelectMainTextureSlotNameForRelations(previewMaterial);
             var slotIndex = 0;
             foreach (var texEnv in previewMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
             {
@@ -1282,7 +1416,10 @@ namespace AssetStudio.Avalonia
                     texEnv.Key,
                     slotIndex,
                     textureId,
-                    slotTexture != null && ReferenceEquals(slotTexture, mainTexture)));
+                    textureRef?.m_FileID ?? 0,
+                    textureRef?.m_PathID ?? 0,
+                    !string.IsNullOrEmpty(textureId),
+                    string.Equals(texEnv.Key, mainTextureSlotName, StringComparison.OrdinalIgnoreCase)));
 
                 if (textureRef != null && !textureRef.IsNull)
                 {
@@ -1301,6 +1438,42 @@ namespace AssetStudio.Avalonia
 
                 slotIndex++;
             }
+        }
+
+        private static string? SelectMainTextureSlotNameForRelations(Material displayMaterial)
+        {
+            var texEnvs = displayMaterial.m_SavedProperties?.m_TexEnvs;
+            if (texEnvs == null || texEnvs.Length == 0)
+            {
+                return null;
+            }
+
+            foreach (var preferredSlot in PreferredMaterialTextureSlots)
+            {
+                foreach (var texEnv in texEnvs)
+                {
+                    if (string.Equals(texEnv.Key, preferredSlot, StringComparison.OrdinalIgnoreCase)
+                        && texEnv.Value?.m_Texture != null
+                        && !texEnv.Value.m_Texture.IsNull)
+                    {
+                        return texEnv.Key;
+                    }
+                }
+            }
+
+            foreach (var texEnv in texEnvs)
+            {
+                if (!NonDiffuseSlots.Contains(texEnv.Key)
+                    && texEnv.Value?.m_Texture != null
+                    && !texEnv.Value.m_Texture.IsNull)
+                {
+                    return texEnv.Key;
+                }
+            }
+
+            return texEnvs
+                .FirstOrDefault(texEnv => texEnv.Value?.m_Texture != null && !texEnv.Value.m_Texture.IsNull)
+                .Key;
         }
 
         private static string GetSemanticTextureAssetIdFromPPtr(Material material, PPtr<Texture>? textureRef)
@@ -1663,8 +1836,7 @@ namespace AssetStudio.Avalonia
         {
             if (displayMaterial.m_SavedProperties?.m_TexEnvs == null) return null;
 
-            var slots = new[] { "_MainTex", "_BaseMap", "_BaseColorMap", "_BaseColorTexture", "_Diffuse", "_AlbedoMap" };
-            foreach (var slot in slots)
+            foreach (var slot in PreferredMaterialTextureSlots)
             {
                 if (textureSlots.TryGetValue(slot, out var tex) && tex != null)
                 {

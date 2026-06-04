@@ -6358,17 +6358,22 @@ public partial class MainWindow : Window
 
     private static bool IsPreferredMaterialPreviewSlot(string propertyName)
     {
-        switch (propertyName)
-        {
-            case "_BaseMap":
-            case "_MainTex":
-            case "_BaseColorMap":
-            case "_BaseColorTexture":
-                return true;
-            default:
-                return false;
-        }
+        return PreferredMaterialTextureSlots.Contains(propertyName, StringComparer.OrdinalIgnoreCase);
     }
+
+    private static readonly string[] PreferredMaterialTextureSlots =
+    {
+        "_BaseMap",
+        "_MainTex",
+        "texture",
+        "Texture",
+        "_Texture",
+        "_BaseColorMap",
+        "_BaseColorTexture",
+        "_Diffuse",
+        "_AlbedoMap",
+        "_Albedo"
+    };
 
     private Material? FindMaterialForMesh(Mesh mesh)
     {
@@ -6447,6 +6452,7 @@ public partial class MainWindow : Window
     private static readonly HashSet<string> NonDiffuseSlots = new(StringComparer.OrdinalIgnoreCase)
     {
         "_BumpMap", "_NormalMap", "_DetailNormalMap", "_DetailNormalMapScale",
+        "_Normal", "Normal", "normal",
         "_MetallicGlossMap", "_SpecGlossMap", "_OcclusionMap",
         "_EmissionMap", "_ParallaxMap", "_DetailMask",
         "_Cubemap", "_ReflectionTex", "_ShadowMap"

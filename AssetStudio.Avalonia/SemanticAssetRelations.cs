@@ -119,6 +119,7 @@ internal sealed class SemanticMeshMaterialRelation
         string rendererAssetId,
         string rendererType,
         int subMeshIndex,
+        int materialSlotIndex,
         int materialScore)
     {
         MeshAssetId = meshAssetId;
@@ -126,6 +127,7 @@ internal sealed class SemanticMeshMaterialRelation
         RendererAssetId = rendererAssetId;
         RendererType = rendererType;
         SubMeshIndex = subMeshIndex;
+        MaterialSlotIndex = materialSlotIndex;
         MaterialScore = materialScore;
     }
 
@@ -134,6 +136,7 @@ internal sealed class SemanticMeshMaterialRelation
     public string RendererAssetId { get; }
     public string RendererType { get; }
     public int SubMeshIndex { get; }
+    public int MaterialSlotIndex { get; }
     public int MaterialScore { get; }
 }
 
@@ -145,6 +148,9 @@ internal sealed class SemanticMaterialTextureRelation
         string slotName,
         int slotIndex,
         string textureAssetId,
+        int textureFileId,
+        long texturePathId,
+        bool isResolved,
         bool isMainTexture)
     {
         MaterialAssetId = materialAssetId;
@@ -152,6 +158,9 @@ internal sealed class SemanticMaterialTextureRelation
         SlotName = slotName;
         SlotIndex = slotIndex;
         TextureAssetId = textureAssetId;
+        TextureFileId = textureFileId;
+        TexturePathId = texturePathId;
+        IsResolved = isResolved;
         IsMainTexture = isMainTexture;
     }
 
@@ -160,5 +169,8 @@ internal sealed class SemanticMaterialTextureRelation
     public string SlotName { get; }
     public int SlotIndex { get; }
     public string TextureAssetId { get; }
+    public int TextureFileId { get; }
+    public long TexturePathId { get; }
+    public bool IsResolved { get; }
     public bool IsMainTexture { get; }
 }
