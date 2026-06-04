@@ -758,7 +758,20 @@ public partial class MainWindow : Window
             ? (long)(audioClip.m_Length * 1000.0f)
             : 0;
 
-        rebuiltExtension = DetectAudioExtension(audioData, rebuiltExtension);
+        var converter = new AudioClipConverter(audioClip);
+        if (converter.IsSupport)
+        {
+            rebuiltData = converter.ConvertToWav();
+            if (rebuiltData != null)
+            {
+                rebuiltExtension = ".wav";
+            }
+        }
+
+        if (rebuiltData == null)
+        {
+            rebuiltExtension = DetectAudioExtension(audioData, rebuiltExtension);
+        }
 
         return new AudioPreviewAnalysis(rebuiltData, rebuiltExtension, durationMs);
     }

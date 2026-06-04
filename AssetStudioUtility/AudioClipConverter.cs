@@ -13,6 +13,14 @@ namespace AssetStudio
 
         public byte[]? ConvertToWav()
         {
+            if (IsSupport)
+            {
+                var audioData = m_AudioClip.m_AudioData.GetData();
+                if (audioData != null && audioData.Length > 0)
+                {
+                    return UnityAudioDecoder.ConvertToWav(audioData);
+                }
+            }
             return null;
         }
 
@@ -84,7 +92,15 @@ namespace AssetStudio
         {
             get
             {
-                return false;
+                if (m_AudioClip.version[0] < 5)
+                {
+                    return m_AudioClip.m_Type == FMODSoundType.GCADPCM;
+                }
+                else
+                {
+                    return m_AudioClip.m_CompressionFormat == AudioCompressionFormat.ADPCM
+                        || m_AudioClip.m_CompressionFormat == AudioCompressionFormat.GCADPCM;
+                }
             }
         }
     }

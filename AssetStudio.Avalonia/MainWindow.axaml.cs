@@ -2176,7 +2176,7 @@ public partial class MainWindow : Window
             return false;
         }
 
-        var folderPath = appSettings.LoadFolderPath;
+        var folderPath = GetCurrentCacheFolderPath();
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
         {
             return false;
@@ -2267,17 +2267,7 @@ public partial class MainWindow : Window
         {
             return false;
         }
-
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            return _sqliteCache.HasSemanticRelations(folderPath, signature);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to validate lazy connection cache: {ex.Message}");
-            return false;
-        }
+        return true;
     }
 
     private static bool IsCompletedLazyIndexingStatus(string? status)
@@ -6218,22 +6208,18 @@ public partial class MainWindow : Window
         {
             sb.AppendLine($"Parent material: {displayMaterial.m_Name}");
         }
-        
-        Shader? shader = null;
-        if (displayMaterial.m_Shader != null && displayMaterial.m_Shader.TryGet(out var s))
-        {
-            shader = s;
-        }
 
-        if (shader != null)
-        {
-            sb.AppendLine($"Shader: {shader.m_ParsedForm?.m_Name ?? shader.m_Name}");
-        }
+        AppendMaterialShaderReference(sb, displayMaterial);
         sb.AppendLine();
         sb.AppendLine("Texture slots:");
 
         Texture2D? previewTexture = null;
-        foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+        var texEnvs = displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>();
+        if (texEnvs.Length == 0)
+        {
+            sb.AppendLine("  <none>");
+        }
+        foreach (var texEnv in texEnvs)
         {
             sb.Append($"  {texEnv.Key}: ");
             var texEnvValue = texEnv.Value;
@@ -6260,12 +6246,131 @@ public partial class MainWindow : Window
             }
         }
 
+        AppendMaterialScalarProperties(sb, displayMaterial);
+
         if (previewTexture == null)
         {
             previewTexture = FindTextureForMaterial(displayMaterial);
         }
 
         return (sb.ToString(), previewTexture);
+    }
+
+    private void AppendMaterialShaderReference(StringBuilder sb, Material material)
+    {
+        var shaderRef = material.m_Shader;
+        if (shaderRef == null || shaderRef.IsNull)
+        {
+            sb.AppendLine("Shader: <none>");
+            return;
+        }
+
+        var shaderName = TryGetLoadedShaderName(shaderRef);
+        var sourceName = string.Empty;
+        if (shaderRef.TryGetAssetsFile(out var shaderFile))
+        {
+            sourceName = shaderFile.fileName;
+            if (string.IsNullOrWhiteSpace(shaderName))
+            {
+                var shaderHandle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(shaderFile, shaderRef.m_PathID));
+                shaderName = shaderHandle?.Name;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(shaderName))
+        {
+            shaderName = "unloaded or unsupported shader";
+        }
+
+        sb.AppendLine($"Shader: {shaderName} (FileID: {shaderRef.m_FileID}, PathID: {shaderRef.m_PathID})");
+        if (!string.IsNullOrWhiteSpace(sourceName))
+        {
+            sb.AppendLine($"Shader source: {sourceName}");
+        }
+    }
+
+    private static string? TryGetLoadedShaderName(PPtr<Shader> shaderRef)
+    {
+        if (shaderRef == null || !shaderRef.TryGetAssetsFile(out var sourceFile) || sourceFile?.ObjectsDic == null)
+        {
+            return null;
+        }
+
+        lock (sourceFile)
+        {
+            if (sourceFile.ObjectsDic.TryGetValue(shaderRef.m_PathID, out var loadedObject) && loadedObject is Shader shader)
+            {
+                return shader.m_ParsedForm?.m_Name ?? shader.m_Name;
+            }
+        }
+
+        return null;
+    }
+
+    private static void AppendMaterialScalarProperties(StringBuilder sb, Material material)
+    {
+        var properties = material.m_SavedProperties;
+        if (properties == null)
+        {
+            return;
+        }
+
+        AppendMaterialIntProperties(sb, properties.m_Ints);
+        AppendMaterialFloatProperties(sb, properties.m_Floats);
+        AppendMaterialColorProperties(sb, properties.m_Colors);
+    }
+
+    private static void AppendMaterialIntProperties(StringBuilder sb, KeyValuePair<string, int>[]? values)
+    {
+        sb.AppendLine();
+        sb.AppendLine("Int properties:");
+        if (values == null || values.Length == 0)
+        {
+            sb.AppendLine("  <none>");
+            return;
+        }
+
+        foreach (var value in values)
+        {
+            sb.AppendLine($"  {value.Key}: {value.Value.ToString(CultureInfo.InvariantCulture)}");
+        }
+    }
+
+    private static void AppendMaterialFloatProperties(StringBuilder sb, KeyValuePair<string, float>[]? values)
+    {
+        sb.AppendLine();
+        sb.AppendLine("Float properties:");
+        if (values == null || values.Length == 0)
+        {
+            sb.AppendLine("  <none>");
+            return;
+        }
+
+        foreach (var value in values)
+        {
+            sb.AppendLine($"  {value.Key}: {value.Value.ToString("0.######", CultureInfo.InvariantCulture)}");
+        }
+    }
+
+    private static void AppendMaterialColorProperties(StringBuilder sb, KeyValuePair<string, Color>[]? values)
+    {
+        sb.AppendLine();
+        sb.AppendLine("Color properties:");
+        if (values == null || values.Length == 0)
+        {
+            sb.AppendLine("  <none>");
+            return;
+        }
+
+        foreach (var value in values)
+        {
+            var color = value.Value;
+            sb.AppendLine(
+                $"  {value.Key}: R={color.R.ToString("0.######", CultureInfo.InvariantCulture)}, " +
+                $"G={color.G.ToString("0.######", CultureInfo.InvariantCulture)}, " +
+                $"B={color.B.ToString("0.######", CultureInfo.InvariantCulture)}, " +
+                $"A={color.A.ToString("0.######", CultureInfo.InvariantCulture)}");
+        }
     }
 
     private static void MakeAlphaOnlyTextureVisible(Image<Bgra32> image)
@@ -6516,7 +6621,7 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var folderPath = appSettings.LoadFolderPath;
+        var folderPath = GetCurrentCacheFolderPath();
         if (!CanUseLazySemanticRelationCache(folderPath))
         {
             return null;
@@ -9001,9 +9106,20 @@ public partial class MainWindow : Window
                 var m_AudioData = m_AudioClip.m_AudioData.GetData();
                 if (m_AudioData == null || m_AudioData.Length == 0) return false;
                 var converter = new AudioClipConverter(m_AudioClip);
-                var filePath = Path.Combine(exportPath, fileName + converter.GetExtensionName());
-                if (File.Exists(filePath)) return false;
-                File.WriteAllBytes(filePath, m_AudioData);
+                if (exportOptions.ConvertAudio && converter.IsSupport)
+                {
+                    var filePath = Path.Combine(exportPath, fileName + ".wav");
+                    if (File.Exists(filePath)) return false;
+                    var buffer = converter.ConvertToWav();
+                    if (buffer == null) return false;
+                    File.WriteAllBytes(filePath, buffer);
+                }
+                else
+                {
+                    var filePath = Path.Combine(exportPath, fileName + converter.GetExtensionName());
+                    if (File.Exists(filePath)) return false;
+                    File.WriteAllBytes(filePath, m_AudioData);
+                }
                 return true;
             }
             case Material m_Material:
@@ -9704,7 +9820,7 @@ public partial class MainWindow : Window
             return materials;
         }
 
-        var folderPath = appSettings.LoadFolderPath;
+        var folderPath = GetCurrentCacheFolderPath();
         if (!CanUseLazySemanticRelationCache(folderPath))
         {
             return materials;
@@ -9882,7 +9998,7 @@ public partial class MainWindow : Window
         var sb = new StringBuilder();
         sb.Append(FormatMeshPreviewSummary(mesh, item));
 
-        var folderPath = appSettings.LoadFolderPath;
+        var folderPath = GetCurrentCacheFolderPath();
         var connectionsReady = CanUseLazySemanticRelationCache(folderPath);
         sb.AppendLine($"Connections: {(connectionsReady ? "Complete" : "Not built yet")}");
 
