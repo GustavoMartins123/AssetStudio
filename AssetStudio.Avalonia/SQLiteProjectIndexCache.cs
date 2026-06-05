@@ -286,6 +286,7 @@ namespace AssetStudio.Avalonia
                             CREATE INDEX IF NOT EXISTS idx_mesh_renderers_mesh ON MeshRenderers(ProjectId, MeshAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh ON MeshMaterials(ProjectId, MeshAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh_submesh ON MeshMaterials(ProjectId, MeshAssetUniqueID, SubMeshIndex);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_renderer ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_material ON MaterialTextures(ProjectId, MaterialAssetUniqueID);
@@ -1367,52 +1368,46 @@ namespace AssetStudio.Avalonia
                           AND mm.MeshAssetUniqueID = @meshAssetId
                         GROUP BY mm.RendererAssetUniqueID
                     ),
-                    BestRenderer AS (
-                        SELECT RendererAssetUniqueID
-                        FROM RendererStats
-                        ORDER BY
-                            RendererScore DESC,
-                            MainTextureCount DESC,
-                            TextureCount DESC,
-                            SameSourceScore DESC,
-                            MaterialCount DESC,
-                            RelationCount DESC,
-                            MaterialScore DESC,
-                            RendererAssetUniqueID
-                        LIMIT 1
-                    ),
                     RankedMaterials AS (
                         SELECT
-                            SubMeshIndex,
-                            MaterialSlotIndex,
-                            MaterialAssetUniqueID,
+                            mm.SubMeshIndex,
+                            mm.MaterialSlotIndex,
+                            mm.MaterialAssetUniqueID,
                             ROW_NUMBER() OVER (
-                                PARTITION BY SubMeshIndex
+                                PARTITION BY mm.SubMeshIndex
                                 ORDER BY
-                                    CASE WHEN MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                    CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
                                     CASE WHEN EXISTS (
                                         SELECT 1
                                         FROM MaterialTextures mt
-                                        WHERE mt.ProjectId = MeshMaterials.ProjectId
-                                          AND mt.MaterialAssetUniqueID = MeshMaterials.MaterialAssetUniqueID
+                                        WHERE mt.ProjectId = mm.ProjectId
+                                          AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
                                           AND mt.TextureAssetUniqueID <> ''
                                           AND mt.IsMainTexture <> 0
                                     ) THEN 0 ELSE 1 END,
                                     CASE WHEN EXISTS (
                                         SELECT 1
                                         FROM MaterialTextures mt
-                                        WHERE mt.ProjectId = MeshMaterials.ProjectId
-                                          AND mt.MaterialAssetUniqueID = MeshMaterials.MaterialAssetUniqueID
+                                        WHERE mt.ProjectId = mm.ProjectId
+                                          AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
                                           AND mt.TextureAssetUniqueID <> ''
                                     ) THEN 0 ELSE 1 END,
-                                    MaterialScore DESC,
-                                    MaterialSlotIndex,
-                                    MaterialAssetUniqueID
+                                    COALESCE(rs.RendererScore, 0) DESC,
+                                    COALESCE(rs.SameSourceScore, 0) DESC,
+                                    COALESCE(rs.MainTextureCount, 0) DESC,
+                                    COALESCE(rs.TextureCount, 0) DESC,
+                                    mm.MaterialScore DESC,
+                                    COALESCE(rs.MaterialCount, 0) DESC,
+                                    COALESCE(rs.RelationCount, 0) DESC,
+                                    mm.MaterialSlotIndex,
+                                    mm.RendererAssetUniqueID,
+                                    mm.MaterialAssetUniqueID
                             ) AS RowNumber
-                        FROM MeshMaterials
-                        WHERE ProjectId = @projectId
-                          AND MeshAssetUniqueID = @meshAssetId
-                          AND RendererAssetUniqueID = (SELECT RendererAssetUniqueID FROM BestRenderer)
+                        FROM MeshMaterials mm
+                        LEFT JOIN RendererStats rs
+                          ON rs.RendererAssetUniqueID = mm.RendererAssetUniqueID
+                        WHERE mm.ProjectId = @projectId
+                          AND mm.MeshAssetUniqueID = @meshAssetId
                     )
                     SELECT SubMeshIndex, MaterialAssetUniqueID
                     FROM RankedMaterials

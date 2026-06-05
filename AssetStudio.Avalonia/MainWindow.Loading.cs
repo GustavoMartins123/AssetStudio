@@ -561,11 +561,9 @@ namespace AssetStudio.Avalonia
 
             void AddMeshMaterials(Mesh mesh, List<Material?> materials)
             {
-                if (!localMeshToMaterialsCache.TryGetValue(mesh, out var existingList)
-                    || ScoreMaterialsStatic(materials) > ScoreMaterialsStatic(existingList))
-                {
-                    localMeshToMaterialsCache[mesh] = materials;
-                }
+                localMeshToMaterialsCache[mesh] = localMeshToMaterialsCache.TryGetValue(mesh, out var existingList)
+                    ? MergeMeshMaterialLists(existingList, materials)
+                    : new List<Material?>(materials);
             }
 
             void AddMeshAssociation(Mesh mesh, string sourceType, string? description)
@@ -662,11 +660,9 @@ namespace AssetStudio.Avalonia
 
             void AddMeshMaterials(Mesh mesh, List<Material?> materials)
             {
-                if (!result.MeshToMaterialsCache.TryGetValue(mesh, out var existingList)
-                    || ScoreMaterialsStatic(materials) > ScoreMaterialsStatic(existingList))
-                {
-                    result.MeshToMaterialsCache[mesh] = materials;
-                }
+                result.MeshToMaterialsCache[mesh] = result.MeshToMaterialsCache.TryGetValue(mesh, out var existingList)
+                    ? MergeMeshMaterialLists(existingList, materials)
+                    : new List<Material?>(materials);
             }
 
             void AddMeshAssociation(Mesh mesh, string sourceType, string? description)
@@ -2056,6 +2052,47 @@ namespace AssetStudio.Avalonia
                 }
             }
             return score;
+        }
+
+        private static List<Material?> MergeMeshMaterialLists(List<Material?> existing, List<Material?> incoming)
+        {
+            if (existing == null || existing.Count == 0)
+            {
+                return new List<Material?>(incoming ?? new List<Material?>());
+            }
+
+            if (incoming == null || incoming.Count == 0)
+            {
+                return new List<Material?>(existing);
+            }
+
+            var merged = new List<Material?>(existing);
+            while (merged.Count < incoming.Count)
+            {
+                merged.Add(null);
+            }
+
+            var addedNewSubMesh = false;
+            for (var i = 0; i < incoming.Count; i++)
+            {
+                var incomingMaterial = incoming[i];
+                if (incomingMaterial == null || merged[i] != null)
+                {
+                    continue;
+                }
+
+                merged[i] = incomingMaterial;
+                addedNewSubMesh = true;
+            }
+
+            if (addedNewSubMesh)
+            {
+                return merged;
+            }
+
+            return ScoreMaterialsStatic(incoming) > ScoreMaterialsStatic(existing)
+                ? new List<Material?>(incoming)
+                : new List<Material?>(existing);
         }
     }
 }
