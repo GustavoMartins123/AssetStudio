@@ -130,6 +130,12 @@ namespace AssetStudio
             {
                 var m_StreamingMipmapsPriority = reader.ReadInt32();
             }
+            if (version[0] >= 2022) //2022.x and up
+            {
+                var m_IgnoreMipmapLimit = reader.ReadBoolean();
+                reader.AlignStream();
+                var m_MipmapLimitGroupName = reader.ReadAlignedString();
+            }
             var m_ImageCount = reader.ReadInt32();
             var m_TextureDimension = reader.ReadInt32();
             m_TextureSettings = new GLTextureSettings(reader);
@@ -152,7 +158,7 @@ namespace AssetStudio
             try
             {
                 image_data_size = reader.ReadInt32();
-                if ((version[0] == 5 && version[1] >= 3) || version[0] > 5)//5.3.0 and up
+                if (image_data_size == 0 && HasStreamData(version))//5.3.0 and up
                 {
                     m_StreamData = new StreamingInfo(reader);
                     // Validação genérica: se o path lido do StreamingInfo for um lixo de memória, é certeza que há um desalinhamento.
@@ -167,7 +173,7 @@ namespace AssetStudio
                 // Fallback para forks que adicionam um padding u32 antes do tamanho da imagem
                 reader.BaseStream.Position = posBeforeImageData + 4; // Pula 4 bytes
                 image_data_size = reader.ReadInt32();
-                if ((version[0] == 5 && version[1] >= 3) || version[0] > 5)
+                if (image_data_size == 0 && HasStreamData(version))
                 {
                     m_StreamData = new StreamingInfo(reader);
                 }
@@ -187,6 +193,11 @@ namespace AssetStudio
                 resourceReader = new ResourceReader(reader, reader.BaseStream.Position, 0);
             }
             image_data = resourceReader;
+        }
+
+        private static bool HasStreamData(int[] version)
+        {
+            return (version[0] == 5 && version[1] >= 3) || version[0] > 5;
         }
 
         private bool TryReadFromTypeTree()

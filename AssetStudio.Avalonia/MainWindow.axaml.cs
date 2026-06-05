@@ -46,7 +46,7 @@ public partial class MainWindow : Window
     private const int PreviewDebounceMilliseconds = 180;
     private const int MaxInlinePreviewTextureDimension = 1024;
     private const int MaxCachedPreviewTextureDimension = 512;
-    private const int TexturePreviewThumbnailAlgorithmVersion = 1;
+    private const int TexturePreviewThumbnailAlgorithmVersion = 2;
     private const int ProgressiveIndexingUiThrottleMilliseconds = 500;
     private const int CachedIndexLoadBatchSize = 2500;
     private const int UserInteractionPriorityMilliseconds = 1200;
@@ -9999,7 +9999,8 @@ public partial class MainWindow : Window
 
     private static global::OpenTK.Mathematics.Vector2[]? BuildMeshPreviewUvs(Mesh mesh)
     {
-        if (mesh.m_UV0 == null || mesh.m_UV0.Length < mesh.m_VertexCount * 2)
+        var componentCount = GetMeshPreviewUvComponentCount(mesh.m_UV0, mesh.m_VertexCount);
+        if (componentCount < 2)
         {
             return null;
         }
@@ -10007,10 +10008,22 @@ public partial class MainWindow : Window
         var uvs = new global::OpenTK.Mathematics.Vector2[mesh.m_VertexCount];
         for (int i = 0; i < mesh.m_VertexCount; i++)
         {
-            uvs[i] = new global::OpenTK.Mathematics.Vector2(mesh.m_UV0[i * 2], mesh.m_UV0[i * 2 + 1]);
+            var offset = i * componentCount;
+            uvs[i] = new global::OpenTK.Mathematics.Vector2(mesh.m_UV0[offset], mesh.m_UV0[offset + 1]);
         }
 
         return uvs;
+    }
+
+    private static int GetMeshPreviewUvComponentCount(float[]? uv, int vertexCount)
+    {
+        if (uv == null || vertexCount <= 0 || uv.Length < vertexCount * 2 || uv.Length % vertexCount != 0)
+        {
+            return 0;
+        }
+
+        var componentCount = uv.Length / vertexCount;
+        return componentCount is >= 2 and <= 4 ? componentCount : 0;
     }
 
     private string FormatMeshPreviewSummary(Mesh mesh, AssetItem item)

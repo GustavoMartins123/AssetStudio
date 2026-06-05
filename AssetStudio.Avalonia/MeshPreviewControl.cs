@@ -723,6 +723,29 @@ void main()
             return normals;
         }
 
+        private static Vector2[]? BuildPreviewUvData(float[]? uv, int vertexCount)
+        {
+            if (uv == null || vertexCount <= 0 || uv.Length < vertexCount * 2 || uv.Length % vertexCount != 0)
+            {
+                return null;
+            }
+
+            var componentCount = uv.Length / vertexCount;
+            if (componentCount < 2 || componentCount > 4)
+            {
+                return null;
+            }
+
+            var result = new Vector2[vertexCount];
+            for (var i = 0; i < vertexCount; i++)
+            {
+                var offset = i * componentCount;
+                result[i] = new Vector2(uv[offset], uv[offset + 1]);
+            }
+
+            return result;
+        }
+
         private static Vector3[]? RemapVector3Data(Vector3[]? source, int[] sourceVertexIndices)
         {
             if (source == null)
@@ -990,15 +1013,7 @@ void main()
                         }
                     }
 
-                    localUvData = uvs;
-                    if (localUvData == null && m_Mesh.m_UV0 != null && m_Mesh.m_UV0.Length >= m_VertexCount * 2)
-                    {
-                        localUvData = new Vector2[m_VertexCount];
-                        for (int i = 0; i < m_VertexCount; i++)
-                        {
-                            localUvData[i] = new Vector2(m_Mesh.m_UV0[i * 2], m_Mesh.m_UV0[i * 2 + 1]);
-                        }
-                    }
+                    localUvData = uvs ?? BuildPreviewUvData(m_Mesh.m_UV0, m_VertexCount);
 
                     localPreviewSubMeshIndexCounts = BuildSubMeshIndexCounts(m_Mesh, localIndiceData.Length);
                     if (densityPercent < PreviewMeshSimplifier.MaxDensityPercent - 0.01f)

@@ -10,7 +10,7 @@ using Vector4 = OpenTK.Mathematics.Vector4;
 
 internal sealed class MeshPreviewGeometryCache
 {
-    public const int AlgorithmVersion = 1;
+    public const int AlgorithmVersion = 2;
 
     public Matrix4 ModelMatrix { get; init; }
     public Vector3[] Vertices { get; init; } = Array.Empty<Vector3>();
