@@ -64,46 +64,50 @@
             </Border>
 
             <Border Grid.Column="1" BorderThickness="1" BorderBrush="Gray" Padding="16">
-                <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,*" RowSpacing="12">
-                    <DockPanel Grid.Row="0" LastChildFill="True">
-                        <Image x:Name="DetailIcon" DockPanel.Dock="Right" Width="72" Height="72" Stretch="Uniform" />
-                        <StackPanel>
-                            <TextBlock x:Name="DetailName" Text="Select a project" FontSize="22" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                            <TextBlock x:Name="DetailSubtitle" Text="Project metadata appears here." Opacity="0.68" TextTrimming="CharacterEllipsis" />
-                        </StackPanel>
-                    </DockPanel>
+                <Grid RowDefinitions="*,Auto" RowSpacing="12">
+                    <ScrollViewer Grid.Row="0" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                        <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="12" Margin="0,0,12,0">
+                            <DockPanel Grid.Row="0" LastChildFill="True">
+                                <Image x:Name="DetailIcon" DockPanel.Dock="Right" Width="72" Height="72" Stretch="Uniform" />
+                                <StackPanel>
+                                    <TextBlock x:Name="DetailName" Text="Select a project" FontSize="22" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="DetailSubtitle" Text="Project metadata appears here." Opacity="0.68" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </DockPanel>
 
-                    <Grid Grid.Row="1" ColumnDefinitions="150,*" ColumnSpacing="12">
-                        <TextBlock Text="Project root" FontWeight="SemiBold" />
-                        <TextBlock x:Name="DetailRoot" Grid.Column="1" Text="-" TextWrapping="Wrap" />
-                    </Grid>
+                            <Grid Grid.Row="1" ColumnDefinitions="150,*" ColumnSpacing="12">
+                                <TextBlock Text="Project root" FontWeight="SemiBold" />
+                                <TextBlock x:Name="DetailRoot" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                            </Grid>
 
-                    <Grid Grid.Row="2" ColumnDefinitions="150,*" ColumnSpacing="12">
-                        <TextBlock Text="Last load folder" FontWeight="SemiBold" />
-                        <TextBlock x:Name="DetailLastLoad" Grid.Column="1" Text="-" TextWrapping="Wrap" />
-                    </Grid>
+                            <Grid Grid.Row="2" ColumnDefinitions="150,*" ColumnSpacing="12">
+                                <TextBlock Text="Last load folder" FontWeight="SemiBold" />
+                                <TextBlock x:Name="DetailLastLoad" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                            </Grid>
 
-                    <Grid Grid.Row="3" ColumnDefinitions="150,*" ColumnSpacing="12">
-                        <TextBlock Text="Last export folder" FontWeight="SemiBold" />
-                        <TextBlock x:Name="DetailLastExport" Grid.Column="1" Text="-" TextWrapping="Wrap" />
-                    </Grid>
+                            <Grid Grid.Row="3" ColumnDefinitions="150,*" ColumnSpacing="12">
+                                <TextBlock Text="Last export folder" FontWeight="SemiBold" />
+                                <TextBlock x:Name="DetailLastExport" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                            </Grid>
 
-                    <Grid Grid.Row="4" ColumnDefinitions="150,*" ColumnSpacing="12">
-                        <TextBlock Text="Dates" FontWeight="SemiBold" />
-                        <TextBlock x:Name="DetailDates" Grid.Column="1" Text="-" TextWrapping="Wrap" />
-                    </Grid>
+                            <Grid Grid.Row="4" ColumnDefinitions="150,*" ColumnSpacing="12">
+                                <TextBlock Text="Dates" FontWeight="SemiBold" />
+                                <TextBlock x:Name="DetailDates" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                            </Grid>
 
-                    <Grid Grid.Row="5" ColumnDefinitions="150,*" ColumnSpacing="12">
-                        <TextBlock Text="Stats" FontWeight="SemiBold" />
-                        <TextBlock x:Name="DetailStats" Grid.Column="1" Text="-" TextWrapping="Wrap" />
-                    </Grid>
+                            <Grid Grid.Row="5" ColumnDefinitions="150,*" ColumnSpacing="12">
+                                <TextBlock Text="Stats" FontWeight="SemiBold" />
+                                <TextBlock x:Name="DetailStats" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                            </Grid>
 
-                    <Grid Grid.Row="6" ColumnDefinitions="150,*" ColumnSpacing="12">
-                        <TextBlock Text="Indexing" FontWeight="SemiBold" />
-                        <TextBlock x:Name="DetailIndexing" Grid.Column="1" Text="-" TextWrapping="Wrap" />
-                    </Grid>
+                            <Grid Grid.Row="6" ColumnDefinitions="150,*" ColumnSpacing="12">
+                                <TextBlock Text="Indexing" FontWeight="SemiBold" />
+                                <TextBlock x:Name="DetailIndexing" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                            </Grid>
+                        </Grid>
+                    </ScrollViewer>
 
-                    <StackPanel Grid.Row="7" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" VerticalAlignment="Bottom">
                         <Button x:Name="EditProjectButton" Click="EditProject_Click" MinWidth="92" IsEnabled="False">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />

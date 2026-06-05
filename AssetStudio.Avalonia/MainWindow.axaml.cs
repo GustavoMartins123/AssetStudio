@@ -4651,7 +4651,7 @@ public partial class MainWindow : Window
                                 if (GLPreviewControl != null)
                                 {
                                     currentPreviewMesh = m_Mesh;
-                                    GLPreviewControl.ApplyMeshTextures(subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                                    GLPreviewControl.ApplyMeshTextures(m_Mesh, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
                                     GLPreviewControl.IsVisible = true;
                                     BuildMeshMaterialControls(m_Mesh, allMaterials);
                                     ShowPreviewGeometryControls(showBoneControls: false);

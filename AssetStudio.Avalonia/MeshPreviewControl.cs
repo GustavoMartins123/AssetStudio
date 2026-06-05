@@ -659,6 +659,27 @@ void main()
             meshPreviewSourceSubMeshTexHeights = null;
             previewSubMeshIndexCounts = null;
             keepExistingTextures = false;
+            ClearPendingTextureUploads();
+        }
+
+        private void ClearPendingTextureUploads()
+        {
+            lock (textureLock)
+            {
+                pendingTextureData = null;
+                pendingTextureWidth = 0;
+                pendingTextureHeight = 0;
+                hasPendingTexture = false;
+                pendingSubMeshTextures = null;
+                pendingSubMeshTexWidths = null;
+                pendingSubMeshTexHeights = null;
+                hasPendingSubMeshTextures = false;
+            }
+        }
+
+        private bool HasPreviewTexture()
+        {
+            return previewTextureId != 0 || previewTextureIds?.Any(id => id != 0) == true;
         }
 
         private static Vector3[] BuildCalculatedNormals(Vector3[] vertices, int[] indices)
@@ -793,7 +814,17 @@ void main()
 
         public void ApplyMeshTextures(List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
         {
+            ApplyMeshTextures(null, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+        }
+
+        public void ApplyMeshTextures(Mesh? expectedMesh, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
+        {
             if (subMeshTextures == null || !subMeshTextures.Any(t => t != null))
+            {
+                return;
+            }
+
+            if (expectedMesh != null && !ReferenceEquals(meshPreviewSource, expectedMesh))
             {
                 return;
             }
@@ -803,6 +834,7 @@ void main()
             meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
             keepExistingTextures = true;
             previewMaterialMode = true;
+            vao = 0;
 
             lock (textureLock)
             {
@@ -823,6 +855,7 @@ void main()
                 previewMaterialMode = false;
                 materialTintOverrides = null;
                 keepExistingTextures = false;
+                ClearPendingTextureUploads();
             }
             else
             {
@@ -1359,6 +1392,8 @@ void main()
                         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
                         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
                     }
+
+                    vao = 0;
                 }
 
                 if (Bounds.Width != lastWidth || Bounds.Height != lastHeight)
@@ -1955,9 +1990,10 @@ void main()
                 }
                 else if (e.Key == Key.S)
                 {
-                    if (uvData != null && previewTextureId != 0)
+                    if (uvData != null && HasPreviewTexture())
                     {
                         previewMaterialMode = !previewMaterialMode;
+                        vao = 0;
                     }
                     else
                     {
