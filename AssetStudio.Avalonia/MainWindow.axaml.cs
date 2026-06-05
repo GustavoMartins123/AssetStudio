@@ -48,6 +48,7 @@ public partial class MainWindow : Window
     private const int MaxCachedPreviewTextureDimension = 512;
     private const int TexturePreviewThumbnailAlgorithmVersion = 1;
     private const int ProgressiveIndexingUiThrottleMilliseconds = 500;
+    private const int CachedIndexLoadBatchSize = 2500;
     private const int UserInteractionPriorityMilliseconds = 1200;
     private const int UserPreviewPriorityMilliseconds = 1800;
     private const int UserInteractionYieldDelayMilliseconds = 40;
@@ -1571,18 +1572,45 @@ public partial class MainWindow : Window
 
             if (cachedHandles != null)
             {
-                StatusStripUpdate("Loading project index from SQLite cache...");
-                foreach (var handle in cachedHandles)
+                ViewModel.IsIndexingActive = true;
+                ViewModel.IsPauseEnabled = false;
+                ViewModel.IsResumeEnabled = false;
+                ViewModel.IsStopEnabled = false;
+                ShowIndexingProgressPanel("running", 0, cachedHandles.Count, cachedHandles.Count, 0, string.Empty, string.Empty, null);
+
+                try
                 {
-                    RememberLazyHandleSourcePath(handle);
-                    assetsManager.ProjectIndex.AddHandle(handle);
+                    StatusStripUpdate("Loading project index from SQLite cache...");
+                    var count = await LoadCachedHandlesIntoProjectIndexSmoothlyAsync(cachedHandles);
+                    progressBar.Value = 100;
+                    ViewModel.LoadingProgress = 100;
+                    StatusStripUpdate($"Loaded from cache. Showing {visibleAssets.Count:N0} assets ({count:N0} newly visible).");
+
+                    await BuildLazyConnectionsIfNeededAsync(paths);
+                    if (currentScanResult != null
+                        && paths.Length == 1
+                        && Directory.Exists(paths[0])
+                        && HasCompletedLazyStructureBuild(paths[0], currentScanResult))
+                    {
+                        var completedStructureState = TryLoadIndexingProgress(paths[0], currentScanResult);
+                        if (completedStructureState != null)
+                        {
+                            ShowIndexingProgressPanel(completedStructureState);
+                        }
+                        SaveCurrentProjectAfterLoad(null, assetsManager.ProjectIndex.GetHandles().Count(), exportableAssets.Count);
+                        return;
+                    }
+
+                    await BuildAssetStructuresAsync(incremental: true, showStructureProgress: true);
+                    return;
                 }
-                progressBar.Value = 100;
-                var count = AppendNewLazyAssetsFromProjectIndex();
-                StatusStripUpdate($"Loaded from cache. Total assets: {count:N0}");
-                await BuildLazyConnectionsIfNeededAsync(paths);
-                await BuildAssetStructuresAsync(incremental: false, showStructureProgress: true);
-                return;
+                finally
+                {
+                    ViewModel.IsIndexingActive = false;
+                    ViewModel.IsPauseEnabled = false;
+                    ViewModel.IsResumeEnabled = false;
+                    ViewModel.IsStopEnabled = false;
+                }
             }
 
             StartProgressiveIndexing(files, paths);
@@ -1682,7 +1710,44 @@ public partial class MainWindow : Window
             });
     }
 
-    private int AppendNewLazyAssetsFromProjectIndex()
+    private async Task<int> LoadCachedHandlesIntoProjectIndexSmoothlyAsync(IReadOnlyList<AssetHandle> cachedHandles)
+    {
+        if (cachedHandles == null || cachedHandles.Count == 0)
+        {
+            return 0;
+        }
+
+        var totalVisible = 0;
+        var totalHandles = cachedHandles.Count;
+        for (var offset = 0; offset < totalHandles; offset += CachedIndexLoadBatchSize)
+        {
+            var start = offset;
+            var count = Math.Min(CachedIndexLoadBatchSize, totalHandles - start);
+            await Task.Run(() =>
+            {
+                for (var i = start; i < start + count; i++)
+                {
+                    var handle = cachedHandles[i];
+                    RememberLazyHandleSourcePath(handle);
+                    assetsManager.ProjectIndex.AddHandle(handle);
+                }
+            });
+
+            totalVisible += AppendNewLazyAssetsFromProjectIndex(count);
+            var processed = start + count;
+            var percent = totalHandles == 0 ? 100 : Math.Min(100, processed * 100.0 / totalHandles);
+            progressBar.Value = percent;
+            ViewModel.LoadingProgress = (int)percent;
+            ShowIndexingProgressPanel("running", processed, totalHandles, totalHandles - processed, percent, string.Empty, string.Empty, null);
+            StatusStripUpdate($"Loading project index from SQLite cache... {processed:N0}/{totalHandles:N0} handles | Showing {visibleAssets.Count:N0} assets");
+            await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Background);
+            await Task.Delay(1);
+        }
+
+        return totalVisible;
+    }
+
+    private int AppendNewLazyAssetsFromProjectIndex(int? maxHandlesToDrain = null)
     {
         if (!assetsManager.LazyLoading)
         {
@@ -1693,7 +1758,11 @@ public partial class MainWindow : Window
         var filterTypesChanged = false;
         var newExportableItems = new List<AssetItem>();
 
-        foreach (var handle in assetsManager.ProjectIndex.DrainPendingHandles())
+        var pendingHandles = maxHandlesToDrain.HasValue
+            ? assetsManager.ProjectIndex.DrainPendingHandles(maxHandlesToDrain.Value)
+            : assetsManager.ProjectIndex.DrainPendingHandles();
+
+        foreach (var handle in pendingHandles)
         {
             if (handle == null || string.IsNullOrEmpty(handle.UniqueID))
             {
@@ -2267,6 +2336,12 @@ public partial class MainWindow : Window
             return false;
         }
         return true;
+    }
+
+    private bool HasCompletedLazyStructureBuild(string folderPath, ProjectScanResult scanResult)
+    {
+        var state = TryLoadIndexingProgress(folderPath, scanResult);
+        return string.Equals(state?.Status, "structure_completed", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsConnectionReadyStatus(string? status)
@@ -3686,14 +3761,19 @@ public partial class MainWindow : Window
             }
             UpdateLazyAssetItemHandle(assetItem, handle);
 
+            var preserveSemanticPreviewCaches = CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath());
             lock (previewCacheLock)
             {
-                meshToMaterialsCache = null;
+                if (!preserveSemanticPreviewCaches)
+                {
+                    meshToMaterialsCache = null;
+                    materialMainTextureCache = null;
+                    materialPreviewMaterialCache = null;
+                    materialTextureSlotsCache = null;
+                }
+
                 meshAssociatedRenderersCache = null;
                 meshSourceTypesCache = null;
-                materialMainTextureCache = null;
-                materialPreviewMaterialCache = null;
-                materialTextureSlotsCache = null;
                 objectToAssetItemCache = null;
                 animationClipAvatarCache = null;
                 avatarMeshCache = null;
@@ -4258,12 +4338,15 @@ public partial class MainWindow : Window
                                 return;
                             }
 
-                            EnsureMeshPreviewDependenciesLoaded(m_Mesh);
-
                             var subMeshTextures = new List<byte[]?>();
                             var subMeshTexWidths = new List<int>();
                             var subMeshTexHeights = new List<int>();
                             var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                            if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                            {
+                                EnsureMeshPreviewDependenciesLoaded(m_Mesh);
+                                allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                            }
 
                             if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
                             {
@@ -6164,15 +6247,20 @@ public partial class MainWindow : Window
             return FindMaterialsForMesh(mesh);
         }
 
+        if (meshToMaterialsCache != null && meshToMaterialsCache.TryGetValue(mesh, out var cachedList))
+        {
+            return new List<Material?>(cachedList);
+        }
+
         var semanticMaterials = TryLoadMaterialsForMeshFromSemanticCache(mesh);
         if (semanticMaterials.Count > 0)
         {
             return semanticMaterials;
         }
 
-        if (meshToMaterialsCache != null && meshToMaterialsCache.TryGetValue(mesh, out var cachedList))
+        if (CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
         {
-            return new List<Material?>(cachedList);
+            return new List<Material?>();
         }
 
         List<SerializedFile> filesSnapshot;

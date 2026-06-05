@@ -22,6 +22,10 @@ public partial class ProjectManagerWindow : Window
     private readonly ProjectManagerStore _store = ProjectManagerStore.Shared;
     private readonly ObservableCollection<ProjectListItem> _projects = new();
     private Bitmap? _defaultIcon;
+    private int _refreshVersion;
+    private bool _isRefreshingProjects;
+    private bool _isOpeningProject;
+    private bool _isDeletingProject;
 
     public ProjectManagerWindow()
     {
@@ -42,28 +46,48 @@ public partial class ProjectManagerWindow : Window
 
     private async void RefreshProjects(string? selectProjectId = null)
     {
-        _projects.Clear();
-        var projects = await Task.Run(() => _store.GetProjects()
-            .Select(project => (Project: project, IndexingState: _store.LoadLatestIndexingState(project.ProjectRoot)))
-            .ToList());
-        foreach (var project in projects)
-        {
-            _projects.Add(new ProjectListItem(project.Project, _defaultIcon, project.IndexingState));
-        }
-
-        EmptyProjectsText.IsVisible = _projects.Count == 0;
-
-        if (!string.IsNullOrWhiteSpace(selectProjectId))
-        {
-            ProjectListBox.SelectedItem = _projects.FirstOrDefault(x => x.Project.Id == selectProjectId);
-        }
-        else if (_projects.Count > 0 && ProjectListBox.SelectedItem == null)
-        {
-            ProjectListBox.SelectedIndex = 0;
-        }
-
+        var refreshVersion = ++_refreshVersion;
+        _isRefreshingProjects = true;
         UpdateDetails();
-        StatusText.Text = $"Project database: {_store.DatabasePath}";
+        StatusText.Text = "Loading projects...";
+
+        try
+        {
+            var projects = await Task.Run(() => _store.GetProjects()
+                .Select(project => (Project: project, IndexingState: _store.LoadLatestIndexingState(project.ProjectRoot)))
+                .ToList());
+            if (refreshVersion != _refreshVersion)
+            {
+                return;
+            }
+
+            _projects.Clear();
+            foreach (var project in projects)
+            {
+                _projects.Add(new ProjectListItem(project.Project, _defaultIcon, project.IndexingState));
+            }
+
+            EmptyProjectsText.IsVisible = _projects.Count == 0;
+
+            if (!string.IsNullOrWhiteSpace(selectProjectId))
+            {
+                ProjectListBox.SelectedItem = _projects.FirstOrDefault(x => x.Project.Id == selectProjectId);
+            }
+            else if (_projects.Count > 0 && ProjectListBox.SelectedItem == null)
+            {
+                ProjectListBox.SelectedIndex = 0;
+            }
+
+            StatusText.Text = $"Project database: {_store.DatabasePath}";
+        }
+        finally
+        {
+            if (refreshVersion == _refreshVersion)
+            {
+                _isRefreshingProjects = false;
+                UpdateDetails();
+            }
+        }
     }
 
     private async void AddProject_Click(object? sender, RoutedEventArgs e)
@@ -116,6 +140,11 @@ public partial class ProjectManagerWindow : Window
 
     private async void RemoveProject_Click(object? sender, RoutedEventArgs e)
     {
+        if (_isDeletingProject || _isOpeningProject)
+        {
+            return;
+        }
+
         var selected = GetSelectedProject();
         if (selected == null)
         {
@@ -129,15 +158,44 @@ public partial class ProjectManagerWindow : Window
 
         try
         {
+            _isDeletingProject = true;
+            UpdateDetails();
             var name = selected.DisplayName;
             var projectId = selected.Project.Id;
-            await Task.Run(() => _store.RemoveProject(projectId));
-            RefreshProjects();
-            StatusText.Text = $"Deleted AssetStudio project data: {name}";
+            var selectedIndex = ProjectListBox.SelectedIndex;
+            var cleanup = await Task.Run(() => _store.RemoveProjectEntry(projectId));
+            if (cleanup == null)
+            {
+                _projects.Remove(selected);
+                EmptyProjectsText.IsVisible = _projects.Count == 0;
+                UpdateDetails();
+                StatusText.Text = "Project was already removed.";
+                return;
+            }
+
+            _projects.Remove(selected);
+            EmptyProjectsText.IsVisible = _projects.Count == 0;
+            if (_projects.Count > 0)
+            {
+                ProjectListBox.SelectedIndex = Math.Clamp(selectedIndex, 0, _projects.Count - 1);
+            }
+            else
+            {
+                ProjectListBox.SelectedItem = null;
+            }
+
+            UpdateDetails();
+            StatusText.Text = $"Removed project: {name}. Cache cleanup is running in the background.";
+            _ = CleanupRemovedProjectInBackground(cleanup);
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Unable to delete project:\n{ex.Message}", "Project manager");
+        }
+        finally
+        {
+            _isDeletingProject = false;
+            UpdateDetails();
         }
     }
 
@@ -170,7 +228,7 @@ public partial class ProjectManagerWindow : Window
         {
             Text =
                 $"Delete \"{selected.DisplayName}\" from AssetStudio?\n\n" +
-                "This removes the project entry, saved settings, SQLite index cache, decompressed cache folder, and copied icons.\n\n" +
+                "This removes the project entry now, then cleans saved settings, preview/decompressed cache folders, SQLite index cache, and copied icons in the background.\n\n" +
                 "The real game/project folder is not deleted.\n\n" +
                 rootText,
             TextWrapping = TextWrapping.Wrap
@@ -217,6 +275,25 @@ public partial class ProjectManagerWindow : Window
         return await dialog.ShowDialog<bool>(this);
     }
 
+    private async Task CleanupRemovedProjectInBackground(ProjectRemovalCleanup cleanup)
+    {
+        try
+        {
+            await Task.Run(() => _store.CleanupRemovedProject(cleanup));
+            if (IsVisible)
+            {
+                StatusText.Text = $"Finished cache cleanup for: {cleanup.DisplayName}";
+            }
+        }
+        catch (Exception ex)
+        {
+            if (IsVisible)
+            {
+                StatusText.Text = $"Project removed, but background cleanup failed: {ex.Message}";
+            }
+        }
+    }
+
     private void OpenProject_Click(object? sender, RoutedEventArgs e)
     {
         var selected = GetSelectedProject();
@@ -255,7 +332,10 @@ public partial class ProjectManagerWindow : Window
     private void UpdateDetails()
     {
         var selected = GetSelectedProject();
-        var enabled = selected != null;
+        var busy = _isRefreshingProjects || _isOpeningProject || _isDeletingProject;
+        var enabled = selected != null && !busy;
+        AddProjectButton.IsEnabled = !busy;
+        OpenWithoutProjectButton.IsEnabled = !busy;
         OpenProjectButton.IsEnabled = enabled;
         EditProjectButton.IsEnabled = enabled;
         RemoveProjectButton.IsEnabled = enabled;
@@ -293,8 +373,17 @@ public partial class ProjectManagerWindow : Window
 
     private async void OpenProject(string projectId)
     {
+        if (_isOpeningProject || _isDeletingProject)
+        {
+            return;
+        }
+
+        var launched = false;
         try
         {
+            _isOpeningProject = true;
+            UpdateDetails();
+            StatusText.Text = "Opening project...";
             var project = await Task.Run(() =>
             {
                 _store.TouchProject(projectId);
@@ -309,11 +398,20 @@ public partial class ProjectManagerWindow : Window
             }
 
             var settings = await Task.Run(() => _store.LoadProjectSettings(project));
+            launched = true;
             LaunchMainWindow(new ProjectLaunchContext(_store, project, settings));
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Unable to open project:\n{ex.Message}", "Project manager");
+        }
+        finally
+        {
+            if (!launched)
+            {
+                _isOpeningProject = false;
+                UpdateDetails();
+            }
         }
     }
 

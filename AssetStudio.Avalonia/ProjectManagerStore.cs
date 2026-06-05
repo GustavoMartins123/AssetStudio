@@ -118,6 +118,16 @@ public sealed class ProjectLaunchContext
     public AvaloniaAppSettings Settings { get; }
 }
 
+public sealed class ProjectRemovalCleanup
+{
+    public string ProjectId { get; init; } = string.Empty;
+    public string DisplayName { get; init; } = string.Empty;
+    public string ProjectRoot { get; init; } = string.Empty;
+    public string IconPath { get; init; } = string.Empty;
+    public string IconSourcePath { get; init; } = string.Empty;
+    public IReadOnlyList<string> StoredIconPaths { get; init; } = Array.Empty<string>();
+}
+
 public sealed class ProjectManagerStore
 {
     private const string AppSettingsJsonKey = "app_settings_json";
@@ -398,23 +408,66 @@ public sealed class ProjectManagerStore
 
     public void RemoveProject(string projectId)
     {
+        var cleanup = RemoveProjectEntry(projectId);
+        CleanupRemovedProject(cleanup);
+    }
+
+    public ProjectRemovalCleanup? RemoveProjectEntry(string projectId)
+    {
         var project = GetProject(projectId);
+        if (project == null)
+        {
+            return null;
+        }
+
         var iconSourcePath = GetProjectIconSourcePath(projectId);
+        var storedIconPaths = GetStoredIconFilesForProject(projectId).ToArray();
+
         using var conn = CreateConnection();
+        using var transaction = conn.BeginTransaction();
         using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = "DELETE FROM ManagedProjects WHERE Id = @id";
         cmd.Parameters.AddWithValue("@id", projectId);
         cmd.ExecuteNonQuery();
+        transaction.Commit();
 
-        if (project != null)
+        return new ProjectRemovalCleanup
         {
-            _indexCache.DeleteIndexCache(project.ProjectRoot);
-            DeleteDecompressedCacheFolder(project.ProjectRoot);
-            DeleteStoredIcon(project.IconPath);
+            ProjectId = projectId,
+            DisplayName = project.DisplayName,
+            ProjectRoot = project.ProjectRoot,
+            IconPath = project.IconPath,
+            IconSourcePath = iconSourcePath,
+            StoredIconPaths = storedIconPaths
+        };
+    }
+
+    public void CleanupRemovedProject(ProjectRemovalCleanup? cleanup)
+    {
+        if (cleanup == null)
+        {
+            return;
         }
 
-        DeleteStoredIconFilesForProject(projectId);
-        DeleteExecutableIconPreview(iconSourcePath);
+        DeleteDecompressedCacheFolder(cleanup.ProjectRoot);
+        DeletePreviewCacheFolder(cleanup.ProjectRoot);
+        DeleteStoredIcon(cleanup.IconPath);
+        foreach (var path in cleanup.StoredIconPaths)
+        {
+            DeleteStoredIcon(path);
+        }
+
+        DeleteStoredIconFilesForProject(cleanup.ProjectId);
+        DeleteExecutableIconPreview(cleanup.IconSourcePath);
+
+        try
+        {
+            _indexCache.DeleteIndexCache(cleanup.ProjectRoot);
+        }
+        catch
+        {
+        }
     }
 
     public void TouchProject(string projectId)
@@ -869,6 +922,23 @@ public sealed class ProjectManagerStore
         }
     }
 
+    private IEnumerable<string> GetStoredIconFilesForProject(string projectId)
+    {
+        if (string.IsNullOrWhiteSpace(projectId))
+        {
+            return Array.Empty<string>();
+        }
+
+        try
+        {
+            return Directory.EnumerateFiles(_iconsDirectory, projectId + ".*", SearchOption.TopDirectoryOnly).ToArray();
+        }
+        catch
+        {
+            return Array.Empty<string>();
+        }
+    }
+
     private void DeleteExecutableIconPreview(string sourcePath)
     {
         if (string.IsNullOrWhiteSpace(sourcePath)
@@ -927,6 +997,27 @@ public sealed class ProjectManagerStore
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "AssetStudio",
                 "DecompressedCache");
+            var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(projectRoot));
+            DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void DeletePreviewCacheFolder(string projectRoot)
+    {
+        if (string.IsNullOrWhiteSpace(projectRoot))
+        {
+            return;
+        }
+
+        try
+        {
+            var cacheRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio",
+                "PreviewCache");
             var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(projectRoot));
             DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
         }

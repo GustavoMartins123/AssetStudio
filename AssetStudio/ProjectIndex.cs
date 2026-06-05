@@ -45,6 +45,21 @@ namespace AssetStudio
             }
         }
 
+        public IEnumerable<AssetHandle> DrainPendingHandles(int maxCount)
+        {
+            if (maxCount <= 0)
+            {
+                yield break;
+            }
+
+            var drained = 0;
+            while (drained < maxCount && _pendingHandles.TryDequeue(out var handle))
+            {
+                drained++;
+                yield return handle;
+            }
+        }
+
         public IEnumerable<AssetHandle> GetHandlesForFile(string fileName)
         {
             if (string.IsNullOrEmpty(fileName)) return Array.Empty<AssetHandle>();
