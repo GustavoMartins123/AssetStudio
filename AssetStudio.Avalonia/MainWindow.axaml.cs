@@ -1587,6 +1587,11 @@ public partial class MainWindow : Window
                     StatusStripUpdate($"Loaded from cache. Showing {visibleAssets.Count:N0} assets ({count:N0} newly visible).");
 
                     await BuildLazyConnectionsIfNeededAsync(paths);
+                    if (ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(paths))
+                    {
+                        return;
+                    }
+
                     if (currentScanResult != null
                         && paths.Length == 1
                         && Directory.Exists(paths[0])
@@ -1697,6 +1702,10 @@ public partial class MainWindow : Window
                         if (!wasCancelled)
                         {
                             await BuildLazyConnectionsIfNeededAsync(paths, force: true);
+                            if (ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(paths))
+                            {
+                                return;
+                            }
                         }
 
                         await BuildAssetStructuresAsync(incremental: true, showStructureProgress: !wasCancelled);
@@ -2335,13 +2344,34 @@ public partial class MainWindow : Window
         {
             return false;
         }
-        return true;
+
+        return HasSavedSemanticRelations(folderPath, scanResult);
     }
 
     private bool HasCompletedLazyStructureBuild(string folderPath, ProjectScanResult scanResult)
     {
         var state = TryLoadIndexingProgress(folderPath, scanResult);
-        return string.Equals(state?.Status, "structure_completed", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(state?.Status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+            && HasSavedSemanticRelations(folderPath, scanResult);
+    }
+
+    private bool HasSavedSemanticRelations(string folderPath, ProjectScanResult scanResult)
+    {
+        if (scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            return _sqliteCache.HasSemanticRelations(folderPath, signature);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to inspect saved semantic relations: {ex.Message}");
+            return false;
+        }
     }
 
     private static bool IsConnectionReadyStatus(string? status)
@@ -2384,6 +2414,29 @@ public partial class MainWindow : Window
         await BuildLazyConnectionsAsync(folderPath, currentScanResult);
     }
 
+    private bool ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(string[] paths)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || paths.Length != 1 || !Directory.Exists(paths[0]))
+        {
+            return false;
+        }
+
+        var folderPath = paths[0];
+        if (HasCompletedLazyConnectionBuild(folderPath, currentScanResult))
+        {
+            return false;
+        }
+
+        var state = TryLoadIndexingProgress(folderPath, currentScanResult);
+        if (state != null)
+        {
+            ShowIndexingProgressPanel(state);
+        }
+
+        StatusStripUpdate("Connections did not produce saved relations; asset structure finalization was skipped.");
+        return true;
+    }
+
     private async Task BuildLazyConnectionsAsync(string folderPath, ProjectScanResult scanResult)
     {
         if (isBuildingLazyConnections)
@@ -2420,7 +2473,7 @@ public partial class MainWindow : Window
             StatusStripUpdate($"Building connections... 0/{sourcePaths.Count:N0} files");
             PublishLazyConnectionProgress(folderPath, scanResult, "connecting", 0, sourcePaths.Count, string.Empty, string.Empty);
 
-            var relations = await Task.Run(async () => await BuildLazySemanticRelationsForSourcesAsync(
+            var buildResult = await Task.Run(async () => await BuildLazySemanticRelationsForSourcesAsync(
                 sourcePaths,
                 (processedFiles, currentSourcePath) =>
                 {
@@ -2444,12 +2497,23 @@ public partial class MainWindow : Window
                         StatusStripUpdate($"Building connections... {processedFiles:N0}/{sourcePaths.Count:N0} files ({percent:0.#}%)");
                     }, DispatcherPriority.Background);
                 }));
+            var relations = buildResult.Relations;
+            var diagnostics = buildResult.Diagnostics;
+            var diagnosticSummary = diagnostics.FormatStatusSummary(sourcePaths.Count, relations);
+            Logger.Info($"Lazy connection diagnostics: {diagnostics.FormatDetailedSummary(sourcePaths.Count, relations)}");
+
+            if (!relations.HasMaterialRelations)
+            {
+                PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, diagnosticSummary, lastSourcePath);
+                StatusStripUpdate($"Connections build produced no mesh/material/texture relations. {diagnosticSummary}");
+                return;
+            }
 
             var saved = TrySaveSemanticRelations(folderPath, scanResult, relations, replaceExisting: true);
             if (!saved)
             {
-                PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
-                StatusStripUpdate("Connections build finished, but saving to SQLite failed.");
+                PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, diagnosticSummary, lastSourcePath);
+                StatusStripUpdate($"Connections build finished, but saving to SQLite failed. {diagnosticSummary}");
                 return;
             }
 
@@ -2615,17 +2679,20 @@ public partial class MainWindow : Window
         return sourcePaths;
     }
 
-    private async Task<SemanticAssetRelations> BuildLazySemanticRelationsForSourcesAsync(
+    private async Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
         IReadOnlyList<string> sourcePaths,
         Action<int, string> reportProgress)
     {
         var mergedRelations = new SemanticAssetRelations();
+        var diagnostics = new LazyConnectionBuildDiagnostics();
+        diagnostics.SourceCount = sourcePaths.Count;
         var failedSources = new List<string>();
         const int batchSize = 32;
 
         for (var i = 0; i < sourcePaths.Count; i += batchSize)
         {
             var batch = sourcePaths.Skip(i).Take(batchSize).ToList();
+            diagnostics.BatchCount++;
             try
             {
                 await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
@@ -2639,6 +2706,7 @@ public partial class MainWindow : Window
                     try
                     {
                         var filesForSource = GetLoadedFilesForConnectionSource(sourcePath);
+                        diagnostics.RecordLoadedFiles(sourcePath, filesForSource.Count);
                         if (filesForSource.Count == 0)
                         {
                             continue;
@@ -2646,10 +2714,13 @@ public partial class MainWindow : Window
 
                         using (assetsManager.LruCache.SuspendEviction())
                         {
+                            var objectsBefore = filesForSource.Sum(file => file.Objects.Count);
                             foreach (var file in filesForSource)
                             {
-                                MaterializeReferenceObjects(file, LazyConnectionReferenceTypes);
+                                MaterializeReferenceObjects(file, LazyConnectionReferenceTypes, diagnostics);
                             }
+                            var objectsAfter = filesForSource.Sum(file => file.Objects.Count);
+                            diagnostics.RecordMaterializedSource(sourcePath, objectsBefore, objectsAfter);
 
                             BuildAssetReferenceIndexesBackground(
                                 filesForSource,
@@ -2664,12 +2735,14 @@ public partial class MainWindow : Window
                                 out var semanticRelations);
 
                             mergedRelations.Merge(semanticRelations);
+                            diagnostics.RecordRelationsPass(semanticRelations);
                         }
                         UnloadConnectionBuildObjects(filesForSource);
                     }
                     catch (Exception ex)
                     {
                         failedSources.Add(sourcePath);
+                        diagnostics.FailedSources++;
                         Logger.Warning($"Failed to build connections for {Path.GetFileName(sourcePath)}: {ex.Message}");
                     }
                     finally
@@ -2687,6 +2760,7 @@ public partial class MainWindow : Window
                 foreach (var sourcePath in batch)
                 {
                     failedSources.Add(sourcePath);
+                    diagnostics.FailedSources++;
                     Logger.Warning($"Failed to load/build connections for {Path.GetFileName(sourcePath)} in batch: {ex.Message}");
                 }
                 for (var j = 0; j < batch.Count; j++)
@@ -2708,17 +2782,171 @@ public partial class MainWindow : Window
             Logger.Warning($"Connections build completed with {failedSources.Count:N0} failed source file(s). First failure: {Path.GetFileName(failedSources[0])}");
         }
 
-        return mergedRelations;
+        return new LazyConnectionBuildResult(mergedRelations, diagnostics);
+    }
+
+    private sealed class LazyConnectionBuildResult
+    {
+        public LazyConnectionBuildResult(SemanticAssetRelations relations, LazyConnectionBuildDiagnostics diagnostics)
+        {
+            Relations = relations;
+            Diagnostics = diagnostics;
+        }
+
+        public SemanticAssetRelations Relations { get; }
+        public LazyConnectionBuildDiagnostics Diagnostics { get; }
+    }
+
+    private sealed class LazyConnectionBuildDiagnostics
+    {
+        private const int SampleLimit = 3;
+        private readonly Dictionary<ClassIDType, int> materializedTypes = new();
+        private readonly List<string> sourceSamplesWithoutLoadedFiles = new();
+        private readonly List<string> sourceSamplesWithoutReferenceObjects = new();
+
+        public int SourceCount { get; set; }
+        public int BatchCount { get; set; }
+        public int SourcesWithLoadedFiles { get; private set; }
+        public int SourcesWithoutLoadedFiles { get; private set; }
+        public int LoadedFileMatches { get; private set; }
+        public int CandidateHandles { get; private set; }
+        public int ResolvedObjects { get; private set; }
+        public int FailedObjects { get; private set; }
+        public int SourcesWithoutReferenceObjects { get; private set; }
+        public int ObjectsBeforeMaterialize { get; private set; }
+        public int ObjectsAfterMaterialize { get; private set; }
+        public int RelationPasses { get; private set; }
+        public int FailedSources { get; set; }
+        public int AssetEdges { get; private set; }
+        public int MeshRenderers { get; private set; }
+        public int MeshMaterials { get; private set; }
+        public int MaterialTextures { get; private set; }
+
+        public void RecordLoadedFiles(string sourcePath, int loadedFileCount)
+        {
+            if (loadedFileCount <= 0)
+            {
+                SourcesWithoutLoadedFiles++;
+                AddSample(sourceSamplesWithoutLoadedFiles, sourcePath);
+                return;
+            }
+
+            SourcesWithLoadedFiles++;
+            LoadedFileMatches += loadedFileCount;
+        }
+
+        public void RecordMaterializedSource(string sourcePath, int objectsBefore, int objectsAfter)
+        {
+            ObjectsBeforeMaterialize += Math.Max(0, objectsBefore);
+            ObjectsAfterMaterialize += Math.Max(0, objectsAfter);
+            if (objectsAfter <= 0)
+            {
+                SourcesWithoutReferenceObjects++;
+                AddSample(sourceSamplesWithoutReferenceObjects, sourcePath);
+            }
+        }
+
+        public void RecordMaterializationCandidateCount(int count)
+        {
+            CandidateHandles += Math.Max(0, count);
+        }
+
+        public void RecordResolvedObject(ClassIDType type)
+        {
+            ResolvedObjects++;
+            materializedTypes.TryGetValue(type, out var count);
+            materializedTypes[type] = count + 1;
+        }
+
+        public void RecordFailedObject()
+        {
+            FailedObjects++;
+        }
+
+        public void RecordRelationsPass(SemanticAssetRelations relations)
+        {
+            if (relations == null)
+            {
+                return;
+            }
+
+            RelationPasses++;
+            AssetEdges += relations.AssetEdges.Count;
+            MeshRenderers += relations.MeshRenderers.Count;
+            MeshMaterials += relations.MeshMaterials.Count;
+            MaterialTextures += relations.MaterialTextures.Count;
+        }
+
+        public string FormatStatusSummary(int totalSources, SemanticAssetRelations relations)
+        {
+            return $"sources {totalSources:N0}, matched {SourcesWithLoadedFiles:N0}, no files {SourcesWithoutLoadedFiles:N0}, " +
+                $"handles {CandidateHandles:N0}, objects {ResolvedObjects:N0}, " +
+                $"mesh-material {relations.MeshMaterials.Count:N0}, material-texture {relations.MaterialTextures.Count:N0}, edges {relations.AssetEdges.Count:N0}";
+        }
+
+        public string FormatDetailedSummary(int totalSources, SemanticAssetRelations relations)
+        {
+            var materialized = materializedTypes.Count == 0
+                ? "none"
+                : string.Join(", ", materializedTypes
+                    .OrderByDescending(entry => entry.Value)
+                    .Take(5)
+                    .Select(entry => $"{entry.Key}:{entry.Value:N0}"));
+
+            var summary = $"{FormatStatusSummary(totalSources, relations)}, failed objects {FailedObjects:N0}, " +
+                $"object files empty {SourcesWithoutReferenceObjects:N0}, relation passes {RelationPasses:N0}, " +
+                $"types {materialized}";
+
+            if (sourceSamplesWithoutLoadedFiles.Count > 0)
+            {
+                summary += $" | no-file sample: {string.Join(", ", sourceSamplesWithoutLoadedFiles)}";
+            }
+
+            if (sourceSamplesWithoutReferenceObjects.Count > 0)
+            {
+                summary += $" | empty-object sample: {string.Join(", ", sourceSamplesWithoutReferenceObjects)}";
+            }
+
+            return summary;
+        }
+
+        private static void AddSample(List<string> samples, string sourcePath)
+        {
+            if (samples.Count >= SampleLimit)
+            {
+                return;
+            }
+
+            samples.Add(Path.GetFileName(sourcePath));
+        }
     }
 
     private List<SerializedFile> GetLoadedFilesForConnectionSource(string sourcePath)
     {
         lock (assetsManager.loadLock)
         {
-            return assetsManager.assetsFileList
+            var directMatches = assetsManager.assetsFileList
                 .Where(file => file != null
                     && (IsSameLazySource(file.originalPath, sourcePath)
                         || IsSameLazySource(file.fullName, sourcePath)))
+                .ToList();
+            if (directMatches.Count > 0)
+            {
+                return directMatches;
+            }
+
+            var expectedSerializedFileNames = assetsManager.ProjectIndex.GetHandles()
+                .Where(handle => handle != null && IsSameLazySource(handle.OriginalPath, sourcePath))
+                .Select(handle => handle.SerializedFileName)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (expectedSerializedFileNames.Count == 0)
+            {
+                return directMatches;
+            }
+
+            return assetsManager.assetsFileList
+                .Where(file => file != null && expectedSerializedFileNames.Contains(file.fileName))
                 .ToList();
         }
     }
@@ -3385,7 +3613,15 @@ public partial class MainWindow : Window
         }
         if (publishStructureProgress)
         {
-            PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
+            var folderPath = GetCurrentCacheFolderPath();
+            if (!assetsManager.LazyLoading || (currentScanResult != null && HasSavedSemanticRelations(folderPath, currentScanResult)))
+            {
+                PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
+            }
+            else
+            {
+                PublishStructureBuildProgress("structure_failed", structureBuildSteps, structureBuildSteps, "Asset structure built without saved connections");
+            }
         }
         }
         catch
@@ -6237,7 +6473,7 @@ public partial class MainWindow : Window
 
     private Material? FindMaterialForMesh(Mesh mesh)
     {
-        return FindMaterialsForMesh(mesh).FirstOrDefault();
+        return FindMaterialsForMesh(mesh).FirstOrDefault(material => material != null);
     }
 
     private List<Material?> FindMaterialsForMeshPreview(Mesh mesh)
@@ -6299,8 +6535,7 @@ public partial class MainWindow : Window
         ClassIDType.MeshFilter,
         ClassIDType.MeshRenderer,
         ClassIDType.SkinnedMeshRenderer,
-        ClassIDType.Material,
-        ClassIDType.Texture2D
+        ClassIDType.Material
     };
 
     private static readonly HashSet<ClassIDType> LazyConnectionReferenceTypes = new()
@@ -6389,6 +6624,29 @@ public partial class MainWindow : Window
 
         var materialAssetId = AssetHandle.BuildUniqueID(material.assetsFile, material.m_PathID);
         var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        var texture = TryResolveTextureIdsForMaterialFromSemanticCache(folderPath, signature, material, materialAssetId, slotName);
+        if (texture != null)
+        {
+            return texture;
+        }
+
+        var parentMaterialId = GetMaterialParentAssetIdForSemanticCache(material);
+        if (!string.IsNullOrEmpty(parentMaterialId)
+            && !string.Equals(parentMaterialId, materialAssetId, StringComparison.Ordinal))
+        {
+            return TryResolveTextureIdsForMaterialFromSemanticCache(folderPath, signature, material, parentMaterialId, slotName);
+        }
+
+        return null;
+    }
+
+    private Texture2D? TryResolveTextureIdsForMaterialFromSemanticCache(
+        string folderPath,
+        string signature,
+        Material cacheMaterial,
+        string materialAssetId,
+        string? slotName)
+    {
         var textureIds = _sqliteCache.LoadMaterialTextureAssetIds(folderPath, signature, materialAssetId, slotName);
         foreach (var textureId in textureIds)
         {
@@ -6407,15 +6665,15 @@ public partial class MainWindow : Window
             if (string.IsNullOrEmpty(slotName))
             {
                 materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
-                materialMainTextureCache[material] = texture;
+                materialMainTextureCache[cacheMaterial] = texture;
             }
             else
             {
                 materialTextureSlotsCache ??= new Dictionary<Material, Dictionary<string, Texture2D?>>();
-                if (!materialTextureSlotsCache.TryGetValue(material, out var slots))
+                if (!materialTextureSlotsCache.TryGetValue(cacheMaterial, out var slots))
                 {
                     slots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
-                    materialTextureSlotsCache[material] = slots;
+                    materialTextureSlotsCache[cacheMaterial] = slots;
                 }
 
                 slots[slotName] = texture;
@@ -6425,6 +6683,22 @@ public partial class MainWindow : Window
         }
 
         return null;
+    }
+
+    private string GetMaterialParentAssetIdForSemanticCache(Material material)
+    {
+        if (material.assetsFile == null || material.m_Parent == null || material.m_Parent.IsNull)
+        {
+            return string.Empty;
+        }
+
+        if (material.m_Parent.TryGet(out var parentMaterial) && parentMaterial?.assetsFile != null)
+        {
+            return AssetHandle.BuildUniqueID(parentMaterial.assetsFile, parentMaterial.m_PathID);
+        }
+
+        var handle = FindMaterialHandleForPPtr(material, material.m_Parent);
+        return handle?.UniqueID ?? string.Empty;
     }
 
     private void IndexMaterialTextures(Material material)
@@ -6549,7 +6823,10 @@ public partial class MainWindow : Window
         }
     }
 
-    private void MaterializeReferenceObjects(SerializedFile sourceFile, HashSet<ClassIDType> referenceTypes)
+    private void MaterializeReferenceObjects(
+        SerializedFile sourceFile,
+        HashSet<ClassIDType> referenceTypes,
+        LazyConnectionBuildDiagnostics? diagnostics = null)
     {
         var handles = assetsManager.ProjectIndex
             .GetHandlesForFile(sourceFile.fileName)
@@ -6559,6 +6836,7 @@ public partial class MainWindow : Window
                     || string.IsNullOrEmpty(handle.OriginalPath)))
             .ToList();
 
+        diagnostics?.RecordMaterializationCandidateCount(handles.Count);
         foreach (var handle in handles)
         {
             if (handle.SourceFile?.reader == null)
@@ -6567,7 +6845,14 @@ public partial class MainWindow : Window
             }
 
             var obj = assetsManager.ResolveHandle(handle);
-            if (obj != null && handle.Tag is AssetItem item)
+            if (obj == null)
+            {
+                diagnostics?.RecordFailedObject();
+                continue;
+            }
+
+            diagnostics?.RecordResolvedObject(handle.Type);
+            if (handle.Tag is AssetItem item)
             {
                 UpdateLazyAssetItemHandle(item, handle);
             }
@@ -6702,6 +6987,60 @@ public partial class MainWindow : Window
         return null;
     }
 
+    private AssetHandle? FindMaterialHandleForPPtr(Material material, PPtr<Material> materialRef)
+    {
+        if (material.assetsFile == null || materialRef == null || materialRef.IsNull)
+        {
+            return null;
+        }
+
+        if (materialRef.TryGetAssetsFile(out var loadedSourceFile))
+        {
+            var handle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(loadedSourceFile, materialRef.m_PathID));
+            if (IsMaterialHandleForPath(handle, materialRef.m_PathID))
+            {
+                return handle;
+            }
+        }
+
+        var candidateFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (materialRef.m_FileID == 0)
+        {
+            candidateFileNames.Add(material.assetsFile.fileName);
+        }
+        else if (materialRef.m_FileID > 0
+            && material.assetsFile.m_Externals != null
+            && materialRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
+        {
+            var external = material.assetsFile.m_Externals[materialRef.m_FileID - 1];
+            AddCandidateFileName(candidateFileNames, external.fileName);
+            AddCandidateFileName(candidateFileNames, external.pathName);
+
+            if (assetsManager.TryFindSerializedFile(external.fileName, external.pathName, out var sourceFile))
+            {
+                AddCandidateFileName(candidateFileNames, sourceFile.fileName);
+                var handle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(sourceFile, materialRef.m_PathID));
+                if (IsMaterialHandleForPath(handle, materialRef.m_PathID))
+                {
+                    return handle;
+                }
+            }
+        }
+
+        foreach (var fileName in candidateFileNames)
+        {
+            var handle = assetsManager.ProjectIndex
+                .GetHandlesForFile(fileName)
+                .FirstOrDefault(candidate => IsMaterialHandleForPath(candidate, materialRef.m_PathID));
+            if (handle != null)
+            {
+                return handle;
+            }
+        }
+
+        return null;
+    }
+
     private static void AddCandidateFileName(HashSet<string> candidates, string? fileNameOrPath)
     {
         if (string.IsNullOrWhiteSpace(fileNameOrPath))
@@ -6720,6 +7059,11 @@ public partial class MainWindow : Window
     private static bool IsTexture2DHandleForPath(AssetHandle? handle, long pathId)
     {
         return handle != null && handle.PathID == pathId && handle.Type == ClassIDType.Texture2D;
+    }
+
+    private static bool IsMaterialHandleForPath(AssetHandle? handle, long pathId)
+    {
+        return handle != null && handle.PathID == pathId && handle.Type == ClassIDType.Material;
     }
 
     private async void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)

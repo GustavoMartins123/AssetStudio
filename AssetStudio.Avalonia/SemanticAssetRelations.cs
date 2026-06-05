@@ -16,6 +16,11 @@ internal sealed class SemanticAssetRelations
         MeshMaterials.Count > 0 ||
         MaterialTextures.Count > 0;
 
+    public bool HasMaterialRelations =>
+        AssetEdges.Count > 0 ||
+        MeshMaterials.Count > 0 ||
+        MaterialTextures.Count > 0;
+
     public void Merge(SemanticAssetRelations other)
     {
         if (other == null)

@@ -701,14 +701,7 @@ namespace AssetStudio.Avalonia
 
                 using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
-                cmd.CommandText = @"
-                    SELECT
-                        (SELECT COUNT(1) FROM AssetEdges WHERE ProjectId = @projectId) +
-                        (SELECT COUNT(1) FROM MeshRenderers WHERE ProjectId = @projectId) +
-                        (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
-                        (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
-                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
-                var count = Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
+                var count = CountMaterialSemanticRelations(conn, transaction, projectId.Value);
                 transaction.Commit();
                 return count > 0;
             }
@@ -963,6 +956,24 @@ namespace AssetStudio.Avalonia
                 return null;
             }
 
+            if (IsSemanticReadyStatus(state.Status)
+                && CountMaterialSemanticRelations(conn, transaction, projectId) == 0)
+            {
+                state = new ProjectIndexingState
+                {
+                    Status = "connections_failed",
+                    TotalFiles = state.TotalFiles,
+                    ProcessedFiles = state.ProcessedFiles,
+                    PendingFiles = state.PendingFiles,
+                    PercentComplete = state.PercentComplete,
+                    CurrentFile = "Saved connections missing",
+                    LastReadFile = string.Empty,
+                    StartedAt = state.StartedAt,
+                    UpdatedAt = state.UpdatedAt,
+                    CompletedAt = null
+                };
+            }
+
             using (var cmd = conn.CreateCommand())
             {
                 cmd.Transaction = transaction;
@@ -980,6 +991,27 @@ namespace AssetStudio.Avalonia
             }
 
             return state;
+        }
+
+        private static bool IsSemanticReadyStatus(string? status)
+        {
+            return string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static long CountMaterialSemanticRelations(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT
+                    (SELECT COUNT(1) FROM AssetEdges WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
         }
 
         private static bool IsTerminalIndexingStatus(string? status)

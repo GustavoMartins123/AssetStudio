@@ -717,6 +717,74 @@ namespace AssetStudio.Avalonia
                 }
             }
 
+            bool AddMeshRendererRelations(
+                MeshRenderer renderer,
+                MeshFilter meshFilter,
+                Mesh? mesh,
+                string meshId,
+                GameObject? gameObject,
+                HashSet<string> seenRendererMeshRelations)
+            {
+                var rendererId = GetSemanticAssetId(renderer);
+                if (string.IsNullOrEmpty(meshId) || string.IsNullOrEmpty(rendererId))
+                {
+                    return false;
+                }
+
+                if (!seenRendererMeshRelations.Add($"{rendererId}->{meshId}"))
+                {
+                    return false;
+                }
+
+                var gameObjectName = gameObject?.m_Name ?? string.Empty;
+                var description = !string.IsNullOrEmpty(gameObjectName)
+                    ? $"MeshRenderer on GameObject \"{gameObjectName}\" (PathID: {renderer.m_PathID}); MeshFilter PathID: {meshFilter.m_PathID}"
+                    : $"MeshRenderer PathID: {renderer.m_PathID}; MeshFilter PathID: {meshFilter.m_PathID}";
+
+                AddRendererMeshRelation(result.SemanticRelations, meshId, renderer, "MeshRenderer", gameObject, description);
+                AddAssetEdge(result.SemanticRelations, meshFilter, "Mesh", "m_Mesh", 0, meshId, meshFilter.m_Mesh.m_FileID, meshFilter.m_Mesh.m_PathID);
+
+                if (mesh != null)
+                {
+                    AddMeshAssociation(mesh, "MeshFilter", description);
+                }
+
+                if (renderer.m_Materials != null)
+                {
+                    var resolvedBindings = ResolveRendererMaterialBindings(file, renderer);
+                    AddMaterialTextureRelationsForBindings(resolvedBindings);
+                    var materialIds = resolvedBindings.Select(binding => binding.MaterialId).ToList();
+                    foreach (var binding in resolvedBindings)
+                    {
+                        AddMeshMaterialRelation(
+                            result.SemanticRelations,
+                            meshId,
+                            binding.MaterialId,
+                            renderer,
+                            "MeshRenderer",
+                            binding.Binding.SubMeshIndex,
+                            binding.Binding.MaterialSlotIndex,
+                            materialIds);
+                        AddAssetEdge(
+                            result.SemanticRelations,
+                            renderer,
+                            "Material",
+                            "m_Materials",
+                            binding.Binding.MaterialSlotIndex,
+                            binding.MaterialId,
+                            binding.Binding.MaterialPointer?.m_FileID ?? 0,
+                            binding.Binding.MaterialPointer?.m_PathID ?? 0);
+                    }
+
+                    if (mesh != null)
+                    {
+                        AddMeshMaterials(mesh, BuildSubMeshMaterialList(resolvedBindings));
+                    }
+                }
+
+                return true;
+            }
+
             AssetStudio.Object[] objectsSnapshot;
             lock (file)
             {
@@ -724,6 +792,8 @@ namespace AssetStudio.Avalonia
             }
 
             var containerReferences = new List<(string Container, List<PPtr<AssetStudio.Object>> References)>();
+            var meshFiltersByGameObjectId = BuildMeshFilterBindingsByGameObject(file, objectsSnapshot);
+            var seenRendererMeshRelations = new HashSet<string>(StringComparer.Ordinal);
 
             result.SemanticRelations.SourceFiles.Add(new SemanticSourceFileEntry(
                 file.fileName ?? string.Empty,
@@ -807,6 +877,7 @@ namespace AssetStudio.Avalonia
                 else if (obj is MeshRenderer mr)
                 {
                     var go = ResolveGameObjectBackground(file, mr.m_GameObject);
+                    var addedMeshRendererRelation = false;
 
                     if (go?.m_Components != null)
                     {
@@ -833,51 +904,33 @@ namespace AssetStudio.Avalonia
 
                                 if (!string.IsNullOrEmpty(mfMeshId))
                                 {
-                                    AddRendererMeshRelation(result.SemanticRelations, mfMeshId, mr, "MeshRenderer", go,
-                                        $"MeshRenderer on GameObject \"{go.m_Name}\" (PathID: {mr.m_PathID}); MeshFilter PathID: {mf.m_PathID}");
-                                    AddAssetEdge(result.SemanticRelations, mf, "Mesh", "m_Mesh", 0, mfMeshId, mf.m_Mesh.m_FileID, mf.m_Mesh.m_PathID);
-
-                                    if (mfMesh != null)
-                                    {
-                                        AddMeshAssociation(
-                                            mfMesh,
-                                            "MeshFilter",
-                                            $"MeshFilter on GameObject \"{go.m_Name}\" (PathID: {mf.m_PathID})");
-                                    }
-
-                                    if (mr.m_Materials != null)
-                                    {
-                                        var resolvedBindings = ResolveRendererMaterialBindings(file, mr);
-                                        AddMaterialTextureRelationsForBindings(resolvedBindings);
-                                        var materialIds = resolvedBindings.Select(binding => binding.MaterialId).ToList();
-                                        foreach (var binding in resolvedBindings)
-                                        {
-                                            AddMeshMaterialRelation(
-                                                result.SemanticRelations,
-                                                mfMeshId,
-                                                binding.MaterialId,
-                                                mr,
-                                                "MeshRenderer",
-                                                binding.Binding.SubMeshIndex,
-                                                binding.Binding.MaterialSlotIndex,
-                                                materialIds);
-                                            AddAssetEdge(
-                                                result.SemanticRelations,
-                                                mr,
-                                                "Material",
-                                                "m_Materials",
-                                                binding.Binding.MaterialSlotIndex,
-                                                binding.MaterialId,
-                                                binding.Binding.MaterialPointer?.m_FileID ?? 0,
-                                                binding.Binding.MaterialPointer?.m_PathID ?? 0);
-                                        }
-
-                                        if (mfMesh != null)
-                                        {
-                                            AddMeshMaterials(mfMesh, BuildSubMeshMaterialList(resolvedBindings));
-                                        }
-                                    }
+                                    addedMeshRendererRelation |= AddMeshRendererRelations(
+                                        mr,
+                                        mf,
+                                        mfMesh,
+                                        mfMeshId,
+                                        go,
+                                        seenRendererMeshRelations);
                                 }
+                            }
+                        }
+                    }
+
+                    if (!addedMeshRendererRelation)
+                    {
+                        var gameObjectId = GetSemanticGameObjectId(file, mr.m_GameObject, go);
+                        if (!string.IsNullOrEmpty(gameObjectId)
+                            && meshFiltersByGameObjectId.TryGetValue(gameObjectId, out var meshFilterBindings))
+                        {
+                            foreach (var binding in meshFilterBindings)
+                            {
+                                addedMeshRendererRelation |= AddMeshRendererRelations(
+                                    mr,
+                                    binding.MeshFilter,
+                                    binding.Mesh,
+                                    binding.MeshId,
+                                    go ?? binding.GameObject,
+                                    seenRendererMeshRelations);
                             }
                         }
                     }
@@ -1048,6 +1101,58 @@ namespace AssetStudio.Avalonia
             }
 
             return FindSemanticHandleForPPtr(sourceFile, pptr.m_FileID, pptr.m_PathID, expectedType: null);
+        }
+
+        private static Dictionary<string, List<MeshFilterSemanticBinding>> BuildMeshFilterBindingsByGameObject(
+            SerializedFile sourceFile,
+            IEnumerable<AssetStudio.Object> objects)
+        {
+            var result = new Dictionary<string, List<MeshFilterSemanticBinding>>(StringComparer.Ordinal);
+            foreach (var meshFilter in objects.OfType<MeshFilter>())
+            {
+                var gameObject = ResolveGameObjectBackground(sourceFile, meshFilter.m_GameObject);
+                var gameObjectId = GetSemanticGameObjectId(sourceFile, meshFilter.m_GameObject, gameObject);
+                if (string.IsNullOrEmpty(gameObjectId))
+                {
+                    continue;
+                }
+
+                var mesh = ResolveMeshBackground(sourceFile, meshFilter.m_Mesh);
+                var meshId = GetSemanticAssetId(mesh);
+                if (string.IsNullOrEmpty(meshId))
+                {
+                    meshId = GetSemanticAssetIdFromPPtr(sourceFile, meshFilter.m_Mesh, ClassIDType.Mesh);
+                }
+
+                if (string.IsNullOrEmpty(meshId))
+                {
+                    continue;
+                }
+
+                if (!result.TryGetValue(gameObjectId, out var bindings))
+                {
+                    bindings = new List<MeshFilterSemanticBinding>();
+                    result[gameObjectId] = bindings;
+                }
+
+                bindings.Add(new MeshFilterSemanticBinding(meshFilter, mesh, meshId, gameObject));
+            }
+
+            return result;
+        }
+
+        private static string GetSemanticGameObjectId(
+            SerializedFile sourceFile,
+            PPtr<GameObject> gameObjectPtr,
+            GameObject? gameObject)
+        {
+            var gameObjectId = GetSemanticAssetId(gameObject);
+            if (!string.IsNullOrEmpty(gameObjectId))
+            {
+                return gameObjectId;
+            }
+
+            return GetSemanticAssetIdFromPPtr(sourceFile, gameObjectPtr, ClassIDType.GameObject);
         }
 
         private static GameObject? ResolveGameObjectBackground(SerializedFile sourceFile, PPtr<GameObject> pptr)
@@ -1264,6 +1369,22 @@ namespace AssetStudio.Avalonia
             public int MaterialSlotIndex { get; }
             public int SubMeshIndex { get; }
             public PPtr<Material>? MaterialPointer { get; }
+        }
+
+        private readonly struct MeshFilterSemanticBinding
+        {
+            public MeshFilterSemanticBinding(MeshFilter meshFilter, Mesh? mesh, string meshId, GameObject? gameObject)
+            {
+                MeshFilter = meshFilter;
+                Mesh = mesh;
+                MeshId = meshId;
+                GameObject = gameObject;
+            }
+
+            public MeshFilter MeshFilter { get; }
+            public Mesh? Mesh { get; }
+            public string MeshId { get; }
+            public GameObject? GameObject { get; }
         }
 
         private readonly struct ResolvedRendererMaterialBinding
