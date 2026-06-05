@@ -326,6 +326,10 @@ public partial class MainWindow : Window
         }
 
         UpdateMeshMaterialControlValues();
+        if (SelectedMeshMaterialSlot is { } selectedSlot)
+        {
+            GLPreviewControl?.FocusSubMesh(selectedSlot.SlotIndex);
+        }
     }
 
     private void MeshMaterialSlider_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)

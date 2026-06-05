@@ -382,6 +382,87 @@ void main()
             RequestNextFrameRendering();
         }
 
+        public void FocusSubMesh(int subMeshIndex)
+        {
+            if (subMeshIndex < 0 || isAvatarMode)
+            {
+                return;
+            }
+
+            if (!TryGetSubMeshBounds(subMeshIndex, out var min, out var max))
+            {
+                return;
+            }
+
+            modelMatrixData = CreatePreviewModelMatrix(min, max);
+            RequestNextFrameRendering();
+        }
+
+        private bool TryGetSubMeshBounds(int subMeshIndex, out Vector3 min, out Vector3 max)
+        {
+            min = Vector3.Zero;
+            max = Vector3.Zero;
+
+            var subMeshIndexCounts = previewSubMeshIndexCounts;
+            var indices = indiceData;
+            var vertices = vertexData;
+            if (subMeshIndexCounts == null
+                || indices == null
+                || vertices == null
+                || subMeshIndex < 0
+                || subMeshIndex >= subMeshIndexCounts.Length)
+            {
+                return false;
+            }
+
+            var flatOffsetElements = 0;
+            for (var i = 0; i < subMeshIndex; i++)
+            {
+                flatOffsetElements += Math.Max(0, subMeshIndexCounts[i]);
+            }
+
+            if (flatOffsetElements >= indices.Length)
+            {
+                return false;
+            }
+
+            var indexCount = Math.Min(Math.Max(0, subMeshIndexCounts[subMeshIndex]), indices.Length - flatOffsetElements);
+            if (indexCount <= 0)
+            {
+                return false;
+            }
+
+            var hasPoint = false;
+            var end = flatOffsetElements + indexCount;
+            for (var i = flatOffsetElements; i < end; i++)
+            {
+                var vertexIndex = indices[i];
+                if ((uint)vertexIndex >= (uint)vertices.Length)
+                {
+                    continue;
+                }
+
+                var point = vertices[vertexIndex];
+                if (!IsFinitePoint(point))
+                {
+                    continue;
+                }
+
+                if (!hasPoint)
+                {
+                    min = point;
+                    max = point;
+                    hasPoint = true;
+                }
+                else
+                {
+                    ExpandBounds(point, ref min, ref max);
+                }
+            }
+
+            return hasPoint;
+        }
+
         private static void ExpandBounds(Vector3 point, ref Vector3 min, ref Vector3 max)
         {
             if (!IsFinitePoint(point))
