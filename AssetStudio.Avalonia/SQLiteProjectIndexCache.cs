@@ -286,8 +286,13 @@ namespace AssetStudio.Avalonia
                             CREATE INDEX IF NOT EXISTS idx_mesh_renderers_mesh ON MeshRenderers(ProjectId, MeshAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh ON MeshMaterials(ProjectId, MeshAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_renderer ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_material ON MaterialTextures(ProjectId, MaterialAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_material_textures_preview_material ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_material_textures_material_lookup ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, TextureAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, TextureAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
                             CREATE INDEX IF NOT EXISTS idx_indexing_read_files_project ON IndexingReadFiles(ProjectId, ReadOrder);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_indexing_read_files_unique ON IndexingReadFiles(ProjectId, FilePath);
@@ -1321,17 +1326,58 @@ namespace AssetStudio.Avalonia
                 using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
                 cmd.CommandText = @"
-                    WITH BestRenderer AS (
-                        SELECT RendererAssetUniqueID
-                        FROM MeshMaterials
+                    WITH MeshSource AS (
+                        SELECT SourceFileId
+                        FROM Assets
                         WHERE ProjectId = @projectId
-                          AND MeshAssetUniqueID = @meshAssetId
-                        GROUP BY RendererAssetUniqueID
+                          AND UniqueID = @meshAssetId
+                        LIMIT 1
+                    ),
+                    RendererStats AS (
+                        SELECT
+                            mm.RendererAssetUniqueID,
+                            MAX(CASE WHEN mm.RendererType <> 'Container' THEN 1 ELSE 0 END) AS RendererScore,
+                            SUM(CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) AS MaterialCount,
+                            COUNT(*) AS RelationCount,
+                            MAX(mm.MaterialScore) AS MaterialScore,
+                            MAX(CASE WHEN EXISTS (
+                                SELECT 1
+                                FROM Assets materialAsset
+                                WHERE materialAsset.ProjectId = mm.ProjectId
+                                  AND materialAsset.UniqueID = mm.MaterialAssetUniqueID
+                                  AND materialAsset.SourceFileId = (SELECT SourceFileId FROM MeshSource)
+                            ) THEN 1 ELSE 0 END) AS SameSourceScore,
+                            SUM(CASE WHEN EXISTS (
+                                SELECT 1
+                                FROM MaterialTextures mt
+                                WHERE mt.ProjectId = mm.ProjectId
+                                  AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                                  AND mt.TextureAssetUniqueID <> ''
+                                  AND mt.IsMainTexture <> 0
+                            ) THEN 1 ELSE 0 END) AS MainTextureCount,
+                            SUM(CASE WHEN EXISTS (
+                                SELECT 1
+                                FROM MaterialTextures mt
+                                WHERE mt.ProjectId = mm.ProjectId
+                                  AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                                  AND mt.TextureAssetUniqueID <> ''
+                            ) THEN 1 ELSE 0 END) AS TextureCount
+                        FROM MeshMaterials mm
+                        WHERE mm.ProjectId = @projectId
+                          AND mm.MeshAssetUniqueID = @meshAssetId
+                        GROUP BY mm.RendererAssetUniqueID
+                    ),
+                    BestRenderer AS (
+                        SELECT RendererAssetUniqueID
+                        FROM RendererStats
                         ORDER BY
-                            MAX(CASE WHEN RendererType <> 'Container' THEN 1 ELSE 0 END) DESC,
-                            SUM(CASE WHEN MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) DESC,
-                            COUNT(*) DESC,
-                            MAX(MaterialScore) DESC,
+                            RendererScore DESC,
+                            MainTextureCount DESC,
+                            TextureCount DESC,
+                            SameSourceScore DESC,
+                            MaterialCount DESC,
+                            RelationCount DESC,
+                            MaterialScore DESC,
                             RendererAssetUniqueID
                         LIMIT 1
                     ),
@@ -1344,6 +1390,21 @@ namespace AssetStudio.Avalonia
                                 PARTITION BY SubMeshIndex
                                 ORDER BY
                                     CASE WHEN MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                    CASE WHEN EXISTS (
+                                        SELECT 1
+                                        FROM MaterialTextures mt
+                                        WHERE mt.ProjectId = MeshMaterials.ProjectId
+                                          AND mt.MaterialAssetUniqueID = MeshMaterials.MaterialAssetUniqueID
+                                          AND mt.TextureAssetUniqueID <> ''
+                                          AND mt.IsMainTexture <> 0
+                                    ) THEN 0 ELSE 1 END,
+                                    CASE WHEN EXISTS (
+                                        SELECT 1
+                                        FROM MaterialTextures mt
+                                        WHERE mt.ProjectId = MeshMaterials.ProjectId
+                                          AND mt.MaterialAssetUniqueID = MeshMaterials.MaterialAssetUniqueID
+                                          AND mt.TextureAssetUniqueID <> ''
+                                    ) THEN 0 ELSE 1 END,
                                     MaterialScore DESC,
                                     MaterialSlotIndex,
                                     MaterialAssetUniqueID
@@ -1401,16 +1462,40 @@ namespace AssetStudio.Avalonia
 
                 using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
-                cmd.CommandText = @"
+                var slotFilter = string.IsNullOrEmpty(slotName) ? string.Empty : " AND SlotName = @slotName";
+                cmd.CommandText = $@"
+                    WITH TextureCandidates AS (
+                        SELECT
+                            TextureAssetUniqueID,
+                            SlotName,
+                            SlotIndex,
+                            IsMainTexture,
+                            0 AS SourceRank
+                        FROM MaterialTextures
+                        WHERE ProjectId = @projectId
+                          AND MaterialAssetUniqueID = @materialAssetId
+                          AND TextureAssetUniqueID <> ''
+                          {slotFilter}
+                        UNION ALL
+                        SELECT
+                            TextureAssetUniqueID,
+                            SlotName,
+                            SlotIndex,
+                            IsMainTexture,
+                            1 AS SourceRank
+                        FROM MaterialTextures
+                        WHERE ProjectId = @projectId
+                          AND PreviewMaterialAssetUniqueID = @materialAssetId
+                          AND PreviewMaterialAssetUniqueID <> MaterialAssetUniqueID
+                          AND TextureAssetUniqueID <> ''
+                          {slotFilter}
+                    )
                     SELECT TextureAssetUniqueID
-                    FROM MaterialTextures
-                    WHERE ProjectId = @projectId
-                      AND TextureAssetUniqueID <> ''
-                      AND (MaterialAssetUniqueID = @materialAssetId OR PreviewMaterialAssetUniqueID = @materialAssetId)
-                      AND (@slotName = '' OR SlotName = @slotName)
+                    FROM TextureCandidates
                     GROUP BY TextureAssetUniqueID
                     ORDER BY
                         MAX(IsMainTexture) DESC,
+                        MIN(SourceRank),
                         MIN(CASE SlotName
                             WHEN '_BaseMap' THEN 0
                             WHEN '_MainTex' THEN 1
@@ -1421,9 +1506,11 @@ namespace AssetStudio.Avalonia
                             WHEN '_BaseColorTexture' THEN 6
                             WHEN '_Diffuse' THEN 7
                             WHEN '_AlbedoMap' THEN 8
+                            WHEN '_Albedo' THEN 9
                             ELSE 20
                         END),
-                        MIN(SlotIndex)";
+                        MIN(SlotIndex),
+                        TextureAssetUniqueID";
                 cmd.Parameters.AddWithValue("@projectId", projectId.Value);
                 cmd.Parameters.AddWithValue("@materialAssetId", materialAssetId);
                 cmd.Parameters.AddWithValue("@slotName", slotName ?? string.Empty);

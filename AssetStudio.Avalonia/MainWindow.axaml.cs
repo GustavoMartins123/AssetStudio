@@ -4620,6 +4620,7 @@ public partial class MainWindow : Window
                                                             byte temp = tb[p];
                                                             tb[p] = tb[p + 2];
                                                             tb[p + 2] = temp;
+                                                            tb[p + 3] = byte.MaxValue;
                                                         }
                                                     }
                                                 }
