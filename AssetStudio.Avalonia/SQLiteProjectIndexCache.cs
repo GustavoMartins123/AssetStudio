@@ -373,7 +373,13 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        public void SaveIndexCache(string folderPath, string signature, ProjectScanResult scanResult, string unityVersion, IEnumerable<AssetHandle> handles)
+        public void SaveIndexCache(
+            string folderPath,
+            string signature,
+            ProjectScanResult scanResult,
+            string unityVersion,
+            IEnumerable<AssetHandle> handles,
+            bool preserveSemanticRelations = false)
         {
             EnsureInitialized();
             try
@@ -384,7 +390,7 @@ namespace AssetStudio.Avalonia
                     using (var transaction = conn.BeginTransaction())
                     {
                         var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
-                        ClearIndexTablesForProject(conn, transaction, projectId);
+                        ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
 
                         // Insert handles in batch using parameterized query
                         using (var cmd = conn.CreateCommand())
@@ -489,9 +495,20 @@ namespace AssetStudio.Avalonia
             return Convert.ToInt64(insertCmd.ExecuteScalar());
         }
 
-        private static void ClearIndexTablesForProject(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        private static void ClearIndexTablesForProject(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            bool preserveSemanticRelations)
         {
-            var tables = new[]
+            var tables = preserveSemanticRelations
+                ? new[]
+                {
+                    "AssetHandles",
+                    "Assets",
+                    "SourceFiles"
+                }
+                : new[]
             {
                 "AssetHandles",
                 "MaterialTextures",

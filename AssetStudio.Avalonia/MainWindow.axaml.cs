@@ -2231,14 +2231,14 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveIndexCache(string folderPath, ProjectScanResult scanResult)
+    private void SaveIndexCache(string folderPath, ProjectScanResult scanResult, bool preserveSemanticRelations = false)
     {
         try
         {
             var signature = _sqliteCache.GetFolderSignature(scanResult);
             var unityVersion = assetsManager.SpecifyUnityVersion;
             var handles = assetsManager.ProjectIndex.GetHandles();
-            _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles);
+            _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations);
         }
         catch (Exception ex)
         {
@@ -3603,7 +3603,10 @@ public partial class MainWindow : Window
             var folderPath = GetCurrentCacheFolderPath();
             if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
             {
-                SaveIndexCache(folderPath, currentScanResult);
+                SaveIndexCache(
+                    folderPath,
+                    currentScanResult,
+                    preserveSemanticRelations: HasSavedSemanticRelations(folderPath, currentScanResult));
             }
         }
 
