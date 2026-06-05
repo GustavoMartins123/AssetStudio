@@ -692,6 +692,31 @@ namespace AssetStudio.Avalonia
                 renderers.Add(description);
             }
 
+            void AddMaterialTextureRelationsForBindings(IEnumerable<ResolvedRendererMaterialBinding> bindings)
+            {
+                var seenMaterials = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var material in bindings.Select(binding => binding.Material).Where(material => material != null))
+                {
+                    var materialId = GetSemanticAssetId(material);
+                    if (string.IsNullOrEmpty(materialId) || !seenMaterials.Add(materialId))
+                    {
+                        continue;
+                    }
+
+                    IndexMaterialTexturesBackground(
+                        material!,
+                        result.MaterialPreviewMaterialCache,
+                        result.MaterialTextureSlotsCache,
+                        result.MaterialMainTextureCache);
+                    AddMaterialTextureRelations(
+                        result.SemanticRelations,
+                        material!,
+                        result.MaterialPreviewMaterialCache,
+                        result.MaterialTextureSlotsCache,
+                        result.MaterialMainTextureCache);
+                }
+            }
+
             AssetStudio.Object[] objectsSnapshot;
             lock (file)
             {
@@ -748,6 +773,7 @@ namespace AssetStudio.Avalonia
                         if (smr.m_Materials != null)
                         {
                             var resolvedBindings = ResolveRendererMaterialBindings(file, smr);
+                            AddMaterialTextureRelationsForBindings(resolvedBindings);
                             var materialIds = resolvedBindings.Select(binding => binding.MaterialId).ToList();
                             foreach (var binding in resolvedBindings)
                             {
@@ -822,6 +848,7 @@ namespace AssetStudio.Avalonia
                                     if (mr.m_Materials != null)
                                     {
                                         var resolvedBindings = ResolveRendererMaterialBindings(file, mr);
+                                        AddMaterialTextureRelationsForBindings(resolvedBindings);
                                         var materialIds = resolvedBindings.Select(binding => binding.MaterialId).ToList();
                                         foreach (var binding in resolvedBindings)
                                         {

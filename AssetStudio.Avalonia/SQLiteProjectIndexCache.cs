@@ -988,7 +988,9 @@ namespace AssetStudio.Avalonia
                 || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase);
+                || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
         }
 
         private static DateTime? ReadNullableDateTime(SqliteDataReader reader, int ordinal)

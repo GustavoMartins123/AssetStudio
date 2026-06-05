@@ -484,6 +484,9 @@ public partial class ProjectManagerWindow : Window
                 "connecting" => "Building connections",
                 "connections_completed" => "Connections complete",
                 "connections_failed" => "Connections failed",
+                "building_structure" => "Building asset structure",
+                "structure_completed" => "Asset structure complete",
+                "structure_failed" => "Asset structure failed",
                 "completed" => "Complete",
                 "failed" => "Failed",
                 _ => "Unknown"

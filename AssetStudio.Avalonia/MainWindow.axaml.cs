@@ -439,6 +439,9 @@ public partial class MainWindow : Window
             "cancelled" => "Indexing cancelled",
             "connecting" => "Building connections",
             "connections_completed" => "Connections complete",
+            "building_structure" => "Building asset structure",
+            "structure_completed" => "Asset structure complete",
+            "structure_failed" => "Asset structure failed",
             "completed" => "Indexing complete",
             "failed" => "Indexing failed",
             "connections_failed" => "Connections build failed",
@@ -1578,11 +1581,7 @@ public partial class MainWindow : Window
                 var count = AppendNewLazyAssetsFromProjectIndex();
                 StatusStripUpdate($"Loaded from cache. Total assets: {count:N0}");
                 await BuildLazyConnectionsIfNeededAsync(paths);
-                await BuildAssetStructuresAsync(incremental: false);
-                if (currentScanResult != null && HasCompletedLazyConnectionBuild(paths[0], currentScanResult))
-                {
-                    HideIndexingProgressPanel();
-                }
+                await BuildAssetStructuresAsync(incremental: false, showStructureProgress: true);
                 return;
             }
 
@@ -1672,7 +1671,7 @@ public partial class MainWindow : Window
                             await BuildLazyConnectionsIfNeededAsync(paths, force: true);
                         }
 
-                        await BuildAssetStructuresAsync(incremental: true);
+                        await BuildAssetStructuresAsync(incremental: true, showStructureProgress: !wasCancelled);
                     }
                     catch (Exception ex)
                     {
@@ -2263,17 +2262,26 @@ public partial class MainWindow : Window
     private bool HasCompletedLazyConnectionBuild(string folderPath, ProjectScanResult scanResult)
     {
         var state = TryLoadIndexingProgress(folderPath, scanResult);
-        if (state == null || !string.Equals(state.Status, "connections_completed", StringComparison.OrdinalIgnoreCase))
+        if (state == null || !IsConnectionReadyStatus(state.Status))
         {
             return false;
         }
         return true;
     }
 
+    private static bool IsConnectionReadyStatus(string? status)
+    {
+        return string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsCompletedLazyIndexingStatus(string? status)
     {
         return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase);
+            || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool CanUseLazySemanticRelationCache(string folderPath)
@@ -2437,6 +2445,42 @@ public partial class MainWindow : Window
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to persist connection build progress: {ex.Message}");
+            }
+        }
+
+        ShowIndexingProgressPanel(update);
+    }
+
+    private void PublishStructureBuildProgress(string status, int processedSteps, int totalSteps, string currentStage)
+    {
+        var safeTotal = Math.Max(1, totalSteps);
+        var safeProcessed = Math.Clamp(processedSteps, 0, safeTotal);
+        var update = new IndexingProgressUpdate
+        {
+            Status = status,
+            TotalFiles = safeTotal,
+            ProcessedFiles = safeProcessed,
+            PendingFiles = Math.Max(0, safeTotal - safeProcessed),
+            PercentComplete = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal)),
+            CurrentFile = currentStage ?? string.Empty,
+            LastReadFile = currentStage ?? string.Empty,
+            NewlyReadFiles = Array.Empty<string>()
+        };
+
+        if (currentScanResult != null)
+        {
+            var folderPath = GetCurrentCacheFolderPath();
+            if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
+            {
+                try
+                {
+                    var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+                    _sqliteCache.SaveIndexingProgress(folderPath, signature, currentScanResult, update);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to persist structure build progress: {ex.Message}");
+                }
             }
         }
 
@@ -2936,10 +2980,21 @@ public partial class MainWindow : Window
         await BuildAssetStructuresAsync(incremental);
     }
 
-    private async Task BuildAssetStructuresAsync(bool incremental = false)
+    private async Task BuildAssetStructuresAsync(bool incremental = false, bool showStructureProgress = false)
     {
         if (isBuildingAssetStructures) return;
         isBuildingAssetStructures = true;
+        var publishStructureProgress = showStructureProgress && assetsManager.LazyLoading && currentScanResult != null;
+        const int structureBuildSteps = 5;
+
+        void PublishStructureStage(int processedSteps, string stage)
+        {
+            if (publishStructureProgress)
+            {
+                PublishStructureBuildProgress("building_structure", processedSteps, structureBuildSteps, stage);
+            }
+        }
+
         try
         {
             if (assetsManager.assetsFileList.Count == 0 && (!assetsManager.LazyLoading || !assetsManager.ProjectIndex.GetHandles().Any()))
@@ -2949,6 +3004,7 @@ public partial class MainWindow : Window
             }
 
             StatusStripUpdate("Building asset structures...");
+            PublishStructureStage(0, "Preparing asset structure build");
 
         // Capture required UI states on the UI thread
         bool displayAllChecked = displayAll.IsChecked == true;
@@ -2960,6 +3016,7 @@ public partial class MainWindow : Window
 
         var result = await Task.Run(() =>
         {
+            PublishStructureStage(1, "Collecting containers and asset items");
             string? localProductName = null;
             var localExportableAssets = new List<AssetItem>();
             var localSceneTreeNodes = new List<GameObjectNode>();
@@ -3027,6 +3084,7 @@ public partial class MainWindow : Window
                     out localProductName);
             }
 
+            PublishStructureStage(2, "Linking asset items");
             if (!assetsManager.LazyLoading)
             {
                 LinkAssetItemsToSceneNodesBackground(filesListSnapshot, localTreeNodeDictionary, localObjectAssetItemDic);
@@ -3081,6 +3139,7 @@ public partial class MainWindow : Window
             var localMeshAvatarCache = new Dictionary<Mesh, Avatar?>();
             var localAnimationClipTransformBindingsCache = new Dictionary<AnimationClip, HashSet<uint>>();
 
+            PublishStructureStage(3, "Building reference indexes");
             if (!assetsManager.LazyLoading)
             {
                 Parallel.Invoke(
@@ -3104,6 +3163,7 @@ public partial class MainWindow : Window
                         out localAnimationClipTransformBindingsCache));
             }
 
+            PublishStructureStage(4, "Building class structures");
             var localAssetClassItems = new List<AssetClassItem>();
             var objectCounts = filesListSnapshot
                 .SelectMany(file => file.m_Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.classID }))
@@ -3147,6 +3207,7 @@ public partial class MainWindow : Window
         });
 
         await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
+        PublishStructureStage(5, "Applying asset structure to UI");
 
         // Apply results back on the UI thread
         var newExportableAssets = result.NewExportableAssets;
@@ -3247,6 +3308,18 @@ public partial class MainWindow : Window
         {
             TrySaveSemanticRelations(result.SemanticRelations);
         }
+        if (publishStructureProgress)
+        {
+            PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
+        }
+        }
+        catch
+        {
+            if (publishStructureProgress)
+            {
+                PublishStructureBuildProgress("structure_failed", structureBuildSteps, structureBuildSteps, "Asset structure build failed");
+            }
+            throw;
         }
         finally
         {
@@ -5989,390 +6062,6 @@ public partial class MainWindow : Window
         });
     }
 
-    private void PreviewMaterial(AssetItem assetItem, Material m_Material)
-    {
-        HideAnimationPlayback();
-        if (GLPreviewControl != null)
-        {
-            GLPreviewControl.StopAnimation();
-            GLPreviewControl.IsVisible = false;
-        }
-
-        if (TextureGLPreview != null)
-        {
-            TextureGLPreview.IsVisible = false;
-        }
-
-        currentPreviewTexture = null;
-        var currentId = ++texturePreviewIdCounter;
-        TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\nLoading material preview...";
-        TextPreviewBox.IsVisible = true;
-        ImagePreviewBox.IsVisible = false;
-        PreviewLabel.IsVisible = false;
-        PreviewInfoBorder.IsVisible = false;
-        StatusStripUpdate("Loading material preview...");
-
-        Task.Run(() =>
-        {
-            TexturePreviewImageResult? previewImage = null;
-            try
-            {
-                try
-                {
-                    EnsureMaterialPreviewDependenciesLoaded(m_Material);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to prepare material preview dependencies for {m_Material.m_Name}: {ex.Message}");
-                }
-
-                var previewData = BuildMaterialPreviewData(m_Material);
-                if (currentId != texturePreviewIdCounter)
-                {
-                    return;
-                }
-
-                if (previewData.PreviewTexture == null)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                        {
-                            return;
-                        }
-
-                        TextPreviewBox.Text = previewData.InfoText;
-                        TextPreviewBox.IsVisible = true;
-                        ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
-                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                        StatusStripUpdate("Material loaded (no texture).");
-                    });
-                    return;
-                }
-
-                previewImage = LoadTexturePreviewThumbnail(previewData.PreviewTexture, MaxCachedPreviewTextureDimension);
-                var loadedPreviewImage = previewImage;
-                var image = loadedPreviewImage?.Image;
-                if (image == null)
-                {
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                        {
-                            return;
-                        }
-
-                        TextPreviewBox.Text = previewData.InfoText;
-                        TextPreviewBox.IsVisible = true;
-                        ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
-                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                        StatusStripUpdate("Material loaded (no preview texture support).");
-                    });
-                    return;
-                }
-
-                var activePreviewImage = loadedPreviewImage!;
-                var materialPreviewWasDownscaled = activePreviewImage.Downscaled;
-                var materialPreviewFromCache = activePreviewImage.FromCache;
-                var materialPreviewWidth = image.Width;
-                var materialPreviewHeight = image.Height;
-
-                int validChannel = 0;
-                for (int i = 0; i < 4; i++)
-                {
-                    if (textureChannels[i])
-                    {
-                        validChannel++;
-                    }
-                }
-
-                if (validChannel != 4)
-                {
-                    image.ProcessPixelRows(accessor =>
-                    {
-                        for (int y = 0; y < accessor.Height; y++)
-                        {
-                            var row = accessor.GetRowSpan(y);
-                            for (int x = 0; x < accessor.Width; x++)
-                            {
-                                ref Bgra32 pixel = ref row[x];
-                                pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
-                            }
-                        }
-                    });
-                }
-                else
-                {
-                    MakeAlphaOnlyTextureVisible(image);
-                }
-
-                var postedPreviewImage = activePreviewImage;
-                var postedPreviewTexture = previewData.PreviewTexture!;
-                previewImage = null;
-                Dispatcher.UIThread.Post(() =>
-                {
-                    try
-                    {
-                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                        {
-                            return;
-                        }
-
-                        currentPreviewTexture = postedPreviewTexture;
-                        if (GLPreviewControl != null)
-                        {
-                            GLPreviewControl.SetMaterialTexture(postedPreviewImage.Image);
-                            GLPreviewControl.IsVisible = true;
-                            HidePreviewGeometryControls();
-                            GLPreviewControl.Focus();
-                        }
-
-                        ImagePreviewBox.IsVisible = false;
-                        TextPreviewBox.IsVisible = false;
-                        PreviewLabel.IsVisible = false;
-
-                        if (displayInfo.IsChecked == true)
-                        {
-                            var previewInfoText = previewData.InfoText;
-                            if (materialPreviewWasDownscaled)
-                            {
-                                previewInfoText += $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}";
-                            }
-                            if (materialPreviewFromCache)
-                            {
-                                previewInfoText += "\nPreview texture loaded from cache";
-                            }
-
-                            PreviewInfoOverlay.Text = previewInfoText;
-                            PreviewInfoBorder.IsVisible = true;
-                        }
-                        else
-                        {
-                            PreviewInfoBorder.IsVisible = false;
-                        }
-
-                        StatusStripUpdate($"Material preview loaded: {postedPreviewTexture.m_Name}");
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.Log(LoggerEvent.Error, $"Material preview UI failed for {m_Material.m_Name}: {ex}");
-                        if (currentId == texturePreviewIdCounter)
-                        {
-                            TextPreviewBox.Text = previewData.InfoText + "\n[Error showing preview texture: " + ex.Message + "]";
-                            TextPreviewBox.IsVisible = true;
-                            ImagePreviewBox.IsVisible = false;
-                            PreviewInfoBorder.IsVisible = false;
-                            if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                            StatusStripUpdate("Material preview UI error.");
-                        }
-                    }
-                    finally
-                    {
-                        postedPreviewImage.Dispose();
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (currentId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
-                    {
-                        TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\n[Error loading material preview: {ex.Message}]";
-                        TextPreviewBox.IsVisible = true;
-                        ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
-                        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-                        StatusStripUpdate("Material preview error.");
-                    }
-                });
-            }
-            finally
-            {
-                previewImage?.Dispose();
-            }
-        });
-    }
-
-    private (string InfoText, Texture2D? PreviewTexture) BuildMaterialPreviewData(Material m_Material)
-    {
-        var displayMaterial = ResolveMaterialForPreview(m_Material) ?? m_Material;
-        var sb = new StringBuilder();
-        sb.AppendLine($"Material: {m_Material.m_Name}");
-        if (!ReferenceEquals(displayMaterial, m_Material))
-        {
-            sb.AppendLine($"Parent material: {displayMaterial.m_Name}");
-        }
-
-        AppendMaterialShaderReference(sb, displayMaterial);
-        sb.AppendLine();
-        sb.AppendLine("Texture slots:");
-
-        Texture2D? previewTexture = null;
-        var texEnvs = displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>();
-        if (texEnvs.Length == 0)
-        {
-            sb.AppendLine("  <none>");
-        }
-        foreach (var texEnv in texEnvs)
-        {
-            sb.Append($"  {texEnv.Key}: ");
-            var texEnvValue = texEnv.Value;
-            var textureRef = texEnvValue?.m_Texture;
-            
-            var texture = texEnvValue != null ? GetMaterialTextureSlot(displayMaterial, texEnv.Key) : null;
-
-            if (texture != null && textureRef != null)
-            {
-                sb.AppendLine($"{texture.m_Name} ({texture.m_Width}x{texture.m_Height}, {texture.m_TextureFormat})");
-                sb.AppendLine($"    FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID}");
-                sb.AppendLine($"    Scale: {texEnvValue?.m_Scale.X}, {texEnvValue?.m_Scale.Y}");
-                sb.AppendLine($"    Offset: {texEnvValue?.m_Offset.X}, {texEnvValue?.m_Offset.Y}");
-                if (previewTexture == null && IsPreferredMaterialPreviewSlot(texEnv.Key))
-                {
-                    previewTexture = texture;
-                }
-            }
-            else
-            {
-                sb.AppendLine(textureRef == null || textureRef.IsNull
-                    ? "null"
-                    : $"missing (FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID})");
-            }
-        }
-
-        AppendMaterialScalarProperties(sb, displayMaterial);
-
-        if (previewTexture == null)
-        {
-            previewTexture = FindTextureForMaterial(displayMaterial);
-        }
-
-        return (sb.ToString(), previewTexture);
-    }
-
-    private void AppendMaterialShaderReference(StringBuilder sb, Material material)
-    {
-        var shaderRef = material.m_Shader;
-        if (shaderRef == null || shaderRef.IsNull)
-        {
-            sb.AppendLine("Shader: <none>");
-            return;
-        }
-
-        var shaderName = TryGetLoadedShaderName(shaderRef);
-        var sourceName = string.Empty;
-        if (shaderRef.TryGetAssetsFile(out var shaderFile))
-        {
-            sourceName = shaderFile.fileName;
-            if (string.IsNullOrWhiteSpace(shaderName))
-            {
-                var shaderHandle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(shaderFile, shaderRef.m_PathID));
-                shaderName = shaderHandle?.Name;
-            }
-        }
-
-        if (string.IsNullOrWhiteSpace(shaderName))
-        {
-            shaderName = "unloaded or unsupported shader";
-        }
-
-        sb.AppendLine($"Shader: {shaderName} (FileID: {shaderRef.m_FileID}, PathID: {shaderRef.m_PathID})");
-        if (!string.IsNullOrWhiteSpace(sourceName))
-        {
-            sb.AppendLine($"Shader source: {sourceName}");
-        }
-    }
-
-    private static string? TryGetLoadedShaderName(PPtr<Shader> shaderRef)
-    {
-        if (shaderRef == null || !shaderRef.TryGetAssetsFile(out var sourceFile) || sourceFile?.ObjectsDic == null)
-        {
-            return null;
-        }
-
-        lock (sourceFile)
-        {
-            if (sourceFile.ObjectsDic.TryGetValue(shaderRef.m_PathID, out var loadedObject) && loadedObject is Shader shader)
-            {
-                return shader.m_ParsedForm?.m_Name ?? shader.m_Name;
-            }
-        }
-
-        return null;
-    }
-
-    private static void AppendMaterialScalarProperties(StringBuilder sb, Material material)
-    {
-        var properties = material.m_SavedProperties;
-        if (properties == null)
-        {
-            return;
-        }
-
-        AppendMaterialIntProperties(sb, properties.m_Ints);
-        AppendMaterialFloatProperties(sb, properties.m_Floats);
-        AppendMaterialColorProperties(sb, properties.m_Colors);
-    }
-
-    private static void AppendMaterialIntProperties(StringBuilder sb, KeyValuePair<string, int>[]? values)
-    {
-        sb.AppendLine();
-        sb.AppendLine("Int properties:");
-        if (values == null || values.Length == 0)
-        {
-            sb.AppendLine("  <none>");
-            return;
-        }
-
-        foreach (var value in values)
-        {
-            sb.AppendLine($"  {value.Key}: {value.Value.ToString(CultureInfo.InvariantCulture)}");
-        }
-    }
-
-    private static void AppendMaterialFloatProperties(StringBuilder sb, KeyValuePair<string, float>[]? values)
-    {
-        sb.AppendLine();
-        sb.AppendLine("Float properties:");
-        if (values == null || values.Length == 0)
-        {
-            sb.AppendLine("  <none>");
-            return;
-        }
-
-        foreach (var value in values)
-        {
-            sb.AppendLine($"  {value.Key}: {value.Value.ToString("0.######", CultureInfo.InvariantCulture)}");
-        }
-    }
-
-    private static void AppendMaterialColorProperties(StringBuilder sb, KeyValuePair<string, Color>[]? values)
-    {
-        sb.AppendLine();
-        sb.AppendLine("Color properties:");
-        if (values == null || values.Length == 0)
-        {
-            sb.AppendLine("  <none>");
-            return;
-        }
-
-        foreach (var value in values)
-        {
-            var color = value.Value;
-            sb.AppendLine(
-                $"  {value.Key}: R={color.R.ToString("0.######", CultureInfo.InvariantCulture)}, " +
-                $"G={color.G.ToString("0.######", CultureInfo.InvariantCulture)}, " +
-                $"B={color.B.ToString("0.######", CultureInfo.InvariantCulture)}, " +
-                $"A={color.A.ToString("0.######", CultureInfo.InvariantCulture)}");
-        }
-    }
-
     private static void MakeAlphaOnlyTextureVisible(Image<Bgra32> image)
     {
         long rgbSignal = 0;
@@ -6461,24 +6150,7 @@ public partial class MainWindow : Window
         return ResolveMaterialForPreviewUncachedBackground(material);
     }
 
-    private static bool IsPreferredMaterialPreviewSlot(string propertyName)
-    {
-        return PreferredMaterialTextureSlots.Contains(propertyName, StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static readonly string[] PreferredMaterialTextureSlots =
-    {
-        "_BaseMap",
-        "_MainTex",
-        "texture",
-        "Texture",
-        "_Texture",
-        "_BaseColorMap",
-        "_BaseColorTexture",
-        "_Diffuse",
-        "_AlbedoMap",
-        "_Albedo"
-    };
+    private static readonly string[] PreferredMaterialTextureSlots = MaterialPreviewBuilder.PreferredTextureSlots;
 
     private Material? FindMaterialForMesh(Mesh mesh)
     {
