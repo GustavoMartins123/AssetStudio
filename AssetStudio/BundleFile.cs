@@ -644,41 +644,75 @@ namespace AssetStudio
 
         private void ReadBlocks(EndianBinaryReader reader, Stream blocksStream)
         {
-            foreach (var blockInfo in m_BlocksInfo)
+            byte[]? compressedBuffer = null;
+            byte[]? uncompressedBuffer = null;
+            try
             {
-                var compressionType = (CompressionType)(blockInfo.flags & StorageBlockFlags.CompressionTypeMask);
-                switch (compressionType)
+                foreach (var blockInfo in m_BlocksInfo)
                 {
-                    case CompressionType.None:
-                        {
-                            reader.BaseStream.CopyTo(blocksStream, blockInfo.compressedSize);
-                            break;
-                        }
-                    case CompressionType.Lzma:
-                        {
-                            SevenZipHelper.StreamDecompress(reader.BaseStream, blocksStream, blockInfo.compressedSize, blockInfo.uncompressedSize);
-                            break;
-                        }
-                    case CompressionType.Lz4:
-                    case CompressionType.Lz4HC:
-                        {
-                            var compressedSize = (int)blockInfo.compressedSize;
-                            var compressedBytes = BigArrayPool<byte>.Shared.Rent(compressedSize);
-                            reader.Read(compressedBytes, 0, compressedSize);
-                            var uncompressedSize = (int)blockInfo.uncompressedSize;
-                            var uncompressedBytes = BigArrayPool<byte>.Shared.Rent(uncompressedSize);
-                            var numWrite = LZ4Codec.Decode(compressedBytes, 0, compressedSize, uncompressedBytes, 0, uncompressedSize);
-                            if (numWrite != uncompressedSize)
+                    var compressionType = (CompressionType)(blockInfo.flags & StorageBlockFlags.CompressionTypeMask);
+                    switch (compressionType)
+                    {
+                        case CompressionType.None:
                             {
-                                throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                reader.BaseStream.CopyTo(blocksStream, blockInfo.compressedSize);
+                                break;
                             }
-                            blocksStream.Write(uncompressedBytes, 0, uncompressedSize);
-                            BigArrayPool<byte>.Shared.Return(compressedBytes);
-                            BigArrayPool<byte>.Shared.Return(uncompressedBytes);
-                            break;
-                        }
-                    default:
-                        throw new IOException($"Unsupported compression type {compressionType}");
+                        case CompressionType.Lzma:
+                            {
+                                SevenZipHelper.StreamDecompress(reader.BaseStream, blocksStream, blockInfo.compressedSize, blockInfo.uncompressedSize);
+                                break;
+                            }
+                        case CompressionType.Lz4:
+                        case CompressionType.Lz4HC:
+                            {
+                                var compressedSize = (int)blockInfo.compressedSize;
+                                if (compressedBuffer == null || compressedBuffer.Length < compressedSize)
+                                {
+                                    if (compressedBuffer != null)
+                                    {
+                                        var oldBuffer = compressedBuffer;
+                                        compressedBuffer = null;
+                                        BigArrayPool<byte>.Shared.Return(oldBuffer);
+                                    }
+                                    compressedBuffer = BigArrayPool<byte>.Shared.Rent(compressedSize);
+                                }
+                                reader.Read(compressedBuffer, 0, compressedSize);
+
+                                var uncompressedSize = (int)blockInfo.uncompressedSize;
+                                if (uncompressedBuffer == null || uncompressedBuffer.Length < uncompressedSize)
+                                {
+                                    if (uncompressedBuffer != null)
+                                    {
+                                        var oldBuffer = uncompressedBuffer;
+                                        uncompressedBuffer = null;
+                                        BigArrayPool<byte>.Shared.Return(oldBuffer);
+                                    }
+                                    uncompressedBuffer = BigArrayPool<byte>.Shared.Rent(uncompressedSize);
+                                }
+
+                                var numWrite = LZ4Codec.Decode(compressedBuffer, 0, compressedSize, uncompressedBuffer, 0, uncompressedSize);
+                                if (numWrite != uncompressedSize)
+                                {
+                                    throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                }
+                                blocksStream.Write(uncompressedBuffer, 0, uncompressedSize);
+                                break;
+                            }
+                        default:
+                            throw new IOException($"Unsupported compression type {compressionType}");
+                    }
+                }
+            }
+            finally
+            {
+                if (compressedBuffer != null)
+                {
+                    BigArrayPool<byte>.Shared.Return(compressedBuffer);
+                }
+                if (uncompressedBuffer != null)
+                {
+                    BigArrayPool<byte>.Shared.Return(uncompressedBuffer);
                 }
             }
             blocksStream.Position = 0;

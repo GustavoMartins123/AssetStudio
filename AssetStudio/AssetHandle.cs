@@ -1,5 +1,6 @@
 #nullable enable
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -8,6 +9,8 @@ namespace AssetStudio
 {
     public class AssetHandle
     {
+        private static readonly ConcurrentDictionary<string, string> SourceHashCache = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+
         public string UniqueID { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
         public ClassIDType Type { get; set; }
@@ -57,6 +60,15 @@ namespace AssetStudio
                 ? serializedFileName ?? string.Empty
                 : $"{normalizedPath}\u001f{serializedFileName ?? string.Empty}";
 
+            return SourceHashCache.GetOrAdd(key, ComputeSourceHash);
+        }
+
+        private static string ComputeSourceHash(string key)
+        {
+#if NET5_0_OR_GREATER
+            var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(key));
+            return Convert.ToHexString(bytes).Substring(0, 16).ToLowerInvariant();
+#else
             using (var sha256 = SHA256.Create())
             {
                 var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(key));
@@ -67,6 +79,7 @@ namespace AssetStudio
                 }
                 return sb.ToString(0, 16);
             }
+#endif
         }
 
         private static string NormalizeSourcePath(string? path)
@@ -84,7 +97,7 @@ namespace AssetStudio
             }
             catch
             {
-                return path.Replace('\\', '/').Trim().ToUpperInvariant();
+                return path!.Replace('\\', '/').Trim().ToUpperInvariant();
             }
         }
 

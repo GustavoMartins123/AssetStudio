@@ -76,6 +76,30 @@ namespace AssetStudio.Avalonia
             return ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6;
         }
 
+        private static void TryCheckpointWal(SqliteConnection conn, string context)
+        {
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+                using var reader = cmd.ExecuteReader();
+                if (reader.Read())
+                {
+                    var busy = reader.FieldCount > 0 && !reader.IsDBNull(0) ? reader.GetInt32(0) : 0;
+                    var logFrames = reader.FieldCount > 1 && !reader.IsDBNull(1) ? reader.GetInt32(1) : 0;
+                    var checkpointedFrames = reader.FieldCount > 2 && !reader.IsDBNull(2) ? reader.GetInt32(2) : 0;
+                    if (busy != 0)
+                    {
+                        Logger.Warning($"SQLite WAL checkpoint for {context} could not finish now: {checkpointedFrames:N0}/{logFrames:N0} frames checkpointed, busy={busy}.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"SQLite WAL checkpoint for {context} failed: {ex.Message}");
+            }
+        }
+
         private static bool ShouldRebuildSchema(SqliteConnection conn)
         {
             using (var cmd = conn.CreateCommand())
@@ -380,7 +404,7 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        public void SaveIndexCache(
+        public bool SaveIndexCache(
             string folderPath,
             string signature,
             ProjectScanResult scanResult,
@@ -427,14 +451,17 @@ namespace AssetStudio.Avalonia
                     ReportProgress(stage);
                 }
 
-                ReportProgress("Preparing SQLite index cache", force: true);
+                ReportProgress("Waiting for SQLite writer", force: true);
                 lock (WriteGate)
                 {
+                    ReportProgress("Opening SQLite connection", force: true);
                     using (var conn = CreateConnection())
                     {
                         using (var transaction = conn.BeginTransaction())
                         {
+                            ReportProgress("Preparing SQLite project row", force: true);
                             var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
+                            ReportProgress("Clearing previous index rows", force: true);
                             ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
 
                             // Insert handles in batch using parameterized query
@@ -479,10 +506,14 @@ namespace AssetStudio.Avalonia
 
                             InsertSourceFilesAndAssets(conn, transaction, projectId, handleList, AdvanceProgress);
 
+                            ReportProgress("Committing SQLite transaction", force: true);
                             transaction.Commit();
+                            ReportProgress("Checkpointing SQLite WAL", force: true);
+                            TryCheckpointWal(conn, "index cache");
                             processedWork = totalWork;
                             ReportProgress("SQLite index cache saved", force: true);
                             Logger.Info($"Saved index cache in SQLite for: {folderPath}");
+                            return true;
                         }
                     }
                 }
@@ -490,6 +521,7 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to save SQLite index cache: {ex.Message}");
+                return false;
             }
         }
 
@@ -695,7 +727,12 @@ namespace AssetStudio.Avalonia
             return $"{serializedFileName}\u001f{originalPath}";
         }
 
-        internal bool SaveSemanticRelations(string folderPath, string signature, SemanticAssetRelations relations, bool replaceExisting = false)
+        internal bool SaveSemanticRelations(
+            string folderPath,
+            string signature,
+            SemanticAssetRelations relations,
+            bool replaceExisting = false,
+            Action<int, int, string>? progress = null)
         {
             if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0))
             {
@@ -705,10 +742,54 @@ namespace AssetStudio.Avalonia
             EnsureInitialized();
             try
             {
+                var totalWork = Math.Max(1,
+                    relations.SourceFiles.Count
+                    + relations.AssetEdges.Count
+                    + relations.MeshRenderers.Count
+                    + relations.MeshMaterials.Count
+                    + relations.MaterialTextures.Count
+                    + (replaceExisting ? 4 : 0)
+                    + 3);
+                var processedWork = 0;
+                var lastReportedWork = -1;
+                var lastReportedTicks = 0L;
+                var minWorkDelta = Math.Max(1, totalWork / 100000);
+
+                void ReportProgress(string stage, bool force = false)
+                {
+                    if (progress == null)
+                    {
+                        return;
+                    }
+
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var elapsedMs = lastReportedTicks == 0
+                        ? double.MaxValue
+                        : (nowTicks - lastReportedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+                    if (!force && processedWork < totalWork && processedWork - lastReportedWork < minWorkDelta && elapsedMs < 100)
+                    {
+                        return;
+                    }
+
+                    lastReportedWork = processedWork;
+                    lastReportedTicks = nowTicks;
+                    progress(Math.Clamp(processedWork, 0, totalWork), totalWork, stage);
+                }
+
+                void AdvanceProgress(string stage)
+                {
+                    processedWork++;
+                    ReportProgress(stage);
+                }
+
+                ReportProgress("Waiting for SQLite writer", force: true);
                 lock (WriteGate)
                 {
+                    ReportProgress("Opening SQLite connection", force: true);
                     using var conn = CreateConnection();
                     using var transaction = conn.BeginTransaction();
+                    ReportProgress("Resolving project row", force: true);
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
                     if (projectId == null)
                     {
@@ -717,16 +798,21 @@ namespace AssetStudio.Avalonia
 
                     if (replaceExisting)
                     {
-                        ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
+                        ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value, AdvanceProgress);
                     }
 
-                    InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles);
-                    InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges);
-                    InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers);
-                    InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials);
-                    InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures);
+                    InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles, AdvanceProgress);
+                    InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges, AdvanceProgress);
+                    InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers, AdvanceProgress);
+                    InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials, AdvanceProgress);
+                    InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures, AdvanceProgress);
 
+                    ReportProgress("Committing semantic relations", force: true);
                     transaction.Commit();
+                    ReportProgress("Checkpointing SQLite WAL", force: true);
+                    TryCheckpointWal(conn, "semantic relations");
+                    processedWork = totalWork;
+                    ReportProgress("Semantic relations saved", force: true);
                     return true;
                 }
             }
@@ -802,7 +888,11 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static void ClearSemanticRelationTablesForProject(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        private static void ClearSemanticRelationTablesForProject(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            Action<string>? advanceProgress = null)
         {
             var tables = new[]
             {
@@ -819,6 +909,7 @@ namespace AssetStudio.Avalonia
                 cmd.CommandText = $"DELETE FROM {table} WHERE ProjectId = @projectId";
                 cmd.Parameters.AddWithValue("@projectId", projectId);
                 cmd.ExecuteNonQuery();
+                advanceProgress?.Invoke($"Clearing old {table} rows");
             }
         }
 
@@ -1138,7 +1229,12 @@ namespace AssetStudio.Avalonia
                 : null;
         }
 
-        private static void InsertSemanticSourceFiles(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticSourceFileEntry> sourceFiles)
+        private static void InsertSemanticSourceFiles(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<SemanticSourceFileEntry> sourceFiles,
+            Action<string>? advanceProgress = null)
         {
             if (sourceFiles.Count == 0)
             {
@@ -1163,6 +1259,7 @@ namespace AssetStudio.Avalonia
             var pObjectCount = cmd.Parameters.Add("@objectCount", SqliteType.Integer);
 
             pProjectId.Value = projectId;
+            var rowIndex = 0;
             foreach (var sourceFile in sourceFiles)
             {
                 pSerializedFileName.Value = sourceFile.SerializedFileName;
@@ -1170,10 +1267,17 @@ namespace AssetStudio.Avalonia
                 pUnityVersion.Value = sourceFile.UnityVersion;
                 pObjectCount.Value = sourceFile.ObjectCount;
                 cmd.ExecuteNonQuery();
+                rowIndex++;
+                advanceProgress?.Invoke($"Saving semantic source files: {rowIndex:N0}/{sourceFiles.Count:N0}");
             }
         }
 
-        private static void InsertAssetEdges(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticAssetEdgeRelation> edges)
+        private static void InsertAssetEdges(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<SemanticAssetEdgeRelation> edges,
+            Action<string>? advanceProgress = null)
         {
             if (edges.Count == 0)
             {
@@ -1208,6 +1312,7 @@ namespace AssetStudio.Avalonia
             var pIsResolved = cmd.Parameters.Add("@isResolved", SqliteType.Integer);
 
             pProjectId.Value = projectId;
+            var rowIndex = 0;
             foreach (var edge in edges)
             {
                 pSourceAssetId.Value = edge.SourceAssetId;
@@ -1226,6 +1331,8 @@ namespace AssetStudio.Avalonia
                 pTargetPathId.Value = edge.TargetPathId;
                 pIsResolved.Value = edge.IsResolved ? 1 : 0;
                 cmd.ExecuteNonQuery();
+                rowIndex++;
+                advanceProgress?.Invoke($"Saving asset edges: {rowIndex:N0}/{edges.Count:N0}");
             }
         }
 
@@ -1253,7 +1360,12 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
-        private static void InsertMeshRenderers(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticMeshRendererRelation> renderers)
+        private static void InsertMeshRenderers(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<SemanticMeshRendererRelation> renderers,
+            Action<string>? advanceProgress = null)
         {
             if (renderers.Count == 0)
             {
@@ -1282,6 +1394,7 @@ namespace AssetStudio.Avalonia
             var pDescription = cmd.Parameters.Add("@description", SqliteType.Text);
 
             pProjectId.Value = projectId;
+            var rowIndex = 0;
             foreach (var renderer in renderers)
             {
                 pMeshAssetId.Value = renderer.MeshAssetId;
@@ -1291,10 +1404,17 @@ namespace AssetStudio.Avalonia
                 pGameObjectName.Value = renderer.GameObjectName;
                 pDescription.Value = renderer.Description;
                 cmd.ExecuteNonQuery();
+                rowIndex++;
+                advanceProgress?.Invoke($"Saving mesh renderers: {rowIndex:N0}/{renderers.Count:N0}");
             }
         }
 
-        private static void InsertMeshMaterials(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticMeshMaterialRelation> materials)
+        private static void InsertMeshMaterials(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<SemanticMeshMaterialRelation> materials,
+            Action<string>? advanceProgress = null)
         {
             if (materials.Count == 0)
             {
@@ -1323,6 +1443,7 @@ namespace AssetStudio.Avalonia
             var pMaterialScore = cmd.Parameters.Add("@materialScore", SqliteType.Integer);
 
             pProjectId.Value = projectId;
+            var rowIndex = 0;
             foreach (var material in materials)
             {
                 pMeshAssetId.Value = material.MeshAssetId;
@@ -1333,10 +1454,17 @@ namespace AssetStudio.Avalonia
                 pMaterialSlotIndex.Value = material.MaterialSlotIndex;
                 pMaterialScore.Value = material.MaterialScore;
                 cmd.ExecuteNonQuery();
+                rowIndex++;
+                advanceProgress?.Invoke($"Saving mesh materials: {rowIndex:N0}/{materials.Count:N0}");
             }
         }
 
-        private static void InsertMaterialTextures(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<SemanticMaterialTextureRelation> textures)
+        private static void InsertMaterialTextures(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<SemanticMaterialTextureRelation> textures,
+            Action<string>? advanceProgress = null)
         {
             if (textures.Count == 0)
             {
@@ -1368,6 +1496,7 @@ namespace AssetStudio.Avalonia
             var pIsMainTexture = cmd.Parameters.Add("@isMainTexture", SqliteType.Integer);
 
             pProjectId.Value = projectId;
+            var rowIndex = 0;
             foreach (var texture in textures)
             {
                 pMaterialAssetId.Value = texture.MaterialAssetId;
@@ -1380,6 +1509,8 @@ namespace AssetStudio.Avalonia
                 pIsResolved.Value = texture.IsResolved ? 1 : 0;
                 pIsMainTexture.Value = texture.IsMainTexture ? 1 : 0;
                 cmd.ExecuteNonQuery();
+                rowIndex++;
+                advanceProgress?.Invoke($"Saving material textures: {rowIndex:N0}/{textures.Count:N0}");
             }
         }
 

@@ -1,5 +1,7 @@
 using System;
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Texture2DDecoder;
 
 namespace AssetStudio
@@ -284,11 +286,11 @@ namespace AssetStudio
         {
             if (platform == BuildTarget.XBOX360)
             {
-                for (var i = 0; i < reader.Size / 2; i++)
+                var byteCount = Math.Min(reader.Size, image_data.Length) & ~1;
+                var words = MemoryMarshal.Cast<byte, ushort>(image_data.AsSpan(0, byteCount));
+                for (var i = 0; i < words.Length; i++)
                 {
-                    var b = image_data[i * 2];
-                    image_data[i * 2] = image_data[i * 2 + 1];
-                    image_data[i * 2 + 1] = b;
+                    words[i] = BinaryPrimitives.ReverseEndianness(words[i]);
                 }
             }
         }

@@ -81,7 +81,7 @@ namespace AssetStudio
 
         private T ReadWithFreshReader<T>(System.Func<ObjectReader, T> read)
         {
-            var objectInfo = assetsFile.m_Objects.FirstOrDefault(x => x.m_PathID == m_PathID);
+            assetsFile.ObjectInfoDic.TryGetValue(m_PathID, out var objectInfo);
             if (objectInfo == null)
             {
                 objectInfo = new ObjectInfo

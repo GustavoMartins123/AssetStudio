@@ -563,12 +563,22 @@ public partial class ProjectManagerWindow : Window
 
         private static string FormatIndexingCounts(ProjectIndexingState state)
         {
+            var unitLabel = IsStageProgressStatus(state.Status) ? "steps" : "files";
             if (state.TotalFiles <= 0)
             {
-                return $"{state.ProcessedFiles:N0} files";
+                return $"{state.ProcessedFiles:N0} {unitLabel}";
             }
 
-            return $"{state.ProcessedFiles:N0}/{state.TotalFiles:N0} files, {state.PendingFiles:N0} pending";
+            return $"{state.ProcessedFiles:N0}/{state.TotalFiles:N0} {unitLabel}, {state.PendingFiles:N0} pending";
+        }
+
+        private static bool IsStageProgressStatus(string? status)
+        {
+            return string.Equals(status, "saving_index", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "saving_connections", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string FormatIndexingStatus(string status)
@@ -579,6 +589,8 @@ public partial class ProjectManagerWindow : Window
                 "paused" => "Paused",
                 "cancelling" => "Stopping",
                 "cancelled" => "Cancelled",
+                "saving_index" => "Saving index cache",
+                "saving_connections" => "Saving connections",
                 "connecting" => "Building connections",
                 "connections_completed" => "Connections complete",
                 "connections_failed" => "Connections failed",

@@ -10,6 +10,7 @@ namespace AssetStudio
         private byte[] hash2;
         private uint[] state = new uint[16];
         private uint[] keyBuffer = new uint[128];
+        private readonly uint[] mix = new uint[16];
 
         public Block512KeyGenerator(string token)
         {
@@ -61,7 +62,6 @@ namespace AssetStudio
                     keyBuffer[offset + i] = keyBuffer[offset + i - 16] ^ state[i];
             }
 
-            uint[] mix = new uint[16];
             Array.Copy(keyBuffer, offset, mix, 0, 16);
 
             for (int i = 0; i < rounds; i += 2)
@@ -89,8 +89,17 @@ namespace AssetStudio
             }
         }
 
-        public byte[] GetKey(uint block)
+        public void FillKey(uint block, byte[] destination)
         {
+            if (destination == null)
+            {
+                throw new ArgumentNullException(nameof(destination));
+            }
+            if (destination.Length < 512)
+            {
+                throw new ArgumentException("The destination buffer must be at least 512 bytes.", nameof(destination));
+            }
+
             int h2_idx_1 = (int)((block % 13) | 0x30);
             uint hashPart1 = BitConverter.ToUInt32(hash2, h2_idx_1);
 
@@ -141,8 +150,13 @@ namespace AssetStudio
             state[12]++;
             GenerateBlock(4, 0x70);
 
+            Buffer.BlockCopy(keyBuffer, 0, destination, 0, 512);
+        }
+
+        public byte[] GetKey(uint block)
+        {
             byte[] result = new byte[512];
-            Buffer.BlockCopy(keyBuffer, 0, result, 0, 512);
+            FillKey(block, result);
             return result;
         }
     }

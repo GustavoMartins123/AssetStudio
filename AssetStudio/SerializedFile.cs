@@ -18,6 +18,7 @@ namespace AssetStudio
         public BuildType buildType;
         public List<Object> Objects;
         public Dictionary<long, Object> ObjectsDic;
+        public Dictionary<long, ObjectInfo> ObjectInfoDic;
 
         public SerializedFileHeader header;
         private byte m_FileEndianess;
@@ -97,6 +98,14 @@ namespace AssetStudio
             {
                 m_Types.Add(ReadSerializedType(false));
             }
+            var serializedTypeByClassId = new Dictionary<int, SerializedType>(typeCount);
+            foreach (var serializedType in m_Types)
+            {
+                if (!serializedTypeByClassId.ContainsKey(serializedType.classID))
+                {
+                    serializedTypeByClassId.Add(serializedType.classID, serializedType);
+                }
+            }
 
             if (header.m_Version >= SerializedFileFormatVersion.Unknown_7 && header.m_Version < SerializedFileFormatVersion.Unknown_14)
             {
@@ -108,6 +117,7 @@ namespace AssetStudio
             m_Objects = new List<ObjectInfo>(objectCount);
             Objects = new List<Object>(objectCount);
             ObjectsDic = new Dictionary<long, Object>(objectCount);
+            ObjectInfoDic = new Dictionary<long, ObjectInfo>(objectCount);
             for (int i = 0; i < objectCount; i++)
             {
                 var objectInfo = new ObjectInfo();
@@ -136,7 +146,7 @@ namespace AssetStudio
                 if (header.m_Version < SerializedFileFormatVersion.RefactoredClassId)
                 {
                     objectInfo.classID = reader.ReadUInt16();
-                    objectInfo.serializedType = m_Types.Find(x => x.classID == objectInfo.typeID);
+                    serializedTypeByClassId.TryGetValue(objectInfo.typeID, out objectInfo.serializedType);
                 }
                 else
                 {
@@ -159,6 +169,7 @@ namespace AssetStudio
                     objectInfo.stripped = reader.ReadByte();
                 }
                 m_Objects.Add(objectInfo);
+                ObjectInfoDic[objectInfo.m_PathID] = objectInfo;
             }
 
             if (header.m_Version >= SerializedFileFormatVersion.HasScriptTypeIndex)

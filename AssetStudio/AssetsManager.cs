@@ -1171,13 +1171,14 @@ namespace AssetStudio
 
                     using (var localReader = assetsFile.reader.Clone())
                     {
+                        assetsFile.ObjectInfoDic.TryGetValue(handle.PathID, out var existingObjectInfo);
                         var objectInfo = new ObjectInfo
                         {
                             m_PathID = handle.PathID,
                             byteStart = handle.ByteStart,
                             byteSize = (uint)handle.ByteSize,
                             classID = (int)handle.Type,
-                            serializedType = assetsFile.m_Objects.FirstOrDefault(x => x.m_PathID == handle.PathID)?.serializedType
+                            serializedType = existingObjectInfo?.serializedType
                         };
 
                         var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
@@ -1296,11 +1297,12 @@ namespace AssetStudio
                             }
                             else
                             {
-                                var localObjects = new List<Object>();
+                                var localObjects = new Object[assetsFile.m_Objects.Count];
                                 using var localReader = assetsFile.reader.Clone();
 
-                                foreach (var objectInfo in assetsFile.m_Objects)
+                                for (int objectIndex = 0; objectIndex < assetsFile.m_Objects.Count; objectIndex++)
                                 {
+                                    var objectInfo = assetsFile.m_Objects[objectIndex];
                                     if ((System.Threading.Volatile.Read(ref progressValue) & 0x3f) == 0)
                                     {
                                         await YieldForUserInteractionIfNeededAsync(highPriority);
@@ -1348,7 +1350,7 @@ namespace AssetStudio
                                         {
                                             var obj = CreateObjectFromReader(objectReader);
                                             handle.RealObject = obj;
-                                            localObjects.Add(obj);
+                                            localObjects[objectIndex] = obj;
                                             if (obj is AssetBundle bundle)
                                                 name = bundle.m_Name;
                                             else if (obj is ResourceManager rm)
@@ -1371,15 +1373,12 @@ namespace AssetStudio
                                     Progress.Report(currentProgress, progressCount);
                                 }
 
-                                var pathIdToIndex = new Dictionary<long, int>();
-                                for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                                foreach (var obj in localObjects)
                                 {
-                                    pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
-                                }
-                                var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
-                                foreach (var obj in sortedObjects)
-                                {
-                                    assetsFile.AddObject(obj);
+                                    if (obj != null)
+                                    {
+                                        assetsFile.AddObject(obj);
+                                    }
                                 }
                             }
                             }
@@ -1400,19 +1399,21 @@ namespace AssetStudio
 
             foreach (var assetsFile in ClaimUnprocessedFiles(filesForRead))
             {
-                var localObjects = new System.Collections.Concurrent.ConcurrentBag<Object>();
+                var localObjects = new Object[assetsFile.m_Objects.Count];
 
                 var parallelOptions = new System.Threading.Tasks.ParallelOptions
                 {
                     MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
                 };
 
-                System.Threading.Tasks.Parallel.ForEach(
-                    assetsFile.m_Objects,
+                System.Threading.Tasks.Parallel.For(
+                    0,
+                    assetsFile.m_Objects.Count,
                     parallelOptions,
                     () => assetsFile.reader.Clone(),
-                    (objectInfo, state, localReader) =>
+                    (objectIndex, state, localReader) =>
                     {
+                        var objectInfo = assetsFile.m_Objects[objectIndex];
                         if (ShouldStopLoading)
                         {
                             state.Stop();
@@ -1434,7 +1435,7 @@ namespace AssetStudio
                         try
                         {
                             Object obj = CreateObjectFromReader(objectReader);
-                            localObjects.Add(obj);
+                            localObjects[objectIndex] = obj;
                         }
                         catch (Exception e)
                         {
@@ -1493,15 +1494,12 @@ namespace AssetStudio
                     localReader => localReader.Dispose()
                 );
 
-                var pathIdToIndex = new Dictionary<long, int>();
-                for (int idx = 0; idx < assetsFile.m_Objects.Count; idx++)
+                foreach (var obj in localObjects)
                 {
-                    pathIdToIndex[assetsFile.m_Objects[idx].m_PathID] = idx;
-                }
-                var sortedObjects = localObjects.OrderBy(obj => pathIdToIndex[obj.m_PathID]).ToList();
-                foreach (var obj in sortedObjects)
-                {
-                    assetsFile.AddObject(obj);
+                    if (obj != null)
+                    {
+                        assetsFile.AddObject(obj);
+                    }
                 }
             }
         }

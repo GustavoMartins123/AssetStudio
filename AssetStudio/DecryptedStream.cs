@@ -13,7 +13,7 @@ namespace AssetStudio
         private long position;
 
         private uint cachedBlockIndex = uint.MaxValue;
-        private byte[]? cachedKeystream;
+        private readonly byte[] cachedKeystream = new byte[512];
 
         public DecryptedStream(Stream baseStream, string token)
         {
@@ -68,12 +68,13 @@ namespace AssetStudio
                 if (cachedBlockIndex != blockIndex)
                 {
                     cachedBlockIndex = blockIndex;
-                    cachedKeystream = keyGen.GetKey(blockIndex);
+                    keyGen.FillKey(blockIndex, cachedKeystream);
                 }
 
+                var bufferIndex = offset + (int)(curPos - position);
                 for (int i = 0; i < bytesToDecrypt; i++)
                 {
-                    buffer[offset + (int)(curPos - position) + i] ^= cachedKeystream![offsetInBlock + i];
+                    buffer[bufferIndex + i] ^= cachedKeystream[offsetInBlock + i];
                 }
 
                 curPos += bytesToDecrypt;

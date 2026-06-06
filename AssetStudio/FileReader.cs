@@ -1,5 +1,5 @@
 using System.IO;
-using System.Linq;
+using System.Text;
 
 namespace AssetStudio
 {
@@ -15,6 +15,7 @@ namespace AssetStudio
         private static readonly byte[] brotliMagic = { 0x62, 0x72, 0x6F, 0x74, 0x6C, 0x69 };
         private static readonly byte[] zipMagic = { 0x50, 0x4B, 0x03, 0x04 };
         private static readonly byte[] zipSpannedMagic = { 0x50, 0x4B, 0x07, 0x08 };
+        private const int FileTypeHeaderBytes = 64;
 
         public FileReader(string path) : this(path, File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { }
 
@@ -27,8 +28,12 @@ namespace AssetStudio
 
         private FileType CheckFileType()
         {
-            var signature = this.ReadStringToNull(20);
             Position = 0;
+            var headerLength = (int)System.Math.Min(FileTypeHeaderBytes, BaseStream.Length);
+            var header = ReadBytes(headerLength);
+            Position = 0;
+
+            var signature = ReadNullTerminatedAscii(header, 20);
             switch (signature)
             {
                 case "UnityWeb":
@@ -40,57 +45,46 @@ namespace AssetStudio
                     return FileType.WebFile;
                 default:
                     {
-                        byte[] magic = ReadBytes(2);
-                        Position = 0;
-                        if (gzipMagic.SequenceEqual(magic))
+                        if (StartsWith(header, gzipMagic))
                         {
                             return FileType.GZipFile;
                         }
-                        Position = 0x20;
-                        magic = ReadBytes(6);
-                        Position = 0;
-                        if (brotliMagic.SequenceEqual(magic))
+                        if (MatchesAt(header, 0x20, brotliMagic))
                         {
                             return FileType.BrotliFile;
                         }
-                        if (IsSerializedFile())
+                        if (IsSerializedFile(header))
                         {
                             return FileType.AssetsFile;
                         }
-                        magic = ReadBytes(4);
-                        Position = 0;
-                        if (zipMagic.SequenceEqual(magic) || zipSpannedMagic.SequenceEqual(magic))
+                        if (StartsWith(header, zipMagic) || StartsWith(header, zipSpannedMagic))
                             return FileType.ZipFile;
                         return FileType.ResourceFile;
                     }
             }
         }
 
-        private bool IsSerializedFile()
+        private bool IsSerializedFile(byte[] header)
         {
             var fileSize = BaseStream.Length;
-            if (fileSize < 20)
+            if (fileSize < 20 || header.Length < 20)
             {
                 return false;
             }
-            var m_MetadataSize = ReadUInt32();
-            long m_FileSize = ReadUInt32();
-            var m_Version = ReadUInt32();
-            long m_DataOffset = ReadUInt32();
-            var m_Endianess = ReadByte();
-            var m_Reserved = ReadBytes(3);
+            var m_MetadataSize = ReadUInt32BigEndian(header, 0);
+            long m_FileSize = ReadUInt32BigEndian(header, 4);
+            var m_Version = ReadUInt32BigEndian(header, 8);
+            long m_DataOffset = ReadUInt32BigEndian(header, 12);
             if (m_Version >= 22)
             {
-                if (fileSize < 48)
+                if (fileSize < 48 || header.Length < 40)
                 {
-                    Position = 0;
                     return false;
                 }
-                m_MetadataSize = ReadUInt32();
-                m_FileSize = ReadInt64();
-                m_DataOffset = ReadInt64();
+                m_MetadataSize = ReadUInt32BigEndian(header, 20);
+                m_FileSize = ReadInt64BigEndian(header, 24);
+                m_DataOffset = ReadInt64BigEndian(header, 32);
             }
-            Position = 0;
             if (m_FileSize != fileSize)
             {
                 return false;
@@ -100,6 +94,63 @@ namespace AssetStudio
                 return false;
             }
             return true;
+        }
+
+        private static string ReadNullTerminatedAscii(byte[] buffer, int maxLength)
+        {
+            var length = System.Math.Min(buffer.Length, maxLength);
+            for (int i = 0; i < length; i++)
+            {
+                if (buffer[i] == 0)
+                {
+                    length = i;
+                    break;
+                }
+            }
+            return Encoding.ASCII.GetString(buffer, 0, length);
+        }
+
+        private static bool StartsWith(byte[] buffer, byte[] value)
+        {
+            return MatchesAt(buffer, 0, value);
+        }
+
+        private static bool MatchesAt(byte[] buffer, int offset, byte[] value)
+        {
+            if (offset < 0 || buffer.Length - offset < value.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < value.Length; i++)
+            {
+                if (buffer[offset + i] != value[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static uint ReadUInt32BigEndian(byte[] buffer, int offset)
+        {
+            return ((uint)buffer[offset] << 24)
+                | ((uint)buffer[offset + 1] << 16)
+                | ((uint)buffer[offset + 2] << 8)
+                | buffer[offset + 3];
+        }
+
+        private static long ReadInt64BigEndian(byte[] buffer, int offset)
+        {
+            var value = ((ulong)buffer[offset] << 56)
+                | ((ulong)buffer[offset + 1] << 48)
+                | ((ulong)buffer[offset + 2] << 40)
+                | ((ulong)buffer[offset + 3] << 32)
+                | ((ulong)buffer[offset + 4] << 24)
+                | ((ulong)buffer[offset + 5] << 16)
+                | ((ulong)buffer[offset + 6] << 8)
+                | buffer[offset + 7];
+            return unchecked((long)value);
         }
 
         public FileReader Clone()

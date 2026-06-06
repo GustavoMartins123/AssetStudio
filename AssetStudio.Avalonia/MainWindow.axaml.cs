@@ -402,15 +402,19 @@ public partial class MainWindow : Window
         }
 
         var percent = Math.Clamp(percentComplete, 0, 100);
-        var filePath = !string.IsNullOrWhiteSpace(currentFile) ? currentFile : lastReadFile;
-        var fileName = string.IsNullOrWhiteSpace(filePath) ? string.Empty : Path.GetFileName(filePath);
+        var isStageProgress = IsStageProgressStatus(status);
+        var progressDetail = !string.IsNullOrWhiteSpace(currentFile) ? currentFile : lastReadFile;
+        var fileName = string.IsNullOrWhiteSpace(progressDetail) || isStageProgress ? string.Empty : Path.GetFileName(progressDetail);
+        var unitLabel = isStageProgress ? "steps" : "files";
         var countText = totalFiles > 0
-            ? $"{processedFiles:N0}/{totalFiles:N0} files"
-            : $"{processedFiles:N0} files";
+            ? $"{processedFiles:N0}/{totalFiles:N0} {unitLabel}"
+            : $"{processedFiles:N0} {unitLabel}";
         var pendingText = pendingFiles > 0 ? $" | {pendingFiles:N0} pending" : string.Empty;
-        var fileText = string.IsNullOrWhiteSpace(fileName)
-            ? string.Empty
-            : $" | {(string.IsNullOrWhiteSpace(currentFile) ? "Last" : "Now")}: {fileName}";
+        var fileText = isStageProgress
+            ? (string.IsNullOrWhiteSpace(progressDetail) ? string.Empty : $" | {progressDetail}")
+            : (string.IsNullOrWhiteSpace(fileName)
+                ? string.Empty
+                : $" | {(string.IsNullOrWhiteSpace(currentFile) ? "Last" : "Now")}: {fileName}");
         var updatedText = updatedAt.HasValue
             ? $" | Updated {updatedAt.Value.ToLocalTime():HH:mm:ss}"
             : string.Empty;
@@ -442,6 +446,8 @@ public partial class MainWindow : Window
             "paused" => "Indexing paused",
             "cancelling" => "Stopping indexing",
             "cancelled" => "Indexing cancelled",
+            "saving_index" => "Saving index cache",
+            "saving_connections" => "Saving connections",
             "connecting" => "Building connections",
             "connections_completed" => "Connections complete",
             "building_structure" => "Building asset structure",
@@ -452,6 +458,15 @@ public partial class MainWindow : Window
             "connections_failed" => "Connections build failed",
             _ => "Indexing"
         };
+    }
+
+    private static bool IsStageProgressStatus(string? status)
+    {
+        return string.Equals(status, "saving_index", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "saving_connections", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
     }
 
     private void PrioritizeUserInteraction(int milliseconds = UserInteractionPriorityMilliseconds)
@@ -2246,12 +2261,97 @@ public partial class MainWindow : Window
             var signature = _sqliteCache.GetFolderSignature(scanResult);
             var unityVersion = assetsManager.SpecifyUnityVersion;
             var handles = assetsManager.ProjectIndex.GetHandles();
-            _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations, progress);
+            PublishDatabaseWriteProgress(
+                folderPath,
+                scanResult,
+                "saving_index",
+                0,
+                1,
+                "Waiting for SQLite writer",
+                persist: true);
+
+            void ReportSaveProgress(int processed, int total, string stage)
+            {
+                progress?.Invoke(processed, total, stage);
+                PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "saving_index",
+                    processed,
+                    total,
+                    stage,
+                    persist: false);
+            }
+
+            var saved = _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations, ReportSaveProgress);
+
+            if (saved)
+            {
+                PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "completed",
+                    1,
+                    1,
+                    "SQLite index cache saved",
+                    persist: true);
+            }
+            else
+            {
+                PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "failed",
+                    1,
+                    1,
+                    "SQLite index cache save failed",
+                    persist: true);
+            }
         }
         catch (Exception ex)
         {
             Logger.Warning($"Failed to save index cache: {ex.Message}");
         }
+    }
+
+    private void PublishDatabaseWriteProgress(
+        string folderPath,
+        ProjectScanResult scanResult,
+        string status,
+        int processed,
+        int total,
+        string stage,
+        bool persist)
+    {
+        var safeTotal = Math.Max(1, total);
+        var safeProcessed = Math.Clamp(processed, 0, safeTotal);
+        var percent = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal));
+        var update = new IndexingProgressUpdate
+        {
+            Status = status,
+            TotalFiles = safeTotal,
+            ProcessedFiles = safeProcessed,
+            PendingFiles = Math.Max(0, safeTotal - safeProcessed),
+            PercentComplete = percent,
+            CurrentFile = stage ?? string.Empty,
+            LastReadFile = stage ?? string.Empty,
+            NewlyReadFiles = Array.Empty<string>()
+        };
+
+        if (persist)
+        {
+            try
+            {
+                var signature = _sqliteCache.GetFolderSignature(scanResult);
+                _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to persist database write progress: {ex.Message}");
+            }
+        }
+
+        ShowIndexingProgressPanel(update, 3);
     }
 
     private bool TrySaveSemanticRelations(SemanticAssetRelations relations)
@@ -2285,7 +2385,42 @@ public partial class MainWindow : Window
         try
         {
             var signature = _sqliteCache.GetFolderSignature(scanResult);
-            return _sqliteCache.SaveSemanticRelations(folderPath, signature, relations, replaceExisting);
+            PublishDatabaseWriteProgress(
+                folderPath,
+                scanResult,
+                "saving_connections",
+                0,
+                1,
+                "Waiting for SQLite writer",
+                persist: true);
+
+            var saved = _sqliteCache.SaveSemanticRelations(
+                folderPath,
+                signature,
+                relations,
+                replaceExisting,
+                (processed, total, stage) => PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "saving_connections",
+                    processed,
+                    total,
+                    stage,
+                    persist: false));
+
+            if (saved)
+            {
+                PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "saving_connections",
+                    1,
+                    1,
+                    "Semantic relations saved",
+                    persist: false);
+            }
+
+            return saved;
         }
         catch (Exception ex)
         {
@@ -2517,7 +2652,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var saved = TrySaveSemanticRelations(folderPath, scanResult, relations, replaceExisting: true);
+            var saved = await Task.Run(() => TrySaveSemanticRelations(folderPath, scanResult, relations, replaceExisting: true));
             if (!saved)
             {
                 PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, diagnosticSummary, lastSourcePath);
@@ -3630,7 +3765,7 @@ public partial class MainWindow : Window
 
         if (!assetsManager.LazyLoading)
         {
-            TrySaveSemanticRelations(result.SemanticRelations);
+            await Task.Run(() => TrySaveSemanticRelations(result.SemanticRelations));
         }
         if (publishStructureProgress)
         {
@@ -9895,7 +10030,7 @@ public partial class MainWindow : Window
         materialTextureSlotsCache = localMaterialTextureSlotsCache;
         if (!assetsManager.LazyLoading)
         {
-            TrySaveSemanticRelations(semanticRelations);
+            _ = Task.Run(() => TrySaveSemanticRelations(semanticRelations));
         }
 
         BuildAnimationPreviewIndexesBackground(
