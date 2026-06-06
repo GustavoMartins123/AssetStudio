@@ -337,7 +337,7 @@ public partial class MainWindow : Window
         Dispatcher.UIThread.Post(() => ViewModel.LoadingProgress = value);
     }
 
-    private void ShowIndexingProgressPanel(IndexingProgressUpdate update)
+    private void ShowIndexingProgressPanel(IndexingProgressUpdate update, int percentDecimals = 1)
     {
         if (update == null)
         {
@@ -352,10 +352,11 @@ public partial class MainWindow : Window
             update.PercentComplete,
             update.CurrentFile,
             update.LastReadFile,
-            null);
+            null,
+            percentDecimals);
     }
 
-    private void ShowIndexingProgressPanel(ProjectIndexingState state)
+    private void ShowIndexingProgressPanel(ProjectIndexingState state, int percentDecimals = 1)
     {
         if (state == null)
         {
@@ -370,7 +371,8 @@ public partial class MainWindow : Window
             state.PercentComplete,
             state.CurrentFile,
             state.LastReadFile,
-            state.UpdatedAt);
+            state.UpdatedAt,
+            percentDecimals);
     }
 
     private void ShowIndexingProgressPanel(
@@ -381,7 +383,8 @@ public partial class MainWindow : Window
         double percentComplete,
         string currentFile,
         string lastReadFile,
-        DateTime? updatedAt)
+        DateTime? updatedAt,
+        int percentDecimals = 1)
     {
         if (!Dispatcher.UIThread.CheckAccess())
         {
@@ -393,7 +396,8 @@ public partial class MainWindow : Window
                 percentComplete,
                 currentFile,
                 lastReadFile,
-                updatedAt));
+                updatedAt,
+                percentDecimals));
             return;
         }
 
@@ -413,7 +417,7 @@ public partial class MainWindow : Window
 
         IndexingProgressPanel.IsVisible = true;
         IndexingProgressText.Text = $"{BuildIndexingProgressTitle(status)}: {countText}{pendingText}{fileText}{updatedText}";
-        IndexingProgressPercentText.Text = $"{percent:0.#}%";
+        IndexingProgressPercentText.Text = percent.ToString("0." + new string('#', Math.Max(0, percentDecimals)), CultureInfo.InvariantCulture) + "%";
         IndexingProgressBar.Value = percent;
     }
 
@@ -2231,14 +2235,18 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveIndexCache(string folderPath, ProjectScanResult scanResult, bool preserveSemanticRelations = false)
+    private void SaveIndexCache(
+        string folderPath,
+        ProjectScanResult scanResult,
+        bool preserveSemanticRelations = false,
+        Action<int, int, string>? progress = null)
     {
         try
         {
             var signature = _sqliteCache.GetFolderSignature(scanResult);
             var unityVersion = assetsManager.SpecifyUnityVersion;
             var handles = assetsManager.ProjectIndex.GetHandles();
-            _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations);
+            _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations, progress);
         }
         catch (Exception ex)
         {
@@ -2590,40 +2598,51 @@ public partial class MainWindow : Window
         ShowIndexingProgressPanel(update);
     }
 
-    private void PublishStructureBuildProgress(string status, int processedSteps, int totalSteps, string currentStage)
+    private void PublishStructureBuildProgress(
+        string status,
+        int processedSteps,
+        int totalSteps,
+        string currentStage,
+        bool persist = true,
+        int percentDecimals = 1)
     {
         var safeTotal = Math.Max(1, totalSteps);
         var safeProcessed = Math.Clamp(processedSteps, 0, safeTotal);
+        var percentComplete = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal));
         var update = new IndexingProgressUpdate
         {
             Status = status,
             TotalFiles = safeTotal,
             ProcessedFiles = safeProcessed,
             PendingFiles = Math.Max(0, safeTotal - safeProcessed),
-            PercentComplete = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal)),
+            PercentComplete = percentComplete,
             CurrentFile = currentStage ?? string.Empty,
             LastReadFile = currentStage ?? string.Empty,
             NewlyReadFiles = Array.Empty<string>()
         };
 
-        if (currentScanResult != null)
+        if (persist && currentScanResult != null)
         {
             var folderPath = GetCurrentCacheFolderPath();
             if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
             {
-                try
+                var scanResult = currentScanResult;
+                _ = Task.Run(() =>
                 {
-                    var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-                    _sqliteCache.SaveIndexingProgress(folderPath, signature, currentScanResult, update);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to persist structure build progress: {ex.Message}");
-                }
+                    try
+                    {
+                        var signature = _sqliteCache.GetFolderSignature(scanResult);
+                        _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Failed to persist structure build progress: {ex.Message}");
+                    }
+                });
             }
         }
 
-        ShowIndexingProgressPanel(update);
+        ShowIndexingProgressPanel(update, percentDecimals);
     }
 
     private List<string> GetLazyConnectionSourcePaths()
@@ -3288,7 +3307,7 @@ public partial class MainWindow : Window
         if (isBuildingAssetStructures) return;
         isBuildingAssetStructures = true;
         var publishStructureProgress = showStructureProgress && assetsManager.LazyLoading && currentScanResult != null;
-        const int structureBuildSteps = 7;
+        const int structureBuildSteps = 6;
 
         void PublishStructureStage(int processedSteps, string stage)
         {
@@ -3608,20 +3627,6 @@ public partial class MainWindow : Window
             : m_ObjectsCount;
         PublishStructureStage(6, "Saving project metadata");
         await Task.Run(() => SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count));
-        if (assetsManager.LazyLoading && currentScanResult != null)
-        {
-            var folderPath = GetCurrentCacheFolderPath();
-            if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
-            {
-                PublishStructureStage(6, "Saving SQLite index cache");
-                var scanResult = currentScanResult;
-                var preserveSemanticRelations = await Task.Run(() => HasSavedSemanticRelations(folderPath, scanResult));
-                await Task.Run(() => SaveIndexCache(
-                    folderPath,
-                    scanResult,
-                    preserveSemanticRelations: preserveSemanticRelations));
-            }
-        }
 
         if (!assetsManager.LazyLoading)
         {

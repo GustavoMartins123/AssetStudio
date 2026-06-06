@@ -386,12 +386,48 @@ namespace AssetStudio.Avalonia
             ProjectScanResult scanResult,
             string unityVersion,
             IEnumerable<AssetHandle> handles,
-            bool preserveSemanticRelations = false)
+            bool preserveSemanticRelations = false,
+            Action<int, int, string>? progress = null)
         {
             EnsureInitialized();
             try
             {
                 var handleList = handles?.ToList() ?? new List<AssetHandle>();
+                var totalWork = Math.Max(1, handleList.Count * 2 + Math.Max(1, scanResult.TotalFiles));
+                var processedWork = 0;
+                var lastReportedWork = -1;
+                var lastReportedTicks = 0L;
+                var minWorkDelta = Math.Max(1, totalWork / 100000);
+
+                void ReportProgress(string stage, bool force = false)
+                {
+                    if (progress == null)
+                    {
+                        return;
+                    }
+
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var elapsedMs = lastReportedTicks == 0
+                        ? double.MaxValue
+                        : (nowTicks - lastReportedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+                    if (!force && processedWork < totalWork && processedWork - lastReportedWork < minWorkDelta && elapsedMs < 100)
+                    {
+                        return;
+                    }
+
+                    lastReportedWork = processedWork;
+                    lastReportedTicks = nowTicks;
+                    progress(Math.Clamp(processedWork, 0, totalWork), totalWork, stage);
+                }
+
+                void AdvanceProgress(string stage)
+                {
+                    processedWork++;
+                    ReportProgress(stage);
+                }
+
+                ReportProgress("Preparing SQLite index cache", force: true);
                 lock (WriteGate)
                 {
                     using (var conn = CreateConnection())
@@ -422,6 +458,7 @@ namespace AssetStudio.Avalonia
 
                                 pProjectId.Value = projectId;
 
+                                var savedHandleRows = 0;
                                 foreach (var h in handleList)
                                 {
                                     pUniqueId.Value = h.UniqueID ?? string.Empty;
@@ -435,12 +472,16 @@ namespace AssetStudio.Avalonia
                                     pByteSize.Value = h.ByteSize;
 
                                     cmd.ExecuteNonQuery();
+                                    savedHandleRows++;
+                                    AdvanceProgress($"Saving handles: {savedHandleRows:N0}/{handleList.Count:N0}");
                                 }
                             }
 
-                            InsertSourceFilesAndAssets(conn, transaction, projectId, handleList);
+                            InsertSourceFilesAndAssets(conn, transaction, projectId, handleList, AdvanceProgress);
 
                             transaction.Commit();
+                            processedWork = totalWork;
+                            ReportProgress("SQLite index cache saved", force: true);
                             Logger.Info($"Saved index cache in SQLite for: {folderPath}");
                         }
                     }
@@ -539,7 +580,12 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static void InsertSourceFilesAndAssets(SqliteConnection conn, SqliteTransaction transaction, long projectId, IReadOnlyCollection<AssetHandle> handles)
+        private static void InsertSourceFilesAndAssets(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<AssetHandle> handles,
+            Action<string>? advanceProgress = null)
         {
             if (handles.Count == 0)
             {
@@ -555,6 +601,7 @@ namespace AssetStudio.Avalonia
                 })
                 .ToList();
 
+            var sourceGroupIndex = 0;
             foreach (var group in sourceGroups)
             {
                 using (var cmd = conn.CreateCommand())
@@ -590,6 +637,9 @@ namespace AssetStudio.Avalonia
                         sourceFileIds[GetSourceFileKey(group.Key.SerializedFileName, group.Key.OriginalPath)] = Convert.ToInt64(id);
                     }
                 }
+
+                sourceGroupIndex++;
+                advanceProgress?.Invoke($"Saving source files: {sourceGroupIndex:N0}/{sourceGroups.Count:N0}");
             }
 
             using (var cmd = conn.CreateCommand())
@@ -619,6 +669,7 @@ namespace AssetStudio.Avalonia
                 var pByteSize = cmd.Parameters.Add("@byteSize", SqliteType.Integer);
 
                 pProjectId.Value = projectId;
+                var assetRowIndex = 0;
                 foreach (var handle in handles)
                 {
                     var sourceKey = GetSourceFileKey(handle.SerializedFileName ?? string.Empty, handle.OriginalPath ?? string.Empty);
@@ -633,6 +684,8 @@ namespace AssetStudio.Avalonia
                     pByteStart.Value = handle.ByteStart;
                     pByteSize.Value = handle.ByteSize;
                     cmd.ExecuteNonQuery();
+                    assetRowIndex++;
+                    advanceProgress?.Invoke($"Saving asset rows: {assetRowIndex:N0}/{handles.Count:N0}");
                 }
             }
         }
