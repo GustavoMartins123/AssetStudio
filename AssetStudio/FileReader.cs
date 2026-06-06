@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Text;
 
@@ -24,6 +26,15 @@ namespace AssetStudio
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
             FileType = CheckFileType();
+        }
+
+        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[] cachedMemoryBuffer) : base(stream, endian)
+        {
+            FullPath = Path.GetFullPath(path);
+            FileName = Path.GetFileName(path);
+            FileType = fileType;
+            this.cachedMemoryBuffer = cachedMemoryBuffer;
+            Position = 0;
         }
 
         private FileType CheckFileType()
@@ -159,11 +170,8 @@ namespace AssetStudio
             {
                 if (memStream.TryGetBuffer(out var segment) && segment.Array != null)
                 {
-                    var segmentStream = new MemoryStream(segment.Array, segment.Offset, segment.Count, false, true);
-                    var segmentClone = new FileReader(FullPath, segmentStream);
-                    segmentClone.Endian = Endian;
-                    segmentClone.cachedMemoryBuffer = cachedMemoryBuffer;
-                    return segmentClone;
+                    var segmentStream = PooledReadOnlyMemoryStream.Rent(segment.Array, segment.Offset, segment.Count);
+                    return new FileReader(FullPath, segmentStream, Endian, FileType, cachedMemoryBuffer);
                 }
 
                 if (cachedMemoryBuffer == null)
@@ -177,35 +185,25 @@ namespace AssetStudio
                     }
                 }
 
-                var newStream = new MemoryStream(cachedMemoryBuffer, 0, cachedMemoryBuffer.Length, false, true);
-                var clone = new FileReader(FullPath, newStream);
-                clone.Endian = Endian;
-                clone.cachedMemoryBuffer = cachedMemoryBuffer;
-                return clone;
+                var newStream = PooledReadOnlyMemoryStream.Rent(cachedMemoryBuffer, 0, cachedMemoryBuffer.Length);
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer);
             }
             else if (BaseStream is DecryptedStream decStream)
             {
                 var clonedUnderlying = CloneStream(decStream.BaseStream);
                 var newDecStream = new DecryptedStream(clonedUnderlying, decStream.Token);
-                newDecStream.Position = decStream.Position;
-                var clone = new FileReader(FullPath, newDecStream);
-                clone.Endian = Endian;
-                return clone;
+                return new FileReader(FullPath, newDecStream, Endian, FileType, cachedMemoryBuffer);
             }
             else if (BaseStream is SubStream subStream)
             {
                 var newStream = new SubStream(subStream.FilePath, subStream.Offset, subStream.Length);
-                var clone = new FileReader(FullPath, newStream);
-                clone.Endian = Endian;
-                return clone;
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer);
             }
             else if (BaseStream is FileStream fileStream)
             {
                 var streamPath = fileStream.Name;
                 var newStream = File.Open(streamPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                var clone = new FileReader(FullPath, newStream);
-                clone.Endian = Endian;
-                return clone;
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer);
             }
             else
             {
@@ -217,9 +215,7 @@ namespace AssetStudio
                     BaseStream.CopyTo(tempMemStream);
                     BaseStream.Position = originalPosition;
                     tempMemStream.Position = originalPosition;
-                    var clone = new FileReader(FullPath, tempMemStream);
-                    clone.Endian = Endian;
-                    return clone;
+                    return new FileReader(FullPath, tempMemStream, Endian, FileType, cachedMemoryBuffer);
                 }
                 catch (System.Exception ex)
                 {
@@ -234,9 +230,10 @@ namespace AssetStudio
             {
                 if (memStream.TryGetBuffer(out var segment) && segment.Array != null)
                 {
-                    return new MemoryStream(segment.Array, segment.Offset, segment.Count, false, true);
+                    return PooledReadOnlyMemoryStream.Rent(segment.Array, segment.Offset, segment.Count);
                 }
-                return new MemoryStream(memStream.ToArray(), 0, (int)memStream.Length, false, true);
+                var buffer = memStream.ToArray();
+                return PooledReadOnlyMemoryStream.Rent(buffer, 0, buffer.Length);
             }
             if (src is SubStream subStream)
             {
@@ -254,6 +251,143 @@ namespace AssetStudio
             src.Position = pos;
             temp.Position = pos;
             return temp;
+        }
+
+        private sealed class PooledReadOnlyMemoryStream : Stream
+        {
+            private static readonly ConcurrentBag<PooledReadOnlyMemoryStream> Pool = new ConcurrentBag<PooledReadOnlyMemoryStream>();
+            private byte[] buffer;
+            private int origin;
+            private int length;
+            private int position;
+            private bool isOpen;
+
+            public static PooledReadOnlyMemoryStream Rent(byte[] buffer, int offset, int count)
+            {
+                if (!Pool.TryTake(out var stream))
+                {
+                    stream = new PooledReadOnlyMemoryStream();
+                }
+
+                stream.buffer = buffer;
+                stream.origin = offset;
+                stream.length = count;
+                stream.position = 0;
+                stream.isOpen = true;
+                return stream;
+            }
+
+            public override bool CanRead => isOpen;
+            public override bool CanSeek => isOpen;
+            public override bool CanWrite => false;
+            public override long Length
+            {
+                get
+                {
+                    ThrowIfClosed();
+                    return length;
+                }
+            }
+
+            public override long Position
+            {
+                get
+                {
+                    ThrowIfClosed();
+                    return position;
+                }
+                set
+                {
+                    ThrowIfClosed();
+                    if (value < 0 || value > length)
+                    {
+                        throw new ArgumentOutOfRangeException(nameof(value));
+                    }
+                    position = (int)value;
+                }
+            }
+
+            public override int Read(byte[] destination, int offset, int count)
+            {
+                ThrowIfClosed();
+                if (destination == null)
+                {
+                    throw new ArgumentNullException(nameof(destination));
+                }
+                if (offset < 0 || count < 0 || destination.Length - offset < count)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+
+                var remaining = length - position;
+                if (remaining <= 0)
+                {
+                    return 0;
+                }
+
+                var bytesToRead = Math.Min(count, remaining);
+                Buffer.BlockCopy(buffer, origin + position, destination, offset, bytesToRead);
+                position += bytesToRead;
+                return bytesToRead;
+            }
+
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                ThrowIfClosed();
+                long newPosition;
+                switch (origin)
+                {
+                    case SeekOrigin.Begin:
+                        newPosition = offset;
+                        break;
+                    case SeekOrigin.Current:
+                        newPosition = position + offset;
+                        break;
+                    case SeekOrigin.End:
+                        newPosition = length + offset;
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(origin));
+                }
+
+                if (newPosition < 0 || newPosition > length)
+                {
+                    throw new IOException("Attempted to seek outside the memory stream bounds.");
+                }
+
+                position = (int)newPosition;
+                return position;
+            }
+
+            public override void Flush()
+            {
+                ThrowIfClosed();
+            }
+
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing && isOpen)
+                {
+                    buffer = null;
+                    origin = 0;
+                    length = 0;
+                    position = 0;
+                    isOpen = false;
+                    Pool.Add(this);
+                }
+                base.Dispose(disposing);
+            }
+
+            private void ThrowIfClosed()
+            {
+                if (!isOpen)
+                {
+                    throw new ObjectDisposedException(nameof(PooledReadOnlyMemoryStream));
+                }
+            }
         }
     }
 }

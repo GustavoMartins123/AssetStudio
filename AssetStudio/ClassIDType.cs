@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 
 // official Class ID Reference: https://docs.unity3d.com/Manual/ClassIDReference.html
 namespace AssetStudio
@@ -382,28 +381,87 @@ namespace AssetStudio
 
     public static class ClassIDTypeHelper
     {
-        private static readonly HashSet<int> DefinedValues = BuildDefinedValues();
+        private const int SmallLookupSize = 512;
+        private static readonly ClassIDType[] SmallLookup = BuildSmallLookup();
+        private static readonly int[] SparseDefinedValues = BuildSparseDefinedValues();
 
         public static ClassIDType FromClassId(int classId)
         {
-            return DefinedValues.Contains(classId)
+            if (classId == (int)ClassIDType.UnknownType)
+            {
+                return ClassIDType.UnknownType;
+            }
+
+            if ((uint)classId < SmallLookup.Length)
+            {
+                return SmallLookup[classId];
+            }
+
+            return Array.BinarySearch(SparseDefinedValues, classId) >= 0
                 ? (ClassIDType)classId
                 : ClassIDType.UnknownType;
         }
 
         public static bool IsDefined(int classId)
         {
-            return DefinedValues.Contains(classId);
+            if (classId == (int)ClassIDType.UnknownType)
+            {
+                return true;
+            }
+
+            if ((uint)classId < SmallLookup.Length)
+            {
+                return SmallLookup[classId] != ClassIDType.UnknownType;
+            }
+
+            return Array.BinarySearch(SparseDefinedValues, classId) >= 0;
         }
 
-        private static HashSet<int> BuildDefinedValues()
+        private static ClassIDType[] BuildSmallLookup()
         {
-            var values = new HashSet<int>();
+            var lookup = new ClassIDType[SmallLookupSize];
+            for (int i = 0; i < lookup.Length; i++)
+            {
+                lookup[i] = ClassIDType.UnknownType;
+            }
+
             foreach (ClassIDType value in Enum.GetValues(typeof(ClassIDType)))
             {
-                values.Add((int)value);
+                var classId = (int)value;
+                if ((uint)classId < lookup.Length)
+                {
+                    lookup[classId] = value;
+                }
             }
-            return values;
+            return lookup;
+        }
+
+        private static int[] BuildSparseDefinedValues()
+        {
+            var values = (ClassIDType[])Enum.GetValues(typeof(ClassIDType));
+            var count = 0;
+            foreach (var value in values)
+            {
+                var classId = (int)value;
+                if (classId >= SmallLookupSize)
+                {
+                    count++;
+                }
+            }
+
+            var sparseValues = new int[count];
+            var index = 0;
+            foreach (var value in values)
+            {
+                var classId = (int)value;
+                if (classId >= SmallLookupSize)
+                {
+                    sparseValues[index++] = classId;
+                }
+            }
+
+            Array.Sort(sparseValues);
+            return sparseValues;
         }
     }
 }

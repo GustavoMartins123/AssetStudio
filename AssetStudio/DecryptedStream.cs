@@ -1,6 +1,7 @@
 #nullable enable
 using System;
 using System.IO;
+using System.Numerics;
 
 namespace AssetStudio
 {
@@ -72,10 +73,7 @@ namespace AssetStudio
                 }
 
                 var bufferIndex = offset + (int)(curPos - position);
-                for (int i = 0; i < bytesToDecrypt; i++)
-                {
-                    buffer[bufferIndex + i] ^= cachedKeystream[offsetInBlock + i];
-                }
+                XorBytes(buffer, bufferIndex, cachedKeystream, offsetInBlock, bytesToDecrypt);
 
                 curPos += bytesToDecrypt;
                 bytesRemaining -= bytesToDecrypt;
@@ -111,6 +109,27 @@ namespace AssetStudio
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override void Flush() => BaseStream.Flush();
+
+        private static void XorBytes(byte[] destination, int destinationOffset, byte[] key, int keyOffset, int count)
+        {
+            int i = 0;
+            if (Vector.IsHardwareAccelerated && count >= Vector<byte>.Count)
+            {
+                var vectorSize = Vector<byte>.Count;
+                var vectorEnd = count - count % vectorSize;
+                for (; i < vectorEnd; i += vectorSize)
+                {
+                    var left = new Vector<byte>(destination, destinationOffset + i);
+                    var right = new Vector<byte>(key, keyOffset + i);
+                    (left ^ right).CopyTo(destination, destinationOffset + i);
+                }
+            }
+
+            for (; i < count; i++)
+            {
+                destination[destinationOffset + i] ^= key[keyOffset + i];
+            }
+        }
 
         protected override void Dispose(bool disposing)
         {

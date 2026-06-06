@@ -1,9 +1,9 @@
 #nullable enable
 using K4os.Compression.LZ4;
 using System;
+using System.Buffers;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 
 namespace AssetStudio
 {
@@ -39,6 +39,10 @@ namespace AssetStudio
         public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
         public static string TemporaryDirectory { get; set; } = "";
         public static string CacheDirectory { get; set; } = "";
+        private const int PersistentCacheSampleBytes = 1024 * 1024;
+        private const long PersistentCacheFullSignatureThreshold = 8L * 1024 * 1024;
+        private const ulong PersistentCacheFnvOffsetBasis = 14695981039346656037UL;
+        private const ulong PersistentCacheFnvPrime = 1099511628211UL;
 
         public class Header
         {
@@ -442,22 +446,104 @@ namespace AssetStudio
 
         private static string CreatePersistentBlocksCacheFileName(string path, long sourceLength)
         {
-            var sourceHash = ComputeSourceContentHash(path);
-            return $"{SanitizeTempFilePart(Path.GetFileName(path))}_{sourceLength}_{sourceHash}.blocks";
+            var sourceSignature = ComputeSourceContentSignature(path, sourceLength);
+            return $"{SanitizeTempFilePart(Path.GetFileName(path))}_{sourceLength}_{sourceSignature}.blocks";
         }
 
-        private static string ComputeSourceContentHash(string path)
+        private static string ComputeSourceContentSignature(string path, long sourceLength)
         {
+            var hash = AddUInt64(PersistentCacheFnvOffsetBasis, (ulong)sourceLength);
+            var buffer = ArrayPool<byte>.Shared.Rent(PersistentCacheSampleBytes);
+            var fileOptions = sourceLength <= PersistentCacheFullSignatureThreshold
+                ? FileOptions.SequentialScan
+                : FileOptions.RandomAccess;
             using var stream = new FileStream(
                 path,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete,
                 1024 * 1024,
-                FileOptions.SequentialScan);
-            using var sha256 = SHA256.Create();
-            var hash = sha256.ComputeHash(stream);
-            return BitConverter.ToString(hash, 0, 16).Replace("-", string.Empty).ToLowerInvariant();
+                fileOptions);
+            try
+            {
+                if (sourceLength <= PersistentCacheFullSignatureThreshold)
+                {
+                    hash = AddSample(hash, stream, buffer, 0, sourceLength);
+                }
+                else
+                {
+                    hash = AddSample(hash, stream, buffer, 0, PersistentCacheSampleBytes);
+                    hash = AddSample(
+                        hash,
+                        stream,
+                        buffer,
+                        Math.Max(0, sourceLength - PersistentCacheSampleBytes),
+                        PersistentCacheSampleBytes);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            return "s1_" + hash.ToString("x16");
+        }
+
+        private static ulong AddSample(ulong hash, FileStream stream, byte[] buffer, long offset, long bytesToRead)
+        {
+            if (bytesToRead <= 0)
+            {
+                return hash;
+            }
+
+            stream.Position = offset;
+            var remaining = bytesToRead;
+            hash = AddUInt64(hash, (ulong)offset);
+            while (remaining > 0)
+            {
+                var readSize = (int)Math.Min(buffer.Length, remaining);
+                var bytesRead = stream.Read(buffer, 0, readSize);
+                if (bytesRead <= 0)
+                {
+                    break;
+                }
+
+                hash = AddInt32(hash, bytesRead);
+                hash = AddBytes(hash, buffer, bytesRead);
+                remaining -= bytesRead;
+            }
+
+            return hash;
+        }
+
+        private static ulong AddUInt64(ulong hash, ulong value)
+        {
+            for (int i = 0; i < sizeof(ulong); i++)
+            {
+                hash ^= (byte)(value >> (i * 8));
+                hash *= PersistentCacheFnvPrime;
+            }
+            return hash;
+        }
+
+        private static ulong AddInt32(ulong hash, int value)
+        {
+            for (int i = 0; i < sizeof(int); i++)
+            {
+                hash ^= (byte)(value >> (i * 8));
+                hash *= PersistentCacheFnvPrime;
+            }
+            return hash;
+        }
+
+        private static ulong AddBytes(ulong hash, byte[] buffer, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                hash ^= buffer[i];
+                hash *= PersistentCacheFnvPrime;
+            }
+            return hash;
         }
 
         private void ReadBlocksAndDirectory(EndianBinaryReader reader, Stream blocksStream)
