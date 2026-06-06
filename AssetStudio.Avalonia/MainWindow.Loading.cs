@@ -58,7 +58,11 @@ namespace AssetStudio.Avalonia
                 or ClassIDType.Sprite
                 or ClassIDType.MovieTexture
                 or ClassIDType.AnimationClip
-                or ClassIDType.Animator;
+                or ClassIDType.Animator
+                or ClassIDType.Avatar
+                or ClassIDType.AnimatorController
+                or ClassIDType.AnimatorOverrideController
+                or ClassIDType.RuntimeAnimatorController;
         }
 
         private static void BuildLazyAssetItemsBackground(
@@ -792,6 +796,8 @@ namespace AssetStudio.Avalonia
 
             var containerReferences = new List<(string Container, List<PPtr<AssetStudio.Object>> References)>();
             var meshFiltersByGameObjectId = BuildMeshFilterBindingsByGameObject(file, objectsSnapshot);
+            var skinnedMeshBindings = BuildSkinnedMeshBindings(file, objectsSnapshot);
+            var animatorCount = objectsSnapshot.OfType<Animator>().Count();
             var seenRendererMeshRelations = new HashSet<string>(StringComparer.Ordinal);
 
             result.SemanticRelations.SourceFiles.Add(new SemanticSourceFileEntry(
@@ -872,6 +878,15 @@ namespace AssetStudio.Avalonia
                             }
                         }
                     }
+                }
+                else if (obj is Animator animator)
+                {
+                    AddAnimatorAvatarMeshRelations(
+                        file,
+                        animator,
+                        skinnedMeshBindings,
+                        animatorCount,
+                        result.SemanticRelations);
                 }
                 else if (obj is MeshRenderer mr)
                 {
@@ -1167,6 +1182,402 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        private static List<SkinnedMeshSemanticBinding> BuildSkinnedMeshBindings(
+            SerializedFile sourceFile,
+            IEnumerable<AssetStudio.Object> objects)
+        {
+            var result = new List<SkinnedMeshSemanticBinding>();
+            foreach (var renderer in objects.OfType<SkinnedMeshRenderer>())
+            {
+                var mesh = ResolveMeshBackground(sourceFile, renderer.m_Mesh);
+                var meshId = GetSemanticAssetId(mesh);
+                if (string.IsNullOrEmpty(meshId))
+                {
+                    meshId = GetSemanticAssetIdFromPPtr(sourceFile, renderer.m_Mesh, ClassIDType.Mesh);
+                }
+
+                if (string.IsNullOrEmpty(meshId))
+                {
+                    continue;
+                }
+
+                result.Add(new SkinnedMeshSemanticBinding(
+                    renderer,
+                    mesh,
+                    meshId,
+                    ResolveGameObjectBackground(sourceFile, renderer.m_GameObject),
+                    renderer.m_Mesh.m_FileID,
+                    renderer.m_Mesh.m_PathID));
+            }
+
+            return result;
+        }
+
+        private static void AddAnimatorAvatarMeshRelations(
+            SerializedFile sourceFile,
+            Animator animator,
+            List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
+            int animatorCount,
+            SemanticAssetRelations relations)
+        {
+            if (animator == null)
+            {
+                return;
+            }
+
+            var avatarId = string.Empty;
+            var avatarFileId = 0;
+            var avatarPathId = 0L;
+            if (animator.m_Avatar != null && !animator.m_Avatar.IsNull)
+            {
+                var avatar = ResolveAvatarBackground(sourceFile, animator.m_Avatar);
+                avatarId = GetSemanticAssetId(avatar);
+                if (string.IsNullOrEmpty(avatarId))
+                {
+                    avatarId = GetSemanticAssetIdFromPPtr(sourceFile, animator.m_Avatar, ClassIDType.Avatar);
+                }
+
+                avatarFileId = animator.m_Avatar.m_FileID;
+                avatarPathId = animator.m_Avatar.m_PathID;
+
+                if (!string.IsNullOrEmpty(avatarId))
+                {
+                    AddAssetEdge(
+                        relations,
+                        animator,
+                        "Avatar",
+                        "m_Avatar",
+                        0,
+                        avatarId,
+                        avatarFileId,
+                        avatarPathId);
+                }
+            }
+
+            var animatorGameObject = ResolveGameObjectBackground(sourceFile, animator.m_GameObject);
+            var meshSlotIndex = 0;
+            var seenMeshes = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var binding in FindSkinnedMeshesForAnimator(sourceFile, animatorGameObject, skinnedMeshBindings, animatorCount))
+            {
+                if (string.IsNullOrEmpty(binding.MeshId) || !seenMeshes.Add(binding.MeshId))
+                {
+                    continue;
+                }
+
+                AddAssetEdge(
+                    relations,
+                    animator,
+                    "Mesh",
+                    "AnimatorMesh",
+                    meshSlotIndex,
+                    binding.MeshId,
+                    binding.MeshFileId,
+                    binding.MeshPathId);
+
+                if (!string.IsNullOrEmpty(avatarId))
+                {
+                    AddAssetEdgeById(
+                        relations,
+                        avatarId,
+                        "Mesh",
+                        "AnimatorMesh",
+                        meshSlotIndex,
+                        binding.MeshId,
+                        avatarFileId,
+                        avatarPathId,
+                        binding.MeshFileId,
+                        binding.MeshPathId,
+                        isResolved: true);
+                }
+
+                meshSlotIndex++;
+            }
+
+            var controller = ResolveRuntimeAnimatorControllerBackground(sourceFile, animator.m_Controller);
+            if (controller != null)
+            {
+                AddAnimatorControllerClipRelations(
+                    sourceFile,
+                    relations,
+                    controller,
+                    animator,
+                    avatarId,
+                    avatarFileId,
+                    avatarPathId,
+                    depth: 0);
+            }
+        }
+
+        private static IEnumerable<SkinnedMeshSemanticBinding> FindSkinnedMeshesForAnimator(
+            SerializedFile sourceFile,
+            GameObject? animatorGameObject,
+            List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
+            int animatorCount)
+        {
+            if (skinnedMeshBindings.Count == 0)
+            {
+                yield break;
+            }
+
+            if (animatorGameObject != null)
+            {
+                var matchedAny = false;
+                foreach (var binding in skinnedMeshBindings)
+                {
+                    if (binding.GameObject != null
+                        && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
+                    {
+                        matchedAny = true;
+                        yield return binding;
+                    }
+                }
+
+                if (matchedAny)
+                {
+                    yield break;
+                }
+            }
+
+            if (animatorCount == 1)
+            {
+                foreach (var binding in skinnedMeshBindings)
+                {
+                    yield return binding;
+                }
+            }
+        }
+
+        private static bool IsSameOrDescendantGameObject(SerializedFile sourceFile, GameObject child, GameObject ancestor)
+        {
+            var ancestorPathId = ancestor.m_PathID;
+            GameObject? current = child;
+            var visited = new HashSet<long>();
+
+            for (var depth = 0; current != null && depth < 256; depth++)
+            {
+                if (!visited.Add(current.m_PathID))
+                {
+                    return false;
+                }
+
+                if (current.m_PathID == ancestorPathId)
+                {
+                    return true;
+                }
+
+                var transform = ResolveTransformForGameObjectBackground(sourceFile, current);
+                if (transform?.m_Father == null || transform.m_Father.IsNull)
+                {
+                    return false;
+                }
+
+                var parentTransform = ResolveTransformBackground(sourceFile, transform.m_Father);
+                if (parentTransform == null)
+                {
+                    return false;
+                }
+
+                current = ResolveGameObjectBackground(sourceFile, parentTransform.m_GameObject);
+            }
+
+            return false;
+        }
+
+        private static Transform? ResolveTransformForGameObjectBackground(SerializedFile sourceFile, GameObject gameObject)
+        {
+            if (gameObject.m_Transform != null)
+            {
+                return gameObject.m_Transform;
+            }
+
+            if (gameObject.m_Components == null)
+            {
+                return null;
+            }
+
+            foreach (var componentPtr in gameObject.m_Components)
+            {
+                Component? component = null;
+                if (componentPtr.TryGet(out var resolvedComponent))
+                {
+                    component = resolvedComponent;
+                }
+                else if (componentPtr.m_FileID == 0)
+                {
+                    component = ResolveObjectBackground(sourceFile, componentPtr.m_PathID) as Component;
+                }
+
+                if (component is Transform transform)
+                {
+                    return transform;
+                }
+            }
+
+            return null;
+        }
+
+        private static Transform? ResolveTransformBackground(SerializedFile sourceFile, PPtr<Transform> pptr)
+        {
+            if (pptr.TryGet(out var transform))
+            {
+                return transform;
+            }
+
+            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Transform : null;
+        }
+
+        private static Avatar? ResolveAvatarBackground(SerializedFile sourceFile, PPtr<Avatar> pptr)
+        {
+            if (pptr.TryGet(out var avatar))
+            {
+                return avatar;
+            }
+
+            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Avatar : null;
+        }
+
+        private static RuntimeAnimatorController? ResolveRuntimeAnimatorControllerBackground(
+            SerializedFile sourceFile,
+            PPtr<RuntimeAnimatorController> pptr)
+        {
+            if (pptr.TryGet(out var controller))
+            {
+                return controller;
+            }
+
+            return pptr.m_FileID == 0
+                ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as RuntimeAnimatorController
+                : null;
+        }
+
+        private static void AddAnimatorControllerClipRelations(
+            SerializedFile fallbackSourceFile,
+            SemanticAssetRelations relations,
+            RuntimeAnimatorController controller,
+            Animator animator,
+            string avatarId,
+            int avatarFileId,
+            long avatarPathId,
+            int depth)
+        {
+            if (depth > 4 || controller == null)
+            {
+                return;
+            }
+
+            var controllerSourceFile = controller.assetsFile ?? fallbackSourceFile;
+            var controllerId = GetSemanticAssetId(controller);
+            if (string.IsNullOrEmpty(controllerId))
+            {
+                controllerId = GetSemanticAssetIdFromPPtr(fallbackSourceFile, animator.m_Controller, ClassIDType.RuntimeAnimatorController);
+            }
+
+            var slotIndex = 0;
+            foreach (var clipRef in EnumerateAnimationClipPointers(controller))
+            {
+                if (clipRef == null || clipRef.IsNull)
+                {
+                    slotIndex++;
+                    continue;
+                }
+
+                var clipId = GetSemanticAssetIdFromPPtr(controllerSourceFile, clipRef, ClassIDType.AnimationClip);
+                if (string.IsNullOrEmpty(clipId))
+                {
+                    slotIndex++;
+                    continue;
+                }
+
+                AddAssetEdge(
+                    relations,
+                    animator,
+                    "AnimationClip",
+                    "AnimatorControllerClip",
+                    slotIndex,
+                    clipId,
+                    clipRef.m_FileID,
+                    clipRef.m_PathID);
+
+                if (!string.IsNullOrEmpty(controllerId))
+                {
+                    AddAssetEdgeById(
+                        relations,
+                        controllerId,
+                        "AnimationClip",
+                        "m_AnimationClips",
+                        slotIndex,
+                        clipId,
+                        0,
+                        controller.m_PathID,
+                        clipRef.m_FileID,
+                        clipRef.m_PathID,
+                        isResolved: true);
+                }
+
+                if (!string.IsNullOrEmpty(avatarId))
+                {
+                    AddAssetEdgeById(
+                        relations,
+                        clipId,
+                        "Avatar",
+                        "AnimatorAvatar",
+                        slotIndex,
+                        avatarId,
+                        clipRef.m_FileID,
+                        clipRef.m_PathID,
+                        avatarFileId,
+                        avatarPathId,
+                        isResolved: true);
+                }
+
+                slotIndex++;
+            }
+
+            if (controller is AnimatorOverrideController overrideController
+                && overrideController.m_Controller != null
+                && !overrideController.m_Controller.IsNull)
+            {
+                var baseController = ResolveRuntimeAnimatorControllerBackground(controllerSourceFile, overrideController.m_Controller);
+                if (baseController != null && !ReferenceEquals(baseController, controller))
+                {
+                    AddAnimatorControllerClipRelations(
+                        controllerSourceFile,
+                        relations,
+                        baseController,
+                        animator,
+                        avatarId,
+                        avatarFileId,
+                        avatarPathId,
+                        depth + 1);
+                }
+            }
+        }
+
+        private static IEnumerable<PPtr<AnimationClip>> EnumerateAnimationClipPointers(RuntimeAnimatorController controller)
+        {
+            if (controller is AnimatorController animatorController)
+            {
+                foreach (var clip in animatorController.m_AnimationClips ?? Array.Empty<PPtr<AnimationClip>>())
+                {
+                    yield return clip;
+                }
+            }
+            else if (controller is AnimatorOverrideController overrideController)
+            {
+                foreach (var clipOverride in overrideController.m_Clips ?? Array.Empty<AnimationClipOverride>())
+                {
+                    if (clipOverride.m_OverrideClip != null && !clipOverride.m_OverrideClip.IsNull)
+                    {
+                        yield return clipOverride.m_OverrideClip;
+                    }
+                    else if (clipOverride.m_OriginalClip != null && !clipOverride.m_OriginalClip.IsNull)
+                    {
+                        yield return clipOverride.m_OriginalClip;
+                    }
+                }
+            }
+        }
+
         private static string GetSemanticGameObjectId(
             SerializedFile sourceFile,
             PPtr<GameObject> gameObjectPtr,
@@ -1411,6 +1822,32 @@ namespace AssetStudio.Avalonia
             public Mesh? Mesh { get; }
             public string MeshId { get; }
             public GameObject? GameObject { get; }
+        }
+
+        private readonly struct SkinnedMeshSemanticBinding
+        {
+            public SkinnedMeshSemanticBinding(
+                SkinnedMeshRenderer renderer,
+                Mesh? mesh,
+                string meshId,
+                GameObject? gameObject,
+                int meshFileId,
+                long meshPathId)
+            {
+                Renderer = renderer;
+                Mesh = mesh;
+                MeshId = meshId;
+                GameObject = gameObject;
+                MeshFileId = meshFileId;
+                MeshPathId = meshPathId;
+            }
+
+            public SkinnedMeshRenderer Renderer { get; }
+            public Mesh? Mesh { get; }
+            public string MeshId { get; }
+            public GameObject? GameObject { get; }
+            public int MeshFileId { get; }
+            public long MeshPathId { get; }
         }
 
         private readonly struct ResolvedRendererMaterialBinding
@@ -1687,6 +2124,37 @@ namespace AssetStudio.Avalonia
                 targetFileId,
                 targetPathId,
                 !string.IsNullOrEmpty(targetId)));
+        }
+
+        private static void AddAssetEdgeById(
+            SemanticAssetRelations relations,
+            string sourceId,
+            string edgeKind,
+            string slotName,
+            int slotIndex,
+            string targetId,
+            int sourceFileId,
+            long sourcePathId,
+            int targetFileId,
+            long targetPathId,
+            bool isResolved)
+        {
+            if (string.IsNullOrEmpty(sourceId))
+            {
+                return;
+            }
+
+            relations.AssetEdges.Add(new SemanticAssetEdgeRelation(
+                sourceId,
+                edgeKind,
+                slotName,
+                slotIndex,
+                targetId ?? string.Empty,
+                sourceFileId,
+                sourcePathId,
+                targetFileId,
+                targetPathId,
+                isResolved && !string.IsNullOrEmpty(targetId)));
         }
 
         private sealed class AssetReferenceIndexBuildResult

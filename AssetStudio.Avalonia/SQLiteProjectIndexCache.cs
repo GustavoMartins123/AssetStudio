@@ -10,7 +10,8 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 5;
+        private const int SemanticSchemaVersion = 7;
+        private const int SemanticRelationCommitBatchSize = 10_000;
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
         private readonly HashSet<string> _initializedDbs = new();
@@ -404,6 +405,12 @@ namespace AssetStudio.Avalonia
                         return null;
                     }
 
+                    var indexingStatus = LoadProjectIndexingStatus(conn, projectId.Value);
+                    if (IsIncompleteIndexCacheStatus(indexingStatus))
+                    {
+                        return null;
+                    }
+
                     var handles = new List<AssetHandle>();
                     using (var cmd = conn.CreateCommand())
                     {
@@ -431,7 +438,7 @@ namespace AssetStudio.Avalonia
                             }
                         }
                     }
-                    return handles;
+                    return handles.Count == 0 ? null : handles;
                 }
             }
             catch (Exception ex)
@@ -439,6 +446,33 @@ namespace AssetStudio.Avalonia
                 Logger.Warning($"Failed to load SQLite index cache: {ex.Message}");
                 return null;
             }
+        }
+
+        private static string? LoadProjectIndexingStatus(SqliteConnection conn, long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT Status
+                FROM ProjectIndexingState
+                WHERE ProjectId = @projectId
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            return cmd.ExecuteScalar()?.ToString();
+        }
+
+        private static bool IsIncompleteIndexCacheStatus(string? status)
+        {
+            if (string.IsNullOrWhiteSpace(status))
+            {
+                return false;
+            }
+
+            return string.Equals(status, "running", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "paused", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "cancelling", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "saving_index", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase);
         }
 
         public bool SaveIndexCache(
@@ -785,18 +819,20 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
+                var clearWork = replaceExisting ? 4 : 0;
                 var totalWork = Math.Max(1,
                     relations.SourceFiles.Count
                     + relations.AssetEdges.Count
                     + relations.MeshRenderers.Count
                     + relations.MeshMaterials.Count
                     + relations.MaterialTextures.Count
-                    + (replaceExisting ? 4 : 0)
+                    + clearWork
                     + 3);
                 var processedWork = 0;
                 var lastReportedWork = -1;
                 var lastReportedTicks = 0L;
                 var minWorkDelta = Math.Max(1, totalWork / 100000);
+                var currentStage = string.Empty;
 
                 void ReportProgress(string stage, bool force = false)
                 {
@@ -823,6 +859,7 @@ namespace AssetStudio.Avalonia
                 void AdvanceProgress(string stage)
                 {
                     processedWork++;
+                    currentStage = stage;
                     ReportProgress(stage);
                 }
 
@@ -831,32 +868,119 @@ namespace AssetStudio.Avalonia
                 {
                     ReportProgress("Opening SQLite connection", force: true);
                     using var conn = CreateConnection(folderPath);
-                    using var transaction = conn.BeginTransaction();
-                    ReportProgress("Resolving project row", force: true);
-                    var projectId = FindProjectId(conn, transaction, folderPath, signature);
-                    if (projectId == null)
+
+                    long projectId;
+                    bool resumePartialSave;
+                    using (var transaction = conn.BeginTransaction())
                     {
-                        return false;
+                        ReportProgress("Resolving project row", force: true);
+                        var foundProjectId = FindProjectId(conn, transaction, folderPath, signature);
+                        if (foundProjectId == null)
+                        {
+                            return false;
+                        }
+
+                        projectId = foundProjectId.Value;
+                        resumePartialSave = replaceExisting
+                            && IsSemanticSaveInProgress(conn, transaction, projectId)
+                            && CountMaterialSemanticRelations(conn, transaction, projectId) > 0;
+
+                        SaveProjectIndexingState(
+                            conn,
+                            transaction,
+                            projectId,
+                            "saving_connections",
+                            processedWork,
+                            totalWork,
+                            resumePartialSave
+                                ? "Resuming partial semantic relation save"
+                                : "Preparing semantic relation save",
+                            completed: false);
+                        transaction.Commit();
                     }
 
-                    if (replaceExisting)
+                    if (replaceExisting && !resumePartialSave)
                     {
-                        ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value, AdvanceProgress);
+                        using var transaction = conn.BeginTransaction();
+                        ClearSemanticRelationTablesForProject(conn, transaction, projectId, AdvanceProgress);
+                        SaveProjectIndexingState(
+                            conn,
+                            transaction,
+                            projectId,
+                            "saving_connections",
+                            processedWork,
+                            totalWork,
+                            currentStage,
+                            completed: false);
+                        transaction.Commit();
+                    }
+                    else if (replaceExisting && resumePartialSave)
+                    {
+                        processedWork += clearWork;
+                        currentStage = "Resuming partial semantic relation save";
+                        ReportProgress(currentStage, force: true);
                     }
 
-                    InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles, AdvanceProgress);
-                    InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges, AdvanceProgress);
-                    InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers, AdvanceProgress);
-                    InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials, AdvanceProgress);
-                    InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures, AdvanceProgress);
+                    using (var transaction = conn.BeginTransaction())
+                    {
+                        InsertSemanticSourceFiles(conn, transaction, projectId, relations.SourceFiles, AdvanceProgress);
+                        SaveProjectIndexingState(
+                            conn,
+                            transaction,
+                            projectId,
+                            "saving_connections",
+                            processedWork,
+                            totalWork,
+                            string.IsNullOrWhiteSpace(currentStage) ? "Saving semantic source files" : currentStage,
+                            completed: false);
+                        transaction.Commit();
+                    }
+
+                    Dictionary<string, long> assetSourceFileIds;
+                    using (var transaction = conn.BeginTransaction())
+                    {
+                        assetSourceFileIds = LoadAssetSourceFileIdMap(conn, transaction, projectId);
+                        transaction.Commit();
+                    }
+
+                    InsertAssetEdgesInChunks(conn, projectId, relations.AssetEdges, assetSourceFileIds, AdvanceProgress, SaveProgressCheckpoint);
+                    InsertMeshRenderersInChunks(conn, projectId, relations.MeshRenderers, AdvanceProgress, SaveProgressCheckpoint);
+                    InsertMeshMaterialsInChunks(conn, projectId, relations.MeshMaterials, AdvanceProgress, SaveProgressCheckpoint);
+                    InsertMaterialTexturesInChunks(conn, projectId, relations.MaterialTextures, AdvanceProgress, SaveProgressCheckpoint);
 
                     ReportProgress("Committing semantic relations", force: true);
-                    transaction.Commit();
+                    using (var transaction = conn.BeginTransaction())
+                    {
+                        processedWork = totalWork;
+                        currentStage = "Semantic relations saved";
+                        SaveProjectIndexingState(
+                            conn,
+                            transaction,
+                            projectId,
+                            "connections_completed",
+                            processedWork,
+                            totalWork,
+                            currentStage,
+                            completed: true);
+                        transaction.Commit();
+                    }
                     ReportProgress("Checkpointing SQLite WAL", force: true);
                     TryCheckpointWal(conn, "semantic relations");
-                    processedWork = totalWork;
                     ReportProgress("Semantic relations saved", force: true);
                     return true;
+
+                    void SaveProgressCheckpoint(SqliteConnection checkpointConn, SqliteTransaction checkpointTransaction)
+                    {
+                        SaveProjectIndexingState(
+                            checkpointConn,
+                            checkpointTransaction,
+                            projectId,
+                            "saving_connections",
+                            processedWork,
+                            totalWork,
+                            string.IsNullOrWhiteSpace(currentStage) ? "Saving semantic relations" : currentStage,
+                            completed: false);
+                    }
                 }
             }
             catch (Exception ex)
@@ -1256,6 +1380,66 @@ namespace AssetStudio.Avalonia
             return Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
         }
 
+        private static bool IsSemanticSaveInProgress(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT Status
+                FROM ProjectIndexingState
+                WHERE ProjectId = @projectId
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            var status = cmd.ExecuteScalar()?.ToString();
+            return string.Equals(status, "saving_connections", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void SaveProjectIndexingState(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            string status,
+            int processed,
+            int total,
+            string stage,
+            bool completed)
+        {
+            var safeTotal = Math.Max(1, total);
+            var safeProcessed = Math.Clamp(processed, 0, safeTotal);
+            var percent = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal));
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO ProjectIndexingState (
+                    ProjectId, Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                    CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt)
+                VALUES (
+                    @projectId, @status, @totalFiles, @processedFiles, @pendingFiles, @percentComplete,
+                    @currentFile, @lastReadFile, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, @completedAt)
+                ON CONFLICT(ProjectId)
+                DO UPDATE SET
+                    Status = excluded.Status,
+                    TotalFiles = excluded.TotalFiles,
+                    ProcessedFiles = excluded.ProcessedFiles,
+                    PendingFiles = excluded.PendingFiles,
+                    PercentComplete = excluded.PercentComplete,
+                    CurrentFile = excluded.CurrentFile,
+                    LastReadFile = excluded.LastReadFile,
+                    UpdatedAt = CURRENT_TIMESTAMP,
+                    CompletedAt = excluded.CompletedAt";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            cmd.Parameters.AddWithValue("@status", status ?? string.Empty);
+            cmd.Parameters.AddWithValue("@totalFiles", safeTotal);
+            cmd.Parameters.AddWithValue("@processedFiles", safeProcessed);
+            cmd.Parameters.AddWithValue("@pendingFiles", Math.Max(0, safeTotal - safeProcessed));
+            cmd.Parameters.AddWithValue("@percentComplete", percent);
+            cmd.Parameters.AddWithValue("@currentFile", stage ?? string.Empty);
+            cmd.Parameters.AddWithValue("@lastReadFile", stage ?? string.Empty);
+            cmd.Parameters.AddWithValue("@completedAt", completed ? DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss") : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+
         private static bool IsTerminalIndexingStatus(string? status)
         {
             return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
@@ -1326,15 +1510,17 @@ namespace AssetStudio.Avalonia
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
-            IReadOnlyCollection<SemanticAssetEdgeRelation> edges,
+            IReadOnlyList<SemanticAssetEdgeRelation> edges,
+            int startIndex,
+            int count,
+            IReadOnlyDictionary<string, long> assetSourceFileIds,
             Action<string>? advanceProgress = null)
         {
-            if (edges.Count == 0)
+            if (edges.Count == 0 || count <= 0)
             {
                 return;
             }
 
-            var assetSourceFileIds = LoadAssetSourceFileIdMap(conn, transaction, projectId);
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = @"
@@ -1362,9 +1548,10 @@ namespace AssetStudio.Avalonia
             var pIsResolved = cmd.Parameters.Add("@isResolved", SqliteType.Integer);
 
             pProjectId.Value = projectId;
-            var rowIndex = 0;
-            foreach (var edge in edges)
+            var endIndex = Math.Min(edges.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
             {
+                var edge = edges[i];
                 pSourceAssetId.Value = edge.SourceAssetId;
                 pEdgeKind.Value = edge.EdgeKind;
                 pSlotName.Value = edge.SlotName;
@@ -1381,8 +1568,7 @@ namespace AssetStudio.Avalonia
                 pTargetPathId.Value = edge.TargetPathId;
                 pIsResolved.Value = edge.IsResolved ? 1 : 0;
                 cmd.ExecuteNonQuery();
-                rowIndex++;
-                advanceProgress?.Invoke($"Saving asset edges: {rowIndex:N0}/{edges.Count:N0}");
+                advanceProgress?.Invoke($"Saving asset edges: {i + 1:N0}/{edges.Count:N0}");
             }
         }
 
@@ -1410,14 +1596,81 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        private static void InsertAssetEdgesInChunks(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<SemanticAssetEdgeRelation> edges,
+            IReadOnlyDictionary<string, long> assetSourceFileIds,
+            Action<string> advanceProgress,
+            Action<SqliteConnection, SqliteTransaction> saveProgress)
+        {
+            for (var offset = 0; offset < edges.Count; offset += SemanticRelationCommitBatchSize)
+            {
+                using var transaction = conn.BeginTransaction();
+                InsertAssetEdges(conn, transaction, projectId, edges, offset, SemanticRelationCommitBatchSize, assetSourceFileIds, advanceProgress);
+                saveProgress(conn, transaction);
+                transaction.Commit();
+            }
+        }
+
+        private static void InsertMeshRenderersInChunks(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<SemanticMeshRendererRelation> renderers,
+            Action<string> advanceProgress,
+            Action<SqliteConnection, SqliteTransaction> saveProgress)
+        {
+            for (var offset = 0; offset < renderers.Count; offset += SemanticRelationCommitBatchSize)
+            {
+                using var transaction = conn.BeginTransaction();
+                InsertMeshRenderers(conn, transaction, projectId, renderers, offset, SemanticRelationCommitBatchSize, advanceProgress);
+                saveProgress(conn, transaction);
+                transaction.Commit();
+            }
+        }
+
+        private static void InsertMeshMaterialsInChunks(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<SemanticMeshMaterialRelation> materials,
+            Action<string> advanceProgress,
+            Action<SqliteConnection, SqliteTransaction> saveProgress)
+        {
+            for (var offset = 0; offset < materials.Count; offset += SemanticRelationCommitBatchSize)
+            {
+                using var transaction = conn.BeginTransaction();
+                InsertMeshMaterials(conn, transaction, projectId, materials, offset, SemanticRelationCommitBatchSize, advanceProgress);
+                saveProgress(conn, transaction);
+                transaction.Commit();
+            }
+        }
+
+        private static void InsertMaterialTexturesInChunks(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<SemanticMaterialTextureRelation> textures,
+            Action<string> advanceProgress,
+            Action<SqliteConnection, SqliteTransaction> saveProgress)
+        {
+            for (var offset = 0; offset < textures.Count; offset += SemanticRelationCommitBatchSize)
+            {
+                using var transaction = conn.BeginTransaction();
+                InsertMaterialTextures(conn, transaction, projectId, textures, offset, SemanticRelationCommitBatchSize, advanceProgress);
+                saveProgress(conn, transaction);
+                transaction.Commit();
+            }
+        }
+
         private static void InsertMeshRenderers(
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
-            IReadOnlyCollection<SemanticMeshRendererRelation> renderers,
+            IReadOnlyList<SemanticMeshRendererRelation> renderers,
+            int startIndex,
+            int count,
             Action<string>? advanceProgress = null)
         {
-            if (renderers.Count == 0)
+            if (renderers.Count == 0 || count <= 0)
             {
                 return;
             }
@@ -1444,9 +1697,10 @@ namespace AssetStudio.Avalonia
             var pDescription = cmd.Parameters.Add("@description", SqliteType.Text);
 
             pProjectId.Value = projectId;
-            var rowIndex = 0;
-            foreach (var renderer in renderers)
+            var endIndex = Math.Min(renderers.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
             {
+                var renderer = renderers[i];
                 pMeshAssetId.Value = renderer.MeshAssetId;
                 pRendererAssetId.Value = renderer.RendererAssetId;
                 pRendererType.Value = renderer.RendererType;
@@ -1454,8 +1708,7 @@ namespace AssetStudio.Avalonia
                 pGameObjectName.Value = renderer.GameObjectName;
                 pDescription.Value = renderer.Description;
                 cmd.ExecuteNonQuery();
-                rowIndex++;
-                advanceProgress?.Invoke($"Saving mesh renderers: {rowIndex:N0}/{renderers.Count:N0}");
+                advanceProgress?.Invoke($"Saving mesh renderers: {i + 1:N0}/{renderers.Count:N0}");
             }
         }
 
@@ -1463,10 +1716,12 @@ namespace AssetStudio.Avalonia
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
-            IReadOnlyCollection<SemanticMeshMaterialRelation> materials,
+            IReadOnlyList<SemanticMeshMaterialRelation> materials,
+            int startIndex,
+            int count,
             Action<string>? advanceProgress = null)
         {
-            if (materials.Count == 0)
+            if (materials.Count == 0 || count <= 0)
             {
                 return;
             }
@@ -1493,9 +1748,10 @@ namespace AssetStudio.Avalonia
             var pMaterialScore = cmd.Parameters.Add("@materialScore", SqliteType.Integer);
 
             pProjectId.Value = projectId;
-            var rowIndex = 0;
-            foreach (var material in materials)
+            var endIndex = Math.Min(materials.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
             {
+                var material = materials[i];
                 pMeshAssetId.Value = material.MeshAssetId;
                 pMaterialAssetId.Value = material.MaterialAssetId;
                 pRendererAssetId.Value = material.RendererAssetId;
@@ -1504,8 +1760,7 @@ namespace AssetStudio.Avalonia
                 pMaterialSlotIndex.Value = material.MaterialSlotIndex;
                 pMaterialScore.Value = material.MaterialScore;
                 cmd.ExecuteNonQuery();
-                rowIndex++;
-                advanceProgress?.Invoke($"Saving mesh materials: {rowIndex:N0}/{materials.Count:N0}");
+                advanceProgress?.Invoke($"Saving mesh materials: {i + 1:N0}/{materials.Count:N0}");
             }
         }
 
@@ -1513,10 +1768,12 @@ namespace AssetStudio.Avalonia
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
-            IReadOnlyCollection<SemanticMaterialTextureRelation> textures,
+            IReadOnlyList<SemanticMaterialTextureRelation> textures,
+            int startIndex,
+            int count,
             Action<string>? advanceProgress = null)
         {
-            if (textures.Count == 0)
+            if (textures.Count == 0 || count <= 0)
             {
                 return;
             }
@@ -1546,9 +1803,10 @@ namespace AssetStudio.Avalonia
             var pIsMainTexture = cmd.Parameters.Add("@isMainTexture", SqliteType.Integer);
 
             pProjectId.Value = projectId;
-            var rowIndex = 0;
-            foreach (var texture in textures)
+            var endIndex = Math.Min(textures.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
             {
+                var texture = textures[i];
                 pMaterialAssetId.Value = texture.MaterialAssetId;
                 pPreviewMaterialAssetId.Value = texture.PreviewMaterialAssetId;
                 pSlotName.Value = texture.SlotName;
@@ -1559,8 +1817,7 @@ namespace AssetStudio.Avalonia
                 pIsResolved.Value = texture.IsResolved ? 1 : 0;
                 pIsMainTexture.Value = texture.IsMainTexture ? 1 : 0;
                 cmd.ExecuteNonQuery();
-                rowIndex++;
-                advanceProgress?.Invoke($"Saving material textures: {rowIndex:N0}/{textures.Count:N0}");
+                advanceProgress?.Invoke($"Saving material textures: {i + 1:N0}/{textures.Count:N0}");
             }
         }
 
@@ -1777,6 +2034,257 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to load material texture relations from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        internal List<string> LoadAvatarMeshAssetIds(string folderPath, string signature, string avatarAssetId)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(avatarAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT ae.TargetAssetUniqueID
+                    FROM AssetEdges ae
+                    INNER JOIN Assets target
+                      ON target.ProjectId = ae.ProjectId
+                     AND target.UniqueID = ae.TargetAssetUniqueID
+                    WHERE ae.ProjectId = @projectId
+                      AND ae.SourceAssetUniqueID = @avatarAssetId
+                      AND ae.EdgeKind = 'Mesh'
+                      AND ae.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                      AND ae.TargetAssetUniqueID <> ''
+                      AND target.Type = @meshType
+                    GROUP BY ae.TargetAssetUniqueID
+                    ORDER BY MIN(ae.SlotIndex), MIN(target.Name), ae.TargetAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@avatarAssetId", avatarAssetId);
+                cmd.Parameters.AddWithValue("@meshType", (int)ClassIDType.Mesh);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(reader.GetString(0));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load avatar mesh relations from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        internal List<string> LoadMeshAvatarAssetIds(string folderPath, string signature, string meshAssetId)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(meshAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT ae.SourceAssetUniqueID
+                    FROM AssetEdges ae
+                    INNER JOIN Assets source
+                      ON source.ProjectId = ae.ProjectId
+                     AND source.UniqueID = ae.SourceAssetUniqueID
+                    WHERE ae.ProjectId = @projectId
+                      AND ae.TargetAssetUniqueID = @meshAssetId
+                      AND ae.EdgeKind = 'Mesh'
+                      AND ae.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                      AND ae.SourceAssetUniqueID <> ''
+                      AND source.Type = @avatarType
+                    GROUP BY ae.SourceAssetUniqueID
+                    ORDER BY MIN(ae.SlotIndex), MIN(source.Name), ae.SourceAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                cmd.Parameters.AddWithValue("@avatarType", (int)ClassIDType.Avatar);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(reader.GetString(0));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load mesh avatar relations from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        internal List<string> LoadAnimationClipAvatarAssetIds(string folderPath, string signature, string clipAssetId)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(clipAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    WITH AvatarCandidates AS (
+                        SELECT
+                            ae.TargetAssetUniqueID AS AvatarAssetId,
+                            ae.SlotIndex AS SortIndex
+                        FROM AssetEdges ae
+                        WHERE ae.ProjectId = @projectId
+                          AND ae.SourceAssetUniqueID = @clipAssetId
+                          AND ae.EdgeKind = 'Avatar'
+                          AND ae.SlotName IN ('AnimatorAvatar', 'CompatibleAvatar')
+                          AND ae.TargetAssetUniqueID <> ''
+                        UNION ALL
+                        SELECT
+                            avatarEdge.TargetAssetUniqueID AS AvatarAssetId,
+                            avatarEdge.SlotIndex AS SortIndex
+                        FROM AssetEdges clipEdge
+                        INNER JOIN AssetEdges avatarEdge
+                          ON avatarEdge.ProjectId = clipEdge.ProjectId
+                         AND avatarEdge.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
+                         AND avatarEdge.EdgeKind = 'Avatar'
+                         AND avatarEdge.TargetAssetUniqueID <> ''
+                        WHERE clipEdge.ProjectId = @projectId
+                          AND clipEdge.TargetAssetUniqueID = @clipAssetId
+                          AND clipEdge.EdgeKind = 'AnimationClip'
+                    )
+                    SELECT candidates.AvatarAssetId
+                    FROM AvatarCandidates candidates
+                    INNER JOIN Assets target
+                      ON target.ProjectId = @projectId
+                     AND target.UniqueID = candidates.AvatarAssetId
+                    WHERE target.Type = @avatarType
+                    GROUP BY candidates.AvatarAssetId
+                    ORDER BY MIN(candidates.SortIndex), MIN(target.Name), candidates.AvatarAssetId";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@clipAssetId", clipAssetId);
+                cmd.Parameters.AddWithValue("@avatarType", (int)ClassIDType.Avatar);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(reader.GetString(0));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load animation clip avatar relations from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        internal List<string> LoadAnimationClipMeshAssetIds(string folderPath, string signature, string clipAssetId)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(clipAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    WITH MeshCandidates AS (
+                        SELECT
+                            meshEdge.TargetAssetUniqueID AS MeshAssetId,
+                            meshEdge.SlotIndex AS SortIndex
+                        FROM AssetEdges clipEdge
+                        INNER JOIN AssetEdges meshEdge
+                          ON meshEdge.ProjectId = clipEdge.ProjectId
+                         AND meshEdge.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
+                         AND meshEdge.EdgeKind = 'Mesh'
+                         AND meshEdge.SlotName = 'AnimatorMesh'
+                         AND meshEdge.TargetAssetUniqueID <> ''
+                        WHERE clipEdge.ProjectId = @projectId
+                          AND clipEdge.TargetAssetUniqueID = @clipAssetId
+                          AND clipEdge.EdgeKind = 'AnimationClip'
+                        UNION ALL
+                        SELECT
+                            meshEdge.TargetAssetUniqueID AS MeshAssetId,
+                            meshEdge.SlotIndex AS SortIndex
+                        FROM AssetEdges clipAvatarEdge
+                        INNER JOIN AssetEdges meshEdge
+                          ON meshEdge.ProjectId = clipAvatarEdge.ProjectId
+                         AND meshEdge.SourceAssetUniqueID = clipAvatarEdge.TargetAssetUniqueID
+                         AND meshEdge.EdgeKind = 'Mesh'
+                         AND meshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                         AND meshEdge.TargetAssetUniqueID <> ''
+                        WHERE clipAvatarEdge.ProjectId = @projectId
+                          AND clipAvatarEdge.SourceAssetUniqueID = @clipAssetId
+                          AND clipAvatarEdge.EdgeKind = 'Avatar'
+                    )
+                    SELECT candidates.MeshAssetId
+                    FROM MeshCandidates candidates
+                    INNER JOIN Assets target
+                      ON target.ProjectId = @projectId
+                     AND target.UniqueID = candidates.MeshAssetId
+                    WHERE target.Type = @meshType
+                    GROUP BY candidates.MeshAssetId
+                    ORDER BY MIN(candidates.SortIndex), MIN(target.Name), candidates.MeshAssetId";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@clipAssetId", clipAssetId);
+                cmd.Parameters.AddWithValue("@meshType", (int)ClassIDType.Mesh);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(reader.GetString(0));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load animation clip mesh relations from SQLite: {ex.Message}");
             }
 
             return result;
