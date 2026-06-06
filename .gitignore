@@ -358,3 +358,7 @@ healthchecksdb
 TASKS.local.md
 
 .vscode/
+
+# Custom modifications and scrap directories
+scratch/
+annotations/

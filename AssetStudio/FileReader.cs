@@ -18,7 +18,7 @@ namespace AssetStudio
 
         public FileReader(string path) : this(path, File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { }
 
-        public FileReader(string path, Stream stream) : base(stream, EndianType.BigEndian)
+        public FileReader(string path, Stream stream) : base(DecryptionHelper.CheckAndDecryptStream(stream, path), EndianType.BigEndian)
         {
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
@@ -132,6 +132,15 @@ namespace AssetStudio
                 clone.cachedMemoryBuffer = cachedMemoryBuffer;
                 return clone;
             }
+            else if (BaseStream is DecryptedStream decStream)
+            {
+                var clonedUnderlying = CloneStream(decStream.BaseStream);
+                var newDecStream = new DecryptedStream(clonedUnderlying, decStream.Token);
+                newDecStream.Position = decStream.Position;
+                var clone = new FileReader(FullPath, newDecStream);
+                clone.Endian = Endian;
+                return clone;
+            }
             else if (BaseStream is SubStream subStream)
             {
                 var newStream = new SubStream(subStream.FilePath, subStream.Offset, subStream.Length);
@@ -166,6 +175,34 @@ namespace AssetStudio
                     throw new System.NotSupportedException($"Cloning stream type {BaseStream.GetType().Name} failed.", ex);
                 }
             }
+        }
+
+        private Stream CloneStream(Stream src)
+        {
+            if (src is MemoryStream memStream)
+            {
+                if (memStream.TryGetBuffer(out var segment) && segment.Array != null)
+                {
+                    return new MemoryStream(segment.Array, segment.Offset, segment.Count, false, true);
+                }
+                return new MemoryStream(memStream.ToArray(), 0, (int)memStream.Length, false, true);
+            }
+            if (src is SubStream subStream)
+            {
+                return new SubStream(subStream.FilePath, subStream.Offset, subStream.Length);
+            }
+            if (src is FileStream fileStream)
+            {
+                return File.Open(fileStream.Name, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            }
+            
+            var temp = new MemoryStream();
+            var pos = src.Position;
+            src.Position = 0;
+            src.CopyTo(temp);
+            src.Position = pos;
+            temp.Position = pos;
+            return temp;
         }
     }
 }
