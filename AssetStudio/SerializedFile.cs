@@ -19,6 +19,7 @@ namespace AssetStudio
         public List<Object> Objects;
         public Dictionary<long, Object> ObjectsDic;
         public Dictionary<long, ObjectInfo> ObjectInfoDic;
+        private readonly object objectCollectionLock = new object();
 
         public SerializedFileHeader header;
         private byte m_FileEndianess;
@@ -383,7 +384,7 @@ namespace AssetStudio
 
         public void AddObject(Object obj)
         {
-            lock (this)
+            lock (objectCollectionLock)
             {
                 if (ObjectsDic.ContainsKey(obj.m_PathID))
                 {
@@ -392,6 +393,23 @@ namespace AssetStudio
 
                 Objects.Add(obj);
                 ObjectsDic.Add(obj.m_PathID, obj);
+            }
+        }
+
+        public bool TryGetObject(long pathID, out Object obj)
+        {
+            lock (objectCollectionLock)
+            {
+                return ObjectsDic.TryGetValue(pathID, out obj);
+            }
+        }
+
+        public void RemoveObject(Object obj)
+        {
+            lock (objectCollectionLock)
+            {
+                Objects.Remove(obj);
+                ObjectsDic.Remove(obj.m_PathID);
             }
         }
 

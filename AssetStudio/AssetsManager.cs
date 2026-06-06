@@ -59,6 +59,8 @@ namespace AssetStudio
         private const double DefaultLazyLoadThreadRatio = 0.4;
         private const double DefaultLazyReadThreadRatio = 0.4;
         private const int DefaultMemoryLimitPercent = 90;
+        private static readonly ConcurrentDictionary<string, int> ConfiguredThreadCountCache = new ConcurrentDictionary<string, int>();
+        private static readonly ConcurrentDictionary<string, int> ConfiguredThreadCountOrDefaultCache = new ConcurrentDictionary<string, int>();
         private static readonly int DefaultLazyLoadThreadCount = GetConfiguredThreadCount("ASSETSTUDIO_LAZY_LOAD_THREADS", DefaultLazyLoadThreadRatio);
         private static readonly int DefaultLazyReadThreadCount = GetConfiguredThreadCount("ASSETSTUDIO_LAZY_READ_THREADS", DefaultLazyReadThreadRatio);
 #if NET6_0_OR_GREATER
@@ -1184,20 +1186,18 @@ namespace AssetStudio
                         var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                         var obj = CreateObjectFromReader(objectReader);
 
-                        lock (assetsFile)
+                        if (assetsFile.TryGetObject(obj.m_PathID, out var existing))
                         {
-                            if (assetsFile.ObjectsDic.TryGetValue(obj.m_PathID, out var existing))
+                            handle.RealObject = existing;
+                            if (LazyLoading)
                             {
-                                handle.RealObject = existing;
-                                if (LazyLoading)
-                                {
-                                    LruCache.RecordAccess(handle);
-                                }
-                                return existing;
+                                LruCache.RecordAccess(handle);
                             }
-                            handle.RealObject = obj;
-                            assetsFile.AddObject(obj);
+                            return existing;
                         }
+
+                        handle.RealObject = obj;
+                        assetsFile.AddObject(obj);
 
                         if (LazyLoading)
                         {
@@ -1325,11 +1325,7 @@ namespace AssetStudio
 
                                     var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                                     
-                                    ClassIDType type = ClassIDType.UnknownType;
-                                    if (Enum.IsDefined(typeof(ClassIDType), objectInfo.classID))
-                                    {
-                                        type = (ClassIDType)objectInfo.classID;
-                                    }
+                                    var type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
 
                                     var handle = new AssetHandle
                                     {
@@ -1506,6 +1502,12 @@ namespace AssetStudio
 
         public static int GetConfiguredThreadCount(string environmentVariable, double defaultRatio)
         {
+            var cacheKey = environmentVariable + "\u001f" + defaultRatio.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+            return ConfiguredThreadCountCache.GetOrAdd(cacheKey, _ => ComputeConfiguredThreadCount(environmentVariable, defaultRatio));
+        }
+
+        private static int ComputeConfiguredThreadCount(string environmentVariable, double defaultRatio)
+        {
             var value = Environment.GetEnvironmentVariable(environmentVariable);
             if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
             {
@@ -1547,6 +1549,12 @@ namespace AssetStudio
         }
 
         private static int GetConfiguredThreadCountOrDefault(string environmentVariable, int defaultValue)
+        {
+            var cacheKey = environmentVariable + "\u001f" + defaultValue.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return ConfiguredThreadCountOrDefaultCache.GetOrAdd(cacheKey, _ => ComputeConfiguredThreadCountOrDefault(environmentVariable, defaultValue));
+        }
+
+        private static int ComputeConfiguredThreadCountOrDefault(string environmentVariable, int defaultValue)
         {
             var value = Environment.GetEnvironmentVariable(environmentVariable);
             if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
@@ -1986,11 +1994,7 @@ namespace AssetStudio
                         var assetsFile = handle.SourceFile;
                         if (assetsFile != null)
                         {
-                            lock (assetsFile)
-                            {
-                                assetsFile.Objects.Remove(obj);
-                                assetsFile.ObjectsDic.Remove(obj.m_PathID);
-                            }
+                            assetsFile.RemoveObject(obj);
                         }
                     }
                 }

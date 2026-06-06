@@ -1111,8 +1111,8 @@ public partial class MainWindow : Window
         if (!string.IsNullOrEmpty(rootNode?.m_Type))
             return rootNode.m_Type;
 
-        return Enum.IsDefined(typeof(ClassIDType), type.classID)
-            ? ((ClassIDType)type.classID).ToString()
+        return ClassIDTypeHelper.IsDefined(type.classID)
+            ? ClassIDTypeHelper.FromClassId(type.classID).ToString()
             : $"Class {type.classID}";
     }
 
@@ -11019,11 +11019,7 @@ public partial class MainWindow : Window
                 var assetsFile = handle.SourceFile;
                 if (assetsFile != null)
                 {
-                    lock (assetsFile)
-                    {
-                        assetsFile.Objects.Remove(obj);
-                        assetsFile.ObjectsDic.Remove(obj.m_PathID);
-                    }
+                    assetsFile.RemoveObject(obj);
                 }
             }
         }

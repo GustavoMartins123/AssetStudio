@@ -12,26 +12,63 @@ namespace AssetStudio.Avalonia
     {
         private const int SemanticSchemaVersion = 5;
         private static readonly object WriteGate = new object();
-        private readonly string _dbPath;
-
-        private readonly Task _initTask;
+        private readonly string _cacheDir;
+        private readonly HashSet<string> _initializedDbs = new();
+        private readonly object _initLock = new object();
 
         public SQLiteProjectIndexCache()
         {
-            var cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
-            Directory.CreateDirectory(cacheDir);
-            _dbPath = Path.Combine(cacheDir, "project_index.db");
-            _initTask = Task.Run(InitializeDatabase);
+            _cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
+            Directory.CreateDirectory(_cacheDir);
         }
 
-        private void EnsureInitialized()
+        private static string GetFolderCacheKey(string folderPath)
         {
-            _initTask.Wait();
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return string.Empty;
+            }
+            try
+            {
+                var normalized = Path.GetFullPath(folderPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                using var md5 = System.Security.Cryptography.MD5.Create();
+                var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(normalized));
+                return Convert.ToHexString(hashBytes).ToLowerInvariant();
+            }
+            catch
+            {
+                var normalized = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                using var md5 = System.Security.Cryptography.MD5.Create();
+                var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(normalized));
+                return Convert.ToHexString(hashBytes).ToLowerInvariant();
+            }
         }
 
-        private SqliteConnection CreateConnection()
+        private string GetDbPath(string folderPath)
         {
-            var conn = new SqliteConnection($"Data Source={_dbPath}");
+            var folderKey = GetFolderCacheKey(folderPath);
+            return Path.Combine(_cacheDir, $"project_index_{folderKey}.db");
+        }
+
+        private void EnsureInitialized(string folderPath)
+        {
+            var dbPath = GetDbPath(folderPath);
+            lock (_initLock)
+            {
+                if (_initializedDbs.Contains(dbPath))
+                {
+                    return;
+                }
+
+                InitializeDatabase(folderPath);
+                _initializedDbs.Add(dbPath);
+            }
+        }
+
+        private SqliteConnection CreateConnection(string folderPath)
+        {
+            var dbPath = GetDbPath(folderPath);
+            var conn = new SqliteConnection($"Data Source={dbPath}");
             conn.DefaultTimeout = 60;
             conn.Open();
             using var pragma = conn.CreateCommand();
@@ -40,13 +77,13 @@ namespace AssetStudio.Avalonia
             return conn;
         }
 
-        private void InitializeDatabase()
+        private void InitializeDatabase(string folderPath)
         {
             try
             {
                 lock (WriteGate)
                 {
-                    using (var conn = CreateConnection())
+                    using (var conn = CreateConnection(folderPath))
                     {
                         using (var pragma = conn.CreateCommand())
                         {
@@ -67,7 +104,7 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
-                Logger.Error($"Failed to initialize SQLite database cache: {ex.Message}", ex);
+                Logger.Error($"Failed to initialize SQLite database cache for {folderPath}: {ex.Message}", ex);
             }
         }
 
@@ -342,10 +379,10 @@ namespace AssetStudio.Avalonia
 
         public List<AssetHandle>? LoadIndexCache(string folderPath, string signature)
         {
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using (var conn = CreateConnection())
+                using (var conn = CreateConnection(folderPath))
                 {
                     long? projectId = null;
                     using (var cmd = conn.CreateCommand())
@@ -413,7 +450,7 @@ namespace AssetStudio.Avalonia
             bool preserveSemanticRelations = false,
             Action<int, int, string>? progress = null)
         {
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
                 var handleList = handles?.ToList() ?? new List<AssetHandle>();
@@ -455,7 +492,7 @@ namespace AssetStudio.Avalonia
                 lock (WriteGate)
                 {
                     ReportProgress("Opening SQLite connection", force: true);
-                    using (var conn = CreateConnection())
+                    using (var conn = CreateConnection(folderPath))
                     {
                         using (var transaction = conn.BeginTransaction())
                         {
@@ -557,9 +594,15 @@ namespace AssetStudio.Avalonia
 
             using (var deleteOldCmd = conn.CreateCommand())
             {
+                var path1 = folderPath;
+                var path2 = path1.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 deleteOldCmd.Transaction = transaction;
-                deleteOldCmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path";
-                deleteOldCmd.Parameters.AddWithValue("@path", folderPath);
+                deleteOldCmd.CommandText = @"
+                    DELETE FROM Projects
+                    WHERE FolderPath = @path1 COLLATE NOCASE
+                       OR FolderPath = @path2 COLLATE NOCASE";
+                deleteOldCmd.Parameters.AddWithValue("@path1", path1);
+                deleteOldCmd.Parameters.AddWithValue("@path2", path2);
                 deleteOldCmd.ExecuteNonQuery();
             }
 
@@ -739,7 +782,7 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
                 var totalWork = Math.Max(1,
@@ -787,7 +830,7 @@ namespace AssetStudio.Avalonia
                 lock (WriteGate)
                 {
                     ReportProgress("Opening SQLite connection", force: true);
-                    using var conn = CreateConnection();
+                    using var conn = CreateConnection(folderPath);
                     using var transaction = conn.BeginTransaction();
                     ReportProgress("Resolving project row", force: true);
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
@@ -830,12 +873,12 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection();
+                    using var conn = CreateConnection(folderPath);
                     using var transaction = conn.BeginTransaction();
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
                     if (projectId == null)
@@ -860,10 +903,10 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection();
+                using var conn = CreateConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -915,10 +958,17 @@ namespace AssetStudio.Avalonia
 
         private static long? FindProjectId(SqliteConnection conn, SqliteTransaction transaction, string folderPath, string signature)
         {
+            var path1 = folderPath;
+            var path2 = path1.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
-            cmd.CommandText = "SELECT Id FROM Projects WHERE FolderPath = @path AND SignatureHash = @signature LIMIT 1";
-            cmd.Parameters.AddWithValue("@path", folderPath);
+            cmd.CommandText = @"
+                SELECT Id FROM Projects
+                WHERE (FolderPath = @path1 COLLATE NOCASE OR FolderPath = @path2 COLLATE NOCASE)
+                  AND SignatureHash = @signature
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@path1", path1);
+            cmd.Parameters.AddWithValue("@path2", path2);
             cmd.Parameters.AddWithValue("@signature", signature);
             var id = cmd.ExecuteScalar();
             return id == null ? null : Convert.ToInt64(id);
@@ -952,12 +1002,12 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection();
+                    using var conn = CreateConnection(folderPath);
                     using var transaction = conn.BeginTransaction();
                     var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
 
@@ -1052,10 +1102,10 @@ namespace AssetStudio.Avalonia
                 return null;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection();
+                using var conn = CreateConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -1085,10 +1135,10 @@ namespace AssetStudio.Avalonia
                 return null;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection();
+                using var conn = CreateConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindLatestProjectId(conn, transaction, folderPath);
                 if (projectId == null)
@@ -1522,10 +1572,10 @@ namespace AssetStudio.Avalonia
                 return result;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection();
+                using var conn = CreateConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -1653,10 +1703,10 @@ namespace AssetStudio.Avalonia
                 return result;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection();
+                using var conn = CreateConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -1745,10 +1795,10 @@ namespace AssetStudio.Avalonia
                 return null;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection();
+                using var conn = CreateConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -1814,12 +1864,12 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            EnsureInitialized();
+            EnsureInitialized(folderPath);
             try
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection();
+                    using var conn = CreateConnection(folderPath);
                     using var transaction = conn.BeginTransaction();
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
                     if (projectId == null)
@@ -1866,45 +1916,42 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            var fullPath = GetFullPathOrOriginal(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            var walPath = dbPath + "-wal";
+            var shmPath = dbPath + "-shm";
 
-            EnsureInitialized();
             try
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection();
-                    using var transaction = conn.BeginTransaction();
-
-                    using (var cmd = conn.CreateCommand())
+                    // Force close any pooled connections to this database first
+                    using (var conn = new SqliteConnection($"Data Source={dbPath}"))
                     {
-                        cmd.Transaction = transaction;
-                        cmd.CommandText = @"
-                            DELETE FROM AssetHandles
-                            WHERE ProjectId IN (
-                                SELECT Id FROM Projects
-                                WHERE FolderPath = @path OR FolderPath = @fullPath
-                            )";
-                        cmd.Parameters.AddWithValue("@path", folderPath);
-                        cmd.Parameters.AddWithValue("@fullPath", fullPath);
-                        cmd.ExecuteNonQuery();
+                        SqliteConnection.ClearPool(conn);
                     }
 
-                    using (var cmd = conn.CreateCommand())
+                    if (File.Exists(dbPath))
                     {
-                        cmd.Transaction = transaction;
-                        cmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path OR FolderPath = @fullPath";
-                        cmd.Parameters.AddWithValue("@path", folderPath);
-                        cmd.Parameters.AddWithValue("@fullPath", fullPath);
-                        cmd.ExecuteNonQuery();
+                        File.Delete(dbPath);
+                    }
+                    if (File.Exists(walPath))
+                    {
+                        File.Delete(walPath);
+                    }
+                    if (File.Exists(shmPath))
+                    {
+                        File.Delete(shmPath);
                     }
 
-                    transaction.Commit();
+                    lock (_initLock)
+                    {
+                        _initializedDbs.Remove(dbPath);
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Logger.Warning($"Failed to delete SQLite index cache: {ex.Message}");
+                Logger.Warning($"Failed to delete SQLite index cache files for {folderPath}: {ex.Message}");
             }
         }
 

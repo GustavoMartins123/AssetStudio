@@ -26,14 +26,7 @@ namespace AssetStudio
             m_PathID = objectInfo.m_PathID;
             byteStart = objectInfo.byteStart;
             byteSize = objectInfo.byteSize;
-            if (Enum.IsDefined(typeof(ClassIDType), objectInfo.classID))
-            {
-                type = (ClassIDType)objectInfo.classID;
-            }
-            else
-            {
-                type = ClassIDType.UnknownType;
-            }
+            type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
             serializedType = objectInfo.serializedType;
             platform = assetsFile.m_TargetPlatform;
             m_Version = assetsFile.header.m_Version;

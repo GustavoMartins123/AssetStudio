@@ -3,6 +3,7 @@ using K4os.Compression.LZ4;
 using System;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 
 namespace AssetStudio
 {
@@ -311,7 +312,7 @@ namespace AssetStudio
                 try
                 {
                     var fileInfo = new FileInfo(path);
-                    var cachedFileName = $"{SanitizeTempFilePart(Path.GetFileName(path))}_{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}.blocks";
+                    var cachedFileName = CreatePersistentBlocksCacheFileName(path, fileInfo.Length);
                     var cachedFilePath = Path.Combine(CacheDirectory, cachedFileName);
 
                     Directory.CreateDirectory(CacheDirectory);
@@ -437,6 +438,26 @@ namespace AssetStudio
                 }
             }
             return new string(chars);
+        }
+
+        private static string CreatePersistentBlocksCacheFileName(string path, long sourceLength)
+        {
+            var sourceHash = ComputeSourceContentHash(path);
+            return $"{SanitizeTempFilePart(Path.GetFileName(path))}_{sourceLength}_{sourceHash}.blocks";
+        }
+
+        private static string ComputeSourceContentHash(string path)
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                1024 * 1024,
+                FileOptions.SequentialScan);
+            using var sha256 = SHA256.Create();
+            var hash = sha256.ComputeHash(stream);
+            return BitConverter.ToString(hash, 0, 16).Replace("-", string.Empty).ToLowerInvariant();
         }
 
         private void ReadBlocksAndDirectory(EndianBinaryReader reader, Stream blocksStream)

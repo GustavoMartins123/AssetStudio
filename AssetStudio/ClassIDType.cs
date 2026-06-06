@@ -1,3 +1,6 @@
+using System;
+using System.Collections.Generic;
+
 // official Class ID Reference: https://docs.unity3d.com/Manual/ClassIDReference.html
 namespace AssetStudio
 {
@@ -375,5 +378,32 @@ namespace AssetStudio
         VisualEffect = 2083052967,
         LocalizationAsset = 2083778819,
         ScriptedImporter = 2089858483
+    }
+
+    public static class ClassIDTypeHelper
+    {
+        private static readonly HashSet<int> DefinedValues = BuildDefinedValues();
+
+        public static ClassIDType FromClassId(int classId)
+        {
+            return DefinedValues.Contains(classId)
+                ? (ClassIDType)classId
+                : ClassIDType.UnknownType;
+        }
+
+        public static bool IsDefined(int classId)
+        {
+            return DefinedValues.Contains(classId);
+        }
+
+        private static HashSet<int> BuildDefinedValues()
+        {
+            var values = new HashSet<int>();
+            foreach (ClassIDType value in Enum.GetValues(typeof(ClassIDType)))
+            {
+                values.Add((int)value);
+            }
+            return values;
+        }
     }
 }

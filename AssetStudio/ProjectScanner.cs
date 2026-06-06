@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -293,43 +294,50 @@ namespace AssetStudio
                 return result;
 
             var headerSize = (int)Math.Min(128, fileSize);
-            var header = new byte[headerSize];
-            int read;
-            using (var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            var header = ArrayPool<byte>.Shared.Rent(headerSize);
+            try
             {
-                read = stream.Read(header, 0, header.Length);
-            }
-
-            string detectedSignature = null;
-            if (StartsWithAscii(header, read, "UnityFS"))
-                detectedSignature = "UnityFS";
-            else if (StartsWithAscii(header, read, "UnityWeb"))
-                detectedSignature = "UnityWeb";
-            else if (StartsWithAscii(header, read, "UnityRaw"))
-                detectedSignature = "UnityRaw";
-            else if (StartsWithAscii(header, read, "UnityArchive"))
-                detectedSignature = "UnityArchive";
-
-            if (detectedSignature != null)
-            {
-                result.Kind = ProjectFileKind.UnityBundle;
-                result.BundleSignature = detectedSignature;
-
-                int pos = detectedSignature.Length + 1; // signature + null terminator
-                if (pos + 4 <= read)
+                int read;
+                using (var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
-                    result.BundleVersion = (uint)ReadUInt32BigEndian(header, pos);
-                    pos += 4;
-                    result.BundleUnityVersion = ReadNullTerminatedAscii(header, read, pos);
+                    read = stream.Read(header, 0, headerSize);
                 }
 
-                return result;
-            }
+                string detectedSignature = null;
+                if (StartsWithAscii(header, read, "UnityFS"))
+                    detectedSignature = "UnityFS";
+                else if (StartsWithAscii(header, read, "UnityWeb"))
+                    detectedSignature = "UnityWeb";
+                else if (StartsWithAscii(header, read, "UnityRaw"))
+                    detectedSignature = "UnityRaw";
+                else if (StartsWithAscii(header, read, "UnityArchive"))
+                    detectedSignature = "UnityArchive";
 
-            if (IsSerializedFileHeader(header, read, fileSize))
+                if (detectedSignature != null)
+                {
+                    result.Kind = ProjectFileKind.UnityBundle;
+                    result.BundleSignature = detectedSignature;
+
+                    int pos = detectedSignature.Length + 1; // signature + null terminator
+                    if (pos + 4 <= read)
+                    {
+                        result.BundleVersion = (uint)ReadUInt32BigEndian(header, pos);
+                        pos += 4;
+                        result.BundleUnityVersion = ReadNullTerminatedAscii(header, read, pos);
+                    }
+
+                    return result;
+                }
+
+                if (IsSerializedFileHeader(header, read, fileSize))
+                {
+                    result.Kind = ProjectFileKind.SerializedFile;
+                    return result;
+                }
+            }
+            finally
             {
-                result.Kind = ProjectFileKind.SerializedFile;
-                return result;
+                ArrayPool<byte>.Shared.Return(header);
             }
 
             var extension = Path.GetExtension(path);
