@@ -11,6 +11,7 @@ namespace AssetStudio.Avalonia
     public class SQLiteProjectIndexCache
     {
         private const int SemanticSchemaVersion = 5;
+        private static readonly object WriteGate = new object();
         private readonly string _dbPath;
 
         private readonly Task _initTask;
@@ -43,28 +44,36 @@ namespace AssetStudio.Avalonia
         {
             try
             {
-                using (var conn = CreateConnection())
+                lock (WriteGate)
                 {
-                    using (var pragma = conn.CreateCommand())
+                    using (var conn = CreateConnection())
                     {
-                        pragma.CommandText = @"
-                            PRAGMA journal_mode = WAL;
-                            PRAGMA synchronous = NORMAL;";
-                        pragma.ExecuteNonQuery();
-                    }
+                        using (var pragma = conn.CreateCommand())
+                        {
+                            pragma.CommandText = @"
+                                PRAGMA journal_mode = WAL;
+                                PRAGMA synchronous = NORMAL;";
+                            pragma.ExecuteNonQuery();
+                        }
 
-                    if (ShouldRebuildSchema(conn))
-                    {
-                        RebuildSchema(conn);
-                    }
+                        if (ShouldRebuildSchema(conn))
+                        {
+                            RebuildSchema(conn);
+                        }
 
-                    CreateSchema(conn);
+                        CreateSchema(conn);
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Logger.Error($"Failed to initialize SQLite database cache: {ex.Message}", ex);
             }
+        }
+
+        private static bool IsDatabaseBusy(SqliteException ex)
+        {
+            return ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6;
         }
 
         private static bool ShouldRebuildSchema(SqliteConnection conn)
@@ -334,14 +343,6 @@ namespace AssetStudio.Avalonia
                         return null;
                     }
 
-                    // Update LastIndexed timestamp
-                    using (var cmd = conn.CreateCommand())
-                    {
-                        cmd.CommandText = "UPDATE Projects SET LastIndexed = CURRENT_TIMESTAMP WHERE Id = @id";
-                        cmd.Parameters.AddWithValue("@id", projectId.Value);
-                        cmd.ExecuteNonQuery();
-                    }
-
                     var handles = new List<AssetHandle>();
                     using (var cmd = conn.CreateCommand())
                     {
@@ -391,54 +392,57 @@ namespace AssetStudio.Avalonia
             try
             {
                 var handleList = handles?.ToList() ?? new List<AssetHandle>();
-                using (var conn = CreateConnection())
+                lock (WriteGate)
                 {
-                    using (var transaction = conn.BeginTransaction())
+                    using (var conn = CreateConnection())
                     {
-                        var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
-                        ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
-
-                        // Insert handles in batch using parameterized query
-                        using (var cmd = conn.CreateCommand())
+                        using (var transaction = conn.BeginTransaction())
                         {
-                            cmd.CommandText = @"
-                                INSERT INTO AssetHandles (ProjectId, UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize)
-                                VALUES (@projectId, @uniqueId, @name, @type, @container, @originalPath, @serializedFile, @pathId, @byteStart, @byteSize)";
-                            cmd.Transaction = transaction;
+                            var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
+                            ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
 
-                            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
-                            var pUniqueId = cmd.Parameters.Add("@uniqueId", SqliteType.Text);
-                            var pName = cmd.Parameters.Add("@name", SqliteType.Text);
-                            var pType = cmd.Parameters.Add("@type", SqliteType.Integer);
-                            var pContainer = cmd.Parameters.Add("@container", SqliteType.Text);
-                            var pOriginalPath = cmd.Parameters.Add("@originalPath", SqliteType.Text);
-                            var pSerializedFile = cmd.Parameters.Add("@serializedFile", SqliteType.Text);
-                            var pPathId = cmd.Parameters.Add("@pathId", SqliteType.Integer);
-                            var pByteStart = cmd.Parameters.Add("@byteStart", SqliteType.Integer);
-                            var pByteSize = cmd.Parameters.Add("@byteSize", SqliteType.Integer);
-
-                            pProjectId.Value = projectId;
-
-                            foreach (var h in handleList)
+                            // Insert handles in batch using parameterized query
+                            using (var cmd = conn.CreateCommand())
                             {
-                                pUniqueId.Value = h.UniqueID ?? string.Empty;
-                                pName.Value = h.Name ?? string.Empty;
-                                pType.Value = (int)h.Type;
-                                pContainer.Value = h.Container ?? (object)DBNull.Value;
-                                pOriginalPath.Value = h.OriginalPath ?? (object)DBNull.Value;
-                                pSerializedFile.Value = h.SerializedFileName ?? (object)DBNull.Value;
-                                pPathId.Value = h.PathID;
-                                pByteStart.Value = h.ByteStart;
-                                pByteSize.Value = h.ByteSize;
+                                cmd.CommandText = @"
+                                    INSERT INTO AssetHandles (ProjectId, UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize)
+                                    VALUES (@projectId, @uniqueId, @name, @type, @container, @originalPath, @serializedFile, @pathId, @byteStart, @byteSize)";
+                                cmd.Transaction = transaction;
 
-                                cmd.ExecuteNonQuery();
+                                var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+                                var pUniqueId = cmd.Parameters.Add("@uniqueId", SqliteType.Text);
+                                var pName = cmd.Parameters.Add("@name", SqliteType.Text);
+                                var pType = cmd.Parameters.Add("@type", SqliteType.Integer);
+                                var pContainer = cmd.Parameters.Add("@container", SqliteType.Text);
+                                var pOriginalPath = cmd.Parameters.Add("@originalPath", SqliteType.Text);
+                                var pSerializedFile = cmd.Parameters.Add("@serializedFile", SqliteType.Text);
+                                var pPathId = cmd.Parameters.Add("@pathId", SqliteType.Integer);
+                                var pByteStart = cmd.Parameters.Add("@byteStart", SqliteType.Integer);
+                                var pByteSize = cmd.Parameters.Add("@byteSize", SqliteType.Integer);
+
+                                pProjectId.Value = projectId;
+
+                                foreach (var h in handleList)
+                                {
+                                    pUniqueId.Value = h.UniqueID ?? string.Empty;
+                                    pName.Value = h.Name ?? string.Empty;
+                                    pType.Value = (int)h.Type;
+                                    pContainer.Value = h.Container ?? (object)DBNull.Value;
+                                    pOriginalPath.Value = h.OriginalPath ?? (object)DBNull.Value;
+                                    pSerializedFile.Value = h.SerializedFileName ?? (object)DBNull.Value;
+                                    pPathId.Value = h.PathID;
+                                    pByteStart.Value = h.ByteStart;
+                                    pByteSize.Value = h.ByteSize;
+
+                                    cmd.ExecuteNonQuery();
+                                }
                             }
+
+                            InsertSourceFilesAndAssets(conn, transaction, projectId, handleList);
+
+                            transaction.Commit();
+                            Logger.Info($"Saved index cache in SQLite for: {folderPath}");
                         }
-
-                        InsertSourceFilesAndAssets(conn, transaction, projectId, handleList);
-
-                        transaction.Commit();
-                        Logger.Info($"Saved index cache in SQLite for: {folderPath}");
                     }
                 }
             }
@@ -648,27 +652,30 @@ namespace AssetStudio.Avalonia
             EnsureInitialized();
             try
             {
-                using var conn = CreateConnection();
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
-                if (projectId == null)
+                lock (WriteGate)
                 {
-                    return false;
+                    using var conn = CreateConnection();
+                    using var transaction = conn.BeginTransaction();
+                    var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                    if (projectId == null)
+                    {
+                        return false;
+                    }
+
+                    if (replaceExisting)
+                    {
+                        ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
+                    }
+
+                    InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles);
+                    InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges);
+                    InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers);
+                    InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials);
+                    InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures);
+
+                    transaction.Commit();
+                    return true;
                 }
-
-                if (replaceExisting)
-                {
-                    ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
-                }
-
-                InsertSemanticSourceFiles(conn, transaction, projectId.Value, relations.SourceFiles);
-                InsertAssetEdges(conn, transaction, projectId.Value, relations.AssetEdges);
-                InsertMeshRenderers(conn, transaction, projectId.Value, relations.MeshRenderers);
-                InsertMeshMaterials(conn, transaction, projectId.Value, relations.MeshMaterials);
-                InsertMaterialTextures(conn, transaction, projectId.Value, relations.MaterialTextures);
-
-                transaction.Commit();
-                return true;
             }
             catch (Exception ex)
             {
@@ -687,16 +694,19 @@ namespace AssetStudio.Avalonia
             EnsureInitialized();
             try
             {
-                using var conn = CreateConnection();
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
-                if (projectId == null)
+                lock (WriteGate)
                 {
-                    return;
-                }
+                    using var conn = CreateConnection();
+                    using var transaction = conn.BeginTransaction();
+                    var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                    if (projectId == null)
+                    {
+                        return;
+                    }
 
-                ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
-                transaction.Commit();
+                    ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
+                    transaction.Commit();
+                }
             }
             catch (Exception ex)
             {
@@ -727,6 +737,10 @@ namespace AssetStudio.Avalonia
                 var count = CountMaterialSemanticRelations(conn, transaction, projectId.Value);
                 transaction.Commit();
                 return count > 0;
+            }
+            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+            {
+                return false;
             }
             catch (Exception ex)
             {
@@ -797,86 +811,89 @@ namespace AssetStudio.Avalonia
             EnsureInitialized();
             try
             {
-                using var conn = CreateConnection();
-                using var transaction = conn.BeginTransaction();
-                var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
-
-                if (update.ProcessedFiles == 0
-                    && update.NewlyReadFiles.Count == 0
-                    && string.Equals(update.Status, "running", StringComparison.OrdinalIgnoreCase))
+                lock (WriteGate)
                 {
-                    using var clearCmd = conn.CreateCommand();
-                    clearCmd.Transaction = transaction;
-                    clearCmd.CommandText = "DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId";
-                    clearCmd.Parameters.AddWithValue("@projectId", projectId);
-                    clearCmd.ExecuteNonQuery();
-                }
+                    using var conn = CreateConnection();
+                    using var transaction = conn.BeginTransaction();
+                    var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
 
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        INSERT INTO ProjectIndexingState (
-                            ProjectId, Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
-                            CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt)
-                        VALUES (
-                            @projectId, @status, @totalFiles, @processedFiles, @pendingFiles, @percentComplete,
-                            @currentFile, @lastReadFile, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, @completedAt)
-                        ON CONFLICT(ProjectId)
-                        DO UPDATE SET
-                            Status = excluded.Status,
-                            TotalFiles = excluded.TotalFiles,
-                            ProcessedFiles = excluded.ProcessedFiles,
-                            PendingFiles = excluded.PendingFiles,
-                            PercentComplete = excluded.PercentComplete,
-                            CurrentFile = excluded.CurrentFile,
-                            LastReadFile = excluded.LastReadFile,
-                            UpdatedAt = CURRENT_TIMESTAMP,
-                            CompletedAt = excluded.CompletedAt";
-                    cmd.Parameters.AddWithValue("@projectId", projectId);
-                    cmd.Parameters.AddWithValue("@status", update.Status ?? string.Empty);
-                    cmd.Parameters.AddWithValue("@totalFiles", update.TotalFiles);
-                    cmd.Parameters.AddWithValue("@processedFiles", update.ProcessedFiles);
-                    cmd.Parameters.AddWithValue("@pendingFiles", update.PendingFiles);
-                    cmd.Parameters.AddWithValue("@percentComplete", update.PercentComplete);
-                    cmd.Parameters.AddWithValue("@currentFile", update.CurrentFile ?? string.Empty);
-                    cmd.Parameters.AddWithValue("@lastReadFile", update.LastReadFile ?? string.Empty);
-                    cmd.Parameters.AddWithValue("@completedAt", IsTerminalIndexingStatus(update.Status) ? DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss") : DBNull.Value);
-                    cmd.ExecuteNonQuery();
-                }
-
-                if (update.NewlyReadFiles.Count > 0)
-                {
-                    using var cmd = conn.CreateCommand();
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        INSERT INTO IndexingReadFiles (ProjectId, FilePath, FileName, ReadOrder, Status)
-                        VALUES (@projectId, @filePath, @fileName, @readOrder, 'read')
-                        ON CONFLICT(ProjectId, FilePath)
-                        DO UPDATE SET
-                            FileName = excluded.FileName,
-                            ReadOrder = excluded.ReadOrder,
-                            ReadAt = CURRENT_TIMESTAMP,
-                            Status = excluded.Status";
-
-                    var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
-                    var pFilePath = cmd.Parameters.Add("@filePath", SqliteType.Text);
-                    var pFileName = cmd.Parameters.Add("@fileName", SqliteType.Text);
-                    var pReadOrder = cmd.Parameters.Add("@readOrder", SqliteType.Integer);
-                    pProjectId.Value = projectId;
-
-                    var firstReadOrder = Math.Max(1, update.ProcessedFiles - update.NewlyReadFiles.Count + 1);
-                    for (var i = 0; i < update.NewlyReadFiles.Count; i++)
+                    if (update.ProcessedFiles == 0
+                        && update.NewlyReadFiles.Count == 0
+                        && string.Equals(update.Status, "running", StringComparison.OrdinalIgnoreCase))
                     {
-                        var filePath = update.NewlyReadFiles[i] ?? string.Empty;
-                        pFilePath.Value = filePath;
-                        pFileName.Value = Path.GetFileName(filePath);
-                        pReadOrder.Value = firstReadOrder + i;
+                        using var clearCmd = conn.CreateCommand();
+                        clearCmd.Transaction = transaction;
+                        clearCmd.CommandText = "DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId";
+                        clearCmd.Parameters.AddWithValue("@projectId", projectId);
+                        clearCmd.ExecuteNonQuery();
+                    }
+
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.Transaction = transaction;
+                        cmd.CommandText = @"
+                            INSERT INTO ProjectIndexingState (
+                                ProjectId, Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                                CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt)
+                            VALUES (
+                                @projectId, @status, @totalFiles, @processedFiles, @pendingFiles, @percentComplete,
+                                @currentFile, @lastReadFile, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, @completedAt)
+                            ON CONFLICT(ProjectId)
+                            DO UPDATE SET
+                                Status = excluded.Status,
+                                TotalFiles = excluded.TotalFiles,
+                                ProcessedFiles = excluded.ProcessedFiles,
+                                PendingFiles = excluded.PendingFiles,
+                                PercentComplete = excluded.PercentComplete,
+                                CurrentFile = excluded.CurrentFile,
+                                LastReadFile = excluded.LastReadFile,
+                                UpdatedAt = CURRENT_TIMESTAMP,
+                                CompletedAt = excluded.CompletedAt";
+                        cmd.Parameters.AddWithValue("@projectId", projectId);
+                        cmd.Parameters.AddWithValue("@status", update.Status ?? string.Empty);
+                        cmd.Parameters.AddWithValue("@totalFiles", update.TotalFiles);
+                        cmd.Parameters.AddWithValue("@processedFiles", update.ProcessedFiles);
+                        cmd.Parameters.AddWithValue("@pendingFiles", update.PendingFiles);
+                        cmd.Parameters.AddWithValue("@percentComplete", update.PercentComplete);
+                        cmd.Parameters.AddWithValue("@currentFile", update.CurrentFile ?? string.Empty);
+                        cmd.Parameters.AddWithValue("@lastReadFile", update.LastReadFile ?? string.Empty);
+                        cmd.Parameters.AddWithValue("@completedAt", IsTerminalIndexingStatus(update.Status) ? DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss") : DBNull.Value);
                         cmd.ExecuteNonQuery();
                     }
-                }
 
-                transaction.Commit();
+                    if (update.NewlyReadFiles.Count > 0)
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.Transaction = transaction;
+                        cmd.CommandText = @"
+                            INSERT INTO IndexingReadFiles (ProjectId, FilePath, FileName, ReadOrder, Status)
+                            VALUES (@projectId, @filePath, @fileName, @readOrder, 'read')
+                            ON CONFLICT(ProjectId, FilePath)
+                            DO UPDATE SET
+                                FileName = excluded.FileName,
+                                ReadOrder = excluded.ReadOrder,
+                                ReadAt = CURRENT_TIMESTAMP,
+                                Status = excluded.Status";
+
+                        var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+                        var pFilePath = cmd.Parameters.Add("@filePath", SqliteType.Text);
+                        var pFileName = cmd.Parameters.Add("@fileName", SqliteType.Text);
+                        var pReadOrder = cmd.Parameters.Add("@readOrder", SqliteType.Integer);
+                        pProjectId.Value = projectId;
+
+                        var firstReadOrder = Math.Max(1, update.ProcessedFiles - update.NewlyReadFiles.Count + 1);
+                        for (var i = 0; i < update.NewlyReadFiles.Count; i++)
+                        {
+                            var filePath = update.NewlyReadFiles[i] ?? string.Empty;
+                            pFilePath.Value = filePath;
+                            pFileName.Value = Path.GetFileName(filePath);
+                            pReadOrder.Value = firstReadOrder + i;
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    transaction.Commit();
+                }
             }
             catch (Exception ex)
             {
@@ -906,6 +923,10 @@ namespace AssetStudio.Avalonia
                 transaction.Commit();
                 return state;
             }
+            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+            {
+                return null;
+            }
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to load indexing progress: {ex.Message}");
@@ -934,6 +955,10 @@ namespace AssetStudio.Avalonia
                 var state = LoadIndexingState(conn, transaction, projectId.Value);
                 transaction.Commit();
                 return state;
+            }
+            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+            {
+                return null;
             }
             catch (Exception ex)
             {
@@ -1548,7 +1573,6 @@ namespace AssetStudio.Avalonia
                 }
 
                 PreviewCacheEntry? entry = null;
-                long? entryId = null;
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.Transaction = transaction;
@@ -1570,21 +1594,11 @@ namespace AssetStudio.Avalonia
                     using var reader = cmd.ExecuteReader();
                     if (reader.Read())
                     {
-                        entryId = reader.GetInt64(0);
                         entry = new PreviewCacheEntry(
                             reader.GetString(1),
                             reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
                             reader.GetInt64(3));
                     }
-                }
-
-                if (entryId != null)
-                {
-                    using var updateCmd = conn.CreateCommand();
-                    updateCmd.Transaction = transaction;
-                    updateCmd.CommandText = "UPDATE PreviewCacheEntries SET LastAccessed = CURRENT_TIMESTAMP WHERE Id = @id";
-                    updateCmd.Parameters.AddWithValue("@id", entryId.Value);
-                    updateCmd.ExecuteNonQuery();
                 }
 
                 transaction.Commit();
@@ -1619,38 +1633,41 @@ namespace AssetStudio.Avalonia
             EnsureInitialized();
             try
             {
-                using var conn = CreateConnection();
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
-                if (projectId == null)
+                lock (WriteGate)
                 {
-                    return;
+                    using var conn = CreateConnection();
+                    using var transaction = conn.BeginTransaction();
+                    var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                    if (projectId == null)
+                    {
+                        return;
+                    }
+
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        INSERT INTO PreviewCacheEntries (
+                            ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters, PayloadHash, PayloadPath, ByteSize)
+                        VALUES (
+                            @projectId, @assetUniqueId, @previewKind, @algorithmVersion, @parameters, @payloadHash, @payloadPath, @byteSize)
+                        ON CONFLICT(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters)
+                        DO UPDATE SET
+                            PayloadHash = excluded.PayloadHash,
+                            PayloadPath = excluded.PayloadPath,
+                            ByteSize = excluded.ByteSize,
+                            LastAccessed = CURRENT_TIMESTAMP";
+                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                    cmd.Parameters.AddWithValue("@assetUniqueId", assetUniqueId);
+                    cmd.Parameters.AddWithValue("@previewKind", previewKind);
+                    cmd.Parameters.AddWithValue("@algorithmVersion", algorithmVersion);
+                    cmd.Parameters.AddWithValue("@parameters", parameters ?? string.Empty);
+                    cmd.Parameters.AddWithValue("@payloadHash", payloadHash);
+                    cmd.Parameters.AddWithValue("@payloadPath", payloadPath);
+                    cmd.Parameters.AddWithValue("@byteSize", byteSize);
+                    cmd.ExecuteNonQuery();
+
+                    transaction.Commit();
                 }
-
-                using var cmd = conn.CreateCommand();
-                cmd.Transaction = transaction;
-                cmd.CommandText = @"
-                    INSERT INTO PreviewCacheEntries (
-                        ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters, PayloadHash, PayloadPath, ByteSize)
-                    VALUES (
-                        @projectId, @assetUniqueId, @previewKind, @algorithmVersion, @parameters, @payloadHash, @payloadPath, @byteSize)
-                    ON CONFLICT(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters)
-                    DO UPDATE SET
-                        PayloadHash = excluded.PayloadHash,
-                        PayloadPath = excluded.PayloadPath,
-                        ByteSize = excluded.ByteSize,
-                        LastAccessed = CURRENT_TIMESTAMP";
-                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
-                cmd.Parameters.AddWithValue("@assetUniqueId", assetUniqueId);
-                cmd.Parameters.AddWithValue("@previewKind", previewKind);
-                cmd.Parameters.AddWithValue("@algorithmVersion", algorithmVersion);
-                cmd.Parameters.AddWithValue("@parameters", parameters ?? string.Empty);
-                cmd.Parameters.AddWithValue("@payloadHash", payloadHash);
-                cmd.Parameters.AddWithValue("@payloadPath", payloadPath);
-                cmd.Parameters.AddWithValue("@byteSize", byteSize);
-                cmd.ExecuteNonQuery();
-
-                transaction.Commit();
             }
             catch (Exception ex)
             {
@@ -1670,33 +1687,36 @@ namespace AssetStudio.Avalonia
             EnsureInitialized();
             try
             {
-                using var conn = CreateConnection();
-                using var transaction = conn.BeginTransaction();
-
-                using (var cmd = conn.CreateCommand())
+                lock (WriteGate)
                 {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        DELETE FROM AssetHandles
-                        WHERE ProjectId IN (
-                            SELECT Id FROM Projects
-                            WHERE FolderPath = @path OR FolderPath = @fullPath
-                        )";
-                    cmd.Parameters.AddWithValue("@path", folderPath);
-                    cmd.Parameters.AddWithValue("@fullPath", fullPath);
-                    cmd.ExecuteNonQuery();
-                }
+                    using var conn = CreateConnection();
+                    using var transaction = conn.BeginTransaction();
 
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path OR FolderPath = @fullPath";
-                    cmd.Parameters.AddWithValue("@path", folderPath);
-                    cmd.Parameters.AddWithValue("@fullPath", fullPath);
-                    cmd.ExecuteNonQuery();
-                }
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.Transaction = transaction;
+                        cmd.CommandText = @"
+                            DELETE FROM AssetHandles
+                            WHERE ProjectId IN (
+                                SELECT Id FROM Projects
+                                WHERE FolderPath = @path OR FolderPath = @fullPath
+                            )";
+                        cmd.Parameters.AddWithValue("@path", folderPath);
+                        cmd.Parameters.AddWithValue("@fullPath", fullPath);
+                        cmd.ExecuteNonQuery();
+                    }
 
-                transaction.Commit();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.Transaction = transaction;
+                        cmd.CommandText = "DELETE FROM Projects WHERE FolderPath = @path OR FolderPath = @fullPath";
+                        cmd.Parameters.AddWithValue("@path", folderPath);
+                        cmd.Parameters.AddWithValue("@fullPath", fullPath);
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    transaction.Commit();
+                }
             }
             catch (Exception ex)
             {

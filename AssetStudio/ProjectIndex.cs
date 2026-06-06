@@ -9,6 +9,8 @@ namespace AssetStudio
         private readonly ConcurrentDictionary<string, AssetHandle> _handles = new ConcurrentDictionary<string, AssetHandle>();
         private readonly ConcurrentDictionary<string, ConcurrentBag<AssetHandle>> _handlesByFile = new ConcurrentDictionary<string, ConcurrentBag<AssetHandle>>();
         private readonly ConcurrentQueue<AssetHandle> _pendingHandles = new ConcurrentQueue<AssetHandle>();
+
+        public int Count => _handles.Count;
         
         public void AddHandle(AssetHandle handle)
         {

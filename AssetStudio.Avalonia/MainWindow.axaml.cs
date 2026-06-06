@@ -54,7 +54,7 @@ public partial class MainWindow : Window
     private const int UserInteractionYieldDelayMilliseconds = 40;
     private long userInteractionPriorityUntilTimestamp;
     private List<AssetItem> visibleAssets = new();
-    private readonly BulkObservableCollection<AssetItem> visibleAssetItems = new();
+    private BulkObservableCollection<AssetItem> visibleAssetItems = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
 
@@ -109,9 +109,9 @@ public partial class MainWindow : Window
     private bool isRefreshingFilterList;
     private bool isRefreshingClassesList;
     private bool _statusUpdatePending;
-    private readonly Dictionary<string, AssetItem> lazyAssetItemsByHandleId = new(StringComparer.Ordinal);
-    private readonly HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
-    private readonly HashSet<ClassIDType> exportableAssetTypes = new();
+    private Dictionary<string, AssetItem> lazyAssetItemsByHandleId = new(StringComparer.Ordinal);
+    private HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
+    private HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
     private bool projectAutoIndexStarted;
     private int foregroundLazyLoadCount;
@@ -1602,7 +1602,7 @@ public partial class MainWindow : Window
                         {
                             ShowIndexingProgressPanel(completedStructureState);
                         }
-                        SaveCurrentProjectAfterLoad(null, assetsManager.ProjectIndex.GetHandles().Count(), exportableAssets.Count);
+                        SaveCurrentProjectAfterLoad(null, assetsManager.ProjectIndex.Count, exportableAssets.Count);
                         return;
                     }
 
@@ -3288,7 +3288,7 @@ public partial class MainWindow : Window
         if (isBuildingAssetStructures) return;
         isBuildingAssetStructures = true;
         var publishStructureProgress = showStructureProgress && assetsManager.LazyLoading && currentScanResult != null;
-        const int structureBuildSteps = 5;
+        const int structureBuildSteps = 7;
 
         void PublishStructureStage(int processedSteps, string stage)
         {
@@ -3300,7 +3300,7 @@ public partial class MainWindow : Window
 
         try
         {
-            if (assetsManager.assetsFileList.Count == 0 && (!assetsManager.LazyLoading || !assetsManager.ProjectIndex.GetHandles().Any()))
+            if (assetsManager.assetsFileList.Count == 0 && (!assetsManager.LazyLoading || assetsManager.ProjectIndex.Count == 0))
             {
                 StatusStripUpdate("No Unity file can be loaded.");
                 return;
@@ -3487,6 +3487,12 @@ public partial class MainWindow : Window
                 .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            BuildExportableAssetIndexesBackground(
+                localExportableAssets,
+                out var localLazyAssetItemsByHandleId,
+                out var localExportableAssetHandleIds,
+                out var localExportableAssetTypes);
+
             return new BuildAssetStructuresResult
             {
                 ProductName = localProductName,
@@ -3505,7 +3511,10 @@ public partial class MainWindow : Window
                 AvatarMeshCache = localAvatarMeshCache,
                 MeshAvatarCache = localMeshAvatarCache,
                 AnimationClipTransformBindingsCache = localAnimationClipTransformBindingsCache,
-                AssetClassItems = localAssetClassItems
+                AssetClassItems = localAssetClassItems,
+                LazyAssetItemsByHandleId = localLazyAssetItemsByHandleId,
+                ExportableAssetHandleIds = localExportableAssetHandleIds,
+                ExportableAssetTypes = localExportableAssetTypes
             };
         });
 
@@ -3519,7 +3528,7 @@ public partial class MainWindow : Window
         if (useIncrementalPath && newExportableAssets!.Count == 0)
         {
             exportableAssets = result.ExportableAssets;
-            SyncExportableAssetHandleIds();
+            ApplyExportableAssetIndexes(result);
             assetClassItems = result.AssetClassItems;
             BuildFilterTypeMenu();
             UpdateAssetClassesIncremental(result.AssetClassItems);
@@ -3528,7 +3537,7 @@ public partial class MainWindow : Window
         {
             // Incremental path: only append new items to avoid O(n) DataGrid notifications
             exportableAssets = result.ExportableAssets;
-            SyncExportableAssetHandleIds();
+            ApplyExportableAssetIndexes(result);
             assetClassItems = result.AssetClassItems;
 
             BuildFilterTypeMenu();
@@ -3539,7 +3548,7 @@ public partial class MainWindow : Window
         {
             // Full rebuild path (initial load, display all toggle, etc.)
             exportableAssets = result.ExportableAssets;
-            SyncExportableAssetHandleIds();
+            ApplyExportableAssetIndexes(result);
             sceneTreeNodes = result.SceneTreeNodes;
             treeSearchResults.Clear();
             nextGameObjectSearchIndex = 0;
@@ -3595,18 +3604,22 @@ public partial class MainWindow : Window
         }
 
         var assetCountForStats = assetsManager.LazyLoading
-            ? assetsManager.ProjectIndex.GetHandles().Count()
+            ? assetsManager.ProjectIndex.Count
             : m_ObjectsCount;
-        SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count);
+        PublishStructureStage(6, "Saving project metadata");
+        await Task.Run(() => SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count));
         if (assetsManager.LazyLoading && currentScanResult != null)
         {
             var folderPath = GetCurrentCacheFolderPath();
             if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
             {
-                SaveIndexCache(
+                PublishStructureStage(6, "Saving SQLite index cache");
+                var scanResult = currentScanResult;
+                var preserveSemanticRelations = await Task.Run(() => HasSavedSemanticRelations(folderPath, scanResult));
+                await Task.Run(() => SaveIndexCache(
                     folderPath,
-                    currentScanResult,
-                    preserveSemanticRelations: HasSavedSemanticRelations(folderPath, currentScanResult));
+                    scanResult,
+                    preserveSemanticRelations: preserveSemanticRelations));
             }
         }
 
@@ -7974,6 +7987,13 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ApplyExportableAssetIndexes(BuildAssetStructuresResult result)
+    {
+        lazyAssetItemsByHandleId = result.LazyAssetItemsByHandleId ?? new Dictionary<string, AssetItem>(StringComparer.Ordinal);
+        exportableAssetHandleIds = result.ExportableAssetHandleIds ?? new HashSet<string>(StringComparer.Ordinal);
+        exportableAssetTypes = result.ExportableAssetTypes ?? new HashSet<ClassIDType>();
+    }
+
     private void EnsureAssetListItemsSource()
     {
         if (AssetListDataGrid.ItemsSource != visibleAssetItems)
@@ -7984,9 +8004,8 @@ public partial class MainWindow : Window
 
     private void RefreshAssetListItems()
     {
+        visibleAssetItems = new BulkObservableCollection<AssetItem>(visibleAssets);
         EnsureAssetListItemsSource();
-        visibleAssetItems.Clear();
-        visibleAssetItems.AddRange(visibleAssets);
     }
 
     private void UpdateAssetListSortHeaderIndicators()
@@ -11382,58 +11401,4 @@ public enum ExportMode
     Convert,
     Raw,
     Dump
-}
-
-
-
-public class BulkObservableCollection<T> : System.Collections.ObjectModel.ObservableCollection<T>
-{
-    private bool _suppressNotification = false;
-
-    protected override void OnCollectionChanged(System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
-    {
-        if (!_suppressNotification)
-            base.OnCollectionChanged(e);
-    }
-
-    protected override void OnPropertyChanged(System.ComponentModel.PropertyChangedEventArgs e)
-    {
-        if (!_suppressNotification)
-            base.OnPropertyChanged(e);
-    }
-
-    public void BeginUpdate()
-    {
-        _suppressNotification = true;
-    }
-
-    public void EndUpdate()
-    {
-        _suppressNotification = false;
-        OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Count"));
-        OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Item[]"));
-        OnCollectionChanged(new System.Collections.Specialized.NotifyCollectionChangedEventArgs(System.Collections.Specialized.NotifyCollectionChangedAction.Reset));
-    }
-
-    public void AddRange(IEnumerable<T> list)
-    {
-        if (list == null)
-            throw new ArgumentNullException(nameof(list));
-
-        _suppressNotification = true;
-        try
-        {
-            foreach (T item in list)
-            {
-                Add(item);
-            }
-        }
-        finally
-        {
-            _suppressNotification = false;
-            OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Count"));
-            OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs("Item[]"));
-            OnCollectionChanged(new System.Collections.Specialized.NotifyCollectionChangedEventArgs(System.Collections.Specialized.NotifyCollectionChangedAction.Reset));
-        }
-    }
 }

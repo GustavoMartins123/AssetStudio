@@ -29,6 +29,9 @@ namespace AssetStudio.Avalonia
             public Dictionary<Mesh, Avatar?> MeshAvatarCache;
             public Dictionary<AnimationClip, HashSet<uint>> AnimationClipTransformBindingsCache;
             public List<AssetClassItem> AssetClassItems;
+            public Dictionary<string, AssetItem> LazyAssetItemsByHandleId;
+            public HashSet<string> ExportableAssetHandleIds;
+            public HashSet<ClassIDType> ExportableAssetTypes;
         }
 
         private static ParallelOptions CreateStructureBuildParallelOptions()
@@ -970,6 +973,33 @@ namespace AssetStudio.Avalonia
                 {
                     containerReferences.Add((entry.Key ?? string.Empty, references));
                 }
+            }
+        }
+
+        private static void BuildExportableAssetIndexesBackground(
+            IEnumerable<AssetItem> exportableAssets,
+            out Dictionary<string, AssetItem> lazyItemsByHandleId,
+            out HashSet<string> exportableHandleIds,
+            out HashSet<ClassIDType> exportableTypes)
+        {
+            lazyItemsByHandleId = new Dictionary<string, AssetItem>(StringComparer.Ordinal);
+            exportableHandleIds = new HashSet<string>(StringComparer.Ordinal);
+            exportableTypes = new HashSet<ClassIDType>();
+
+            foreach (var item in exportableAssets)
+            {
+                if (item == null)
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(item.Handle?.UniqueID))
+                {
+                    lazyItemsByHandleId[item.Handle.UniqueID] = item;
+                    exportableHandleIds.Add(item.Handle.UniqueID);
+                }
+
+                exportableTypes.Add(item.Type);
             }
         }
 
