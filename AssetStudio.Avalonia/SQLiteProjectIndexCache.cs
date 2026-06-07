@@ -2091,6 +2091,85 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        internal Dictionary<string, List<string>> LoadAvatarMeshAssetIdsByAvatarIds(string folderPath, string signature, IReadOnlyList<string> avatarAssetIds)
+        {
+            var result = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var ids = avatarAssetIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (ids.Count == 0)
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                const int chunkSize = 400;
+                for (var offset = 0; offset < ids.Count; offset += chunkSize)
+                {
+                    var chunk = ids.Skip(offset).Take(chunkSize).ToList();
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = transaction;
+                    var placeholders = new List<string>(chunk.Count);
+                    for (var i = 0; i < chunk.Count; i++)
+                    {
+                        var parameterName = "@avatarId" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        placeholders.Add(parameterName);
+                        cmd.Parameters.AddWithValue(parameterName, chunk[i]);
+                    }
+
+                    cmd.CommandText = $@"
+                        SELECT
+                            ae.SourceAssetUniqueID,
+                            ae.TargetAssetUniqueID
+                        FROM AssetEdges ae
+                        INNER JOIN Assets target
+                          ON target.ProjectId = ae.ProjectId
+                         AND target.UniqueID = ae.TargetAssetUniqueID
+                        WHERE ae.ProjectId = @projectId
+                          AND ae.SourceAssetUniqueID IN ({string.Join(",", placeholders)})
+                          AND ae.EdgeKind = 'Mesh'
+                          AND ae.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                          AND ae.TargetAssetUniqueID <> ''
+                          AND target.Type = @meshType
+                        GROUP BY ae.SourceAssetUniqueID, ae.TargetAssetUniqueID
+                        ORDER BY ae.SourceAssetUniqueID, MIN(ae.SlotIndex), MIN(target.Name), ae.TargetAssetUniqueID";
+                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                    cmd.Parameters.AddWithValue("@meshType", (int)ClassIDType.Mesh);
+
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var avatarId = reader.GetString(0);
+                        var meshId = reader.GetString(1);
+                        if (!result.TryGetValue(avatarId, out var meshes))
+                        {
+                            meshes = new List<string>();
+                            result[avatarId] = meshes;
+                        }
+
+                        meshes.Add(meshId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load avatar mesh relations from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
         internal List<string> LoadMeshAvatarAssetIds(string folderPath, string signature, string meshAssetId)
         {
             var result = new List<string>();

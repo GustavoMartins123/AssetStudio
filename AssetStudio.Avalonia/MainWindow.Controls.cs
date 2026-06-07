@@ -317,7 +317,7 @@ public partial class MainWindow : Window
 
         if (candidate.AnimationClip != null)
         {
-            PreviewAnimationClip(candidate.AnimationClip, candidate.Avatar, candidate.Mesh, candidate.AvatarId, candidate.MeshId);
+            PreviewAnimationClip(candidate.AnimationClip, candidate.Avatar, candidate.Mesh, candidate.AvatarId, candidate.MeshId, rebuildCandidateControls: false);
         }
         else if (candidate.Avatar != null)
         {

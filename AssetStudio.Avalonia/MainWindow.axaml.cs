@@ -5566,6 +5566,23 @@ public partial class MainWindow : Window
         return _sqliteCache.LoadAnimationClipMeshAssetIds(folderPath, signature, clipAssetId);
     }
 
+    private Dictionary<string, List<string>> LoadAvatarMeshAssetIdsByAvatarIdsForPreview(IReadOnlyList<string> avatarIds)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || avatarIds.Count == 0)
+        {
+            return new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadAvatarMeshAssetIdsByAvatarIds(folderPath, signature, avatarIds);
+    }
+
     private List<PreviewCandidateItem> BuildAvatarPreviewCandidates(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null)
     {
         var candidates = new List<PreviewCandidateItem>();
@@ -6229,14 +6246,61 @@ public partial class MainWindow : Window
 
         if (assetsManager.LazyLoading)
         {
-            foreach (var avatarId in LoadAnimationClipAvatarAssetIdsForPreview(clip))
+            var avatarIds = LoadAnimationClipAvatarAssetIdsForPreview(clip);
+            var avatarMeshIdsByAvatarId = LoadAvatarMeshAssetIdsByAvatarIdsForPreview(avatarIds);
+            var avatarIdsCoveredByMesh = new HashSet<string>(StringComparer.Ordinal);
+            var meshIdsCoveredByAvatar = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var avatarId in avatarIds)
             {
+                if (avatarMeshIdsByAvatarId.TryGetValue(avatarId, out var avatarMeshIds) && avatarMeshIds.Count > 0)
+                {
+                    foreach (var meshId in avatarMeshIds)
+                    {
+                        if (string.IsNullOrWhiteSpace(meshId))
+                        {
+                            continue;
+                        }
+
+                        meshIdsCoveredByAvatar.Add(meshId);
+                        avatarIdsCoveredByMesh.Add(avatarId);
+                        AddCandidate(
+                            null,
+                            null,
+                            avatarId,
+                            meshId,
+                            "Avatar relation",
+                            GetPreviewHandleName(avatarId, "Avatar"),
+                            GetPreviewHandleName(meshId, "Mesh"));
+                    }
+
+                    continue;
+                }
+
                 AddCandidate(null, null, avatarId, null, "Avatar relation", GetPreviewHandleName(avatarId, "Avatar"));
             }
 
             foreach (var meshId in LoadAnimationClipMeshAssetIdsForPreview(clip))
             {
+                if (meshIdsCoveredByAvatar.Contains(meshId))
+                {
+                    continue;
+                }
+
                 AddCandidate(null, null, null, meshId, "Animator mesh", meshName: GetPreviewHandleName(meshId, "Mesh"));
+            }
+
+            if (meshIdsCoveredByAvatar.Count > 0)
+            {
+                candidates.RemoveAll(candidate =>
+                    (string.IsNullOrWhiteSpace(candidate.AvatarId)
+                        && candidate.Avatar == null
+                        && !string.IsNullOrWhiteSpace(candidate.MeshId)
+                        && meshIdsCoveredByAvatar.Contains(candidate.MeshId))
+                    || (!string.IsNullOrWhiteSpace(candidate.AvatarId)
+                        && candidate.Mesh == null
+                        && string.IsNullOrWhiteSpace(candidate.MeshId)
+                        && avatarIdsCoveredByMesh.Contains(candidate.AvatarId)));
             }
         }
         else
@@ -6363,11 +6427,27 @@ public partial class MainWindow : Window
         Avatar? preferredAvatar = null,
         Mesh? preferredMesh = null,
         string? preferredAvatarId = null,
-        string? preferredMeshId = null)
+        string? preferredMeshId = null,
+        bool rebuildCandidateControls = true)
     {
-        var previewCandidates = BuildAnimationClipPreviewCandidates(clip, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
-        var selectedCandidate = SelectAnimationClipPreviewCandidate(clip, previewCandidates, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
-        BuildPreviewCandidateControls(previewCandidates, selectedCandidate, "Animation Target");
+        PreviewCandidateItem? selectedCandidate;
+        if (rebuildCandidateControls)
+        {
+            var previewCandidates = BuildAnimationClipPreviewCandidates(clip, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
+            selectedCandidate = SelectAnimationClipPreviewCandidate(clip, previewCandidates, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
+            BuildPreviewCandidateControls(previewCandidates, selectedCandidate, "Animation Target");
+        }
+        else
+        {
+            selectedCandidate = new PreviewCandidateItem
+            {
+                AnimationClip = clip,
+                Avatar = preferredAvatar,
+                Mesh = preferredMesh,
+                AvatarId = preferredAvatarId ?? string.Empty,
+                MeshId = preferredMeshId ?? string.Empty
+            };
+        }
 
         var resolvedCandidate = ResolveAnimationClipPreviewCandidate(selectedCandidate);
         Avatar? avatar = resolvedCandidate?.Avatar;
