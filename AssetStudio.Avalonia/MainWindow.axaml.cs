@@ -4687,173 +4687,8 @@ public partial class MainWindow : Window
                     }
                     break;
                 case Mesh m_Mesh:
-                {
-                    var meshPreviewId = texturePreviewIdCounter;
-                    PreviewLabel.IsVisible = false;
-                    StatusStripUpdate("Preparing mesh preview...");
-                    if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                    {
-                        PreviewInfoOverlay.Text = "Loading details...";
-                        PreviewInfoBorder.IsVisible = true;
-                    }
-
-                    var localAssetItem = assetItem;
-                    var includeMeshInfo = displayInfo.IsChecked == true;
-                    Task.Run(() =>
-                    {
-                        try
-                        {
-                            m_Mesh.EnsureProcessed();
-                            if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
-                            {
-                                throw new Exception("Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.");
-                            }
-
-                            var uvs = BuildMeshPreviewUvs(m_Mesh);
-                            var quickInfoText = includeMeshInfo
-                                ? FormatMeshPreviewSummary(m_Mesh, localAssetItem) + Environment.NewLine + "Loading material details..."
-                                : string.Empty;
-
-                            Dispatcher.UIThread.Post(() =>
-                            {
-                                if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
-                                {
-                                    return;
-                                }
-
-                                if (GLPreviewControl != null)
-                                {
-                                    currentPreviewMesh = m_Mesh;
-                                    GLPreviewControl.SetMesh(m_Mesh, uvs);
-                                    GLPreviewControl.IsVisible = true;
-                                    ShowPreviewGeometryControls(showBoneControls: false);
-                                    GLPreviewControl.Focus();
-                                }
-
-                                if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                                {
-                                    PreviewInfoOverlay.Text = quickInfoText;
-                                    PreviewInfoBorder.IsVisible = true;
-                                }
-
-                                StatusStripUpdate("OpenGL Preview | Mesh loaded | Loading materials...");
-                            });
-
-                            if (meshPreviewId != texturePreviewIdCounter)
-                            {
-                                return;
-                            }
-
-                            var subMeshTextures = new List<byte[]?>();
-                            var subMeshTexWidths = new List<int>();
-                            var subMeshTexHeights = new List<int>();
-                            var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
-                            if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
-                            {
-                                EnsureMeshPreviewDependenciesLoaded(m_Mesh);
-                                allMaterials = FindMaterialsForMeshPreview(m_Mesh);
-                            }
-
-                            if (m_Mesh.m_SubMeshes != null && m_Mesh.m_SubMeshes.Length > 0)
-                            {
-                                for (int i = 0; i < m_Mesh.m_SubMeshes.Length; i++)
-                                {
-                                    if (meshPreviewId != texturePreviewIdCounter)
-                                    {
-                                        return;
-                                    }
-
-                                    byte[]? tb = null;
-                                    int tw = 0, th = 0;
-
-                                    if (i < allMaterials.Count && allMaterials[i] != null)
-                                    {
-                                        var tex = FindTextureForMaterial(allMaterials[i]!);
-                                        if (tex != null)
-                                        {
-                                            try
-                                            {
-                                                using (var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension))
-                                                {
-                                                    var image = previewImage?.Image;
-                                                    if (image != null)
-                                                    {
-                                                        tw = image.Width;
-                                                        th = image.Height;
-                                                        tb = new byte[tw * th * 4];
-                                                        image.CopyPixelDataTo(tb);
-                                                        for (int p = 0; p < tb.Length; p += 4)
-                                                        {
-                                                            byte temp = tb[p];
-                                                            tb[p] = tb[p + 2];
-                                                            tb[p + 2] = temp;
-                                                            tb[p + 3] = byte.MaxValue;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            catch {}
-                                        }
-                                    }
-                                    subMeshTextures.Add(tb);
-                                    subMeshTexWidths.Add(tw);
-                                    subMeshTexHeights.Add(th);
-                                }
-                            }
-
-                            var infoText = includeMeshInfo
-                                ? assetsManager.LazyLoading
-                                    ? FormatLazyMeshPreview(m_Mesh, localAssetItem, allMaterials)
-                                    : FormatMeshPreview(m_Mesh, localAssetItem)
-                                : string.Empty;
-                            var hasTextures = subMeshTextures.Any(t => t != null);
-
-                            Dispatcher.UIThread.Post(() =>
-                            {
-                                if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
-                                {
-                                    return;
-                                }
-
-                                if (GLPreviewControl != null)
-                                {
-                                    currentPreviewMesh = m_Mesh;
-                                    GLPreviewControl.ApplyMeshTextures(m_Mesh, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
-                                    GLPreviewControl.IsVisible = true;
-                                    BuildMeshMaterialControls(m_Mesh, allMaterials);
-                                    ShowPreviewGeometryControls(showBoneControls: false);
-                                    GLPreviewControl.Focus();
-                                }
-
-                                if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                                {
-                                    PreviewInfoOverlay.Text = infoText;
-                                    PreviewInfoBorder.IsVisible = true;
-                                }
-
-                                StatusStripUpdate(hasTextures
-                                    ? "OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded"
-                                    : "OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
-                            });
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.Log(LoggerEvent.Error, $"Mesh preview failed for {localAssetItem.Name}: {ex.Message}");
-                            Dispatcher.UIThread.Post(() =>
-                            {
-                                if (meshPreviewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
-                                {
-                                    StatusStripUpdate($"Mesh preview error: {ex.Message}");
-                                    if (PreviewInfoOverlay != null)
-                                    {
-                                        PreviewInfoOverlay.Text = $"Failed to load mesh: {ex.Message}";
-                                    }
-                                }
-                            });
-                        }
-                    });
+                    PreviewMesh(assetItem, m_Mesh);
                     break;
-                }
                 case Object obj when obj.type == ClassIDType.PrefabInstance:
                     SetTextWithTruncation(TextPreviewBox, fbxHeader + FormatPrefab(obj));
                     TextPreviewBox.IsVisible = true;
@@ -5413,6 +5248,552 @@ public partial class MainWindow : Window
             }
         }
         return $"Clip_{clipID}";
+    }
+
+    private void PreviewMesh(
+        AssetItem assetItem,
+        Mesh m_Mesh,
+        bool rebuildCandidateControls = true,
+        PreviewCandidateItem? selectedCandidate = null,
+        bool preferModelGroup = true)
+    {
+        if (rebuildCandidateControls)
+        {
+            var candidates = BuildMeshPreviewCandidates(m_Mesh);
+            var activeCandidate = SelectMeshPreviewCandidate(m_Mesh, candidates, selectedCandidate, preferModelGroup);
+            BuildPreviewCandidateControls(candidates, activeCandidate, "Model Group");
+            if (activeCandidate?.IsModelGroup == true)
+            {
+                QueuePreviewCandidateSelection(activeCandidate);
+                return;
+            }
+        }
+
+        var meshPreviewId = texturePreviewIdCounter;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate("Preparing mesh preview...");
+        if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+        {
+            PreviewInfoOverlay.Text = "Loading details...";
+            PreviewInfoBorder.IsVisible = true;
+        }
+
+        var localAssetItem = assetItem;
+        var includeMeshInfo = displayInfo.IsChecked == true;
+        Task.Run(() =>
+        {
+            try
+            {
+                m_Mesh.EnsureProcessed();
+                if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
+                {
+                    throw new Exception("Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.");
+                }
+
+                var uvs = BuildMeshPreviewUvs(m_Mesh);
+                var quickInfoText = includeMeshInfo
+                    ? FormatMeshPreviewSummary(m_Mesh, localAssetItem) + Environment.NewLine + "Loading material details..."
+                    : string.Empty;
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
+                    {
+                        return;
+                    }
+
+                    if (GLPreviewControl != null)
+                    {
+                        currentPreviewMesh = m_Mesh;
+                        GLPreviewControl.SetMesh(m_Mesh, uvs);
+                        GLPreviewControl.IsVisible = true;
+                        ShowPreviewGeometryControls(showBoneControls: false);
+                        GLPreviewControl.Focus();
+                    }
+
+                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    {
+                        PreviewInfoOverlay.Text = quickInfoText;
+                        PreviewInfoBorder.IsVisible = true;
+                    }
+
+                    StatusStripUpdate("OpenGL Preview | Mesh loaded | Loading materials...");
+                });
+
+                if (meshPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                var subMeshTextures = new List<byte[]?>();
+                var subMeshTexWidths = new List<int>();
+                var subMeshTexHeights = new List<int>();
+                var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                {
+                    EnsureMeshPreviewDependenciesLoaded(m_Mesh);
+                    allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                }
+
+                AddPreviewTextureSlotsForMesh(
+                    m_Mesh,
+                    allMaterials,
+                    subMeshTextures,
+                    subMeshTexWidths,
+                    subMeshTexHeights);
+
+                var infoText = includeMeshInfo
+                    ? assetsManager.LazyLoading
+                        ? FormatLazyMeshPreview(m_Mesh, localAssetItem, allMaterials)
+                        : FormatMeshPreview(m_Mesh, localAssetItem)
+                    : string.Empty;
+                var hasTextures = subMeshTextures.Any(t => t != null);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
+                    {
+                        return;
+                    }
+
+                    if (GLPreviewControl != null)
+                    {
+                        currentPreviewMesh = m_Mesh;
+                        GLPreviewControl.ApplyMeshTextures(m_Mesh, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                        GLPreviewControl.IsVisible = true;
+                        BuildMeshMaterialControls(m_Mesh, allMaterials);
+                        ShowPreviewGeometryControls(showBoneControls: false);
+                        GLPreviewControl.Focus();
+                    }
+
+                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    {
+                        PreviewInfoOverlay.Text = infoText;
+                        PreviewInfoBorder.IsVisible = true;
+                    }
+
+                    StatusStripUpdate(hasTextures
+                        ? "OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded"
+                        : "OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Mesh preview failed for {localAssetItem.Name}: {ex.Message}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (meshPreviewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
+                    {
+                        StatusStripUpdate($"Mesh preview error: {ex.Message}");
+                        if (PreviewInfoOverlay != null)
+                        {
+                            PreviewInfoOverlay.Text = $"Failed to load mesh: {ex.Message}";
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private List<PreviewCandidateItem> BuildMeshPreviewCandidates(Mesh mesh)
+    {
+        var candidates = new List<PreviewCandidateItem>();
+        var meshId = GetPreviewObjectKey(mesh);
+        var currentLabel = !string.IsNullOrWhiteSpace(mesh.m_Name)
+            ? mesh.m_Name
+            : GetPreviewHandleName(meshId, "Mesh");
+        candidates.Add(new PreviewCandidateItem
+        {
+            Mesh = mesh,
+            MeshId = meshId,
+            Label = $"Current mesh: {currentLabel} (Mesh PathID: {mesh.m_PathID})"
+        });
+
+        if (string.IsNullOrWhiteSpace(meshId))
+        {
+            return candidates;
+        }
+
+        var seenGroups = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var group in LoadModelGroupsForMeshAssetIdForPreview(meshId))
+        {
+            if (string.IsNullOrWhiteSpace(group.GroupId) || !seenGroups.Add(group.GroupId))
+            {
+                continue;
+            }
+
+            var groupMeshes = LoadModelGroupMeshesForPreview(group.GroupId);
+            var meshIds = groupMeshes
+                .Select(item => item.MeshAssetId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (meshIds.Length < 2)
+            {
+                continue;
+            }
+
+            var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+            var representativeMeshId = representative?.MeshAssetId ?? meshId;
+            var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+                ? group.GroupName
+                : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                    ? group.RootGameObjectName
+                    : GetPreviewHandleName(representativeMeshId, "Model");
+            var representativeName = !string.IsNullOrWhiteSpace(representative?.MeshName)
+                ? representative!.MeshName
+                : GetPreviewHandleName(representativeMeshId, "Mesh");
+
+            candidates.Add(new PreviewCandidateItem
+            {
+                Mesh = string.Equals(representativeMeshId, meshId, StringComparison.Ordinal) ? mesh : null,
+                MeshId = representativeMeshId,
+                ModelGroupId = group.GroupId,
+                ModelGroupName = groupName,
+                ModelGroupMeshIds = meshIds,
+                ModelGroupMeshCount = meshIds.Length,
+                ModelGroupConfidence = group.Confidence,
+                Label = $"Model group: {groupName} ({meshIds.Length:N0} parts) -> {representativeName}"
+            });
+        }
+
+        return candidates;
+    }
+
+    private PreviewCandidateItem? SelectMeshPreviewCandidate(
+        Mesh mesh,
+        IReadOnlyList<PreviewCandidateItem> candidates,
+        PreviewCandidateItem? selectedCandidate,
+        bool preferModelGroup)
+    {
+        if (selectedCandidate != null)
+        {
+            var selected = candidates.FirstOrDefault(candidate =>
+                (!string.IsNullOrWhiteSpace(selectedCandidate.ModelGroupId)
+                    && string.Equals(candidate.ModelGroupId, selectedCandidate.ModelGroupId, StringComparison.Ordinal))
+                || AreSamePreviewObject(candidate.Mesh, selectedCandidate.Mesh)
+                || (!string.IsNullOrWhiteSpace(selectedCandidate.MeshId)
+                    && string.Equals(candidate.MeshId, selectedCandidate.MeshId, StringComparison.Ordinal)));
+            if (selected != null)
+            {
+                return selected;
+            }
+        }
+
+        if (preferModelGroup)
+        {
+            var group = candidates.FirstOrDefault(candidate => candidate.IsModelGroup && candidate.ModelGroupMeshIds.Count > 1);
+            if (group != null)
+            {
+                return group;
+            }
+        }
+
+        return candidates.FirstOrDefault(candidate => AreSamePreviewObject(candidate.Mesh, mesh))
+            ?? candidates.FirstOrDefault();
+    }
+
+    private List<ModelGroupInfo> LoadModelGroupsForMeshAssetIdForPreview(string meshId)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || string.IsNullOrWhiteSpace(meshId))
+        {
+            return new List<ModelGroupInfo>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<ModelGroupInfo>();
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadModelGroupsForMeshAssetId(folderPath, signature, meshId);
+    }
+
+    private List<Mesh> ResolveModelGroupMeshesForPreview(PreviewCandidateItem candidate, CancellationToken token)
+    {
+        if (candidate.ModelGroupMeshes.Count > 0)
+        {
+            return candidate.ModelGroupMeshes.ToList();
+        }
+
+        var meshIds = candidate.ModelGroupMeshIds;
+        if (meshIds.Count == 0 && !string.IsNullOrWhiteSpace(candidate.ModelGroupId))
+        {
+            meshIds = LoadModelGroupMeshesForPreview(candidate.ModelGroupId)
+                .Select(mesh => mesh.MeshAssetId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        var result = new List<Mesh>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var meshId in meshIds)
+        {
+            token.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(meshId) || !seen.Add(meshId))
+            {
+                continue;
+            }
+
+            var mesh = ResolveMeshPreviewCandidate(meshId);
+            if (mesh != null)
+            {
+                result.Add(mesh);
+            }
+        }
+
+        return result;
+    }
+
+    private void PreviewModelGroupCandidate(PreviewCandidateItem candidate)
+    {
+        var meshes = candidate.ModelGroupMeshes.Count > 0
+            ? candidate.ModelGroupMeshes.ToList()
+            : ResolveModelGroupMeshesForPreview(candidate, CancellationToken.None);
+        if (meshes.Count == 0 && candidate.Mesh != null)
+        {
+            meshes.Add(candidate.Mesh);
+        }
+
+        if (meshes.Count == 0)
+        {
+            StatusStripUpdate("Model group preview: no mesh parts were resolved from saved connections.");
+            return;
+        }
+
+        var meshPreviewId = texturePreviewIdCounter;
+        var localAssetItem = AssetListDataGrid.SelectedItem as AssetItem;
+        var includeMeshInfo = displayInfo.IsChecked == true;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate($"Preparing model group preview ({meshes.Count:N0} parts)...");
+        if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+        {
+            PreviewInfoOverlay.Text = "Loading model group details...";
+            PreviewInfoBorder.IsVisible = true;
+        }
+
+        Task.Run(() =>
+        {
+            try
+            {
+                foreach (var mesh in meshes)
+                {
+                    mesh.EnsureProcessed();
+                }
+
+                var uvs = meshes.Select(BuildMeshPreviewUvs).ToArray();
+                var quickInfoText = includeMeshInfo
+                    ? FormatModelGroupPreviewSummary(candidate, meshes, localAssetItem, null) + Environment.NewLine + "Loading material details..."
+                    : string.Empty;
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (meshPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    if (GLPreviewControl != null)
+                    {
+                        currentPreviewMesh = candidate.Mesh ?? meshes[0];
+                        GLPreviewControl.SetMeshGroup(meshes, uvs);
+                        GLPreviewControl.IsVisible = true;
+                        ShowPreviewGeometryControls(showBoneControls: false);
+                        GLPreviewControl.Focus();
+                    }
+
+                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    {
+                        PreviewInfoOverlay.Text = quickInfoText;
+                        PreviewInfoBorder.IsVisible = true;
+                    }
+
+                    StatusStripUpdate($"OpenGL Preview | Model group loaded ({meshes.Count:N0} parts) | Loading materials...");
+                });
+
+                var allMaterials = new List<Material?>();
+                var subMeshTextures = new List<byte[]?>();
+                var subMeshTexWidths = new List<int>();
+                var subMeshTexHeights = new List<int>();
+                foreach (var mesh in meshes)
+                {
+                    if (meshPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    var materials = FindMaterialsForMeshPreview(mesh);
+                    if (materials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    {
+                        EnsureMeshPreviewDependenciesLoaded(mesh);
+                        materials = FindMaterialsForMeshPreview(mesh);
+                    }
+
+                    var slotCountBefore = subMeshTextures.Count;
+                    AddPreviewTextureSlotsForMesh(
+                        mesh,
+                        materials,
+                        subMeshTextures,
+                        subMeshTexWidths,
+                        subMeshTexHeights);
+
+                    var slotCount = subMeshTextures.Count - slotCountBefore;
+                    for (var i = 0; i < slotCount; i++)
+                    {
+                        allMaterials.Add(i < materials.Count ? materials[i] : null);
+                    }
+                }
+
+                var hasTextures = subMeshTextures.Any(t => t != null);
+                var infoText = includeMeshInfo
+                    ? FormatModelGroupPreviewSummary(candidate, meshes, localAssetItem, allMaterials)
+                    : string.Empty;
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (meshPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    if (GLPreviewControl != null)
+                    {
+                        GLPreviewControl.ApplyMeshTextures(subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                        GLPreviewControl.IsVisible = true;
+                        BuildMeshMaterialControlsForSlots(allMaterials);
+                        ShowPreviewGeometryControls(showBoneControls: false);
+                        GLPreviewControl.Focus();
+                    }
+
+                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    {
+                        PreviewInfoOverlay.Text = infoText;
+                        PreviewInfoBorder.IsVisible = true;
+                    }
+
+                    StatusStripUpdate(hasTextures
+                        ? $"OpenGL Preview | Model group: {candidate.ModelGroupName} | Parts: {meshes.Count:N0} | Textured"
+                        : $"OpenGL Preview | Model group: {candidate.ModelGroupName} | Parts: {meshes.Count:N0} | No textures found");
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Model group preview failed for {candidate.ModelGroupName}: {ex.Message}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (meshPreviewId == texturePreviewIdCounter)
+                    {
+                        StatusStripUpdate($"Model group preview error: {ex.Message}");
+                    }
+                });
+            }
+        });
+    }
+
+    private void AddPreviewTextureSlotsForMesh(
+        Mesh mesh,
+        IReadOnlyList<Material?> materials,
+        List<byte[]?> subMeshTextures,
+        List<int> subMeshTexWidths,
+        List<int> subMeshTexHeights)
+    {
+        var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
+        if (slotCount <= 0 && mesh.m_Indices?.Count > 0)
+        {
+            slotCount = 1;
+        }
+
+        for (int i = 0; i < slotCount; i++)
+        {
+            byte[]? tb = null;
+            int tw = 0, th = 0;
+
+            if (i < materials.Count && materials[i] != null)
+            {
+                var tex = FindTextureForMaterial(materials[i]!);
+                if (tex != null)
+                {
+                    try
+                    {
+                        using (var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension))
+                        {
+                            var image = previewImage?.Image;
+                            if (image != null)
+                            {
+                                tw = image.Width;
+                                th = image.Height;
+                                tb = new byte[tw * th * 4];
+                                image.CopyPixelDataTo(tb);
+                                for (int p = 0; p < tb.Length; p += 4)
+                                {
+                                    byte temp = tb[p];
+                                    tb[p] = tb[p + 2];
+                                    tb[p + 2] = temp;
+                                    tb[p + 3] = byte.MaxValue;
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            subMeshTextures.Add(tb);
+            subMeshTexWidths.Add(tw);
+            subMeshTexHeights.Add(th);
+        }
+    }
+
+    private string FormatModelGroupPreviewSummary(
+        PreviewCandidateItem candidate,
+        IReadOnlyList<Mesh> meshes,
+        AssetItem? item,
+        IReadOnlyList<Material?>? materials)
+    {
+        var sb = new StringBuilder();
+        var groupName = !string.IsNullOrWhiteSpace(candidate.ModelGroupName)
+            ? candidate.ModelGroupName
+            : "Model group";
+        sb.AppendLine($"Model Group: {groupName}");
+        sb.AppendLine("==================================================");
+        if (item != null)
+        {
+            sb.AppendLine($"Selected Asset: {item.Name} (PathID: {item.PathID})");
+        }
+        sb.AppendLine($"Group Kind: {(candidate.ModelGroupId.Contains(":sceneobject:", StringComparison.OrdinalIgnoreCase) ? "SceneObject" : "Animator")}");
+        sb.AppendLine($"Parts: {meshes.Count}");
+        sb.AppendLine($"Confidence: {candidate.ModelGroupConfidence}");
+
+        var vertexTotal = meshes.Sum(mesh => Math.Max(0, mesh.m_VertexCount));
+        var indexTotal = meshes.Sum(mesh => mesh.m_Indices?.Count ?? 0);
+        sb.AppendLine($"Vertex Count: {vertexTotal:N0}");
+        sb.AppendLine($"Index Count: {indexTotal:N0}");
+
+        if (materials != null)
+        {
+            sb.AppendLine($"Material Slots: {materials.Count}");
+            foreach (var material in materials.Where(material => material != null).Take(16))
+            {
+                sb.AppendLine($"  - {material!.m_Name} (PathID: {material.m_PathID})");
+            }
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("Mesh Parts:");
+        foreach (var mesh in meshes.Take(24))
+        {
+            sb.AppendLine($"  - {mesh.m_Name} (PathID: {mesh.m_PathID}, Submeshes: {mesh.m_SubMeshes?.Length ?? 0})");
+        }
+        if (meshes.Count > 24)
+        {
+            sb.AppendLine($"  ... {meshes.Count - 24:N0} more");
+        }
+
+        return sb.ToString();
     }
 
     private static string GetPreviewObjectKey(AssetStudio.Object? asset)

@@ -52,6 +52,7 @@ public partial class MainWindow : Window
         public string ModelGroupId { get; init; } = string.Empty;
         public string ModelGroupName { get; init; } = string.Empty;
         public IReadOnlyList<string> ModelGroupMeshIds { get; init; } = Array.Empty<string>();
+        public IReadOnlyList<AssetStudio.Mesh> ModelGroupMeshes { get; init; } = Array.Empty<AssetStudio.Mesh>();
         public int ModelGroupMeshCount { get; init; }
         public int ModelGroupConfidence { get; init; }
         public string Label { get; init; } = string.Empty;
@@ -327,11 +328,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (candidate.AnimationClip != null)
-        {
-            QueuePreviewCandidateSelection(candidate);
-        }
-        else if (candidate.Avatar != null)
+        if (candidate.AnimationClip != null
+            || candidate.Avatar != null
+            || candidate.Mesh != null
+            || candidate.IsModelGroup)
         {
             QueuePreviewCandidateSelection(candidate);
         }
@@ -347,7 +347,11 @@ public partial class MainWindow : Window
 
         StatusStripUpdate(candidate.AnimationClip != null
             ? "Preparing animation target..."
-            : "Preparing avatar target...");
+            : candidate.Avatar != null
+                ? "Preparing avatar target..."
+                : candidate.IsModelGroup
+                    ? "Preparing model group target..."
+                    : "Preparing mesh target...");
 
         _ = Task.Run(async () =>
         {
@@ -392,8 +396,30 @@ public partial class MainWindow : Window
         {
             var resolvedCandidate = ResolveAnimationClipPreviewCandidate(candidate, cacheRelation: false) ?? candidate;
             token.ThrowIfCancellationRequested();
-            resolvedCandidate.Mesh?.EnsureProcessed();
-            return resolvedCandidate;
+            var groupMeshes = ResolveModelGroupMeshesForPreview(resolvedCandidate, token);
+            var mesh = resolvedCandidate.Mesh ?? groupMeshes.FirstOrDefault();
+            mesh?.EnsureProcessed();
+            foreach (var groupMesh in groupMeshes)
+            {
+                token.ThrowIfCancellationRequested();
+                groupMesh.EnsureProcessed();
+            }
+
+            return new PreviewCandidateItem
+            {
+                AnimationClip = resolvedCandidate.AnimationClip,
+                Avatar = resolvedCandidate.Avatar,
+                Mesh = mesh,
+                AvatarId = resolvedCandidate.AvatarId,
+                MeshId = !string.IsNullOrWhiteSpace(resolvedCandidate.MeshId) ? resolvedCandidate.MeshId : GetPreviewObjectKey(mesh),
+                ModelGroupId = resolvedCandidate.ModelGroupId,
+                ModelGroupName = resolvedCandidate.ModelGroupName,
+                ModelGroupMeshIds = resolvedCandidate.ModelGroupMeshIds,
+                ModelGroupMeshes = groupMeshes,
+                ModelGroupMeshCount = resolvedCandidate.ModelGroupMeshCount,
+                ModelGroupConfidence = resolvedCandidate.ModelGroupConfidence,
+                Label = resolvedCandidate.Label
+            };
         }
 
         if (candidate.Avatar != null)
@@ -405,7 +431,15 @@ public partial class MainWindow : Window
             }
 
             token.ThrowIfCancellationRequested();
+            var groupMeshes = ResolveModelGroupMeshesForPreview(candidate, token);
+            mesh ??= groupMeshes.FirstOrDefault();
             mesh?.EnsureProcessed();
+            foreach (var groupMesh in groupMeshes)
+            {
+                token.ThrowIfCancellationRequested();
+                groupMesh.EnsureProcessed();
+            }
+
             return new PreviewCandidateItem
             {
                 Avatar = candidate.Avatar,
@@ -415,6 +449,42 @@ public partial class MainWindow : Window
                 ModelGroupId = candidate.ModelGroupId,
                 ModelGroupName = candidate.ModelGroupName,
                 ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+                ModelGroupMeshes = groupMeshes,
+                ModelGroupMeshCount = candidate.ModelGroupMeshCount,
+                ModelGroupConfidence = candidate.ModelGroupConfidence,
+                Label = candidate.Label
+            };
+        }
+
+        if (candidate.Mesh != null || !string.IsNullOrWhiteSpace(candidate.MeshId) || candidate.IsModelGroup)
+        {
+            var mesh = candidate.Mesh;
+            if (mesh == null && !string.IsNullOrWhiteSpace(candidate.MeshId))
+            {
+                mesh = ResolveMeshPreviewCandidate(candidate.MeshId);
+            }
+
+            token.ThrowIfCancellationRequested();
+            var groupMeshes = ResolveModelGroupMeshesForPreview(candidate, token);
+            mesh ??= groupMeshes.FirstOrDefault();
+            mesh?.EnsureProcessed();
+            foreach (var groupMesh in groupMeshes)
+            {
+                token.ThrowIfCancellationRequested();
+                groupMesh.EnsureProcessed();
+            }
+
+            return new PreviewCandidateItem
+            {
+                AnimationClip = candidate.AnimationClip,
+                Avatar = candidate.Avatar,
+                Mesh = mesh,
+                AvatarId = candidate.AvatarId,
+                MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
+                ModelGroupId = candidate.ModelGroupId,
+                ModelGroupName = candidate.ModelGroupName,
+                ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+                ModelGroupMeshes = groupMeshes,
                 ModelGroupMeshCount = candidate.ModelGroupMeshCount,
                 ModelGroupConfidence = candidate.ModelGroupConfidence,
                 Label = candidate.Label
@@ -440,6 +510,14 @@ public partial class MainWindow : Window
         else if (candidate.Avatar != null)
         {
             PreviewAvatar(candidate.Avatar, candidate.Mesh, candidate.MeshId, candidate);
+        }
+        else if (candidate.IsModelGroup)
+        {
+            PreviewModelGroupCandidate(candidate);
+        }
+        else if (candidate.Mesh != null && AssetListDataGrid.SelectedItem is AssetItem selectedAsset)
+        {
+            PreviewMesh(selectedAsset, candidate.Mesh, rebuildCandidateControls: false, selectedCandidate: candidate, preferModelGroup: false);
         }
     }
 
@@ -516,6 +594,54 @@ public partial class MainWindow : Window
             for (int i = 0; i < slotCount; i++)
             {
                 var material = i < materials.Count ? materials[i] : null;
+                var baseColor = GetMeshMaterialBaseColor(material);
+                meshMaterialPreviewSlots.Add(new MeshMaterialPreviewSlot
+                {
+                    SlotIndex = i,
+                    MaterialName = string.IsNullOrEmpty(material?.m_Name) ? "No Material" : material!.m_Name,
+                    BaseColor = baseColor,
+                    CurrentColor = baseColor
+                });
+            }
+
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.SelectedIndex = meshMaterialPreviewSlots.Count > 0 ? 0 : -1;
+            }
+
+            if (MeshMaterialControlsContainer != null)
+            {
+                MeshMaterialControlsContainer.IsVisible = meshMaterialPreviewSlots.Count > 0;
+            }
+        }
+        finally
+        {
+            updatingMeshMaterialControls = false;
+        }
+
+        UpdateMeshMaterialControlValues();
+        ApplyMeshMaterialOverrides();
+    }
+
+    private void BuildMeshMaterialControlsForSlots(IReadOnlyList<AssetStudio.Material?> materials)
+    {
+        updatingMeshMaterialControls = true;
+        try
+        {
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.SelectedItem = null;
+                MeshMaterialSelector.SelectedIndex = -1;
+                if (MeshMaterialSelector.ItemsSource != meshMaterialPreviewSlots)
+                {
+                    MeshMaterialSelector.ItemsSource = meshMaterialPreviewSlots;
+                }
+            }
+
+            meshMaterialPreviewSlots.Clear();
+            for (int i = 0; i < materials.Count; i++)
+            {
+                var material = materials[i];
                 var baseColor = GetMeshMaterialBaseColor(material);
                 meshMaterialPreviewSlots.Add(new MeshMaterialPreviewSlot
                 {

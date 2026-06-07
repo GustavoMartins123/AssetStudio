@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 8;
+        private const int SemanticSchemaVersion = 9;
         private const int SemanticRelationCommitBatchSize = 10_000;
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
@@ -2697,6 +2697,91 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to load model groups from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        internal List<ModelGroupInfo> LoadModelGroupsForMeshAssetId(string folderPath, string signature, string meshAssetId)
+        {
+            var result = new List<ModelGroupInfo>();
+            if (string.IsNullOrWhiteSpace(meshAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        modelGroup.GroupAssetUniqueID,
+                        modelGroup.GroupKind,
+                        modelGroup.GroupName,
+                        modelGroup.RootGameObjectAssetUniqueID,
+                        modelGroup.RootGameObjectName,
+                        modelGroup.AnimatorAssetUniqueID,
+                        modelGroup.AvatarAssetUniqueID,
+                        modelGroup.ControllerAssetUniqueID,
+                        modelGroup.SourceFileName,
+                        modelGroup.Confidence,
+                        modelGroup.ConfidenceReason,
+                        COUNT(groupMesh.MeshAssetUniqueID) AS PartCount,
+                        MIN(groupMesh.SlotIndex) AS FirstSlot
+                    FROM ModelGroups modelGroup
+                    INNER JOIN ModelGroupMeshes selectedMesh
+                      ON selectedMesh.ProjectId = modelGroup.ProjectId
+                     AND selectedMesh.GroupAssetUniqueID = modelGroup.GroupAssetUniqueID
+                     AND selectedMesh.MeshAssetUniqueID = @meshAssetId
+                    INNER JOIN ModelGroupMeshes groupMesh
+                      ON groupMesh.ProjectId = modelGroup.ProjectId
+                     AND groupMesh.GroupAssetUniqueID = modelGroup.GroupAssetUniqueID
+                    WHERE modelGroup.ProjectId = @projectId
+                    GROUP BY
+                        modelGroup.GroupAssetUniqueID,
+                        modelGroup.GroupKind,
+                        modelGroup.GroupName,
+                        modelGroup.RootGameObjectAssetUniqueID,
+                        modelGroup.RootGameObjectName,
+                        modelGroup.AnimatorAssetUniqueID,
+                        modelGroup.AvatarAssetUniqueID,
+                        modelGroup.ControllerAssetUniqueID,
+                        modelGroup.SourceFileName,
+                        modelGroup.Confidence,
+                        modelGroup.ConfidenceReason
+                    ORDER BY modelGroup.Confidence DESC, PartCount ASC, FirstSlot, modelGroup.GroupName, modelGroup.GroupAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(new ModelGroupInfo(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetString(3),
+                        reader.GetString(4),
+                        reader.GetString(5),
+                        reader.GetString(6),
+                        reader.GetString(7),
+                        reader.GetString(8),
+                        reader.GetInt32(9),
+                        reader.GetString(10)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load model groups for mesh from SQLite: {ex.Message}");
             }
 
             return result;

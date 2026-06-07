@@ -797,6 +797,7 @@ namespace AssetStudio.Avalonia
             var containerReferences = new List<(string Container, List<PPtr<AssetStudio.Object>> References)>();
             var meshFiltersByGameObjectId = BuildMeshFilterBindingsByGameObject(file, objectsSnapshot);
             var skinnedMeshBindings = BuildSkinnedMeshBindings(file, objectsSnapshot);
+            var meshRendererBindings = BuildMeshRendererBindings(file, objectsSnapshot, meshFiltersByGameObjectId);
             var animatorCount = objectsSnapshot.OfType<Animator>().Count();
             var seenRendererMeshRelations = new HashSet<string>(StringComparer.Ordinal);
 
@@ -951,6 +952,11 @@ namespace AssetStudio.Avalonia
                 }
             }
 
+            AddSceneObjectModelGroupRelations(
+                file,
+                result.SemanticRelations,
+                skinnedMeshBindings.Select(binding => RendererMeshSemanticBinding.FromSkinned(binding))
+                    .Concat(meshRendererBindings));
             AddContainerMaterialRelations(result.SemanticRelations, file, containerReferences);
             return result;
         }
@@ -1213,6 +1219,59 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        private static List<RendererMeshSemanticBinding> BuildMeshRendererBindings(
+            SerializedFile sourceFile,
+            IEnumerable<AssetStudio.Object> objects,
+            IReadOnlyDictionary<string, List<MeshFilterSemanticBinding>> meshFiltersByGameObjectId)
+        {
+            var result = new List<RendererMeshSemanticBinding>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var renderer in objects.OfType<MeshRenderer>())
+            {
+                var gameObject = ResolveGameObjectBackground(sourceFile, renderer.m_GameObject);
+                var gameObjectId = GetSemanticGameObjectId(sourceFile, renderer.m_GameObject, gameObject);
+                if (string.IsNullOrEmpty(gameObjectId)
+                    || !meshFiltersByGameObjectId.TryGetValue(gameObjectId, out var meshFilterBindings))
+                {
+                    continue;
+                }
+
+                var rendererId = GetSemanticAssetId(renderer);
+                if (string.IsNullOrEmpty(rendererId))
+                {
+                    continue;
+                }
+
+                foreach (var binding in meshFilterBindings)
+                {
+                    if (string.IsNullOrEmpty(binding.MeshId))
+                    {
+                        continue;
+                    }
+
+                    var key = $"{rendererId}\u001f{binding.MeshId}";
+                    if (!seen.Add(key))
+                    {
+                        continue;
+                    }
+
+                    result.Add(new RendererMeshSemanticBinding(
+                        renderer,
+                        rendererId,
+                        "MeshRenderer",
+                        binding.Mesh,
+                        binding.MeshId,
+                        binding.GameObject ?? gameObject,
+                        binding.MeshFilter.m_Mesh.m_FileID,
+                        binding.MeshFilter.m_Mesh.m_PathID,
+                        100,
+                        "MeshRenderer GameObject MeshFilter"));
+                }
+            }
+
+            return result;
+        }
+
         private static void AddAnimatorAvatarMeshRelations(
             SerializedFile sourceFile,
             Animator animator,
@@ -1406,6 +1465,153 @@ namespace AssetStudio.Avalonia
                     match.ConfidenceReason));
                 slotIndex++;
             }
+        }
+
+        private static void AddSceneObjectModelGroupRelations(
+            SerializedFile sourceFile,
+            SemanticAssetRelations relations,
+            IEnumerable<RendererMeshSemanticBinding> rendererBindings)
+        {
+            var bindings = rendererBindings
+                .Where(binding => binding.GameObject != null
+                    && !string.IsNullOrEmpty(binding.MeshId)
+                    && !string.IsNullOrEmpty(binding.RendererId))
+                .ToList();
+            if (bindings.Count < 2)
+            {
+                return;
+            }
+
+            var ancestryByGameObjectId = new Dictionary<string, List<GameObjectHierarchyEntry>>(StringComparer.Ordinal);
+            var rendererCountByAncestorId = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var binding in bindings)
+            {
+                var ancestry = GetGameObjectAncestry(sourceFile, binding.GameObject!);
+                if (ancestry.Count == 0)
+                {
+                    continue;
+                }
+
+                var ownId = ancestry[0].GameObjectId;
+                ancestryByGameObjectId[ownId] = ancestry;
+                foreach (var ancestor in ancestry)
+                {
+                    rendererCountByAncestorId.TryGetValue(ancestor.GameObjectId, out var count);
+                    rendererCountByAncestorId[ancestor.GameObjectId] = count + 1;
+                }
+            }
+
+            var groups = new Dictionary<string, SceneObjectModelGroupBuilder>(StringComparer.Ordinal);
+            foreach (var binding in bindings)
+            {
+                var ownId = binding.GameObject != null ? GetSemanticAssetId(binding.GameObject) : string.Empty;
+                if (string.IsNullOrEmpty(ownId)
+                    || !ancestryByGameObjectId.TryGetValue(ownId, out var ancestry))
+                {
+                    continue;
+                }
+
+                var groupRoot = ancestry.FirstOrDefault(entry =>
+                    rendererCountByAncestorId.TryGetValue(entry.GameObjectId, out var count) && count > 1);
+                if (groupRoot.GameObject == null)
+                {
+                    continue;
+                }
+
+                if (!groups.TryGetValue(groupRoot.GameObjectId, out var group))
+                {
+                    group = new SceneObjectModelGroupBuilder(groupRoot);
+                    groups[groupRoot.GameObjectId] = group;
+                }
+
+                group.Add(binding);
+            }
+
+            foreach (var group in groups.Values)
+            {
+                if (group.Bindings.Count < 2)
+                {
+                    continue;
+                }
+
+                var groupId = $"modelgroup:sceneobject:{group.Root.GameObjectId}";
+                relations.ModelGroups.Add(new SemanticModelGroupRelation(
+                    groupId,
+                    "SceneObject",
+                    group.Root.Name,
+                    group.Root.GameObjectId,
+                    group.Root.Name,
+                    string.Empty,
+                    string.Empty,
+                    string.Empty,
+                    sourceFile.fileName ?? string.Empty,
+                    group.Confidence,
+                    group.ConfidenceReason));
+
+                var slotIndex = 0;
+                var seenParts = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var binding in group.Bindings)
+                {
+                    var partKey = $"{binding.MeshId}\u001f{binding.RendererId}";
+                    if (!seenParts.Add(partKey))
+                    {
+                        continue;
+                    }
+
+                    var gameObjectId = binding.GameObject != null
+                        ? GetSemanticAssetId(binding.GameObject)
+                        : string.Empty;
+                    relations.ModelGroupMeshes.Add(new SemanticModelGroupMeshRelation(
+                        groupId,
+                        binding.MeshId,
+                        binding.RendererId,
+                        binding.RendererType,
+                        gameObjectId,
+                        binding.GameObject?.m_Name ?? string.Empty,
+                        slotIndex,
+                        binding.Confidence,
+                        binding.ConfidenceReason));
+                    slotIndex++;
+                }
+            }
+        }
+
+        private static List<GameObjectHierarchyEntry> GetGameObjectAncestry(SerializedFile sourceFile, GameObject gameObject)
+        {
+            var result = new List<GameObjectHierarchyEntry>();
+            var visited = new HashSet<long>();
+            GameObject? current = gameObject;
+            for (var depth = 0; current != null && depth < 256; depth++)
+            {
+                if (!visited.Add(current.m_PathID))
+                {
+                    break;
+                }
+
+                var currentId = GetSemanticAssetId(current);
+                if (string.IsNullOrEmpty(currentId))
+                {
+                    break;
+                }
+
+                result.Add(new GameObjectHierarchyEntry(current, currentId, current.m_Name ?? string.Empty, depth));
+
+                var transform = ResolveTransformForGameObjectBackground(sourceFile, current);
+                if (transform?.m_Father == null || transform.m_Father.IsNull)
+                {
+                    break;
+                }
+
+                var parentTransform = ResolveTransformBackground(sourceFile, transform.m_Father);
+                if (parentTransform == null)
+                {
+                    break;
+                }
+
+                current = ResolveGameObjectBackground(sourceFile, parentTransform.m_GameObject);
+            }
+
+            return result;
         }
 
         private static string BuildAnimatorModelGroupId(
@@ -1976,6 +2182,97 @@ namespace AssetStudio.Avalonia
             public GameObject? GameObject { get; }
             public int MeshFileId { get; }
             public long MeshPathId { get; }
+        }
+
+        private readonly struct RendererMeshSemanticBinding
+        {
+            public RendererMeshSemanticBinding(
+                Renderer renderer,
+                string rendererId,
+                string rendererType,
+                Mesh? mesh,
+                string meshId,
+                GameObject? gameObject,
+                int meshFileId,
+                long meshPathId,
+                int confidence,
+                string confidenceReason)
+            {
+                Renderer = renderer;
+                RendererId = rendererId;
+                RendererType = rendererType;
+                Mesh = mesh;
+                MeshId = meshId;
+                GameObject = gameObject;
+                MeshFileId = meshFileId;
+                MeshPathId = meshPathId;
+                Confidence = confidence;
+                ConfidenceReason = confidenceReason;
+            }
+
+            public Renderer Renderer { get; }
+            public string RendererId { get; }
+            public string RendererType { get; }
+            public Mesh? Mesh { get; }
+            public string MeshId { get; }
+            public GameObject? GameObject { get; }
+            public int MeshFileId { get; }
+            public long MeshPathId { get; }
+            public int Confidence { get; }
+            public string ConfidenceReason { get; }
+
+            public static RendererMeshSemanticBinding FromSkinned(SkinnedMeshSemanticBinding binding)
+            {
+                return new RendererMeshSemanticBinding(
+                    binding.Renderer,
+                    GetSemanticAssetId(binding.Renderer),
+                    "SkinnedMeshRenderer",
+                    binding.Mesh,
+                    binding.MeshId,
+                    binding.GameObject,
+                    binding.MeshFileId,
+                    binding.MeshPathId,
+                    100,
+                    "SkinnedMeshRenderer hierarchy");
+            }
+        }
+
+        private readonly struct GameObjectHierarchyEntry
+        {
+            public GameObjectHierarchyEntry(GameObject gameObject, string gameObjectId, string name, int depth)
+            {
+                GameObject = gameObject;
+                GameObjectId = gameObjectId;
+                Name = name;
+                Depth = depth;
+            }
+
+            public GameObject GameObject { get; }
+            public string GameObjectId { get; }
+            public string Name { get; }
+            public int Depth { get; }
+        }
+
+        private sealed class SceneObjectModelGroupBuilder
+        {
+            public SceneObjectModelGroupBuilder(GameObjectHierarchyEntry root)
+            {
+                Root = root;
+            }
+
+            public GameObjectHierarchyEntry Root { get; }
+            public List<RendererMeshSemanticBinding> Bindings { get; } = new();
+            public int Confidence => Bindings.Count == 0 ? 0 : Bindings.Min(binding => binding.Confidence);
+            public string ConfidenceReason => Bindings.Count == 0
+                ? string.Empty
+                : Bindings.All(binding => binding.ConfidenceReason == Bindings[0].ConfidenceReason)
+                    ? Bindings[0].ConfidenceReason
+                    : "Mixed renderer hierarchy evidence";
+
+            public void Add(RendererMeshSemanticBinding binding)
+            {
+                Bindings.Add(binding);
+            }
         }
 
         private readonly struct SkinnedMeshSemanticMatch

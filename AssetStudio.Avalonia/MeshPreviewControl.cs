@@ -290,6 +290,16 @@ void main()
                     meshPreviewSourceSubMeshTexHeights,
                     resetMaterialOverrides: false);
             }
+            else if (meshGroupPreviewSources != null && meshGroupPreviewSources.Count > 0)
+            {
+                SetMeshGroup(
+                    meshGroupPreviewSources,
+                    meshGroupPreviewSourceUvs,
+                    meshGroupPreviewSourceSubMeshTextures,
+                    meshGroupPreviewSourceSubMeshTexWidths,
+                    meshGroupPreviewSourceSubMeshTexHeights,
+                    resetMaterialOverrides: false);
+            }
         }
 
         // Mode flags
@@ -320,6 +330,11 @@ void main()
         private List<byte[]?>? meshPreviewSourceSubMeshTextures;
         private List<int>? meshPreviewSourceSubMeshTexWidths;
         private List<int>? meshPreviewSourceSubMeshTexHeights;
+        private IReadOnlyList<Mesh>? meshGroupPreviewSources;
+        private IReadOnlyList<Vector2[]?>? meshGroupPreviewSourceUvs;
+        private List<byte[]?>? meshGroupPreviewSourceSubMeshTextures;
+        private List<int>? meshGroupPreviewSourceSubMeshTexWidths;
+        private List<int>? meshGroupPreviewSourceSubMeshTexHeights;
         private int[]? previewSubMeshIndexCounts;
         private int meshLoadCounter = 0;
 
@@ -738,6 +753,11 @@ void main()
             meshPreviewSourceSubMeshTextures = null;
             meshPreviewSourceSubMeshTexWidths = null;
             meshPreviewSourceSubMeshTexHeights = null;
+            meshGroupPreviewSources = null;
+            meshGroupPreviewSourceUvs = null;
+            meshGroupPreviewSourceSubMeshTextures = null;
+            meshGroupPreviewSourceSubMeshTexWidths = null;
+            meshGroupPreviewSourceSubMeshTexHeights = null;
             previewSubMeshIndexCounts = null;
             keepExistingTextures = false;
             ClearPendingTextureUploads();
@@ -916,6 +936,364 @@ void main()
             SetMesh(m_Mesh, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
         }
 
+        public void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs = null, List<byte[]?>? subMeshTextures = null, List<int>? subMeshTexWidths = null, List<int>? subMeshTexHeights = null)
+        {
+            SetMeshGroup(meshes, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
+        }
+
+        private void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
+        {
+            ClearAvatarPreviewState();
+            meshPreviewSource = null;
+            meshPreviewSourceUvs = null;
+            meshPreviewSourceSubMeshTextures = null;
+            meshPreviewSourceSubMeshTexWidths = null;
+            meshPreviewSourceSubMeshTexHeights = null;
+
+            var meshSources = meshes
+                .Where(mesh => mesh != null)
+                .Distinct()
+                .ToArray();
+            meshGroupPreviewSources = meshSources;
+            meshGroupPreviewSourceUvs = uvs;
+            meshGroupPreviewSourceSubMeshTextures = subMeshTextures;
+            meshGroupPreviewSourceSubMeshTexWidths = subMeshTexWidths;
+            meshGroupPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+
+            if (resetMaterialOverrides)
+            {
+                previewMaterialMode = false;
+                materialTintOverrides = null;
+                keepExistingTextures = false;
+                ClearPendingTextureUploads();
+            }
+            else
+            {
+                keepExistingTextures = true;
+            }
+
+            if (meshSources.Length == 0)
+            {
+                return;
+            }
+
+            var uvSources = uvs?.ToArray();
+            var densityPercent = previewMeshDensityPercent;
+            int currentLoadId = ++meshLoadCounter;
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                var parts = new List<MeshPreviewPartGeometry>();
+                var combinedSubMeshCounts = new List<int>();
+                var totalVertexCount = 0;
+                var totalIndexCount = 0;
+                var hasBounds = false;
+                var min = Vector3.Zero;
+                var max = Vector3.Zero;
+
+                for (var meshIndex = 0; meshIndex < meshSources.Length; meshIndex++)
+                {
+                    var mesh = meshSources[meshIndex];
+                    mesh.EnsureProcessed();
+                    if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0 || mesh.m_Indices == null || mesh.m_Indices.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var meshUvs = uvSources != null && meshIndex < uvSources.Length ? uvSources[meshIndex] : null;
+                    var part = BuildMeshPreviewPartGeometry(mesh, meshUvs, densityPercent);
+                    if (part.Vertices.Length == 0 || part.Indices.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    parts.Add(part);
+                    totalVertexCount += part.Vertices.Length;
+                    totalIndexCount += part.Indices.Length;
+                    if (part.SubMeshIndexCounts != null && part.SubMeshIndexCounts.Length > 0)
+                    {
+                        combinedSubMeshCounts.AddRange(part.SubMeshIndexCounts);
+                    }
+                    else
+                    {
+                        combinedSubMeshCounts.Add(part.Indices.Length);
+                    }
+
+                    if (!hasBounds)
+                    {
+                        min = part.Min;
+                        max = part.Max;
+                        hasBounds = true;
+                    }
+                    else
+                    {
+                        ExpandBounds(part.Min, ref min, ref max);
+                        ExpandBounds(part.Max, ref min, ref max);
+                    }
+                }
+
+                if (parts.Count == 0 || !hasBounds || totalVertexCount <= 0 || totalIndexCount <= 0)
+                {
+                    return;
+                }
+
+                var localVertexData = new Vector3[totalVertexCount];
+                var localIndiceData = new int[totalIndexCount];
+                Vector3[]? localNormalData = parts.All(part => part.Normals != null && part.Normals.Length == part.Vertices.Length)
+                    ? new Vector3[totalVertexCount]
+                    : null;
+                var localColorData = new Vector4[totalVertexCount];
+                Vector2[]? localUvData = parts.Any(part => part.Uvs != null && part.Uvs.Length == part.Vertices.Length)
+                    ? new Vector2[totalVertexCount]
+                    : null;
+
+                var vertexOffset = 0;
+                var indexOffset = 0;
+                foreach (var part in parts)
+                {
+                    Array.Copy(part.Vertices, 0, localVertexData, vertexOffset, part.Vertices.Length);
+                    Array.Copy(part.Colors, 0, localColorData, vertexOffset, part.Colors.Length);
+
+                    if (localNormalData != null && part.Normals != null)
+                    {
+                        Array.Copy(part.Normals, 0, localNormalData, vertexOffset, part.Normals.Length);
+                    }
+
+                    if (localUvData != null && part.Uvs != null)
+                    {
+                        Array.Copy(part.Uvs, 0, localUvData, vertexOffset, part.Uvs.Length);
+                    }
+
+                    for (var i = 0; i < part.Indices.Length; i++)
+                    {
+                        localIndiceData[indexOffset + i] = part.Indices[i] + vertexOffset;
+                    }
+
+                    vertexOffset += part.Vertices.Length;
+                    indexOffset += part.Indices.Length;
+                }
+
+                var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
+                var localPreviewSubMeshIndexCounts = combinedSubMeshCounts.Count > 0
+                    ? combinedSubMeshCounts.ToArray()
+                    : null;
+                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
+
+                if (resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null))
+                {
+                    lock (textureLock)
+                    {
+                        pendingSubMeshTextures = subMeshTextures;
+                        pendingSubMeshTexWidths = subMeshTexWidths;
+                        pendingSubMeshTexHeights = subMeshTexHeights;
+                        hasPendingSubMeshTextures = true;
+                    }
+                }
+
+                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    if (currentLoadId != meshLoadCounter)
+                    {
+                        return;
+                    }
+
+                    if (resetMaterialOverrides)
+                    {
+                        viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
+                        modelMatrixData = localModelMatrixData;
+                        initialViewMatrix = viewMatrixData;
+                        initialModelMatrix = modelMatrixData;
+                    }
+
+                    vertexData = localVertexData;
+                    indiceData = localIndiceData;
+                    normalData = localNormalData;
+                    normal2Data = localNormal2Data;
+                    colorData = localColorData;
+                    uvData = localUvData;
+                    previewSubMeshIndexCounts = localPreviewSubMeshIndexCounts;
+                    if (resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null))
+                    {
+                        previewMaterialMode = true;
+                    }
+                    vao = 0;
+                    RequestNextFrameRendering();
+                });
+            });
+        }
+
+        private MeshPreviewPartGeometry BuildMeshPreviewPartGeometry(Mesh mesh, Vector2[]? uvs, float densityPercent)
+        {
+            var cachedGeometry = LoadMeshPreviewGeometryCache?.Invoke(mesh, densityPercent);
+            if (cachedGeometry != null)
+            {
+                GetMeshPreviewGeometryBounds(cachedGeometry.Vertices, out var cachedMin, out var cachedMax);
+                return new MeshPreviewPartGeometry(
+                    cachedGeometry.Vertices,
+                    cachedGeometry.Indices,
+                    cachedGeometry.Normals,
+                    cachedGeometry.Colors,
+                    cachedGeometry.Uvs,
+                    cachedGeometry.SubMeshIndexCounts,
+                    cachedMin,
+                    cachedMax);
+            }
+
+            var vertexComponentCount = mesh.m_Vertices!.Length == mesh.m_VertexCount * 4 ? 4 : 3;
+            var localVertexData = new Vector3[mesh.m_VertexCount];
+            var min = new Vector3(mesh.m_Vertices[0], mesh.m_Vertices[1], mesh.m_Vertices[2]);
+            var max = min;
+            for (var v = 0; v < mesh.m_VertexCount; v++)
+            {
+                var vertex = new Vector3(
+                    mesh.m_Vertices[v * vertexComponentCount],
+                    mesh.m_Vertices[v * vertexComponentCount + 1],
+                    mesh.m_Vertices[v * vertexComponentCount + 2]);
+                localVertexData[v] = vertex;
+                ExpandBounds(vertex, ref min, ref max);
+            }
+
+            var localIndiceData = new int[mesh.m_Indices.Count];
+            for (var i = 0; i < mesh.m_Indices.Count; i++)
+            {
+                localIndiceData[i] = (int)mesh.m_Indices[i];
+            }
+
+            Vector3[]? localNormalData = null;
+            if (mesh.m_Normals != null && mesh.m_Normals.Length > 0)
+            {
+                var normalComponentCount = mesh.m_Normals.Length == mesh.m_VertexCount * 4 ? 4 : 3;
+                localNormalData = new Vector3[mesh.m_VertexCount];
+                for (var n = 0; n < mesh.m_VertexCount; n++)
+                {
+                    localNormalData[n] = new Vector3(
+                        mesh.m_Normals[n * normalComponentCount],
+                        mesh.m_Normals[n * normalComponentCount + 1],
+                        mesh.m_Normals[n * normalComponentCount + 2]);
+                }
+            }
+
+            Vector4[] localColorData;
+            if (mesh.m_Colors != null && mesh.m_Colors.Length == mesh.m_VertexCount * 3)
+            {
+                localColorData = new Vector4[mesh.m_VertexCount];
+                for (var c = 0; c < mesh.m_VertexCount; c++)
+                {
+                    localColorData[c] = new Vector4(mesh.m_Colors[c * 3], mesh.m_Colors[c * 3 + 1], mesh.m_Colors[c * 3 + 2], 1.0f);
+                }
+            }
+            else if (mesh.m_Colors != null && mesh.m_Colors.Length == mesh.m_VertexCount * 4)
+            {
+                localColorData = new Vector4[mesh.m_VertexCount];
+                for (var c = 0; c < mesh.m_VertexCount; c++)
+                {
+                    localColorData[c] = new Vector4(mesh.m_Colors[c * 4], mesh.m_Colors[c * 4 + 1], mesh.m_Colors[c * 4 + 2], mesh.m_Colors[c * 4 + 3]);
+                }
+            }
+            else
+            {
+                localColorData = new Vector4[mesh.m_VertexCount];
+                Array.Fill(localColorData, new Vector4(0.5f, 0.5f, 0.5f, 1.0f));
+            }
+
+            var localUvData = uvs ?? BuildPreviewUvData(mesh.m_UV0, mesh.m_VertexCount);
+            var localPreviewSubMeshIndexCounts = BuildSubMeshIndexCounts(mesh, localIndiceData.Length);
+            if (densityPercent < PreviewMeshSimplifier.MaxDensityPercent - 0.01f)
+            {
+                var simplified = PreviewMeshSimplifier.Build(localVertexData, mesh.m_Indices, min, max, densityPercent, localPreviewSubMeshIndexCounts);
+                if (simplified.Indices.Length > 0)
+                {
+                    localVertexData = simplified.Vertices;
+                    localIndiceData = simplified.Indices;
+                    localPreviewSubMeshIndexCounts = simplified.SubMeshIndexCounts;
+                    localNormalData = RemapVector3Data(localNormalData, simplified.SourceVertexIndices);
+                    localColorData = RemapVector4Data(localColorData, simplified.SourceVertexIndices) ?? localColorData;
+                    localUvData = RemapVector2Data(localUvData, simplified.SourceVertexIndices);
+                    GetMeshPreviewGeometryBounds(localVertexData, out min, out max);
+                }
+            }
+
+            var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
+            SaveMeshPreviewGeometryCache?.Invoke(mesh, densityPercent, new MeshPreviewGeometryCache
+            {
+                ModelMatrix = CreatePreviewModelMatrix(min, max),
+                Vertices = localVertexData,
+                Indices = localIndiceData,
+                Normals = localNormalData,
+                CalculatedNormals = localNormal2Data,
+                Colors = localColorData,
+                Uvs = localUvData,
+                SubMeshIndexCounts = localPreviewSubMeshIndexCounts
+            });
+
+            return new MeshPreviewPartGeometry(
+                localVertexData,
+                localIndiceData,
+                localNormalData,
+                localColorData,
+                localUvData,
+                localPreviewSubMeshIndexCounts,
+                min,
+                max);
+        }
+
+        private static void GetMeshPreviewGeometryBounds(Vector3[] vertices, out Vector3 min, out Vector3 max)
+        {
+            min = Vector3.Zero;
+            max = Vector3.Zero;
+            var hasPoint = false;
+            foreach (var vertex in vertices)
+            {
+                if (!IsFinitePoint(vertex))
+                {
+                    continue;
+                }
+
+                if (!hasPoint)
+                {
+                    min = vertex;
+                    max = vertex;
+                    hasPoint = true;
+                }
+                else
+                {
+                    ExpandBounds(vertex, ref min, ref max);
+                }
+            }
+        }
+
+        private sealed class MeshPreviewPartGeometry
+        {
+            public MeshPreviewPartGeometry(
+                Vector3[] vertices,
+                int[] indices,
+                Vector3[]? normals,
+                Vector4[] colors,
+                Vector2[]? uvs,
+                int[]? subMeshIndexCounts,
+                Vector3 min,
+                Vector3 max)
+            {
+                Vertices = vertices;
+                Indices = indices;
+                Normals = normals;
+                Colors = colors;
+                Uvs = uvs;
+                SubMeshIndexCounts = subMeshIndexCounts;
+                Min = min;
+                Max = max;
+            }
+
+            public Vector3[] Vertices { get; }
+            public int[] Indices { get; }
+            public Vector3[]? Normals { get; }
+            public Vector4[] Colors { get; }
+            public Vector2[]? Uvs { get; }
+            public int[]? SubMeshIndexCounts { get; }
+            public Vector3 Min { get; }
+            public Vector3 Max { get; }
+        }
+
         public void ApplyMeshTextures(List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
         {
             ApplyMeshTextures(null, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
@@ -933,9 +1311,18 @@ void main()
                 return;
             }
 
-            meshPreviewSourceSubMeshTextures = subMeshTextures;
-            meshPreviewSourceSubMeshTexWidths = subMeshTexWidths;
-            meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+            if (meshGroupPreviewSources != null && meshGroupPreviewSources.Count > 0 && expectedMesh == null)
+            {
+                meshGroupPreviewSourceSubMeshTextures = subMeshTextures;
+                meshGroupPreviewSourceSubMeshTexWidths = subMeshTexWidths;
+                meshGroupPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+            }
+            else
+            {
+                meshPreviewSourceSubMeshTextures = subMeshTextures;
+                meshPreviewSourceSubMeshTexWidths = subMeshTexWidths;
+                meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+            }
             keepExistingTextures = true;
             previewMaterialMode = true;
             vao = 0;
@@ -954,6 +1341,11 @@ void main()
         private void SetMesh(Mesh m_Mesh, Vector2[]? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
         {
             ClearAvatarPreviewState();
+            meshGroupPreviewSources = null;
+            meshGroupPreviewSourceUvs = null;
+            meshGroupPreviewSourceSubMeshTextures = null;
+            meshGroupPreviewSourceSubMeshTexWidths = null;
+            meshGroupPreviewSourceSubMeshTexHeights = null;
             if (resetMaterialOverrides)
             {
                 previewMaterialMode = false;
