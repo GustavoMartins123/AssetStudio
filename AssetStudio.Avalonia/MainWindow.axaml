@@ -282,7 +282,7 @@
                             </Grid>
                         </Border>
 
-                        <Panel Grid.Row="1" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
+                        <Panel x:Name="PreviewContentHost" Grid.Row="1" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
                         <Border x:Name="TextAssetPreviewPanel" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False">
                             <Grid RowDefinitions="Auto,*">

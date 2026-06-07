@@ -99,8 +99,18 @@ public partial class MainWindow : Window
     private DispatcherTimer? _2dAnimTimer;
     private List<(float time, AssetStudio.Object asset)> _2dAnimFrames = new();
     private Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap> _2dAnimBitmaps = new();
+    private global::Avalonia.Media.Imaging.Bitmap? _2dAnimCurrentBitmap;
     private DateTime _2dAnimStartTime;
     private float _2dAnimDuration;
+    private float _2dAnimPausedElapsedSeconds;
+    private int _2dAnimCurrentFrameIndex;
+    private bool _2dAnimPaused;
+    private bool _is2dAnimationPreviewActive;
+    private double _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
+    private const double TwoDAnimationMinPreviewFill = 0.025;
+    private const double TwoDAnimationDefaultPreviewFill = 0.10;
+    private const double TwoDAnimationMaxPreviewFill = 1.0;
+    private const double TwoDAnimationZoomFactor = 1.12;
 
     private readonly SQLiteProjectIndexCache _sqliteCache = new();
     private ProjectScanResult? currentScanResult;
@@ -139,6 +149,9 @@ public partial class MainWindow : Window
         InitializeComponent();
         GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
         GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
+        PreviewContentHost.SizeChanged += (_, _) => Update2DAnimationImageLayout();
+        PreviewContentHost.PointerWheelChanged += ImagePreviewBox_PointerWheelChanged;
+        ImagePreviewBox.PointerWheelChanged += ImagePreviewBox_PointerWheelChanged;
         InitializeTheme();
         try
         {
@@ -284,7 +297,7 @@ public partial class MainWindow : Window
             {
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
-                    AnimFrameLabel.Text = $"Frame: {currentFrame}/{totalFrames}";
+                    UpdateAnimationPlaybackFrame(currentFrame, totalFrames);
                 });
             };
         }
@@ -739,6 +752,33 @@ public partial class MainWindow : Window
         if (AnimPlayPauseBtn != null)
         {
             AnimPlayPauseBtn.Content = "Pause";
+        }
+    }
+
+    private void ShowAnimationPlayback(int totalFrames)
+    {
+        if (AnimationPlaybackPanel != null)
+        {
+            AnimationPlaybackPanel.IsVisible = true;
+        }
+
+        SetAnimationPlaybackPaused(false);
+        UpdateAnimationPlaybackFrame(0, totalFrames);
+    }
+
+    private void SetAnimationPlaybackPaused(bool paused)
+    {
+        if (AnimPlayPauseBtn != null)
+        {
+            AnimPlayPauseBtn.Content = paused ? "Play" : "Pause";
+        }
+    }
+
+    private void UpdateAnimationPlaybackFrame(int currentFrame, int totalFrames)
+    {
+        if (AnimFrameLabel != null)
+        {
+            AnimFrameLabel.Text = $"Frame: {currentFrame}/{Math.Max(0, totalFrames)}";
         }
     }
 
@@ -4619,6 +4659,7 @@ public partial class MainWindow : Window
         ClearPreviewCandidateControls();
         if (asset is not AnimationClip)
         {
+            Stop2DAnimation();
             HideAnimationPlayback();
             GLPreviewControl?.StopAnimation();
             currentPreviewMesh = null;
@@ -7161,9 +7202,21 @@ public partial class MainWindow : Window
         if (TextureGLPreview != null) TextureGLPreview.IsVisible = false;
         if (TextPreviewBox != null) TextPreviewBox.IsVisible = false;
         if (PreviewLabel != null) PreviewLabel.IsVisible = false;
-        if (ImagePreviewBox != null) ImagePreviewBox.IsVisible = true;
+        if (ImagePreviewBox != null)
+        {
+            ImagePreviewBox.IsVisible = true;
+            ImagePreviewBox.Stretch = global::Avalonia.Media.Stretch.Fill;
+            ImagePreviewBox.StretchDirection = global::Avalonia.Media.StretchDirection.Both;
+        }
 
+        _is2dAnimationPreviewActive = true;
+        _2dAnimPaused = false;
+        _2dAnimPausedElapsedSeconds = 0;
+        _2dAnimCurrentFrameIndex = 0;
+        _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
         _2dAnimStartTime = DateTime.UtcNow;
+        ShowAnimationPlayback(_2dAnimFrames.Count);
+        Render2DAnimationFrame(0);
 
         _2dAnimTimer = new DispatcherTimer
         {
@@ -7183,31 +7236,171 @@ public partial class MainWindow : Window
             return;
         }
 
-        var elapsedSeconds = (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
-        var loopTime = _2dAnimDuration > 0 ? (elapsedSeconds % _2dAnimDuration) : 0f;
-
-        var frame = _2dAnimFrames.LastOrDefault(f => f.time <= loopTime);
-        if (frame.asset == null)
+        if (_2dAnimPaused)
         {
-            frame = _2dAnimFrames.First();
+            return;
         }
 
+        Render2DAnimationFrame(Get2DAnimationLoopTime());
+    }
+
+    private float Get2DAnimationLoopTime()
+    {
+        var elapsedSeconds = _2dAnimPaused
+            ? _2dAnimPausedElapsedSeconds
+            : (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
+        return _2dAnimDuration > 0 ? elapsedSeconds % _2dAnimDuration : 0f;
+    }
+
+    private void Render2DAnimationFrame(float loopTime)
+    {
+        if (_2dAnimFrames.Count == 0)
+        {
+            return;
+        }
+
+        var frameIndex = _2dAnimFrames.FindLastIndex(f => f.time <= loopTime);
+        if (frameIndex < 0)
+        {
+            frameIndex = 0;
+        }
+
+        var frame = _2dAnimFrames[frameIndex];
         if (_2dAnimBitmaps.TryGetValue(frame.asset, out var bitmap))
         {
+            _2dAnimCurrentFrameIndex = frameIndex;
+            Set2DAnimationFrame(bitmap);
+            UpdateAnimationPlaybackFrame(_2dAnimCurrentFrameIndex, _2dAnimFrames.Count);
+        }
+    }
+
+    private void Pause2DAnimation()
+    {
+        if (!_is2dAnimationPreviewActive || _2dAnimPaused)
+        {
+            return;
+        }
+
+        _2dAnimPausedElapsedSeconds = (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
+        _2dAnimPaused = true;
+        _2dAnimTimer?.Stop();
+        SetAnimationPlaybackPaused(true);
+    }
+
+    private void Play2DAnimation()
+    {
+        if (!_is2dAnimationPreviewActive || !_2dAnimPaused)
+        {
+            return;
+        }
+
+        _2dAnimStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(_2dAnimPausedElapsedSeconds);
+        _2dAnimPaused = false;
+        _2dAnimTimer?.Start();
+        SetAnimationPlaybackPaused(false);
+    }
+
+    private void Restart2DAnimation()
+    {
+        if (!_is2dAnimationPreviewActive)
+        {
+            return;
+        }
+
+        _2dAnimPaused = false;
+        _2dAnimPausedElapsedSeconds = 0;
+        _2dAnimStartTime = DateTime.UtcNow;
+        Render2DAnimationFrame(0);
+        _2dAnimTimer?.Start();
+        SetAnimationPlaybackPaused(false);
+    }
+
+    private void Set2DAnimationFrame(global::Avalonia.Media.Imaging.Bitmap bitmap)
+    {
+        if (ImagePreviewBox == null)
+        {
+            return;
+        }
+
+        if (!ReferenceEquals(_2dAnimCurrentBitmap, bitmap))
+        {
+            _2dAnimCurrentBitmap = bitmap;
             ImagePreviewBox.Source = bitmap;
         }
+
+        Update2DAnimationImageLayout();
+    }
+
+    private void Update2DAnimationImageLayout()
+    {
+        if (!_is2dAnimationPreviewActive || ImagePreviewBox == null || _2dAnimCurrentBitmap == null)
+        {
+            return;
+        }
+
+        var hostWidth = PreviewContentHost.Bounds.Width;
+        var hostHeight = PreviewContentHost.Bounds.Height;
+        var pixelWidth = Math.Max(1, _2dAnimCurrentBitmap.PixelSize.Width);
+        var pixelHeight = Math.Max(1, _2dAnimCurrentBitmap.PixelSize.Height);
+        if (hostWidth <= 1 || hostHeight <= 1)
+        {
+            ImagePreviewBox.Width = pixelWidth;
+            ImagePreviewBox.Height = pixelHeight;
+            return;
+        }
+
+        var fitScale = Math.Min(hostWidth / pixelWidth, hostHeight / pixelHeight);
+        var fill = Math.Clamp(_2dAnimPreviewFill, TwoDAnimationMinPreviewFill, TwoDAnimationMaxPreviewFill);
+        var scale = Math.Max(0.01, fitScale * fill);
+        ImagePreviewBox.Width = pixelWidth * scale;
+        ImagePreviewBox.Height = pixelHeight * scale;
+    }
+
+    private void ImagePreviewBox_PointerWheelChanged(object? sender, PointerWheelEventArgs e)
+    {
+        if (!_is2dAnimationPreviewActive)
+        {
+            return;
+        }
+
+        _2dAnimPreviewFill *= e.Delta.Y > 0 ? TwoDAnimationZoomFactor : 1.0 / TwoDAnimationZoomFactor;
+        _2dAnimPreviewFill = Math.Clamp(_2dAnimPreviewFill, TwoDAnimationMinPreviewFill, TwoDAnimationMaxPreviewFill);
+        Update2DAnimationImageLayout();
+        e.Handled = true;
     }
 
     private void Stop2DAnimation()
     {
+        var wasActive = _is2dAnimationPreviewActive;
+        _is2dAnimationPreviewActive = false;
+        _2dAnimPaused = false;
+        _2dAnimPausedElapsedSeconds = 0;
         if (_2dAnimTimer != null)
         {
             _2dAnimTimer.Stop();
             _2dAnimTimer.Tick -= On2DAnimTimerTick;
             _2dAnimTimer = null;
         }
+        if (wasActive && ImagePreviewBox != null)
+        {
+            ImagePreviewBox.Source = null;
+        }
+        _2dAnimCurrentBitmap = null;
+        _2dAnimCurrentFrameIndex = 0;
         _2dAnimFrames.Clear();
+        foreach (var bitmap in _2dAnimBitmaps.Values.Distinct())
+        {
+            bitmap.Dispose();
+        }
         _2dAnimBitmaps.Clear();
+        _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
+        if (ImagePreviewBox != null)
+        {
+            ImagePreviewBox.Width = double.NaN;
+            ImagePreviewBox.Height = double.NaN;
+            ImagePreviewBox.Stretch = global::Avalonia.Media.Stretch.Uniform;
+            ImagePreviewBox.StretchDirection = global::Avalonia.Media.StretchDirection.DownOnly;
+        }
     }
 
     private void PreviewAnimationClip(
@@ -7225,6 +7418,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        Stop2DAnimation();
         PreviewCandidateItem? activeCandidate;
         if (rebuildCandidateControls)
         {
@@ -8062,12 +8256,7 @@ public partial class MainWindow : Window
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
 
-            if (AnimationPlaybackPanel != null)
-            {
-                AnimationPlaybackPanel.IsVisible = true;
-                AnimPlayPauseBtn.Content = "Pause";
-                AnimFrameLabel.Text = $"Frame: 0/{frameCount}";
-            }
+            ShowAnimationPlayback(frameCount);
 
             var targetStatus = resolvedCandidate?.IsModelGroup == true
                 ? $" | Model group: {(!string.IsNullOrWhiteSpace(resolvedCandidate.ModelGroupName) ? resolvedCandidate.ModelGroupName : resolvedCandidate.ModelGroupId)} ({resolvedCandidate.ModelGroupMeshCount:N0} parts) | Representative mesh: {avatarMesh.m_Name}"
@@ -8429,12 +8618,7 @@ public partial class MainWindow : Window
                 TextPreviewBox.IsVisible = false;
                 PreviewLabel.IsVisible = false;
 
-                if (AnimationPlaybackPanel != null)
-                {
-                    AnimationPlaybackPanel.IsVisible = true;
-                    AnimPlayPauseBtn.Content = "Pause";
-                    AnimFrameLabel.Text = $"Frame: 0/{allFrames.Length}";
-                }
+                ShowAnimationPlayback(allFrames.Length);
 
                 StatusStripUpdate($"Animation Preview | Clip: {clip.m_Name} | Mesh target: {mesh.m_Name} | Frames: {allFrames.Length} | FPS: {sampleRate:0.##} | Tracks: {trackCount}");
                 return true;
@@ -14217,27 +14401,46 @@ public partial class MainWindow : Window
 
     private void AnimPlayPauseBtn_Click(object? sender, global::Avalonia.Interactivity.RoutedEventArgs e)
     {
-        if (GLPreviewControl != null)
+        if (_is2dAnimationPreviewActive)
+        {
+            if (_2dAnimPaused)
+            {
+                Play2DAnimation();
+            }
+            else
+            {
+                Pause2DAnimation();
+            }
+            return;
+        }
+
+        if (GLPreviewControl != null && GLPreviewControl.IsVisible)
         {
             if (GLPreviewControl.IsPlaying)
             {
                 GLPreviewControl.PauseAnimation();
-                AnimPlayPauseBtn.Content = "Play";
+                SetAnimationPlaybackPaused(true);
             }
             else
             {
                 GLPreviewControl.PlayAnimation();
-                AnimPlayPauseBtn.Content = "Pause";
+                SetAnimationPlaybackPaused(false);
             }
         }
     }
 
     private void AnimRestartBtn_Click(object? sender, global::Avalonia.Interactivity.RoutedEventArgs e)
     {
-        if (GLPreviewControl != null)
+        if (_is2dAnimationPreviewActive)
+        {
+            Restart2DAnimation();
+            return;
+        }
+
+        if (GLPreviewControl != null && GLPreviewControl.IsVisible)
         {
             GLPreviewControl.RestartAnimation();
-            AnimPlayPauseBtn.Content = "Pause";
+            SetAnimationPlaybackPaused(false);
         }
     }
 
