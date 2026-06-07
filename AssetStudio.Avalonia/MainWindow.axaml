@@ -351,6 +351,11 @@
                                         <Button Grid.Column="3" x:Name="RotateDownBtn" Content="▼" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="RotateDownBtn_Click" Height="26" FontSize="10" ToolTip.Tip="Rotate Down 90°" />
                                     </Grid>
                                     
+                                    <StackPanel x:Name="PreviewCandidateControlsContainer" Spacing="6" IsVisible="False">
+                                        <TextBlock x:Name="PreviewCandidateLabel" Text="Candidate" Foreground="White" FontSize="10" VerticalAlignment="Center" />
+                                        <ComboBox x:Name="PreviewCandidateSelector" MinHeight="28" MaxDropDownHeight="240" SelectionChanged="PreviewCandidateSelector_SelectionChanged" />
+                                    </StackPanel>
+
                                     <!-- Preview Geometry Controls -->
                                     <StackPanel x:Name="BoneSizeContainer" Spacing="6" IsVisible="False">
                                         <StackPanel x:Name="BoneSizeControls" Spacing="6">

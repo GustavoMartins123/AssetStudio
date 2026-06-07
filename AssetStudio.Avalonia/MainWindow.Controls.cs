@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
@@ -18,7 +19,12 @@ public partial class MainWindow : Window
     private bool updatingAvatarPreviewControls;
     private DispatcherTimer? avatarPreviewSettingsSaveTimer;
     private readonly ObservableCollection<MeshMaterialPreviewSlot> meshMaterialPreviewSlots = new();
+    private readonly ObservableCollection<PreviewCandidateItem> previewCandidateItems = new();
     private bool updatingMeshMaterialControls;
+    private bool updatingPreviewCandidateControls;
+    private long previewCandidateListVersion;
+    private const int PreviewCandidateInitialBatchSize = 64;
+    private const int PreviewCandidateAppendBatchSize = 128;
 
     private sealed class MeshMaterialPreviewSlot
     {
@@ -30,6 +36,21 @@ public partial class MainWindow : Window
         public override string ToString()
         {
             return $"{SlotIndex + 1}: {MaterialName}";
+        }
+    }
+
+    private sealed class PreviewCandidateItem
+    {
+        public AssetStudio.AnimationClip? AnimationClip { get; init; }
+        public AssetStudio.Avatar? Avatar { get; init; }
+        public AssetStudio.Mesh? Mesh { get; init; }
+        public string AvatarId { get; init; } = string.Empty;
+        public string MeshId { get; init; } = string.Empty;
+        public string Label { get; init; } = string.Empty;
+
+        public override string ToString()
+        {
+            return Label;
         }
     }
 
@@ -166,6 +187,141 @@ public partial class MainWindow : Window
         if (BoneSizeContainer != null)
         {
             BoneSizeContainer.IsVisible = false;
+        }
+    }
+
+    private void ClearPreviewCandidateControls()
+    {
+        previewCandidateListVersion++;
+        updatingPreviewCandidateControls = true;
+        try
+        {
+            if (PreviewCandidateSelector != null)
+            {
+                PreviewCandidateSelector.SelectedItem = null;
+                PreviewCandidateSelector.SelectedIndex = -1;
+                if (PreviewCandidateSelector.ItemsSource != previewCandidateItems)
+                {
+                    PreviewCandidateSelector.ItemsSource = previewCandidateItems;
+                }
+            }
+
+            previewCandidateItems.Clear();
+            if (PreviewCandidateControlsContainer != null)
+            {
+                PreviewCandidateControlsContainer.IsVisible = false;
+            }
+        }
+        finally
+        {
+            updatingPreviewCandidateControls = false;
+        }
+    }
+
+    private void BuildPreviewCandidateControls(
+        IReadOnlyList<PreviewCandidateItem> candidates,
+        PreviewCandidateItem? selectedCandidate,
+        string label)
+    {
+        var version = ++previewCandidateListVersion;
+        updatingPreviewCandidateControls = true;
+        var initialCount = Math.Min(candidates.Count, PreviewCandidateInitialBatchSize);
+        try
+        {
+            if (PreviewCandidateSelector != null)
+            {
+                PreviewCandidateSelector.SelectedItem = null;
+                PreviewCandidateSelector.SelectedIndex = -1;
+                if (PreviewCandidateSelector.ItemsSource != previewCandidateItems)
+                {
+                    PreviewCandidateSelector.ItemsSource = previewCandidateItems;
+                }
+            }
+
+            previewCandidateItems.Clear();
+            for (var i = 0; i < initialCount; i++)
+            {
+                previewCandidateItems.Add(candidates[i]);
+            }
+
+            if (PreviewCandidateLabel != null)
+            {
+                PreviewCandidateLabel.Text = label;
+            }
+
+            if (PreviewCandidateSelector != null && previewCandidateItems.Count > 0)
+            {
+                var selectedIndex = selectedCandidate == null
+                    ? 0
+                    : previewCandidateItems.IndexOf(selectedCandidate);
+                PreviewCandidateSelector.SelectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
+            }
+
+            if (PreviewCandidateControlsContainer != null)
+            {
+                PreviewCandidateControlsContainer.IsVisible = previewCandidateItems.Count > 0;
+            }
+        }
+        finally
+        {
+            updatingPreviewCandidateControls = false;
+        }
+
+        if (initialCount < candidates.Count)
+        {
+            _ = AppendPreviewCandidatesAsync(candidates.Skip(initialCount).ToList(), version);
+        }
+    }
+
+    private async Task AppendPreviewCandidatesAsync(IReadOnlyList<PreviewCandidateItem> candidates, long version)
+    {
+        var index = 0;
+        while (index < candidates.Count && version == previewCandidateListVersion)
+        {
+            var start = index;
+            var count = Math.Min(PreviewCandidateAppendBatchSize, candidates.Count - index);
+            index += count;
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (version != previewCandidateListVersion)
+                {
+                    return;
+                }
+
+                for (var i = 0; i < count; i++)
+                {
+                    previewCandidateItems.Add(candidates[start + i]);
+                }
+            }, DispatcherPriority.Background);
+
+            await Task.Delay(1);
+        }
+    }
+
+    private PreviewCandidateItem? SelectedPreviewCandidate =>
+        PreviewCandidateSelector?.SelectedItem as PreviewCandidateItem;
+
+    private void PreviewCandidateSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (updatingPreviewCandidateControls)
+        {
+            return;
+        }
+
+        var candidate = SelectedPreviewCandidate;
+        if (candidate == null)
+        {
+            return;
+        }
+
+        if (candidate.AnimationClip != null)
+        {
+            PreviewAnimationClip(candidate.AnimationClip, candidate.Avatar, candidate.Mesh, candidate.AvatarId, candidate.MeshId);
+        }
+        else if (candidate.Avatar != null)
+        {
+            PreviewAvatar(candidate.Avatar, candidate.Mesh, candidate.MeshId);
         }
     }
 

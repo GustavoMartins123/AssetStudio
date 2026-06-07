@@ -84,6 +84,7 @@ public partial class MainWindow : Window
     private Dictionary<Avatar, Mesh?>? avatarMeshCache;
     private Dictionary<Avatar, List<Mesh>>? avatarMeshesCache;
     private Dictionary<Mesh, Avatar?>? meshAvatarCache;
+    private Dictionary<string, List<SkinnedMeshRenderer>>? meshSkinnedRenderersCache;
     private Dictionary<AnimationClip, HashSet<uint>>? animationClipTransformBindingsCache;
     private readonly object previewCacheLock = new object();
 
@@ -557,6 +558,7 @@ public partial class MainWindow : Window
             avatarMeshCache = null;
             avatarMeshesCache = null;
             meshAvatarCache = null;
+            meshSkinnedRenderersCache = null;
             animationClipTransformBindingsCache = null;
         }
         logger.ClearErrors();
@@ -673,6 +675,7 @@ public partial class MainWindow : Window
         ApplyAvatarPreviewControlSettings();
         HidePreviewGeometryControls();
         ClearMeshMaterialControls();
+        ClearPreviewCandidateControls();
         if (AnimationPlaybackPanel != null)
         {
             AnimationPlaybackPanel.IsVisible = false;
@@ -4174,6 +4177,7 @@ public partial class MainWindow : Window
                 avatarMeshCache = null;
                 avatarMeshesCache = null;
                 meshAvatarCache = null;
+                meshSkinnedRenderersCache = null;
                 animationClipTransformBindingsCache = null;
             }
 
@@ -4601,6 +4605,7 @@ public partial class MainWindow : Window
             }
         }
         ClearMeshMaterialControls();
+        ClearPreviewCandidateControls();
         if (asset is not AnimationClip)
         {
             HideAnimationPlayback();
@@ -5405,14 +5410,268 @@ public partial class MainWindow : Window
         return $"Clip_{clipID}";
     }
 
-    private void PreviewAvatar(Avatar avatar)
+    private static string GetPreviewObjectKey(AssetStudio.Object? asset)
+    {
+        return asset?.assetsFile != null
+            ? AssetHandle.BuildUniqueID(asset.assetsFile, asset.m_PathID)
+            : asset != null
+                ? $"runtime:{asset.GetType().Name}:{asset.m_PathID}"
+                : string.Empty;
+    }
+
+    private static bool AreSamePreviewObject(AssetStudio.Object? left, AssetStudio.Object? right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
+        var leftKey = GetPreviewObjectKey(left);
+        var rightKey = GetPreviewObjectKey(right);
+        return !string.IsNullOrEmpty(leftKey)
+            && !string.IsNullOrEmpty(rightKey)
+            && string.Equals(leftKey, rightKey, StringComparison.Ordinal);
+    }
+
+    private AssetStudio.Object? ResolvePreviewCandidateAsset(string? assetId)
+    {
+        if (string.IsNullOrWhiteSpace(assetId))
+        {
+            return null;
+        }
+
+        var handle = assetsManager.ProjectIndex.GetHandle(assetId);
+        return handle == null ? null : ResolveSemanticRelationHandleForPreview(handle);
+    }
+
+    private Mesh? ResolveMeshPreviewCandidate(string? meshId)
+    {
+        return ResolvePreviewCandidateAsset(meshId) as Mesh;
+    }
+
+    private Avatar? ResolveAvatarPreviewCandidate(string? avatarId)
+    {
+        return ResolvePreviewCandidateAsset(avatarId) as Avatar;
+    }
+
+    private string GetPreviewHandleName(string assetId, string fallbackName)
+    {
+        var handle = string.IsNullOrWhiteSpace(assetId) ? null : assetsManager.ProjectIndex.GetHandle(assetId);
+        return !string.IsNullOrWhiteSpace(handle?.Name) ? handle!.Name : fallbackName;
+    }
+
+    private List<string> LoadAvatarMeshAssetIdsForPreview(Avatar avatar)
+    {
+        if (!assetsManager.LazyLoading || avatar.assetsFile == null || currentScanResult == null)
+        {
+            return new List<string>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<string>();
+        }
+
+        var avatarAssetId = AssetHandle.BuildUniqueID(avatar.assetsFile, avatar.m_PathID);
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadAvatarMeshAssetIds(folderPath, signature, avatarAssetId);
+    }
+
+    private void CacheAvatarMeshRelation(Avatar avatar, Mesh mesh)
+    {
+        avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
+        avatarMeshCache[avatar] = mesh;
+
+        avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
+        if (!avatarMeshesCache.TryGetValue(avatar, out var meshes))
+        {
+            meshes = new List<Mesh>();
+            avatarMeshesCache[avatar] = meshes;
+        }
+
+        if (!meshes.Any(existing => AreSamePreviewObject(existing, mesh)))
+        {
+            meshes.Add(mesh);
+        }
+
+        meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
+        meshAvatarCache[mesh] = avatar;
+    }
+
+    private Mesh? ResolveFirstMeshForAvatar(Avatar avatar)
+    {
+        if (avatarMeshesCache != null
+            && avatarMeshesCache.TryGetValue(avatar, out var cachedMeshes)
+            && cachedMeshes.Count > 0)
+        {
+            return cachedMeshes[0];
+        }
+
+        if (avatarMeshCache != null
+            && avatarMeshCache.TryGetValue(avatar, out var cachedMesh)
+            && cachedMesh != null)
+        {
+            return cachedMesh;
+        }
+
+        foreach (var meshId in LoadAvatarMeshAssetIdsForPreview(avatar))
+        {
+            var mesh = ResolveMeshPreviewCandidate(meshId);
+            if (mesh == null)
+            {
+                continue;
+            }
+
+            CacheAvatarMeshRelation(avatar, mesh);
+            return mesh;
+        }
+
+        return assetsManager.LazyLoading ? null : FindMeshesForAvatar(avatar).FirstOrDefault();
+    }
+
+    private List<string> LoadAnimationClipAvatarAssetIdsForPreview(AnimationClip clip)
+    {
+        if (!assetsManager.LazyLoading || clip.assetsFile == null || currentScanResult == null)
+        {
+            return new List<string>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<string>();
+        }
+
+        var clipAssetId = AssetHandle.BuildUniqueID(clip.assetsFile, clip.m_PathID);
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadAnimationClipAvatarAssetIds(folderPath, signature, clipAssetId);
+    }
+
+    private List<string> LoadAnimationClipMeshAssetIdsForPreview(AnimationClip clip)
+    {
+        if (!assetsManager.LazyLoading || clip.assetsFile == null || currentScanResult == null)
+        {
+            return new List<string>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<string>();
+        }
+
+        var clipAssetId = AssetHandle.BuildUniqueID(clip.assetsFile, clip.m_PathID);
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadAnimationClipMeshAssetIds(folderPath, signature, clipAssetId);
+    }
+
+    private List<PreviewCandidateItem> BuildAvatarPreviewCandidates(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null)
+    {
+        var candidates = new List<PreviewCandidateItem>();
+        var seenMeshIds = new HashSet<string>(StringComparer.Ordinal);
+
+        void AddMesh(Mesh? mesh, string? meshId, string source, string? name = null)
+        {
+            meshId = !string.IsNullOrWhiteSpace(meshId) ? meshId : GetPreviewObjectKey(mesh);
+            if (string.IsNullOrWhiteSpace(meshId) || !seenMeshIds.Add(meshId))
+            {
+                return;
+            }
+
+            var displayName = !string.IsNullOrWhiteSpace(name)
+                ? name!
+                : !string.IsNullOrWhiteSpace(mesh?.m_Name)
+                    ? mesh!.m_Name
+                    : GetPreviewHandleName(meshId, "Mesh");
+
+            candidates.Add(new PreviewCandidateItem
+            {
+                Avatar = avatar,
+                Mesh = mesh,
+                MeshId = meshId,
+                Label = $"{source}: {displayName} (Mesh PathID: {mesh?.m_PathID.ToString(CultureInfo.InvariantCulture) ?? assetsManager.ProjectIndex.GetHandle(meshId)?.PathID.ToString(CultureInfo.InvariantCulture) ?? "?"})"
+            });
+        }
+
+        AddMesh(preferredMesh, preferredMeshId, "Selected");
+
+        if (avatarMeshCache != null && avatarMeshCache.TryGetValue(avatar, out var cachedMesh))
+        {
+            AddMesh(cachedMesh, null, "Loaded");
+        }
+
+        if (avatarMeshesCache != null && avatarMeshesCache.TryGetValue(avatar, out var cachedMeshes))
+        {
+            foreach (var mesh in cachedMeshes)
+            {
+                AddMesh(mesh, null, "Loaded");
+            }
+        }
+
+        foreach (var meshId in LoadAvatarMeshAssetIdsForPreview(avatar))
+        {
+            AddMesh(null, meshId, "Cached relation", GetPreviewHandleName(meshId, "Mesh"));
+        }
+
+        if (candidates.Count == 0 && !assetsManager.LazyLoading)
+        {
+            foreach (var mesh in FindMeshesForAvatar(avatar))
+            {
+                AddMesh(mesh, null, "Loaded");
+            }
+        }
+
+        return candidates;
+    }
+
+    private Mesh? SelectAvatarPreviewMesh(IReadOnlyList<PreviewCandidateItem> candidates, Mesh? preferredMesh, string? preferredMeshId)
+    {
+        if (preferredMesh != null)
+        {
+            return preferredMesh;
+        }
+
+        if (!string.IsNullOrWhiteSpace(preferredMeshId))
+        {
+            return ResolveMeshPreviewCandidate(preferredMeshId);
+        }
+
+        var loadedCandidate = candidates.FirstOrDefault(x => x.Mesh != null);
+        if (loadedCandidate?.Mesh != null)
+        {
+            return loadedCandidate.Mesh;
+        }
+
+        var idCandidate = candidates.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.MeshId));
+        if (idCandidate != null)
+        {
+            var mesh = ResolveMeshPreviewCandidate(idCandidate.MeshId);
+            if (mesh != null)
+            {
+                return mesh;
+            }
+        }
+
+        return null;
+    }
+
+    private void PreviewAvatar(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null)
     {
         currentPreviewAvatar = avatar;
-        var avatarMeshes = FindMeshesForAvatar(avatar);
-        Mesh? avatarMesh = avatarMeshes.FirstOrDefault();
+        var avatarCandidates = BuildAvatarPreviewCandidates(avatar, preferredMesh, preferredMeshId);
+        Mesh? avatarMesh = SelectAvatarPreviewMesh(avatarCandidates, preferredMesh, preferredMeshId);
+        var selectedMeshId = GetPreviewObjectKey(avatarMesh);
+        var selectedCandidate = avatarCandidates.FirstOrDefault(x =>
+            AreSamePreviewObject(x.Mesh, avatarMesh)
+            || (!string.IsNullOrWhiteSpace(x.MeshId)
+                && !string.IsNullOrWhiteSpace(selectedMeshId)
+                && string.Equals(x.MeshId, selectedMeshId, StringComparison.Ordinal)));
+        BuildPreviewCandidateControls(avatarCandidates, selectedCandidate, "Avatar Mesh");
         avatarMesh?.EnsureProcessed();
         if (avatarMesh != null)
         {
+            CacheAvatarMeshRelation(avatar, avatarMesh);
             EnsureMeshPreviewDependenciesLoaded(avatarMesh);
         }
         currentPreviewMesh = avatarMesh;
@@ -5538,10 +5797,10 @@ public partial class MainWindow : Window
             PreviewLabel.IsVisible = false;
             if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
             {
-                PreviewInfoOverlay.Text = BuildAvatarPreviewInfoText(avatar, avatarMeshes, avatarMesh);
+                PreviewInfoOverlay.Text = BuildAvatarPreviewInfoText(avatar, avatarCandidates, avatarMesh);
                 PreviewInfoBorder.IsVisible = true;
             }
-            StatusStripUpdate($"OpenGL Avatar Preview | Mesh: {avatarMesh.m_Name} | Related meshes: {avatarMeshes.Count} | Skeleton Joints: {bonePositions.Length}");
+            StatusStripUpdate($"OpenGL Avatar Preview | Mesh: {avatarMesh.m_Name} | Related meshes: {avatarCandidates.Count} | Skeleton Joints: {bonePositions.Length}");
             return;
         }
 
@@ -5557,17 +5816,17 @@ public partial class MainWindow : Window
         sb.AppendLine();
         sb.AppendLine($"Avatar Size: {avatar.m_AvatarSize} bytes");
         sb.AppendLine();
-        if (avatarMeshes.Count > 0)
+        if (avatarCandidates.Count > 0)
         {
-            sb.AppendLine($"Related Meshes ({avatarMeshes.Count}):");
-            foreach (var mesh in avatarMeshes.Take(50))
+            sb.AppendLine($"Related Meshes ({avatarCandidates.Count}):");
+            foreach (var candidate in avatarCandidates.Take(50))
             {
-                sb.AppendLine($"  - {mesh.m_Name} (PathID: {mesh.m_PathID})");
+                sb.AppendLine($"  - {candidate.Label}");
             }
 
-            if (avatarMeshes.Count > 50)
+            if (avatarCandidates.Count > 50)
             {
-                sb.AppendLine($"  ... {avatarMeshes.Count - 50} more");
+                sb.AppendLine($"  ... {avatarCandidates.Count - 50} more");
             }
 
             sb.AppendLine();
@@ -5602,7 +5861,7 @@ public partial class MainWindow : Window
         PreviewLabel.IsVisible = false;
     }
 
-    private static string BuildAvatarPreviewInfoText(Avatar avatar, List<Mesh> relatedMeshes, Mesh? selectedMesh)
+    private static string BuildAvatarPreviewInfoText(Avatar avatar, IReadOnlyList<PreviewCandidateItem> relatedMeshes, Mesh? selectedMesh)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"Avatar: {avatar.m_Name} (PathID: {avatar.m_PathID})");
@@ -5614,9 +5873,9 @@ public partial class MainWindow : Window
         }
 
         sb.AppendLine($"Related Meshes ({relatedMeshes.Count}):");
-        foreach (var mesh in relatedMeshes.Take(12))
+        foreach (var candidate in relatedMeshes.Take(12))
         {
-            sb.AppendLine($"- {mesh.m_Name} (PathID: {mesh.m_PathID})");
+            sb.AppendLine($"- {candidate.Label}");
         }
 
         if (relatedMeshes.Count > 12)
@@ -5634,60 +5893,70 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var meshId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
-        var avatarId = avatar?.assetsFile != null
-            ? AssetHandle.BuildUniqueID(avatar.assetsFile, avatar.m_PathID)
-            : string.Empty;
-
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
+        var semanticRenderers = TryLoadSkinnedRenderersForMeshFromSemanticCache(mesh);
+        if (semanticRenderers.Count > 0)
         {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
+            return semanticRenderers
+                .OrderByDescending(renderer => ScoreSkinnedRendererForMesh(renderer, avatar, mesh))
+                .FirstOrDefault();
         }
 
-        SkinnedMeshRenderer? bestRenderer = null;
-        var bestScore = int.MinValue;
-        foreach (var file in filesSnapshot)
-        {
-            AssetStudio.Object[] objectsSnapshot;
-            lock (file)
-            {
-                objectsSnapshot = file.Objects.ToArray();
-            }
-
-            foreach (var renderer in objectsSnapshot.OfType<SkinnedMeshRenderer>())
-            {
-                var rendererMesh = ResolveMeshBackground(file, renderer.m_Mesh);
-                var rendererMeshId = GetSemanticAssetId(rendererMesh);
-                if (string.IsNullOrEmpty(rendererMeshId))
-                {
-                    rendererMeshId = GetSemanticAssetIdFromPPtr(file, renderer.m_Mesh, ClassIDType.Mesh);
-                }
-
-                if (!string.Equals(rendererMeshId, meshId, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                var score = ScoreSkinnedRendererForAvatar(file, objectsSnapshot, renderer, avatar, avatarId, mesh);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestRenderer = renderer;
-                }
-            }
-        }
-
-        return bestRenderer;
+        return null;
     }
 
-    private static int ScoreSkinnedRendererForAvatar(
-        SerializedFile file,
-        AssetStudio.Object[] objectsSnapshot,
-        SkinnedMeshRenderer renderer,
-        Avatar? avatar,
-        string avatarId,
-        Mesh mesh)
+    private List<SkinnedMeshRenderer> TryLoadSkinnedRenderersForMeshFromSemanticCache(Mesh mesh)
+    {
+        if (!assetsManager.LazyLoading || mesh.assetsFile == null || currentScanResult == null)
+        {
+            return new List<SkinnedMeshRenderer>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<SkinnedMeshRenderer>();
+        }
+
+        var meshAssetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+        if (string.IsNullOrWhiteSpace(meshAssetId))
+        {
+            return new List<SkinnedMeshRenderer>();
+        }
+
+        meshSkinnedRenderersCache ??= new Dictionary<string, List<SkinnedMeshRenderer>>(StringComparer.Ordinal);
+        if (meshSkinnedRenderersCache.TryGetValue(meshAssetId, out var cachedRenderers))
+        {
+            return new List<SkinnedMeshRenderer>(cachedRenderers);
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        var rendererIds = _sqliteCache.LoadMeshRendererAssetIds(folderPath, signature, meshAssetId, "SkinnedMeshRenderer");
+        var renderers = new List<SkinnedMeshRenderer>();
+        var seenRendererIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rendererId in rendererIds)
+        {
+            if (string.IsNullOrWhiteSpace(rendererId) || !seenRendererIds.Add(rendererId))
+            {
+                continue;
+            }
+
+            var handle = assetsManager.ProjectIndex.GetHandle(rendererId);
+            if (handle == null)
+            {
+                continue;
+            }
+
+            if (ResolveSemanticRelationHandleForPreview(handle) is SkinnedMeshRenderer renderer)
+            {
+                renderers.Add(renderer);
+            }
+        }
+
+        meshSkinnedRenderersCache[meshAssetId] = renderers;
+        return new List<SkinnedMeshRenderer>(renderers);
+    }
+
+    private static int ScoreSkinnedRendererForMesh(SkinnedMeshRenderer renderer, Avatar? avatar, Mesh mesh)
     {
         var score = 1000;
         if (renderer.m_Bones != null && mesh.m_BindPose != null)
@@ -5702,40 +5971,9 @@ public partial class MainWindow : Window
             }
         }
 
-        if (avatar?.assetsFile == file)
+        if (avatar != null && renderer.assetsFile == avatar.assetsFile)
         {
             score += 20;
-        }
-
-        if (string.IsNullOrEmpty(avatarId))
-        {
-            return score;
-        }
-
-        var rendererGameObject = ResolveGameObjectBackground(file, renderer.m_GameObject);
-        foreach (var animator in objectsSnapshot.OfType<Animator>())
-        {
-            var animatorAvatar = ResolveAvatarBackground(file, animator.m_Avatar);
-            var animatorAvatarId = GetSemanticAssetId(animatorAvatar);
-            if (string.IsNullOrEmpty(animatorAvatarId))
-            {
-                animatorAvatarId = GetSemanticAssetIdFromPPtr(file, animator.m_Avatar, ClassIDType.Avatar);
-            }
-
-            if (!string.Equals(animatorAvatarId, avatarId, StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var animatorGameObject = ResolveGameObjectBackground(file, animator.m_GameObject);
-            if (rendererGameObject != null
-                && animatorGameObject != null
-                && IsSameOrDescendantGameObject(file, rendererGameObject, animatorGameObject))
-            {
-                return score + 500;
-            }
-
-            score += 50;
         }
 
         return score;
@@ -5865,65 +6103,296 @@ public partial class MainWindow : Window
         }
     }
 
-    private void PreviewAnimationClip(AnimationClip clip)
+    private List<PreviewCandidateItem> BuildAnimationClipPreviewCandidates(
+        AnimationClip clip,
+        Avatar? preferredAvatar,
+        Mesh? preferredMesh,
+        string? preferredAvatarId = null,
+        string? preferredMeshId = null)
     {
-        // Step 1: Find the Avatar and Mesh to use, preferring the currently visible one
-        Avatar? avatar = null;
-        Mesh? avatarMesh = null;
+        var candidates = new List<PreviewCandidateItem>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        currentPreviewMesh?.EnsureProcessed();
-        if (currentPreviewMesh != null && currentPreviewMesh.m_BindPose != null && currentPreviewMesh.m_BindPose.Length > 0
-            && currentPreviewMesh.m_BoneNameHashes != null && currentPreviewMesh.m_BoneNameHashes.Length > 0)
+        void AddCandidate(
+            Avatar? avatar,
+            Mesh? mesh,
+            string? avatarId,
+            string? meshId,
+            string source,
+            string? avatarName = null,
+            string? meshName = null)
         {
-            var candidateAvatar = currentPreviewAvatar ?? FindBestAvatarForMesh(currentPreviewMesh);
-            if (candidateAvatar != null && IsAnimationClipCompatibleWithAvatar(clip, candidateAvatar))
+            avatarId = !string.IsNullOrWhiteSpace(avatarId) ? avatarId : GetPreviewObjectKey(avatar);
+            meshId = !string.IsNullOrWhiteSpace(meshId) ? meshId : GetPreviewObjectKey(mesh);
+            if (avatar == null
+                && mesh == null
+                && string.IsNullOrWhiteSpace(avatarId)
+                && string.IsNullOrWhiteSpace(meshId))
             {
-                avatarMesh = currentPreviewMesh;
-                avatar = candidateAvatar;
+                return;
+            }
+
+            var key = $"{avatarId}|{meshId}";
+            if (!seen.Add(key))
+            {
+                return;
+            }
+
+            avatarName = !string.IsNullOrWhiteSpace(avatarName)
+                ? avatarName
+                : !string.IsNullOrWhiteSpace(avatar?.m_Name)
+                    ? avatar!.m_Name
+                    : !string.IsNullOrWhiteSpace(avatarId)
+                        ? GetPreviewHandleName(avatarId!, "Avatar")
+                        : string.Empty;
+            meshName = !string.IsNullOrWhiteSpace(meshName)
+                ? meshName
+                : !string.IsNullOrWhiteSpace(mesh?.m_Name)
+                    ? mesh!.m_Name
+                    : !string.IsNullOrWhiteSpace(meshId)
+                        ? GetPreviewHandleName(meshId!, "Mesh")
+                        : string.Empty;
+
+            var label = !string.IsNullOrWhiteSpace(avatarName) && !string.IsNullOrWhiteSpace(meshName)
+                ? $"{source}: {avatarName} -> {meshName}"
+                : !string.IsNullOrWhiteSpace(avatarName)
+                    ? $"{source}: {avatarName}"
+                    : $"{source}: {meshName}";
+
+            if (mesh != null)
+            {
+                label += $" (Mesh PathID: {mesh.m_PathID})";
+            }
+            else if (!string.IsNullOrWhiteSpace(meshId))
+            {
+                label += $" (Mesh PathID: {assetsManager.ProjectIndex.GetHandle(meshId!)?.PathID.ToString(CultureInfo.InvariantCulture) ?? "?"})";
+            }
+            else if (avatar != null)
+            {
+                label += $" (Avatar PathID: {avatar.m_PathID})";
+            }
+            else if (!string.IsNullOrWhiteSpace(avatarId))
+            {
+                label += $" (Avatar PathID: {assetsManager.ProjectIndex.GetHandle(avatarId!)?.PathID.ToString(CultureInfo.InvariantCulture) ?? "?"})";
+            }
+
+            candidates.Add(new PreviewCandidateItem
+            {
+                AnimationClip = clip,
+                Avatar = avatar,
+                Mesh = mesh,
+                AvatarId = avatarId ?? string.Empty,
+                MeshId = meshId ?? string.Empty,
+                Label = label
+            });
+        }
+
+        if (preferredAvatar != null
+            || preferredMesh != null
+            || !string.IsNullOrWhiteSpace(preferredAvatarId)
+            || !string.IsNullOrWhiteSpace(preferredMeshId))
+        {
+            AddCandidate(preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId, "Selected");
+        }
+
+        if (currentPreviewMesh != null)
+        {
+            AddCandidate(currentPreviewAvatar, currentPreviewMesh, null, null, currentPreviewAvatar != null ? "Current" : "Current mesh");
+        }
+
+        if (currentPreviewAvatar != null)
+        {
+            var addedCurrentMesh = false;
+            if (avatarMeshesCache != null && avatarMeshesCache.TryGetValue(currentPreviewAvatar, out var currentMeshes))
+            {
+                foreach (var mesh in currentMeshes)
+                {
+                    AddCandidate(currentPreviewAvatar, mesh, null, null, "Current avatar");
+                    addedCurrentMesh = true;
+                }
+            }
+
+            if (!addedCurrentMesh
+                && avatarMeshCache != null
+                && avatarMeshCache.TryGetValue(currentPreviewAvatar, out var cachedMesh)
+                && cachedMesh != null)
+            {
+                AddCandidate(currentPreviewAvatar, cachedMesh, null, null, "Current avatar");
+                addedCurrentMesh = true;
+            }
+
+            if (!addedCurrentMesh)
+            {
+                AddCandidate(currentPreviewAvatar, null, null, null, "Current avatar");
             }
         }
-        if (avatar == null && currentPreviewAvatar != null && currentPreviewAvatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null
-            && IsAnimationClipCompatibleWithAvatar(clip, currentPreviewAvatar))
+
+        if (assetsManager.LazyLoading)
         {
-            avatar = currentPreviewAvatar;
-            avatarMesh = GetCachedMeshForAvatar(avatar);
+            foreach (var avatarId in LoadAnimationClipAvatarAssetIdsForPreview(clip))
+            {
+                AddCandidate(null, null, avatarId, null, "Avatar relation", GetPreviewHandleName(avatarId, "Avatar"));
+            }
+
+            foreach (var meshId in LoadAnimationClipMeshAssetIdsForPreview(clip))
+            {
+                AddCandidate(null, null, null, meshId, "Animator mesh", meshName: GetPreviewHandleName(meshId, "Mesh"));
+            }
+        }
+        else
+        {
+            foreach (var candidateAvatar in FindCandidateAvatarsForAnimationClip(clip))
+            {
+                var meshes = FindMeshesForAvatar(candidateAvatar);
+                if (meshes.Count == 0)
+                {
+                    AddCandidate(candidateAvatar, null, null, null, "Avatar relation");
+                    continue;
+                }
+
+                foreach (var mesh in meshes)
+                {
+                    AddCandidate(candidateAvatar, mesh, null, null, "Avatar relation");
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    private PreviewCandidateItem? SelectAnimationClipPreviewCandidate(
+        AnimationClip clip,
+        IReadOnlyList<PreviewCandidateItem> candidates,
+        Avatar? preferredAvatar,
+        Mesh? preferredMesh,
+        string? preferredAvatarId = null,
+        string? preferredMeshId = null)
+    {
+        if (preferredAvatar != null
+            || preferredMesh != null
+            || !string.IsNullOrWhiteSpace(preferredAvatarId)
+            || !string.IsNullOrWhiteSpace(preferredMeshId))
+        {
+            var preferred = candidates.FirstOrDefault(candidate =>
+                (preferredAvatar == null || AreSamePreviewObject(candidate.Avatar, preferredAvatar))
+                && (preferredMesh == null || AreSamePreviewObject(candidate.Mesh, preferredMesh))
+                && (string.IsNullOrWhiteSpace(preferredAvatarId) || string.Equals(candidate.AvatarId, preferredAvatarId, StringComparison.Ordinal))
+                && (string.IsNullOrWhiteSpace(preferredMeshId) || string.Equals(candidate.MeshId, preferredMeshId, StringComparison.Ordinal)));
+            if (preferred != null)
+            {
+                return preferred;
+            }
+        }
+
+        var compatibleAvatar = candidates.FirstOrDefault(candidate =>
+            candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
+            && candidate.Mesh != null
+            && IsAnimationClipCompatibleWithAvatar(clip, candidate.Avatar));
+        if (compatibleAvatar != null)
+        {
+            return compatibleAvatar;
+        }
+
+        if (assetsManager.LazyLoading)
+        {
+            var lazyAvatar = candidates.FirstOrDefault(candidate =>
+                candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
+                && candidate.Mesh != null);
+            if (lazyAvatar != null)
+            {
+                return lazyAvatar;
+            }
+        }
+
+        var animatorMesh = candidates.FirstOrDefault(candidate =>
+            candidate.Avatar == null
+            && candidate.Mesh != null
+            && candidate.Label.StartsWith("Animator mesh:", StringComparison.Ordinal));
+        if (animatorMesh != null)
+        {
+            return animatorMesh;
+        }
+
+        return candidates.FirstOrDefault(candidate => candidate.Mesh != null)
+            ?? candidates.FirstOrDefault(candidate => candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null)
+            ?? candidates.FirstOrDefault();
+    }
+
+    private PreviewCandidateItem? ResolveAnimationClipPreviewCandidate(PreviewCandidateItem? candidate)
+    {
+        if (candidate == null)
+        {
+            return null;
+        }
+
+        var avatar = candidate.Avatar;
+        var mesh = candidate.Mesh;
+        if (avatar == null && !string.IsNullOrWhiteSpace(candidate.AvatarId))
+        {
+            avatar = ResolveAvatarPreviewCandidate(candidate.AvatarId);
+        }
+
+        if (mesh == null && !string.IsNullOrWhiteSpace(candidate.MeshId))
+        {
+            mesh = ResolveMeshPreviewCandidate(candidate.MeshId);
+        }
+
+        if (mesh == null && avatar != null)
+        {
+            mesh = ResolveFirstMeshForAvatar(avatar);
+        }
+
+        if (avatar != null && mesh != null)
+        {
+            CacheAvatarMeshRelation(avatar, mesh);
+        }
+
+        return new PreviewCandidateItem
+        {
+            AnimationClip = candidate.AnimationClip,
+            Avatar = avatar,
+            Mesh = mesh,
+            AvatarId = !string.IsNullOrWhiteSpace(candidate.AvatarId) ? candidate.AvatarId : GetPreviewObjectKey(avatar),
+            MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
+            Label = candidate.Label
+        };
+    }
+
+    private void PreviewAnimationClip(
+        AnimationClip clip,
+        Avatar? preferredAvatar = null,
+        Mesh? preferredMesh = null,
+        string? preferredAvatarId = null,
+        string? preferredMeshId = null)
+    {
+        var previewCandidates = BuildAnimationClipPreviewCandidates(clip, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
+        var selectedCandidate = SelectAnimationClipPreviewCandidate(clip, previewCandidates, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
+        BuildPreviewCandidateControls(previewCandidates, selectedCandidate, "Animation Target");
+
+        var resolvedCandidate = ResolveAnimationClipPreviewCandidate(selectedCandidate);
+        Avatar? avatar = resolvedCandidate?.Avatar;
+        Mesh? avatarMesh = resolvedCandidate?.Mesh;
+
+        if (avatar == null && avatarMesh != null)
+        {
+            if (TryPreviewAnimationClipWithRendererSkeletonFallback(clip, avatarMesh, resolvedCandidate?.MeshId))
+            {
+                return;
+            }
+
+            StatusStripUpdate($"AnimationClip: {clip.m_Name} | Mesh target found, but no usable animation tracks matched {avatarMesh.m_Name}.");
+            return;
         }
 
         if (avatar == null)
         {
-            foreach (var candidateAvatar in FindCandidateAvatarsForAnimationClip(clip))
+            if (TryPreviewAnimationClipWithRendererSkeletonFallback(clip, preferredMesh, preferredMeshId))
             {
-                if (candidateAvatar.m_Avatar?.m_AvatarSkeleton?.m_Node == null)
-                {
-                    continue;
-                }
-
-                var candidateMesh = GetCachedMeshForAvatar(candidateAvatar);
-                var compatible = IsAnimationClipCompatibleWithAvatar(clip, candidateAvatar);
-                if (candidateMesh != null && (compatible || assetsManager.LazyLoading))
-                {
-                    avatar = candidateAvatar;
-                    avatarMesh = candidateMesh;
-                    break;
-                }
-
-                if (avatar == null && compatible)
-                {
-                    avatar = candidateAvatar;
-                    avatarMesh = candidateMesh;
-                }
-            }
-
-            if (avatar == null)
-            {
-                if (TryPreviewAnimationClipWithRendererSkeletonFallback(clip))
-                {
-                    return;
-                }
-
-                StatusStripUpdate($"AnimationClip: No compatible Avatar found for {clip.m_Name}. Load/select the matching model first.");
                 return;
             }
+
+            StatusStripUpdate($"AnimationClip: No compatible Avatar or mesh target found for {clip.m_Name}.");
+            return;
         }
 
         if (avatar == null || avatar.m_Avatar?.m_AvatarSkeleton?.m_Node == null)
@@ -5934,7 +6403,7 @@ public partial class MainWindow : Window
 
         if (avatarMesh == null)
         {
-            avatarMesh = GetCachedMeshForAvatar(avatar);
+            avatarMesh = ResolveFirstMeshForAvatar(avatar);
         }
         avatarMesh?.EnsureProcessed();
 
@@ -6742,7 +7211,7 @@ public partial class MainWindow : Window
 
     private Mesh? GetCachedMeshForAvatar(Avatar avatar)
     {
-        return FindMeshesForAvatar(avatar).FirstOrDefault();
+        return ResolveFirstMeshForAvatar(avatar);
     }
 
     private static Dictionary<Avatar, List<Mesh>> BuildAvatarMeshListCache(Dictionary<Avatar, Mesh?>? singleMeshCache)
@@ -6989,9 +7458,40 @@ public partial class MainWindow : Window
         return avatars;
     }
 
-    private bool TryPreviewAnimationClipWithRendererSkeletonFallback(AnimationClip clip)
+    private bool TryPreviewAnimationClipWithRendererSkeletonFallback(AnimationClip clip, Mesh? preferredMesh = null, string? preferredMeshId = null)
     {
-        foreach (var mesh in TryLoadMeshesForAnimationClipFromSemanticCache(clip))
+        var meshes = new List<Mesh>();
+        void AddMesh(Mesh? mesh)
+        {
+            if (mesh != null && !meshes.Any(existing => AreSamePreviewObject(existing, mesh)))
+            {
+                meshes.Add(mesh);
+            }
+        }
+
+        AddMesh(preferredMesh);
+        if (preferredMesh == null && !string.IsNullOrWhiteSpace(preferredMeshId))
+        {
+            AddMesh(ResolveMeshPreviewCandidate(preferredMeshId));
+        }
+
+        AddMesh(currentPreviewMesh);
+        if (meshes.Count == 0)
+        {
+            var firstMeshId = LoadAnimationClipMeshAssetIdsForPreview(clip).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(firstMeshId))
+            {
+                AddMesh(ResolveMeshPreviewCandidate(firstMeshId));
+            }
+        }
+
+        Mesh? staticMesh = null;
+        global::OpenTK.Mathematics.Vector3[]? staticBonePositions = null;
+        int[]? staticParentIndices = null;
+        string[]? staticBoneNames = null;
+        string? lastReason = null;
+
+        foreach (var mesh in meshes)
         {
             mesh.EnsureProcessed();
             EnsureMeshPreviewDependenciesLoaded(mesh);
@@ -7017,19 +7517,908 @@ public partial class MainWindow : Window
                 return false;
             }
 
-            currentPreviewMesh = mesh;
+            if (staticMesh == null)
+            {
+                staticMesh = mesh;
+                staticBonePositions = bonePositions;
+                staticParentIndices = parentIndices;
+                staticBoneNames = boneNames;
+            }
+
+            if (TryBuildAnimationFramesFromRendererSkeleton(
+                    clip,
+                    mesh,
+                    bonePositions,
+                    parentIndices,
+                    boneNames,
+                    out var allFrames,
+                    out var allBoneMatrices,
+                    out var renderParentIndices,
+                    out var sampleRate,
+                    out var trackCount,
+                    out lastReason))
+            {
+                currentPreviewMesh = mesh;
+                currentPreviewAvatar = null;
+                GLPreviewControl.SetAnimatedAvatar(mesh, allFrames, allBoneMatrices, renderParentIndices, sampleRate, boneNames);
+                GLPreviewControl.IsVisible = true;
+                ShowPreviewGeometryControls(showBoneControls: true);
+                GLPreviewControl.Focus();
+                TextPreviewBox.IsVisible = false;
+                PreviewLabel.IsVisible = false;
+
+                if (AnimationPlaybackPanel != null)
+                {
+                    AnimationPlaybackPanel.IsVisible = true;
+                    AnimPlayPauseBtn.Content = "Pause";
+                    AnimFrameLabel.Text = $"Frame: 0/{allFrames.Length}";
+                }
+
+                StatusStripUpdate($"Animation Preview | Clip: {clip.m_Name} | Mesh target: {mesh.m_Name} | Frames: {allFrames.Length} | FPS: {sampleRate:0.##} | Tracks: {trackCount}");
+                return true;
+            }
+        }
+
+        if (staticMesh != null && staticBonePositions != null && staticParentIndices != null)
+        {
+            currentPreviewMesh = staticMesh;
             currentPreviewAvatar = null;
-            GLPreviewControl.SetAvatar(mesh, bonePositions, parentIndices, boneNames);
+            GLPreviewControl!.SetAvatar(staticMesh, staticBonePositions, staticParentIndices, staticBoneNames);
             GLPreviewControl.IsVisible = true;
             ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
-            StatusStripUpdate($"AnimationClip: {clip.m_Name} | No Avatar relation; showing Animator mesh skeleton: {mesh.m_Name} | Bones: {bonePositions.Length}");
+            StatusStripUpdate($"AnimationClip: {clip.m_Name} | No matching animation tracks for mesh {staticMesh.m_Name}; showing renderer skeleton. {lastReason}");
             return true;
         }
 
         return false;
+    }
+
+    private bool TryBuildAnimationFramesFromRendererSkeleton(
+        AnimationClip clip,
+        Mesh mesh,
+        global::OpenTK.Mathematics.Vector3[] restBonePositions,
+        int[] meshParentIndices,
+        string[] meshBoneNames,
+        out global::OpenTK.Mathematics.Vector3[][] allFrames,
+        out global::OpenTK.Mathematics.Matrix4[][] allBoneMatrices,
+        out int[] renderParentIndices,
+        out float sampleRate,
+        out int trackCount,
+        out string reason)
+    {
+        allFrames = Array.Empty<global::OpenTK.Mathematics.Vector3[]>();
+        allBoneMatrices = Array.Empty<global::OpenTK.Mathematics.Matrix4[]>();
+        renderParentIndices = Array.Empty<int>();
+        sampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30f;
+        trackCount = 0;
+        reason = string.Empty;
+
+        if (mesh.m_BindPose == null || mesh.m_BindPose.Length == 0)
+        {
+            reason = "Mesh has no bind poses.";
+            return false;
+        }
+
+        var meshBoneCount = Math.Min(mesh.m_BindPose.Length, Math.Min(restBonePositions.Length, meshParentIndices.Length));
+        if (meshBoneCount == 0)
+        {
+            reason = "Renderer skeleton has no bones.";
+            return false;
+        }
+
+        var bindPoseInverses = new global::OpenTK.Mathematics.Matrix4[meshBoneCount];
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            var bp = mesh.m_BindPose[i];
+            var otkMat = new global::OpenTK.Mathematics.Matrix4(
+                bp.M00, bp.M01, bp.M02, bp.M03,
+                bp.M10, bp.M11, bp.M12, bp.M13,
+                bp.M20, bp.M21, bp.M22, bp.M23,
+                bp.M30, bp.M31, bp.M32, bp.M33);
+            try
+            {
+                bindPoseInverses[i] = otkMat.Inverted();
+            }
+            catch
+            {
+                bindPoseInverses[i] = global::OpenTK.Mathematics.Matrix4.Identity;
+            }
+        }
+
+        var meshBoneHashToIdx = new Dictionary<uint, int>();
+        if (mesh.m_BoneNameHashes != null)
+        {
+            for (var i = 0; i < Math.Min(mesh.m_BoneNameHashes.Length, meshBoneCount); i++)
+            {
+                meshBoneHashToIdx[mesh.m_BoneNameHashes[i]] = i;
+            }
+        }
+
+        var meshBonePathToIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < Math.Min(meshBoneNames.Length, meshBoneCount); i++)
+        {
+            AddPreviewBonePathAlias(meshBonePathToIdx, meshBoneNames[i], i);
+        }
+
+        bool TryResolveCurvePath(string? path, out int meshBoneIdx)
+        {
+            path = NormalizePreviewAnimationPath(path);
+            if (!string.IsNullOrEmpty(path))
+            {
+                var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                for (var start = 0; start < parts.Length; start++)
+                {
+                    var alias = string.Join("/", parts.Skip(start));
+                    if (meshBonePathToIdx.TryGetValue(alias, out meshBoneIdx) && meshBoneIdx >= 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            meshBoneIdx = -1;
+            return false;
+        }
+
+        bool TryResolveBindingBone(GenericBinding binding, out int meshBoneIdx)
+        {
+            return meshBoneHashToIdx.TryGetValue(binding.path, out meshBoneIdx);
+        }
+
+        var weightedBoneMask = new bool[meshBoneCount];
+        if (mesh.m_Skin != null)
+        {
+            foreach (var skin in mesh.m_Skin)
+            {
+                if (skin?.boneIndex == null || skin.weight == null)
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < Math.Min(skin.boneIndex.Length, skin.weight.Length); i++)
+                {
+                    var boneIdx = skin.boneIndex[i];
+                    if (skin.weight[i] > 0.0001f && boneIdx >= 0 && boneIdx < meshBoneCount)
+                    {
+                        weightedBoneMask[boneIdx] = true;
+                    }
+                }
+            }
+        }
+
+        var hasWeightedBones = weightedBoneMask.Any(x => x);
+        var deformChainMask = new bool[meshBoneCount];
+        if (hasWeightedBones)
+        {
+            for (var i = 0; i < meshBoneCount; i++)
+            {
+                if (!weightedBoneMask[i])
+                {
+                    continue;
+                }
+
+                var current = i;
+                while (current >= 0 && current < meshBoneCount && !deformChainMask[current])
+                {
+                    deformChainMask[current] = true;
+                    current = meshParentIndices[current];
+                }
+            }
+        }
+        else
+        {
+            Array.Fill(deformChainMask, true);
+        }
+
+        bool ShouldUseAnimationBinding(int meshBoneIdx)
+        {
+            if (meshBoneIdx < 0 || meshBoneIdx >= meshBoneCount)
+            {
+                return false;
+            }
+
+            if (!deformChainMask[meshBoneIdx])
+            {
+                return false;
+            }
+
+            return weightedBoneMask[meshBoneIdx] || !IsAuxiliaryPreviewAnimationBone(meshBoneNames.ElementAtOrDefault(meshBoneIdx));
+        }
+
+        var posTracks = new Dictionary<int, List<(float time, global::OpenTK.Mathematics.Vector3 value)>>();
+        var rotTracks = new Dictionary<int, List<(float time, global::OpenTK.Mathematics.Quaternion value)>>();
+        var scaleTracks = new Dictionary<int, List<(float time, global::OpenTK.Mathematics.Vector3 value)>>();
+        float maxTime = 0f;
+
+        void AddPosition(int boneIdx, float time, global::OpenTK.Mathematics.Vector3 value)
+        {
+            if (!ShouldUseAnimationBinding(boneIdx))
+            {
+                return;
+            }
+
+            if (time > maxTime) maxTime = time;
+            if (!posTracks.TryGetValue(boneIdx, out var list)) posTracks[boneIdx] = list = new();
+            list.Add((time, value));
+        }
+
+        void AddRotation(int boneIdx, float time, global::OpenTK.Mathematics.Quaternion value)
+        {
+            if (!ShouldUseAnimationBinding(boneIdx))
+            {
+                return;
+            }
+
+            if (value.LengthSquared > 0)
+            {
+                value.Normalize();
+            }
+
+            if (time > maxTime) maxTime = time;
+            if (!rotTracks.TryGetValue(boneIdx, out var list)) rotTracks[boneIdx] = list = new();
+            list.Add((time, value));
+        }
+
+        void AddScale(int boneIdx, float time, global::OpenTK.Mathematics.Vector3 value)
+        {
+            if (!ShouldUseAnimationBinding(boneIdx))
+            {
+                return;
+            }
+
+            if (time > maxTime) maxTime = time;
+            if (!scaleTracks.TryGetValue(boneIdx, out var list)) scaleTracks[boneIdx] = list = new();
+            list.Add((time, value));
+        }
+
+        foreach (var curve in clip.m_PositionCurves ?? Array.Empty<Vector3Curve>())
+        {
+            if (!TryResolveCurvePath(curve.path, out var boneIdx) || curve.curve?.m_Curve == null)
+            {
+                continue;
+            }
+
+            foreach (var key in curve.curve.m_Curve)
+            {
+                AddPosition(boneIdx, key.time, ToOtkVector3Preview(key.value));
+            }
+        }
+
+        foreach (var curve in clip.m_RotationCurves ?? Array.Empty<QuaternionCurve>())
+        {
+            if (!TryResolveCurvePath(curve.path, out var boneIdx) || curve.curve?.m_Curve == null)
+            {
+                continue;
+            }
+
+            foreach (var key in curve.curve.m_Curve)
+            {
+                AddRotation(boneIdx, key.time, ToOtkQuaternionPreview(key.value));
+            }
+        }
+
+        foreach (var curve in clip.m_EulerCurves ?? Array.Empty<Vector3Curve>())
+        {
+            if (!TryResolveCurvePath(curve.path, out var boneIdx) || curve.curve?.m_Curve == null)
+            {
+                continue;
+            }
+
+            foreach (var key in curve.curve.m_Curve)
+            {
+                var euler = ToOtkVector3Preview(key.value);
+                euler = new global::OpenTK.Mathematics.Vector3(
+                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(euler.X),
+                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(euler.Y),
+                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(euler.Z));
+                AddRotation(boneIdx, key.time, global::OpenTK.Mathematics.Quaternion.FromEulerAngles(euler));
+            }
+        }
+
+        foreach (var curve in clip.m_ScaleCurves ?? Array.Empty<Vector3Curve>())
+        {
+            if (!TryResolveCurvePath(curve.path, out var boneIdx) || curve.curve?.m_Curve == null)
+            {
+                continue;
+            }
+
+            foreach (var key in curve.curve.m_Curve)
+            {
+                AddScale(boneIdx, key.time, ToOtkVector3Preview(key.value));
+            }
+        }
+
+        void AddGenericKeyframe(int meshBoneIdx, uint attribute, float time, float[] data, int offset)
+        {
+            if (offset < 0 || offset >= data.Length)
+            {
+                return;
+            }
+
+            switch (attribute)
+            {
+                case 1 when offset + 2 < data.Length:
+                    AddPosition(meshBoneIdx, time, new global::OpenTK.Mathematics.Vector3(data[offset], data[offset + 1], data[offset + 2]));
+                    break;
+                case 2 when offset + 3 < data.Length:
+                    AddRotation(meshBoneIdx, time, new global::OpenTK.Mathematics.Quaternion(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]));
+                    break;
+                case 3 when offset + 2 < data.Length:
+                    AddScale(meshBoneIdx, time, new global::OpenTK.Mathematics.Vector3(data[offset], data[offset + 1], data[offset + 2]));
+                    break;
+                case 4 when offset + 2 < data.Length:
+                    var euler = new global::OpenTK.Mathematics.Vector3(
+                        global::OpenTK.Mathematics.MathHelper.DegreesToRadians(data[offset]),
+                        global::OpenTK.Mathematics.MathHelper.DegreesToRadians(data[offset + 1]),
+                        global::OpenTK.Mathematics.MathHelper.DegreesToRadians(data[offset + 2]));
+                    AddRotation(meshBoneIdx, time, global::OpenTK.Mathematics.Quaternion.FromEulerAngles(euler));
+                    break;
+            }
+        }
+
+        var muscleClip = clip.m_MuscleClip;
+        var innerClip = muscleClip?.m_Clip;
+        AnimationClipBindingConstant? bindings = null;
+        if (innerClip != null)
+        {
+            bindings = clip.m_ClipBindingConstant;
+            if (bindings == null && innerClip.m_Binding != null)
+            {
+                bindings = innerClip.ConvertValueArrayToGenericBinding();
+            }
+        }
+
+        if (innerClip != null && bindings?.genericBindings != null)
+        {
+            int GetBindingCurveWidth(GenericBinding binding)
+            {
+                if (binding.typeID != ClassIDType.Transform)
+                {
+                    return 1;
+                }
+
+                return binding.attribute switch
+                {
+                    1 => 3,
+                    2 => 4,
+                    3 => 3,
+                    4 => 3,
+                    _ => 1
+                };
+            }
+
+            bool TryFindBindingInfo(int index, out GenericBinding binding, out int startIndex, out int width)
+            {
+                var curves = 0;
+                foreach (var candidate in bindings.genericBindings)
+                {
+                    var candidateWidth = GetBindingCurveWidth(candidate);
+                    if (index >= curves && index < curves + candidateWidth)
+                    {
+                        binding = candidate;
+                        startIndex = curves;
+                        width = candidateWidth;
+                        return true;
+                    }
+
+                    curves += candidateWidth;
+                }
+
+                binding = default!;
+                startIndex = -1;
+                width = 1;
+                return false;
+            }
+
+            void ProcessCurveData(int curveIndexInStream, float time, float[] data, int dataOffset, ref int currentIdxOut)
+            {
+                if (!TryFindBindingInfo(curveIndexInStream, out var binding, out var bindingStart, out var bindingWidth)
+                    || curveIndexInStream != bindingStart)
+                {
+                    currentIdxOut++;
+                    return;
+                }
+
+                if (binding.typeID == ClassIDType.Transform && TryResolveBindingBone(binding, out var meshBoneIdx))
+                {
+                    AddGenericKeyframe(meshBoneIdx, binding.attribute, time, data, currentIdxOut + dataOffset);
+                }
+
+                currentIdxOut += binding.typeID == ClassIDType.Transform ? bindingWidth : 1;
+            }
+
+            void ProcessStreamedFrame(float time, AssetStudio.StreamedClip.StreamedCurveKey[] keyList)
+            {
+                var valuesByIndex = keyList.ToDictionary(x => x.index, x => x.value);
+                var processedStarts = new HashSet<int>();
+
+                foreach (var key in keyList.OrderBy(x => x.index))
+                {
+                    if (!TryFindBindingInfo(key.index, out var binding, out var bindingStart, out var bindingWidth)
+                        || !processedStarts.Add(bindingStart)
+                        || binding.typeID != ClassIDType.Transform
+                        || !TryResolveBindingBone(binding, out var meshBoneIdx))
+                    {
+                        continue;
+                    }
+
+                    var values = new float[bindingWidth];
+                    var hasAllComponents = true;
+                    for (var i = 0; i < bindingWidth; i++)
+                    {
+                        if (valuesByIndex.TryGetValue(bindingStart + i, out var value))
+                        {
+                            values[i] = value;
+                        }
+                        else
+                        {
+                            hasAllComponents = false;
+                            break;
+                        }
+                    }
+
+                    if (hasAllComponents)
+                    {
+                        AddGenericKeyframe(meshBoneIdx, binding.attribute, time, values, 0);
+                    }
+                }
+            }
+
+            if (innerClip.m_StreamedClip != null)
+            {
+                var streamedFrames = innerClip.m_StreamedClip.ReadData();
+                for (var frameIndex = 1; frameIndex < streamedFrames.Count - 1; frameIndex++)
+                {
+                    var frame = streamedFrames[frameIndex];
+                    ProcessStreamedFrame(frame.time, frame.keyList);
+                }
+            }
+
+            if (innerClip.m_DenseClip != null)
+            {
+                var dense = innerClip.m_DenseClip;
+                var streamCount = innerClip.m_StreamedClip?.curveCount ?? 0;
+                for (var frameIndex = 0; frameIndex < dense.m_FrameCount; frameIndex++)
+                {
+                    var time = dense.m_BeginTime + frameIndex / dense.m_SampleRate;
+                    var frameOffset = frameIndex * dense.m_CurveCount;
+                    for (var cIdx = 0; cIdx < dense.m_CurveCount;)
+                    {
+                        var curveIndex = (int)(streamCount + cIdx);
+                        ProcessCurveData(curveIndex, time, dense.m_SampleArray, (int)frameOffset, ref cIdx);
+                    }
+                }
+            }
+
+            if (innerClip.m_ConstantClip != null)
+            {
+                var constant = innerClip.m_ConstantClip;
+                var denseCount = innerClip.m_DenseClip?.m_CurveCount ?? 0;
+                var streamCount = innerClip.m_StreamedClip?.curveCount ?? 0;
+                var time = 0.0f;
+                for (var i = 0; i < 2; i++)
+                {
+                    for (var cIdx = 0; cIdx < constant.data.Length;)
+                    {
+                        var curveIndex = (int)(streamCount + denseCount + cIdx);
+                        ProcessCurveData(curveIndex, time, constant.data, 0, ref cIdx);
+                    }
+
+                    time = muscleClip?.m_StopTime ?? time;
+                }
+            }
+        }
+
+        foreach (var track in posTracks.Values)
+        {
+            track.Sort((a, b) => a.time.CompareTo(b.time));
+        }
+        foreach (var track in rotTracks.Values)
+        {
+            track.Sort((a, b) => a.time.CompareTo(b.time));
+        }
+        foreach (var track in scaleTracks.Values)
+        {
+            track.Sort((a, b) => a.time.CompareTo(b.time));
+        }
+
+        trackCount = posTracks.Count + rotTracks.Count + scaleTracks.Count;
+        if (trackCount == 0)
+        {
+            reason = bindings?.genericBindings != null
+                ? "Clip bindings did not match renderer bone hashes/names."
+                : "Clip has no readable transform binding table.";
+            return false;
+        }
+
+        return BuildAnimationFramesFromTracks(
+            mesh,
+            restBonePositions,
+            meshParentIndices,
+            meshBoneNames,
+            bindPoseInverses,
+            deformChainMask,
+            weightedBoneMask,
+            posTracks,
+            rotTracks,
+            scaleTracks,
+            sampleRate,
+            maxTime > 0f ? maxTime : muscleClip?.m_StopTime ?? 1f,
+            out allFrames,
+            out allBoneMatrices,
+            out renderParentIndices,
+            out reason);
+    }
+
+    private static string NormalizePreviewAnimationPath(string? path)
+    {
+        return (path ?? string.Empty)
+            .Replace("\\", "/", StringComparison.Ordinal)
+            .Trim('/');
+    }
+
+    private static void AddPreviewBonePathAlias(Dictionary<string, int> bonePathToIndex, string? path, int meshBoneIdx)
+    {
+        path = NormalizePreviewAnimationPath(path);
+        if (string.IsNullOrEmpty(path))
+        {
+            return;
+        }
+
+        var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        for (var start = 0; start < parts.Length; start++)
+        {
+            var alias = string.Join("/", parts.Skip(start));
+            if (!bonePathToIndex.TryGetValue(alias, out var existing))
+            {
+                bonePathToIndex[alias] = meshBoneIdx;
+            }
+            else if (existing != meshBoneIdx)
+            {
+                bonePathToIndex[alias] = -1;
+            }
+        }
+    }
+
+    private static global::OpenTK.Mathematics.Vector3 ToOtkVector3Preview(AssetStudio.Vector3 value)
+    {
+        return new global::OpenTK.Mathematics.Vector3(value.X, value.Y, value.Z);
+    }
+
+    private static global::OpenTK.Mathematics.Quaternion ToOtkQuaternionPreview(AssetStudio.Quaternion value)
+    {
+        var q = new global::OpenTK.Mathematics.Quaternion(value.X, value.Y, value.Z, value.W);
+        if (q.LengthSquared > 0)
+        {
+            q.Normalize();
+        }
+        return q;
+    }
+
+    private static global::OpenTK.Mathematics.Matrix4 CreatePreviewLocalMatrix(
+        global::OpenTK.Mathematics.Vector3 position,
+        global::OpenTK.Mathematics.Quaternion rotation,
+        global::OpenTK.Mathematics.Vector3 scale)
+    {
+        return global::OpenTK.Mathematics.Matrix4.CreateScale(scale)
+            * global::OpenTK.Mathematics.Matrix4.CreateFromQuaternion(rotation)
+            * global::OpenTK.Mathematics.Matrix4.CreateTranslation(position);
+    }
+
+    private static bool IsFinitePreviewVector(global::OpenTK.Mathematics.Vector3 value)
+    {
+        return float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z);
+    }
+
+    private static bool IsAuxiliaryPreviewAnimationBone(string? path)
+    {
+        var normalized = NormalizePreviewAnimationPath(path).ToLowerInvariant();
+        if (string.IsNullOrEmpty(normalized))
+        {
+            return false;
+        }
+
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var segment in segments)
+        {
+            if (segment == "ik" || segment.EndsWith("_ik", StringComparison.Ordinal) || segment.StartsWith("ik_", StringComparison.Ordinal)
+                || segment.Contains("effector", StringComparison.Ordinal)
+                || segment.Contains("target", StringComparison.Ordinal)
+                || segment.Contains("pole", StringComparison.Ordinal)
+                || segment.Contains("hint", StringComparison.Ordinal)
+                || segment.Contains("constraint", StringComparison.Ordinal)
+                || segment.Contains("locator", StringComparison.Ordinal)
+                || segment.Contains("dummy", StringComparison.Ordinal)
+                || segment.Contains("helper", StringComparison.Ordinal)
+                || segment.Contains("control", StringComparison.Ordinal)
+                || segment.Contains("ctrl", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool BuildAnimationFramesFromTracks(
+        Mesh mesh,
+        global::OpenTK.Mathematics.Vector3[] restBonePositions,
+        int[] meshParentIndices,
+        string[] meshBoneNames,
+        global::OpenTK.Mathematics.Matrix4[] bindPoseInverses,
+        bool[] deformChainMask,
+        bool[] weightedBoneMask,
+        Dictionary<int, List<(float time, global::OpenTK.Mathematics.Vector3 value)>> posTracks,
+        Dictionary<int, List<(float time, global::OpenTK.Mathematics.Quaternion value)>> rotTracks,
+        Dictionary<int, List<(float time, global::OpenTK.Mathematics.Vector3 value)>> scaleTracks,
+        float sampleRate,
+        float maxTime,
+        out global::OpenTK.Mathematics.Vector3[][] allFrames,
+        out global::OpenTK.Mathematics.Matrix4[][] allBoneMatrices,
+        out int[] renderParentIndices,
+        out string reason)
+    {
+        allFrames = Array.Empty<global::OpenTK.Mathematics.Vector3[]>();
+        allBoneMatrices = Array.Empty<global::OpenTK.Mathematics.Matrix4[]>();
+        renderParentIndices = Array.Empty<int>();
+        reason = string.Empty;
+
+        var meshBoneCount = Math.Min(mesh.m_BindPose?.Length ?? 0, Math.Min(restBonePositions.Length, meshParentIndices.Length));
+        if (meshBoneCount == 0)
+        {
+            reason = "No bones available for frame generation.";
+            return false;
+        }
+
+        global::OpenTK.Mathematics.Vector3 EvaluatePos(int meshBoneIdx, float t)
+        {
+            if (!posTracks.TryGetValue(meshBoneIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Vector3.Zero;
+            if (track.Count == 1) return track[0].value;
+            if (t <= track[0].time) return track[0].value;
+            if (t >= track[^1].time) return track[^1].value;
+
+            for (var i = 0; i < track.Count - 1; i++)
+            {
+                if (t >= track[i].time && t <= track[i + 1].time)
+                {
+                    var factor = (t - track[i].time) / (track[i + 1].time - track[i].time);
+                    return global::OpenTK.Mathematics.Vector3.Lerp(track[i].value, track[i + 1].value, factor);
+                }
+            }
+            return track[^1].value;
+        }
+
+        global::OpenTK.Mathematics.Quaternion EvaluateRot(int meshBoneIdx, float t)
+        {
+            if (!rotTracks.TryGetValue(meshBoneIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Quaternion.Identity;
+            if (track.Count == 1) return track[0].value;
+            if (t <= track[0].time) return track[0].value;
+            if (t >= track[^1].time) return track[^1].value;
+
+            for (var i = 0; i < track.Count - 1; i++)
+            {
+                if (t >= track[i].time && t <= track[i + 1].time)
+                {
+                    var factor = (t - track[i].time) / (track[i + 1].time - track[i].time);
+                    return global::OpenTK.Mathematics.Quaternion.Slerp(track[i].value, track[i + 1].value, factor);
+                }
+            }
+            return track[^1].value;
+        }
+
+        global::OpenTK.Mathematics.Vector3 EvaluateScale(int meshBoneIdx, float t)
+        {
+            if (!scaleTracks.TryGetValue(meshBoneIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Vector3.One;
+            if (track.Count == 1) return track[0].value;
+            if (t <= track[0].time) return track[0].value;
+            if (t >= track[^1].time) return track[^1].value;
+
+            for (var i = 0; i < track.Count - 1; i++)
+            {
+                if (t >= track[i].time && t <= track[i + 1].time)
+                {
+                    var factor = (t - track[i].time) / (track[i + 1].time - track[i].time);
+                    return global::OpenTK.Mathematics.Vector3.Lerp(track[i].value, track[i + 1].value, factor);
+                }
+            }
+            return track[^1].value;
+        }
+
+        var bindPoses = new global::OpenTK.Mathematics.Matrix4[meshBoneCount];
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            try { bindPoses[i] = bindPoseInverses[i].Inverted(); }
+            catch { bindPoses[i] = global::OpenTK.Mathematics.Matrix4.Identity; }
+        }
+
+        var restLocals = new global::OpenTK.Mathematics.Matrix4[meshBoneCount];
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            var pIdx = meshParentIndices[i];
+            restLocals[i] = pIdx >= 0 && pIdx < meshBoneCount
+                ? bindPoses[i] * bindPoseInverses[pIdx]
+                : bindPoses[i];
+        }
+
+        var restMin = new global::OpenTK.Mathematics.Vector3(float.MaxValue);
+        var restMax = new global::OpenTK.Mathematics.Vector3(float.MinValue);
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            var restPosition = restBonePositions[i];
+            if (!IsFinitePreviewVector(restPosition))
+            {
+                continue;
+            }
+
+            restMin = global::OpenTK.Mathematics.Vector3.ComponentMin(restMin, restPosition);
+            restMax = global::OpenTK.Mathematics.Vector3.ComponentMax(restMax, restPosition);
+        }
+
+        var restExtent = (restMax - restMin).Length;
+        if (!float.IsFinite(restExtent) || restExtent <= 0)
+        {
+            restExtent = 1f;
+        }
+
+        var localPositionLimit = Math.Max(1f, restExtent * 2f);
+        foreach (var item in posTracks.ToArray())
+        {
+            var boneIdx = item.Key;
+            if (boneIdx < 0 || boneIdx >= meshBoneCount || meshParentIndices[boneIdx] < 0)
+            {
+                continue;
+            }
+
+            var restLocalPosition = restLocals[boneIdx].ExtractTranslation();
+            if (item.Value.Any(x => !IsFinitePreviewVector(x.value) || (x.value - restLocalPosition).Length > localPositionLimit))
+            {
+                posTracks.Remove(boneIdx);
+            }
+        }
+
+        foreach (var item in scaleTracks.ToArray())
+        {
+            if (item.Value.Any(x => !IsFinitePreviewVector(x.value)
+                || x.value.X <= 0f || x.value.Y <= 0f || x.value.Z <= 0f
+                || Math.Abs(x.value.X) > 10f || Math.Abs(x.value.Y) > 10f || Math.Abs(x.value.Z) > 10f))
+            {
+                scaleTracks.Remove(item.Key);
+            }
+        }
+
+        if (posTracks.Count == 0 && rotTracks.Count == 0 && scaleTracks.Count == 0)
+        {
+            reason = "All extracted tracks were rejected by safety filters.";
+            return false;
+        }
+
+        if (sampleRate <= 0f || !float.IsFinite(sampleRate))
+        {
+            sampleRate = 30f;
+        }
+        if (maxTime <= 0f || !float.IsFinite(maxTime))
+        {
+            maxTime = 1f;
+        }
+
+        var frameCount = Math.Max(1, (int)Math.Ceiling(maxTime * sampleRate));
+        allFrames = new global::OpenTK.Mathematics.Vector3[frameCount][];
+        allBoneMatrices = new global::OpenTK.Mathematics.Matrix4[frameCount][];
+        for (var f = 0; f < frameCount; f++)
+        {
+            var t = f / sampleRate;
+            var framePositions = new global::OpenTK.Mathematics.Vector3[meshBoneCount];
+            var frameMatrices = new global::OpenTK.Mathematics.Matrix4[meshBoneCount];
+            var modelMatrices = new global::OpenTK.Mathematics.Matrix4?[meshBoneCount];
+
+            global::OpenTK.Mathematics.Matrix4 GetModelMatrix(int bIdx)
+            {
+                if (modelMatrices[bIdx] is global::OpenTK.Mathematics.Matrix4 cached)
+                {
+                    return cached;
+                }
+
+                var localMat = restLocals[bIdx];
+                var hasPos = posTracks.ContainsKey(bIdx);
+                var hasRot = rotTracks.ContainsKey(bIdx);
+                var hasScale = scaleTracks.ContainsKey(bIdx);
+
+                if (hasPos || hasRot || hasScale)
+                {
+                    var pos = hasPos ? EvaluatePos(bIdx, t) : localMat.ExtractTranslation();
+                    var rot = hasRot ? EvaluateRot(bIdx, t) : localMat.ExtractRotation();
+                    var scale = hasScale ? EvaluateScale(bIdx, t) : localMat.ExtractScale();
+                    localMat = CreatePreviewLocalMatrix(pos, rot, scale);
+                }
+
+                var pIdx = meshParentIndices[bIdx];
+                if (pIdx >= 0 && pIdx != bIdx && pIdx < meshBoneCount)
+                {
+                    var worldMat = localMat * GetModelMatrix(pIdx);
+                    modelMatrices[bIdx] = worldMat;
+                    return worldMat;
+                }
+
+                modelMatrices[bIdx] = localMat;
+                return localMat;
+            }
+
+            for (var meshBoneIdx = 0; meshBoneIdx < meshBoneCount; meshBoneIdx++)
+            {
+                var mat = GetModelMatrix(meshBoneIdx);
+                framePositions[meshBoneIdx] = mat.ExtractTranslation();
+                frameMatrices[meshBoneIdx] = mat;
+            }
+
+            allFrames[f] = framePositions;
+            allBoneMatrices[f] = frameMatrices;
+        }
+
+        renderParentIndices = meshParentIndices.Take(meshBoneCount).ToArray();
+        var hiddenRenderBones = new bool[meshBoneCount];
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            var boneName = i < meshBoneNames.Length ? meshBoneNames[i] : string.Empty;
+            if (!deformChainMask[i] || (!weightedBoneMask[i] && IsAuxiliaryPreviewAnimationBone(boneName)))
+            {
+                hiddenRenderBones[i] = true;
+                renderParentIndices[i] = -1;
+            }
+        }
+
+        var maxRestEdge = 0f;
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            var parentIdx = meshParentIndices[i];
+            if (parentIdx >= 0 && parentIdx < meshBoneCount
+                && IsFinitePreviewVector(restBonePositions[i])
+                && IsFinitePreviewVector(restBonePositions[parentIdx]))
+            {
+                maxRestEdge = Math.Max(maxRestEdge, (restBonePositions[i] - restBonePositions[parentIdx]).Length);
+            }
+        }
+
+        var edgeLimit = Math.Max(Math.Max(maxRestEdge * 8f, restExtent * 1.5f), 0.5f);
+        for (var i = 0; i < meshBoneCount; i++)
+        {
+            var parentIdx = meshParentIndices[i];
+            if (parentIdx < 0 || parentIdx >= meshBoneCount)
+            {
+                continue;
+            }
+
+            foreach (var frame in allFrames)
+            {
+                if (!IsFinitePreviewVector(frame[i]) || !IsFinitePreviewVector(frame[parentIdx])
+                    || (frame[i] - frame[parentIdx]).Length > edgeLimit)
+                {
+                    hiddenRenderBones[i] = true;
+                    renderParentIndices[i] = -1;
+                    break;
+                }
+            }
+        }
+
+        for (var f = 0; f < allFrames.Length; f++)
+        {
+            for (var i = 0; i < meshBoneCount; i++)
+            {
+                if (!hiddenRenderBones[i])
+                {
+                    continue;
+                }
+
+                var parentIdx = meshParentIndices[i];
+                allFrames[f][i] = parentIdx >= 0 && parentIdx < meshBoneCount
+                    ? allFrames[f][parentIdx]
+                    : restBonePositions[i];
+            }
+        }
+
+        return true;
     }
 
     private List<Mesh> TryLoadMeshesForAnimationClipFromSemanticCache(AnimationClip clip)

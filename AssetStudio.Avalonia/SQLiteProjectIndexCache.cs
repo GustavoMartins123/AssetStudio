@@ -2143,6 +2143,56 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        internal List<string> LoadMeshRendererAssetIds(string folderPath, string signature, string meshAssetId, string? rendererType = null)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(meshAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT mr.RendererAssetUniqueID
+                    FROM MeshRenderers mr
+                    WHERE mr.ProjectId = @projectId
+                      AND mr.MeshAssetUniqueID = @meshAssetId
+                      AND mr.RendererAssetUniqueID <> ''
+                      AND (@rendererType = '' OR mr.RendererType = @rendererType)
+                    GROUP BY mr.RendererAssetUniqueID
+                    ORDER BY
+                        CASE WHEN mr.RendererType = 'SkinnedMeshRenderer' THEN 0 ELSE 1 END,
+                        MIN(mr.GameObjectName),
+                        mr.RendererAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                cmd.Parameters.AddWithValue("@rendererType", rendererType ?? string.Empty);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(reader.GetString(0));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load mesh renderer relations from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
         internal List<string> LoadAnimationClipAvatarAssetIds(string folderPath, string signature, string clipAssetId)
         {
             var result = new List<string>();
