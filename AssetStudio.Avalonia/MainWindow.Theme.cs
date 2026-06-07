@@ -6,8 +6,8 @@ using System;
 
 namespace AssetStudio.Avalonia
 {
-    public partial class MainWindow : Window
-    {
+public partial class MainWindow
+{
         private void InitializeTheme()
         {
             ApplyTheme(appSettings.SelectedTheme);

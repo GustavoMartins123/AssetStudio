@@ -11,7 +11,7 @@ using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
-public partial class MainWindow : Window
+public partial class MainWindow
 {
     private const double MinAvatarPreviewBoneScale = 0.1;
     private const double MaxAvatarPreviewBoneScale = 5.0;

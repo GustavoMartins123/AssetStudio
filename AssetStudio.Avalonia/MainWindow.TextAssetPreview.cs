@@ -7,7 +7,7 @@ using System.Globalization;
 
 namespace AssetStudio.Avalonia;
 
-public partial class MainWindow : Window
+public partial class MainWindow
 {
     private TextAssetPreviewResult? currentTextAssetPreview;
     private TextAssetPreviewMode currentPreviewMode = TextAssetPreviewMode.Cards;

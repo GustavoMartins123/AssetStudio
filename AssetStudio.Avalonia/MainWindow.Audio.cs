@@ -10,7 +10,7 @@ using FFmpegVideoPlayer.Core;
 
 namespace AssetStudio.Avalonia;
 
-public partial class MainWindow : Window
+public partial class MainWindow
 {
     private AudioClip? currentPreviewAudioClip;
     private System.Diagnostics.Process? _linuxAudioProcess;
