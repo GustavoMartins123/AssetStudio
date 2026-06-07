@@ -96,6 +96,11 @@ public partial class MainWindow : Window
     private long _videoLengthMs = 0;
     private volatile int _targetVolume = 80;
     private DispatcherTimer? _ffmpegVideoTimer;
+    private DispatcherTimer? _2dAnimTimer;
+    private List<(float time, AssetStudio.Object asset)> _2dAnimFrames = new();
+    private Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap> _2dAnimBitmaps = new();
+    private DateTime _2dAnimStartTime;
+    private float _2dAnimDuration;
 
     private readonly SQLiteProjectIndexCache _sqliteCache = new();
     private ProjectScanResult? currentScanResult;
@@ -657,6 +662,7 @@ public partial class MainWindow : Window
 
     private void ClearPreview(string message = "[Preview Panel]")
     {
+        Stop2DAnimation();
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
         TextPreviewBox.FontFamily = global::Avalonia.Media.FontFamily.Default;
@@ -7068,6 +7074,142 @@ public partial class MainWindow : Window
         };
     }
 
+    private void Preview2DAnimationClip(AnimationClip clip)
+    {
+        Stop2DAnimation();
+        EnsureAnimationClip2DPreviewDependenciesLoaded(clip);
+
+        var pptrCurve = clip.m_PPtrCurves?.FirstOrDefault(c => c.curve != null && c.curve.Length > 0);
+        if (pptrCurve == null)
+        {
+            StatusStripUpdate("AnimationClip: No keyframes found in 2D animation curves.");
+            return;
+        }
+
+        var frames = new List<(float time, AssetStudio.Object asset)>();
+        foreach (var kf in pptrCurve.curve)
+        {
+            if (kf.value != null && !kf.value.IsNull)
+            {
+                if (kf.value.TryGet<Sprite>(out var sprite))
+                {
+                    frames.Add((kf.time, sprite));
+                }
+                else if (kf.value.TryGet<Texture2D>(out var texture))
+                {
+                    frames.Add((kf.time, texture));
+                }
+            }
+        }
+
+        if (frames.Count == 0)
+        {
+            StatusStripUpdate("AnimationClip: No Sprites or Textures could be loaded for 2D animation.");
+            return;
+        }
+
+        _2dAnimFrames = frames.OrderBy(f => f.time).ToList();
+        _2dAnimDuration = _2dAnimFrames.Last().time;
+        if (_2dAnimDuration <= 0)
+        {
+            _2dAnimDuration = 1.0f;
+        }
+
+        _2dAnimBitmaps.Clear();
+        foreach (var f in _2dAnimFrames)
+        {
+            if (!_2dAnimBitmaps.ContainsKey(f.asset))
+            {
+                try
+                {
+                    Image<Bgra32>? img = null;
+                    if (f.asset is Sprite sprite)
+                    {
+                        img = sprite.GetImage();
+                    }
+                    else if (f.asset is Texture2D texture)
+                    {
+                        img = texture.ConvertToImage(true);
+                    }
+
+                    if (img != null)
+                    {
+                        using (img)
+                        using (var ms = new MemoryStream())
+                        {
+                            img.SaveAsPng(ms);
+                            ms.Position = 0;
+                            var bmp = new global::Avalonia.Media.Imaging.Bitmap(ms);
+                            _2dAnimBitmaps[f.asset] = bmp;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.Log(LoggerEvent.Warning, $"Failed to decode 2D animation frame: {ex.Message}");
+                }
+            }
+        }
+
+        if (_2dAnimBitmaps.Count == 0)
+        {
+            StatusStripUpdate("AnimationClip: Failed to decode any sprite/texture frames for preview.");
+            return;
+        }
+
+        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+        if (TextureGLPreview != null) TextureGLPreview.IsVisible = false;
+        if (TextPreviewBox != null) TextPreviewBox.IsVisible = false;
+        if (PreviewLabel != null) PreviewLabel.IsVisible = false;
+        if (ImagePreviewBox != null) ImagePreviewBox.IsVisible = true;
+
+        _2dAnimStartTime = DateTime.UtcNow;
+
+        _2dAnimTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(30)
+        };
+        _2dAnimTimer.Tick += On2DAnimTimerTick;
+        _2dAnimTimer.Start();
+
+        StatusStripUpdate($"AnimationClip: Playing 2D animation '{clip.m_Name}' ({_2dAnimFrames.Count} frames)...");
+    }
+
+    private void On2DAnimTimerTick(object? sender, EventArgs e)
+    {
+        if (_2dAnimFrames.Count == 0 || ImagePreviewBox == null)
+        {
+            Stop2DAnimation();
+            return;
+        }
+
+        var elapsedSeconds = (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
+        var loopTime = _2dAnimDuration > 0 ? (elapsedSeconds % _2dAnimDuration) : 0f;
+
+        var frame = _2dAnimFrames.LastOrDefault(f => f.time <= loopTime);
+        if (frame.asset == null)
+        {
+            frame = _2dAnimFrames.First();
+        }
+
+        if (_2dAnimBitmaps.TryGetValue(frame.asset, out var bitmap))
+        {
+            ImagePreviewBox.Source = bitmap;
+        }
+    }
+
+    private void Stop2DAnimation()
+    {
+        if (_2dAnimTimer != null)
+        {
+            _2dAnimTimer.Stop();
+            _2dAnimTimer.Tick -= On2DAnimTimerTick;
+            _2dAnimTimer = null;
+        }
+        _2dAnimFrames.Clear();
+        _2dAnimBitmaps.Clear();
+    }
+
     private void PreviewAnimationClip(
         AnimationClip clip,
         Avatar? preferredAvatar = null,
@@ -7077,6 +7219,12 @@ public partial class MainWindow : Window
         bool rebuildCandidateControls = true,
         PreviewCandidateItem? selectedCandidate = null)
     {
+        if (clip.m_PPtrCurves != null && clip.m_PPtrCurves.Length > 0)
+        {
+            Preview2DAnimationClip(clip);
+            return;
+        }
+
         PreviewCandidateItem? activeCandidate;
         if (rebuildCandidateControls)
         {
@@ -9230,6 +9378,7 @@ public partial class MainWindow : Window
 
     private void PreviewSprite(AssetItem assetItem, Sprite m_Sprite)
     {
+        EnsureSpritePreviewDependenciesLoaded(m_Sprite);
         currentPreviewSprite = m_Sprite;
         UpdateImagePreview();
     }
@@ -9486,6 +9635,21 @@ public partial class MainWindow : Window
         ClassIDType.Material
     };
 
+    private static readonly HashSet<ClassIDType> SpritePreviewReferenceTypes = new()
+    {
+        ClassIDType.Sprite,
+        ClassIDType.Texture2D,
+        ClassIDType.SpriteAtlas
+    };
+
+    private static readonly HashSet<ClassIDType> AnimationClip2DPreviewReferenceTypes = new()
+    {
+        ClassIDType.AnimationClip,
+        ClassIDType.Sprite,
+        ClassIDType.Texture2D,
+        ClassIDType.SpriteAtlas
+    };
+
     private static readonly HashSet<ClassIDType> LazyConnectionReferenceTypes = new()
     {
         ClassIDType.GameObject,
@@ -9734,44 +9898,338 @@ public partial class MainWindow : Window
         }
     }
 
-    private void EnsureIndexedExternalSourcesLoaded(SerializedFile sourceFile)
+    private void EnsureSpritePreviewDependenciesLoaded(Sprite sprite)
     {
-        if (sourceFile.m_Externals == null || sourceFile.m_Externals.Count == 0)
+        if (!assetsManager.LazyLoading || sprite.assetsFile == null)
         {
             return;
         }
 
-        foreach (var external in sourceFile.m_Externals)
+        using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
+        EnsureIndexedExternalSourcesLoaded(sprite.assetsFile);
+        MaterializeReferenceObjects(sprite.assetsFile, SpritePreviewReferenceTypes);
+
+        var filesSnapshot = GetLoadedFilesSnapshot();
+        foreach (var file in filesSnapshot)
         {
-            if (external == null || string.IsNullOrWhiteSpace(external.fileName))
+            MaterializeReferenceObjects(file, SpritePreviewReferenceTypes);
+        }
+
+        PrepareLoadedSpriteAtlasReferencesForPreview(filesSnapshot);
+    }
+
+    private void EnsureAnimationClip2DPreviewDependenciesLoaded(AnimationClip clip)
+    {
+        if (!assetsManager.LazyLoading || clip.assetsFile == null)
+        {
+            return;
+        }
+
+        using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
+        EnsureIndexedExternalSourcesLoaded(clip.assetsFile);
+        MaterializeReferenceObjects(clip.assetsFile, AnimationClip2DPreviewReferenceTypes);
+
+        var filesSnapshot = GetLoadedFilesSnapshot();
+        foreach (var file in filesSnapshot)
+        {
+            MaterializeReferenceObjects(file, AnimationClip2DPreviewReferenceTypes);
+        }
+
+        PrepareLoadedSpriteAtlasReferencesForPreview(filesSnapshot);
+    }
+
+    private void EnsureIndexedExternalSourcesLoaded(SerializedFile sourceFile)
+    {
+        if (sourceFile == null)
+        {
+            return;
+        }
+
+        var pending = new Queue<SerializedFile>();
+        var processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var processedExternals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        pending.Enqueue(sourceFile);
+
+        while (pending.Count > 0)
+        {
+            var currentFile = pending.Dequeue();
+            if (currentFile == null || !processedFiles.Add(GetSerializedFileDependencyKey(currentFile)))
             {
                 continue;
             }
 
-            if (assetsManager.TryFindSerializedFile(external.fileName, string.Empty, out _))
+            if (currentFile.m_Externals == null || currentFile.m_Externals.Count == 0)
             {
                 continue;
             }
 
-            var sourcePath = assetsManager.ProjectIndex
-                .GetHandlesForFile(external.fileName)
+            foreach (var external in currentFile.m_Externals)
+            {
+                if (external == null || (string.IsNullOrWhiteSpace(external.fileName) && string.IsNullOrWhiteSpace(external.pathName)))
+                {
+                    continue;
+                }
+
+                var externalKey = $"{external.fileName}|{external.pathName}";
+                if (!processedExternals.Add(externalKey))
+                {
+                    continue;
+                }
+
+                if (TryGetLoadedExternalFile(external, out var loadedExternalFile))
+                {
+                    pending.Enqueue(loadedExternalFile);
+                    continue;
+                }
+
+                var sourcePath = ResolveIndexedExternalSourcePath(external);
+                if (string.IsNullOrWhiteSpace(sourcePath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    RemovePendingFileFromProgressiveQueue(sourcePath);
+                    assetsManager.LoadFilesForPreview(sourcePath);
+                    assetsManager.WaitForAssetsFileLoaded(external.fileName, 5000);
+                    if (TryGetLoadedExternalFile(external, out loadedExternalFile))
+                    {
+                        pending.Enqueue(loadedExternalFile);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to load external preview source {Path.GetFileName(sourcePath)}: {ex.Message}");
+                }
+            }
+        }
+    }
+
+    private List<SerializedFile> GetLoadedFilesSnapshot()
+    {
+        lock (assetsManager.loadLock)
+        {
+            return assetsManager.assetsFileList.ToList();
+        }
+    }
+
+    private bool TryGetLoadedExternalFile(FileIdentifier external, out SerializedFile sourceFile)
+    {
+        sourceFile = null!;
+        if (external == null)
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(external.fileName)
+            && ((assetsManager.TryFindSerializedFile(external.fileName, null, out sourceFile) && sourceFile != null)
+                || (assetsManager.TryFindSerializedFile(external.fileName, external.pathName, out sourceFile) && sourceFile != null)))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(external.pathName)
+            && assetsManager.TryFindSerializedFile(Path.GetFileName(external.pathName), external.pathName, out sourceFile)
+            && sourceFile != null)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private string? ResolveIndexedExternalSourcePath(FileIdentifier external)
+    {
+        if (external == null)
+        {
+            return null;
+        }
+
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        AddCandidateFileName(candidates, external.fileName);
+        AddCandidateFileName(candidates, external.pathName);
+
+        foreach (var candidate in candidates)
+        {
+            var direct = TryResolveExistingPath(candidate);
+            if (!string.IsNullOrEmpty(direct))
+            {
+                return direct;
+            }
+
+            if (!string.IsNullOrEmpty(assetsManager.ProjectRoot))
+            {
+                direct = TryResolveExistingPath(Path.Combine(assetsManager.ProjectRoot, candidate));
+                if (!string.IsNullOrEmpty(direct))
+                {
+                    return direct;
+                }
+            }
+
+            if (lazySourcePathBySerializedFile.TryGetValue(candidate, out var mappedSourcePath))
+            {
+                direct = TryResolveExistingPath(mappedSourcePath);
+                if (!string.IsNullOrEmpty(direct))
+                {
+                    return direct;
+                }
+            }
+
+            var indexedPath = assetsManager.ProjectIndex
+                .GetHandlesForFile(candidate)
                 .Select(ResolveLazyHandleSourcePath)
                 .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
+            if (!string.IsNullOrEmpty(indexedPath))
+            {
+                return indexedPath;
+            }
+        }
 
-            if (string.IsNullOrWhiteSpace(sourcePath))
+        foreach (var candidate in candidates)
+        {
+            var found = FindSourceFileByNameInProjectRoot(candidate);
+            if (!string.IsNullOrEmpty(found))
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static string GetSerializedFileDependencyKey(SerializedFile file)
+    {
+        if (!string.IsNullOrWhiteSpace(file.originalPath))
+        {
+            return file.originalPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(file.fullName))
+        {
+            return file.fullName;
+        }
+
+        return file.fileName ?? string.Empty;
+    }
+
+    private static void PrepareLoadedSpriteAtlasReferencesForPreview(List<SerializedFile> filesSnapshot)
+    {
+        if (filesSnapshot.Count == 0)
+        {
+            return;
+        }
+
+        var sprites = new List<Sprite>();
+        var atlases = new List<SpriteAtlas>();
+        foreach (var file in filesSnapshot)
+        {
+            AssetStudio.Object[] objects;
+            lock (file)
+            {
+                objects = file.Objects.ToArray();
+            }
+
+            foreach (var obj in objects)
+            {
+                if (obj is Sprite sprite)
+                {
+                    ResetSpriteReferenceCache(sprite);
+                    sprites.Add(sprite);
+                }
+                else if (obj is SpriteAtlas atlas)
+                {
+                    ResetSpriteAtlasReferenceCache(atlas);
+                    atlases.Add(atlas);
+                }
+            }
+        }
+
+        if (sprites.Count == 0 || atlases.Count == 0)
+        {
+            return;
+        }
+
+        var spriteAtlasCache = new Dictionary<KeyValuePair<Guid, long>, SpriteAtlas>();
+        foreach (var atlas in atlases)
+        {
+            if (atlas.m_RenderDataMap != null)
+            {
+                foreach (var key in atlas.m_RenderDataMap.Keys)
+                {
+                    spriteAtlasCache[key] = atlas;
+                }
+            }
+
+            foreach (var packedSprite in atlas.m_PackedSprites ?? Array.Empty<PPtr<Sprite>>())
+            {
+                if (packedSprite != null && packedSprite.TryGet(out var sprite) && sprite != null)
+                {
+                    if (sprite.m_SpriteAtlas == null || sprite.m_SpriteAtlas.IsNull)
+                    {
+                        sprite.m_SpriteAtlas?.Set(atlas);
+                    }
+                    else if (sprite.m_SpriteAtlas.TryGet(out var oldAtlas) && oldAtlas?.m_IsVariant == true)
+                    {
+                        sprite.m_SpriteAtlas.Set(atlas);
+                    }
+                }
+            }
+        }
+
+        foreach (var sprite in sprites)
+        {
+            if (sprite.m_SpriteAtlas != null
+                && !sprite.m_SpriteAtlas.IsNull
+                && sprite.m_SpriteAtlas.TryGet(out _))
             {
                 continue;
             }
 
-            try
+            if (sprite.m_RenderDataKey.Key != Guid.Empty
+                && spriteAtlasCache.TryGetValue(sprite.m_RenderDataKey, out var atlas)
+                && sprite.m_SpriteAtlas != null)
             {
-                RemovePendingFileFromProgressiveQueue(sourcePath);
-                assetsManager.LoadFilesForPreview(sourcePath);
-                assetsManager.WaitForAssetsFileLoaded(external.fileName, 5000);
+                sprite.m_SpriteAtlas.Set(atlas);
             }
-            catch (Exception ex)
+        }
+    }
+
+    private static void ResetSpriteReferenceCache(Sprite sprite)
+    {
+        sprite.m_SpriteAtlas?.ResetCache();
+        if (sprite.m_RD == null)
+        {
+            return;
+        }
+
+        sprite.m_RD.texture?.ResetCache();
+        sprite.m_RD.alphaTexture?.ResetCache();
+        foreach (var secondaryTexture in sprite.m_RD.secondaryTextures ?? Array.Empty<SecondarySpriteTexture>())
+        {
+            secondaryTexture?.texture?.ResetCache();
+        }
+    }
+
+    private static void ResetSpriteAtlasReferenceCache(SpriteAtlas atlas)
+    {
+        foreach (var packedSprite in atlas.m_PackedSprites ?? Array.Empty<PPtr<Sprite>>())
+        {
+            packedSprite?.ResetCache();
+        }
+
+        if (atlas.m_RenderDataMap == null)
+        {
+            return;
+        }
+
+        foreach (var data in atlas.m_RenderDataMap.Values)
+        {
+            data.texture?.ResetCache();
+            data.alphaTexture?.ResetCache();
+            foreach (var secondaryTexture in data.secondaryTextures ?? Array.Empty<SecondarySpriteTexture>())
             {
-                Logger.Warning($"Failed to load external preview source {Path.GetFileName(sourcePath)}: {ex.Message}");
+                secondaryTexture?.texture?.ResetCache();
             }
         }
     }
@@ -12147,7 +12605,7 @@ public partial class MainWindow : Window
                     var rawPath = Path.Combine(exportPath, fileName + ".tex");
                     if (File.Exists(rawPath)) return false;
                     File.WriteAllBytes(rawPath, m_Texture2D.image_data.GetData());
-                    AssetExportHelper.WriteTextureMetaIfMissing(rawPath);
+                    AssetExportHelper.WriteTextureMetaIfMissing(rawPath, m_Texture2D);
                     return true;
                 }
 
@@ -12161,7 +12619,7 @@ public partial class MainWindow : Window
                 {
                     image.WriteToStream(file, exportOptions.ConvertTextureFormat);
                 }
-                AssetExportHelper.WriteTextureMetaIfMissing(filePath);
+                AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Texture2D);
                 return true;
             }
             case AudioClip m_AudioClip:
@@ -12237,6 +12695,7 @@ public partial class MainWindow : Window
                 {
                     image.WriteToStream(file, ImageFormat.Png);
                 }
+                AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Sprite);
                 return true;
             }
             case VideoClip m_VideoClip:

@@ -208,7 +208,12 @@ namespace AssetStudio
             var extension = "." + textureFormat.ToString().ToLowerInvariant();
             var texturePath = Path.Combine(textureFolder, FixFileName(texture.m_Name) + extension);
             var metaPath = texturePath + ".meta";
-            return File.Exists(metaPath) && TryReadGuid(metaPath, out guid);
+            if (File.Exists(metaPath) && TryReadGuid(metaPath, out guid))
+            {
+                return true;
+            }
+            guid = GenerateStableGuid(texture);
+            return true;
         }
 
         private static bool TryGetShaderGuid(string path, string shaderName, out string guid)
@@ -293,13 +298,39 @@ namespace AssetStudio
 
         public static void WriteTextureMetaIfMissing(string texturePath)
         {
+            WriteTextureMetaIfMissing(texturePath, null);
+        }
+
+        public static void WriteTextureMetaIfMissing(string texturePath, Object obj)
+        {
             var metaPath = texturePath + ".meta";
             if (File.Exists(metaPath))
             {
                 return;
             }
 
-            File.WriteAllText(metaPath, BuildTextureMeta(GenerateUnityGuid()), Encoding.UTF8);
+            File.WriteAllText(metaPath, BuildTextureMeta(GenerateStableGuid(obj)), Encoding.UTF8);
+        }
+
+        public static string GenerateStableGuid(Object obj)
+        {
+            if (obj == null)
+                return GenerateUnityGuid();
+
+            var fileName = obj.assetsFile?.fileName ?? "";
+            var name = "";
+            if (obj is NamedObject namedObj)
+            {
+                name = namedObj.m_Name;
+            }
+            var pathID = obj.m_PathID;
+
+            var input = $"{fileName}_{name}_{pathID}";
+            using (var md5 = MD5.Create())
+            {
+                var hash = md5.ComputeHash(Encoding.UTF8.GetBytes(input));
+                return string.Concat(hash.Select(x => x.ToString("x2")));
+            }
         }
 
         private static string GenerateUnityGuid()
@@ -948,7 +979,43 @@ TextureImporter:
                 }
             }
 
-            sb.AppendLine("  m_PPtrCurves: []");
+            if (clip.m_PPtrCurves == null || clip.m_PPtrCurves.Length == 0)
+            {
+                sb.AppendLine("  m_PPtrCurves: []");
+            }
+            else
+            {
+                sb.AppendLine("  m_PPtrCurves:");
+                foreach (var pptrCurve in clip.m_PPtrCurves)
+                {
+                    sb.AppendLine("  - serializedVersion: 2");
+                    sb.AppendLine("    curve:");
+                    if (pptrCurve.curve != null)
+                    {
+                        foreach (var kf in pptrCurve.curve)
+                        {
+                            sb.AppendLine("    - serializedVersion: 2");
+                            sb.AppendLine($"      time: {F(kf.time)}");
+                            
+                            string valStr = "{fileID: 0}";
+                            if (kf.value != null && !kf.value.IsNull)
+                            {
+                                if (kf.value.TryGet(out var targetObj))
+                                {
+                                    var fileID = (int)targetObj.type * 100000;
+                                    var targetGuid = GenerateStableGuid(targetObj);
+                                    valStr = $"{{fileID: {fileID}, guid: {targetGuid}, type: 3}}";
+                                }
+                            }
+                            sb.AppendLine($"      value: {valStr}");
+                        }
+                    }
+                    sb.AppendLine($"    attribute: {pptrCurve.attribute}");
+                    sb.AppendLine($"    path: {YamlString(pptrCurve.path)}");
+                    sb.AppendLine($"    classID: {pptrCurve.classID}");
+                    sb.AppendLine("    script: {fileID: 0}");
+                }
+            }
             sb.AppendLine($"  m_SampleRate: {F(clip.m_SampleRate)}");
             sb.AppendLine($"  m_WrapMode: {clip.m_WrapMode}");
 
@@ -959,7 +1026,8 @@ TextureImporter:
             sb.AppendLine($"    m_Extent: {{x: {F(boundsExtent.X)}, y: {F(boundsExtent.Y)}, z: {F(boundsExtent.Z)}}}");
 
             sb.AppendLine("  m_ClipBindingConstant:");
-            var totalBindings = posCurves.Count + rotCurves.Count + eulerCurves.Count + scaleCurves.Count + floatCurves.Count;
+            var pptrCurvesCount = clip.m_PPtrCurves?.Length ?? 0;
+            var totalBindings = posCurves.Count + rotCurves.Count + eulerCurves.Count + scaleCurves.Count + floatCurves.Count + pptrCurvesCount;
             if (totalBindings == 0)
             {
                 sb.AppendLine("    genericBindings: []");
@@ -1017,8 +1085,55 @@ TextureImporter:
                     sb.AppendLine("      customType: 0");
                     sb.AppendLine("      isPPtrCurve: 0");
                 }
+                if (clip.m_PPtrCurves != null)
+                {
+                    foreach (var pptrCurve in clip.m_PPtrCurves)
+                    {
+                        var pathHash = GetCrc(pptrCurve.path);
+                        var attrHash = GetCrc(pptrCurve.attribute);
+                        
+                        GenericBinding match = null;
+                        if (clip.m_ClipBindingConstant?.genericBindings != null)
+                        {
+                            match = clip.m_ClipBindingConstant.genericBindings.FirstOrDefault(b => b.path == pathHash && b.isPPtrCurve == 1);
+                        }
+                        
+                        var typeID = match != null ? (int)match.typeID : pptrCurve.classID;
+                        var customType = match != null ? match.customType : 0;
+                        var attribute = match != null ? match.attribute : attrHash;
+                        
+                        sb.AppendLine("    - serializedVersion: 2");
+                        sb.AppendLine($"      path: {pathHash}");
+                        sb.AppendLine($"      attribute: {attribute}");
+                        sb.AppendLine("      script: {fileID: 0}");
+                        sb.AppendLine($"      typeID: {typeID}");
+                        sb.AppendLine($"      customType: {customType}");
+                        sb.AppendLine("      isPPtrCurve: 1");
+                    }
+                }
             }
-            sb.AppendLine("    pptrCurveMapping: []");
+            if (clip.m_ClipBindingConstant?.pptrCurveMapping == null || clip.m_ClipBindingConstant.pptrCurveMapping.Length == 0)
+            {
+                sb.AppendLine("    pptrCurveMapping: []");
+            }
+            else
+            {
+                sb.AppendLine("    pptrCurveMapping:");
+                foreach (var pptr in clip.m_ClipBindingConstant.pptrCurveMapping)
+                {
+                    string valStr = "{fileID: 0}";
+                    if (pptr != null && !pptr.IsNull)
+                    {
+                        if (pptr.TryGet(out var targetObj))
+                        {
+                            var fileID = (int)targetObj.type * 100000;
+                            var targetGuid = GenerateStableGuid(targetObj);
+                            valStr = $"{{fileID: {fileID}, guid: {targetGuid}, type: 3}}";
+                        }
+                    }
+                    sb.AppendLine($"    - {valStr}");
+                }
+            }
 
             var startTime = clip.m_MuscleClip?.m_StartTime ?? 0f;
             var stopTime = clip.m_MuscleClip?.m_StopTime ?? 0f;

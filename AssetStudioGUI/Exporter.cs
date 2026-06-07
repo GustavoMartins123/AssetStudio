@@ -27,7 +27,7 @@ namespace AssetStudioGUI
                     {
                         image.WriteToStream(file, type);
                     }
-                    AssetExportHelper.WriteTextureMetaIfMissing(exportFullPath);
+                    AssetExportHelper.WriteTextureMetaIfMissing(exportFullPath, m_Texture2D);
                     return true;
                 }
             }
@@ -36,7 +36,7 @@ namespace AssetStudioGUI
                 if (!TryExportFile(exportPath, item, ".tex", out var exportFullPath))
                     return false;
                 File.WriteAllBytes(exportFullPath, m_Texture2D.image_data.GetData());
-                AssetExportHelper.WriteTextureMetaIfMissing(exportFullPath);
+                AssetExportHelper.WriteTextureMetaIfMissing(exportFullPath, m_Texture2D);
                 return true;
             }
         }
@@ -270,7 +270,8 @@ namespace AssetStudioGUI
             var type = Properties.Settings.Default.convertType;
             if (!TryExportFile(exportPath, item, "." + type.ToString().ToLower(), out var exportFullPath))
                 return false;
-            var image = ((Sprite)item.Asset).GetImage();
+            var sprite = (Sprite)item.Asset;
+            var image = sprite.GetImage();
             if (image != null)
             {
                 using (image)
@@ -279,6 +280,7 @@ namespace AssetStudioGUI
                     {
                         image.WriteToStream(file, type);
                     }
+                    AssetExportHelper.WriteTextureMetaIfMissing(exportFullPath, sprite);
                     return true;
                 }
             }

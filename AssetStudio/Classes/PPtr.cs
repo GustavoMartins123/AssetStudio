@@ -94,6 +94,11 @@ namespace AssetStudio
             return false;
         }
 
+        public void ResetCache()
+        {
+            index = -2;
+        }
+
         private bool TryGetObject<TObject>(SerializedFile sourceFile, out TObject result) where TObject : Object
         {
             lock (sourceFile)

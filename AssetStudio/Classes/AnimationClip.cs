@@ -312,6 +312,7 @@ namespace AssetStudio
         public float time;
         public PPtr<Object> value;
 
+        public PPtrKeyframe() { }
 
         public PPtrKeyframe(ObjectReader reader)
         {
@@ -328,6 +329,7 @@ namespace AssetStudio
         public int classID;
         public PPtr<MonoScript> script;
 
+        public PPtrCurve() { }
 
         public PPtrCurve(ObjectReader reader)
         {
@@ -1066,6 +1068,167 @@ namespace AssetStudio
             {
                 reader.AlignStream();
             }
+            ReconstructPPtrCurves();
+        }
+
+        public void ReconstructPPtrCurves()
+        {
+            if (m_ClipBindingConstant == null || m_MuscleClip == null || m_MuscleClip.m_Clip == null)
+            {
+                return;
+            }
+
+            // If m_PPtrCurves already has items, no need to reconstruct
+            if (m_PPtrCurves != null && m_PPtrCurves.Length > 0)
+            {
+                return;
+            }
+
+            var m_Clip = m_MuscleClip.m_Clip;
+            
+            // We want to find all generic bindings where isPPtrCurve == 1
+            // Let's create a dictionary to collect keyframes for each PPtr curve binding
+            var curveDict = new Dictionary<GenericBinding, List<PPtrKeyframe>>();
+
+            // Helper to add a keyframe
+            void AddPPtrKeyframe(int index, float time, float[] data, int offset, ref int curveIndex)
+            {
+                var binding = m_ClipBindingConstant.FindBinding(index);
+                if (binding == null)
+                {
+                    curveIndex++;
+                    return;
+                }
+
+                if (binding.isPPtrCurve == 1)
+                {
+                    if (!curveDict.TryGetValue(binding, out var list))
+                    {
+                        list = new List<PPtrKeyframe>();
+                        curveDict[binding] = list;
+                    }
+
+                    var val = data[curveIndex + offset];
+                    int pptrIndex = (int)Math.Round(val);
+                    if (m_ClipBindingConstant.pptrCurveMapping != null && pptrIndex >= 0 && pptrIndex < m_ClipBindingConstant.pptrCurveMapping.Length)
+                    {
+                        var pptr = m_ClipBindingConstant.pptrCurveMapping[pptrIndex];
+                        var kf = new PPtrKeyframe
+                        {
+                            time = time < 0f ? 0f : time,
+                            value = pptr
+                        };
+                        list.Add(kf);
+                    }
+                    curveIndex++;
+                }
+                else
+                {
+                    // Skip other curve types
+                    if (binding.typeID == ClassIDType.Transform)
+                    {
+                        switch (binding.attribute)
+                        {
+                            case 1: // Position
+                            case 3: // Scale
+                            case 4: // Euler
+                                curveIndex += 3;
+                                break;
+                            case 2: // Rotation
+                                curveIndex += 4;
+                                break;
+                            default:
+                                curveIndex += 1;
+                                break;
+                        }
+                    }
+                    else
+                    {
+                        curveIndex += 1;
+                    }
+                }
+            }
+
+            // Read StreamedClip
+            if (m_Clip.m_StreamedClip != null)
+            {
+                try
+                {
+                    var streamedFrames = m_Clip.m_StreamedClip.ReadData();
+                    for (int frameIndex = 0; frameIndex < streamedFrames.Count - 1; frameIndex++)
+                    {
+                        var frame = streamedFrames[frameIndex];
+                        var streamedValues = frame.keyList.Select(x => x.value).ToArray();
+                        for (int curveIndex = 0; curveIndex < frame.keyList.Length;)
+                        {
+                            AddPPtrKeyframe(frame.keyList[curveIndex].index, frame.time, streamedValues, 0, ref curveIndex);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore decoding errors
+                }
+            }
+
+            // Read DenseClip
+            if (m_Clip.m_DenseClip != null)
+            {
+                var m_DenseClip = m_Clip.m_DenseClip;
+                var streamCount = m_Clip.m_StreamedClip?.curveCount ?? 0;
+                for (int frameIndex = 0; frameIndex < m_DenseClip.m_FrameCount; frameIndex++)
+                {
+                    var time = m_DenseClip.m_BeginTime + frameIndex / m_DenseClip.m_SampleRate;
+                    var frameOffset = frameIndex * m_DenseClip.m_CurveCount;
+                    for (int curveIndex = 0; curveIndex < m_DenseClip.m_CurveCount;)
+                    {
+                        var index = streamCount + curveIndex;
+                        AddPPtrKeyframe((int)index, time, m_DenseClip.m_SampleArray, (int)frameOffset, ref curveIndex);
+                    }
+                }
+            }
+
+            // Read ConstantClip
+            if (m_Clip.m_ConstantClip != null)
+            {
+                var m_ConstantClip = m_Clip.m_ConstantClip;
+                var denseCount = m_Clip.m_DenseClip?.m_CurveCount ?? 0;
+                var streamCount = m_Clip.m_StreamedClip?.curveCount ?? 0;
+                var time2 = 0.0f;
+                for (int i = 0; i < 2; i++)
+                {
+                    for (int curveIndex = 0; curveIndex < m_ConstantClip.data.Length;)
+                    {
+                        var index = streamCount + denseCount + curveIndex;
+                        AddPPtrKeyframe((int)index, time2, m_ConstantClip.data, 0, ref curveIndex);
+                    }
+                    if (m_MuscleClip != null)
+                        time2 = m_MuscleClip.m_StopTime;
+                }
+            }
+
+            // Now construct m_PPtrCurves array
+            var pptrCurves = new List<PPtrCurve>();
+            foreach (var kvp in curveDict)
+            {
+                var binding = kvp.Key;
+                var keyframes = kvp.Value;
+
+                if (keyframes.Count > 0)
+                {
+                    var pptrCurve = new PPtrCurve
+                    {
+                        curve = keyframes.ToArray(),
+                        attribute = binding.attribute == 2015549526 ? "m_Sprite" : $"unknown_{binding.attribute}",
+                        path = binding.path == 0 ? "" : $"path_{binding.path}",
+                        classID = (int)binding.typeID,
+                        script = binding.script != null ? new PPtr<MonoScript>(binding.script.m_FileID, binding.script.m_PathID, assetsFile) : null
+                    };
+                    pptrCurves.Add(pptrCurve);
+                }
+            }
+
+            m_PPtrCurves = pptrCurves.ToArray();
         }
     }
 }
