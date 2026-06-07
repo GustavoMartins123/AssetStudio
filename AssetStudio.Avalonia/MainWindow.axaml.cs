@@ -2668,7 +2668,7 @@ public partial class MainWindow : Window
             PublishLazyConnectionProgress(folderPath, scanResult, "connections_completed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
             ViewModel.LoadingProgress = 100;
             StatusStripUpdate(
-                $"Connections complete. Edges: {relations.AssetEdges.Count:N0}, mesh materials: {relations.MeshMaterials.Count:N0}, material textures: {relations.MaterialTextures.Count:N0}.");
+                $"Connections complete. Model groups: {relations.ModelGroups.Count:N0}, group meshes: {relations.ModelGroupMeshes.Count:N0}, edges: {relations.AssetEdges.Count:N0}, mesh materials: {relations.MeshMaterials.Count:N0}, material textures: {relations.MaterialTextures.Count:N0}.");
         }
         catch (MemoryPressureException ex)
         {
@@ -2977,6 +2977,8 @@ public partial class MainWindow : Window
         public int RelationPasses { get; private set; }
         public int FailedSources { get; set; }
         public int AssetEdges { get; private set; }
+        public int ModelGroups { get; private set; }
+        public int ModelGroupMeshes { get; private set; }
         public int MeshRenderers { get; private set; }
         public int MeshMaterials { get; private set; }
         public int MaterialTextures { get; private set; }
@@ -3031,6 +3033,8 @@ public partial class MainWindow : Window
 
             RelationPasses++;
             AssetEdges += relations.AssetEdges.Count;
+            ModelGroups += relations.ModelGroups.Count;
+            ModelGroupMeshes += relations.ModelGroupMeshes.Count;
             MeshRenderers += relations.MeshRenderers.Count;
             MeshMaterials += relations.MeshMaterials.Count;
             MaterialTextures += relations.MaterialTextures.Count;
@@ -3040,6 +3044,7 @@ public partial class MainWindow : Window
         {
             return $"sources {totalSources:N0}, matched {SourcesWithLoadedFiles:N0}, no files {SourcesWithoutLoadedFiles:N0}, " +
                 $"handles {CandidateHandles:N0}, objects {ResolvedObjects:N0}, " +
+                $"model-groups {relations.ModelGroups.Count:N0}, group-meshes {relations.ModelGroupMeshes.Count:N0}, " +
                 $"mesh-material {relations.MeshMaterials.Count:N0}, material-texture {relations.MaterialTextures.Count:N0}, edges {relations.AssetEdges.Count:N0}";
         }
 
@@ -5583,10 +5588,111 @@ public partial class MainWindow : Window
         return _sqliteCache.LoadAvatarMeshAssetIdsByAvatarIds(folderPath, signature, avatarIds);
     }
 
+    private Dictionary<string, List<ModelGroupInfo>> LoadModelGroupsByAvatarIdsForPreview(IReadOnlyList<string> avatarIds)
+    {
+        var result = new Dictionary<string, List<ModelGroupInfo>>(StringComparer.Ordinal);
+        if (!assetsManager.LazyLoading || currentScanResult == null || avatarIds.Count == 0)
+        {
+            return result;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return result;
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        foreach (var avatarId in avatarIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal))
+        {
+            var groups = _sqliteCache.LoadModelGroupsForAvatarAssetId(folderPath, signature, avatarId);
+            if (groups.Count > 0)
+            {
+                result[avatarId] = groups;
+            }
+        }
+
+        return result;
+    }
+
+    private List<ModelGroupMeshInfo> LoadModelGroupMeshesForPreview(string groupId)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || string.IsNullOrWhiteSpace(groupId))
+        {
+            return new List<ModelGroupMeshInfo>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<ModelGroupMeshInfo>();
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadModelGroupMeshes(folderPath, signature, groupId);
+    }
+
+    private static ModelGroupMeshInfo? SelectRepresentativeModelGroupMesh(IReadOnlyList<ModelGroupMeshInfo> meshes)
+    {
+        return meshes
+            .Where(mesh => !string.IsNullOrWhiteSpace(mesh.MeshAssetId))
+            .OrderByDescending(mesh => mesh.Confidence)
+            .ThenByDescending(mesh => mesh.MeshByteSize)
+            .ThenBy(mesh => mesh.SlotIndex)
+            .FirstOrDefault();
+    }
+
     private List<PreviewCandidateItem> BuildAvatarPreviewCandidates(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null)
     {
         var candidates = new List<PreviewCandidateItem>();
         var seenMeshIds = new HashSet<string>(StringComparer.Ordinal);
+        var seenModelGroupIds = new HashSet<string>(StringComparer.Ordinal);
+        var avatarId = GetPreviewObjectKey(avatar);
+
+        void AddModelGroup(ModelGroupInfo group, IReadOnlyList<ModelGroupMeshInfo> groupMeshes, string source)
+        {
+            if (string.IsNullOrWhiteSpace(group.GroupId) || !seenModelGroupIds.Add(group.GroupId))
+            {
+                return;
+            }
+
+            var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+            if (representative == null)
+            {
+                return;
+            }
+
+            var meshIds = groupMeshes
+                .Select(mesh => mesh.MeshAssetId)
+                .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var displayName = !string.IsNullOrWhiteSpace(group.GroupName)
+                ? group.GroupName
+                : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                    ? group.RootGameObjectName
+                    : GetPreviewHandleName(representative.MeshAssetId, "Model");
+            var representativeName = !string.IsNullOrWhiteSpace(representative.MeshName)
+                ? representative.MeshName
+                : GetPreviewHandleName(representative.MeshAssetId, "Mesh");
+            var pathId = representative.MeshPathId != 0
+                ? representative.MeshPathId.ToString(CultureInfo.InvariantCulture)
+                : assetsManager.ProjectIndex.GetHandle(representative.MeshAssetId)?.PathID.ToString(CultureInfo.InvariantCulture) ?? "?";
+
+            seenMeshIds.Add(representative.MeshAssetId);
+            candidates.Add(new PreviewCandidateItem
+            {
+                Avatar = avatar,
+                MeshId = representative.MeshAssetId,
+                AvatarId = avatarId,
+                ModelGroupId = group.GroupId,
+                ModelGroupName = displayName,
+                ModelGroupMeshIds = meshIds,
+                ModelGroupMeshCount = meshIds.Length,
+                ModelGroupConfidence = group.Confidence,
+                Label = $"{source}: {displayName} ({meshIds.Length:N0} parts) -> {representativeName} (Mesh PathID: {pathId})"
+            });
+        }
 
         void AddMesh(Mesh? mesh, string? meshId, string source, string? name = null)
         {
@@ -5612,6 +5718,14 @@ public partial class MainWindow : Window
         }
 
         AddMesh(preferredMesh, preferredMeshId, "Selected");
+
+        if (!string.IsNullOrWhiteSpace(avatarId))
+        {
+            foreach (var group in LoadModelGroupsByAvatarIdsForPreview(new[] { avatarId }).GetValueOrDefault(avatarId) ?? new List<ModelGroupInfo>())
+            {
+                AddModelGroup(group, LoadModelGroupMeshesForPreview(group.GroupId), "Model group");
+            }
+        }
 
         if (avatarMeshCache != null && avatarMeshCache.TryGetValue(avatar, out var cachedMesh))
         {
@@ -5673,13 +5787,21 @@ public partial class MainWindow : Window
         return null;
     }
 
-    private void PreviewAvatar(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null)
+    private void PreviewAvatar(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null, PreviewCandidateItem? selectedCandidateOverride = null)
     {
         currentPreviewAvatar = avatar;
         var avatarCandidates = BuildAvatarPreviewCandidates(avatar, preferredMesh, preferredMeshId);
         Mesh? avatarMesh = SelectAvatarPreviewMesh(avatarCandidates, preferredMesh, preferredMeshId);
         var selectedMeshId = GetPreviewObjectKey(avatarMesh);
-        var selectedCandidate = avatarCandidates.FirstOrDefault(x =>
+        var selectedCandidate = selectedCandidateOverride == null
+            ? null
+            : avatarCandidates.FirstOrDefault(x =>
+                (!string.IsNullOrWhiteSpace(selectedCandidateOverride.ModelGroupId)
+                    && string.Equals(x.ModelGroupId, selectedCandidateOverride.ModelGroupId, StringComparison.Ordinal))
+                || (!string.IsNullOrWhiteSpace(selectedCandidateOverride.MeshId)
+                    && string.Equals(x.MeshId, selectedCandidateOverride.MeshId, StringComparison.Ordinal))
+                || AreSamePreviewObject(x.Mesh, selectedCandidateOverride.Mesh));
+        selectedCandidate ??= avatarCandidates.FirstOrDefault(x =>
             AreSamePreviewObject(x.Mesh, avatarMesh)
             || (!string.IsNullOrWhiteSpace(x.MeshId)
                 && !string.IsNullOrWhiteSpace(selectedMeshId)
@@ -6137,19 +6259,26 @@ public partial class MainWindow : Window
             string? meshId,
             string source,
             string? avatarName = null,
-            string? meshName = null)
+            string? meshName = null,
+            string? modelGroupId = null,
+            string? modelGroupName = null,
+            IReadOnlyList<string>? modelGroupMeshIds = null,
+            int modelGroupConfidence = 0)
         {
             avatarId = !string.IsNullOrWhiteSpace(avatarId) ? avatarId : GetPreviewObjectKey(avatar);
             meshId = !string.IsNullOrWhiteSpace(meshId) ? meshId : GetPreviewObjectKey(mesh);
             if (avatar == null
                 && mesh == null
                 && string.IsNullOrWhiteSpace(avatarId)
-                && string.IsNullOrWhiteSpace(meshId))
+                && string.IsNullOrWhiteSpace(meshId)
+                && string.IsNullOrWhiteSpace(modelGroupId))
             {
                 return;
             }
 
-            var key = $"{avatarId}|{meshId}";
+            var key = !string.IsNullOrWhiteSpace(modelGroupId)
+                ? $"group:{modelGroupId}|{avatarId}|{meshId}"
+                : $"{avatarId}|{meshId}";
             if (!seen.Add(key))
             {
                 return;
@@ -6170,11 +6299,19 @@ public partial class MainWindow : Window
                         ? GetPreviewHandleName(meshId!, "Mesh")
                         : string.Empty;
 
-            var label = !string.IsNullOrWhiteSpace(avatarName) && !string.IsNullOrWhiteSpace(meshName)
+            var modelGroupPartCount = modelGroupMeshIds?.Count ?? 0;
+            var label = !string.IsNullOrWhiteSpace(modelGroupId)
+                ? $"{source}: {(!string.IsNullOrWhiteSpace(modelGroupName) ? modelGroupName : "Model")} ({modelGroupPartCount:N0} parts)"
+                : !string.IsNullOrWhiteSpace(avatarName) && !string.IsNullOrWhiteSpace(meshName)
                 ? $"{source}: {avatarName} -> {meshName}"
                 : !string.IsNullOrWhiteSpace(avatarName)
                     ? $"{source}: {avatarName}"
                     : $"{source}: {meshName}";
+
+            if (!string.IsNullOrWhiteSpace(modelGroupId) && !string.IsNullOrWhiteSpace(meshName))
+            {
+                label += $" -> {meshName}";
+            }
 
             if (mesh != null)
             {
@@ -6200,6 +6337,11 @@ public partial class MainWindow : Window
                 Mesh = mesh,
                 AvatarId = avatarId ?? string.Empty,
                 MeshId = meshId ?? string.Empty,
+                ModelGroupId = modelGroupId ?? string.Empty,
+                ModelGroupName = modelGroupName ?? string.Empty,
+                ModelGroupMeshIds = modelGroupMeshIds ?? Array.Empty<string>(),
+                ModelGroupMeshCount = modelGroupMeshIds?.Count ?? 0,
+                ModelGroupConfidence = modelGroupConfidence,
                 Label = label
             });
         }
@@ -6248,11 +6390,68 @@ public partial class MainWindow : Window
         {
             var avatarIds = LoadAnimationClipAvatarAssetIdsForPreview(clip);
             var avatarMeshIdsByAvatarId = LoadAvatarMeshAssetIdsByAvatarIdsForPreview(avatarIds);
+            var modelGroupsByAvatarId = LoadModelGroupsByAvatarIdsForPreview(avatarIds);
             var avatarIdsCoveredByMesh = new HashSet<string>(StringComparer.Ordinal);
+            var avatarIdsCoveredByModelGroup = new HashSet<string>(StringComparer.Ordinal);
             var meshIdsCoveredByAvatar = new HashSet<string>(StringComparer.Ordinal);
+            var meshIdsCoveredByModelGroup = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var avatarId in avatarIds)
             {
+                if (modelGroupsByAvatarId.TryGetValue(avatarId, out var modelGroups) && modelGroups.Count > 0)
+                {
+                    foreach (var group in modelGroups)
+                    {
+                        var groupMeshes = LoadModelGroupMeshesForPreview(group.GroupId);
+                        var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+                        if (representative == null)
+                        {
+                            continue;
+                        }
+
+                        var meshIds = groupMeshes
+                            .Select(mesh => mesh.MeshAssetId)
+                            .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
+                            .Distinct(StringComparer.Ordinal)
+                            .ToArray();
+                        foreach (var meshId in meshIds)
+                        {
+                            meshIdsCoveredByModelGroup.Add(meshId);
+                        }
+
+                        avatarIdsCoveredByModelGroup.Add(avatarId);
+                        avatarIdsCoveredByMesh.Add(avatarId);
+                        meshIdsCoveredByAvatar.Add(representative.MeshAssetId);
+
+                        var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+                            ? group.GroupName
+                            : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                                ? group.RootGameObjectName
+                                : GetPreviewHandleName(representative.MeshAssetId, "Model");
+                        var meshName = !string.IsNullOrWhiteSpace(representative.MeshName)
+                            ? representative.MeshName
+                            : GetPreviewHandleName(representative.MeshAssetId, "Mesh");
+
+                        AddCandidate(
+                            null,
+                            null,
+                            avatarId,
+                            representative.MeshAssetId,
+                            "Model group",
+                            GetPreviewHandleName(avatarId, "Avatar"),
+                            meshName,
+                            group.GroupId,
+                            groupName,
+                            meshIds,
+                            group.Confidence);
+                    }
+
+                    if (avatarIdsCoveredByModelGroup.Contains(avatarId))
+                    {
+                        continue;
+                    }
+                }
+
                 if (avatarMeshIdsByAvatarId.TryGetValue(avatarId, out var avatarMeshIds) && avatarMeshIds.Count > 0)
                 {
                     foreach (var meshId in avatarMeshIds)
@@ -6282,7 +6481,7 @@ public partial class MainWindow : Window
 
             foreach (var meshId in LoadAnimationClipMeshAssetIdsForPreview(clip))
             {
-                if (meshIdsCoveredByAvatar.Contains(meshId))
+                if (meshIdsCoveredByAvatar.Contains(meshId) || meshIdsCoveredByModelGroup.Contains(meshId))
                 {
                     continue;
                 }
@@ -6296,11 +6495,18 @@ public partial class MainWindow : Window
                     (string.IsNullOrWhiteSpace(candidate.AvatarId)
                         && candidate.Avatar == null
                         && !string.IsNullOrWhiteSpace(candidate.MeshId)
-                        && meshIdsCoveredByAvatar.Contains(candidate.MeshId))
+                        && (meshIdsCoveredByAvatar.Contains(candidate.MeshId)
+                            || meshIdsCoveredByModelGroup.Contains(candidate.MeshId)))
                     || (!string.IsNullOrWhiteSpace(candidate.AvatarId)
                         && candidate.Mesh == null
                         && string.IsNullOrWhiteSpace(candidate.MeshId)
-                        && avatarIdsCoveredByMesh.Contains(candidate.AvatarId)));
+                        && avatarIdsCoveredByMesh.Contains(candidate.AvatarId))
+                    || (!string.IsNullOrWhiteSpace(candidate.AvatarId)
+                        && candidate.Mesh == null
+                        && !string.IsNullOrWhiteSpace(candidate.MeshId)
+                        && !candidate.IsModelGroup
+                        && avatarIdsCoveredByModelGroup.Contains(candidate.AvatarId)
+                        && meshIdsCoveredByModelGroup.Contains(candidate.MeshId)));
             }
         }
         else
@@ -6359,6 +6565,14 @@ public partial class MainWindow : Window
 
         if (assetsManager.LazyLoading)
         {
+            var lazyModelGroup = candidates.FirstOrDefault(candidate =>
+                candidate.IsModelGroup
+                && (!string.IsNullOrWhiteSpace(candidate.MeshId) || candidate.Mesh != null));
+            if (lazyModelGroup != null)
+            {
+                return lazyModelGroup;
+            }
+
             var lazyAvatar = candidates.FirstOrDefault(candidate =>
                 candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
                 && candidate.Mesh != null);
@@ -6382,7 +6596,7 @@ public partial class MainWindow : Window
             ?? candidates.FirstOrDefault();
     }
 
-    private PreviewCandidateItem? ResolveAnimationClipPreviewCandidate(PreviewCandidateItem? candidate)
+    private PreviewCandidateItem? ResolveAnimationClipPreviewCandidate(PreviewCandidateItem? candidate, bool cacheRelation = true)
     {
         if (candidate == null)
         {
@@ -6406,7 +6620,7 @@ public partial class MainWindow : Window
             mesh = ResolveFirstMeshForAvatar(avatar);
         }
 
-        if (avatar != null && mesh != null)
+        if (cacheRelation && avatar != null && mesh != null)
         {
             CacheAvatarMeshRelation(avatar, mesh);
         }
@@ -6418,6 +6632,11 @@ public partial class MainWindow : Window
             Mesh = mesh,
             AvatarId = !string.IsNullOrWhiteSpace(candidate.AvatarId) ? candidate.AvatarId : GetPreviewObjectKey(avatar),
             MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
+            ModelGroupId = candidate.ModelGroupId,
+            ModelGroupName = candidate.ModelGroupName,
+            ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+            ModelGroupMeshCount = candidate.ModelGroupMeshCount,
+            ModelGroupConfidence = candidate.ModelGroupConfidence,
             Label = candidate.Label
         };
     }
@@ -6428,18 +6647,23 @@ public partial class MainWindow : Window
         Mesh? preferredMesh = null,
         string? preferredAvatarId = null,
         string? preferredMeshId = null,
-        bool rebuildCandidateControls = true)
+        bool rebuildCandidateControls = true,
+        PreviewCandidateItem? selectedCandidate = null)
     {
-        PreviewCandidateItem? selectedCandidate;
+        PreviewCandidateItem? activeCandidate;
         if (rebuildCandidateControls)
         {
             var previewCandidates = BuildAnimationClipPreviewCandidates(clip, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
-            selectedCandidate = SelectAnimationClipPreviewCandidate(clip, previewCandidates, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
-            BuildPreviewCandidateControls(previewCandidates, selectedCandidate, "Animation Target");
+            activeCandidate = SelectAnimationClipPreviewCandidate(clip, previewCandidates, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
+            BuildPreviewCandidateControls(previewCandidates, activeCandidate, "Animation Target");
+        }
+        else if (selectedCandidate != null)
+        {
+            activeCandidate = selectedCandidate;
         }
         else
         {
-            selectedCandidate = new PreviewCandidateItem
+            activeCandidate = new PreviewCandidateItem
             {
                 AnimationClip = clip,
                 Avatar = preferredAvatar,
@@ -6449,7 +6673,7 @@ public partial class MainWindow : Window
             };
         }
 
-        var resolvedCandidate = ResolveAnimationClipPreviewCandidate(selectedCandidate);
+        var resolvedCandidate = ResolveAnimationClipPreviewCandidate(activeCandidate);
         Avatar? avatar = resolvedCandidate?.Avatar;
         Mesh? avatarMesh = resolvedCandidate?.Mesh;
 
@@ -7270,7 +7494,10 @@ public partial class MainWindow : Window
                 AnimFrameLabel.Text = $"Frame: 0/{frameCount}";
             }
 
-            StatusStripUpdate($"Animation Preview | Clip: {clip.m_Name} | Frames: {frameCount} | FPS: {sampleRate} | Tracks: {posTracks.Count + rotTracks.Count + scaleTracks.Count}");
+            var targetStatus = resolvedCandidate?.IsModelGroup == true
+                ? $" | Model group: {(!string.IsNullOrWhiteSpace(resolvedCandidate.ModelGroupName) ? resolvedCandidate.ModelGroupName : resolvedCandidate.ModelGroupId)} ({resolvedCandidate.ModelGroupMeshCount:N0} parts) | Representative mesh: {avatarMesh.m_Name}"
+                : $" | Mesh: {avatarMesh.m_Name}";
+            StatusStripUpdate($"Animation Preview | Clip: {clip.m_Name}{targetStatus} | Frames: {frameCount} | FPS: {sampleRate} | Tracks: {posTracks.Count + rotTracks.Count + scaleTracks.Count}");
         }
     }
 

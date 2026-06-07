@@ -6,12 +6,16 @@ internal sealed class SemanticAssetRelations
 {
     public List<SemanticSourceFileEntry> SourceFiles { get; } = new();
     public List<SemanticAssetEdgeRelation> AssetEdges { get; } = new();
+    public List<SemanticModelGroupRelation> ModelGroups { get; } = new();
+    public List<SemanticModelGroupMeshRelation> ModelGroupMeshes { get; } = new();
     public List<SemanticMeshRendererRelation> MeshRenderers { get; } = new();
     public List<SemanticMeshMaterialRelation> MeshMaterials { get; } = new();
     public List<SemanticMaterialTextureRelation> MaterialTextures { get; } = new();
 
     public bool HasRelations =>
         AssetEdges.Count > 0 ||
+        ModelGroups.Count > 0 ||
+        ModelGroupMeshes.Count > 0 ||
         MeshRenderers.Count > 0 ||
         MeshMaterials.Count > 0 ||
         MaterialTextures.Count > 0;
@@ -30,6 +34,8 @@ internal sealed class SemanticAssetRelations
 
         SourceFiles.AddRange(other.SourceFiles);
         AssetEdges.AddRange(other.AssetEdges);
+        ModelGroups.AddRange(other.ModelGroups);
+        ModelGroupMeshes.AddRange(other.ModelGroupMeshes);
         MeshRenderers.AddRange(other.MeshRenderers);
         MeshMaterials.AddRange(other.MeshMaterials);
         MaterialTextures.AddRange(other.MaterialTextures);
@@ -72,6 +78,82 @@ internal sealed class SemanticAssetEdgeRelation
     public int TargetFileId { get; }
     public long TargetPathId { get; }
     public bool IsResolved { get; }
+}
+
+internal sealed class SemanticModelGroupRelation
+{
+    public SemanticModelGroupRelation(
+        string groupId,
+        string groupKind,
+        string groupName,
+        string rootGameObjectAssetId,
+        string rootGameObjectName,
+        string animatorAssetId,
+        string avatarAssetId,
+        string controllerAssetId,
+        string sourceFileName,
+        int confidence,
+        string confidenceReason)
+    {
+        GroupId = groupId;
+        GroupKind = groupKind;
+        GroupName = groupName;
+        RootGameObjectAssetId = rootGameObjectAssetId;
+        RootGameObjectName = rootGameObjectName;
+        AnimatorAssetId = animatorAssetId;
+        AvatarAssetId = avatarAssetId;
+        ControllerAssetId = controllerAssetId;
+        SourceFileName = sourceFileName;
+        Confidence = confidence;
+        ConfidenceReason = confidenceReason;
+    }
+
+    public string GroupId { get; }
+    public string GroupKind { get; }
+    public string GroupName { get; }
+    public string RootGameObjectAssetId { get; }
+    public string RootGameObjectName { get; }
+    public string AnimatorAssetId { get; }
+    public string AvatarAssetId { get; }
+    public string ControllerAssetId { get; }
+    public string SourceFileName { get; }
+    public int Confidence { get; }
+    public string ConfidenceReason { get; }
+}
+
+internal sealed class SemanticModelGroupMeshRelation
+{
+    public SemanticModelGroupMeshRelation(
+        string groupId,
+        string meshAssetId,
+        string rendererAssetId,
+        string rendererType,
+        string gameObjectAssetId,
+        string gameObjectName,
+        int slotIndex,
+        int confidence,
+        string confidenceReason)
+    {
+        GroupId = groupId;
+        MeshAssetId = meshAssetId;
+        RendererAssetId = rendererAssetId;
+        RendererType = rendererType;
+        GameObjectAssetId = gameObjectAssetId;
+        GameObjectName = gameObjectName;
+        SlotIndex = slotIndex;
+        Confidence = confidence;
+        ConfidenceReason = confidenceReason;
+    }
+
+    public string GroupId { get; }
+    public string MeshAssetId { get; }
+    public string RendererAssetId { get; }
+    public string RendererType { get; }
+    public string GameObjectAssetId { get; }
+    public string GameObjectName { get; }
+    public int SlotIndex { get; }
+    public int Confidence { get; }
+    public string ConfidenceReason { get; }
 }
 
 internal sealed class SemanticSourceFileEntry

@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
@@ -23,6 +24,8 @@ public partial class MainWindow : Window
     private bool updatingMeshMaterialControls;
     private bool updatingPreviewCandidateControls;
     private long previewCandidateListVersion;
+    private long previewCandidateSelectionVersion;
+    private CancellationTokenSource? previewCandidateSelectionCts;
     private const int PreviewCandidateInitialBatchSize = 64;
     private const int PreviewCandidateAppendBatchSize = 128;
 
@@ -46,7 +49,14 @@ public partial class MainWindow : Window
         public AssetStudio.Mesh? Mesh { get; init; }
         public string AvatarId { get; init; } = string.Empty;
         public string MeshId { get; init; } = string.Empty;
+        public string ModelGroupId { get; init; } = string.Empty;
+        public string ModelGroupName { get; init; } = string.Empty;
+        public IReadOnlyList<string> ModelGroupMeshIds { get; init; } = Array.Empty<string>();
+        public int ModelGroupMeshCount { get; init; }
+        public int ModelGroupConfidence { get; init; }
         public string Label { get; init; } = string.Empty;
+
+        public bool IsModelGroup => !string.IsNullOrWhiteSpace(ModelGroupId);
 
         public override string ToString()
         {
@@ -193,6 +203,8 @@ public partial class MainWindow : Window
     private void ClearPreviewCandidateControls()
     {
         previewCandidateListVersion++;
+        previewCandidateSelectionVersion++;
+        previewCandidateSelectionCts?.Cancel();
         updatingPreviewCandidateControls = true;
         try
         {
@@ -317,11 +329,117 @@ public partial class MainWindow : Window
 
         if (candidate.AnimationClip != null)
         {
-            PreviewAnimationClip(candidate.AnimationClip, candidate.Avatar, candidate.Mesh, candidate.AvatarId, candidate.MeshId, rebuildCandidateControls: false);
+            QueuePreviewCandidateSelection(candidate);
         }
         else if (candidate.Avatar != null)
         {
-            PreviewAvatar(candidate.Avatar, candidate.Mesh, candidate.MeshId);
+            QueuePreviewCandidateSelection(candidate);
+        }
+    }
+
+    private void QueuePreviewCandidateSelection(PreviewCandidateItem candidate)
+    {
+        previewCandidateSelectionCts?.Cancel();
+        previewCandidateSelectionCts?.Dispose();
+        previewCandidateSelectionCts = new CancellationTokenSource();
+        var token = previewCandidateSelectionCts.Token;
+        var version = ++previewCandidateSelectionVersion;
+
+        StatusStripUpdate(candidate.AnimationClip != null
+            ? "Preparing animation target..."
+            : "Preparing avatar target...");
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(10, token);
+                var preparedCandidate = PreparePreviewCandidateSelection(candidate, token);
+                token.ThrowIfCancellationRequested();
+
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    if (token.IsCancellationRequested || version != previewCandidateSelectionVersion)
+                    {
+                        return;
+                    }
+
+                    ApplyPreparedPreviewCandidateSelection(preparedCandidate);
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Preview candidate selection failed: {ex}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (version == previewCandidateSelectionVersion)
+                    {
+                        StatusStripUpdate($"Preview target error: {ex.Message}");
+                    }
+                });
+            }
+        }, token);
+    }
+
+    private PreviewCandidateItem PreparePreviewCandidateSelection(PreviewCandidateItem candidate, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
+        if (candidate.AnimationClip != null)
+        {
+            var resolvedCandidate = ResolveAnimationClipPreviewCandidate(candidate, cacheRelation: false) ?? candidate;
+            token.ThrowIfCancellationRequested();
+            resolvedCandidate.Mesh?.EnsureProcessed();
+            return resolvedCandidate;
+        }
+
+        if (candidate.Avatar != null)
+        {
+            var mesh = candidate.Mesh;
+            if (mesh == null && !string.IsNullOrWhiteSpace(candidate.MeshId))
+            {
+                mesh = ResolveMeshPreviewCandidate(candidate.MeshId);
+            }
+
+            token.ThrowIfCancellationRequested();
+            mesh?.EnsureProcessed();
+            return new PreviewCandidateItem
+            {
+                Avatar = candidate.Avatar,
+                Mesh = mesh,
+                AvatarId = candidate.AvatarId,
+                MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
+                ModelGroupId = candidate.ModelGroupId,
+                ModelGroupName = candidate.ModelGroupName,
+                ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+                ModelGroupMeshCount = candidate.ModelGroupMeshCount,
+                ModelGroupConfidence = candidate.ModelGroupConfidence,
+                Label = candidate.Label
+            };
+        }
+
+        return candidate;
+    }
+
+    private void ApplyPreparedPreviewCandidateSelection(PreviewCandidateItem candidate)
+    {
+        if (candidate.AnimationClip != null)
+        {
+            PreviewAnimationClip(
+                candidate.AnimationClip,
+                candidate.Avatar,
+                candidate.Mesh,
+                candidate.AvatarId,
+                candidate.MeshId,
+                rebuildCandidateControls: false,
+                selectedCandidate: candidate);
+        }
+        else if (candidate.Avatar != null)
+        {
+            PreviewAvatar(candidate.Avatar, candidate.Mesh, candidate.MeshId, candidate);
         }
     }
 

@@ -1255,10 +1255,34 @@ namespace AssetStudio.Avalonia
             }
 
             var animatorGameObject = ResolveGameObjectBackground(sourceFile, animator.m_GameObject);
+            var animatorId = GetSemanticAssetId(animator);
+            var rootGameObjectId = animatorGameObject != null
+                ? GetSemanticGameObjectId(sourceFile, animator.m_GameObject, animatorGameObject)
+                : string.Empty;
+            var controller = ResolveRuntimeAnimatorControllerBackground(sourceFile, animator.m_Controller);
+            var controllerId = GetSemanticAssetId(controller);
+            if (string.IsNullOrEmpty(controllerId) && animator.m_Controller != null && !animator.m_Controller.IsNull)
+            {
+                controllerId = GetSemanticAssetIdFromPPtr(sourceFile, animator.m_Controller, ClassIDType.RuntimeAnimatorController);
+            }
+
+            var meshMatches = FindSkinnedMeshesForAnimator(sourceFile, animatorGameObject, skinnedMeshBindings, animatorCount).ToList();
+            AddAnimatorModelGroupRelations(
+                sourceFile,
+                relations,
+                animator,
+                animatorId,
+                animatorGameObject,
+                rootGameObjectId,
+                avatarId,
+                controllerId,
+                meshMatches);
+
             var meshSlotIndex = 0;
             var seenMeshes = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var binding in FindSkinnedMeshesForAnimator(sourceFile, animatorGameObject, skinnedMeshBindings, animatorCount))
+            foreach (var match in meshMatches)
             {
+                var binding = match.Binding;
                 if (string.IsNullOrEmpty(binding.MeshId) || !seenMeshes.Add(binding.MeshId))
                 {
                     continue;
@@ -1293,7 +1317,6 @@ namespace AssetStudio.Avalonia
                 meshSlotIndex++;
             }
 
-            var controller = ResolveRuntimeAnimatorControllerBackground(sourceFile, animator.m_Controller);
             if (controller != null)
             {
                 AddAnimatorControllerClipRelations(
@@ -1308,7 +1331,112 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static IEnumerable<SkinnedMeshSemanticBinding> FindSkinnedMeshesForAnimator(
+        private static void AddAnimatorModelGroupRelations(
+            SerializedFile sourceFile,
+            SemanticAssetRelations relations,
+            Animator animator,
+            string animatorId,
+            GameObject? animatorGameObject,
+            string rootGameObjectId,
+            string avatarId,
+            string controllerId,
+            IReadOnlyList<SkinnedMeshSemanticMatch> meshMatches)
+        {
+            if (meshMatches.Count == 0)
+            {
+                return;
+            }
+
+            var groupId = BuildAnimatorModelGroupId(sourceFile, animator, animatorId, rootGameObjectId, avatarId, controllerId);
+            if (string.IsNullOrEmpty(groupId))
+            {
+                return;
+            }
+
+            var groupName = !string.IsNullOrWhiteSpace(animatorGameObject?.m_Name)
+                ? animatorGameObject!.m_Name
+                : "Animator Model";
+            var confidence = meshMatches.Min(match => match.Confidence);
+            var confidenceReason = meshMatches.All(match => match.ConfidenceReason == meshMatches[0].ConfidenceReason)
+                ? meshMatches[0].ConfidenceReason
+                : "Mixed animator mesh evidence";
+
+            relations.ModelGroups.Add(new SemanticModelGroupRelation(
+                groupId,
+                "Animator",
+                groupName,
+                rootGameObjectId,
+                animatorGameObject?.m_Name ?? string.Empty,
+                animatorId,
+                avatarId,
+                controllerId,
+                sourceFile.fileName ?? string.Empty,
+                confidence,
+                confidenceReason));
+
+            var slotIndex = 0;
+            var seenParts = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var match in meshMatches)
+            {
+                var binding = match.Binding;
+                var rendererId = GetSemanticAssetId(binding.Renderer);
+                if (string.IsNullOrEmpty(binding.MeshId) || string.IsNullOrEmpty(rendererId))
+                {
+                    continue;
+                }
+
+                var partKey = $"{binding.MeshId}\u001f{rendererId}";
+                if (!seenParts.Add(partKey))
+                {
+                    continue;
+                }
+
+                var gameObjectId = binding.GameObject != null
+                    ? GetSemanticAssetId(binding.GameObject)
+                    : string.Empty;
+                relations.ModelGroupMeshes.Add(new SemanticModelGroupMeshRelation(
+                    groupId,
+                    binding.MeshId,
+                    rendererId,
+                    "SkinnedMeshRenderer",
+                    gameObjectId,
+                    binding.GameObject?.m_Name ?? string.Empty,
+                    slotIndex,
+                    match.Confidence,
+                    match.ConfidenceReason));
+                slotIndex++;
+            }
+        }
+
+        private static string BuildAnimatorModelGroupId(
+            SerializedFile sourceFile,
+            Animator animator,
+            string animatorId,
+            string rootGameObjectId,
+            string avatarId,
+            string controllerId)
+        {
+            if (!string.IsNullOrEmpty(animatorId))
+            {
+                return $"modelgroup:animator:{animatorId}";
+            }
+
+            if (!string.IsNullOrEmpty(rootGameObjectId))
+            {
+                return $"modelgroup:root:{rootGameObjectId}";
+            }
+
+            var fallbackId = !string.IsNullOrEmpty(avatarId)
+                ? avatarId
+                : !string.IsNullOrEmpty(controllerId)
+                    ? controllerId
+                    : sourceFile.fileName ?? string.Empty;
+            return string.IsNullOrEmpty(fallbackId)
+                ? string.Empty
+                : $"modelgroup:fallback:{fallbackId}:{animator.m_PathID}";
+        }
+
+        private static IEnumerable<SkinnedMeshSemanticMatch> FindSkinnedMeshesForAnimator(
             SerializedFile sourceFile,
             GameObject? animatorGameObject,
             List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
@@ -1328,7 +1456,7 @@ namespace AssetStudio.Avalonia
                         && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
                     {
                         matchedAny = true;
-                        yield return binding;
+                        yield return new SkinnedMeshSemanticMatch(binding, 100, "Animator hierarchy descendant");
                     }
                 }
 
@@ -1342,7 +1470,7 @@ namespace AssetStudio.Avalonia
             {
                 foreach (var binding in skinnedMeshBindings)
                 {
-                    yield return binding;
+                    yield return new SkinnedMeshSemanticMatch(binding, 20, "Single animator file fallback");
                 }
             }
         }
@@ -1848,6 +1976,20 @@ namespace AssetStudio.Avalonia
             public GameObject? GameObject { get; }
             public int MeshFileId { get; }
             public long MeshPathId { get; }
+        }
+
+        private readonly struct SkinnedMeshSemanticMatch
+        {
+            public SkinnedMeshSemanticMatch(SkinnedMeshSemanticBinding binding, int confidence, string confidenceReason)
+            {
+                Binding = binding;
+                Confidence = confidence;
+                ConfidenceReason = confidenceReason;
+            }
+
+            public SkinnedMeshSemanticBinding Binding { get; }
+            public int Confidence { get; }
+            public string ConfidenceReason { get; }
         }
 
         private readonly struct ResolvedRendererMaterialBinding

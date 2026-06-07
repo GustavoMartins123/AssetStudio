@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 7;
+        private const int SemanticSchemaVersion = 8;
         private const int SemanticRelationCommitBatchSize = 10_000;
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
@@ -180,6 +180,8 @@ namespace AssetStudio.Avalonia
                     DROP TABLE IF EXISTS MaterialTextures;
                     DROP TABLE IF EXISTS MeshMaterials;
                     DROP TABLE IF EXISTS MeshRenderers;
+                    DROP TABLE IF EXISTS ModelGroupMeshes;
+                    DROP TABLE IF EXISTS ModelGroups;
                     DROP TABLE IF EXISTS AssetEdges;
                     DROP TABLE IF EXISTS Assets;
                     DROP TABLE IF EXISTS SourceFiles;
@@ -261,6 +263,36 @@ namespace AssetStudio.Avalonia
                                 TargetFileId INTEGER NOT NULL DEFAULT 0,
                                 TargetPathID INTEGER NOT NULL DEFAULT 0,
                                 IsResolved INTEGER NOT NULL DEFAULT 0
+                            );
+
+                            CREATE TABLE IF NOT EXISTS ModelGroups (
+                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                GroupAssetUniqueID TEXT NOT NULL,
+                                GroupKind TEXT NOT NULL DEFAULT '',
+                                GroupName TEXT NOT NULL DEFAULT '',
+                                RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                RootGameObjectName TEXT NOT NULL DEFAULT '',
+                                AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                SourceFileName TEXT NOT NULL DEFAULT '',
+                                Confidence INTEGER NOT NULL DEFAULT 0,
+                                ConfidenceReason TEXT NOT NULL DEFAULT ''
+                            );
+
+                            CREATE TABLE IF NOT EXISTS ModelGroupMeshes (
+                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                GroupAssetUniqueID TEXT NOT NULL,
+                                MeshAssetUniqueID TEXT NOT NULL,
+                                RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                RendererType TEXT NOT NULL DEFAULT '',
+                                GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                GameObjectName TEXT NOT NULL DEFAULT '',
+                                SlotIndex INTEGER NOT NULL DEFAULT -1,
+                                Confidence INTEGER NOT NULL DEFAULT 0,
+                                ConfidenceReason TEXT NOT NULL DEFAULT ''
                             );
 
                             CREATE TABLE IF NOT EXISTS MeshRenderers (
@@ -353,6 +385,12 @@ namespace AssetStudio.Avalonia
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_edges_unique ON AssetEdges(ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetFileId, TargetPathID);
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_source ON AssetEdges(ProjectId, SourceAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_target ON AssetEdges(ProjectId, TargetAssetUniqueID);
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_model_groups_unique ON ModelGroups(ProjectId, GroupAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_model_group_meshes_unique ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex);
+                            CREATE INDEX IF NOT EXISTS idx_model_group_meshes_mesh ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_renderers_unique ON MeshRenderers(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, RendererType);
                             CREATE INDEX IF NOT EXISTS idx_mesh_renderers_mesh ON MeshRenderers(ProjectId, MeshAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID);
@@ -674,6 +712,8 @@ namespace AssetStudio.Avalonia
                 "MaterialTextures",
                 "MeshMaterials",
                 "MeshRenderers",
+                "ModelGroupMeshes",
+                "ModelGroups",
                 "AssetEdges",
                 "Assets",
                 "SourceFiles"
@@ -823,6 +863,8 @@ namespace AssetStudio.Avalonia
                 var totalWork = Math.Max(1,
                     relations.SourceFiles.Count
                     + relations.AssetEdges.Count
+                    + relations.ModelGroups.Count
+                    + relations.ModelGroupMeshes.Count
                     + relations.MeshRenderers.Count
                     + relations.MeshMaterials.Count
                     + relations.MaterialTextures.Count
@@ -944,6 +986,8 @@ namespace AssetStudio.Avalonia
                     }
 
                     InsertAssetEdgesInChunks(conn, projectId, relations.AssetEdges, assetSourceFileIds, AdvanceProgress, SaveProgressCheckpoint);
+                    InsertModelGroupsInChunks(conn, projectId, relations.ModelGroups, AdvanceProgress, SaveProgressCheckpoint);
+                    InsertModelGroupMeshesInChunks(conn, projectId, relations.ModelGroupMeshes, AdvanceProgress, SaveProgressCheckpoint);
                     InsertMeshRenderersInChunks(conn, projectId, relations.MeshRenderers, AdvanceProgress, SaveProgressCheckpoint);
                     InsertMeshMaterialsInChunks(conn, projectId, relations.MeshMaterials, AdvanceProgress, SaveProgressCheckpoint);
                     InsertMaterialTexturesInChunks(conn, projectId, relations.MaterialTextures, AdvanceProgress, SaveProgressCheckpoint);
@@ -1066,6 +1110,8 @@ namespace AssetStudio.Avalonia
                 "MaterialTextures",
                 "MeshMaterials",
                 "MeshRenderers",
+                "ModelGroupMeshes",
+                "ModelGroups",
                 "AssetEdges"
             };
 
@@ -1374,6 +1420,8 @@ namespace AssetStudio.Avalonia
             cmd.CommandText = @"
                 SELECT
                     (SELECT COUNT(1) FROM AssetEdges WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM ModelGroups WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM ModelGroupMeshes WHERE ProjectId = @projectId) +
                     (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
                     (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
             cmd.Parameters.AddWithValue("@projectId", projectId);
@@ -1613,6 +1661,38 @@ namespace AssetStudio.Avalonia
             }
         }
 
+        private static void InsertModelGroupsInChunks(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<SemanticModelGroupRelation> groups,
+            Action<string> advanceProgress,
+            Action<SqliteConnection, SqliteTransaction> saveProgress)
+        {
+            for (var offset = 0; offset < groups.Count; offset += SemanticRelationCommitBatchSize)
+            {
+                using var transaction = conn.BeginTransaction();
+                InsertModelGroups(conn, transaction, projectId, groups, offset, SemanticRelationCommitBatchSize, advanceProgress);
+                saveProgress(conn, transaction);
+                transaction.Commit();
+            }
+        }
+
+        private static void InsertModelGroupMeshesInChunks(
+            SqliteConnection conn,
+            long projectId,
+            IReadOnlyList<SemanticModelGroupMeshRelation> meshes,
+            Action<string> advanceProgress,
+            Action<SqliteConnection, SqliteTransaction> saveProgress)
+        {
+            for (var offset = 0; offset < meshes.Count; offset += SemanticRelationCommitBatchSize)
+            {
+                using var transaction = conn.BeginTransaction();
+                InsertModelGroupMeshes(conn, transaction, projectId, meshes, offset, SemanticRelationCommitBatchSize, advanceProgress);
+                saveProgress(conn, transaction);
+                transaction.Commit();
+            }
+        }
+
         private static void InsertMeshRenderersInChunks(
             SqliteConnection conn,
             long projectId,
@@ -1658,6 +1738,144 @@ namespace AssetStudio.Avalonia
                 InsertMaterialTextures(conn, transaction, projectId, textures, offset, SemanticRelationCommitBatchSize, advanceProgress);
                 saveProgress(conn, transaction);
                 transaction.Commit();
+            }
+        }
+
+        private static void InsertModelGroups(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticModelGroupRelation> groups,
+            int startIndex,
+            int count,
+            Action<string>? advanceProgress = null)
+        {
+            if (groups.Count == 0 || count <= 0)
+            {
+                return;
+            }
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO ModelGroups (
+                    ProjectId, GroupAssetUniqueID, GroupKind, GroupName,
+                    RootGameObjectAssetUniqueID, RootGameObjectName,
+                    AnimatorAssetUniqueID, AvatarAssetUniqueID, ControllerAssetUniqueID,
+                    SourceFileName, Confidence, ConfidenceReason)
+                VALUES (
+                    @projectId, @groupId, @groupKind, @groupName,
+                    @rootGameObjectId, @rootGameObjectName,
+                    @animatorId, @avatarId, @controllerId,
+                    @sourceFileName, @confidence, @confidenceReason)
+                ON CONFLICT(ProjectId, GroupAssetUniqueID)
+                DO UPDATE SET
+                    GroupKind = excluded.GroupKind,
+                    GroupName = excluded.GroupName,
+                    RootGameObjectAssetUniqueID = excluded.RootGameObjectAssetUniqueID,
+                    RootGameObjectName = excluded.RootGameObjectName,
+                    AnimatorAssetUniqueID = excluded.AnimatorAssetUniqueID,
+                    AvatarAssetUniqueID = excluded.AvatarAssetUniqueID,
+                    ControllerAssetUniqueID = excluded.ControllerAssetUniqueID,
+                    SourceFileName = excluded.SourceFileName,
+                    Confidence = excluded.Confidence,
+                    ConfidenceReason = excluded.ConfidenceReason";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pGroupId = cmd.Parameters.Add("@groupId", SqliteType.Text);
+            var pGroupKind = cmd.Parameters.Add("@groupKind", SqliteType.Text);
+            var pGroupName = cmd.Parameters.Add("@groupName", SqliteType.Text);
+            var pRootGameObjectId = cmd.Parameters.Add("@rootGameObjectId", SqliteType.Text);
+            var pRootGameObjectName = cmd.Parameters.Add("@rootGameObjectName", SqliteType.Text);
+            var pAnimatorId = cmd.Parameters.Add("@animatorId", SqliteType.Text);
+            var pAvatarId = cmd.Parameters.Add("@avatarId", SqliteType.Text);
+            var pControllerId = cmd.Parameters.Add("@controllerId", SqliteType.Text);
+            var pSourceFileName = cmd.Parameters.Add("@sourceFileName", SqliteType.Text);
+            var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
+            var pConfidenceReason = cmd.Parameters.Add("@confidenceReason", SqliteType.Text);
+
+            pProjectId.Value = projectId;
+            var endIndex = Math.Min(groups.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
+            {
+                var group = groups[i];
+                pGroupId.Value = group.GroupId;
+                pGroupKind.Value = group.GroupKind;
+                pGroupName.Value = group.GroupName;
+                pRootGameObjectId.Value = group.RootGameObjectAssetId;
+                pRootGameObjectName.Value = group.RootGameObjectName;
+                pAnimatorId.Value = group.AnimatorAssetId;
+                pAvatarId.Value = group.AvatarAssetId;
+                pControllerId.Value = group.ControllerAssetId;
+                pSourceFileName.Value = group.SourceFileName;
+                pConfidence.Value = group.Confidence;
+                pConfidenceReason.Value = group.ConfidenceReason;
+                cmd.ExecuteNonQuery();
+                advanceProgress?.Invoke($"Saving model groups: {i + 1:N0}/{groups.Count:N0}");
+            }
+        }
+
+        private static void InsertModelGroupMeshes(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticModelGroupMeshRelation> meshes,
+            int startIndex,
+            int count,
+            Action<string>? advanceProgress = null)
+        {
+            if (meshes.Count == 0 || count <= 0)
+            {
+                return;
+            }
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO ModelGroupMeshes (
+                    ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID,
+                    RendererType, GameObjectAssetUniqueID, GameObjectName,
+                    SlotIndex, Confidence, ConfidenceReason)
+                VALUES (
+                    @projectId, @groupId, @meshId, @rendererId,
+                    @rendererType, @gameObjectId, @gameObjectName,
+                    @slotIndex, @confidence, @confidenceReason)
+                ON CONFLICT(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID)
+                DO UPDATE SET
+                    RendererType = excluded.RendererType,
+                    GameObjectAssetUniqueID = excluded.GameObjectAssetUniqueID,
+                    GameObjectName = excluded.GameObjectName,
+                    SlotIndex = excluded.SlotIndex,
+                    Confidence = excluded.Confidence,
+                    ConfidenceReason = excluded.ConfidenceReason";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pGroupId = cmd.Parameters.Add("@groupId", SqliteType.Text);
+            var pMeshId = cmd.Parameters.Add("@meshId", SqliteType.Text);
+            var pRendererId = cmd.Parameters.Add("@rendererId", SqliteType.Text);
+            var pRendererType = cmd.Parameters.Add("@rendererType", SqliteType.Text);
+            var pGameObjectId = cmd.Parameters.Add("@gameObjectId", SqliteType.Text);
+            var pGameObjectName = cmd.Parameters.Add("@gameObjectName", SqliteType.Text);
+            var pSlotIndex = cmd.Parameters.Add("@slotIndex", SqliteType.Integer);
+            var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
+            var pConfidenceReason = cmd.Parameters.Add("@confidenceReason", SqliteType.Text);
+
+            pProjectId.Value = projectId;
+            var endIndex = Math.Min(meshes.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
+            {
+                var mesh = meshes[i];
+                pGroupId.Value = mesh.GroupId;
+                pMeshId.Value = mesh.MeshAssetId;
+                pRendererId.Value = mesh.RendererAssetId;
+                pRendererType.Value = mesh.RendererType;
+                pGameObjectId.Value = mesh.GameObjectAssetId;
+                pGameObjectName.Value = mesh.GameObjectName;
+                pSlotIndex.Value = mesh.SlotIndex;
+                pConfidence.Value = mesh.Confidence;
+                pConfidenceReason.Value = mesh.ConfidenceReason;
+                cmd.ExecuteNonQuery();
+                advanceProgress?.Invoke($"Saving model group meshes: {i + 1:N0}/{meshes.Count:N0}");
             }
         }
 
@@ -2419,6 +2637,143 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        internal List<ModelGroupInfo> LoadModelGroupsForAvatarAssetId(string folderPath, string signature, string avatarAssetId)
+        {
+            var result = new List<ModelGroupInfo>();
+            if (string.IsNullOrWhiteSpace(avatarAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        GroupAssetUniqueID,
+                        GroupKind,
+                        GroupName,
+                        RootGameObjectAssetUniqueID,
+                        RootGameObjectName,
+                        AnimatorAssetUniqueID,
+                        AvatarAssetUniqueID,
+                        ControllerAssetUniqueID,
+                        SourceFileName,
+                        Confidence,
+                        ConfidenceReason
+                    FROM ModelGroups
+                    WHERE ProjectId = @projectId
+                      AND AvatarAssetUniqueID = @avatarAssetId
+                    ORDER BY Confidence DESC, GroupName, GroupAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@avatarAssetId", avatarAssetId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(new ModelGroupInfo(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetString(3),
+                        reader.GetString(4),
+                        reader.GetString(5),
+                        reader.GetString(6),
+                        reader.GetString(7),
+                        reader.GetString(8),
+                        reader.GetInt32(9),
+                        reader.GetString(10)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load model groups from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        internal List<ModelGroupMeshInfo> LoadModelGroupMeshes(string folderPath, string signature, string groupAssetId)
+        {
+            var result = new List<ModelGroupMeshInfo>();
+            if (string.IsNullOrWhiteSpace(groupAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        GroupAssetUniqueID,
+                        MeshAssetUniqueID,
+                        RendererAssetUniqueID,
+                        RendererType,
+                        GameObjectAssetUniqueID,
+                        GameObjectName,
+                        SlotIndex,
+                        Confidence,
+                        ConfidenceReason,
+                        COALESCE(mesh.Name, ''),
+                        COALESCE(mesh.PathID, 0),
+                        COALESCE(mesh.ByteSize, 0),
+                        COALESCE(mesh.Type, 0)
+                    FROM ModelGroupMeshes mgm
+                    LEFT JOIN Assets mesh
+                      ON mesh.ProjectId = mgm.ProjectId
+                     AND mesh.UniqueID = mgm.MeshAssetUniqueID
+                    WHERE mgm.ProjectId = @projectId
+                      AND mgm.GroupAssetUniqueID = @groupAssetId
+                    ORDER BY mgm.SlotIndex, mgm.GameObjectName, mesh.Name, mgm.MeshAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@groupAssetId", groupAssetId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(new ModelGroupMeshInfo(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetString(3),
+                        reader.GetString(4),
+                        reader.GetString(5),
+                        reader.GetInt32(6),
+                        reader.GetInt32(7),
+                        reader.GetString(8),
+                        reader.GetString(9),
+                        reader.GetInt64(10),
+                        reader.GetInt64(11),
+                        reader.GetInt32(12)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load model group meshes from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
         internal PreviewCacheEntry? LoadPreviewCacheEntry(
             string folderPath,
             string signature,
@@ -2603,5 +2958,93 @@ namespace AssetStudio.Avalonia
                 return path;
             }
         }
+    }
+
+    internal sealed class ModelGroupInfo
+    {
+        public ModelGroupInfo(
+            string groupId,
+            string groupKind,
+            string groupName,
+            string rootGameObjectAssetId,
+            string rootGameObjectName,
+            string animatorAssetId,
+            string avatarAssetId,
+            string controllerAssetId,
+            string sourceFileName,
+            int confidence,
+            string confidenceReason)
+        {
+            GroupId = groupId;
+            GroupKind = groupKind;
+            GroupName = groupName;
+            RootGameObjectAssetId = rootGameObjectAssetId;
+            RootGameObjectName = rootGameObjectName;
+            AnimatorAssetId = animatorAssetId;
+            AvatarAssetId = avatarAssetId;
+            ControllerAssetId = controllerAssetId;
+            SourceFileName = sourceFileName;
+            Confidence = confidence;
+            ConfidenceReason = confidenceReason;
+        }
+
+        public string GroupId { get; }
+        public string GroupKind { get; }
+        public string GroupName { get; }
+        public string RootGameObjectAssetId { get; }
+        public string RootGameObjectName { get; }
+        public string AnimatorAssetId { get; }
+        public string AvatarAssetId { get; }
+        public string ControllerAssetId { get; }
+        public string SourceFileName { get; }
+        public int Confidence { get; }
+        public string ConfidenceReason { get; }
+    }
+
+    internal sealed class ModelGroupMeshInfo
+    {
+        public ModelGroupMeshInfo(
+            string groupId,
+            string meshAssetId,
+            string rendererAssetId,
+            string rendererType,
+            string gameObjectAssetId,
+            string gameObjectName,
+            int slotIndex,
+            int confidence,
+            string confidenceReason,
+            string meshName,
+            long meshPathId,
+            long meshByteSize,
+            int meshType)
+        {
+            GroupId = groupId;
+            MeshAssetId = meshAssetId;
+            RendererAssetId = rendererAssetId;
+            RendererType = rendererType;
+            GameObjectAssetId = gameObjectAssetId;
+            GameObjectName = gameObjectName;
+            SlotIndex = slotIndex;
+            Confidence = confidence;
+            ConfidenceReason = confidenceReason;
+            MeshName = meshName;
+            MeshPathId = meshPathId;
+            MeshByteSize = meshByteSize;
+            MeshType = meshType;
+        }
+
+        public string GroupId { get; }
+        public string MeshAssetId { get; }
+        public string RendererAssetId { get; }
+        public string RendererType { get; }
+        public string GameObjectAssetId { get; }
+        public string GameObjectName { get; }
+        public int SlotIndex { get; }
+        public int Confidence { get; }
+        public string ConfidenceReason { get; }
+        public string MeshName { get; }
+        public long MeshPathId { get; }
+        public long MeshByteSize { get; }
+        public int MeshType { get; }
     }
 }
