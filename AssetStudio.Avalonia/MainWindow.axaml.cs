@@ -5415,6 +5415,7 @@ public partial class MainWindow : Window
         }
 
         var seenGroups = new HashSet<string>(StringComparer.Ordinal);
+        var seenGroupPartSignatures = new HashSet<string>(StringComparer.Ordinal);
         foreach (var group in LoadModelGroupsForMeshAssetIdForPreview(meshId))
         {
             if (string.IsNullOrWhiteSpace(group.GroupId) || !seenGroups.Add(group.GroupId))
@@ -5426,9 +5427,14 @@ public partial class MainWindow : Window
             var meshIds = groupMeshes
                 .Select(item => item.MeshAssetId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
-                .Distinct(StringComparer.Ordinal)
                 .ToArray();
             if (meshIds.Length < 2)
+            {
+                continue;
+            }
+
+            var partSignature = string.Join("\u001f", groupMeshes.Select(part => $"{part.MeshAssetId}:{part.RendererAssetId}:{part.SlotIndex}"));
+            if (!seenGroupPartSignatures.Add(partSignature))
             {
                 continue;
             }
@@ -5451,6 +5457,8 @@ public partial class MainWindow : Window
                 ModelGroupId = group.GroupId,
                 ModelGroupName = groupName,
                 ModelGroupMeshIds = meshIds,
+                ModelGroupMeshInfos = groupMeshes.ToArray(),
+                ModelGroupTransforms = groupMeshes.Select(part => part.TransformMatrix).ToArray(),
                 ModelGroupMeshCount = meshIds.Length,
                 ModelGroupConfidence = group.Confidence,
                 Label = $"Model group: {groupName} ({meshIds.Length:N0} parts) -> {representativeName}"
@@ -5517,22 +5525,25 @@ public partial class MainWindow : Window
             return candidate.ModelGroupMeshes.ToList();
         }
 
-        var meshIds = candidate.ModelGroupMeshIds;
+        var meshIds = candidate.ModelGroupMeshInfos.Count > 0
+            ? candidate.ModelGroupMeshInfos
+                .Select(mesh => mesh.MeshAssetId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToArray()
+            : candidate.ModelGroupMeshIds;
         if (meshIds.Count == 0 && !string.IsNullOrWhiteSpace(candidate.ModelGroupId))
         {
             meshIds = LoadModelGroupMeshesForPreview(candidate.ModelGroupId)
                 .Select(mesh => mesh.MeshAssetId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
-                .Distinct(StringComparer.Ordinal)
                 .ToArray();
         }
 
         var result = new List<Mesh>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var meshId in meshIds)
         {
             token.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(meshId) || !seen.Add(meshId))
+            if (string.IsNullOrWhiteSpace(meshId))
             {
                 continue;
             }
@@ -5547,14 +5558,42 @@ public partial class MainWindow : Window
         return result;
     }
 
+    private IReadOnlyList<float[]?> ResolveModelGroupTransformsForPreview(PreviewCandidateItem candidate, int expectedCount)
+    {
+        if (candidate.ModelGroupTransforms.Count > 0)
+        {
+            return candidate.ModelGroupTransforms;
+        }
+
+        if (candidate.ModelGroupMeshInfos.Count > 0)
+        {
+            return candidate.ModelGroupMeshInfos.Select(mesh => mesh.TransformMatrix).ToArray();
+        }
+
+        if (!string.IsNullOrWhiteSpace(candidate.ModelGroupId))
+        {
+            var groupMeshes = LoadModelGroupMeshesForPreview(candidate.ModelGroupId);
+            if (groupMeshes.Count > 0)
+            {
+                return groupMeshes.Select(mesh => mesh.TransformMatrix).ToArray();
+            }
+        }
+
+        return expectedCount > 0
+            ? Enumerable.Repeat<float[]?>(null, expectedCount).ToArray()
+            : Array.Empty<float[]?>();
+    }
+
     private void PreviewModelGroupCandidate(PreviewCandidateItem candidate)
     {
         var meshes = candidate.ModelGroupMeshes.Count > 0
             ? candidate.ModelGroupMeshes.ToList()
             : ResolveModelGroupMeshesForPreview(candidate, CancellationToken.None);
+        var transforms = ResolveModelGroupTransformsForPreview(candidate, meshes.Count);
         if (meshes.Count == 0 && candidate.Mesh != null)
         {
             meshes.Add(candidate.Mesh);
+            transforms = new float[]?[] { null };
         }
 
         if (meshes.Count == 0)
@@ -5598,7 +5637,7 @@ public partial class MainWindow : Window
                     if (GLPreviewControl != null)
                     {
                         currentPreviewMesh = candidate.Mesh ?? meshes[0];
-                        GLPreviewControl.SetMeshGroup(meshes, uvs);
+                        GLPreviewControl.SetMeshGroup(meshes, uvs, transforms);
                         GLPreviewControl.IsVisible = true;
                         ShowPreviewGeometryControls(showBoneControls: false);
                         GLPreviewControl.Focus();
@@ -6046,7 +6085,6 @@ public partial class MainWindow : Window
             var meshIds = groupMeshes
                 .Select(mesh => mesh.MeshAssetId)
                 .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
-                .Distinct(StringComparer.Ordinal)
                 .ToArray();
             var displayName = !string.IsNullOrWhiteSpace(group.GroupName)
                 ? group.GroupName
@@ -6069,6 +6107,8 @@ public partial class MainWindow : Window
                 ModelGroupId = group.GroupId,
                 ModelGroupName = displayName,
                 ModelGroupMeshIds = meshIds,
+                ModelGroupMeshInfos = groupMeshes.ToArray(),
+                ModelGroupTransforms = groupMeshes.Select(mesh => mesh.TransformMatrix).ToArray(),
                 ModelGroupMeshCount = meshIds.Length,
                 ModelGroupConfidence = group.Confidence,
                 Label = $"{source}: {displayName} ({meshIds.Length:N0} parts) -> {representativeName} (Mesh PathID: {pathId})"
@@ -6644,6 +6684,7 @@ public partial class MainWindow : Window
             string? modelGroupId = null,
             string? modelGroupName = null,
             IReadOnlyList<string>? modelGroupMeshIds = null,
+            IReadOnlyList<ModelGroupMeshInfo>? modelGroupMeshInfos = null,
             int modelGroupConfidence = 0)
         {
             avatarId = !string.IsNullOrWhiteSpace(avatarId) ? avatarId : GetPreviewObjectKey(avatar);
@@ -6721,6 +6762,8 @@ public partial class MainWindow : Window
                 ModelGroupId = modelGroupId ?? string.Empty,
                 ModelGroupName = modelGroupName ?? string.Empty,
                 ModelGroupMeshIds = modelGroupMeshIds ?? Array.Empty<string>(),
+                ModelGroupMeshInfos = modelGroupMeshInfos ?? Array.Empty<ModelGroupMeshInfo>(),
+                ModelGroupTransforms = modelGroupMeshInfos?.Select(mesh => mesh.TransformMatrix).ToArray() ?? Array.Empty<float[]?>(),
                 ModelGroupMeshCount = modelGroupMeshIds?.Count ?? 0,
                 ModelGroupConfidence = modelGroupConfidence,
                 Label = label
@@ -6793,7 +6836,6 @@ public partial class MainWindow : Window
                         var meshIds = groupMeshes
                             .Select(mesh => mesh.MeshAssetId)
                             .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
-                            .Distinct(StringComparer.Ordinal)
                             .ToArray();
                         foreach (var meshId in meshIds)
                         {
@@ -6824,6 +6866,7 @@ public partial class MainWindow : Window
                             group.GroupId,
                             groupName,
                             meshIds,
+                            groupMeshes,
                             group.Confidence);
                     }
 
@@ -7016,6 +7059,9 @@ public partial class MainWindow : Window
             ModelGroupId = candidate.ModelGroupId,
             ModelGroupName = candidate.ModelGroupName,
             ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+            ModelGroupMeshInfos = candidate.ModelGroupMeshInfos,
+            ModelGroupMeshes = candidate.ModelGroupMeshes,
+            ModelGroupTransforms = candidate.ModelGroupTransforms,
             ModelGroupMeshCount = candidate.ModelGroupMeshCount,
             ModelGroupConfidence = candidate.ModelGroupConfidence,
             Label = candidate.Label

@@ -52,7 +52,9 @@ public partial class MainWindow : Window
         public string ModelGroupId { get; init; } = string.Empty;
         public string ModelGroupName { get; init; } = string.Empty;
         public IReadOnlyList<string> ModelGroupMeshIds { get; init; } = Array.Empty<string>();
+        public IReadOnlyList<ModelGroupMeshInfo> ModelGroupMeshInfos { get; init; } = Array.Empty<ModelGroupMeshInfo>();
         public IReadOnlyList<AssetStudio.Mesh> ModelGroupMeshes { get; init; } = Array.Empty<AssetStudio.Mesh>();
+        public IReadOnlyList<float[]?> ModelGroupTransforms { get; init; } = Array.Empty<float[]?>();
         public int ModelGroupMeshCount { get; init; }
         public int ModelGroupConfidence { get; init; }
         public string Label { get; init; } = string.Empty;
@@ -415,7 +417,9 @@ public partial class MainWindow : Window
                 ModelGroupId = resolvedCandidate.ModelGroupId,
                 ModelGroupName = resolvedCandidate.ModelGroupName,
                 ModelGroupMeshIds = resolvedCandidate.ModelGroupMeshIds,
+                ModelGroupMeshInfos = resolvedCandidate.ModelGroupMeshInfos,
                 ModelGroupMeshes = groupMeshes,
+                ModelGroupTransforms = ResolveModelGroupTransformsForPreview(resolvedCandidate, groupMeshes.Count),
                 ModelGroupMeshCount = resolvedCandidate.ModelGroupMeshCount,
                 ModelGroupConfidence = resolvedCandidate.ModelGroupConfidence,
                 Label = resolvedCandidate.Label
@@ -449,7 +453,9 @@ public partial class MainWindow : Window
                 ModelGroupId = candidate.ModelGroupId,
                 ModelGroupName = candidate.ModelGroupName,
                 ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+                ModelGroupMeshInfos = candidate.ModelGroupMeshInfos,
                 ModelGroupMeshes = groupMeshes,
+                ModelGroupTransforms = ResolveModelGroupTransformsForPreview(candidate, groupMeshes.Count),
                 ModelGroupMeshCount = candidate.ModelGroupMeshCount,
                 ModelGroupConfidence = candidate.ModelGroupConfidence,
                 Label = candidate.Label
@@ -484,7 +490,9 @@ public partial class MainWindow : Window
                 ModelGroupId = candidate.ModelGroupId,
                 ModelGroupName = candidate.ModelGroupName,
                 ModelGroupMeshIds = candidate.ModelGroupMeshIds,
+                ModelGroupMeshInfos = candidate.ModelGroupMeshInfos,
                 ModelGroupMeshes = groupMeshes,
+                ModelGroupTransforms = ResolveModelGroupTransformsForPreview(candidate, groupMeshes.Count),
                 ModelGroupMeshCount = candidate.ModelGroupMeshCount,
                 ModelGroupConfidence = candidate.ModelGroupConfidence,
                 Label = candidate.Label

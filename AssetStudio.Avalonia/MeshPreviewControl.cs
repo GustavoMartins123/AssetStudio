@@ -295,6 +295,7 @@ void main()
                 SetMeshGroup(
                     meshGroupPreviewSources,
                     meshGroupPreviewSourceUvs,
+                    meshGroupPreviewSourceTransforms,
                     meshGroupPreviewSourceSubMeshTextures,
                     meshGroupPreviewSourceSubMeshTexWidths,
                     meshGroupPreviewSourceSubMeshTexHeights,
@@ -332,6 +333,7 @@ void main()
         private List<int>? meshPreviewSourceSubMeshTexHeights;
         private IReadOnlyList<Mesh>? meshGroupPreviewSources;
         private IReadOnlyList<Vector2[]?>? meshGroupPreviewSourceUvs;
+        private IReadOnlyList<float[]?>? meshGroupPreviewSourceTransforms;
         private List<byte[]?>? meshGroupPreviewSourceSubMeshTextures;
         private List<int>? meshGroupPreviewSourceSubMeshTexWidths;
         private List<int>? meshGroupPreviewSourceSubMeshTexHeights;
@@ -755,6 +757,7 @@ void main()
             meshPreviewSourceSubMeshTexHeights = null;
             meshGroupPreviewSources = null;
             meshGroupPreviewSourceUvs = null;
+            meshGroupPreviewSourceTransforms = null;
             meshGroupPreviewSourceSubMeshTextures = null;
             meshGroupPreviewSourceSubMeshTexWidths = null;
             meshGroupPreviewSourceSubMeshTexHeights = null;
@@ -938,10 +941,15 @@ void main()
 
         public void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs = null, List<byte[]?>? subMeshTextures = null, List<int>? subMeshTexWidths = null, List<int>? subMeshTexHeights = null)
         {
-            SetMeshGroup(meshes, uvs, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
+            SetMeshGroup(meshes, uvs, null, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
         }
 
-        private void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
+        public void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs, IReadOnlyList<float[]?>? transforms, List<byte[]?>? subMeshTextures = null, List<int>? subMeshTexWidths = null, List<int>? subMeshTexHeights = null)
+        {
+            SetMeshGroup(meshes, uvs, transforms, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
+        }
+
+        private void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs, IReadOnlyList<float[]?>? transforms, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
         {
             ClearAvatarPreviewState();
             meshPreviewSource = null;
@@ -952,10 +960,10 @@ void main()
 
             var meshSources = meshes
                 .Where(mesh => mesh != null)
-                .Distinct()
                 .ToArray();
             meshGroupPreviewSources = meshSources;
             meshGroupPreviewSourceUvs = uvs;
+            meshGroupPreviewSourceTransforms = transforms;
             meshGroupPreviewSourceSubMeshTextures = subMeshTextures;
             meshGroupPreviewSourceSubMeshTexWidths = subMeshTexWidths;
             meshGroupPreviewSourceSubMeshTexHeights = subMeshTexHeights;
@@ -978,6 +986,7 @@ void main()
             }
 
             var uvSources = uvs?.ToArray();
+            var transformSources = transforms?.ToArray();
             var densityPercent = previewMeshDensityPercent;
             int currentLoadId = ++meshLoadCounter;
 
@@ -1002,6 +1011,12 @@ void main()
 
                     var meshUvs = uvSources != null && meshIndex < uvSources.Length ? uvSources[meshIndex] : null;
                     var part = BuildMeshPreviewPartGeometry(mesh, meshUvs, densityPercent);
+                    var partTransform = transformSources != null && meshIndex < transformSources.Length ? transformSources[meshIndex] : null;
+                    if (partTransform != null && partTransform.Length == 16)
+                    {
+                        part = TransformMeshPreviewPartGeometry(part, partTransform);
+                    }
+
                     if (part.Vertices.Length == 0 || part.Indices.Length == 0)
                     {
                         continue;
@@ -1237,6 +1252,55 @@ void main()
                 max);
         }
 
+        private static MeshPreviewPartGeometry TransformMeshPreviewPartGeometry(MeshPreviewPartGeometry part, float[] matrix)
+        {
+            var vertices = new Vector3[part.Vertices.Length];
+            for (var i = 0; i < vertices.Length; i++)
+            {
+                vertices[i] = TransformPoint(matrix, part.Vertices[i]);
+            }
+
+            Vector3[]? normals = null;
+            if (part.Normals != null)
+            {
+                normals = new Vector3[part.Normals.Length];
+                for (var i = 0; i < normals.Length; i++)
+                {
+                    var normal = TransformDirection(matrix, part.Normals[i]);
+                    normals[i] = normal.LengthSquared > 0
+                        ? Vector3.Normalize(normal)
+                        : part.Normals[i];
+                }
+            }
+
+            GetMeshPreviewGeometryBounds(vertices, out var min, out var max);
+            return new MeshPreviewPartGeometry(
+                vertices,
+                part.Indices,
+                normals,
+                part.Colors,
+                part.Uvs,
+                part.SubMeshIndexCounts,
+                min,
+                max);
+        }
+
+        private static Vector3 TransformPoint(float[] matrix, Vector3 point)
+        {
+            return new Vector3(
+                matrix[0] * point.X + matrix[1] * point.Y + matrix[2] * point.Z + matrix[3],
+                matrix[4] * point.X + matrix[5] * point.Y + matrix[6] * point.Z + matrix[7],
+                matrix[8] * point.X + matrix[9] * point.Y + matrix[10] * point.Z + matrix[11]);
+        }
+
+        private static Vector3 TransformDirection(float[] matrix, Vector3 direction)
+        {
+            return new Vector3(
+                matrix[0] * direction.X + matrix[1] * direction.Y + matrix[2] * direction.Z,
+                matrix[4] * direction.X + matrix[5] * direction.Y + matrix[6] * direction.Z,
+                matrix[8] * direction.X + matrix[9] * direction.Y + matrix[10] * direction.Z);
+        }
+
         private static void GetMeshPreviewGeometryBounds(Vector3[] vertices, out Vector3 min, out Vector3 max)
         {
             min = Vector3.Zero;
@@ -1343,6 +1407,7 @@ void main()
             ClearAvatarPreviewState();
             meshGroupPreviewSources = null;
             meshGroupPreviewSourceUvs = null;
+            meshGroupPreviewSourceTransforms = null;
             meshGroupPreviewSourceSubMeshTextures = null;
             meshGroupPreviewSourceSubMeshTexWidths = null;
             meshGroupPreviewSourceSubMeshTexHeights = null;

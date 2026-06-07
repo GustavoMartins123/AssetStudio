@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 9;
+        private const int SemanticSchemaVersion = 10;
         private const int SemanticRelationCommitBatchSize = 10_000;
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
@@ -291,6 +291,7 @@ namespace AssetStudio.Avalonia
                                 GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 GameObjectName TEXT NOT NULL DEFAULT '',
                                 SlotIndex INTEGER NOT NULL DEFAULT -1,
+                                TransformMatrix BLOB,
                                 Confidence INTEGER NOT NULL DEFAULT 0,
                                 ConfidenceReason TEXT NOT NULL DEFAULT ''
                             );
@@ -1835,17 +1836,18 @@ namespace AssetStudio.Avalonia
                 INSERT INTO ModelGroupMeshes (
                     ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID,
                     RendererType, GameObjectAssetUniqueID, GameObjectName,
-                    SlotIndex, Confidence, ConfidenceReason)
+                    SlotIndex, TransformMatrix, Confidence, ConfidenceReason)
                 VALUES (
                     @projectId, @groupId, @meshId, @rendererId,
                     @rendererType, @gameObjectId, @gameObjectName,
-                    @slotIndex, @confidence, @confidenceReason)
+                    @slotIndex, @transformMatrix, @confidence, @confidenceReason)
                 ON CONFLICT(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID)
                 DO UPDATE SET
                     RendererType = excluded.RendererType,
                     GameObjectAssetUniqueID = excluded.GameObjectAssetUniqueID,
                     GameObjectName = excluded.GameObjectName,
                     SlotIndex = excluded.SlotIndex,
+                    TransformMatrix = excluded.TransformMatrix,
                     Confidence = excluded.Confidence,
                     ConfidenceReason = excluded.ConfidenceReason";
 
@@ -1857,6 +1859,7 @@ namespace AssetStudio.Avalonia
             var pGameObjectId = cmd.Parameters.Add("@gameObjectId", SqliteType.Text);
             var pGameObjectName = cmd.Parameters.Add("@gameObjectName", SqliteType.Text);
             var pSlotIndex = cmd.Parameters.Add("@slotIndex", SqliteType.Integer);
+            var pTransformMatrix = cmd.Parameters.Add("@transformMatrix", SqliteType.Blob);
             var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
             var pConfidenceReason = cmd.Parameters.Add("@confidenceReason", SqliteType.Text);
 
@@ -1872,11 +1875,42 @@ namespace AssetStudio.Avalonia
                 pGameObjectId.Value = mesh.GameObjectAssetId;
                 pGameObjectName.Value = mesh.GameObjectName;
                 pSlotIndex.Value = mesh.SlotIndex;
+                pTransformMatrix.Value = (object?)SerializeTransformMatrix(mesh.LocalToWorldMatrix) ?? DBNull.Value;
                 pConfidence.Value = mesh.Confidence;
                 pConfidenceReason.Value = mesh.ConfidenceReason;
                 cmd.ExecuteNonQuery();
                 advanceProgress?.Invoke($"Saving model group meshes: {i + 1:N0}/{meshes.Count:N0}");
             }
+        }
+
+        private static byte[]? SerializeTransformMatrix(float[]? matrix)
+        {
+            if (matrix == null || matrix.Length != 16)
+            {
+                return null;
+            }
+
+            var bytes = new byte[sizeof(float) * 16];
+            Buffer.BlockCopy(matrix, 0, bytes, 0, bytes.Length);
+            return bytes;
+        }
+
+        private static float[]? ReadTransformMatrix(SqliteDataReader reader, int ordinal)
+        {
+            if (reader.IsDBNull(ordinal))
+            {
+                return null;
+            }
+
+            var bytes = reader.GetFieldValue<byte[]>(ordinal);
+            if (bytes.Length != sizeof(float) * 16)
+            {
+                return null;
+            }
+
+            var matrix = new float[16];
+            Buffer.BlockCopy(bytes, 0, matrix, 0, bytes.Length);
+            return matrix;
         }
 
         private static void InsertMeshRenderers(
@@ -2819,6 +2853,7 @@ namespace AssetStudio.Avalonia
                         SlotIndex,
                         Confidence,
                         ConfidenceReason,
+                        TransformMatrix,
                         COALESCE(mesh.Name, ''),
                         COALESCE(mesh.PathID, 0),
                         COALESCE(mesh.ByteSize, 0),
@@ -2845,10 +2880,11 @@ namespace AssetStudio.Avalonia
                         reader.GetInt32(6),
                         reader.GetInt32(7),
                         reader.GetString(8),
-                        reader.GetString(9),
-                        reader.GetInt64(10),
+                        ReadTransformMatrix(reader, 9),
+                        reader.GetString(10),
                         reader.GetInt64(11),
-                        reader.GetInt32(12)));
+                        reader.GetInt64(12),
+                        reader.GetInt32(13)));
                 }
             }
             catch (Exception ex)
@@ -3098,6 +3134,7 @@ namespace AssetStudio.Avalonia
             int slotIndex,
             int confidence,
             string confidenceReason,
+            float[]? transformMatrix,
             string meshName,
             long meshPathId,
             long meshByteSize,
@@ -3112,6 +3149,7 @@ namespace AssetStudio.Avalonia
             SlotIndex = slotIndex;
             Confidence = confidence;
             ConfidenceReason = confidenceReason;
+            TransformMatrix = transformMatrix;
             MeshName = meshName;
             MeshPathId = meshPathId;
             MeshByteSize = meshByteSize;
@@ -3127,6 +3165,7 @@ namespace AssetStudio.Avalonia
         public int SlotIndex { get; }
         public int Confidence { get; }
         public string ConfidenceReason { get; }
+        public float[]? TransformMatrix { get; }
         public string MeshName { get; }
         public long MeshPathId { get; }
         public long MeshByteSize { get; }

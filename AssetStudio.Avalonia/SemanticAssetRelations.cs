@@ -131,6 +131,7 @@ internal sealed class SemanticModelGroupMeshRelation
         string gameObjectAssetId,
         string gameObjectName,
         int slotIndex,
+        float[]? localToWorldMatrix,
         int confidence,
         string confidenceReason)
     {
@@ -141,6 +142,7 @@ internal sealed class SemanticModelGroupMeshRelation
         GameObjectAssetId = gameObjectAssetId;
         GameObjectName = gameObjectName;
         SlotIndex = slotIndex;
+        LocalToWorldMatrix = localToWorldMatrix;
         Confidence = confidence;
         ConfidenceReason = confidenceReason;
     }
@@ -152,6 +154,7 @@ internal sealed class SemanticModelGroupMeshRelation
     public string GameObjectAssetId { get; }
     public string GameObjectName { get; }
     public int SlotIndex { get; }
+    public float[]? LocalToWorldMatrix { get; }
     public int Confidence { get; }
     public string ConfidenceReason { get; }
 }

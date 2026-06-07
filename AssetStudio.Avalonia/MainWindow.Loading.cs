@@ -1461,6 +1461,7 @@ namespace AssetStudio.Avalonia
                     gameObjectId,
                     binding.GameObject?.m_Name ?? string.Empty,
                     slotIndex,
+                    BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
                     match.Confidence,
                     match.ConfidenceReason));
                 slotIndex++;
@@ -1569,6 +1570,7 @@ namespace AssetStudio.Avalonia
                         gameObjectId,
                         binding.GameObject?.m_Name ?? string.Empty,
                         slotIndex,
+                        BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
                         binding.Confidence,
                         binding.ConfidenceReason));
                     slotIndex++;
@@ -1612,6 +1614,96 @@ namespace AssetStudio.Avalonia
             }
 
             return result;
+        }
+
+        private static float[]? BuildLocalToWorldMatrix(SerializedFile sourceFile, GameObject? gameObject)
+        {
+            if (gameObject == null)
+            {
+                return null;
+            }
+
+            var transforms = new List<Transform>();
+            var visited = new HashSet<long>();
+            var transform = ResolveTransformForGameObjectBackground(sourceFile, gameObject);
+            for (var depth = 0; transform != null && depth < 256; depth++)
+            {
+                if (!visited.Add(transform.m_PathID))
+                {
+                    break;
+                }
+
+                transforms.Add(transform);
+                if (transform.m_Father == null || transform.m_Father.IsNull)
+                {
+                    break;
+                }
+
+                transform = ResolveTransformBackground(sourceFile, transform.m_Father);
+            }
+
+            if (transforms.Count == 0)
+            {
+                return null;
+            }
+
+            var world = CreateIdentityMatrix();
+            for (var i = transforms.Count - 1; i >= 0; i--)
+            {
+                world = world * BuildLocalMatrix(transforms[i]);
+            }
+
+            return MatrixToRowMajorArray(world, omitIdentity: true);
+        }
+
+        private static Matrix4x4 BuildLocalMatrix(Transform transform)
+        {
+            return Matrix4x4.Translate(transform.m_LocalPosition)
+                * Matrix4x4.Rotate(transform.m_LocalRotation)
+                * Matrix4x4.Scale(transform.m_LocalScale);
+        }
+
+        private static Matrix4x4 CreateIdentityMatrix()
+        {
+            var matrix = new Matrix4x4();
+            matrix.M00 = 1f;
+            matrix.M11 = 1f;
+            matrix.M22 = 1f;
+            matrix.M33 = 1f;
+            return matrix;
+        }
+
+        private static float[]? MatrixToRowMajorArray(Matrix4x4 matrix, bool omitIdentity)
+        {
+            var values = new[]
+            {
+                matrix.M00, matrix.M01, matrix.M02, matrix.M03,
+                matrix.M10, matrix.M11, matrix.M12, matrix.M13,
+                matrix.M20, matrix.M21, matrix.M22, matrix.M23,
+                matrix.M30, matrix.M31, matrix.M32, matrix.M33
+            };
+
+            if (!omitIdentity)
+            {
+                return values;
+            }
+
+            var identity = new[]
+            {
+                1f, 0f, 0f, 0f,
+                0f, 1f, 0f, 0f,
+                0f, 0f, 1f, 0f,
+                0f, 0f, 0f, 1f
+            };
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (Math.Abs(values[i] - identity[i]) > 0.000001f)
+                {
+                    return values;
+                }
+            }
+
+            return null;
         }
 
         private static string BuildAnimatorModelGroupId(
