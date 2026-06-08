@@ -136,21 +136,6 @@ public partial class MainWindow
         await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
     }
 
-    private void GoToSceneHierarchy_Click(object? sender, RoutedEventArgs e)
-    {
-        var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;
-        if (item?.TreeNode == null)
-        {
-            StatusStripUpdate("Selected asset has no scene hierarchy node.");
-            return;
-        }
-
-        item.TreeNode.ExpandAncestors();
-        LeftTabControl.SelectedIndex = 0;
-        SceneTreeView.SelectedItem = item.TreeNode;
-        SceneTreeView.Focus();
-    }
-
     private void ShowOriginalFile_Click(object? sender, RoutedEventArgs e)
     {
         var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;

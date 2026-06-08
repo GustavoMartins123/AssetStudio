@@ -3,6 +3,8 @@ using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
+using AssetStudio;
+using System;
 using System.Globalization;
 
 namespace AssetStudio.Avalonia;
@@ -222,5 +224,26 @@ public partial class MainWindow
         }
 
         return new SolidColorBrush(global::Avalonia.Media.Colors.Transparent);
+    }
+
+    private void PreviewTextAsset(AssetItem assetItem, TextAsset m_TextAsset, string fbxHeader)
+    {
+        var data = m_TextAsset.m_Script ?? Array.Empty<byte>();
+        var preview = TextAssetPreviewBuilder.BuildPreview(assetItem, data, fbxHeader);
+        if (preview.HasDialogueCards)
+        {
+            ShowTextAssetDialoguePreview(assetItem, preview);
+            StatusStripUpdate($"TextAsset localized preview loaded ({preview.DialogueCards.Count:N0} dialogue-like strings, {data.Length:N0} bytes).");
+            return;
+        }
+
+        TextPreviewBox.FontFamily = new global::Avalonia.Media.FontFamily("Consolas, Menlo, DejaVu Sans Mono, monospace");
+        TextPreviewBox.FontSize = 13;
+        SetTextWithTruncation(TextPreviewBox, preview.DetailsText);
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        PreviewInfoBorder.IsVisible = false;
+
+        StatusStripUpdate($"TextAsset preview loaded ({data.Length:N0} bytes).");
     }
 }
