@@ -15,6 +15,10 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private CancellationTokenSource? listSearchDebounce;
+    private bool isRefreshingFilterList;
+    private bool isSorting;
+
     private async void ListSearch_TextChanged(object? sender, TextChangedEventArgs e)
     {
         PrioritizeUserInteraction();
@@ -36,7 +40,6 @@ public partial class MainWindow
         }
     }
 
-    private bool isSorting;
     private async void AssetListDataGrid_Sorting(object? sender, DataGridColumnEventArgs e)
     {
         e.Handled = true;

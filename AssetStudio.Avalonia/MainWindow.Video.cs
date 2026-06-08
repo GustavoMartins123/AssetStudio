@@ -1,5 +1,6 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Threading;
 using AssetStudio;
 using System;
 using System.IO;
@@ -11,6 +12,24 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private string? _currentTempVideoPath;
+    private string? _currentTempVideoAssetId;
+    private CancellationTokenSource? _videoPreviewLoadCts;
+    private bool _isUpdatingVideoProgress = false;
+    private bool _isVideoDragging = false;
+    private long _videoLengthMs = 0;
+    private volatile int _targetVolume = 80;
+    private DispatcherTimer? _ffmpegVideoTimer;
+
+    public void InitializeVideoPlayer()
+    {
+        _ffmpegVideoTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(100)
+        };
+        _ffmpegVideoTimer.Tick += FfmpegVideoTimer_Tick;
+    }
+
     private static string FormatMediaTime(long currentMs, long totalMs)
     {
         return $"{currentMs / 1000 / 60}:{currentMs / 1000 % 60:D2}.{currentMs / 10 % 100:D2} / {totalMs / 1000 / 60}:{totalMs / 1000 % 60:D2}.{totalMs / 10 % 100:D2}";

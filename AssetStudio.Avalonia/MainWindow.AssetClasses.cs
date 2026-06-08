@@ -111,7 +111,7 @@ public partial class MainWindow
         var scrollViewer = FindVisualChild<ScrollViewer>(AssetClassesDataGrid);
         var scrollOffset = scrollViewer?.Offset ?? default;
 
-        SyncObservableCollection(visibleAssetClassItems, classes.ToList());
+        SyncAssetClassCollection(visibleAssetClassItems, classes.ToList());
 
         isRefreshingClassesList = true;
         try
@@ -237,7 +237,7 @@ public partial class MainWindow
         return sb.ToString();
     }
 
-    private static void SyncObservableCollection<T>(System.Collections.ObjectModel.ObservableCollection<T> collection, IReadOnlyList<T>? targetList)
+    private static void SyncAssetClassCollection(System.Collections.ObjectModel.ObservableCollection<AssetClassItem> collection, IReadOnlyList<AssetClassItem>? targetList)
     {
         if (collection == null) return;
         if (targetList == null)
@@ -261,7 +261,7 @@ public partial class MainWindow
             return;
         }
 
-        var targetSet = new HashSet<T>(targetList);
+        var targetSet = new HashSet<AssetClassItem>(targetList);
 
         for (int i = collection.Count - 1; i >= 0; i--)
         {
@@ -277,16 +277,16 @@ public partial class MainWindow
 
             if (i < collection.Count)
             {
-                if (EqualityComparer<T>.Default.Equals(collection[i], targetItem))
+                if (EqualityComparer<AssetClassItem>.Default.Equals(collection[i], targetItem))
                 {
-                    SyncCollectionItem(collection[i], targetItem);
+                    collection[i].CopyFrom(targetItem);
                     continue;
                 }
 
                 int indexInCollection = -1;
                 for (int j = i + 1; j < collection.Count; j++)
                 {
-                    if (EqualityComparer<T>.Default.Equals(collection[j], targetItem))
+                    if (EqualityComparer<AssetClassItem>.Default.Equals(collection[j], targetItem))
                     {
                         indexInCollection = j;
                         break;
@@ -295,7 +295,7 @@ public partial class MainWindow
 
                 if (indexInCollection != -1)
                 {
-                    SyncCollectionItem(collection[indexInCollection], targetItem);
+                    collection[indexInCollection].CopyFrom(targetItem);
                     collection.Move(indexInCollection, i);
                 }
                 else
@@ -315,17 +315,9 @@ public partial class MainWindow
         }
     }
 
-    private static void SyncCollectionItem<T>(T existingItem, T targetItem)
-    {
-        if (existingItem is AssetClassItem existingClass && targetItem is AssetClassItem targetClass)
-        {
-            existingClass.CopyFrom(targetClass);
-        }
-    }
-
     /// <summary>
     /// Incrementally updates the visible class items by updating counts on existing items
-    /// and appending only new class entries. Avoids the full SyncObservableCollection diff.
+    /// and appending only new class entries. Avoids the full SyncAssetClassCollection diff.
     /// </summary>
     private void UpdateAssetClassesIncremental(List<AssetClassItem> updatedClassItems)
     {

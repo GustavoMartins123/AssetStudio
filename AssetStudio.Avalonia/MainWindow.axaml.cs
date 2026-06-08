@@ -64,7 +64,6 @@ public partial class MainWindow : Window
     private readonly ProjectLaunchContext? projectContext;
     private readonly AssemblyLoader assemblyLoader = new AssemblyLoader();
     private readonly GUILogger logger;
-    private CancellationTokenSource? listSearchDebounce;
     private string? assetListSortMember;
     private string assetContextCellText = string.Empty;
     private AssetItem? assetContextItem;
@@ -86,30 +85,6 @@ public partial class MainWindow : Window
     private Dictionary<AnimationClip, HashSet<uint>>? animationClipTransformBindingsCache;
     private readonly object previewCacheLock = new object();
 
-    private string? _currentTempVideoPath;
-    private string? _currentTempVideoAssetId;
-    private CancellationTokenSource? _videoPreviewLoadCts;
-    private bool _isUpdatingVideoProgress = false;
-    private bool _isVideoDragging = false;
-    private long _videoLengthMs = 0;
-    private volatile int _targetVolume = 80;
-    private DispatcherTimer? _ffmpegVideoTimer;
-    private DispatcherTimer? _2dAnimTimer;
-    private List<(float time, AssetStudio.Object asset)> _2dAnimFrames = new();
-    private Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap> _2dAnimBitmaps = new();
-    private global::Avalonia.Media.Imaging.Bitmap? _2dAnimCurrentBitmap;
-    private DateTime _2dAnimStartTime;
-    private float _2dAnimDuration;
-    private float _2dAnimPausedElapsedSeconds;
-    private int _2dAnimCurrentFrameIndex;
-    private bool _2dAnimPaused;
-    private bool _is2dAnimationPreviewActive;
-    private double _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
-    private const double TwoDAnimationMinPreviewFill = 0.025;
-    private const double TwoDAnimationDefaultPreviewFill = 0.10;
-    private const double TwoDAnimationMaxPreviewFill = 1.0;
-    private const double TwoDAnimationZoomFactor = 1.12;
-
     private readonly SQLiteProjectIndexCache _sqliteCache = new();
     private ProjectScanResult? currentScanResult;
     private bool isBuildingAssetStructures;
@@ -121,7 +96,6 @@ public partial class MainWindow : Window
 
     private string? _pendingStatusText;
     private string? _currentlySelectedUniqueID;
-    private bool isRefreshingFilterList;
     private bool isRefreshingClassesList;
     private bool _statusUpdatePending;
     private Dictionary<string, AssetItem> lazyAssetItemsByHandleId = new(StringComparer.Ordinal);
@@ -200,11 +174,7 @@ public partial class MainWindow : Window
 
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
-        _ffmpegVideoTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(100)
-        };
-        _ffmpegVideoTimer.Tick += FfmpegVideoTimer_Tick;
+        InitializeVideoPlayer();
         FfmpegVideoPlayer.MediaEnded += FfmpegVideoPlayer_MediaEnded;
         FfmpegVideoPlayer.IsVisible = true;
 

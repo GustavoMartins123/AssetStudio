@@ -12,6 +12,23 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private const double TwoDAnimationMinPreviewFill = 0.025;
+    private const double TwoDAnimationDefaultPreviewFill = 0.10;
+    private const double TwoDAnimationMaxPreviewFill = 1.0;
+    private const double TwoDAnimationZoomFactor = 1.12;
+
+    private DispatcherTimer? _2dAnimTimer;
+    private List<(float time, AssetStudio.Object asset)> _2dAnimFrames = new();
+    private Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap> _2dAnimBitmaps = new();
+    private global::Avalonia.Media.Imaging.Bitmap? _2dAnimCurrentBitmap;
+    private DateTime _2dAnimStartTime;
+    private float _2dAnimDuration;
+    private float _2dAnimPausedElapsedSeconds;
+    private int _2dAnimCurrentFrameIndex;
+    private bool _2dAnimPaused;
+    private bool _is2dAnimationPreviewActive;
+    private double _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
+
     private void Preview2DAnimationClip(AnimationClip clip)
     {
         Stop2DAnimation();
