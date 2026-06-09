@@ -141,23 +141,28 @@ namespace AssetStudio
                     return;
 
                 // Extract m_InternalIds
+                // Use [^\[\]]* instead of .*? to prevent the lazy match from spanning
+                // across nested arrays (m_InternalIds is a flat string array, but the
+                // surrounding catalog contains many nested arrays/objects). The
+                // bracket-exclusion is O(n) and avoids any ambiguity, even on
+                // multi-MB catalogs with deep nesting.
                 List<string> internalIds = new List<string>();
-                var idsMatch = Regex.Match(content, @"""m_InternalIds""\s*:\s*\[(.*?)\]", RegexOptions.Singleline);
+                var idsMatch = Regex.Match(content, @"""m_InternalIds""\s*:\s*\[([^\[\]]*)\]");
                 if (idsMatch.Success)
                 {
-                    var idMatches = Regex.Matches(idsMatch.Groups[1].Value, @"""([^""]+)""");
+                    var idMatches = Regex.Matches(idsMatch.Groups[1].Value, @"""((?:[^""\\]|\\.)*)""");
                     foreach (Match m in idMatches)
                     {
                         internalIds.Add(m.Groups[1].Value);
                     }
                 }
 
-                // Extract m_InternalIdPrefixes
+                // Extract m_InternalIdPrefixes (same defensive pattern as InternalIds)
                 List<string> prefixes = new List<string>();
-                var prefMatch = Regex.Match(content, @"""m_InternalIdPrefixes""\s*:\s*\[(.*?)\]", RegexOptions.Singleline);
+                var prefMatch = Regex.Match(content, @"""m_InternalIdPrefixes""\s*:\s*\[([^\[\]]*)\]");
                 if (prefMatch.Success)
                 {
-                    var prefMatches = Regex.Matches(prefMatch.Groups[1].Value, @"""([^""]+)""");
+                    var prefMatches = Regex.Matches(prefMatch.Groups[1].Value, @"""((?:[^""\\]|\\.)*)""");
                     foreach (Match m in prefMatches)
                     {
                         prefixes.Add(m.Groups[1].Value);

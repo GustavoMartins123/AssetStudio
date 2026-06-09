@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -100,16 +101,26 @@ namespace AssetStudio
                 throw new ArgumentException("The destination buffer must be at least 512 bytes.", nameof(destination));
             }
 
+            // hash2 is SHA-512 (64 bytes). ToUInt32 reads 4 bytes, so the start
+            // offset must be in [0, 60]. The four indices below are constructed
+            // so the maximum value is 60 (h2_idx_1 with (12 | 0x30) = 60), which
+            // reads bytes 60-63 — last legal window. We assert this defensively so
+            // any future tweak to the bitmasks (| 0x30 / 0x10 / 0x20)
+            // is caught by the assertion.
             int h2_idx_1 = (int)((block % 13) | 0x30);
+            Debug.Assert(h2_idx_1 >= 0 && h2_idx_1 + 4 <= hash2.Length, $"h2_idx_1 out of range: {h2_idx_1}");
             uint hashPart1 = BitConverter.ToUInt32(hash2, h2_idx_1);
 
             int h2_idx_2 = (int)((block / 13) % 13);
+            Debug.Assert(h2_idx_2 >= 0 && h2_idx_2 + 4 <= hash2.Length, $"h2_idx_2 out of range: {h2_idx_2}");
             uint hashPart2 = BitConverter.ToUInt32(hash2, h2_idx_2);
 
             int h2_idx_3 = (int)(((block / 169) % 13) | 0x10);
+            Debug.Assert(h2_idx_3 >= 0 && h2_idx_3 + 4 <= hash2.Length, $"h2_idx_3 out of range: {h2_idx_3}");
             uint hashPart3 = BitConverter.ToUInt32(hash2, h2_idx_3);
 
             int h2_idx_4 = (int)(((block / 2197) % 13) | 0x20);
+            Debug.Assert(h2_idx_4 >= 0 && h2_idx_4 + 4 <= hash2.Length, $"h2_idx_4 out of range: {h2_idx_4}");
             uint hashPart4 = BitConverter.ToUInt32(hash2, h2_idx_4);
 
             int val1 = (int)(2 * (block / 169));
