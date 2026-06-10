@@ -362,3 +362,8 @@ TASKS.local.md
 # Custom modifications and scrap directories
 scratch/
 annotations/
+
+# Distribution packages and packaging builds
+dist/
+build/
+
