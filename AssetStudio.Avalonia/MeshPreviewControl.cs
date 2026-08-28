@@ -19,6 +19,16 @@ namespace AssetStudio.Avalonia
     using Vector4 = OpenTK.Mathematics.Vector4;
     using Matrix4 = OpenTK.Mathematics.Matrix4;
 
+    public enum MeshPreviewViewPreset
+    {
+        Auto,
+        Front,
+        Back,
+        Left,
+        Right,
+        Top
+    }
+
     public class MeshPreviewControl : OpenGlControlBase
     {
         private const string vsSource = @"
@@ -141,8 +151,11 @@ void main()
         private const int LocationNormal = 1;
         private const int LocationColor = 2;
         private const int LocationTexCoord = 3;
-        private const float PreviewFitScale = 1.35f;
+        private const float PreviewFitScale = 1.6f;
         private const float PreviewDepthScale = 0.02f;
+        private const int PreviewBoundsSampleLimit = 32_768;
+        private const int PreviewBoundsMinimumTrimCount = 200;
+        private const float PreviewBoundsTrimFraction = 0.0025f;
 
         // Programs
         private int pgmID;
@@ -231,10 +244,12 @@ void main()
 
         // Matrices
         private Matrix4 modelMatrixData = Matrix4.Identity;
-        private Matrix4 viewMatrixData = Matrix4.Identity;
+        private Matrix4 viewMatrixData = CreateUnityAutoViewMatrix();
         private Matrix4 projMatrixData = Matrix4.Identity;
-        private Matrix4 initialViewMatrix = Matrix4.Identity;
+        private Matrix4 initialViewMatrix = CreateUnityAutoViewMatrix();
         private Matrix4 initialModelMatrix = Matrix4.Identity;
+        private Matrix4 automaticViewMatrix = CreateUnityAutoViewMatrix();
+        private MeshPreviewViewPreset viewPreset = MeshPreviewViewPreset.Auto;
         private float boneScale = 1.0f;
         private Vector3[]? staticBonePositions;
         private int[]? staticParentIndices;
@@ -352,6 +367,24 @@ void main()
         {
             ClipToBounds = true;
             Focusable = true;
+        }
+
+        public MeshPreviewViewPreset ViewPreset
+        {
+            get => viewPreset;
+            set
+            {
+                if (!Enum.IsDefined(value))
+                {
+                    value = MeshPreviewViewPreset.Auto;
+                }
+
+                viewPreset = value;
+                initialViewMatrix = ResolveViewPresetMatrix();
+                viewMatrixData = initialViewMatrix;
+                modelMatrixData = initialModelMatrix;
+                RequestNextFrameRendering();
+            }
         }
 
         public override void Render(DrawingContext context)
@@ -500,8 +533,45 @@ void main()
         {
             var size = max - min;
             var center = (max + min) * 0.5f;
-            float diagonal = Math.Max(1e-5f, size.Length);
-            return Matrix4.CreateTranslation(-center) * Matrix4.CreateScale(PreviewFitScale / diagonal);
+            var largestExtent = Math.Max(1e-5f, Math.Max(size.X, Math.Max(size.Y, size.Z)));
+            return Matrix4.CreateTranslation(-center) * Matrix4.CreateScale(PreviewFitScale / largestExtent);
+        }
+
+        private static Matrix4 CreateUnityAutoViewMatrix()
+        {
+            // Unity assets use +Y as up and +Z as forward. A three-quarter view
+            // keeps those axes stable while still showing depth.
+            return Matrix4.CreateRotationY(-(float)Math.PI / 4)
+                * Matrix4.CreateRotationX(-(float)Math.PI / 6);
+        }
+
+        private static Matrix4 CreateAxisViewMatrix(Vector3 cameraDirection, Vector3 up)
+        {
+            var view = Matrix4.LookAt(cameraDirection, Vector3.Zero, up);
+            view.Row3 = new Vector4(0, 0, 0, 1);
+            return view;
+        }
+
+        private Matrix4 ResolveViewPresetMatrix()
+        {
+            return viewPreset switch
+            {
+                MeshPreviewViewPreset.Front => CreateAxisViewMatrix(Vector3.UnitZ, Vector3.UnitY),
+                MeshPreviewViewPreset.Back => CreateAxisViewMatrix(-Vector3.UnitZ, Vector3.UnitY),
+                MeshPreviewViewPreset.Left => CreateAxisViewMatrix(-Vector3.UnitX, Vector3.UnitY),
+                MeshPreviewViewPreset.Right => CreateAxisViewMatrix(Vector3.UnitX, Vector3.UnitY),
+                MeshPreviewViewPreset.Top => CreateAxisViewMatrix(Vector3.UnitY, -Vector3.UnitZ),
+                _ => automaticViewMatrix
+            };
+        }
+
+        private void SetInitialPreviewFrame(Matrix4 autoViewMatrix, Matrix4 modelMatrix)
+        {
+            automaticViewMatrix = autoViewMatrix;
+            initialModelMatrix = modelMatrix;
+            initialViewMatrix = ResolveViewPresetMatrix();
+            modelMatrixData = initialModelMatrix;
+            viewMatrixData = initialViewMatrix;
         }
 
         private static Vector3[][]? BuildAnimatedAvatarReferenceVertices(Mesh mesh, Vector3[] sourceVertexData, PreviewMeshGeometry referenceMesh, Matrix4[][] boneMatrices, int[] parentIndices, ref Vector3 min, ref Vector3 max, bool expandBounds)
@@ -1088,11 +1158,12 @@ void main()
                     indexOffset += part.Indices.Length;
                 }
 
+                GetRobustMeshPreviewGeometryBounds(localVertexData, out var previewMin, out var previewMax);
                 var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
                 var localPreviewSubMeshIndexCounts = combinedSubMeshCounts.Count > 0
                     ? combinedSubMeshCounts.ToArray()
                     : null;
-                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
+                var localModelMatrixData = CreatePreviewModelMatrix(previewMin, previewMax);
 
                 if (resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null))
                 {
@@ -1114,10 +1185,7 @@ void main()
 
                     if (resetMaterialOverrides)
                     {
-                        viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
-                        modelMatrixData = localModelMatrixData;
-                        initialViewMatrix = viewMatrixData;
-                        initialModelMatrix = modelMatrixData;
+                        SetInitialPreviewFrame(CreateUnityAutoViewMatrix(), localModelMatrixData);
                     }
 
                     vertexData = localVertexData;
@@ -1142,7 +1210,7 @@ void main()
             var cachedGeometry = LoadMeshPreviewGeometryCache?.Invoke(mesh, densityPercent);
             if (cachedGeometry != null)
             {
-                GetMeshPreviewGeometryBounds(cachedGeometry.Vertices, out var cachedMin, out var cachedMax);
+                GetRobustMeshPreviewGeometryBounds(cachedGeometry.Vertices, out var cachedMin, out var cachedMax);
                 return new MeshPreviewPartGeometry(
                     cachedGeometry.Vertices,
                     cachedGeometry.Indices,
@@ -1224,9 +1292,10 @@ void main()
                     localNormalData = RemapVector3Data(localNormalData, simplified.SourceVertexIndices);
                     localColorData = RemapVector4Data(localColorData, simplified.SourceVertexIndices) ?? localColorData;
                     localUvData = RemapVector2Data(localUvData, simplified.SourceVertexIndices);
-                    GetMeshPreviewGeometryBounds(localVertexData, out min, out max);
                 }
             }
+
+            GetRobustMeshPreviewGeometryBounds(localVertexData, out min, out max);
 
             var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
             SaveMeshPreviewGeometryCache?.Invoke(mesh, densityPercent, new MeshPreviewGeometryCache
@@ -1273,7 +1342,7 @@ void main()
                 }
             }
 
-            GetMeshPreviewGeometryBounds(vertices, out var min, out var max);
+            GetRobustMeshPreviewGeometryBounds(vertices, out var min, out var max);
             return new MeshPreviewPartGeometry(
                 vertices,
                 part.Indices,
@@ -1323,6 +1392,60 @@ void main()
                 {
                     ExpandBounds(vertex, ref min, ref max);
                 }
+            }
+        }
+
+        private static void GetRobustMeshPreviewGeometryBounds(Vector3[] vertices, out Vector3 min, out Vector3 max)
+        {
+            min = Vector3.Zero;
+            max = Vector3.Zero;
+            if (vertices.Length == 0)
+            {
+                return;
+            }
+
+            var stride = Math.Max(1, (int)Math.Ceiling(vertices.Length / (double)PreviewBoundsSampleLimit));
+            var capacity = Math.Min(PreviewBoundsSampleLimit, (vertices.Length + stride - 1) / stride);
+            var x = new float[capacity];
+            var y = new float[capacity];
+            var z = new float[capacity];
+            var count = 0;
+            for (var i = 0; i < vertices.Length && count < capacity; i += stride)
+            {
+                var point = vertices[i];
+                if (!IsFinitePoint(point))
+                {
+                    continue;
+                }
+
+                x[count] = point.X;
+                y[count] = point.Y;
+                z[count] = point.Z;
+                count++;
+            }
+
+            if (count == 0)
+            {
+                return;
+            }
+
+            Array.Sort(x, 0, count);
+            Array.Sort(y, 0, count);
+            Array.Sort(z, 0, count);
+            var lowerIndex = count < PreviewBoundsMinimumTrimCount
+                ? 0
+                : Math.Clamp((int)Math.Floor((count - 1) * PreviewBoundsTrimFraction), 0, count - 1);
+            var upperIndex = count < PreviewBoundsMinimumTrimCount
+                ? count - 1
+                : Math.Clamp((int)Math.Ceiling((count - 1) * (1f - PreviewBoundsTrimFraction)), lowerIndex, count - 1);
+
+            min = new Vector3(x[lowerIndex], y[lowerIndex], z[lowerIndex]);
+            max = new Vector3(x[upperIndex], y[upperIndex], z[upperIndex]);
+
+            var robustSize = max - min;
+            if (Math.Max(robustSize.X, Math.Max(robustSize.Y, robustSize.Z)) <= 1e-5f)
+            {
+                GetMeshPreviewGeometryBounds(vertices, out min, out max);
             }
         }
 
@@ -1485,8 +1608,6 @@ void main()
                         ExpandBounds(vertex, ref min, ref max);
                     }
 
-                    localModelMatrixData = CreatePreviewModelMatrix(min, max);
-
                     // Indices
                     localIndiceData = new int[m_Indices.Count];
                     for (int i = 0; i < m_Indices.Count; i = i + 3)
@@ -1569,6 +1690,9 @@ void main()
                         }
                     }
 
+                    GetRobustMeshPreviewGeometryBounds(localVertexData, out var previewMin, out var previewMax);
+                    localModelMatrixData = CreatePreviewModelMatrix(previewMin, previewMax);
+
                     SaveMeshPreviewGeometryCache?.Invoke(m_Mesh, densityPercent, new MeshPreviewGeometryCache
                     {
                         ModelMatrix = localModelMatrixData,
@@ -1600,10 +1724,7 @@ void main()
 
                     if (resetMaterialOverrides)
                     {
-                        viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
-                        modelMatrixData = localModelMatrixData;
-                        initialViewMatrix = viewMatrixData;
-                        initialModelMatrix = modelMatrixData;
+                        SetInitialPreviewFrame(CreateUnityAutoViewMatrix(), localModelMatrixData);
                     }
                     vertexData = localVertexData;
                     indiceData = localIndiceData;
@@ -1703,10 +1824,7 @@ void main()
             colorData = new Vector4[vertexData.Length];
             for (int i = 0; i < vertexData.Length; i++) colorData[i] = new Vector4(1, 1, 1, 1);
 
-            viewMatrixData = Matrix4.CreateRotationY(-(float)Math.PI / 4) * Matrix4.CreateRotationX(-(float)Math.PI / 6);
-            modelMatrixData = Matrix4.CreateScale(0.8f);
-            initialViewMatrix = viewMatrixData;
-            initialModelMatrix = modelMatrixData;
+            SetInitialPreviewFrame(CreateUnityAutoViewMatrix(), Matrix4.CreateScale(0.8f));
         }
 
         protected override void OnOpenGlInit(GlInterface gl)
@@ -2682,7 +2800,7 @@ void main()
                 {
                     if (currentLoadId != meshLoadCounter) return;
 
-                    viewMatrixData = CreateAvatarInitialViewMatrix(avatarBonePositions, boneNames);
+                    var autoViewMatrix = CreateAvatarInitialViewMatrix(avatarBonePositions, boneNames);
                     avatarReferenceMeshSource = m_Mesh;
                     avatarReferenceSourceVertices = localVertexData;
                     avatarReferenceSourceIndices = m_Indices;
@@ -2691,9 +2809,7 @@ void main()
                     avatarReferenceBoneMatrices = null;
                     avatarReferenceParentIndices = null;
                     vertexData = referenceMesh.Vertices;
-                    modelMatrixData = localModelMatrixData;
-                    initialViewMatrix = viewMatrixData;
-                    initialModelMatrix = modelMatrixData;
+                    SetInitialPreviewFrame(autoViewMatrix, localModelMatrixData);
                     indiceData = localIndiceData;
                     normalData = null;
                     normal2Data = null;
@@ -2776,7 +2892,7 @@ void main()
                 {
                     if (currentLoadId != meshLoadCounter) return;
 
-                    viewMatrixData = CreateAvatarInitialViewMatrix(frames[0], boneNames);
+                    var autoViewMatrix = CreateAvatarInitialViewMatrix(frames[0], boneNames);
                     avatarReferenceMeshSource = m_Mesh;
                     avatarReferenceSourceVertices = sourceVertexData;
                     avatarReferenceSourceIndices = m_Indices;
@@ -2785,9 +2901,7 @@ void main()
                     avatarReferenceBoneMatrices = boneMatrices;
                     avatarReferenceParentIndices = parentIndices;
                     vertexData = localVertexData;
-                    modelMatrixData = localModelMatrixData;
-                    initialViewMatrix = viewMatrixData;
-                    initialModelMatrix = modelMatrixData;
+                    SetInitialPreviewFrame(autoViewMatrix, localModelMatrixData);
                     indiceData = localIndiceData;
                     normalData = null;
                     normal2Data = null;

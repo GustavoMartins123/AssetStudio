@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 10;
+        private const int SemanticSchemaVersion = 11;
         private const int SemanticRelationCommitBatchSize = 10_000;
         private const int ReadBusyTimeoutSeconds = 5;
         private static readonly object WriteGate = new object();

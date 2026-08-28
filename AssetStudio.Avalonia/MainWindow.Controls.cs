@@ -92,6 +92,22 @@ public partial class MainWindow
         GLPreviewControl?.RotateDown90();
     }
 
+    private void PreviewViewPresetSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (updatingAvatarPreviewControls
+            || PreviewViewPresetSelector?.SelectedItem is not MeshPreviewViewPreset preset)
+        {
+            return;
+        }
+
+        appSettings.ModelPreviewViewPreset = preset.ToString();
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.ViewPreset = preset;
+        }
+        QueueAvatarPreviewSettingsSave();
+    }
+
     private void ToggleMeshControlsBtn_Click(object? sender, RoutedEventArgs e)
     {
         if (MeshViewerControlsContent != null && ToggleMeshControlsBtn != null)
@@ -132,9 +148,14 @@ public partial class MainWindow
     {
         var boneScale = Math.Clamp(appSettings.AvatarPreviewBoneScale, MinAvatarPreviewBoneScale, MaxAvatarPreviewBoneScale);
         var densityPercent = Math.Clamp(appSettings.AvatarPreviewMeshDensityPercent, MinAvatarPreviewMeshDensityPercent, MaxAvatarPreviewMeshDensityPercent);
+        var viewPreset = Enum.TryParse<MeshPreviewViewPreset>(appSettings.ModelPreviewViewPreset, ignoreCase: true, out var parsedViewPreset)
+            && Enum.IsDefined(parsedViewPreset)
+                ? parsedViewPreset
+                : MeshPreviewViewPreset.Auto;
 
         appSettings.AvatarPreviewBoneScale = boneScale;
         appSettings.AvatarPreviewMeshDensityPercent = densityPercent;
+        appSettings.ModelPreviewViewPreset = viewPreset.ToString();
 
         updatingAvatarPreviewControls = true;
         try
@@ -147,6 +168,11 @@ public partial class MainWindow
             {
                 AvatarMeshDensitySlider.Value = densityPercent;
             }
+            if (PreviewViewPresetSelector != null)
+            {
+                PreviewViewPresetSelector.ItemsSource ??= Enum.GetValues<MeshPreviewViewPreset>();
+                PreviewViewPresetSelector.SelectedItem = viewPreset;
+            }
         }
         finally
         {
@@ -155,6 +181,10 @@ public partial class MainWindow
 
         ApplyAvatarPreviewBoneScale(boneScale);
         ApplyAvatarPreviewMeshDensity(densityPercent);
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.ViewPreset = viewPreset;
+        }
     }
 
     private void ApplyAvatarPreviewBoneScale(double boneScale)
