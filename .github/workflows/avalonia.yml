@@ -1,0 +1,31 @@
+name: Avalonia
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore Avalonia
+        run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj
+
+      - name: Build Avalonia
+        run: dotnet build AssetStudio.Avalonia/AssetStudio.Avalonia.csproj --configuration Release --no-restore

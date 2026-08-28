@@ -25,14 +25,8 @@ public partial class MainWindow
     {
         if (rebuildCandidateControls)
         {
-            var candidates = BuildMeshPreviewCandidates(m_Mesh);
-            var activeCandidate = SelectMeshPreviewCandidate(m_Mesh, candidates, selectedCandidate, preferModelGroup);
-            BuildPreviewCandidateControls(candidates, activeCandidate, "Model Group");
-            if (activeCandidate?.IsModelGroup == true)
-            {
-                QueuePreviewCandidateSelection(activeCandidate);
-                return;
-            }
+            QueueMeshPreviewCandidateBuild(assetItem, m_Mesh, selectedCandidate, preferModelGroup);
+            return;
         }
 
         var meshPreviewId = texturePreviewIdCounter;
@@ -161,6 +155,65 @@ public partial class MainWindow
         });
     }
 
+    private void QueueMeshPreviewCandidateBuild(
+        AssetItem assetItem,
+        Mesh mesh,
+        PreviewCandidateItem? selectedCandidate,
+        bool preferModelGroup)
+    {
+        var previewId = texturePreviewIdCounter;
+        StatusStripUpdate("Loading model relations...");
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var candidates = BuildMeshPreviewCandidates(mesh);
+                var activeCandidate = SelectMeshPreviewCandidate(mesh, candidates, selectedCandidate, preferModelGroup);
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId != texturePreviewIdCounter
+                        || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        return;
+                    }
+
+                    BuildPreviewCandidateControls(candidates, activeCandidate, "Model Group");
+                    if (activeCandidate?.IsModelGroup == true)
+                    {
+                        QueuePreviewCandidateSelection(activeCandidate);
+                        return;
+                    }
+
+                    PreviewMesh(
+                        assetItem,
+                        mesh,
+                        rebuildCandidateControls: false,
+                        selectedCandidate: activeCandidate,
+                        preferModelGroup: preferModelGroup);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Model relation query failed for {assetItem.Name}: {ex}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId == texturePreviewIdCounter
+                        && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    {
+                        ClearPreviewCandidateControls();
+                        PreviewMesh(
+                            assetItem,
+                            mesh,
+                            rebuildCandidateControls: false,
+                            selectedCandidate: selectedCandidate,
+                            preferModelGroup: preferModelGroup);
+                    }
+                });
+            }
+        });
+    }
+
     private List<PreviewCandidateItem> BuildMeshPreviewCandidates(Mesh mesh)
     {
         var candidates = new List<PreviewCandidateItem>();
@@ -182,14 +235,15 @@ public partial class MainWindow
 
         var seenGroups = new HashSet<string>(StringComparer.Ordinal);
         var seenGroupPartSignatures = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var group in LoadModelGroupsForMeshAssetIdForPreview(meshId))
+        foreach (var groupCandidate in LoadModelGroupCandidatesForMeshAssetIdForPreview(meshId))
         {
+            var group = groupCandidate.Group;
             if (string.IsNullOrWhiteSpace(group.GroupId) || !seenGroups.Add(group.GroupId))
             {
                 continue;
             }
 
-            var groupMeshes = LoadModelGroupMeshesForPreview(group.GroupId);
+            var groupMeshes = groupCandidate.Meshes;
             var meshIds = groupMeshes
                 .Select(item => item.MeshAssetId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
@@ -267,21 +321,21 @@ public partial class MainWindow
             ?? candidates.FirstOrDefault();
     }
 
-    private List<ModelGroupInfo> LoadModelGroupsForMeshAssetIdForPreview(string meshId)
+    private List<ModelGroupCandidateInfo> LoadModelGroupCandidatesForMeshAssetIdForPreview(string meshId)
     {
         if (!assetsManager.LazyLoading || currentScanResult == null || string.IsNullOrWhiteSpace(meshId))
         {
-            return new List<ModelGroupInfo>();
+            return new List<ModelGroupCandidateInfo>();
         }
 
         var folderPath = GetCurrentCacheFolderPath();
         if (!CanUseLazySemanticRelationCache(folderPath))
         {
-            return new List<ModelGroupInfo>();
+            return new List<ModelGroupCandidateInfo>();
         }
 
         var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-        return _sqliteCache.LoadModelGroupsForMeshAssetId(folderPath, signature, meshId);
+        return _sqliteCache.LoadModelGroupCandidatesForMeshAssetId(folderPath, signature, meshId);
     }
 
     private List<Mesh> ResolveModelGroupMeshesForPreview(PreviewCandidateItem candidate, CancellationToken token)
@@ -974,10 +1028,78 @@ public partial class MainWindow
         return null;
     }
 
-    private void PreviewAvatar(Avatar avatar, Mesh? preferredMesh = null, string? preferredMeshId = null, PreviewCandidateItem? selectedCandidateOverride = null)
+    private void QueueAvatarPreviewCandidateBuild(
+        Avatar avatar,
+        Mesh? preferredMesh,
+        string? preferredMeshId,
+        PreviewCandidateItem? selectedCandidateOverride)
     {
+        var previewId = texturePreviewIdCounter;
+        var selectedAsset = AssetListDataGrid.SelectedItem;
+        StatusStripUpdate("Loading avatar relations...");
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var candidates = BuildAvatarPreviewCandidates(avatar, preferredMesh, preferredMeshId);
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId != texturePreviewIdCounter
+                        || !ReferenceEquals(AssetListDataGrid.SelectedItem, selectedAsset))
+                    {
+                        return;
+                    }
+
+                    PreviewAvatar(
+                        avatar,
+                        preferredMesh,
+                        preferredMeshId,
+                        selectedCandidateOverride,
+                        rebuildCandidateControls: false,
+                        preparedCandidates: candidates);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Avatar relation query failed for {avatar.m_Name}: {ex}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId == texturePreviewIdCounter
+                        && ReferenceEquals(AssetListDataGrid.SelectedItem, selectedAsset))
+                    {
+                        PreviewAvatar(
+                            avatar,
+                            preferredMesh,
+                            preferredMeshId,
+                            selectedCandidateOverride,
+                            rebuildCandidateControls: false,
+                            preparedCandidates: Array.Empty<PreviewCandidateItem>());
+                    }
+                });
+            }
+        });
+    }
+
+    private void PreviewAvatar(
+        Avatar avatar,
+        Mesh? preferredMesh = null,
+        string? preferredMeshId = null,
+        PreviewCandidateItem? selectedCandidateOverride = null,
+        bool rebuildCandidateControls = true,
+        IReadOnlyList<PreviewCandidateItem>? preparedCandidates = null)
+    {
+        if (rebuildCandidateControls)
+        {
+            QueueAvatarPreviewCandidateBuild(avatar, preferredMesh, preferredMeshId, selectedCandidateOverride);
+            return;
+        }
+
         currentPreviewAvatar = avatar;
-        var avatarCandidates = BuildAvatarPreviewCandidates(avatar, preferredMesh, preferredMeshId);
+        var avatarCandidates = preparedCandidates?.ToList()
+            ?? (selectedCandidateOverride != null
+                ? new List<PreviewCandidateItem> { selectedCandidateOverride }
+                : new List<PreviewCandidateItem>());
         Mesh? avatarMesh = SelectAvatarPreviewMesh(avatarCandidates, preferredMesh, preferredMeshId);
         var selectedMeshId = GetPreviewObjectKey(avatarMesh);
         var selectedCandidate = selectedCandidateOverride == null
@@ -1834,6 +1956,79 @@ public partial class MainWindow
         };
     }
 
+    private void QueueAnimationClipPreviewCandidateBuild(
+        AnimationClip clip,
+        Avatar? preferredAvatar,
+        Mesh? preferredMesh,
+        string? preferredAvatarId,
+        string? preferredMeshId,
+        PreviewCandidateItem? selectedCandidate)
+    {
+        var previewId = texturePreviewIdCounter;
+        var selectedAsset = AssetListDataGrid.SelectedItem;
+        StatusStripUpdate("Loading animation relations...");
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var candidates = BuildAnimationClipPreviewCandidates(
+                    clip,
+                    preferredAvatar,
+                    preferredMesh,
+                    preferredAvatarId,
+                    preferredMeshId);
+                var activeCandidate = selectedCandidate
+                    ?? SelectAnimationClipPreviewCandidate(
+                        clip,
+                        candidates,
+                        preferredAvatar,
+                        preferredMesh,
+                        preferredAvatarId,
+                        preferredMeshId);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId != texturePreviewIdCounter
+                        || !ReferenceEquals(AssetListDataGrid.SelectedItem, selectedAsset))
+                    {
+                        return;
+                    }
+
+                    BuildPreviewCandidateControls(candidates, activeCandidate, "Animation Target");
+                    PreviewAnimationClip(
+                        clip,
+                        preferredAvatar,
+                        preferredMesh,
+                        preferredAvatarId,
+                        preferredMeshId,
+                        rebuildCandidateControls: false,
+                        selectedCandidate: activeCandidate);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Animation relation query failed for {clip.m_Name}: {ex}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (previewId == texturePreviewIdCounter
+                        && ReferenceEquals(AssetListDataGrid.SelectedItem, selectedAsset))
+                    {
+                        ClearPreviewCandidateControls();
+                        PreviewAnimationClip(
+                            clip,
+                            preferredAvatar,
+                            preferredMesh,
+                            preferredAvatarId,
+                            preferredMeshId,
+                            rebuildCandidateControls: false,
+                            selectedCandidate: selectedCandidate);
+                    }
+                });
+            }
+        });
+    }
+
     private void PreviewAnimationClip(
         AnimationClip clip,
         Avatar? preferredAvatar = null,
@@ -1850,14 +2045,20 @@ public partial class MainWindow
         }
 
         Stop2DAnimation();
-        PreviewCandidateItem? activeCandidate;
         if (rebuildCandidateControls)
         {
-            var previewCandidates = BuildAnimationClipPreviewCandidates(clip, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
-            activeCandidate = SelectAnimationClipPreviewCandidate(clip, previewCandidates, preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId);
-            BuildPreviewCandidateControls(previewCandidates, activeCandidate, "Animation Target");
+            QueueAnimationClipPreviewCandidateBuild(
+                clip,
+                preferredAvatar,
+                preferredMesh,
+                preferredAvatarId,
+                preferredMeshId,
+                selectedCandidate);
+            return;
         }
-        else if (selectedCandidate != null)
+
+        PreviewCandidateItem? activeCandidate;
+        if (selectedCandidate != null)
         {
             activeCandidate = selectedCandidate;
         }
