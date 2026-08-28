@@ -10,8 +10,9 @@ namespace AssetStudio.Avalonia
 {
     public class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 10;
+        private const int SemanticSchemaVersion = 11;
         private const int SemanticRelationCommitBatchSize = 10_000;
+        private const int ReadBusyTimeoutSeconds = 5;
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
         private readonly HashSet<string> _initializedDbs = new();
@@ -78,6 +79,26 @@ namespace AssetStudio.Avalonia
             return conn;
         }
 
+        private SqliteConnection CreateReadConnection(string folderPath)
+        {
+            var connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = GetDbPath(folderPath),
+                Mode = SqliteOpenMode.ReadOnly,
+                Pooling = true,
+                DefaultTimeout = ReadBusyTimeoutSeconds
+            }.ToString();
+            var conn = new SqliteConnection(connectionString);
+            conn.Open();
+            using var pragma = conn.CreateCommand();
+            pragma.CommandText = $@"
+                PRAGMA query_only = ON;
+                PRAGMA busy_timeout = {ReadBusyTimeoutSeconds * 1000};
+                PRAGMA temp_store = MEMORY;";
+            pragma.ExecuteNonQuery();
+            return conn;
+        }
+
         private void InitializeDatabase(string folderPath)
         {
             try
@@ -90,7 +111,8 @@ namespace AssetStudio.Avalonia
                         {
                             pragma.CommandText = @"
                                 PRAGMA journal_mode = WAL;
-                                PRAGMA synchronous = NORMAL;";
+                                PRAGMA synchronous = NORMAL;
+                                PRAGMA wal_autocheckpoint = 1000;";
                             pragma.ExecuteNonQuery();
                         }
 
@@ -119,7 +141,9 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+                // PASSIVE does not wait for active readers. TRUNCATE can hold the
+                // only writer for the full busy timeout while previews are reading.
+                cmd.CommandText = "PRAGMA wal_checkpoint(PASSIVE);";
                 using var reader = cmd.ExecuteReader();
                 if (reader.Read())
                 {
@@ -224,6 +248,7 @@ namespace AssetStudio.Avalonia
                             );
 
                             CREATE INDEX IF NOT EXISTS idx_projects_path ON Projects(FolderPath);
+                            CREATE INDEX IF NOT EXISTS idx_projects_lookup ON Projects(FolderPath COLLATE NOCASE, SignatureHash, LastIndexed DESC);
                             CREATE INDEX IF NOT EXISTS idx_handles_project ON AssetHandles(ProjectId);
                             DROP INDEX IF EXISTS idx_handles_unique;
 
@@ -383,26 +408,33 @@ namespace AssetStudio.Avalonia
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_source_files_unique ON SourceFiles(ProjectId, SerializedFileName, OriginalPath);
                             CREATE INDEX IF NOT EXISTS idx_assets_project ON Assets(ProjectId);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_unique ON Assets(ProjectId, UniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_assets_type_source ON Assets(ProjectId, Type, SourceFileId, UniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_edges_unique ON AssetEdges(ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetFileId, TargetPathID);
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_source ON AssetEdges(ProjectId, SourceAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_target ON AssetEdges(ProjectId, TargetAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_asset_edges_source_kind ON AssetEdges(ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SourceAssetUniqueID, SlotIndex);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_groups_unique ON ModelGroups(ProjectId, GroupAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_group_meshes_unique ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_mesh ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_renderers_unique ON MeshRenderers(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, RendererType);
                             CREATE INDEX IF NOT EXISTS idx_mesh_renderers_mesh ON MeshRenderers(ProjectId, MeshAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_mesh_renderers_lookup ON MeshRenderers(ProjectId, MeshAssetUniqueID, RendererType, RendererAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh ON MeshMaterials(ProjectId, MeshAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh_submesh ON MeshMaterials(ProjectId, MeshAssetUniqueID, SubMeshIndex);
                             CREATE INDEX IF NOT EXISTS idx_mesh_materials_renderer ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_rank ON MeshMaterials(ProjectId, MeshAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialScore DESC, RendererAssetUniqueID, MaterialAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_material ON MaterialTextures(ProjectId, MaterialAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_preview_material ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_material_lookup ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, TextureAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_material_textures_rank ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
                             CREATE INDEX IF NOT EXISTS idx_indexing_read_files_project ON IndexingReadFiles(ProjectId, ReadOrder);
@@ -422,7 +454,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using (var conn = CreateConnection(folderPath))
+                using (var conn = CreateReadConnection(folderPath))
                 {
                     long? projectId = null;
                     using (var cmd = conn.CreateCommand())
@@ -1075,18 +1107,14 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                using var conn = CreateReadConnection(folderPath);
+                var projectId = FindProjectId(conn, null, folderPath, signature);
                 if (projectId == null)
                 {
                     return false;
                 }
 
-                using var cmd = conn.CreateCommand();
-                cmd.Transaction = transaction;
-                var count = CountMaterialSemanticRelations(conn, transaction, projectId.Value);
-                transaction.Commit();
+                var count = CountMaterialSemanticRelations(conn, null, projectId.Value);
                 return count > 0;
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
@@ -1127,7 +1155,7 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static long? FindProjectId(SqliteConnection conn, SqliteTransaction transaction, string folderPath, string signature)
+        private static long? FindProjectId(SqliteConnection conn, SqliteTransaction? transaction, string folderPath, string signature)
         {
             var path1 = folderPath;
             var path2 = path1.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -1145,7 +1173,7 @@ namespace AssetStudio.Avalonia
             return id == null ? null : Convert.ToInt64(id);
         }
 
-        private static long? FindLatestProjectId(SqliteConnection conn, SqliteTransaction transaction, string folderPath)
+        private static long? FindLatestProjectId(SqliteConnection conn, SqliteTransaction? transaction, string folderPath)
         {
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
@@ -1276,16 +1304,14 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                using var conn = CreateReadConnection(folderPath);
+                var projectId = FindProjectId(conn, null, folderPath, signature);
                 if (projectId == null)
                 {
                     return null;
                 }
 
-                var state = LoadIndexingState(conn, transaction, projectId.Value);
-                transaction.Commit();
+                var state = LoadIndexingState(conn, null, projectId.Value);
                 return state;
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
@@ -1309,16 +1335,14 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindLatestProjectId(conn, transaction, folderPath);
+                using var conn = CreateReadConnection(folderPath);
+                var projectId = FindLatestProjectId(conn, null, folderPath);
                 if (projectId == null)
                 {
                     return null;
                 }
 
-                var state = LoadIndexingState(conn, transaction, projectId.Value);
-                transaction.Commit();
+                var state = LoadIndexingState(conn, null, projectId.Value);
                 return state;
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
@@ -1332,7 +1356,7 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static ProjectIndexingState? LoadIndexingState(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        private static ProjectIndexingState? LoadIndexingState(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
         {
             ProjectIndexingState? state = null;
             using (var cmd = conn.CreateCommand())
@@ -1414,7 +1438,7 @@ namespace AssetStudio.Avalonia
                 || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static long CountMaterialSemanticRelations(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        private static long CountMaterialSemanticRelations(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
         {
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
@@ -2084,7 +2108,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2102,6 +2126,24 @@ namespace AssetStudio.Avalonia
                           AND UniqueID = @meshAssetId
                         LIMIT 1
                     ),
+                    CandidateMaterials AS (
+                        SELECT DISTINCT MaterialAssetUniqueID
+                        FROM MeshMaterials
+                        WHERE ProjectId = @projectId
+                          AND MeshAssetUniqueID = @meshAssetId
+                          AND MaterialAssetUniqueID <> ''
+                    ),
+                    MaterialStats AS (
+                        SELECT
+                            candidate.MaterialAssetUniqueID,
+                            MAX(CASE WHEN texture.TextureAssetUniqueID <> '' AND texture.IsMainTexture <> 0 THEN 1 ELSE 0 END) AS HasMainTexture,
+                            MAX(CASE WHEN texture.TextureAssetUniqueID <> '' THEN 1 ELSE 0 END) AS HasTexture
+                        FROM CandidateMaterials candidate
+                        LEFT JOIN MaterialTextures texture
+                          ON texture.ProjectId = @projectId
+                         AND texture.MaterialAssetUniqueID = candidate.MaterialAssetUniqueID
+                        GROUP BY candidate.MaterialAssetUniqueID
+                    ),
                     RendererStats AS (
                         SELECT
                             mm.RendererAssetUniqueID,
@@ -2109,29 +2151,15 @@ namespace AssetStudio.Avalonia
                             SUM(CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) AS MaterialCount,
                             COUNT(*) AS RelationCount,
                             MAX(mm.MaterialScore) AS MaterialScore,
-                            MAX(CASE WHEN EXISTS (
-                                SELECT 1
-                                FROM Assets materialAsset
-                                WHERE materialAsset.ProjectId = mm.ProjectId
-                                  AND materialAsset.UniqueID = mm.MaterialAssetUniqueID
-                                  AND materialAsset.SourceFileId = (SELECT SourceFileId FROM MeshSource)
-                            ) THEN 1 ELSE 0 END) AS SameSourceScore,
-                            SUM(CASE WHEN EXISTS (
-                                SELECT 1
-                                FROM MaterialTextures mt
-                                WHERE mt.ProjectId = mm.ProjectId
-                                  AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
-                                  AND mt.TextureAssetUniqueID <> ''
-                                  AND mt.IsMainTexture <> 0
-                            ) THEN 1 ELSE 0 END) AS MainTextureCount,
-                            SUM(CASE WHEN EXISTS (
-                                SELECT 1
-                                FROM MaterialTextures mt
-                                WHERE mt.ProjectId = mm.ProjectId
-                                  AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
-                                  AND mt.TextureAssetUniqueID <> ''
-                            ) THEN 1 ELSE 0 END) AS TextureCount
+                            MAX(CASE WHEN materialAsset.SourceFileId = (SELECT SourceFileId FROM MeshSource) THEN 1 ELSE 0 END) AS SameSourceScore,
+                            SUM(COALESCE(materialStats.HasMainTexture, 0)) AS MainTextureCount,
+                            SUM(COALESCE(materialStats.HasTexture, 0)) AS TextureCount
                         FROM MeshMaterials mm
+                        LEFT JOIN Assets materialAsset
+                          ON materialAsset.ProjectId = mm.ProjectId
+                         AND materialAsset.UniqueID = mm.MaterialAssetUniqueID
+                        LEFT JOIN MaterialStats materialStats
+                          ON materialStats.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
                         WHERE mm.ProjectId = @projectId
                           AND mm.MeshAssetUniqueID = @meshAssetId
                         GROUP BY mm.RendererAssetUniqueID
@@ -2145,21 +2173,8 @@ namespace AssetStudio.Avalonia
                                 PARTITION BY mm.SubMeshIndex
                                 ORDER BY
                                     CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
-                                    CASE WHEN EXISTS (
-                                        SELECT 1
-                                        FROM MaterialTextures mt
-                                        WHERE mt.ProjectId = mm.ProjectId
-                                          AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
-                                          AND mt.TextureAssetUniqueID <> ''
-                                          AND mt.IsMainTexture <> 0
-                                    ) THEN 0 ELSE 1 END,
-                                    CASE WHEN EXISTS (
-                                        SELECT 1
-                                        FROM MaterialTextures mt
-                                        WHERE mt.ProjectId = mm.ProjectId
-                                          AND mt.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
-                                          AND mt.TextureAssetUniqueID <> ''
-                                    ) THEN 0 ELSE 1 END,
+                                    CASE WHEN COALESCE(materialStats.HasMainTexture, 0) <> 0 THEN 0 ELSE 1 END,
+                                    CASE WHEN COALESCE(materialStats.HasTexture, 0) <> 0 THEN 0 ELSE 1 END,
                                     COALESCE(rs.RendererScore, 0) DESC,
                                     COALESCE(rs.SameSourceScore, 0) DESC,
                                     COALESCE(rs.MainTextureCount, 0) DESC,
@@ -2174,6 +2189,8 @@ namespace AssetStudio.Avalonia
                         FROM MeshMaterials mm
                         LEFT JOIN RendererStats rs
                           ON rs.RendererAssetUniqueID = mm.RendererAssetUniqueID
+                        LEFT JOIN MaterialStats materialStats
+                          ON materialStats.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
                         WHERE mm.ProjectId = @projectId
                           AND mm.MeshAssetUniqueID = @meshAssetId
                     )
@@ -2215,7 +2232,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2302,7 +2319,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2358,7 +2375,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2433,7 +2450,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2485,7 +2502,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2535,7 +2552,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2606,7 +2623,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2682,7 +2699,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2736,6 +2753,165 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        internal List<ModelGroupCandidateInfo> LoadModelGroupCandidatesForMeshAssetId(
+            string folderPath,
+            string signature,
+            string meshAssetId)
+        {
+            var result = new List<ModelGroupCandidateInfo>();
+            if (string.IsNullOrWhiteSpace(meshAssetId))
+            {
+                return result;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateReadConnection(folderPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return result;
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    WITH CandidateGroups AS (
+                        SELECT
+                            modelGroup.GroupAssetUniqueID,
+                            modelGroup.GroupKind,
+                            modelGroup.GroupName,
+                            modelGroup.RootGameObjectAssetUniqueID,
+                            modelGroup.RootGameObjectName,
+                            modelGroup.AnimatorAssetUniqueID,
+                            modelGroup.AvatarAssetUniqueID,
+                            modelGroup.ControllerAssetUniqueID,
+                            modelGroup.SourceFileName,
+                            modelGroup.Confidence,
+                            modelGroup.ConfidenceReason,
+                            COUNT(groupMesh.MeshAssetUniqueID) AS PartCount,
+                            MIN(groupMesh.SlotIndex) AS FirstSlot
+                        FROM ModelGroups modelGroup
+                        INNER JOIN ModelGroupMeshes groupMesh
+                          ON groupMesh.ProjectId = modelGroup.ProjectId
+                         AND groupMesh.GroupAssetUniqueID = modelGroup.GroupAssetUniqueID
+                        WHERE modelGroup.ProjectId = @projectId
+                          AND EXISTS (
+                              SELECT 1
+                              FROM ModelGroupMeshes selectedMesh
+                              WHERE selectedMesh.ProjectId = modelGroup.ProjectId
+                                AND selectedMesh.GroupAssetUniqueID = modelGroup.GroupAssetUniqueID
+                                AND selectedMesh.MeshAssetUniqueID = @meshAssetId
+                          )
+                        GROUP BY
+                            modelGroup.GroupAssetUniqueID,
+                            modelGroup.GroupKind,
+                            modelGroup.GroupName,
+                            modelGroup.RootGameObjectAssetUniqueID,
+                            modelGroup.RootGameObjectName,
+                            modelGroup.AnimatorAssetUniqueID,
+                            modelGroup.AvatarAssetUniqueID,
+                            modelGroup.ControllerAssetUniqueID,
+                            modelGroup.SourceFileName,
+                            modelGroup.Confidence,
+                            modelGroup.ConfidenceReason
+                    )
+                    SELECT
+                        candidate.GroupAssetUniqueID,
+                        candidate.GroupKind,
+                        candidate.GroupName,
+                        candidate.RootGameObjectAssetUniqueID,
+                        candidate.RootGameObjectName,
+                        candidate.AnimatorAssetUniqueID,
+                        candidate.AvatarAssetUniqueID,
+                        candidate.ControllerAssetUniqueID,
+                        candidate.SourceFileName,
+                        candidate.Confidence,
+                        candidate.ConfidenceReason,
+                        groupMesh.MeshAssetUniqueID,
+                        groupMesh.RendererAssetUniqueID,
+                        groupMesh.RendererType,
+                        groupMesh.GameObjectAssetUniqueID,
+                        groupMesh.GameObjectName,
+                        groupMesh.SlotIndex,
+                        groupMesh.Confidence,
+                        groupMesh.ConfidenceReason,
+                        groupMesh.TransformMatrix,
+                        COALESCE(mesh.Name, ''),
+                        COALESCE(mesh.PathID, 0),
+                        COALESCE(mesh.ByteSize, 0),
+                        COALESCE(mesh.Type, 0)
+                    FROM CandidateGroups candidate
+                    INNER JOIN ModelGroupMeshes groupMesh
+                      ON groupMesh.ProjectId = @projectId
+                     AND groupMesh.GroupAssetUniqueID = candidate.GroupAssetUniqueID
+                    LEFT JOIN Assets mesh
+                      ON mesh.ProjectId = groupMesh.ProjectId
+                     AND mesh.UniqueID = groupMesh.MeshAssetUniqueID
+                    ORDER BY
+                        candidate.Confidence DESC,
+                        candidate.PartCount,
+                        candidate.FirstSlot,
+                        candidate.GroupName,
+                        candidate.GroupAssetUniqueID,
+                        groupMesh.SlotIndex,
+                        groupMesh.GameObjectName,
+                        mesh.Name,
+                        groupMesh.MeshAssetUniqueID";
+                cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+                cmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+
+                var candidatesById = new Dictionary<string, ModelGroupCandidateInfo>(StringComparer.Ordinal);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var groupId = reader.GetString(0);
+                    if (!candidatesById.TryGetValue(groupId, out var candidate))
+                    {
+                        var group = new ModelGroupInfo(
+                            groupId,
+                            reader.GetString(1),
+                            reader.GetString(2),
+                            reader.GetString(3),
+                            reader.GetString(4),
+                            reader.GetString(5),
+                            reader.GetString(6),
+                            reader.GetString(7),
+                            reader.GetString(8),
+                            reader.GetInt32(9),
+                            reader.GetString(10));
+                        candidate = new ModelGroupCandidateInfo(group);
+                        candidatesById.Add(groupId, candidate);
+                        result.Add(candidate);
+                    }
+
+                    candidate.Meshes.Add(new ModelGroupMeshInfo(
+                        groupId,
+                        reader.GetString(11),
+                        reader.GetString(12),
+                        reader.GetString(13),
+                        reader.GetString(14),
+                        reader.GetString(15),
+                        reader.GetInt32(16),
+                        reader.GetInt32(17),
+                        reader.GetString(18),
+                        ReadTransformMatrix(reader, 19),
+                        reader.GetString(20),
+                        reader.GetInt64(21),
+                        reader.GetInt64(22),
+                        reader.GetInt32(23)));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load model group candidates from SQLite: {ex.Message}");
+            }
+
+            return result;
+        }
+
         internal List<ModelGroupInfo> LoadModelGroupsForMeshAssetId(string folderPath, string signature, string meshAssetId)
         {
             var result = new List<ModelGroupInfo>();
@@ -2747,7 +2923,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2832,7 +3008,7 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
+                using var conn = CreateReadConnection(folderPath);
                 using var transaction = conn.BeginTransaction();
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
@@ -2911,9 +3087,8 @@ namespace AssetStudio.Avalonia
             EnsureInitialized(folderPath);
             try
             {
-                using var conn = CreateConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                using var conn = CreateReadConnection(folderPath);
+                var projectId = FindProjectId(conn, null, folderPath, signature);
                 if (projectId == null)
                 {
                     return null;
@@ -2922,7 +3097,6 @@ namespace AssetStudio.Avalonia
                 PreviewCacheEntry? entry = null;
                 using (var cmd = conn.CreateCommand())
                 {
-                    cmd.Transaction = transaction;
                     cmd.CommandText = @"
                         SELECT Id, PayloadHash, PayloadPath, ByteSize
                         FROM PreviewCacheEntries
@@ -2948,7 +3122,6 @@ namespace AssetStudio.Avalonia
                     }
                 }
 
-                transaction.Commit();
                 return entry;
             }
             catch (Exception ex)
@@ -3041,6 +3214,16 @@ namespace AssetStudio.Avalonia
                     using (var conn = new SqliteConnection($"Data Source={dbPath}"))
                     {
                         SqliteConnection.ClearPool(conn);
+                    }
+                    using (var readConn = new SqliteConnection(new SqliteConnectionStringBuilder
+                    {
+                        DataSource = dbPath,
+                        Mode = SqliteOpenMode.ReadOnly,
+                        Pooling = true,
+                        DefaultTimeout = ReadBusyTimeoutSeconds
+                    }.ToString()))
+                    {
+                        SqliteConnection.ClearPool(readConn);
                     }
 
                     if (File.Exists(dbPath))
@@ -3170,5 +3353,16 @@ namespace AssetStudio.Avalonia
         public long MeshPathId { get; }
         public long MeshByteSize { get; }
         public int MeshType { get; }
+    }
+
+    internal sealed class ModelGroupCandidateInfo
+    {
+        public ModelGroupCandidateInfo(ModelGroupInfo group)
+        {
+            Group = group;
+        }
+
+        public ModelGroupInfo Group { get; }
+        public List<ModelGroupMeshInfo> Meshes { get; } = new();
     }
 }

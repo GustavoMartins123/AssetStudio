@@ -1461,7 +1461,7 @@ namespace AssetStudio.Avalonia
                     gameObjectId,
                     binding.GameObject?.m_Name ?? string.Empty,
                     slotIndex,
-                    BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
+                    BuildLocalToGroupRootMatrix(sourceFile, binding.GameObject, rootGameObjectId),
                     match.Confidence,
                     match.ConfidenceReason));
                 slotIndex++;
@@ -1570,7 +1570,7 @@ namespace AssetStudio.Avalonia
                         gameObjectId,
                         binding.GameObject?.m_Name ?? string.Empty,
                         slotIndex,
-                        BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
+                        BuildLocalToGroupRootMatrix(sourceFile, binding.GameObject, group.Root.GameObjectId),
                         binding.Confidence,
                         binding.ConfidenceReason));
                     slotIndex++;
@@ -1654,6 +1654,60 @@ namespace AssetStudio.Avalonia
             }
 
             return MatrixToRowMajorArray(world, omitIdentity: true);
+        }
+
+        private static float[]? BuildLocalToGroupRootMatrix(
+            SerializedFile sourceFile,
+            GameObject? gameObject,
+            string rootGameObjectId)
+        {
+            if (gameObject == null || string.IsNullOrWhiteSpace(rootGameObjectId))
+            {
+                return BuildLocalToWorldMatrix(sourceFile, gameObject);
+            }
+
+            var transforms = new List<Transform>();
+            var visited = new HashSet<long>();
+            var transform = ResolveTransformForGameObjectBackground(sourceFile, gameObject);
+            var reachedGroupRoot = false;
+            for (var depth = 0; transform != null && depth < 256; depth++)
+            {
+                if (!visited.Add(transform.m_PathID))
+                {
+                    break;
+                }
+
+                var transformGameObject = ResolveGameObjectBackground(sourceFile, transform.m_GameObject);
+                var transformGameObjectId = transformGameObject != null
+                    ? GetSemanticAssetId(transformGameObject)
+                    : string.Empty;
+                if (string.Equals(transformGameObjectId, rootGameObjectId, StringComparison.Ordinal))
+                {
+                    reachedGroupRoot = true;
+                    break;
+                }
+
+                transforms.Add(transform);
+                if (transform.m_Father == null || transform.m_Father.IsNull)
+                {
+                    break;
+                }
+
+                transform = ResolveTransformBackground(sourceFile, transform.m_Father);
+            }
+
+            if (!reachedGroupRoot)
+            {
+                return BuildLocalToWorldMatrix(sourceFile, gameObject);
+            }
+
+            var localToRoot = CreateIdentityMatrix();
+            for (var i = transforms.Count - 1; i >= 0; i--)
+            {
+                localToRoot = localToRoot * BuildLocalMatrix(transforms[i]);
+            }
+
+            return MatrixToRowMajorArray(localToRoot, omitIdentity: true);
         }
 
         private static Matrix4x4 BuildLocalMatrix(Transform transform)

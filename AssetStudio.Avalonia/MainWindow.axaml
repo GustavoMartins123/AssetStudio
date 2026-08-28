@@ -342,6 +342,11 @@
                                 <StackPanel x:Name="MeshViewerControlsContent" Spacing="8" ClipToBounds="False">
                                     <!-- Reset View Button -->
                                     <Button x:Name="ResetViewBtn" Content="Reset View" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="ResetViewBtn_Click" Height="28" FontSize="11" />
+
+                                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                                        <TextBlock Text="View" Foreground="White" FontSize="10" VerticalAlignment="Center" />
+                                        <ComboBox Grid.Column="1" x:Name="PreviewViewPresetSelector" MinHeight="28" SelectionChanged="PreviewViewPresetSelector_SelectionChanged" />
+                                    </Grid>
                                     
                                     <!-- Directional Rotation Buttons -->
                                     <Grid ColumnDefinitions="*,*,*,*" ColumnSpacing="4">
