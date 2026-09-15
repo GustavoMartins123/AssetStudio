@@ -40,7 +40,9 @@ namespace AssetStudio
         private int _exportedBoneCount;
         private int _exportedMeshCount;
         private int _exportedSkinCount;
+        private int _candidateClusterCount;
         private int _exportedClusterCount;
+        private int _omittedClusterCount;
         private int _exportedMaterialCount;
         private int _exportedTextureCount;
         private int _exportedAnimationStackCount;
@@ -246,7 +248,7 @@ namespace AssetStudio
                 poseNode.AddNode(node);
 
                 var matrixNode = N("Matrix");
-                matrixNode.AddProperty(new DoubleArrayToken(ToFbxMatrixArray(matrix)));
+                matrixNode.AddProperty(new DoubleArrayToken(NumericsToFbxArray(matrix)));
                 poseNode.AddNode(matrixNode);
 
                 pose.AddNode(poseNode);
@@ -709,7 +711,7 @@ namespace AssetStudio
             Connect(skinId, geoId);
 
             var meshBindMatrix = GetFrameMatrix(mesh.Path, System.Numerics.Matrix4x4.Identity);
-            var transform = ToFbxMatrixArray(meshBindMatrix);
+            var transform = NumericsToFbxArray(meshBindMatrix);
 
             for (int boneIdx = 0; boneIdx < mesh.BoneList.Count; boneIdx++)
             {
@@ -717,15 +719,7 @@ namespace AssetStudio
                 if (bone.Path == null)
                     continue;
 
-                var clusterId = GenId();
-                _exportedClusterCount++;
-                var cluster = N("Deformer");
-                cluster.AddProperty(new LongToken(clusterId));
-                cluster.AddProperty(new StringToken($"SubDeformer::{bone.Path}"));
-                cluster.AddProperty(new StringToken("Cluster"));
-                AddSimpleNode(cluster, "Version", 100);
-                AddSimpleNode(cluster, "Mode", "TotalOne");
-                AddSimpleNode(cluster, "UserData", "");
+                _candidateClusterCount++;
 
                 var indices = new List<int>(mesh.VertexList.Count);
                 var weights = new List<double>(mesh.VertexList.Count);
@@ -744,7 +738,21 @@ namespace AssetStudio
                 }
 
                 if (indices.Count == 0)
+                {
+                    _omittedClusterCount++;
+                    Logger.Verbose($"Omitted zero-weight skin cluster for mesh '{mesh.Path}' and bone '{bone.Path}'.");
                     continue;
+                }
+
+                var clusterId = GenId();
+                _exportedClusterCount++;
+                var cluster = N("Deformer");
+                cluster.AddProperty(new LongToken(clusterId));
+                cluster.AddProperty(new StringToken($"SubDeformer::{bone.Path}"));
+                cluster.AddProperty(new StringToken("Cluster"));
+                AddSimpleNode(cluster, "Version", 100);
+                AddSimpleNode(cluster, "Mode", "TotalOne");
+                AddSimpleNode(cluster, "UserData", "");
 
                 var idxNode = N("Indexes");
                 idxNode.AddProperty(new IntegerArrayToken(indices.ToArray()));
@@ -754,7 +762,7 @@ namespace AssetStudio
                 wNode.AddProperty(new DoubleArrayToken(weights.ToArray()));
                 cluster.AddNode(wNode);
 
-                var transformLink = ToFbxMatrixArray(GetBindPoseLinkMatrix(meshBindMatrix, bone));
+                var transformLink = NumericsToFbxArray(GetBindPoseLinkMatrix(meshBindMatrix, bone));
 
                 var tNode = N("Transform");
                 tNode.AddProperty(new DoubleArrayToken(transform));
@@ -1074,8 +1082,8 @@ namespace AssetStudio
         {
             if (TryGetInverseBindPoseMatrix(bone.Matrix, out var inverseBindPose))
             {
-                // Unity stores bind poses as bone^-1 * mesh; FBX clusters need the bone global matrix at bind time.
-                return meshBindMatrix * inverseBindPose;
+                // In row-vector convention: P_row * B_row = M_row => B_row = inverse(P_row) * M_row
+                return inverseBindPose * meshBindMatrix;
             }
 
             Logger.Warning($"Unable to invert bind pose for bone '{bone.Path}' while exporting FBX skin cluster; using frame transform.");
@@ -1084,21 +1092,41 @@ namespace AssetStudio
 
         private static bool TryGetInverseBindPoseMatrix(Matrix4x4 matrix, out System.Numerics.Matrix4x4 inverseBindPose)
         {
-            return System.Numerics.Matrix4x4.Invert(ToFbxMatrix(matrix), out inverseBindPose);
+            return System.Numerics.Matrix4x4.Invert(UnityBindPoseToNumerics(matrix), out inverseBindPose);
         }
 
-        private static System.Numerics.Matrix4x4 ToFbxMatrix(Matrix4x4 matrix)
+        /// <summary>
+        /// Converts a Unity deserialized bind pose Matrix4x4 into a System.Numerics.Matrix4x4.
+        ///
+        /// Mathematical Convention and Serialization Details:
+        /// 1. Unity binary assets store serialized Matrix4x4f as 16 consecutive floats in row-major order:
+        ///    e00, e01, e02, e03,
+        ///    e10, e11, e12, e13,
+        ///    e20, e21, e22, e23,
+        ///    e30, e31, e32, e33
+        ///    where the translation vector resides in elements e03, e13, e23 (or values[3], values[7], values[11]).
+        /// 2. AssetStudio's Matrix4x4(float[] values) constructor populates internal storage column-by-column:
+        ///    values[0]->M00, values[1]->M10, values[2]->M20, values[3]->M30 (row 3, col 0)
+        ///    values[4]->M01, values[5]->M11, values[6]->M21, values[7]->M31 (row 3, col 1)
+        ///    values[8]->M02, values[9]->M12, values[10]->M22, values[11]->M32 (row 3, col 2)
+        ///    Consequently, translation is stored in AssetStudio.Matrix4x4 in row 3 (M30, M31, M32).
+        /// 3. System.Numerics.Matrix4x4 follows row-vector convention (v' = v * M), where translation
+        ///    is stored in the 4th row (M41, M42, M43).
+        /// 4. Direct index mapping (matrix[r, c] -> M(r+1)(c+1)) maps row 3 (M30, M31, M32) directly into
+        ///    M41, M42, M43, properly preserving the translation in System.Numerics row-vector representation.
+        /// </summary>
+        private static System.Numerics.Matrix4x4 UnityBindPoseToNumerics(Matrix4x4 matrix)
         {
             return new System.Numerics.Matrix4x4(
-                matrix[0, 0], matrix[1, 0], matrix[2, 0], matrix[3, 0],
-                matrix[0, 1], matrix[1, 1], matrix[2, 1], matrix[3, 1],
-                matrix[0, 2], matrix[1, 2], matrix[2, 2], matrix[3, 2],
-                matrix[0, 3], matrix[1, 3], matrix[2, 3], matrix[3, 3]);
+                matrix[0, 0], matrix[0, 1], matrix[0, 2], matrix[0, 3],
+                matrix[1, 0], matrix[1, 1], matrix[1, 2], matrix[1, 3],
+                matrix[2, 0], matrix[2, 1], matrix[2, 2], matrix[2, 3],
+                matrix[3, 0], matrix[3, 1], matrix[3, 2], matrix[3, 3]);
         }
 
         private double[] GetFrameMatrixArray(string path, System.Numerics.Matrix4x4 fallback)
         {
-            return ToFbxMatrixArray(GetFrameMatrix(path, fallback));
+            return NumericsToFbxArray(GetFrameMatrix(path, fallback));
         }
 
         private System.Numerics.Matrix4x4 GetFrameMatrix(string path, System.Numerics.Matrix4x4 fallback)
@@ -1153,7 +1181,11 @@ namespace AssetStudio
             return (float)(SanitizeDouble(degrees) * Math.PI / 180.0);
         }
 
-        private static double[] ToFbxMatrixArray(System.Numerics.Matrix4x4 matrix)
+        /// <summary>
+        /// Serializes a System.Numerics.Matrix4x4 row-vector matrix into a 16-element double array
+        /// in FBX row-major layout.
+        /// </summary>
+        private static double[] NumericsToFbxArray(System.Numerics.Matrix4x4 matrix)
         {
             return new[]
             {
@@ -1229,13 +1261,9 @@ namespace AssetStudio
 
         private bool ShouldZeroBoneTransform(string normalizedPath)
         {
-            if (string.IsNullOrEmpty(normalizedPath))
-                return false;
-
-            if (_meshPathSet.Contains(normalizedPath))
-                return false;
-
-            return _bonePathSet.Contains(normalizedPath) || _skinBonePathSet.Contains(normalizedPath);
+            // Bone zeroing is permanently disabled. Preserving original rest poses ensures consistency
+            // between the FBX skeletal hierarchy rest pose and skin cluster bind poses.
+            return false;
         }
 
         private static string NormalizeFramePath(string path)
@@ -1544,7 +1572,9 @@ namespace AssetStudio
                 writer.WriteLine($"Exported bone models: {_exportedBoneCount}");
                 writer.WriteLine($"Exported meshes: {_exportedMeshCount}");
                 writer.WriteLine($"Exported skins: {_exportedSkinCount}");
-                writer.WriteLine($"Exported skin clusters: {_exportedClusterCount}");
+                writer.WriteLine($"Candidate bone bindings: {_candidateClusterCount}");
+                writer.WriteLine($"Active FBX skin clusters: {_exportedClusterCount}");
+                writer.WriteLine($"Zero-weight bindings omitted: {_omittedClusterCount}");
                 writer.WriteLine($"Exported materials: {_exportedMaterialCount}");
                 writer.WriteLine($"Exported textures: {_exportedTextureCount}");
                 writer.WriteLine($"Exported animation stacks: {_exportedAnimationStackCount}");

@@ -451,40 +451,40 @@ namespace AssetStudio
             {
                 return Vector3.Zero;
             }
-            var magnitude = (float)Math.Sqrt(unit);
-            q.X /= magnitude;
-            q.Y /= magnitude;
-            q.Z /= magnitude;
-            q.W /= magnitude;
-            sqw = q.W * q.W;
-            sqx = q.X * q.X;
-            sqy = q.Y * q.Y;
-            sqz = q.Z * q.Z;
-            unit = 1f;
-            float test = q.X * q.Y + q.Z * q.W;
+            float invNorm = 1f / (float)Math.Sqrt(unit);
+            float qx = q.X * invNorm;
+            float qy = q.Y * invNorm;
+            float qz = q.Z * invNorm;
+            float qw = q.W * invNorm;
 
-            float yaw, pitch, roll;
+            // Compute matrix elements for Euler XYZ rotation (Rx * Ry * Rz)
+            // matching FbxSharpieExporter.BuildLocalMatrix and FBX default eEulerXYZ
+            float m11 = 1f - 2f * (qy * qy + qz * qz);
+            float m12 = 2f * (qx * qy + qz * qw);
+            float m13 = 2f * (qx * qz - qy * qw);
+            float m23 = 2f * (qy * qz + qx * qw);
+            float m33 = 1f - 2f * (qx * qx + qy * qy);
 
-            if (test > 0.499f * unit)
+            float sinY = -m13;
+            sinY = Math.Max(-1f, Math.Min(1f, sinY));
+            float rotY = (float)Math.Asin(sinY);
+
+            float rotX, rotZ;
+            if (Math.Abs(sinY) < 0.99999f)
             {
-                yaw = 2f * (float)Math.Atan2(q.X, q.W);
-                pitch = (float)Math.PI / 2f;
-                roll = 0f;
-            }
-            else if (test < -0.499f * unit)
-            {
-                yaw = -2f * (float)Math.Atan2(q.X, q.W);
-                pitch = -(float)Math.PI / 2f;
-                roll = 0f;
+                rotX = (float)Math.Atan2(m23, m33);
+                rotZ = (float)Math.Atan2(m12, m11);
             }
             else
             {
-                yaw = (float)Math.Atan2(2f * q.Y * q.W - 2f * q.X * q.Z, sqx - sqy - sqz + sqw);
-                pitch = (float)Math.Asin(Math.Max(-1f, Math.Min(1f, 2f * test / unit)));
-                roll = (float)Math.Atan2(2f * q.X * q.W - 2f * q.Y * q.Z, -sqx + sqy -sqz + sqw);
+                float m21 = 2f * (qx * qy - qz * qw);
+                float m22 = 1f - 2f * (qx * qx + qz * qz);
+                rotX = (float)Math.Atan2(-m21, m22);
+                rotZ = 0f;
             }
 
-            return new Vector3(roll * 180f / (float)Math.PI, pitch * 180f / (float)Math.PI, yaw * 180f / (float)Math.PI);
+            const float rad2deg = 180f / (float)Math.PI;
+            return new Vector3(rotX * rad2deg, rotY * rad2deg, rotZ * rad2deg);
         }
 
         private void ConvertTransforms(Transform trans, ImportedFrame parent)
