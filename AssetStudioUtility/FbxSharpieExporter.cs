@@ -21,6 +21,7 @@ namespace AssetStudio
         private bool _exportAnimations;
         private bool _exportBlendShape;
         private bool _castToBone;
+        private bool _exportMeshes;
         private float _boneSize;
         private string _exportDirectory;
         private ImportedFrame _rootFrame;
@@ -76,7 +77,7 @@ namespace AssetStudio
         private List<MeshDiagnosticInfo> _meshDiagnostics = new List<MeshDiagnosticInfo>();
 
         public FbxSharpieExporter(string fileName, float scaleFactor, int versionIndex, bool isAscii, bool is60Fps,
-            bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f)
+            bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f, bool exportMeshes = true)
         {
             _scaleFactor = scaleFactor;
             _isAscii = isAscii;
@@ -85,6 +86,7 @@ namespace AssetStudio
             _exportBlendShape = exportBlendShape;
             _castToBone = castToBone;
             _boneSize = boneSize;
+            _exportMeshes = exportMeshes;
             _document = new FbxDocument();
             _document.Version = FbxVersion.v7_4;
 
@@ -121,13 +123,13 @@ namespace AssetStudio
                     ExportBindPose();
                 }
 
-                if (convert.MaterialList != null)
+                if (_exportMeshes && convert.MaterialList != null)
                 {
                     foreach (var mat in convert.MaterialList)
                         ExportMaterial(mat, convert);
                 }
 
-                if (convert.MeshList != null)
+                if (_exportMeshes && convert.MeshList != null)
                 {
                     foreach (var mesh in convert.MeshList)
                         ExportMesh(mesh, convert);
@@ -166,7 +168,7 @@ namespace AssetStudio
             _frameGlobalMatrixMap[normalizedPath] = globalMatrix;
             var isBone = IsBonePath(normalizedPath);
             var zeroTransform = ShouldZeroBoneTransform(normalizedPath);
-            var modelType = _meshPathSet.Contains(normalizedPath) ? "Mesh" : isBone ? "LimbNode" : "Null";
+            var modelType = (_exportMeshes && _meshPathSet.Contains(normalizedPath)) ? "Mesh" : isBone ? "LimbNode" : "Null";
             var fbxName = GetUniqueFbxName(frame.Name);
 
             var model = N("Model");
@@ -1250,11 +1252,14 @@ namespace AssetStudio
 
         private bool IsBonePath(string normalizedPath)
         {
-            if (_castToBone)
-                return true;
-
             if (string.IsNullOrEmpty(normalizedPath))
                 return false;
+
+            if (normalizedPath == NormalizeFramePath(_rootFrame?.Path))
+                return false;
+
+            if (_castToBone)
+                return true;
 
             return _bonePathSet.Contains(normalizedPath);
         }
