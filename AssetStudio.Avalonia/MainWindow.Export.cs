@@ -1513,6 +1513,11 @@ public partial class MainWindow
                 exportOptions.FbxVersion,
                 exportOptions.FbxFormat == 1);
 
+            if (exportOptions.ExportUnityMeta)
+            {
+                AssetExportHelper.WriteModelMetaIfMissing(exportFile);
+            }
+
             // 2. Export each animation clip separately
             foreach (var anim in convert.AnimationList)
             {
@@ -1536,6 +1541,19 @@ public partial class MainWindow
                     (float)exportOptions.ScaleFactor,
                     exportOptions.FbxVersion,
                     exportOptions.FbxFormat == 1);
+
+                if (exportOptions.ExportUnityMeta)
+                {
+                    AssetExportHelper.WriteAnimationMetaIfMissing(animFile);
+                }
+
+                if (exportOptions.ExportUnityAnimClips)
+                {
+                    var animClipPath = Path.Combine(
+                        Path.GetDirectoryName(exportFile)!,
+                        $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.anim");
+                    AssetExportHelper.ExportUnityAnimationClip(anim, animClipPath);
+                }
             }
         }
         else
@@ -1553,6 +1571,11 @@ public partial class MainWindow
                 (float)exportOptions.ScaleFactor,
                 exportOptions.FbxVersion,
                 exportOptions.FbxFormat == 1);
+
+            if (exportOptions.ExportUnityMeta)
+            {
+                AssetExportHelper.WriteModelMetaIfMissing(exportFile);
+            }
         }
     }
 

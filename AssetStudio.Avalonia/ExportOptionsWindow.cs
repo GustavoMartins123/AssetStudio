@@ -36,6 +36,8 @@ public sealed class ExportOptionsState
     public decimal ScaleFactor { get; set; } = 1m;
     public int FbxVersion { get; set; } = 3;
     public int FbxFormat { get; set; } = 1;
+    public bool ExportUnityMeta { get; set; } = true;
+    public bool ExportUnityAnimClips { get; set; } = true;
 
     public ExportOptionsState Clone() => (ExportOptionsState)MemberwiseClone();
 
@@ -60,6 +62,8 @@ public sealed class ExportOptionsState
         ScaleFactor = other.ScaleFactor;
         FbxVersion = other.FbxVersion;
         FbxFormat = other.FbxFormat;
+        ExportUnityMeta = other.ExportUnityMeta;
+        ExportUnityAnimClips = other.ExportUnityAnimClips;
     }
 }
 
@@ -85,13 +89,15 @@ public sealed class ExportOptionsWindow : Window
     private readonly TextBox scaleFactor = new() { Width = 90 };
     private readonly ComboBox fbxVersion = new();
     private readonly ComboBox fbxFormat = new();
+    private readonly CheckBox exportUnityMeta = new() { Content = "Export Unity humanoid .meta" };
+    private readonly CheckBox exportUnityAnimClips = new() { Content = "Export Unity native .anim clips" };
 
     public ExportOptionsWindow(ExportOptionsState state)
     {
         this.state = state;
         Title = "Export options";
         Width = 420;
-        Height = 560;
+        Height = 620;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         CanResize = false;
 
@@ -124,6 +130,10 @@ public sealed class ExportOptionsWindow : Window
         panel.Children.Add(Labeled("Scale factor", scaleFactor));
         panel.Children.Add(Labeled("FBX version", fbxVersion));
         panel.Children.Add(Labeled("FBX format", fbxFormat));
+        panel.Children.Add(Separator());
+        panel.Children.Add(new TextBlock { Text = "Unity Integration" });
+        panel.Children.Add(exportUnityMeta);
+        panel.Children.Add(exportUnityAnimClips);
 
         var buttons = new StackPanel
         {
@@ -163,6 +173,8 @@ public sealed class ExportOptionsWindow : Window
         scaleFactor.Text = state.ScaleFactor.ToString(CultureInfo.InvariantCulture);
         fbxVersion.SelectedIndex = state.FbxVersion;
         fbxFormat.SelectedIndex = state.FbxFormat;
+        exportUnityMeta.IsChecked = state.ExportUnityMeta;
+        exportUnityAnimClips.IsChecked = state.ExportUnityAnimClips;
     }
 
     private void Ok_Click(object? sender, RoutedEventArgs e)
@@ -186,6 +198,8 @@ public sealed class ExportOptionsWindow : Window
         state.ScaleFactor = ParseDecimal(scaleFactor.Text, state.ScaleFactor);
         state.FbxVersion = Math.Max(0, fbxVersion.SelectedIndex);
         state.FbxFormat = Math.Max(0, fbxFormat.SelectedIndex);
+        state.ExportUnityMeta = exportUnityMeta.IsChecked == true;
+        state.ExportUnityAnimClips = exportUnityAnimClips.IsChecked == true;
         Close(state);
     }
 

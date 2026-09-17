@@ -1726,5 +1726,502 @@ TextureImporter:
             return true;
         }
         #endregion
+
+        #region Unity Model and Animation Helpers
+        public static void WriteModelMetaIfMissing(string modelFbxPath, Object obj = null)
+        {
+            var metaPath = modelFbxPath + ".meta";
+            if (File.Exists(metaPath)) return;
+            var guid = GenerateStableGuid(obj);
+            var metaContent = BuildModelHumanoidMeta(guid);
+            File.WriteAllText(metaPath, metaContent, Encoding.UTF8);
+        }
+
+        public static void WriteAnimationMetaIfMissing(string animFbxPath, Object obj = null)
+        {
+            var metaPath = animFbxPath + ".meta";
+            if (File.Exists(metaPath)) return;
+            var guid = GenerateStableGuid(obj);
+            var metaContent = BuildAnimationHumanoidMeta(guid);
+            File.WriteAllText(metaPath, metaContent, Encoding.UTF8);
+        }
+
+        private static string BuildModelHumanoidMeta(string guid)
+        {
+            return $@"fileFormatVersion: 2
+guid: {guid}
+ModelImporter:
+  serializedVersion: 24501
+  internalIDToNameTable: []
+  externalObjects: {{}}
+  materials:
+    materialImportMode: 2
+    materialName: 0
+    materialSearch: 1
+    materialLocation: 1
+    searchTexturesGlobally: 0
+  animations:
+    legacyGenerateAnimations: 4
+    bakeSimulation: 0
+    resampleCurves: 1
+    optimizeGameObjects: 0
+    removeConstantScaleCurves: 0
+    motionNodeName: 
+    animationImportErrors: 
+    animationImportWarnings: 
+    animationRetargetingWarnings: 
+    animationDoRetargetingWarnings: 0
+    importAnimatedCustomProperties: 0
+    importConstraints: 0
+    animationCompression: 3
+    animationRotationError: 0.5
+    animationPositionError: 0.5
+    animationScaleError: 0.5
+    animationWrapMode: 0
+    extraExposedTransformPaths: []
+    extraUserProperties: []
+    clipAnimations: []
+    isReadable: 0
+  meshes:
+    lODScreenPercentages: []
+    globalScale: 100
+    meshCompression: 0
+    addColliders: 0
+    useSRGBMaterialColor: 1
+    sortHierarchyByName: 1
+    importPhysicalCameras: 1
+    importVisibility: 1
+    importBlendShapes: 1
+    importCameras: 1
+    importLights: 1
+    nodeNameCollisionStrategy: 1
+    fileIdsGeneration: 2
+    swapUVChannels: 0
+    generateSecondaryUV: 0
+    useFileUnits: 1
+    keepQuads: 0
+    weldVertices: 1
+    bakeAxisConversion: 0
+    preserveHierarchy: 0
+    skinWeightsMode: 0
+    maxBonesPerVertex: 4
+    minBoneWeight: 0.001
+    optimizeBones: 1
+    generateMeshLods: 0
+    meshLodGenerationFlags: 0
+    maximumMeshLod: -1
+    importUVs: -1
+    importVertexColors: 1
+    meshOptimizationFlags: -1
+    indexFormat: 0
+    secondaryUVAngleDistortion: 8
+    secondaryUVAreaDistortion: 15.000001
+    secondaryUVHardAngle: 88
+    secondaryUVMarginMethod: 1
+    secondaryUVMinLightmapResolution: 40
+    secondaryUVMinObjectScale: 1
+    secondaryUVPackMargin: 4
+    useFileScale: 1
+    strictVertexDataChecks: 0
+  tangentSpace:
+    normalSmoothAngle: 60
+    normalImportMode: 0
+    tangentImportMode: 3
+    normalCalculationMode: 4
+    legacyComputeAllNormalsFromSmoothingGroupsWhenMeshHasBlendShapes: 0
+    blendShapeNormalImportMode: 1
+    normalSmoothingSource: 0
+    calculateBlendshapeNormalsDeltaFromImportedNormals: 0
+  referencedClips: []
+  importAnimation: 0
+  humanDescription:
+    serializedVersion: 3
+    human:
+    - boneName: Bip001 Pelvis
+      humanName: Hips
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L Thigh
+      humanName: LeftUpperLeg
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R Thigh
+      humanName: RightUpperLeg
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L Calf
+      humanName: LeftLowerLeg
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R Calf
+      humanName: RightLowerLeg
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L Foot
+      humanName: LeftFoot
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R Foot
+      humanName: RightFoot
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 Spine
+      humanName: Spine
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 Spine1
+      humanName: Chest
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 Spine2
+      humanName: UpperChest
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 Neck
+      humanName: Neck
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 Head
+      humanName: Head
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L Clavicle
+      humanName: LeftShoulder
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L UpperArm
+      humanName: LeftUpperArm
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L Forearm
+      humanName: LeftLowerArm
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 L Hand
+      humanName: LeftHand
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R Clavicle
+      humanName: RightShoulder
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R UpperArm
+      humanName: RightUpperArm
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R Forearm
+      humanName: RightLowerArm
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    - boneName: Bip001 R Hand
+      humanName: RightHand
+      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
+    skeleton: []
+    armTwist: 0.5
+    foreArmTwist: 0.5
+    upperLegTwist: 0.5
+    legTwist: 0.5
+    armStretch: 0.05
+    legStretch: 0.05
+    feetSpacing: 0
+    globalScale: 1
+    rootMotionBoneName: 
+    hasTranslationDoF: 0
+    hasExtraRoot: 0
+    skeletonHasParents: 1
+  lastHumanDescriptionAvatarSource: {{instanceID: 0}}
+  autoGenerateAvatarMappingIfUnspecified: 1
+  animationType: 3
+  humanoidOversampling: 1
+  avatarSetup: 1
+  addHumanoidExtraRootOnlyWhenUsingAvatar: 1
+  importBlendShapeDeformPercent: 1
+  remapMaterialsIfMaterialImportModeIsNone: 0
+  additionalBone: 0
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+";
+        }
+
+        private static string BuildAnimationHumanoidMeta(string guid)
+        {
+            return $@"fileFormatVersion: 2
+guid: {guid}
+ModelImporter:
+  serializedVersion: 24501
+  internalIDToNameTable: []
+  externalObjects: {{}}
+  materials:
+    materialImportMode: 0
+    materialName: 0
+    materialSearch: 1
+    materialLocation: 1
+    searchTexturesGlobally: 0
+  animations:
+    legacyGenerateAnimations: 4
+    bakeSimulation: 0
+    resampleCurves: 1
+    optimizeGameObjects: 0
+    removeConstantScaleCurves: 0
+    motionNodeName: 
+    animationImportErrors: 
+    animationImportWarnings: 
+    animationRetargetingWarnings: 
+    animationDoRetargetingWarnings: 0
+    importAnimatedCustomProperties: 0
+    importConstraints: 0
+    animationCompression: 1
+    animationRotationError: 0.5
+    animationPositionError: 0.5
+    animationScaleError: 0.5
+    animationWrapMode: 0
+    extraExposedTransformPaths: []
+    extraUserProperties: []
+    clipAnimations: []
+    isReadable: 0
+  meshes:
+    lODScreenPercentages: []
+    globalScale: 1
+    meshCompression: 0
+    addColliders: 0
+    useSRGBMaterialColor: 1
+    sortHierarchyByName: 1
+    importPhysicalCameras: 1
+    importVisibility: 1
+    importBlendShapes: 1
+    importCameras: 1
+    importLights: 1
+    nodeNameCollisionStrategy: 1
+    fileIdsGeneration: 2
+    swapUVChannels: 0
+    generateSecondaryUV: 0
+    useFileUnits: 1
+    keepQuads: 0
+    weldVertices: 1
+    bakeAxisConversion: 0
+    preserveHierarchy: 0
+    skinWeightsMode: 0
+    maxBonesPerVertex: 4
+    minBoneWeight: 0.001
+    optimizeBones: 1
+    generateMeshLods: 0
+    meshLodGenerationFlags: 0
+    maximumMeshLod: -1
+    importUVs: -1
+    importVertexColors: 1
+    meshOptimizationFlags: -1
+    indexFormat: 0
+    secondaryUVAngleDistortion: 8
+    secondaryUVAreaDistortion: 15.000001
+    secondaryUVHardAngle: 88
+    secondaryUVMarginMethod: 1
+    secondaryUVMinLightmapResolution: 40
+    secondaryUVMinObjectScale: 1
+    secondaryUVPackMargin: 4
+    useFileScale: 1
+    strictVertexDataChecks: 0
+  tangentSpace:
+    normalSmoothAngle: 60
+    normalImportMode: 0
+    tangentImportMode: 3
+    normalCalculationMode: 4
+    legacyComputeAllNormalsFromSmoothingGroupsWhenMeshHasBlendShapes: 0
+    blendShapeNormalImportMode: 1
+    normalSmoothingSource: 0
+    calculateBlendshapeNormalsDeltaFromImportedNormals: 0
+  referencedClips: []
+  importAnimation: 1
+  humanDescription:
+    serializedVersion: 3
+    human: []
+    skeleton: []
+    armTwist: 0.5
+    foreArmTwist: 0.5
+    upperLegTwist: 0.5
+    legTwist: 0.5
+    armStretch: 0.05
+    legStretch: 0.05
+    feetSpacing: 0
+    globalScale: 1
+    rootMotionBoneName: 
+    hasTranslationDoF: 0
+    hasExtraRoot: 0
+    skeletonHasParents: 1
+  lastHumanDescriptionAvatarSource: {{instanceID: 0}}
+  autoGenerateAvatarMappingIfUnspecified: 1
+  animationType: 3
+  humanoidOversampling: 1
+  avatarSetup: 1
+  addHumanoidExtraRootOnlyWhenUsingAvatar: 1
+  importBlendShapeDeformPercent: 1
+  remapMaterialsIfMaterialImportModeIsNone: 0
+  additionalBone: 0
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+";
+        }
+
+        public static void ExportUnityAnimationClip(ImportedKeyframedAnimation anim, string outputPath)
+        {
+            var inv = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.AppendLine("%YAML 1.1");
+            sb.AppendLine("%TAG !u! tag:unity3d.com,2011:");
+            sb.AppendLine("--- !u!74 &7400000");
+            sb.AppendLine("AnimationClip:");
+            sb.AppendLine("  m_ObjectHideFlags: 0");
+            sb.AppendLine("  m_CorrespondingSourceObject: {fileID: 0}");
+            sb.AppendLine("  m_PrefabInstance: {fileID: 0}");
+            sb.AppendLine("  m_PrefabAsset: {fileID: 0}");
+            sb.AppendLine($"  m_Name: {YamlString(anim.Name)}");
+            sb.AppendLine("  serializedVersion: 7");
+            sb.AppendLine("  m_Legacy: 0");
+            sb.AppendLine("  m_Compressed: 0");
+            sb.AppendLine("  m_UseHighQualityCurve: 1");
+            sb.AppendLine("  m_RotationCurves: []");
+            sb.AppendLine("  m_CompressedRotationCurves: []");
+
+            sb.AppendLine("  m_EulerCurves:");
+            if (anim.TrackList != null)
+            {
+                foreach (var track in anim.TrackList)
+                {
+                    if (track.Rotations == null || track.Rotations.Count == 0) continue;
+                    var path = track.Path?.Replace('\\', '/').Trim('/');
+                    sb.AppendLine("  - curve:");
+                    sb.AppendLine("      serializedVersion: 2");
+                    sb.AppendLine("      m_Curve:");
+                    foreach (var k in track.Rotations)
+                    {
+                        sb.AppendLine("      - serializedVersion: 3");
+                        sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
+                        sb.AppendLine($"        value: {{x: {k.value.X.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
+                        sb.AppendLine("        inSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine("        outSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine("        tangentMode: 0");
+                        sb.AppendLine("        weightedMode: 0");
+                        sb.AppendLine("        inWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                        sb.AppendLine("        outWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                    }
+                    sb.AppendLine("      m_PreInfinity: 2");
+                    sb.AppendLine("      m_PostInfinity: 2");
+                    sb.AppendLine("      m_RotationOrder: 4");
+                    sb.AppendLine($"    path: {path}");
+                }
+            }
+
+            sb.AppendLine("  m_PositionCurves:");
+            if (anim.TrackList != null)
+            {
+                foreach (var track in anim.TrackList)
+                {
+                    if (track.Translations == null || track.Translations.Count == 0) continue;
+                    var path = track.Path?.Replace('\\', '/').Trim('/');
+                    sb.AppendLine("  - curve:");
+                    sb.AppendLine("      serializedVersion: 2");
+                    sb.AppendLine("      m_Curve:");
+                    foreach (var k in track.Translations)
+                    {
+                        sb.AppendLine("      - serializedVersion: 3");
+                        sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
+                        sb.AppendLine($"        value: {{x: {k.value.X.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
+                        sb.AppendLine("        inSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine("        outSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine("        tangentMode: 0");
+                        sb.AppendLine("        weightedMode: 0");
+                        sb.AppendLine("        inWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                        sb.AppendLine("        outWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                    }
+                    sb.AppendLine("      m_PreInfinity: 2");
+                    sb.AppendLine("      m_PostInfinity: 2");
+                    sb.AppendLine("      m_RotationOrder: 4");
+                    sb.AppendLine($"    path: {path}");
+                }
+            }
+
+            sb.AppendLine("  m_ScaleCurves:");
+            if (anim.TrackList != null)
+            {
+                foreach (var track in anim.TrackList)
+                {
+                    if (track.Scalings == null || track.Scalings.Count == 0) continue;
+                    var path = track.Path?.Replace('\\', '/').Trim('/');
+                    sb.AppendLine("  - curve:");
+                    sb.AppendLine("      serializedVersion: 2");
+                    sb.AppendLine("      m_Curve:");
+                    foreach (var k in track.Scalings)
+                    {
+                        sb.AppendLine("      - serializedVersion: 3");
+                        sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
+                        sb.AppendLine($"        value: {{x: {k.value.X.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
+                        sb.AppendLine("        inSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine("        outSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine("        tangentMode: 0");
+                        sb.AppendLine("        weightedMode: 0");
+                        sb.AppendLine("        inWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                        sb.AppendLine("        outWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                    }
+                    sb.AppendLine("      m_PreInfinity: 2");
+                    sb.AppendLine("      m_PostInfinity: 2");
+                    sb.AppendLine("      m_RotationOrder: 4");
+                    sb.AppendLine($"    path: {path}");
+                }
+            }
+
+            sb.AppendLine("  m_FloatCurves: []");
+            sb.AppendLine("  m_PPtrCurves: []");
+            sb.AppendLine($"  m_SampleRate: {(anim.SampleRate > 0 ? anim.SampleRate.ToString("0.######", inv) : "30")}");
+            sb.AppendLine("  m_WrapMode: 0");
+            sb.AppendLine("  m_Bounds:");
+            sb.AppendLine("    m_Center: {x: 0, y: 0, z: 0}");
+            sb.AppendLine("    m_Extent: {x: 0, y: 0, z: 0}");
+            sb.AppendLine("  m_ClipBindingConstant:");
+            sb.AppendLine("    genericBindings: []");
+            sb.AppendLine("    pptrCurveMapping: []");
+
+            float maxStopTime = 0f;
+            if (anim.TrackList != null)
+            {
+                foreach (var t in anim.TrackList)
+                {
+                    if (t.Rotations != null) foreach (var k in t.Rotations) if (k.time > maxStopTime) maxStopTime = k.time;
+                    if (t.Translations != null) foreach (var k in t.Translations) if (k.time > maxStopTime) maxStopTime = k.time;
+                    if (t.Scalings != null) foreach (var k in t.Scalings) if (k.time > maxStopTime) maxStopTime = k.time;
+                }
+            }
+
+            sb.AppendLine("  m_AnimationClipSettings:");
+            sb.AppendLine("    serializedVersion: 2");
+            sb.AppendLine("    m_AdditiveReferencePoseClip: {fileID: 0}");
+            sb.AppendLine("    m_AdditiveReferencePoseTime: 0");
+            sb.AppendLine("    m_StartTime: 0");
+            sb.AppendLine($"    m_StopTime: {maxStopTime.ToString("0.######", inv)}");
+            sb.AppendLine("    m_OrientationOffsetY: 0");
+            sb.AppendLine("    m_Level: 0");
+            sb.AppendLine("    m_CycleOffset: 0");
+            sb.AppendLine("    m_HasAdditiveReferencePose: 0");
+            sb.AppendLine("    m_LoopTime: 1");
+            sb.AppendLine("    m_LoopBlend: 0");
+            sb.AppendLine("    m_LoopBlendOrientation: 0");
+            sb.AppendLine("    m_LoopBlendPositionY: 0");
+            sb.AppendLine("    m_LoopBlendPositionXZ: 0");
+            sb.AppendLine("    m_KeepOriginalOrientation: 0");
+            sb.AppendLine("    m_KeepOriginalPositionY: 1");
+            sb.AppendLine("    m_KeepOriginalPositionXZ: 0");
+            sb.AppendLine("    m_HeightFromFeet: 0");
+            sb.AppendLine("    m_Mirror: 0");
+            sb.AppendLine("  m_EditorCurves: []");
+            sb.AppendLine("  m_EulerEditorCurves: []");
+            sb.AppendLine("  m_HasGenericRootTransform: 0");
+            sb.AppendLine("  m_HasMotionFloatCurves: 0");
+            sb.AppendLine("  m_Events: []");
+
+            Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+            File.WriteAllText(outputPath, sb.ToString(), Encoding.UTF8);
+        }
+
+        public static void GenerateUnityGuide(string folderPath, string modelName)
+        {
+            var guidePath = Path.Combine(folderPath, "UNITY_GUIDE.md");
+            var text = $@"# Unity Integration Guide - {modelName}
+
+This asset was exported for **Unity Engine** with automatic **Humanoid Rig** configuration and native `.anim` clips.
+
+---
+
+## 📁 File Structure
+
+- **`{modelName}.fbx`**: Clean Autodesk Binary 7400 FBX model.
+- **`{modelName}.fbx.meta`**: Pre-configured Unity Humanoid Rig importer settings.
+- **`*.fbx` / `*.fbx.meta`**: Humanoid animation clips in FBX format.
+- **`*.anim`**: Native Unity YAML AnimationClips ready to drag & drop into any Animator Controller.
+Exported by AssetStudio.
+";
+            File.WriteAllText(guidePath, text, Encoding.UTF8);
+        }
+        #endregion
     }
 }
