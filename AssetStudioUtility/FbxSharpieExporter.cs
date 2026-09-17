@@ -92,6 +92,7 @@ namespace AssetStudio
 
             BuildHeader();
             BuildGlobalSettings(scaleFactor);
+            BuildDocuments();
             BuildDefinitions();
 
             _objects = N("Objects");
@@ -149,7 +150,7 @@ namespace AssetStudio
 
                 BuildTakes();
                 WriteExportReport(exportPath, convert);
-                if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else FbxIO.WriteBinary(_document, exportPath);
+                if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else AutodeskBinaryWriter.Write(_document, exportPath);
             }
             finally
             {
@@ -1478,19 +1479,75 @@ namespace AssetStudio
             header.AddNode(ver);
             var fbxVer = N("FBXVersion"); fbxVer.AddProperty(new IntegerToken(7400));
             header.AddNode(fbxVer);
+            var encType = N("EncryptionType"); encType.AddProperty(new IntegerToken(0));
+            header.AddNode(encType);
 
             var ts = N("CreationTimeStamp");
-            var now = DateTime.Now;
-            AddSimpleNode(ts, "Year", now.Year);
-            AddSimpleNode(ts, "Month", now.Month);
-            AddSimpleNode(ts, "Day", now.Day);
-            AddSimpleNode(ts, "Hour", now.Hour);
-            AddSimpleNode(ts, "Minute", now.Minute);
-            AddSimpleNode(ts, "Second", now.Second);
-            AddSimpleNode(ts, "Millisecond", now.Millisecond);
+            AddSimpleNode(ts, "Version", 1000);
+            AddSimpleNode(ts, "Year", 1970);
+            AddSimpleNode(ts, "Month", 1);
+            AddSimpleNode(ts, "Day", 1);
+            AddSimpleNode(ts, "Hour", 10);
+            AddSimpleNode(ts, "Minute", 0);
+            AddSimpleNode(ts, "Second", 0);
+            AddSimpleNode(ts, "Millisecond", 0);
             header.AddNode(ts);
 
+            var creator = N("Creator"); creator.AddProperty(new StringToken("ModelExtractor - Neon Divide"));
+            header.AddNode(creator);
+
+            var sceneInfo = N("SceneInfo");
+            sceneInfo.AddProperty(new StringToken("GlobalInfo\0\u0001SceneInfo"));
+            sceneInfo.AddProperty(new StringToken("UserData"));
+            AddSimpleNode(sceneInfo, "Type", "UserData");
+            AddSimpleNode(sceneInfo, "Version", 100);
+            var metaData = N("MetaData");
+            AddSimpleNode(metaData, "Version", 100);
+            AddSimpleNode(metaData, "Title", "");
+            AddSimpleNode(metaData, "Subject", "");
+            AddSimpleNode(metaData, "Author", "");
+            AddSimpleNode(metaData, "Keywords", "");
+            AddSimpleNode(metaData, "Revision", "");
+            AddSimpleNode(metaData, "Comment", "");
+            sceneInfo.AddNode(metaData);
+
+            var props = N("Properties70");
+            props.AddNode(MakeStringP("DocumentUrl", "/model.fbx"));
+            props.AddNode(MakeStringP("SrcDocumentUrl", "/model.fbx"));
+            sceneInfo.AddNode(props);
+            header.AddNode(sceneInfo);
+
             _document.AddNode(header);
+
+            // Top-level metadata required by Autodesk FBX SDK
+            var fileId = N("FileId");
+            fileId.AddProperty(new ByteArrayToken(new byte[] { 0x28, 0xb3, 0x2a, 0xeb, 0xb6, 0x24, 0xcc, 0xc2, 0xbf, 0xc8, 0xb0, 0x2a, 0xa9, 0x2b, 0xfc, 0xf1 }));
+            _document.AddNode(fileId);
+
+            var cTime = N("CreationTime");
+            cTime.AddProperty(new StringToken("1970-01-01 10:00:00:000"));
+            _document.AddNode(cTime);
+
+            var topCreator = N("Creator");
+            topCreator.AddProperty(new StringToken("ModelExtractor - Neon Divide"));
+            _document.AddNode(topCreator);
+        }
+
+        private void BuildDocuments()
+        {
+            var docs = N("Documents");
+            AddSimpleNode(docs, "Count", 1);
+            var doc = N("Document");
+            doc.AddProperty(new LongToken(GenId()));
+            doc.AddProperty(new StringToken("Scene\0\u0001Document"));
+            doc.AddProperty(new StringToken("Scene"));
+            doc.AddNode(N("Properties70"));
+            AddSimpleNode(doc, "RootNode", 0L);
+            docs.AddNode(doc);
+            _document.AddNode(docs);
+
+            var refs = N("References");
+            _document.AddNode(refs);
         }
 
         private void BuildDefinitions()
@@ -1526,34 +1583,36 @@ namespace AssetStudio
 
         private void BuildTakes()
         {
-            if (_takes.Count == 0)
-                return;
-
             var takes = N("Takes");
-            AddSimpleNode(takes, "Current", _takes[0].Name);
-            foreach (var takeInfo in _takes)
+            if (_takes.Count == 0)
             {
-                var take = N("Take");
-                take.AddProperty(new StringToken(takeInfo.Name));
-
-                var fileName = N("FileName");
-                fileName.AddProperty(new StringToken($"{takeInfo.Name}.tak"));
-                take.AddNode(fileName);
-
-                var localTime = N("LocalTime");
-                localTime.AddProperty(new LongToken(takeInfo.Start));
-                localTime.AddProperty(new LongToken(takeInfo.Stop));
-                take.AddNode(localTime);
-
-                var referenceTime = N("ReferenceTime");
-                referenceTime.AddProperty(new LongToken(takeInfo.Start));
-                referenceTime.AddProperty(new LongToken(takeInfo.Stop));
-                take.AddNode(referenceTime);
-
-                takes.AddNode(take);
+                AddSimpleNode(takes, "Current", "");
             }
+            else
+            {
+                AddSimpleNode(takes, "Current", _takes[0].Name);
+                foreach (var takeInfo in _takes)
+                {
+                    var take = N("Take");
+                    take.AddProperty(new StringToken(takeInfo.Name));
 
-            _document.AddNode(takes);
+                    var fileName = N("FileName");
+                    fileName.AddProperty(new StringToken($"{takeInfo.Name}.tak"));
+                    take.AddNode(fileName);
+
+                    var localTime = N("LocalTime");
+                    localTime.AddProperty(new LongToken(takeInfo.Start));
+                    localTime.AddProperty(new LongToken(takeInfo.Stop));
+                    take.AddNode(localTime);
+
+                    var referenceTime = N("ReferenceTime");
+                    referenceTime.AddProperty(new LongToken(takeInfo.Start));
+                    referenceTime.AddProperty(new LongToken(takeInfo.Stop));
+                    take.AddNode(referenceTime);
+
+                    takes.AddNode(take);
+                }
+            }
         }
 
         private void WriteExportReport(string exportPath, IImported convert)
