@@ -1,8 +1,7 @@
 using Avalonia.Input;
 using Avalonia.Threading;
 using AssetStudio;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -77,7 +76,7 @@ public partial class MainWindow
             {
                 try
                 {
-                    Image<Bgra32>? img = null;
+                    SKBitmap? img = null;
                     if (f.asset is Sprite sprite)
                     {
                         img = sprite.GetImage();
@@ -92,7 +91,7 @@ public partial class MainWindow
                         using (img)
                         using (var ms = new MemoryStream())
                         {
-                            img.SaveAsPng(ms);
+                            img.WriteToStream(ms, ImageFormat.Png);
                             ms.Position = 0;
                             var bmp = new global::Avalonia.Media.Imaging.Bitmap(ms);
                             _2dAnimBitmaps[f.asset] = bmp;

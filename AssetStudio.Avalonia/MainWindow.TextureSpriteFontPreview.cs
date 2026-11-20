@@ -1,8 +1,6 @@
 using Avalonia.Threading;
 using AssetStudio;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
+using SkiaSharp;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -100,65 +98,96 @@ public partial class MainWindow
         });
     }
 
-    private static void MakeAlphaOnlyTextureVisible(Image<Bgra32> image)
+    private static void ApplyPreviewChannelMask(SKBitmap image, bool[] channels, int validChannel)
+    {
+        var pixels = image.GetWritablePixelSpan();
+        int width = image.Width;
+        int height = image.Height;
+        int rowBytes = image.RowBytes;
+        byte fillColor = (validChannel == 1 && channels[3]) ? byte.MaxValue : byte.MinValue;
+        bool keepR = channels[0];
+        bool keepG = channels[1];
+        bool keepB = channels[2];
+        bool keepA = channels[3];
+
+        for (int y = 0; y < height; y++)
+        {
+            var row = pixels.Slice(y * rowBytes, width * 4);
+            for (int x = 0; x < width; x++)
+            {
+                int offset = x * 4;
+                if (!keepB) row[offset] = fillColor;
+                if (!keepG) row[offset + 1] = fillColor;
+                if (!keepR) row[offset + 2] = fillColor;
+                if (!keepA) row[offset + 3] = byte.MaxValue;
+            }
+        }
+        GC.KeepAlive(image);
+    }
+
+    private static void MakeAlphaOnlyTextureVisible(SKBitmap image)
     {
         long rgbSignal = 0;
         long alphaSignal = 0;
         int samples = 0;
         byte minAlpha = byte.MaxValue;
         byte maxAlpha = byte.MinValue;
-        int stepX = Math.Max(1, image.Width / 128);
-        int stepY = Math.Max(1, image.Height / 128);
+        int width = image.Width;
+        int height = image.Height;
+        int rowBytes = image.RowBytes;
+        int stepX = Math.Max(1, width / 128);
+        int stepY = Math.Max(1, height / 128);
 
-        image.ProcessPixelRows(accessor =>
+        var pixels = image.GetWritablePixelSpan();
+        for (int y = 0; y < height; y += stepY)
         {
-            for (int y = 0; y < accessor.Height; y += stepY)
+            var row = pixels.Slice(y * rowBytes, width * 4);
+            for (int x = 0; x < width; x += stepX)
             {
-                var row = accessor.GetRowSpan(y);
-                for (int x = 0; x < accessor.Width; x += stepX)
-                {
-                    var pixel = row[x];
-                    rgbSignal += pixel.R + pixel.G + pixel.B;
-                    alphaSignal += pixel.A;
-                    minAlpha = Math.Min(minAlpha, pixel.A);
-                    maxAlpha = Math.Max(maxAlpha, pixel.A);
-                    samples++;
-                }
+                int offset = x * 4;
+                byte b = row[offset];
+                byte g = row[offset + 1];
+                byte r = row[offset + 2];
+                byte a = row[offset + 3];
+                rgbSignal += r + g + b;
+                alphaSignal += a;
+                minAlpha = Math.Min(minAlpha, a);
+                maxAlpha = Math.Max(maxAlpha, a);
+                samples++;
             }
-        });
+        }
 
         if (samples == 0
             || rgbSignal / (samples * 3) >= 8
             || alphaSignal / samples <= 8
             || maxAlpha - minAlpha <= 16)
         {
+            GC.KeepAlive(image);
             return;
         }
 
-        image.ProcessPixelRows(accessor =>
+        for (int y = 0; y < height; y++)
         {
-            for (int y = 0; y < accessor.Height; y++)
+            var row = pixels.Slice(y * rowBytes, width * 4);
+            for (int x = 0; x < width; x++)
             {
-                var row = accessor.GetRowSpan(y);
-                for (int x = 0; x < accessor.Width; x++)
-                {
-                    ref Bgra32 pixel = ref row[x];
-                    byte value = pixel.A;
-                    pixel.R = value;
-                    pixel.G = value;
-                    pixel.B = value;
-                    pixel.A = byte.MaxValue;
-                }
+                int offset = x * 4;
+                byte value = row[offset + 3];
+                row[offset] = value;
+                row[offset + 1] = value;
+                row[offset + 2] = value;
+                row[offset + 3] = byte.MaxValue;
             }
-        });
+        }
+        GC.KeepAlive(image);
     }
 
-    private static bool LimitInlinePreviewImage(Image<Bgra32> image)
+    private static bool LimitInlinePreviewImage(ref SKBitmap image)
     {
-        return LimitPreviewImage(image, MaxInlinePreviewTextureDimension);
+        return LimitPreviewImage(ref image, MaxInlinePreviewTextureDimension);
     }
 
-    private static bool LimitPreviewImage(Image<Bgra32> image, int maxDimension)
+    private static bool LimitPreviewImage(ref SKBitmap image, int maxDimension)
     {
         var maxSide = Math.Max(image.Width, image.Height);
         if (maxSide <= maxDimension)
@@ -169,11 +198,15 @@ public partial class MainWindow
         var scale = maxDimension / (float)maxSide;
         var width = Math.Max(1, (int)Math.Round(image.Width * scale));
         var height = Math.Max(1, (int)Math.Round(image.Height * scale));
-        image.Mutate(x => x.Resize(new ResizeOptions
+        var resizedInfo = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+        var resized = image.Resize(resizedInfo, new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+        if (resized == null)
         {
-            Size = new SixLabors.ImageSharp.Size(width, height),
-            Mode = ResizeMode.Max
-        }));
+            return false;
+        }
+
+        image.Dispose();
+        image = resized;
         return true;
     }
 
@@ -194,7 +227,7 @@ public partial class MainWindow
             {
                 try
                 {
-                    Image<Bgra32>? decodedImage = null;
+                    SKBitmap? decodedImage = null;
                     int width = 0;
                     int height = 0;
                     string infoText = string.Empty;
@@ -333,7 +366,7 @@ public partial class MainWindow
         {
             try
             {
-                Image<Bgra32>? image = null;
+                SKBitmap? image = null;
                 string infoText = string.Empty;
                 bool isTexture = previewTexture != null;
 
@@ -393,90 +426,81 @@ public partial class MainWindow
                     return;
                 }
 
-                int validChannel = 0;
-                for (int i = 0; i < 4; i++)
+                using (image)
                 {
-                    if (textureChannels[i])
+                    int validChannel = 0;
+                    for (int i = 0; i < 4; i++)
                     {
-                        validChannel++;
-                    }
-                }
-
-                if (validChannel != 4)
-                {
-                    image.ProcessPixelRows(accessor =>
-                    {
-                        for (int y = 0; y < accessor.Height; y++)
+                        if (textureChannels[i])
                         {
-                            var row = accessor.GetRowSpan(y);
-                            for (int x = 0; x < accessor.Width; x++)
+                            validChannel++;
+                        }
+                    }
+
+                    if (validChannel != 4)
+                    {
+                        ApplyPreviewChannelMask(image, textureChannels, validChannel);
+                    }
+
+                    using (var ms = new MemoryStream())
+                    {
+                        image.WriteToStream(ms, ImageFormat.Png);
+                        ms.Position = 0;
+                        var bitmap = new global::Avalonia.Media.Imaging.Bitmap(ms);
+
+                        infoText += "\nChannels: ";
+                        if (validChannel == 0)
+                        {
+                            infoText += "None";
+                        }
+                        else
+                        {
+                            var channelNames = new string[4] { "R", "G", "B", "A" };
+                            var activeList = new List<string>();
+                            for (int i = 0; i < 4; i++)
                             {
-                                ref Bgra32 pixel = ref row[x];
-                                pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
+                                if (textureChannels[i])
+                                    activeList.Add(channelNames[i]);
                             }
+                            infoText += string.Join(" ", activeList);
                         }
-                    });
-                }
+                        infoText += "\nRender mode: CPU (Fallback)";
 
-                using (var ms = new MemoryStream())
-                {
-                    image.SaveAsPng(ms);
-                    ms.Position = 0;
-                    var bitmap = new global::Avalonia.Media.Imaging.Bitmap(ms);
-
-                    infoText += "\nChannels: ";
-                    if (validChannel == 0)
-                    {
-                        infoText += "None";
-                    }
-                    else
-                    {
-                        var channelNames = new string[4] { "R", "G", "B", "A" };
-                        var activeList = new List<string>();
-                        for (int i = 0; i < 4; i++)
+                        string finalInfoText = infoText;
+                        Dispatcher.UIThread.Post(() =>
                         {
-                            if (textureChannels[i])
-                                activeList.Add(channelNames[i]);
-                        }
-                        infoText += string.Join(" ", activeList);
-                    }
-                    infoText += "\nRender mode: CPU (Fallback)";
-
-                    image.Dispose();
-
-                    string finalInfoText = infoText;
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (currentId == texturePreviewIdCounter)
-                        {
-                            ImagePreviewBox.Source = bitmap;
-                            ImagePreviewBox.IsVisible = true;
-                            TextPreviewBox.IsVisible = false;
-                            PreviewLabel.IsVisible = false;
-
-                            if (displayInfo.IsChecked == true)
+                            if (currentId == texturePreviewIdCounter)
                             {
-                                PreviewInfoOverlay.Text = finalInfoText;
-                                PreviewInfoBorder.IsVisible = true;
+                                ImagePreviewBox.Source = bitmap;
+                                ImagePreviewBox.IsVisible = true;
+                                TextPreviewBox.IsVisible = false;
+                                PreviewLabel.IsVisible = false;
+
+                                if (displayInfo.IsChecked == true)
+                                {
+                                    PreviewInfoOverlay.Text = finalInfoText;
+                                    PreviewInfoBorder.IsVisible = true;
+                                }
+                                else
+                                {
+                                    PreviewInfoBorder.IsVisible = false;
+                                }
+
+                                if (isTexture)
+                                {
+                                    StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle");
+                                }
+                                else
+                                {
+                                    StatusStripUpdate(string.Empty);
+                                }
                             }
                             else
                             {
-                                PreviewInfoBorder.IsVisible = false;
+                                bitmap.Dispose();
                             }
-
-                            if (isTexture)
-                            {
-                                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle");
-                            }
-                            else
-                            {
-                                StatusStripUpdate(string.Empty);
-                            }
-                        }
-                    });
+                        });
+                    }
                 }
             }
             catch (Exception ex)

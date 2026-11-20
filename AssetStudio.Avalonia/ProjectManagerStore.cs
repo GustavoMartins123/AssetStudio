@@ -10,8 +10,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 namespace AssetStudio.Avalonia;
 
@@ -829,8 +828,8 @@ public sealed class ProjectManagerStore
 
         try
         {
-            var imageInfo = SixLabors.ImageSharp.Image.Identify(storedPath);
-            if (imageInfo != null)
+            var imageInfo = SKBitmap.DecodeBounds(storedPath);
+            if (imageInfo.Width > 0 && imageInfo.Height > 0)
             {
                 icon.Width = imageInfo.Width;
                 icon.Height = imageInfo.Height;
@@ -868,8 +867,8 @@ public sealed class ProjectManagerStore
 
         try
         {
-            var imageInfo = SixLabors.ImageSharp.Image.Identify(storedPath);
-            if (imageInfo != null)
+            var imageInfo = SKBitmap.DecodeBounds(storedPath);
+            if (imageInfo.Width > 0 && imageInfo.Height > 0)
             {
                 icon.Width = imageInfo.Width;
                 icon.Height = imageInfo.Height;
@@ -1243,8 +1242,13 @@ public sealed class ProjectManagerStore
 
             EnsureVisibleAlpha(pixels);
             Directory.CreateDirectory(Path.GetDirectoryName(outputPngPath)!);
-            using var image = SixLabors.ImageSharp.Image.LoadPixelData<Bgra32>(pixels, width, height);
-            image.SaveAsPng(outputPngPath);
+            using var image = AssetStudio.ImageExtensions.CreateBgraUnpremulBitmap(pixels, width, height);
+            if (image == null)
+            {
+                return false;
+            }
+            using var file = File.Create(outputPngPath);
+            image.WriteToStream(file, ImageFormat.Png);
             return true;
         }
         finally

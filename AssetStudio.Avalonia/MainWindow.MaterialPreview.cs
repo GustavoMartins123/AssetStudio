@@ -2,7 +2,6 @@ using System;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using AssetStudio;
-using SixLabors.ImageSharp.PixelFormats;
 
 namespace AssetStudio.Avalonia;
 
@@ -109,21 +108,7 @@ public partial class MainWindow
 
                 if (validChannel != 4)
                 {
-                    image.ProcessPixelRows(accessor =>
-                    {
-                        for (int y = 0; y < accessor.Height; y++)
-                        {
-                            var row = accessor.GetRowSpan(y);
-                            for (int x = 0; x < accessor.Width; x++)
-                            {
-                                ref Bgra32 pixel = ref row[x];
-                                pixel.R = textureChannels[0] ? pixel.R : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.G = textureChannels[1] ? pixel.G : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.B = textureChannels[2] ? pixel.B : (validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue);
-                                pixel.A = textureChannels[3] ? pixel.A : byte.MaxValue;
-                            }
-                        }
-                    });
+                    ApplyPreviewChannelMask(image, textureChannels, validChannel);
                 }
                 else
                 {

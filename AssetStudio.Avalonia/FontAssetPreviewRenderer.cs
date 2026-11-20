@@ -1,99 +1,125 @@
+using SkiaSharp;
+using System;
+using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
 using AvaloniaBitmap = Avalonia.Media.Imaging.Bitmap;
-using ImageSharpColor = SixLabors.ImageSharp.Color;
-using SixLabors.Fonts;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Drawing.Processing;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 
 namespace AssetStudio.Avalonia;
 
 internal static class FontAssetPreviewRenderer
 {
-    private static bool TryGetSystemSandboxFont(out FontFamily family)
+    private static SKTypeface? TryCreateSystemSandboxTypeface()
     {
-        string[] preferredFonts = { "Noto Sans CJK JP", "Noto Sans", "DejaVu Sans", "Liberation Sans", "Ubuntu", "sans-serif" };
+        var fontManager = SKFontManager.Default;
+        var installed = new HashSet<string>(fontManager.FontFamilies, StringComparer.OrdinalIgnoreCase);
+        string[] preferredFonts =
+        {
+            "Noto Sans CJK JP",
+            "Noto Sans",
+            "Segoe UI",
+            "DejaVu Sans",
+            "Liberation Sans",
+            "Ubuntu",
+            "Arial",
+            "sans-serif"
+        };
+
         foreach (var fontName in preferredFonts)
         {
-            if (SystemFonts.TryGet(fontName, out family))
+            if (installed.Contains(fontName))
             {
-                return true;
+                var matched = fontManager.MatchFamily(fontName, SKFontStyle.Normal);
+                if (matched != null)
+                {
+                    return matched;
+                }
             }
         }
-        var families = SystemFonts.Families.ToList();
-        if (families.Count > 0)
+
+        foreach (var familyName in fontManager.FontFamilies)
         {
-            family = families[0];
-            return true;
+            var matched = fontManager.MatchFamily(familyName, SKFontStyle.Normal);
+            if (matched != null)
+            {
+                return matched;
+            }
         }
-        family = default;
-        return false;
+
+        return null;
     }
 
-    public static (AvaloniaBitmap Bitmap, string InfoText) Render(string fontName, byte[] fontData, System.Func<bool> isCancelled)
+    public static (AvaloniaBitmap Bitmap, string InfoText) Render(string fontName, byte[] fontData, Func<bool> isCancelled)
+    {
+        var pngBytes = RenderToPngBytes(fontName, fontData, isCancelled);
+        if (isCancelled()) throw new OperationCanceledException();
+
+        using var ms = new MemoryStream(pngBytes, writable: false);
+        return (new AvaloniaBitmap(ms), BuildInfoText(fontData));
+    }
+
+    internal static byte[] RenderToPngBytes(string fontName, byte[] fontData, Func<bool> isCancelled)
     {
         const int width = 1200;
         const int height = 720;
         const int margin = 42;
+        const float maxWidth = width - margin * 2;
 
-        if (isCancelled()) throw new System.OperationCanceledException();
+        if (isCancelled()) throw new OperationCanceledException();
 
-        var collection = new FontCollection();
-        using var fontStream = new MemoryStream(fontData, writable: false);
-        var family = collection.Add(fontStream);
-
-        if (isCancelled()) throw new System.OperationCanceledException();
-
-        using var image = new Image<Rgba32>(width, height, new Rgba32(30, 33, 39));
-        image.Mutate(ctx =>
+        using var skFontData = SKData.CreateCopy(fontData);
+        using var typeface = SKTypeface.FromData(skFontData);
+        if (typeface == null)
         {
-            if (isCancelled()) return;
+            throw new InvalidDataException("The embedded font data could not be decoded by SkiaSharp.");
+        }
 
-            if (!TryGetSystemSandboxFont(out var metadataFamily))
-            {
-                metadataFamily = family;
-            }
+        if (isCancelled()) throw new OperationCanceledException();
 
-            if (isCancelled()) return;
+        using var systemMetadataTypeface = TryCreateSystemSandboxTypeface();
+        var metadataTypeface = systemMetadataTypeface ?? typeface;
 
-            var titleFont = metadataFamily.CreateFont(30, SixLabors.Fonts.FontStyle.Regular);
-            var smallFont = metadataFamily.CreateFont(18, SixLabors.Fonts.FontStyle.Regular);
-            var mediumFont = family.CreateFont(32, SixLabors.Fonts.FontStyle.Regular);
-            var largeFont = family.CreateFont(56, SixLabors.Fonts.FontStyle.Regular);
-            var hugeFont = family.CreateFont(84, SixLabors.Fonts.FontStyle.Regular);
+        if (isCancelled()) throw new OperationCanceledException();
 
-            var muted = ImageSharpColor.FromRgb(178, 186, 200);
-            var foreground = ImageSharpColor.FromRgb(245, 247, 250);
-            var accent = ImageSharpColor.FromRgb(117, 207, 180);
+        var info = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul);
+        using var bitmap = new SKBitmap(info);
+        using (var canvas = new SKCanvas(bitmap))
+        using (var titleFont = CreateFont(metadataTypeface, 30f))
+        using (var smallFont = CreateFont(metadataTypeface, 18f))
+        using (var mediumFont = CreateFont(typeface, 32f))
+        using (var largeFont = CreateFont(typeface, 56f))
+        using (var hugeFont = CreateFont(typeface, 84f))
+        using (var paint = new SKPaint { IsAntialias = true })
+        {
+            canvas.Clear(new SKColor(30, 33, 39));
 
-            if (isCancelled()) return;
-            DrawText(ctx, titleFont, $"Font: {fontName}", foreground, margin, 34, width - margin * 2);
-            if (isCancelled()) return;
-            DrawText(ctx, smallFont, $"Format: {DetectFontFormat(fontData)}   Size: {fontData.Length:N0} bytes", muted, margin, 88, width - margin * 2);
-            if (isCancelled()) return;
-            DrawText(ctx, mediumFont, "abcdefghijklmnopqrstuvwxyz", foreground, margin, 150, width - margin * 2);
-            if (isCancelled()) return;
-            DrawText(ctx, mediumFont, "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789", foreground, margin, 205, width - margin * 2);
-            if (isCancelled()) return;
-            DrawText(ctx, largeFont, "Pack my box with five dozen liquor jugs.", accent, margin, 290, width - margin * 2);
-            if (isCancelled()) return;
-            DrawText(ctx, hugeFont, "Hamburgefonstiv 123", foreground, margin, 405, width - margin * 2);
-            if (isCancelled()) return;
-            DrawText(ctx, mediumFont, "\u65e5\u672c\u8a9e\u30b5\u30f3\u30d7\u30eb: \u30ea\u30bc \u30d5\u30a3\u30fc\u30ca \u30a6\u30a7\u30f3\u30c7\u30a3", foreground, margin, 600, width - margin * 2);
-        });
+            var muted = new SKColor(178, 186, 200);
+            var foreground = new SKColor(245, 247, 250);
+            var accent = new SKColor(117, 207, 180);
 
-        if (isCancelled()) throw new System.OperationCanceledException();
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, titleFont, paint, $"Font: {fontName}", foreground, margin, 34f, maxWidth);
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, smallFont, paint, $"Format: {DetectFontFormat(fontData)}   Size: {fontData.Length:N0} bytes", muted, margin, 88f, maxWidth);
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, mediumFont, paint, "abcdefghijklmnopqrstuvwxyz", foreground, margin, 150f, maxWidth);
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, mediumFont, paint, "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789", foreground, margin, 205f, maxWidth);
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, largeFont, paint, "Pack my box with five dozen liquor jugs.", accent, margin, 290f, maxWidth);
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, hugeFont, paint, "Hamburgefonstiv 123", foreground, margin, 405f, maxWidth);
+            if (isCancelled()) throw new OperationCanceledException();
+            DrawWrappedText(canvas, mediumFont, paint, "\u65e5\u672c\u8a9e\u30b5\u30f3\u30d7\u30eb: \u30ea\u30bc \u30d5\u30a3\u30fc\u30ca \u30a6\u30a7\u30f3\u30c7\u30a3", foreground, margin, 600f, maxWidth);
+
+            canvas.Flush();
+        }
+
+        if (isCancelled()) throw new OperationCanceledException();
 
         using var ms = new MemoryStream();
-        image.SaveAsPng(ms);
-        ms.Position = 0;
-
-        if (isCancelled()) throw new System.OperationCanceledException();
-
-        return (new AvaloniaBitmap(ms), BuildInfoText(fontData));
+        bitmap.WriteToStream(ms, ImageFormat.Png);
+        return ms.ToArray();
     }
 
     public static string BuildFallbackText(AssetStudio.Font font, string errorMessage)
@@ -110,27 +136,127 @@ internal static class FontAssetPreviewRenderer
         return sb.ToString();
     }
 
+    private static SKFont CreateFont(SKTypeface typeface, float size)
+    {
+        return new SKFont(typeface, size)
+        {
+            Edging = SKFontEdging.Antialias,
+            Subpixel = true
+        };
+    }
+
     private static string BuildInfoText(byte[] fontData)
     {
         return $"Format: {DetectFontFormat(fontData)}\nData size: {fontData.Length:N0} bytes";
     }
 
-    private static void DrawText(
-        IImageProcessingContext ctx,
-        SixLabors.Fonts.Font font,
+    private static void DrawWrappedText(
+        SKCanvas canvas,
+        SKFont font,
+        SKPaint paint,
         string text,
-        ImageSharpColor color,
+        SKColor color,
         float x,
-        float y,
-        float wrappingLength)
+        float topY,
+        float maxWidth)
     {
-        var options = new RichTextOptions(font)
+        if (string.IsNullOrEmpty(text))
         {
-            Origin = new PointF(x, y),
-            WrappingLength = wrappingLength,
-            Dpi = 96
-        };
-        ctx.DrawText(options, text, color);
+            return;
+        }
+
+        paint.Color = color;
+        var metrics = font.Metrics;
+        float ascent = -metrics.Ascent;
+        if (ascent <= 0f)
+        {
+            ascent = font.Size * 0.8f;
+        }
+
+        float lineHeight = font.Spacing;
+        if (lineHeight <= 0f)
+        {
+            lineHeight = ascent + metrics.Descent + metrics.Leading;
+        }
+        if (lineHeight <= 0f)
+        {
+            lineHeight = font.Size * 1.2f;
+        }
+
+        float baselineY = topY + ascent;
+        var paragraphs = text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+        foreach (var paragraph in paragraphs)
+        {
+            if (paragraph.Length == 0)
+            {
+                baselineY += lineHeight;
+                continue;
+            }
+
+            foreach (var line in WrapParagraph(font, paint, paragraph, maxWidth))
+            {
+                canvas.DrawText(line, x, baselineY, SKTextAlign.Left, font, paint);
+                baselineY += lineHeight;
+            }
+        }
+    }
+
+    private static List<string> WrapParagraph(SKFont font, SKPaint paint, string paragraph, float maxWidth)
+    {
+        var lines = new List<string>();
+        if (maxWidth <= 0f || font.MeasureText(paragraph, paint) <= maxWidth)
+        {
+            lines.Add(paragraph);
+            return lines;
+        }
+
+        var current = new StringBuilder();
+        var words = paragraph.Split(' ');
+        for (int w = 0; w < words.Length; w++)
+        {
+            var word = words[w];
+            var candidate = current.Length == 0 ? word : current + " " + word;
+            if (font.MeasureText(candidate, paint) <= maxWidth)
+            {
+                if (current.Length > 0)
+                {
+                    current.Append(' ');
+                }
+                current.Append(word);
+                continue;
+            }
+
+            if (current.Length > 0)
+            {
+                lines.Add(current.ToString());
+                current.Clear();
+            }
+
+            if (font.MeasureText(word, paint) <= maxWidth)
+            {
+                current.Append(word);
+                continue;
+            }
+
+            // Fallback character-level wrapping for long tokens or CJK runs without spaces.
+            foreach (var ch in word)
+            {
+                var charCandidate = current.ToString() + ch;
+                if (current.Length > 0 && font.MeasureText(charCandidate, paint) > maxWidth)
+                {
+                    lines.Add(current.ToString());
+                    current.Clear();
+                }
+                current.Append(ch);
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            lines.Add(current.ToString());
+        }
+
+        return lines;
     }
 
     private static string DetectFontFormat(byte[]? data)

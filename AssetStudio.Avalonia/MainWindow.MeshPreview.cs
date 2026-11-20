@@ -1,7 +1,5 @@
 using Avalonia.Threading;
 using AssetStudio;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -584,7 +582,7 @@ public partial class MainWindow
                                 tw = image.Width;
                                 th = image.Height;
                                 tb = new byte[tw * th * 4];
-                                image.CopyPixelDataTo(tb);
+                                image.CopyBgraPixelsTo(tb);
                                 for (int p = 0; p < tb.Length; p += 4)
                                 {
                                     byte temp = tb[p];

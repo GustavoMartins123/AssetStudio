@@ -3,8 +3,6 @@ using Avalonia.Interactivity;
 using Avalonia.Threading;
 using AssetStudio.Avalonia.Services;
 using AssetStudio;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -237,13 +235,16 @@ public partial class MainWindow : Window
                     var bytes = File.ReadAllBytes(entry.PayloadPath);
                     if (string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
                     {
-                        var cachedImage = SixLabors.ImageSharp.Image.Load<Bgra32>(bytes);
-                        return new TexturePreviewImageResult(
-                            cachedImage,
-                            fromCache: true,
-                            downscaled: sourceWidth > cachedImage.Width || sourceHeight > cachedImage.Height,
-                            sourceWidth,
-                            sourceHeight);
+                        var cachedImage = ImageExtensions.DecodeBgraUnpremul(bytes);
+                        if (cachedImage != null)
+                        {
+                            return new TexturePreviewImageResult(
+                                cachedImage,
+                                fromCache: true,
+                                downscaled: sourceWidth > cachedImage.Width || sourceHeight > cachedImage.Height,
+                                sourceWidth,
+                                sourceHeight);
+                        }
                     }
                 }
             }
@@ -259,13 +260,13 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var downscaled = LimitPreviewImage(image, maxDimension);
+        var downscaled = LimitPreviewImage(ref image, maxDimension);
         if (canUsePersistentCache)
         {
             try
             {
                 using var stream = new MemoryStream();
-                image.SaveAsPng(stream);
+                image.WriteToStream(stream, ImageFormat.Png);
                 var bytes = stream.ToArray();
                 var hash = ComputeSha256Hex(bytes);
                 var payloadPath = GetPreviewCachePayloadPath(folderPath, hash, ".texturepreview.png");

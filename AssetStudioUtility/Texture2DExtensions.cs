@@ -1,6 +1,4 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
+using SkiaSharp;
 using System;
 using System.IO;
 
@@ -8,7 +6,7 @@ namespace AssetStudio
 {
     public static class Texture2DExtensions
     {
-        public static Image<Bgra32> ConvertToImage(this Texture2D m_Texture2D, bool flip)
+        public static SKBitmap ConvertToImage(this Texture2D m_Texture2D, bool flip)
         {
             if (m_Texture2D.m_Width <= 0 || m_Texture2D.m_Height <= 0)
             {
@@ -18,9 +16,10 @@ namespace AssetStudio
 
             var converter = new Texture2DConverter(m_Texture2D);
             byte[] buff;
+            long outputSize;
             try
             {
-                var outputSize = (long)m_Texture2D.m_Width * m_Texture2D.m_Height * 4;
+                outputSize = (long)m_Texture2D.m_Width * m_Texture2D.m_Height * 4;
                 if (outputSize > int.MaxValue)
                 {
                     Logger.Warning($"Texture too large for preview {m_Texture2D.m_Name}: {m_Texture2D.m_Width}x{m_Texture2D.m_Height}");
@@ -37,12 +36,11 @@ namespace AssetStudio
             {
                 if (converter.DecodeTexture2D(buff))
                 {
-                    var image = Image.LoadPixelData<Bgra32>(buff, m_Texture2D.m_Width, m_Texture2D.m_Height);
-                    if (flip)
-                    {
-                        image.Mutate(x => x.Flip(FlipMode.Vertical));
-                    }
-                    return image;
+                    return ImageExtensions.CreateBgraUnpremulBitmap(
+                        buff.AsSpan(0, (int)outputSize),
+                        m_Texture2D.m_Width,
+                        m_Texture2D.m_Height,
+                        flipVertical: flip);
                 }
                 return m_Texture2D.ConvertEncodedImage(flip);
             }
@@ -52,7 +50,7 @@ namespace AssetStudio
             }
         }
 
-        private static Image<Bgra32> ConvertEncodedImage(this Texture2D m_Texture2D, bool flip)
+        private static SKBitmap ConvertEncodedImage(this Texture2D m_Texture2D, bool flip)
         {
             try
             {
@@ -62,10 +60,15 @@ namespace AssetStudio
                     return null;
                 }
 
-                var image = Image.Load<Bgra32>(data);
+                var image = ImageExtensions.DecodeBgraUnpremul(data);
+                if (image == null)
+                {
+                    return null;
+                }
+
                 if (flip)
                 {
-                    image.Mutate(x => x.Flip(FlipMode.Vertical));
+                    image.FlipVerticalInPlace();
                 }
                 return image;
             }

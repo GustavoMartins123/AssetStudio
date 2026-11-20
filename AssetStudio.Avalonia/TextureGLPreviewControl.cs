@@ -9,8 +9,7 @@ using OpenTK;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
 using Texture2DDecoder;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 namespace AssetStudio.Avalonia
 {
@@ -139,7 +138,7 @@ void main()
             RequestNextFrameRendering();
         }
 
-        public void SetImage(Image<Bgra32> image)
+        public void SetImage(SKBitmap image)
         {
             ResetPanAndZoom();
 
@@ -155,7 +154,7 @@ void main()
                 hasPendingTexture = true;
 
                 pendingTextureData = new byte[image.Width * image.Height * 4];
-                image.CopyPixelDataTo(pendingTextureData);
+                image.CopyBgraPixelsTo(pendingTextureData);
                 for (int i = 0; i < pendingTextureData.Length; i += 4)
                 {
                     byte temp = pendingTextureData[i]; // B

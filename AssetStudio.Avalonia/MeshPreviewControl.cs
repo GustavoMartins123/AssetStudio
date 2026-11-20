@@ -10,8 +10,7 @@ using Avalonia.Media;
 using OpenTK;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 namespace AssetStudio.Avalonia
 {
     using Vector2 = OpenTK.Mathematics.Vector2;
@@ -1743,7 +1742,7 @@ void main()
             });
         }
 
-        public void SetMaterialTexture(Image<Bgra32> image)
+        public void SetMaterialTexture(SKBitmap image)
         {
             ++meshLoadCounter;
             ClearAvatarPreviewState();
@@ -1755,7 +1754,7 @@ void main()
                 pendingTextureWidth = image.Width;
                 pendingTextureHeight = image.Height;
                 pendingTextureData = new byte[image.Width * image.Height * 4];
-                image.CopyPixelDataTo(pendingTextureData);
+                image.CopyBgraPixelsTo(pendingTextureData);
                 for (int i = 0; i < pendingTextureData.Length; i += 4)
                 {
                     byte temp = pendingTextureData[i];

@@ -1,14 +1,10 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Drawing;
-using SixLabors.ImageSharp.Drawing.Processing;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
+using SkiaSharp;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -18,6 +14,7 @@ namespace AssetStudio
     {
         private const int MaxCachedAtlases = 4;
         private const long MaxCachedBytes = 256L * 1024L * 1024L; // 256 MiB
+        private static readonly SKSamplingOptions ResizeSampling = new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear);
 
         private static readonly object _cacheLock = new object();
         private static readonly Dictionary<AtlasCacheKey, AtlasCacheEntry> _cacheByKey = new Dictionary<AtlasCacheKey, AtlasCacheEntry>();
@@ -40,7 +37,7 @@ namespace AssetStudio
             DisposeEntries(toDispose);
         }
 
-        public static Image<Bgra32> GetImage(this Sprite m_Sprite)
+        public static SKBitmap GetImage(this Sprite m_Sprite)
         {
             if (m_Sprite.m_SpriteAtlas != null && m_Sprite.m_SpriteAtlas.TryGet(out var m_SpriteAtlas))
             {
@@ -59,7 +56,7 @@ namespace AssetStudio
             return null;
         }
 
-        private static Image<Bgra32> CutImage(Sprite m_Sprite, Texture2D m_Texture2D, Rectf textureRect, Vector2 textureRectOffset, float downscaleMultiplier, SpriteSettings settingsRaw)
+        private static SKBitmap CutImage(Sprite m_Sprite, Texture2D m_Texture2D, Rectf textureRect, Vector2 textureRectOffset, float downscaleMultiplier, SpriteSettings settingsRaw)
         {
             if (m_Texture2D == null)
             {
@@ -78,8 +75,8 @@ namespace AssetStudio
                 }
             }
 
-            Image<Bgra32> spriteImage;
-            Rectangle rect;
+            SKBitmap spriteImage;
+            SKRectI rect;
             using (var atlasLease = AcquireAtlasLease(m_Texture2D, targetWidth, targetHeight))
             {
                 if (atlasLease.Entry == null)
@@ -102,17 +99,21 @@ namespace AssetStudio
                     switch (settingsRaw.packingRotation)
                     {
                         case SpritePackingRotation.FlipHorizontal:
-                            spriteImage.Mutate(x => x.Flip(FlipMode.Horizontal));
+                            FlipHorizontalInPlace(spriteImage);
                             break;
                         case SpritePackingRotation.FlipVertical:
-                            spriteImage.Mutate(x => x.Flip(FlipMode.Vertical));
+                            spriteImage.FlipVerticalInPlace();
                             break;
                         case SpritePackingRotation.Rotate180:
-                            spriteImage.Mutate(x => x.Rotate(180));
+                            Rotate180InPlace(spriteImage);
                             break;
                         case SpritePackingRotation.Rotate90:
-                            spriteImage.Mutate(x => x.Rotate(270));
+                        {
+                            var rotated = Rotate270Clockwise(spriteImage);
+                            spriteImage.Dispose();
+                            spriteImage = rotated;
                             break;
+                        }
                     }
                 }
 
@@ -122,28 +123,68 @@ namespace AssetStudio
                     try
                     {
                         var triangles = GetTriangles(m_Sprite.m_RD);
-                        var polygons = triangles.Select(x => new Polygon(new LinearLineSegment(x.Select(y => new PointF(y.X, y.Y)).ToArray()))).ToArray();
-                        IPathCollection path = new PathCollection(polygons);
-                        var matrix = Matrix3x2.CreateScale(m_Sprite.m_PixelsToUnits);
-                        matrix *= Matrix3x2.CreateTranslation(m_Sprite.m_Rect.width * m_Sprite.m_Pivot.X - textureRectOffset.X, m_Sprite.m_Rect.height * m_Sprite.m_Pivot.Y - textureRectOffset.Y);
-                        path = path.Transform(matrix);
-                        var graphicsOptions = new GraphicsOptions
+                        int maskWidth = spriteImage.Width;
+                        int maskHeight = spriteImage.Height;
+                        float scale = m_Sprite.m_PixelsToUnits;
+                        float offsetX = m_Sprite.m_Rect.width * m_Sprite.m_Pivot.X - textureRectOffset.X;
+                        float offsetY = m_Sprite.m_Rect.height * m_Sprite.m_Pivot.Y - textureRectOffset.Y;
+
+                        var maskInfo = new SKImageInfo(maskWidth, maskHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
+                        using var mask = new SKBitmap(maskInfo);
+                        using (var canvas = new SKCanvas(mask))
+                        using (var paint = new SKPaint
                         {
-                            Antialias = false,
-                            AlphaCompositionMode = PixelAlphaCompositionMode.DestOut
-                        };
-                        var options = new DrawingOptions
+                            Color = SKColors.White,
+                            Style = SKPaintStyle.Fill,
+                            IsAntialias = false
+                        })
+                        using (var path = new SKPath())
                         {
-                            GraphicsOptions = graphicsOptions
-                        };
-                        using (var mask = new Image<Bgra32>(rect.Width, rect.Height, SixLabors.ImageSharp.Color.Black))
-                        {
-                            mask.Mutate(x => x.Fill(options, SixLabors.ImageSharp.Color.Red, path));
-                            var bursh = new ImageBrush(mask);
-                            spriteImage.Mutate(x => x.Fill(options, bursh));
-                            spriteImage.Mutate(x => x.Flip(FlipMode.Vertical));
-                            return spriteImage;
+                            canvas.Clear(SKColors.Transparent);
+                            foreach (var triangle in triangles)
+                            {
+                                if (triangle == null || triangle.Length < 3)
+                                {
+                                    continue;
+                                }
+
+                                path.Rewind();
+                                path.MoveTo(triangle[0].X * scale + offsetX, triangle[0].Y * scale + offsetY);
+                                for (int i = 1; i < triangle.Length; i++)
+                                {
+                                    path.LineTo(triangle[i].X * scale + offsetX, triangle[i].Y * scale + offsetY);
+                                }
+                                path.Close();
+                                canvas.DrawPath(path, paint);
+                            }
+                            canvas.Flush();
                         }
+
+                        var maskPixels = mask.GetPixelSpan();
+                        var dstPixels = spriteImage.GetWritablePixelSpan();
+                        int maskRowBytes = mask.RowBytes;
+                        int dstRowBytes = spriteImage.RowBytes;
+                        for (int y = 0; y < maskHeight; y++)
+                        {
+                            var maskRow = maskPixels.Slice(y * maskRowBytes, maskWidth * 4);
+                            var dstRow = dstPixels.Slice(y * dstRowBytes, maskWidth * 4);
+                            for (int x = 0; x < maskWidth; x++)
+                            {
+                                int offset = x * 4;
+                                if (maskRow[offset + 3] == 0)
+                                {
+                                    dstRow[offset] = 0;
+                                    dstRow[offset + 1] = 0;
+                                    dstRow[offset + 2] = 0;
+                                    dstRow[offset + 3] = 0;
+                                }
+                            }
+                        }
+                        GC.KeepAlive(mask);
+                        GC.KeepAlive(spriteImage);
+
+                        spriteImage.FlipVerticalInPlace();
+                        return spriteImage;
                     }
                     catch (Exception ex)
                     {
@@ -152,7 +193,7 @@ namespace AssetStudio
                 }
 
                 //Rectangle
-                spriteImage.Mutate(x => x.Flip(FlipMode.Vertical));
+                spriteImage.FlipVerticalInPlace();
                 return spriteImage;
             }
             catch
@@ -162,7 +203,74 @@ namespace AssetStudio
             }
         }
 
-        private static Image<Bgra32> CropSpriteRegion(AtlasCacheEntry entry, Rectf textureRect, out Rectangle rect)
+        private static void FlipHorizontalInPlace(SKBitmap bitmap)
+        {
+            int width = bitmap.Width;
+            int height = bitmap.Height;
+            if (width <= 1 || height <= 0)
+            {
+                return;
+            }
+
+            var pixels = bitmap.GetWritablePixelSpan();
+            int rowBytes = bitmap.RowBytes;
+            int halfWidth = width / 2;
+            for (int y = 0; y < height; y++)
+            {
+                var row = MemoryMarshal.Cast<byte, uint>(pixels.Slice(y * rowBytes, width * 4));
+                for (int x = 0; x < halfWidth; x++)
+                {
+                    int mirrorX = width - 1 - x;
+                    uint tmp = row[x];
+                    row[x] = row[mirrorX];
+                    row[mirrorX] = tmp;
+                }
+            }
+            GC.KeepAlive(bitmap);
+        }
+
+        private static void Rotate180InPlace(SKBitmap bitmap)
+        {
+            bitmap.FlipVerticalInPlace();
+            FlipHorizontalInPlace(bitmap);
+        }
+
+        private static SKBitmap Rotate270Clockwise(SKBitmap source)
+        {
+            int srcWidth = source.Width;
+            int srcHeight = source.Height;
+            var dstInfo = new SKImageInfo(srcHeight, srcWidth, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            var rotated = new SKBitmap(dstInfo);
+            try
+            {
+                var srcPixels = source.GetPixelSpan();
+                var dstPixels = rotated.GetWritablePixelSpan();
+                int srcRowBytes = source.RowBytes;
+                int dstRowBytes = rotated.RowBytes;
+
+                for (int y = 0; y < srcHeight; y++)
+                {
+                    var srcRow = MemoryMarshal.Cast<byte, uint>(srcPixels.Slice(y * srcRowBytes, srcWidth * 4));
+                    int dstX = y;
+                    for (int x = 0; x < srcWidth; x++)
+                    {
+                        int dstY = srcWidth - 1 - x;
+                        var dstRow = MemoryMarshal.Cast<byte, uint>(dstPixels.Slice(dstY * dstRowBytes, srcHeight * 4));
+                        dstRow[dstX] = srcRow[x];
+                    }
+                }
+                GC.KeepAlive(source);
+                GC.KeepAlive(rotated);
+                return rotated;
+            }
+            catch
+            {
+                rotated.Dispose();
+                throw;
+            }
+        }
+
+        private static SKBitmap CropSpriteRegion(AtlasCacheEntry entry, Rectf textureRect, out SKRectI rect)
         {
             lock (entry.SyncRoot)
             {
@@ -179,19 +287,25 @@ namespace AssetStudio
                     return null;
                 }
 
-                rect = new Rectangle(rectX, rectY, rectWidth, rectHeight);
-                var spriteImage = new Image<Bgra32>(rectWidth, rectHeight);
+                rect = SKRectI.Create(rectX, rectY, rectWidth, rectHeight);
+                var info = new SKImageInfo(rectWidth, rectHeight, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+                var spriteImage = new SKBitmap(info);
                 try
                 {
-                    originalImage.ProcessPixelRows(spriteImage, (srcAccessor, dstAccessor) =>
+                    var srcPixels = originalImage.GetPixelSpan();
+                    var dstPixels = spriteImage.GetWritablePixelSpan();
+                    int srcRowBytes = originalImage.RowBytes;
+                    int dstRowBytes = spriteImage.RowBytes;
+                    int copyBytes = rectWidth * 4;
+                    int srcXBytes = rectX * 4;
+                    for (int y = 0; y < rectHeight; y++)
                     {
-                        for (int y = 0; y < rectHeight; y++)
-                        {
-                            var srcRow = srcAccessor.GetRowSpan(rectY + y).Slice(rectX, rectWidth);
-                            var dstRow = dstAccessor.GetRowSpan(y);
-                            srcRow.CopyTo(dstRow);
-                        }
-                    });
+                        var srcRow = srcPixels.Slice((rectY + y) * srcRowBytes + srcXBytes, copyBytes);
+                        var dstRow = dstPixels.Slice(y * dstRowBytes, copyBytes);
+                        srcRow.CopyTo(dstRow);
+                    }
+                    GC.KeepAlive(originalImage);
+                    GC.KeepAlive(spriteImage);
                     return spriteImage;
                 }
                 catch
@@ -340,7 +454,7 @@ namespace AssetStudio
             return decodedEntry != null ? new AtlasLease(decodedEntry) : default;
         }
 
-        private static Image<Bgra32> DecodeAtlasImage(Texture2D m_Texture2D, int targetWidth, int targetHeight)
+        private static SKBitmap DecodeAtlasImage(Texture2D m_Texture2D, int targetWidth, int targetHeight)
         {
             var originalImage = m_Texture2D.ConvertToImage(false);
             if (originalImage == null)
@@ -352,7 +466,10 @@ namespace AssetStudio
             {
                 try
                 {
-                    originalImage.Mutate(x => x.Resize(targetWidth, targetHeight));
+                    var resizedInfo = new SKImageInfo(targetWidth, targetHeight, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+                    var resized = originalImage.Resize(resizedInfo, ResizeSampling);
+                    originalImage.Dispose();
+                    return resized;
                 }
                 catch
                 {
@@ -461,14 +578,14 @@ namespace AssetStudio
         {
             public readonly AtlasCacheKey Key;
             public readonly WeakReference<Texture2D> TextureRef;
-            public readonly Image<Bgra32> Image;
+            public readonly SKBitmap Image;
             public readonly long EstimatedBytes;
             public readonly object SyncRoot = new object();
             public LinkedListNode<AtlasCacheEntry> LruNode;
 
             private int _refCount;
 
-            public AtlasCacheEntry(AtlasCacheKey key, Texture2D texture, Image<Bgra32> image, long estimatedBytes)
+            public AtlasCacheEntry(AtlasCacheKey key, Texture2D texture, SKBitmap image, long estimatedBytes)
             {
                 Key = key;
                 TextureRef = new WeakReference<Texture2D>(texture);

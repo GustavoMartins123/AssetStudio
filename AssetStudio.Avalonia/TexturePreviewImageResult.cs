@@ -1,11 +1,10 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 namespace AssetStudio.Avalonia;
 
 internal sealed class TexturePreviewImageResult : System.IDisposable
 {
-    public TexturePreviewImageResult(Image<Bgra32> image, bool fromCache, bool downscaled, int sourceWidth, int sourceHeight)
+    public TexturePreviewImageResult(SKBitmap image, bool fromCache, bool downscaled, int sourceWidth, int sourceHeight)
     {
         Image = image;
         FromCache = fromCache;
@@ -14,7 +13,7 @@ internal sealed class TexturePreviewImageResult : System.IDisposable
         SourceHeight = sourceHeight;
     }
 
-    public Image<Bgra32> Image { get; }
+    public SKBitmap Image { get; }
     public bool FromCache { get; }
     public bool Downscaled { get; }
     public int SourceWidth { get; }
