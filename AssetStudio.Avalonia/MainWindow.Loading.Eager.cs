@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using AssetStudio;
 
@@ -335,48 +336,66 @@ namespace AssetStudio.Avalonia
             List<AssetItem> localExportableAssets,
             List<GameObjectNode> localSceneTreeNodes)
         {
-            var fbxNodes = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var item in localExportableAssets)
+            var count = localExportableAssets.Count;
+            if (count == 0)
             {
-                if (item.TreeNode?.GameObject == null)
-                {
-                    continue;
-                }
-
-                var fbxContainer = GetFbxContainerPath(item.Container);
-                if (fbxContainer == null)
-                {
-                    continue;
-                }
-
-                fbxNodes.TryAdd(fbxContainer, GetFbxRootNode(item.TreeNode, fbxContainer));
+                return;
             }
 
-            foreach (var item in localExportableAssets)
+            // Resolve each item's FBX container exactly once (the legacy code re-split every
+            // container path three times). Pure per-item work, so it parallelizes safely.
+            var fbxContainers = new string?[count];
+            var treeNodes = new GameObjectNode?[count];
+            var anyFbx = 0;
+            if (count >= FbxSceneNodeIndex.ParallelContainerThreshold)
             {
-                var fbxContainer = GetFbxContainerPath(item.Container);
-                if (fbxContainer == null || fbxNodes.ContainsKey(fbxContainer))
+                Parallel.For(0, count, CreateStructureBuildParallelOptions(), index =>
                 {
-                    continue;
-                }
-
-                var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
-                var node = FindSceneNodeByNameBackground(localSceneTreeNodes, fbxName);
-                if (node?.GameObject != null)
+                    var item = localExportableAssets[index];
+                    treeNodes[index] = item.TreeNode;
+                    var container = ResolveFbxContainerFast(item.Container);
+                    fbxContainers[index] = container;
+                    if (container != null)
+                    {
+                        Volatile.Write(ref anyFbx, 1);
+                    }
+                });
+            }
+            else
+            {
+                for (int index = 0; index < count; index++)
                 {
-                    fbxNodes[fbxContainer] = node;
+                    var item = localExportableAssets[index];
+                    treeNodes[index] = item.TreeNode;
+                    var container = ResolveFbxContainerFast(item.Container);
+                    fbxContainers[index] = container;
+                    if (container != null)
+                    {
+                        anyFbx = 1;
+                    }
                 }
             }
 
-            foreach (var item in localExportableAssets)
+            if (anyFbx == 0)
             {
-                var fbxContainer = GetFbxContainerPath(item.Container);
+                return;
+            }
+
+            var fbxNodes = FbxSceneNodeIndex.ResolveFbxNodes(treeNodes, fbxContainers, localSceneTreeNodes);
+            if (fbxNodes.Count == 0)
+            {
+                return;
+            }
+
+            for (int index = 0; index < count; index++)
+            {
+                var fbxContainer = fbxContainers[index];
                 if (fbxContainer == null || !fbxNodes.TryGetValue(fbxContainer, out var node))
                 {
                     continue;
                 }
 
+                var item = localExportableAssets[index];
                 item.TreeNode = node;
                 if (item.Asset is Mesh or Animator)
                 {
@@ -389,18 +408,150 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static GameObjectNode? FindSceneNodeByNameBackground(List<GameObjectNode> localSceneTreeNodes, string name)
+        /// <summary>
+        /// Same result as <see cref="GetFbxContainerPath"/>, with an allocation-free reject for
+        /// containers that cannot contain an ".fbx" segment (the overwhelming majority).
+        /// </summary>
+        internal static string? ResolveFbxContainerFast(string? container)
         {
-            foreach (var root in localSceneTreeNodes)
+            if (string.IsNullOrEmpty(container) || !container.Contains(".fbx", StringComparison.OrdinalIgnoreCase))
             {
-                var match = FindNodeByName(root, name);
-                if (match != null)
+                return null;
+            }
+
+            return GetFbxContainerPath(container);
+        }
+    }
+
+    /// <summary>
+    /// Precomputed name lookups over the scene hierarchy used to link FBX sub-assets to scene nodes.
+    /// Replaces the legacy per-asset recursive DFS (O(N_assets * N_nodes)) with single-pass indices
+    /// that preserve the exact legacy semantics:
+    /// <list type="bullet">
+    /// <item>only nodes backed by a <see cref="GameObject"/> are matchable;</item>
+    /// <item>names compare with <see cref="StringComparer.OrdinalIgnoreCase"/>;</item>
+    /// <item>ties resolve to the first node in pre-order (roots in list order, children in order),
+    /// which is exactly the node the legacy early-exit DFS returned.</item>
+    /// </list>
+    /// </summary>
+    internal static class FbxSceneNodeIndex
+    {
+        internal const int ParallelContainerThreshold = 8192;
+
+        /// <summary>Builds a first-pre-order-wins name index over every root.</summary>
+        internal static Dictionary<string, GameObjectNode> BuildNameIndex(IReadOnlyList<GameObjectNode> roots)
+        {
+            var index = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
+            var stack = new Stack<GameObjectNode>();
+            for (int r = 0; r < roots.Count; r++)
+            {
+                IndexSubtree(roots[r], index, stack);
+            }
+
+            return index;
+        }
+
+        /// <summary>Builds a first-pre-order-wins name index over a single subtree (root included).</summary>
+        internal static Dictionary<string, GameObjectNode> BuildSubtreeIndex(GameObjectNode root)
+        {
+            var index = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
+            IndexSubtree(root, index, new Stack<GameObjectNode>());
+            return index;
+        }
+
+        /// <summary>
+        /// Iterative (stack-safe) pre-order walk; <c>TryAdd</c> keeps the first visited node per name.
+        /// </summary>
+        private static void IndexSubtree(GameObjectNode root, Dictionary<string, GameObjectNode> index, Stack<GameObjectNode> stack)
+        {
+            stack.Clear();
+            stack.Push(root);
+            while (stack.Count > 0)
+            {
+                var node = stack.Pop();
+                if (node.GameObject != null && node.Name is { } name)
                 {
-                    return match;
+                    index.TryAdd(name, node);
+                }
+
+                var children = node.Children;
+                for (int i = children.Count - 1; i >= 0; i--)
+                {
+                    stack.Push(children[i]);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Maps FBX container paths to the scene node every sub-asset of that container links to.
+        /// <paramref name="itemTreeNodes"/> and <paramref name="fbxContainers"/> are parallel arrays
+        /// (one entry per exportable asset, container already resolved via GetFbxContainerPath).
+        /// </summary>
+        internal static Dictionary<string, GameObjectNode> ResolveFbxNodes(
+            IReadOnlyList<GameObjectNode?> itemTreeNodes,
+            IReadOnlyList<string?> fbxContainers,
+            IReadOnlyList<GameObjectNode> roots)
+        {
+            if (itemTreeNodes.Count != fbxContainers.Count)
+            {
+                throw new ArgumentException("Tree node and container lists must have the same length.", nameof(fbxContainers));
+            }
+
+            var fbxNodes = new Dictionary<string, GameObjectNode>(StringComparer.OrdinalIgnoreCase);
+
+            // Pass 1: assets already attached to a GameObject node anchor their container to the
+            // node named like the FBX inside their top-level GameObject subtree (or that root).
+            Dictionary<GameObjectNode, Dictionary<string, GameObjectNode>>? subtreeIndices = null;
+            for (int i = 0; i < itemTreeNodes.Count; i++)
+            {
+                var treeNode = itemTreeNodes[i];
+                if (treeNode?.GameObject == null)
+                {
+                    continue;
+                }
+
+                var fbxContainer = fbxContainers[i];
+                if (fbxContainer == null || fbxNodes.ContainsKey(fbxContainer))
+                {
+                    continue;
+                }
+
+                var root = treeNode;
+                while (root.Parent?.GameObject != null)
+                {
+                    root = root.Parent;
+                }
+
+                subtreeIndices ??= new Dictionary<GameObjectNode, Dictionary<string, GameObjectNode>>(ReferenceEqualityComparer.Instance);
+                if (!subtreeIndices.TryGetValue(root, out var subtreeIndex))
+                {
+                    subtreeIndex = BuildSubtreeIndex(root);
+                    subtreeIndices.Add(root, subtreeIndex);
+                }
+
+                var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
+                fbxNodes.Add(fbxContainer, subtreeIndex.TryGetValue(fbxName, out var namedRoot) ? namedRoot : root);
+            }
+
+            // Pass 2: remaining containers fall back to the first scene-wide node named like the FBX.
+            Dictionary<string, GameObjectNode>? sceneIndex = null;
+            for (int i = 0; i < fbxContainers.Count; i++)
+            {
+                var fbxContainer = fbxContainers[i];
+                if (fbxContainer == null || fbxNodes.ContainsKey(fbxContainer))
+                {
+                    continue;
+                }
+
+                sceneIndex ??= BuildNameIndex(roots);
+                var fbxName = Path.GetFileNameWithoutExtension(fbxContainer);
+                if (sceneIndex.TryGetValue(fbxName, out var node))
+                {
+                    fbxNodes[fbxContainer] = node;
                 }
             }
 
-            return null;
+            return fbxNodes;
         }
     }
 }
