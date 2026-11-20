@@ -44,6 +44,9 @@ jobs:
             throw "Expected native texture decoder was not copied to '$dll'."
           }
 
+      - name: Run Tests
+        run: dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --verbosity normal
+
       - name: Upload AssetStudio.Avalonia (win-x64) Artifact
         uses: actions/upload-artifact@v4
         with:

@@ -16,6 +16,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Texture2DDecoderNative", "T
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AssetStudio.Avalonia", "AssetStudio.Avalonia\AssetStudio.Avalonia.csproj", "{8ABC4A98-6A9A-4BA8-BC12-592FA18BE659}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AssetStudio.Tests", "AssetStudio.Tests\AssetStudio.Tests.csproj", "{3577804E-AD36-4BB0-8C8F-5229585D921B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -86,6 +88,18 @@ Global
 		{8ABC4A98-6A9A-4BA8-BC12-592FA18BE659}.Release|x64.Build.0 = Release|Any CPU
 		{8ABC4A98-6A9A-4BA8-BC12-592FA18BE659}.Release|x86.ActiveCfg = Release|Any CPU
 		{8ABC4A98-6A9A-4BA8-BC12-592FA18BE659}.Release|x86.Build.0 = Release|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Debug|x64.Build.0 = Debug|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Debug|x86.Build.0 = Debug|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x64.ActiveCfg = Release|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x64.Build.0 = Release|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x86.ActiveCfg = Release|Any CPU
+		{3577804E-AD36-4BB0-8C8F-5229585D921B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
