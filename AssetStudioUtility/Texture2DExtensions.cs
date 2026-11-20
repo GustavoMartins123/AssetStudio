@@ -14,40 +14,82 @@ namespace AssetStudio
                 return null;
             }
 
-            var converter = new Texture2DConverter(m_Texture2D);
-            byte[] buff;
-            long outputSize;
-            try
+            long outputSize = (long)m_Texture2D.m_Width * m_Texture2D.m_Height * 4L;
+            if (outputSize <= 0 || outputSize > int.MaxValue)
             {
-                outputSize = (long)m_Texture2D.m_Width * m_Texture2D.m_Height * 4;
-                if (outputSize > int.MaxValue)
+                Logger.Warning($"Texture too large for preview {m_Texture2D.m_Name}: {m_Texture2D.m_Width}x{m_Texture2D.m_Height}");
+                return null;
+            }
+
+            var converter = new Texture2DConverter(m_Texture2D);
+            if (!converter.CanDecode())
+            {
+                return m_Texture2D.ConvertEncodedImage(flip);
+            }
+
+            if (converter.SupportsDirectSpanDecode)
+            {
+                SKBitmap? bitmap = null;
+                try
                 {
-                    Logger.Warning($"Texture too large for preview {m_Texture2D.m_Name}: {m_Texture2D.m_Width}x{m_Texture2D.m_Height}");
+                    var info = new SKImageInfo(m_Texture2D.m_Width, m_Texture2D.m_Height, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+                    bitmap = new SKBitmap(info);
+                    var dstSpan = bitmap.GetWritablePixelSpan();
+                    int expectedRowBytes = checked(m_Texture2D.m_Width * 4);
+                    if (bitmap.RowBytes == expectedRowBytes && dstSpan.Length >= (int)outputSize)
+                    {
+                        if (converter.DecodeTexture2D(dstSpan.Slice(0, (int)outputSize)))
+                        {
+                            if (flip)
+                            {
+                                bitmap.FlipVerticalInPlace();
+                            }
+                            GC.KeepAlive(bitmap);
+                            var result = bitmap;
+                            bitmap = null;
+                            return result;
+                        }
+
+                        bitmap.Dispose();
+                        bitmap = null;
+                        return m_Texture2D.ConvertEncodedImage(flip);
+                    }
+                }
+                catch (OutOfMemoryException)
+                {
+                    bitmap?.Dispose();
+                    Logger.Warning($"Out of memory allocating image buffer for {m_Texture2D.m_Name} ({m_Texture2D.m_Width}x{m_Texture2D.m_Height})");
                     return null;
                 }
-                buff = BigArrayPool<byte>.Shared.Rent((int)outputSize);
+                finally
+                {
+                    bitmap?.Dispose();
+                }
+            }
+
+            byte[] pixels;
+            try
+            {
+                pixels = GC.AllocateUninitializedArray<byte>((int)outputSize, pinned: true);
             }
             catch (OutOfMemoryException)
             {
                 Logger.Warning($"Out of memory allocating image buffer for {m_Texture2D.m_Name} ({m_Texture2D.m_Width}x{m_Texture2D.m_Height})");
                 return null;
             }
-            try
+
+            if (converter.DecodeTexture2D(pixels))
             {
-                if (converter.DecodeTexture2D(buff))
+                if (flip)
                 {
-                    return ImageExtensions.CreateBgraUnpremulBitmap(
-                        buff.AsSpan(0, (int)outputSize),
-                        m_Texture2D.m_Width,
-                        m_Texture2D.m_Height,
-                        flipVertical: flip);
+                    int rowBytes = checked(m_Texture2D.m_Width * 4);
+                    ImageExtensions.FlipVerticalInPlace(pixels.AsSpan(0, (int)outputSize), rowBytes, rowBytes, m_Texture2D.m_Height);
                 }
-                return m_Texture2D.ConvertEncodedImage(flip);
+
+                return ImageExtensions.WrapBgraUnpremulBitmap(pixels, m_Texture2D.m_Width, m_Texture2D.m_Height);
             }
-            finally
-            {
-                BigArrayPool<byte>.Shared.Return(buff);
-            }
+
+            return m_Texture2D.ConvertEncodedImage(flip);
         }
 
         private static SKBitmap? ConvertEncodedImage(this Texture2D m_Texture2D, bool flip)

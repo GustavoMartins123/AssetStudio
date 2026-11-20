@@ -2,11 +2,21 @@
 using System;
 using System.Buffers.Binary;
 using System.IO;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace AssetStudio
 {
     public static class ImageExtensions
     {
+        private static readonly SKBitmapReleaseDelegate s_pinnedHandleReleaseDelegate = static (_, context) =>
+        {
+            if (context is GCHandle handle && handle.IsAllocated)
+            {
+                handle.Free();
+            }
+        };
         public static Span<byte> GetWritablePixelSpan(this SKBitmap? bitmap)
         {
             if (bitmap == null)
@@ -69,6 +79,46 @@ namespace AssetStudio
             }
         }
 
+        internal static SKBitmap WrapBgraUnpremulBitmap(byte[] bgraPixels, int width, int height)
+        {
+            if (bgraPixels == null) throw new ArgumentNullException(nameof(bgraPixels));
+            if (width <= 0 || height <= 0)
+            {
+                throw new ArgumentOutOfRangeException(width <= 0 ? nameof(width) : nameof(height), "Bitmap dimensions must be positive.");
+            }
+
+            long requiredBytes = (long)width * height * 4L;
+            if (requiredBytes > int.MaxValue || bgraPixels.Length < requiredBytes)
+            {
+                throw new ArgumentException($"Pixel buffer length ({bgraPixels.Length}) is smaller than required ({requiredBytes}) for {width}x{height} BGRA32.");
+            }
+
+            var info = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            var bitmap = new SKBitmap();
+            var handle = GCHandle.Alloc(bgraPixels, GCHandleType.Pinned);
+            try
+            {
+                if (bitmap.InstallPixels(info, handle.AddrOfPinnedObject(), width * 4, s_pinnedHandleReleaseDelegate, handle))
+                {
+                    return bitmap;
+                }
+
+                handle.Free();
+                bitmap.Dispose();
+            }
+            catch
+            {
+                if (handle.IsAllocated)
+                {
+                    handle.Free();
+                }
+                bitmap.Dispose();
+                throw;
+            }
+
+            return CreateBgraUnpremulBitmap(bgraPixels.AsSpan(0, (int)requiredBytes), width, height, flipVertical: false);
+        }
+
         public static SKBitmap? DecodeBgraUnpremul(byte[]? data)
         {
             if (data == null || data.Length == 0)
@@ -125,24 +175,100 @@ namespace AssetStudio
             }
 
             var pixels = bitmap.GetWritablePixelSpan();
-            byte[] tempRow = BigArrayPool<byte>.Shared.Rent(rowLength);
-            try
+            if (pixels.IsEmpty)
             {
-                var tempSpan = tempRow.AsSpan(0, rowLength);
-                int halfHeight = height / 2;
-                for (int y = 0; y < halfHeight; y++)
-                {
-                    var topRow = pixels.Slice(y * rowBytes, rowLength);
-                    var bottomRow = pixels.Slice((height - 1 - y) * rowBytes, rowLength);
-                    topRow.CopyTo(tempSpan);
-                    bottomRow.CopyTo(topRow);
-                    tempSpan.CopyTo(bottomRow);
-                }
-                GC.KeepAlive(bitmap);
+                return;
             }
-            finally
+
+            FlipVerticalInPlace(pixels, rowBytes, rowLength, height);
+            GC.KeepAlive(bitmap);
+        }
+
+        /// <summary>
+        /// Flips an image pixel buffer vertically in-place using SIMD register swaps with zero heap allocations.
+        /// </summary>
+        public static void FlipVerticalInPlace(Span<byte> pixels, int rowBytes, int rowLength, int height)
+        {
+            if (height <= 1 || rowLength <= 0 || rowBytes < rowLength)
             {
-                BigArrayPool<byte>.Shared.Return(tempRow);
+                return;
+            }
+
+            long requiredSpanLength = (long)(height - 1) * rowBytes + rowLength;
+            if (pixels.Length < requiredSpanLength)
+            {
+                throw new ArgumentException($"Pixel span length ({pixels.Length}) is smaller than required ({requiredSpanLength}).", nameof(pixels));
+            }
+
+            ref byte baseRef = ref MemoryMarshal.GetReference(pixels);
+            int halfHeight = height / 2;
+            nuint uRowLength = (nuint)rowLength;
+
+            for (int y = 0; y < halfHeight; y++)
+            {
+                ref byte topRef = ref Unsafe.Add(ref baseRef, (nint)y * rowBytes);
+                ref byte bottomRef = ref Unsafe.Add(ref baseRef, (nint)(height - 1 - y) * rowBytes);
+                SwapRows(ref topRef, ref bottomRef, uRowLength);
+            }
+        }
+
+        private static void SwapRows(ref byte topRef, ref byte bottomRef, nuint byteLength)
+        {
+            nuint i = 0;
+
+            if (Vector512.IsHardwareAccelerated && byteLength >= 64)
+            {
+                nuint limit = byteLength - 64;
+                for (; i <= limit; i += 64)
+                {
+                    var top = Vector512.LoadUnsafe(ref topRef, i);
+                    var bottom = Vector512.LoadUnsafe(ref bottomRef, i);
+                    bottom.StoreUnsafe(ref topRef, i);
+                    top.StoreUnsafe(ref bottomRef, i);
+                }
+            }
+
+            if (Vector256.IsHardwareAccelerated && byteLength - i >= 32)
+            {
+                nuint limit = byteLength - 32;
+                for (; i <= limit; i += 32)
+                {
+                    var top = Vector256.LoadUnsafe(ref topRef, i);
+                    var bottom = Vector256.LoadUnsafe(ref bottomRef, i);
+                    bottom.StoreUnsafe(ref topRef, i);
+                    top.StoreUnsafe(ref bottomRef, i);
+                }
+            }
+
+            if (Vector128.IsHardwareAccelerated && byteLength - i >= 16)
+            {
+                nuint limit = byteLength - 16;
+                for (; i <= limit; i += 16)
+                {
+                    var top = Vector128.LoadUnsafe(ref topRef, i);
+                    var bottom = Vector128.LoadUnsafe(ref bottomRef, i);
+                    bottom.StoreUnsafe(ref topRef, i);
+                    top.StoreUnsafe(ref bottomRef, i);
+                }
+            }
+
+            if (byteLength - i >= 8)
+            {
+                nuint limit = byteLength - 8;
+                for (; i <= limit; i += 8)
+                {
+                    ulong top = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref topRef, i));
+                    ulong bottom = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref bottomRef, i));
+                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref topRef, i), bottom);
+                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref bottomRef, i), top);
+                }
+            }
+
+            for (; i < byteLength; i++)
+            {
+                byte top = Unsafe.Add(ref topRef, i);
+                Unsafe.Add(ref topRef, i) = Unsafe.Add(ref bottomRef, i);
+                Unsafe.Add(ref bottomRef, i) = top;
             }
         }
 

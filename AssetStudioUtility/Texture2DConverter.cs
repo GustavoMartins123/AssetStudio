@@ -3,12 +3,52 @@ using System.Buffers.Binary;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using Texture2DDecoder;
 
 namespace AssetStudio
 {
     public class Texture2DConverter
     {
+        private readonly struct PixelSwizzleMasks
+        {
+            public readonly Vector128<byte> Mask128;
+            public readonly Vector256<byte> Lane256;
+            public readonly Vector256<byte> Global256;
+            public readonly Vector512<byte> Lane512;
+            public readonly Vector512<byte> Global512;
+            public readonly byte P0;
+            public readonly byte P1;
+            public readonly byte P2;
+            public readonly byte P3;
+
+            private PixelSwizzleMasks(byte p0, byte p1, byte p2, byte p3)
+            {
+                P0 = p0;
+                P1 = p1;
+                P2 = p2;
+                P3 = p3;
+
+                Mask128 = Vector128.Create(
+                    p0, p1, p2, p3,
+                    (byte)(4 + p0), (byte)(4 + p1), (byte)(4 + p2), (byte)(4 + p3),
+                    (byte)(8 + p0), (byte)(8 + p1), (byte)(8 + p2), (byte)(8 + p3),
+                    (byte)(12 + p0), (byte)(12 + p1), (byte)(12 + p2), (byte)(12 + p3));
+                Lane256 = Vector256.Create(Mask128, Mask128);
+                Global256 = Vector256.Create(Mask128, Mask128 + Vector128.Create((byte)16));
+                Lane512 = Vector512.Create(Lane256, Lane256);
+                Global512 = Vector512.Create(Global256, Global256 + Vector256.Create((byte)32));
+            }
+
+            public static PixelSwizzleMasks Create(byte p0, byte p1, byte p2, byte p3) => new(p0, p1, p2, p3);
+        }
+
+        private static readonly PixelSwizzleMasks s_rgbaBgraMasks = PixelSwizzleMasks.Create(2, 1, 0, 3);
+        private static readonly PixelSwizzleMasks s_argbToBgraMasks = PixelSwizzleMasks.Create(3, 2, 1, 0);
+        private static readonly PixelSwizzleMasks s_abgrToBgraMasks = PixelSwizzleMasks.Create(1, 2, 3, 0);
+        private static readonly PixelSwizzleMasks s_bgraToAbgrMasks = PixelSwizzleMasks.Create(3, 0, 1, 2);
+
         private ResourceReader reader;
         private int m_Width;
         private int m_Height;
@@ -29,9 +69,69 @@ namespace AssetStudio
             outPutSize = expectedOutput <= int.MaxValue ? (int)expectedOutput : 0;
         }
 
+        internal bool SupportsDirectSpanDecode
+        {
+            get
+            {
+                if (!RequiresNativeWholeImageArray(m_TextureFormat))
+                {
+                    return true;
+                }
+
+                long expectedOutputSize = (long)m_Width * m_Height * 4;
+                long minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
+                return ShouldUseStreamingDecode(expectedOutputSize, minDataSize);
+            }
+        }
+
+        internal bool CanDecode()
+        {
+            if (reader.Size <= 0 || m_Width <= 0 || m_Height <= 0 || !IsSupportedFormat(m_TextureFormat))
+            {
+                return false;
+            }
+
+            long expectedOutputSize = (long)m_Width * m_Height * 4;
+            long minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
+            if (minDataSize > int.MaxValue || expectedOutputSize <= 0 || expectedOutputSize > int.MaxValue)
+            {
+                return false;
+            }
+
+            if (minDataSize > 0 && reader.Size < minDataSize)
+            {
+                return (double)reader.Size / minDataSize >= 0.1;
+            }
+
+            return true;
+        }
+
         public bool DecodeTexture2D(byte[] bytes)
         {
-            if (bytes == null || reader.Size <= 0 || m_Width <= 0 || m_Height <= 0)
+            if (bytes == null)
+            {
+                return false;
+            }
+
+            return DecodeTexture2DCore(bytes.AsSpan(), bytes);
+        }
+
+        public bool DecodeTexture2D(Span<byte> bytes)
+        {
+            return DecodeTexture2DCore(bytes, backingArray: null);
+        }
+
+        private bool ShouldUseStreamingDecode(long expectedOutputSize, long minDataSize)
+        {
+            return expectedOutputSize >= 16 * 1024 * 1024
+                && minDataSize > 0
+                && reader.Size >= minDataSize
+                && GetFormatParams(m_TextureFormat, out _);
+        }
+
+        private bool DecodeTexture2DCore(Span<byte> bytes, byte[]? backingArray)
+        {
+            if (reader.Size <= 0 || m_Width <= 0 || m_Height <= 0)
             {
                 return false;
             }
@@ -43,11 +143,11 @@ namespace AssetStudio
                 return false;
             }
 
-            if (expectedOutputSize >= 16 * 1024 * 1024 && minDataSize > 0 && reader.Size >= minDataSize && GetFormatParams(m_TextureFormat, out _))
+            if (ShouldUseStreamingDecode(expectedOutputSize, minDataSize))
             {
                 try
                 {
-                    if (DecodeTexture2DStreaming(bytes))
+                    if (DecodeTexture2DStreamingCore(bytes, backingArray))
                     {
                         return true;
                     }
@@ -96,198 +196,334 @@ namespace AssetStudio
                     Logger.Warning($"Failed to read texture data: {ex.Message}");
                     return false;
                 }
-                switch (m_TextureFormat)
+
+                if (RequiresNativeWholeImageArray(m_TextureFormat))
                 {
-                case TextureFormat.Alpha8: //test pass
-                    flag = DecodeAlpha8(buff, bytes);
-                    break;
-                case TextureFormat.ARGB4444: //test pass
-                    SwapBytesForXbox(buff);
-                    flag = DecodeARGB4444(buff, bytes);
-                    break;
-                case TextureFormat.RGB24: //test pass
-                    flag = DecodeRGB24(buff, bytes);
-                    break;
-                case TextureFormat.RGBA32: //test pass
-                    flag = DecodeRGBA32(buff, bytes);
-                    break;
-                case TextureFormat.ARGB32: //test pass
-                    flag = DecodeARGB32(buff, bytes);
-                    break;
-                case TextureFormat.ARGBFloat:
-                    flag = DecodeARGBFloat(buff, bytes);
-                    break;
-                case TextureFormat.RGB565: //test pass
-                    SwapBytesForXbox(buff);
-                    flag = DecodeRGB565(buff, bytes);
-                    break;
-                case TextureFormat.BGR24:
-                    flag = DecodeBGR24(buff, bytes);
-                    break;
-                case TextureFormat.R16: //test pass
-                    flag = DecodeR16(buff, bytes);
-                    break;
-                case TextureFormat.DXT1: //test pass
-                    SwapBytesForXbox(buff);
-                    flag = DecodeDXT1(buff, bytes);
-                    break;
-                case TextureFormat.DXT3:
-                    SwapBytesForXbox(buff);
-                    flag = DecodeDXT3(buff, bytes);
-                    break;
-                case TextureFormat.DXT5: //test pass
-                    SwapBytesForXbox(buff);
-                    flag = DecodeDXT5(buff, bytes);
-                    break;
-                case TextureFormat.RGBA4444: //test pass
-                    flag = DecodeRGBA4444(buff, bytes);
-                    break;
-                case TextureFormat.BGRA32: //test pass
-                    flag = DecodeBGRA32(buff, bytes);
-                    break;
-                case TextureFormat.RHalf:
-                    flag = DecodeRHalf(buff, bytes);
-                    break;
-                case TextureFormat.RGHalf:
-                    flag = DecodeRGHalf(buff, bytes);
-                    break;
-                case TextureFormat.RGBAHalf: //test pass
-                    flag = DecodeRGBAHalf(buff, bytes);
-                    break;
-                case TextureFormat.RFloat:
-                    flag = DecodeRFloat(buff, bytes);
-                    break;
-                case TextureFormat.RGFloat:
-                    flag = DecodeRGFloat(buff, bytes);
-                    break;
-                case TextureFormat.RGBAFloat:
-                    flag = DecodeRGBAFloat(buff, bytes);
-                    break;
-                case TextureFormat.RGBFloat:
-                    flag = DecodeRGBFloat(buff, bytes);
-                    break;
-                case TextureFormat.YUY2: //test pass
-                    flag = DecodeYUY2(buff, bytes);
-                    break;
-                case TextureFormat.RGB9e5Float: //test pass
-                    flag = DecodeRGB9e5Float(buff, bytes);
-                    break;
-                case TextureFormat.BC6H: //test pass
-                    flag = DecodeBC6H(buff, bytes);
-                    break;
-                case TextureFormat.BC7: //test pass
-                    flag = DecodeBC7(buff, bytes);
-                    break;
-                case TextureFormat.BC4: //test pass
-                    flag = DecodeBC4(buff, bytes);
-                    break;
-                case TextureFormat.BC5: //test pass
-                    flag = DecodeBC5(buff, bytes);
-                    break;
-                case TextureFormat.DXT1Crunched: //test pass
-                    flag = DecodeDXT1Crunched(buff, bytes);
-                    break;
-                case TextureFormat.DXT5Crunched: //test pass
-                    flag = DecodeDXT5Crunched(buff, bytes);
-                    break;
-                case TextureFormat.PVRTC_RGB2: //test pass
-                case TextureFormat.PVRTC_RGBA2: //test pass
-                    flag = DecodePVRTC(buff, bytes, true);
-                    break;
-                case TextureFormat.PVRTC_RGB4: //test pass
-                case TextureFormat.PVRTC_RGBA4: //test pass
-                    flag = DecodePVRTC(buff, bytes, false);
-                    break;
-                case TextureFormat.ETC_RGB4: //test pass
-                case TextureFormat.ETC_RGB4_3DS:
-                    flag = DecodeETC1(buff, bytes);
-                    break;
-                case TextureFormat.ATC_RGB4: //test pass
-                    flag = DecodeATCRGB4(buff, bytes);
-                    break;
-                case TextureFormat.ATC_RGBA8: //test pass
-                    flag = DecodeATCRGBA8(buff, bytes);
-                    break;
-                case TextureFormat.EAC_R: //test pass
-                    flag = DecodeEACR(buff, bytes);
-                    break;
-                case TextureFormat.EAC_R_SIGNED:
-                    flag = DecodeEACRSigned(buff, bytes);
-                    break;
-                case TextureFormat.EAC_RG: //test pass
-                    flag = DecodeEACRG(buff, bytes);
-                    break;
-                case TextureFormat.EAC_RG_SIGNED:
-                    flag = DecodeEACRGSigned(buff, bytes);
-                    break;
-                case TextureFormat.ETC2_RGB: //test pass
-                    flag = DecodeETC2(buff, bytes);
-                    break;
-                case TextureFormat.ETC2_RGBA1: //test pass
-                    flag = DecodeETC2A1(buff, bytes);
-                    break;
-                case TextureFormat.ETC2_RGBA8: //test pass
-                case TextureFormat.ETC_RGBA8_3DS:
-                    flag = DecodeETC2A8(buff, bytes);
-                    break;
-                case TextureFormat.ASTC_RGB_4x4: //test pass
-                case TextureFormat.ASTC_RGBA_4x4: //test pass
-                case TextureFormat.ASTC_HDR_4x4: //test pass
-                    flag = DecodeASTC(buff, bytes, 4);
-                    break;
-                case TextureFormat.ASTC_RGB_5x5: //test pass
-                case TextureFormat.ASTC_RGBA_5x5: //test pass
-                case TextureFormat.ASTC_HDR_5x5: //test pass
-                    flag = DecodeASTC(buff, bytes, 5);
-                    break;
-                case TextureFormat.ASTC_RGB_6x6: //test pass
-                case TextureFormat.ASTC_RGBA_6x6: //test pass
-                case TextureFormat.ASTC_HDR_6x6: //test pass
-                    flag = DecodeASTC(buff, bytes, 6);
-                    break;
-                case TextureFormat.ASTC_RGB_8x8: //test pass
-                case TextureFormat.ASTC_RGBA_8x8: //test pass
-                case TextureFormat.ASTC_HDR_8x8: //test pass
-                    flag = DecodeASTC(buff, bytes, 8);
-                    break;
-                case TextureFormat.ASTC_RGB_10x10: //test pass
-                case TextureFormat.ASTC_RGBA_10x10: //test pass
-                case TextureFormat.ASTC_HDR_10x10: //test pass
-                    flag = DecodeASTC(buff, bytes, 10);
-                    break;
-                case TextureFormat.ASTC_RGB_12x12: //test pass
-                case TextureFormat.ASTC_RGBA_12x12: //test pass
-                case TextureFormat.ASTC_HDR_12x12: //test pass
-                    flag = DecodeASTC(buff, bytes, 12);
-                    break;
-                case TextureFormat.RG16: //test pass
-                    flag = DecodeRG16(buff, bytes);
-                    break;
-                case TextureFormat.R8: //test pass
-                    flag = DecodeR8(buff, bytes);
-                    break;
-                case TextureFormat.ETC_RGB4Crunched: //test pass
-                    flag = DecodeETC1Crunched(buff, bytes);
-                    break;
-                case TextureFormat.ETC2_RGBA8Crunched: //test pass
-                    flag = DecodeETC2A8Crunched(buff, bytes);
-                    break;
-                case TextureFormat.RG32: //test pass
-                    flag = DecodeRG32(buff, bytes);
-                    break;
-                case TextureFormat.RGB48: //test pass
-                    flag = DecodeRGB48(buff, bytes);
-                    break;
-                case TextureFormat.RGBA64: //test pass
-                    flag = DecodeRGBA64(buff, bytes);
-                    break;
-            }
+                    if (m_TextureFormat == TextureFormat.DXT1 || m_TextureFormat == TextureFormat.DXT5)
+                    {
+                        SwapBytesForXbox(buff);
+                    }
+
+                    if (backingArray != null)
+                    {
+                        flag = DecodeNativeFormat(m_TextureFormat, buff, backingArray);
+                    }
+                    else
+                    {
+                        int outLen = (int)expectedOutputSize;
+                        byte[] tempOut;
+                        try
+                        {
+                            tempOut = BigArrayPool<byte>.Shared.Rent(outLen);
+                        }
+                        catch (OutOfMemoryException)
+                        {
+                            Logger.Warning($"Out of memory allocating {outLen} bytes for native texture decode");
+                            return false;
+                        }
+                        try
+                        {
+                            flag = DecodeNativeFormat(m_TextureFormat, buff, tempOut);
+                            if (flag)
+                            {
+                                tempOut.AsSpan(0, outLen).CopyTo(bytes);
+                            }
+                        }
+                        finally
+                        {
+                            BigArrayPool<byte>.Shared.Return(tempOut);
+                        }
+                    }
+                }
+                else
+                {
+                    if (m_TextureFormat == TextureFormat.ARGB4444
+                        || m_TextureFormat == TextureFormat.RGB565
+                        || m_TextureFormat == TextureFormat.DXT3)
+                    {
+                        SwapBytesForXbox(buff);
+                    }
+
+                    flag = DecodeManagedFormat(m_TextureFormat, buff.AsSpan(0, allocSize), bytes.Slice(0, (int)expectedOutputSize));
+                }
             }
             finally
             {
                 BigArrayPool<byte>.Shared.Return(buff);
             }
             return flag;
+        }
+
+        private static bool IsSupportedFormat(TextureFormat format)
+        {
+            return format switch
+            {
+                TextureFormat.Alpha8 or
+                TextureFormat.ARGB4444 or
+                TextureFormat.RGB24 or
+                TextureFormat.RGBA32 or
+                TextureFormat.ARGB32 or
+                TextureFormat.ARGBFloat or
+                TextureFormat.RGB565 or
+                TextureFormat.BGR24 or
+                TextureFormat.R16 or
+                TextureFormat.DXT1 or
+                TextureFormat.DXT3 or
+                TextureFormat.DXT5 or
+                TextureFormat.RGBA4444 or
+                TextureFormat.BGRA32 or
+                TextureFormat.RHalf or
+                TextureFormat.RGHalf or
+                TextureFormat.RGBAHalf or
+                TextureFormat.RFloat or
+                TextureFormat.RGFloat or
+                TextureFormat.RGBAFloat or
+                TextureFormat.RGBFloat or
+                TextureFormat.YUY2 or
+                TextureFormat.RGB9e5Float or
+                TextureFormat.BC6H or
+                TextureFormat.BC7 or
+                TextureFormat.BC4 or
+                TextureFormat.BC5 or
+                TextureFormat.DXT1Crunched or
+                TextureFormat.DXT5Crunched or
+                TextureFormat.PVRTC_RGB2 or
+                TextureFormat.PVRTC_RGBA2 or
+                TextureFormat.PVRTC_RGB4 or
+                TextureFormat.PVRTC_RGBA4 or
+                TextureFormat.ETC_RGB4 or
+                TextureFormat.ETC_RGB4_3DS or
+                TextureFormat.ATC_RGB4 or
+                TextureFormat.ATC_RGBA8 or
+                TextureFormat.EAC_R or
+                TextureFormat.EAC_R_SIGNED or
+                TextureFormat.EAC_RG or
+                TextureFormat.EAC_RG_SIGNED or
+                TextureFormat.ETC2_RGB or
+                TextureFormat.ETC2_RGBA1 or
+                TextureFormat.ETC2_RGBA8 or
+                TextureFormat.ETC_RGBA8_3DS or
+                TextureFormat.ASTC_RGB_4x4 or
+                TextureFormat.ASTC_RGBA_4x4 or
+                TextureFormat.ASTC_HDR_4x4 or
+                TextureFormat.ASTC_RGB_5x5 or
+                TextureFormat.ASTC_RGBA_5x5 or
+                TextureFormat.ASTC_HDR_5x5 or
+                TextureFormat.ASTC_RGB_6x6 or
+                TextureFormat.ASTC_RGBA_6x6 or
+                TextureFormat.ASTC_HDR_6x6 or
+                TextureFormat.ASTC_RGB_8x8 or
+                TextureFormat.ASTC_RGBA_8x8 or
+                TextureFormat.ASTC_HDR_8x8 or
+                TextureFormat.ASTC_RGB_10x10 or
+                TextureFormat.ASTC_RGBA_10x10 or
+                TextureFormat.ASTC_HDR_10x10 or
+                TextureFormat.ASTC_RGB_12x12 or
+                TextureFormat.ASTC_RGBA_12x12 or
+                TextureFormat.ASTC_HDR_12x12 or
+                TextureFormat.RG16 or
+                TextureFormat.R8 or
+                TextureFormat.ETC_RGB4Crunched or
+                TextureFormat.ETC2_RGBA8Crunched or
+                TextureFormat.RG32 or
+                TextureFormat.RGB48 or
+                TextureFormat.RGBA64 => true,
+                _ => false
+            };
+        }
+
+        private static bool RequiresNativeWholeImageArray(TextureFormat format)
+        {
+            return format switch
+            {
+                TextureFormat.DXT1 or
+                TextureFormat.DXT5 or
+                TextureFormat.BC6H or
+                TextureFormat.BC7 or
+                TextureFormat.BC4 or
+                TextureFormat.BC5 or
+                TextureFormat.DXT1Crunched or
+                TextureFormat.DXT5Crunched or
+                TextureFormat.PVRTC_RGB2 or
+                TextureFormat.PVRTC_RGBA2 or
+                TextureFormat.PVRTC_RGB4 or
+                TextureFormat.PVRTC_RGBA4 or
+                TextureFormat.ETC_RGB4 or
+                TextureFormat.ETC_RGB4_3DS or
+                TextureFormat.ATC_RGB4 or
+                TextureFormat.ATC_RGBA8 or
+                TextureFormat.EAC_R or
+                TextureFormat.EAC_R_SIGNED or
+                TextureFormat.EAC_RG or
+                TextureFormat.EAC_RG_SIGNED or
+                TextureFormat.ETC2_RGB or
+                TextureFormat.ETC2_RGBA1 or
+                TextureFormat.ETC2_RGBA8 or
+                TextureFormat.ETC_RGBA8_3DS or
+                TextureFormat.ASTC_RGB_4x4 or
+                TextureFormat.ASTC_RGBA_4x4 or
+                TextureFormat.ASTC_HDR_4x4 or
+                TextureFormat.ASTC_RGB_5x5 or
+                TextureFormat.ASTC_RGBA_5x5 or
+                TextureFormat.ASTC_HDR_5x5 or
+                TextureFormat.ASTC_RGB_6x6 or
+                TextureFormat.ASTC_RGBA_6x6 or
+                TextureFormat.ASTC_HDR_6x6 or
+                TextureFormat.ASTC_RGB_8x8 or
+                TextureFormat.ASTC_RGBA_8x8 or
+                TextureFormat.ASTC_HDR_8x8 or
+                TextureFormat.ASTC_RGB_10x10 or
+                TextureFormat.ASTC_RGBA_10x10 or
+                TextureFormat.ASTC_HDR_10x10 or
+                TextureFormat.ASTC_RGB_12x12 or
+                TextureFormat.ASTC_RGBA_12x12 or
+                TextureFormat.ASTC_HDR_12x12 or
+                TextureFormat.ETC_RGB4Crunched or
+                TextureFormat.ETC2_RGBA8Crunched => true,
+                _ => false
+            };
+        }
+
+        private bool DecodeNativeFormat(TextureFormat format, byte[] buff, byte[] bytes)
+        {
+            switch (format)
+            {
+                case TextureFormat.DXT1: //test pass
+                    return DecodeDXT1(buff, bytes);
+                case TextureFormat.DXT5: //test pass
+                    return DecodeDXT5(buff, bytes);
+                case TextureFormat.BC6H: //test pass
+                    return DecodeBC6H(buff, bytes);
+                case TextureFormat.BC7: //test pass
+                    return DecodeBC7(buff, bytes);
+                case TextureFormat.BC4: //test pass
+                    return DecodeBC4(buff, bytes);
+                case TextureFormat.BC5: //test pass
+                    return DecodeBC5(buff, bytes);
+                case TextureFormat.DXT1Crunched: //test pass
+                    return DecodeDXT1Crunched(buff, bytes);
+                case TextureFormat.DXT5Crunched: //test pass
+                    return DecodeDXT5Crunched(buff, bytes);
+                case TextureFormat.PVRTC_RGB2: //test pass
+                case TextureFormat.PVRTC_RGBA2: //test pass
+                    return DecodePVRTC(buff, bytes, true);
+                case TextureFormat.PVRTC_RGB4: //test pass
+                case TextureFormat.PVRTC_RGBA4: //test pass
+                    return DecodePVRTC(buff, bytes, false);
+                case TextureFormat.ETC_RGB4: //test pass
+                case TextureFormat.ETC_RGB4_3DS:
+                    return DecodeETC1(buff, bytes);
+                case TextureFormat.ATC_RGB4: //test pass
+                    return DecodeATCRGB4(buff, bytes);
+                case TextureFormat.ATC_RGBA8: //test pass
+                    return DecodeATCRGBA8(buff, bytes);
+                case TextureFormat.EAC_R: //test pass
+                    return DecodeEACR(buff, bytes);
+                case TextureFormat.EAC_R_SIGNED:
+                    return DecodeEACRSigned(buff, bytes);
+                case TextureFormat.EAC_RG: //test pass
+                    return DecodeEACRG(buff, bytes);
+                case TextureFormat.EAC_RG_SIGNED:
+                    return DecodeEACRGSigned(buff, bytes);
+                case TextureFormat.ETC2_RGB: //test pass
+                    return DecodeETC2(buff, bytes);
+                case TextureFormat.ETC2_RGBA1: //test pass
+                    return DecodeETC2A1(buff, bytes);
+                case TextureFormat.ETC2_RGBA8: //test pass
+                case TextureFormat.ETC_RGBA8_3DS:
+                    return DecodeETC2A8(buff, bytes);
+                case TextureFormat.ASTC_RGB_4x4: //test pass
+                case TextureFormat.ASTC_RGBA_4x4: //test pass
+                case TextureFormat.ASTC_HDR_4x4: //test pass
+                    return DecodeASTC(buff, bytes, 4);
+                case TextureFormat.ASTC_RGB_5x5: //test pass
+                case TextureFormat.ASTC_RGBA_5x5: //test pass
+                case TextureFormat.ASTC_HDR_5x5: //test pass
+                    return DecodeASTC(buff, bytes, 5);
+                case TextureFormat.ASTC_RGB_6x6: //test pass
+                case TextureFormat.ASTC_RGBA_6x6: //test pass
+                case TextureFormat.ASTC_HDR_6x6: //test pass
+                    return DecodeASTC(buff, bytes, 6);
+                case TextureFormat.ASTC_RGB_8x8: //test pass
+                case TextureFormat.ASTC_RGBA_8x8: //test pass
+                case TextureFormat.ASTC_HDR_8x8: //test pass
+                    return DecodeASTC(buff, bytes, 8);
+                case TextureFormat.ASTC_RGB_10x10: //test pass
+                case TextureFormat.ASTC_RGBA_10x10: //test pass
+                case TextureFormat.ASTC_HDR_10x10: //test pass
+                    return DecodeASTC(buff, bytes, 10);
+                case TextureFormat.ASTC_RGB_12x12: //test pass
+                case TextureFormat.ASTC_RGBA_12x12: //test pass
+                case TextureFormat.ASTC_HDR_12x12: //test pass
+                    return DecodeASTC(buff, bytes, 12);
+                case TextureFormat.ETC_RGB4Crunched: //test pass
+                    return DecodeETC1Crunched(buff, bytes);
+                case TextureFormat.ETC2_RGBA8Crunched: //test pass
+                    return DecodeETC2A8Crunched(buff, bytes);
+                default:
+                    return false;
+            }
+        }
+
+        private bool DecodeManagedFormat(TextureFormat format, ReadOnlySpan<byte> buff, Span<byte> bytes)
+        {
+            switch (format)
+            {
+                case TextureFormat.Alpha8: //test pass
+                    return DecodeAlpha8(buff, bytes);
+                case TextureFormat.ARGB4444: //test pass
+                    return DecodeARGB4444(buff, bytes);
+                case TextureFormat.RGB24: //test pass
+                    return DecodeRGB24(buff, bytes);
+                case TextureFormat.RGBA32: //test pass
+                    return DecodeRGBA32(buff, bytes);
+                case TextureFormat.ARGB32: //test pass
+                    return DecodeARGB32(buff, bytes);
+                case TextureFormat.ARGBFloat:
+                    return DecodeARGBFloat(buff, bytes);
+                case TextureFormat.RGB565: //test pass
+                    return DecodeRGB565(buff, bytes);
+                case TextureFormat.BGR24:
+                    return DecodeBGR24(buff, bytes);
+                case TextureFormat.R16: //test pass
+                    return DecodeR16(buff, bytes);
+                case TextureFormat.DXT3:
+                    return DecodeDXT3(buff, bytes);
+                case TextureFormat.RGBA4444: //test pass
+                    return DecodeRGBA4444(buff, bytes);
+                case TextureFormat.BGRA32: //test pass
+                    return DecodeBGRA32(buff, bytes);
+                case TextureFormat.RHalf:
+                    return DecodeRHalf(buff, bytes);
+                case TextureFormat.RGHalf:
+                    return DecodeRGHalf(buff, bytes);
+                case TextureFormat.RGBAHalf: //test pass
+                    return DecodeRGBAHalf(buff, bytes);
+                case TextureFormat.RFloat:
+                    return DecodeRFloat(buff, bytes);
+                case TextureFormat.RGFloat:
+                    return DecodeRGFloat(buff, bytes);
+                case TextureFormat.RGBAFloat:
+                    return DecodeRGBAFloat(buff, bytes);
+                case TextureFormat.RGBFloat:
+                    return DecodeRGBFloat(buff, bytes);
+                case TextureFormat.YUY2: //test pass
+                    return DecodeYUY2(buff, bytes);
+                case TextureFormat.RGB9e5Float: //test pass
+                    return DecodeRGB9e5Float(buff, bytes);
+                case TextureFormat.RG16: //test pass
+                    return DecodeRG16(buff, bytes);
+                case TextureFormat.R8: //test pass
+                    return DecodeR8(buff, bytes);
+                case TextureFormat.RG32: //test pass
+                    return DecodeRG32(buff, bytes);
+                case TextureFormat.RGB48: //test pass
+                    return DecodeRGB48(buff, bytes);
+                case TextureFormat.RGBA64: //test pass
+                    return DecodeRGBA64(buff, bytes);
+                default:
+                    return false;
+            }
         }
 
         private void SwapBytesForXbox(byte[] image_data)
@@ -303,11 +539,271 @@ namespace AssetStudio
             }
         }
 
-        private bool DecodeAlpha8(byte[] image_data, byte[] buff)
+        /// <summary>
+        /// Swizzles 32-bit pixels between RGBA and BGRA byte order using SIMD instructions.
+        /// Supports both separate and identical (in-place) source and destination buffers.
+        /// </summary>
+        public static void SwizzleRgbaBgra(ReadOnlySpan<byte> source, Span<byte> destination)
+            => Swizzle4BytePixels(source, destination, in s_rgbaBgraMasks);
+
+        /// <summary>
+        /// Swizzles 32-bit pixels from ARGB to BGRA byte order using SIMD instructions.
+        /// </summary>
+        public static void SwizzleArgbToBgra(ReadOnlySpan<byte> source, Span<byte> destination)
+            => Swizzle4BytePixels(source, destination, in s_argbToBgraMasks);
+
+        /// <summary>
+        /// Swizzles 32-bit pixels from ABGR to BGRA byte order using SIMD instructions.
+        /// </summary>
+        public static void SwizzleAbgrToBgra(ReadOnlySpan<byte> source, Span<byte> destination)
+            => Swizzle4BytePixels(source, destination, in s_abgrToBgraMasks);
+
+        /// <summary>
+        /// Swizzles 32-bit pixels from BGRA to ABGR byte order (or RGBA to ARGB) using SIMD instructions.
+        /// </summary>
+        public static void SwizzleBgraToAbgr(ReadOnlySpan<byte> source, Span<byte> destination)
+            => Swizzle4BytePixels(source, destination, in s_bgraToAbgrMasks);
+
+        private static void Swizzle4BytePixels(ReadOnlySpan<byte> source, Span<byte> destination, in PixelSwizzleMasks masks)
+        {
+            int byteCount = source.Length & ~3;
+            if (byteCount == 0)
+            {
+                return;
+            }
+
+            if (destination.Length < byteCount)
+            {
+                throw new ArgumentException($"Destination span length ({destination.Length}) is smaller than required ({byteCount}).", nameof(destination));
+            }
+
+            ref byte srcRef = ref MemoryMarshal.GetReference(source);
+            ref byte dstRef = ref MemoryMarshal.GetReference(destination);
+            if (!Unsafe.AreSame(ref srcRef, ref dstRef) && source.Slice(0, byteCount).Overlaps(destination.Slice(0, byteCount)))
+            {
+                byte[] temp = BigArrayPool<byte>.Shared.Rent(byteCount);
+                try
+                {
+                    Span<byte> tempSpan = temp.AsSpan(0, byteCount);
+                    Swizzle4BytePixelsCore(ref srcRef, ref MemoryMarshal.GetReference(tempSpan), (nuint)byteCount, in masks);
+                    tempSpan.CopyTo(destination);
+                    return;
+                }
+                finally
+                {
+                    BigArrayPool<byte>.Shared.Return(temp);
+                }
+            }
+
+            Swizzle4BytePixelsCore(ref srcRef, ref dstRef, (nuint)byteCount, in masks);
+        }
+
+        private static void Swizzle4BytePixelsCore(ref byte srcRef, ref byte dstRef, nuint count, in PixelSwizzleMasks masks)
+        {
+            nuint i = 0;
+
+            if (Avx512BW.IsSupported && count >= 64)
+            {
+                Vector512<byte> mask = masks.Lane512;
+                nuint limit = count - 64;
+                for (; i <= limit; i += 64)
+                {
+                    var vec = Vector512.LoadUnsafe(ref srcRef, i);
+                    Avx512BW.Shuffle(vec, mask).StoreUnsafe(ref dstRef, i);
+                }
+            }
+            else if (Vector512.IsHardwareAccelerated && count >= 64)
+            {
+                Vector512<byte> mask = masks.Global512;
+                nuint limit = count - 64;
+                for (; i <= limit; i += 64)
+                {
+                    var vec = Vector512.LoadUnsafe(ref srcRef, i);
+                    Vector512.Shuffle(vec, mask).StoreUnsafe(ref dstRef, i);
+                }
+            }
+
+            if (Avx2.IsSupported && count - i >= 32)
+            {
+                Vector256<byte> mask = masks.Lane256;
+                nuint limit = count - 32;
+                for (; i <= limit; i += 32)
+                {
+                    var vec = Vector256.LoadUnsafe(ref srcRef, i);
+                    Avx2.Shuffle(vec, mask).StoreUnsafe(ref dstRef, i);
+                }
+            }
+            else if (Vector256.IsHardwareAccelerated && count - i >= 32)
+            {
+                Vector256<byte> mask = masks.Global256;
+                nuint limit = count - 32;
+                for (; i <= limit; i += 32)
+                {
+                    var vec = Vector256.LoadUnsafe(ref srcRef, i);
+                    Vector256.Shuffle(vec, mask).StoreUnsafe(ref dstRef, i);
+                }
+            }
+
+            if (Vector128.IsHardwareAccelerated && count - i >= 16)
+            {
+                Vector128<byte> mask = masks.Mask128;
+                nuint limit = count - 16;
+                for (; i <= limit; i += 16)
+                {
+                    var vec = Vector128.LoadUnsafe(ref srcRef, i);
+                    Vector128.Shuffle(vec, mask).StoreUnsafe(ref dstRef, i);
+                }
+            }
+
+            nuint p0 = masks.P0;
+            nuint p1 = masks.P1;
+            nuint p2 = masks.P2;
+            nuint p3 = masks.P3;
+            for (; i < count; i += 4)
+            {
+                byte b0 = Unsafe.Add(ref srcRef, i + p0);
+                byte b1 = Unsafe.Add(ref srcRef, i + p1);
+                byte b2 = Unsafe.Add(ref srcRef, i + p2);
+                byte b3 = Unsafe.Add(ref srcRef, i + p3);
+                Unsafe.Add(ref dstRef, i) = b0;
+                Unsafe.Add(ref dstRef, i + 1) = b1;
+                Unsafe.Add(ref dstRef, i + 2) = b2;
+                Unsafe.Add(ref dstRef, i + 3) = b3;
+            }
+        }
+
+        /// <summary>
+        /// Decodes ARGB4444 pixels into BGRA32 output using zero-allocation SIMD / register bit operations.
+        /// </summary>
+        public static void DecodeArgb4444(ReadOnlySpan<byte> source, Span<byte> destination, int pixelCount)
+            => Decode4444(source, destination, pixelCount, isRgba4444: false);
+
+        /// <summary>
+        /// Decodes RGBA4444 pixels into BGRA32 output using zero-allocation SIMD / register bit operations.
+        /// </summary>
+        public static void DecodeRgba4444(ReadOnlySpan<byte> source, Span<byte> destination, int pixelCount)
+            => Decode4444(source, destination, pixelCount, isRgba4444: true);
+
+        private static void Decode4444(ReadOnlySpan<byte> source, Span<byte> destination, int pixelCount, bool isRgba4444)
+        {
+            if (pixelCount <= 0)
+            {
+                return;
+            }
+
+            long requiredSrcBytes = (long)pixelCount * 2L;
+            long requiredDstBytes = (long)pixelCount * 4L;
+            if (source.Length < requiredSrcBytes)
+            {
+                throw new ArgumentException($"Source buffer length ({source.Length}) is smaller than required ({requiredSrcBytes}).", nameof(source));
+            }
+            if (destination.Length < requiredDstBytes)
+            {
+                throw new ArgumentException($"Destination buffer length ({destination.Length}) is smaller than required ({requiredDstBytes}).", nameof(destination));
+            }
+
+            int i = 0;
+            if (BitConverter.IsLittleEndian)
+            {
+                ref ushort srcU16 = ref Unsafe.As<byte, ushort>(ref MemoryMarshal.GetReference(source));
+                ref uint dstU32 = ref Unsafe.As<byte, uint>(ref MemoryMarshal.GetReference(destination));
+                nuint idx = 0;
+                nuint count = (nuint)pixelCount;
+
+                if (Vector256.IsHardwareAccelerated && count >= 16)
+                {
+                    var mask000F = Vector256.Create(0x000Fu);
+                    var mask00F0 = Vector256.Create(0x00F0u);
+                    var mask0F00 = Vector256.Create(0x0F00u);
+                    var maskF000 = Vector256.Create(0xF000u);
+                    nuint limit = count - 16;
+                    for (; idx <= limit; idx += 16)
+                    {
+                        var packed = Vector256.LoadUnsafe(ref srcU16, idx);
+                        var (lo, hi) = Vector256.Widen(packed);
+                        Expand4444Vector256(lo, isRgba4444, mask000F, mask00F0, mask0F00, maskF000).StoreUnsafe(ref dstU32, idx);
+                        Expand4444Vector256(hi, isRgba4444, mask000F, mask00F0, mask0F00, maskF000).StoreUnsafe(ref dstU32, idx + 8);
+                    }
+                }
+
+                if (Vector128.IsHardwareAccelerated && count - idx >= 8)
+                {
+                    var mask000F = Vector128.Create(0x000Fu);
+                    var mask00F0 = Vector128.Create(0x00F0u);
+                    var mask0F00 = Vector128.Create(0x0F00u);
+                    var maskF000 = Vector128.Create(0xF000u);
+                    nuint limit = count - 8;
+                    for (; idx <= limit; idx += 8)
+                    {
+                        var packed = Vector128.LoadUnsafe(ref srcU16, idx);
+                        var (lo, hi) = Vector128.Widen(packed);
+                        Expand4444Vector128(lo, isRgba4444, mask000F, mask00F0, mask0F00, maskF000).StoreUnsafe(ref dstU32, idx);
+                        Expand4444Vector128(hi, isRgba4444, mask000F, mask00F0, mask0F00, maskF000).StoreUnsafe(ref dstU32, idx + 4);
+                    }
+                }
+
+                i = (int)idx;
+            }
+
+            for (; i < pixelCount; i++)
+            {
+                uint p = BinaryPrimitives.ReadUInt16LittleEndian(source.Slice(i * 2, 2));
+                uint r = isRgba4444 ? ((p >> 4) | ((p & 0x000Fu) << 12)) : p;
+                uint expanded = (r & 0x000Fu)
+                              | ((r & 0x00F0u) << 4)
+                              | ((r & 0x0F00u) << 8)
+                              | ((r & 0xF000u) << 12);
+                uint bgra = expanded | (expanded << 4);
+                BinaryPrimitives.WriteUInt32LittleEndian(destination.Slice(i * 4, 4), bgra);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<uint> Expand4444Vector256(
+            Vector256<uint> v,
+            bool isRgba4444,
+            Vector256<uint> mask000F,
+            Vector256<uint> mask00F0,
+            Vector256<uint> mask0F00,
+            Vector256<uint> maskF000)
+        {
+            if (isRgba4444)
+            {
+                v = (v >> 4) | ((v & mask000F) << 12);
+            }
+
+            Vector256<uint> expanded = (v & mask000F)
+                                     | ((v & mask00F0) << 4)
+                                     | ((v & mask0F00) << 8)
+                                     | ((v & maskF000) << 12);
+            return expanded | (expanded << 4);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<uint> Expand4444Vector128(
+            Vector128<uint> v,
+            bool isRgba4444,
+            Vector128<uint> mask000F,
+            Vector128<uint> mask00F0,
+            Vector128<uint> mask0F00,
+            Vector128<uint> maskF000)
+        {
+            if (isRgba4444)
+            {
+                v = (v >> 4) | ((v & mask000F) << 12);
+            }
+
+            Vector128<uint> expanded = (v & mask000F)
+                                     | ((v & mask00F0) << 4)
+                                     | ((v & mask0F00) << 8)
+                                     | ((v & maskF000) << 12);
+            return expanded | (expanded << 4);
+        }
+
+        private bool DecodeAlpha8(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
-            var span = new Span<byte>(buff);
-            span.Fill(0xFF);
+            buff.Fill(0xFF);
             for (var i = 0; i < size; i++)
             {
                 buff[i * 4 + 3] = image_data[i];
@@ -315,25 +811,13 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeARGB4444(byte[] image_data, byte[] buff)
+        private bool DecodeARGB4444(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
-            var size = m_Width * m_Height;
-            var pixelNew = new byte[4];
-            for (var i = 0; i < size; i++)
-            {
-                var pixelOldShort = BitConverter.ToUInt16(image_data, i * 2);
-                pixelNew[0] = (byte)(pixelOldShort & 0x000f);
-                pixelNew[1] = (byte)((pixelOldShort & 0x00f0) >> 4);
-                pixelNew[2] = (byte)((pixelOldShort & 0x0f00) >> 8);
-                pixelNew[3] = (byte)((pixelOldShort & 0xf000) >> 12);
-                for (var j = 0; j < 4; j++)
-                    pixelNew[j] = (byte)((pixelNew[j] << 4) | pixelNew[j]);
-                pixelNew.CopyTo(buff, i * 4);
-            }
+            DecodeArgb4444(image_data, buff, m_Width * m_Height);
             return true;
         }
 
-        private bool DecodeRGB24(byte[] image_data, byte[] buff)
+        private bool DecodeRGB24(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
@@ -346,48 +830,36 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeRGBA32(byte[] image_data, byte[] buff)
+        private bool DecodeRGBA32(ReadOnlySpan<byte> image_data, Span<byte> buff)
+        {
+            SwizzleRgbaBgra(image_data.Slice(0, outPutSize), buff.Slice(0, outPutSize));
+            return true;
+        }
+
+        private bool DecodeARGB32(ReadOnlySpan<byte> image_data, Span<byte> buff)
+        {
+            SwizzleArgbToBgra(image_data.Slice(0, outPutSize), buff.Slice(0, outPutSize));
+            return true;
+        }
+
+        private bool DecodeARGBFloat(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = image_data[i + 2];
-                buff[i + 1] = image_data[i + 1];
-                buff[i + 2] = image_data[i + 0];
-                buff[i + 3] = image_data[i + 3];
+                buff[i] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4 + 12, 4)));
+                buff[i + 1] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4 + 8, 4)));
+                buff[i + 2] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4 + 4, 4)));
+                buff[i + 3] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4, 4)));
             }
             return true;
         }
 
-        private bool DecodeARGB32(byte[] image_data, byte[] buff)
-        {
-            for (var i = 0; i < outPutSize; i += 4)
-            {
-                buff[i] = image_data[i + 3];
-                buff[i + 1] = image_data[i + 2];
-                buff[i + 2] = image_data[i + 1];
-                buff[i + 3] = image_data[i + 0];
-            }
-            return true;
-        }
-
-        private bool DecodeARGBFloat(byte[] image_data, byte[] buff)
-        {
-            for (var i = 0; i < outPutSize; i += 4)
-            {
-                buff[i] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 12));
-                buff[i + 1] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 8));
-                buff[i + 2] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 4));
-                buff[i + 3] = FloatToByte(BitConverter.ToSingle(image_data, i * 4));
-            }
-            return true;
-        }
-
-        private bool DecodeRGB565(byte[] image_data, byte[] buff)
+        private bool DecodeRGB565(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
             {
-                var p = BitConverter.ToUInt16(image_data, i * 2);
+                var p = BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 2, 2));
                 buff[i * 4] = (byte)((p << 3) | (p >> 2 & 7));
                 buff[i * 4 + 1] = (byte)((p >> 3 & 0xfc) | (p >> 9 & 3));
                 buff[i * 4 + 2] = (byte)((p >> 8 & 0xf8) | (p >> 13));
@@ -396,7 +868,7 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeBGR24(byte[] image_data, byte[] buff)
+        private bool DecodeBGR24(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
@@ -409,14 +881,14 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeR16(byte[] image_data, byte[] buff)
+        private bool DecodeR16(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
             {
                 buff[i * 4] = 0; //b
                 buff[i * 4 + 1] = 0; //g
-                buff[i * 4 + 2] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 2)); //r
+                buff[i * 4 + 2] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 2, 2))); //r
                 buff[i * 4 + 3] = 255; //a
             }
             return true;
@@ -427,7 +899,7 @@ namespace AssetStudio
             return TextureDecoder.DecodeDXT1(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeDXT3(byte[] image_data, byte[] buff)
+        private bool DecodeDXT3(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             int blockCountX = (m_Width + 3) / 4;
             int blockCountY = (m_Height + 3) / 4;
@@ -441,10 +913,10 @@ namespace AssetStudio
                     if (blockIndex + 16 > image_data.Length)
                         continue;
 
-                    ulong alphaData = BitConverter.ToUInt64(image_data, blockIndex);
-                    ushort c0 = BitConverter.ToUInt16(image_data, blockIndex + 8);
-                    ushort c1 = BitConverter.ToUInt16(image_data, blockIndex + 10);
-                    uint colorIndices = BitConverter.ToUInt32(image_data, blockIndex + 12);
+                    ulong alphaData = BinaryPrimitives.ReadUInt64LittleEndian(image_data.Slice(blockIndex, 8));
+                    ushort c0 = BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(blockIndex + 8, 2));
+                    ushort c1 = BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(blockIndex + 10, 2));
+                    uint colorIndices = BinaryPrimitives.ReadUInt32LittleEndian(image_data.Slice(blockIndex + 12, 4));
 
                     int r5_0 = (c0 >> 11) & 0x1F;
                     int g6_0 = (c0 >> 5) & 0x3F;
@@ -516,118 +988,100 @@ namespace AssetStudio
             return TextureDecoder.DecodeDXT5(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeRGBA4444(byte[] image_data, byte[] buff)
+        private bool DecodeRGBA4444(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
-            var size = m_Width * m_Height;
-            var pixelNew = new byte[4];
-            for (var i = 0; i < size; i++)
-            {
-                var pixelOldShort = BitConverter.ToUInt16(image_data, i * 2);
-                pixelNew[0] = (byte)((pixelOldShort & 0x00f0) >> 4);
-                pixelNew[1] = (byte)((pixelOldShort & 0x0f00) >> 8);
-                pixelNew[2] = (byte)((pixelOldShort & 0xf000) >> 12);
-                pixelNew[3] = (byte)(pixelOldShort & 0x000f);
-                for (var j = 0; j < 4; j++)
-                    pixelNew[j] = (byte)((pixelNew[j] << 4) | pixelNew[j]);
-                pixelNew.CopyTo(buff, i * 4);
-            }
+            DecodeRgba4444(image_data, buff, m_Width * m_Height);
             return true;
         }
 
-        private bool DecodeBGRA32(byte[] image_data, byte[] buff)
+        private bool DecodeBGRA32(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
-            for (var i = 0; i < outPutSize; i += 4)
-            {
-                buff[i] = image_data[i];
-                buff[i + 1] = image_data[i + 1];
-                buff[i + 2] = image_data[i + 2];
-                buff[i + 3] = image_data[i + 3];
-            }
+            image_data.Slice(0, outPutSize).CopyTo(buff);
             return true;
         }
 
-        private bool DecodeRHalf(byte[] image_data, byte[] buff)
+        private bool DecodeRHalf(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
                 buff[i] = 0;
                 buff[i + 1] = 0;
-                buff[i + 2] = FloatToByte((float)BitConverter.ToHalf(image_data, i / 2));
+                buff[i + 2] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i / 2, 2)));
                 buff[i + 3] = 255;
             }
             return true;
         }
 
-        private bool DecodeRGHalf(byte[] image_data, byte[] buff)
+        private bool DecodeRGHalf(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
                 buff[i] = 0;
-                buff[i + 1] = FloatToByte((float)BitConverter.ToHalf(image_data, i + 2));
-                buff[i + 2] = FloatToByte((float)BitConverter.ToHalf(image_data, i));
+                buff[i + 1] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i + 2, 2)));
+                buff[i + 2] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i, 2)));
                 buff[i + 3] = 255;
             }
             return true;
         }
 
-        private bool DecodeRGBAHalf(byte[] image_data, byte[] buff)
+        private bool DecodeRGBAHalf(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2 + 4));
-                buff[i + 1] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2 + 2));
-                buff[i + 2] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2));
-                buff[i + 3] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2 + 6));
+                buff[i] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i * 2 + 4, 2)));
+                buff[i + 1] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i * 2 + 2, 2)));
+                buff[i + 2] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i * 2, 2)));
+                buff[i + 3] = FloatToByte((float)BinaryPrimitives.ReadHalfLittleEndian(image_data.Slice(i * 2 + 6, 2)));
             }
             return true;
         }
 
-        private bool DecodeRFloat(byte[] image_data, byte[] buff)
+        private bool DecodeRFloat(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
                 buff[i] = 0;
                 buff[i + 1] = 0;
-                buff[i + 2] = (byte)Math.Round(BitConverter.ToSingle(image_data, i) * 255f);
+                buff[i + 2] = (byte)Math.Round(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i, 4)) * 255f);
                 buff[i + 3] = 255;
             }
             return true;
         }
 
-        private bool DecodeRGFloat(byte[] image_data, byte[] buff)
+        private bool DecodeRGFloat(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
                 buff[i] = 0;
-                buff[i + 1] = (byte)Math.Round(BitConverter.ToSingle(image_data, i * 2 + 4) * 255f);
-                buff[i + 2] = (byte)Math.Round(BitConverter.ToSingle(image_data, i * 2) * 255f);
+                buff[i + 1] = (byte)Math.Round(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 2 + 4, 4)) * 255f);
+                buff[i + 2] = (byte)Math.Round(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 2, 4)) * 255f);
                 buff[i + 3] = 255;
             }
             return true;
         }
 
-        private bool DecodeRGBAFloat(byte[] image_data, byte[] buff)
+        private bool DecodeRGBAFloat(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 8));
-                buff[i + 1] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 4));
-                buff[i + 2] = FloatToByte(BitConverter.ToSingle(image_data, i * 4));
-                buff[i + 3] = FloatToByte(BitConverter.ToSingle(image_data, i * 4 + 12));
+                buff[i] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4 + 8, 4)));
+                buff[i + 1] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4 + 4, 4)));
+                buff[i + 2] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4, 4)));
+                buff[i + 3] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 4 + 12, 4)));
             }
             return true;
         }
 
-        private bool DecodeRGBFloat(byte[] image_data, byte[] buff)
+        private bool DecodeRGBFloat(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
             {
                 var input = i * 12;
                 var output = i * 4;
-                buff[output] = FloatToByte(BitConverter.ToSingle(image_data, input + 8));
-                buff[output + 1] = FloatToByte(BitConverter.ToSingle(image_data, input + 4));
-                buff[output + 2] = FloatToByte(BitConverter.ToSingle(image_data, input));
+                buff[output] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(input + 8, 4)));
+                buff[output + 1] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(input + 4, 4)));
+                buff[output + 2] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(input, 4)));
                 buff[output + 3] = 255;
             }
             return true;
@@ -649,7 +1103,7 @@ namespace AssetStudio
             return (byte)Math.Round(value * 255f);
         }
 
-        private bool DecodeYUY2(byte[] image_data, byte[] buff)
+        private bool DecodeYUY2(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             int p = 0;
             int o = 0;
@@ -679,11 +1133,11 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeRGB9e5Float(byte[] image_data, byte[] buff)
+        private bool DecodeRGB9e5Float(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                var n = BitConverter.ToInt32(image_data, i);
+                var n = BinaryPrimitives.ReadInt32LittleEndian(image_data.Slice(i, 4));
                 var scale = n >> 27 & 0x1f;
                 var scalef = Math.Pow(2, scale - 24);
                 var b = n >> 18 & 0x1ff;
@@ -803,7 +1257,7 @@ namespace AssetStudio
             return TextureDecoder.DecodeASTC(image_data, m_Width, m_Height, blocksize, blocksize, buff);
         }
 
-        private bool DecodeRG16(byte[] image_data, byte[] buff)
+        private bool DecodeRG16(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
@@ -816,7 +1270,7 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeR8(byte[] image_data, byte[] buff)
+        private bool DecodeR8(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
@@ -861,39 +1315,39 @@ namespace AssetStudio
             return (byte)(((component * 255) + 32895) >> 16);
         }
 
-        private bool DecodeRG32(byte[] image_data, byte[] buff)
+        private bool DecodeRG32(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = 0;                                                                          //b
-                buff[i + 1] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i + 2));     //g
-                buff[i + 2] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i));         //r
-                buff[i + 3] = byte.MaxValue;                                                          //a
+                buff[i] = 0;                                                                                              //b
+                buff[i + 1] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i + 2, 2))); //g
+                buff[i + 2] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i, 2)));     //r
+                buff[i + 3] = byte.MaxValue;                                                                              //a
             }
             return true;
         }
 
-        private bool DecodeRGB48(byte[] image_data, byte[] buff)
+        private bool DecodeRGB48(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             var size = m_Width * m_Height;
             for (var i = 0; i < size; i++)
             {
-                buff[i * 4] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 6 + 4));     //b
-                buff[i * 4 + 1] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 6 + 2)); //g
-                buff[i * 4 + 2] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 6));     //r
-                buff[i * 4 + 3] = byte.MaxValue;                                                          //a
+                buff[i * 4] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 6 + 4, 2)));     //b
+                buff[i * 4 + 1] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 6 + 2, 2))); //g
+                buff[i * 4 + 2] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 6, 2)));     //r
+                buff[i * 4 + 3] = byte.MaxValue;                                                                                     //a
             }
             return true;
         }
 
-        private bool DecodeRGBA64(byte[] image_data, byte[] buff)
+        private bool DecodeRGBA64(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 2 + 4));     //b
-                buff[i + 1] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 2 + 2)); //g
-                buff[i + 2] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 2));     //r
-                buff[i + 3] = DownScaleFrom16BitTo8Bit(BitConverter.ToUInt16(image_data, i * 2 + 6)); //a
+                buff[i] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 2 + 4, 2)));     //b
+                buff[i + 1] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 2 + 2, 2))); //g
+                buff[i + 2] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 2, 2)));     //r
+                buff[i + 3] = DownScaleFrom16BitTo8Bit(BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(i * 2 + 6, 2))); //a
             }
             return true;
         }
@@ -1242,6 +1696,11 @@ namespace AssetStudio
 
         private bool DecodeTexture2DStreaming(byte[] bytes)
         {
+            return bytes != null && DecodeTexture2DStreamingCore(bytes.AsSpan(), bytes);
+        }
+
+        private bool DecodeTexture2DStreamingCore(Span<byte> bytes, byte[]? backingArray)
+        {
             if (!GetFormatParams(m_TextureFormat, out var param))
             {
                 return false;
@@ -1303,7 +1762,7 @@ namespace AssetStudio
                         }
 
                         int dstOffset = by * blockHeight * outputRowStride;
-                        Buffer.BlockCopy(chunkDecoded, 0, bytes, dstOffset, chunkHeight * outputRowStride);
+                        chunkDecoded.AsSpan(0, chunkHeight * outputRowStride).CopyTo(bytes.Slice(dstOffset));
                     }
                     return true;
                 }
@@ -1322,13 +1781,33 @@ namespace AssetStudio
 
                 if (m_TextureFormat == TextureFormat.BGRA32)
                 {
-                    for (int yStart = 0; yStart < m_Height; yStart += rowsPerChunk)
+                    byte[]? bgraRowScratch = null;
+                    try
                     {
-                        int chunkRows = Math.Min(rowsPerChunk, m_Height - yStart);
-                        int chunkBytes = chunkRows * rowBytes;
-                        readSession.ReadSegment((long)yStart * rowBytes, bytes, yStart * rowBytes, chunkBytes);
+                        for (int yStart = 0; yStart < m_Height; yStart += rowsPerChunk)
+                        {
+                            int chunkRows = Math.Min(rowsPerChunk, m_Height - yStart);
+                            int chunkBytes = chunkRows * rowBytes;
+                            if (backingArray != null)
+                            {
+                                readSession.ReadSegment((long)yStart * rowBytes, backingArray, yStart * rowBytes, chunkBytes);
+                            }
+                            else
+                            {
+                                bgraRowScratch ??= BigArrayPool<byte>.Shared.Rent(rowsPerChunk * rowBytes);
+                                readSession.ReadSegment((long)yStart * rowBytes, bgraRowScratch, 0, chunkBytes);
+                                bgraRowScratch.AsSpan(0, chunkBytes).CopyTo(bytes.Slice(yStart * rowBytes, chunkBytes));
+                            }
+                        }
+                        return true;
                     }
-                    return true;
+                    finally
+                    {
+                        if (bgraRowScratch != null)
+                        {
+                            BigArrayPool<byte>.Shared.Return(bgraRowScratch);
+                        }
+                    }
                 }
 
                 byte[] tempChunk = BigArrayPool<byte>.Shared.Rent(rowsPerChunk * rowBytes);
@@ -1340,6 +1819,17 @@ namespace AssetStudio
                         int chunkRows = Math.Min(rowsPerChunk, m_Height - yStart);
                         int chunkBytes = chunkRows * rowBytes;
                         readSession.ReadSegment((long)yStart * rowBytes, tempChunk, 0, chunkBytes);
+
+                        if (m_TextureFormat == TextureFormat.RGBA32)
+                        {
+                            SwizzleRgbaBgra(tempChunk.AsSpan(0, chunkBytes), bytes.Slice(yStart * outputRowStride, chunkBytes));
+                            continue;
+                        }
+                        if (m_TextureFormat == TextureFormat.ARGB32)
+                        {
+                            SwizzleArgbToBgra(tempChunk.AsSpan(0, chunkBytes), bytes.Slice(yStart * outputRowStride, chunkBytes));
+                            continue;
+                        }
 
                         for (int r = 0; r < chunkRows; r++)
                         {
@@ -1378,28 +1868,6 @@ namespace AssetStudio
                                         bytes[outIdx + 1] = tempChunk[inIdx + 1];
                                         bytes[outIdx + 2] = tempChunk[inIdx + 2];
                                         bytes[outIdx + 3] = 255;
-                                    }
-                                    break;
-                                case TextureFormat.RGBA32:
-                                    for (int x = 0; x < m_Width; x++)
-                                    {
-                                        int inIdx = srcRow + x * 4;
-                                        int outIdx = dstRow + x * 4;
-                                        bytes[outIdx] = tempChunk[inIdx + 2];
-                                        bytes[outIdx + 1] = tempChunk[inIdx + 1];
-                                        bytes[outIdx + 2] = tempChunk[inIdx];
-                                        bytes[outIdx + 3] = tempChunk[inIdx + 3];
-                                    }
-                                    break;
-                                case TextureFormat.ARGB32:
-                                    for (int x = 0; x < m_Width; x++)
-                                    {
-                                        int inIdx = srcRow + x * 4;
-                                        int outIdx = dstRow + x * 4;
-                                        bytes[outIdx] = tempChunk[inIdx + 3];
-                                        bytes[outIdx + 1] = tempChunk[inIdx + 2];
-                                        bytes[outIdx + 2] = tempChunk[inIdx + 1];
-                                        bytes[outIdx + 3] = tempChunk[inIdx];
                                     }
                                     break;
                                 case TextureFormat.RG16:

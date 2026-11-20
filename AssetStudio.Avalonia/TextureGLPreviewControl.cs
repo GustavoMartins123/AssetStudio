@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -82,6 +83,64 @@ void main()
         // Channel masking
         private readonly bool[] channelMask = new bool[4] { true, true, true, true };
 
+        public readonly record struct GlCapabilities(
+            bool IsOpenGles,
+            int MajorVersion,
+            int MinorVersion,
+            bool SupportsBgraUpload,
+            bool SupportsS3tc,
+            bool SupportsRgtc,
+            bool SupportsBptc,
+            bool SupportsEtc1,
+            bool SupportsEtc2,
+            bool SupportsAstcLdr,
+            bool SupportsAstcHdr)
+        {
+            public static GlCapabilities FromVersionAndExtensions(
+                bool isOpenGles,
+                int majorVersion,
+                int minorVersion,
+                IReadOnlySet<string>? extensions)
+            {
+                bool HasExt(string name) => extensions != null && extensions.Contains(name);
+
+                bool supportsBgra = !isOpenGles;
+                bool supportsS3tc = HasExt("GL_EXT_texture_compression_s3tc")
+                    || HasExt("GL_NV_texture_compression_s3tc")
+                    || HasExt("GL_S3_s3tc");
+                bool supportsRgtc = (!isOpenGles && majorVersion >= 3)
+                    || HasExt("GL_ARB_texture_compression_rgtc")
+                    || HasExt("GL_EXT_texture_compression_rgtc");
+                bool supportsBptc = (!isOpenGles && (majorVersion > 4 || (majorVersion == 4 && minorVersion >= 2)))
+                    || HasExt("GL_ARB_texture_compression_bptc")
+                    || HasExt("GL_EXT_texture_compression_bptc");
+                bool supportsEtc2 = (isOpenGles && majorVersion >= 3)
+                    || (!isOpenGles && (majorVersion > 4 || (majorVersion == 4 && minorVersion >= 3)))
+                    || HasExt("GL_ARB_ES3_compatibility")
+                    || (HasExt("GL_OES_compressed_ETC2_RGB8_texture") && HasExt("GL_OES_compressed_ETC2_RGBA8_texture"));
+                bool supportsEtc1 = supportsEtc2
+                    || (isOpenGles && HasExt("GL_OES_compressed_ETC1_RGB8_texture"));
+                bool supportsAstcHdr = HasExt("GL_KHR_texture_compression_astc_hdr");
+                bool supportsAstcLdr = (isOpenGles && (majorVersion > 3 || (majorVersion == 3 && minorVersion >= 2)))
+                    || supportsAstcHdr
+                    || HasExt("GL_KHR_texture_compression_astc_ldr")
+                    || HasExt("GL_OES_texture_compression_astc");
+
+                return new GlCapabilities(
+                    isOpenGles,
+                    majorVersion,
+                    minorVersion,
+                    supportsBgra,
+                    supportsS3tc,
+                    supportsRgtc,
+                    supportsBptc,
+                    supportsEtc1,
+                    supportsEtc2,
+                    supportsAstcLdr,
+                    supportsAstcHdr);
+            }
+        }
+
         // Pending texture upload data
         private readonly object textureLock = new object();
         private byte[]? pendingTextureData;
@@ -93,6 +152,8 @@ void main()
         private bool pendingNeedsYFlip;
         private bool currentNeedsYFlip;
         private bool hasPendingTexture;
+        private GlCapabilities glCapabilities;
+        private bool hasGlCapabilities;
 
         public event Action<string>? GpuErrorOccurred;
 
@@ -147,20 +208,14 @@ void main()
                 currentTexture = null;
                 pendingWidth = image.Width;
                 pendingHeight = image.Height;
-                pendingFormat = TextureFormat.RGBA32;
+                pendingFormat = TextureFormat.BGRA32;
                 pendingVersion = null;
                 pendingPlatform = BuildTarget.NoTarget;
                 pendingNeedsYFlip = true;
                 hasPendingTexture = true;
 
-                pendingTextureData = new byte[image.Width * image.Height * 4];
+                pendingTextureData = new byte[checked(image.Width * image.Height * 4)];
                 image.CopyBgraPixelsTo(pendingTextureData);
-                for (int i = 0; i < pendingTextureData.Length; i += 4)
-                {
-                    byte temp = pendingTextureData[i]; // B
-                    pendingTextureData[i] = pendingTextureData[i + 2]; // R to B
-                    pendingTextureData[i + 2] = temp; // B to R
-                }
             }
 
             hasTexture = true;
@@ -188,9 +243,10 @@ void main()
             try
             {
                 GL.LoadBindings(new AvaloniaBindingsContext(gl));
-                
-                var version = gl.ContextInfo?.Version;
-                bool isGles = version.HasValue && version.Value.Type == GlProfileType.OpenGLES;
+                glCapabilities = QueryGlCapabilities(gl);
+                hasGlCapabilities = true;
+
+                bool isGles = glCapabilities.IsOpenGles;
                 string glslVersion = isGles ? "#version 300 es" : "#version 330 core";
                 string precision = isGles ? "precision mediump float;" : "";
 
@@ -378,39 +434,299 @@ void main()
             }
         }
 
-        private static int GetMip0Size(TextureFormat format, int width, int height)
+        private static GlCapabilities QueryGlCapabilities(GlInterface gl)
         {
-            int bw = (width + 3) / 4;
-            int bh = (height + 3) / 4;
-            int blocks = bw * bh;
+            var version = gl.ContextInfo?.Version;
+            bool isGles = version.HasValue && version.Value.Type == GlProfileType.OpenGLES;
+            int major = version?.Major ?? 0;
+            int minor = version?.Minor ?? 0;
+
+            if (major == 0)
+            {
+                while (GL.GetError() != ErrorCode.NoError) { }
+                GL.GetInteger(GetPName.MajorVersion, out major);
+                GL.GetInteger(GetPName.MinorVersion, out minor);
+                if (GL.GetError() != ErrorCode.NoError || major <= 0)
+                {
+                    major = 2;
+                    minor = 1;
+                    while (GL.GetError() != ErrorCode.NoError) { }
+                }
+            }
+
+            var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (gl.ContextInfo?.Extensions != null)
+            {
+                foreach (var ext in gl.ContextInfo.Extensions)
+                {
+                    if (!string.IsNullOrWhiteSpace(ext))
+                    {
+                        extensions.Add(ext);
+                    }
+                }
+            }
+
+            if (extensions.Count == 0)
+            {
+                while (GL.GetError() != ErrorCode.NoError) { }
+                if (major >= 3)
+                {
+                    GL.GetInteger(GetPName.NumExtensions, out int numExt);
+                    if (GL.GetError() == ErrorCode.NoError && numExt > 0)
+                    {
+                        for (int i = 0; i < numExt; i++)
+                        {
+                            string? ext = GL.GetString(StringNameIndexed.Extensions, i);
+                            if (!string.IsNullOrWhiteSpace(ext))
+                            {
+                                extensions.Add(ext);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    string? extStr = GL.GetString(StringName.Extensions);
+                    if (GL.GetError() == ErrorCode.NoError && !string.IsNullOrEmpty(extStr))
+                    {
+                        foreach (var ext in extStr.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            extensions.Add(ext);
+                        }
+                    }
+                }
+                while (GL.GetError() != ErrorCode.NoError) { }
+            }
+
+            return GlCapabilities.FromVersionAndExtensions(isGles, major, minor, extensions);
+        }
+
+        public static int GetMip0Size(TextureFormat format, int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+            {
+                return 0;
+            }
+
+            long BlockBytes(int bw, int bh, int bytesPerBlock)
+            {
+                long blocksX = ((long)width + bw - 1) / bw;
+                long blocksY = ((long)height + bh - 1) / bh;
+                return blocksX * blocksY * bytesPerBlock;
+            }
+
+            long size = format switch
+            {
+                TextureFormat.DXT1 or
+                TextureFormat.BC4 or
+                TextureFormat.ETC_RGB4 or
+                TextureFormat.ETC_RGB4_3DS or
+                TextureFormat.ETC2_RGB or
+                TextureFormat.ETC2_RGBA1 or
+                TextureFormat.EAC_R or
+                TextureFormat.EAC_R_SIGNED or
+                TextureFormat.ATC_RGB4 or
+                TextureFormat.PVRTC_RGB4 or
+                TextureFormat.PVRTC_RGBA4 => BlockBytes(4, 4, 8),
+
+                TextureFormat.PVRTC_RGB2 or
+                TextureFormat.PVRTC_RGBA2 => BlockBytes(8, 4, 8),
+
+                TextureFormat.DXT3 or
+                TextureFormat.DXT5 or
+                TextureFormat.BC5 or
+                TextureFormat.BC6H or
+                TextureFormat.BC7 or
+                TextureFormat.ETC2_RGBA8 or
+                TextureFormat.ETC_RGBA8_3DS or
+                TextureFormat.EAC_RG or
+                TextureFormat.EAC_RG_SIGNED or
+                TextureFormat.ATC_RGBA8 or
+                TextureFormat.ASTC_RGB_4x4 or
+                TextureFormat.ASTC_RGBA_4x4 or
+                TextureFormat.ASTC_HDR_4x4 => BlockBytes(4, 4, 16),
+
+                TextureFormat.ASTC_RGB_5x5 or
+                TextureFormat.ASTC_RGBA_5x5 or
+                TextureFormat.ASTC_HDR_5x5 => BlockBytes(5, 5, 16),
+
+                TextureFormat.ASTC_RGB_6x6 or
+                TextureFormat.ASTC_RGBA_6x6 or
+                TextureFormat.ASTC_HDR_6x6 => BlockBytes(6, 6, 16),
+
+                TextureFormat.ASTC_RGB_8x8 or
+                TextureFormat.ASTC_RGBA_8x8 or
+                TextureFormat.ASTC_HDR_8x8 => BlockBytes(8, 8, 16),
+
+                TextureFormat.ASTC_RGB_10x10 or
+                TextureFormat.ASTC_RGBA_10x10 or
+                TextureFormat.ASTC_HDR_10x10 => BlockBytes(10, 10, 16),
+
+                TextureFormat.ASTC_RGB_12x12 or
+                TextureFormat.ASTC_RGBA_12x12 or
+                TextureFormat.ASTC_HDR_12x12 => BlockBytes(12, 12, 16),
+
+                TextureFormat.Alpha8 or
+                TextureFormat.R8 => (long)width * height,
+
+                TextureFormat.ARGB4444 or
+                TextureFormat.RGBA4444 or
+                TextureFormat.RGB565 or
+                TextureFormat.R16 or
+                TextureFormat.RG16 or
+                TextureFormat.RHalf or
+                TextureFormat.YUY2 => (long)width * height * 2L,
+
+                TextureFormat.RGB24 or
+                TextureFormat.BGR24 => (long)width * height * 3L,
+
+                TextureFormat.RGBA32 or
+                TextureFormat.ARGB32 or
+                TextureFormat.BGRA32 or
+                TextureFormat.RGB9e5Float or
+                TextureFormat.RG32 or
+                TextureFormat.RGHalf or
+                TextureFormat.RFloat => (long)width * height * 4L,
+
+                TextureFormat.RGB48 => (long)width * height * 6L,
+
+                TextureFormat.RGBAHalf or
+                TextureFormat.RGFloat or
+                TextureFormat.RGBA64 => (long)width * height * 8L,
+
+                TextureFormat.RGBFloat => (long)width * height * 12L,
+
+                TextureFormat.RGBAFloat or
+                TextureFormat.ARGBFloat => (long)width * height * 16L,
+
+                _ => (long)width * height * 4L
+            };
+
+            return size <= int.MaxValue ? (int)size : 0;
+        }
+
+        public static bool TryResolveCompressedInternalFormat(
+            TextureFormat format,
+            GlCapabilities capabilities,
+            out int glInternalFormat,
+            bool srgb = false)
+        {
+            glInternalFormat = 0;
+
             switch (format)
             {
                 case TextureFormat.DXT1:
-                case TextureFormat.BC4:
-                    return blocks * 8;
+                    if (!capabilities.SupportsS3tc) return false;
+                    glInternalFormat = srgb ? 0x8C4C : 0x83F0; // GL_COMPRESSED_SRGB_S3TC_DXT1_EXT / GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+                    return true;
                 case TextureFormat.DXT3:
+                    if (!capabilities.SupportsS3tc) return false;
+                    glInternalFormat = srgb ? 0x8C4E : 0x83F2; // GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT / GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+                    return true;
                 case TextureFormat.DXT5:
+                    if (!capabilities.SupportsS3tc) return false;
+                    glInternalFormat = srgb ? 0x8C4F : 0x83F3; // GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT / GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+                    return true;
+                case TextureFormat.BC4:
+                    if (!capabilities.SupportsRgtc) return false;
+                    glInternalFormat = 0x8DBB; // GL_COMPRESSED_RED_RGTC1
+                    return true;
                 case TextureFormat.BC5:
+                    if (!capabilities.SupportsRgtc) return false;
+                    glInternalFormat = 0x8DBD; // GL_COMPRESSED_RG_RGTC2
+                    return true;
                 case TextureFormat.BC6H:
+                    if (!capabilities.SupportsBptc) return false;
+                    glInternalFormat = 0x8E8F; // GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT
+                    return true;
                 case TextureFormat.BC7:
-                    return blocks * 16;
-                default:
-                    int pixels = width * height;
-                    switch (format)
+                    if (!capabilities.SupportsBptc) return false;
+                    glInternalFormat = srgb ? 0x8E8D : 0x8E8C; // GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM / GL_COMPRESSED_RGBA_BPTC_UNORM
+                    return true;
+
+                case TextureFormat.ETC_RGB4:
+                    if (capabilities.SupportsEtc2)
                     {
-                        case TextureFormat.Alpha8:
-                            return pixels;
-                        case TextureFormat.ARGB4444:
-                        case TextureFormat.RGBA4444:
-                            return pixels * 2;
-                        case TextureFormat.RGB24:
-                            return pixels * 3;
-                        case TextureFormat.RGBA32:
-                        case TextureFormat.BGRA32:
-                            return pixels * 4;
-                        default:
-                            return pixels * 4;
+                        glInternalFormat = srgb ? 0x9275 : 0x9274; // GL_COMPRESSED_SRGB8_ETC2 / GL_COMPRESSED_RGB8_ETC2
+                        return true;
                     }
+                    if (!srgb && capabilities.SupportsEtc1)
+                    {
+                        glInternalFormat = 0x8D64; // GL_ETC1_RGB8_OES
+                        return true;
+                    }
+                    return false;
+                case TextureFormat.ETC2_RGB:
+                    if (!capabilities.SupportsEtc2) return false;
+                    glInternalFormat = srgb ? 0x9275 : 0x9274; // GL_COMPRESSED_SRGB8_ETC2 / GL_COMPRESSED_RGB8_ETC2
+                    return true;
+                case TextureFormat.ETC2_RGBA1:
+                    if (!capabilities.SupportsEtc2) return false;
+                    glInternalFormat = srgb ? 0x9277 : 0x9276; // GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2 / GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2
+                    return true;
+                case TextureFormat.ETC2_RGBA8:
+                    if (!capabilities.SupportsEtc2) return false;
+                    glInternalFormat = srgb ? 0x9279 : 0x9278; // GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC / GL_COMPRESSED_RGBA8_ETC2_EAC
+                    return true;
+
+                case TextureFormat.ASTC_RGB_4x4:
+                case TextureFormat.ASTC_RGBA_4x4:
+                    if (!capabilities.SupportsAstcLdr) return false;
+                    glInternalFormat = srgb ? 0x93D0 : 0x93B0; // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR / GL_COMPRESSED_RGBA_ASTC_4x4_KHR
+                    return true;
+                case TextureFormat.ASTC_RGB_5x5:
+                case TextureFormat.ASTC_RGBA_5x5:
+                    if (!capabilities.SupportsAstcLdr) return false;
+                    glInternalFormat = srgb ? 0x93D2 : 0x93B2; // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR / GL_COMPRESSED_RGBA_ASTC_5x5_KHR
+                    return true;
+                case TextureFormat.ASTC_RGB_6x6:
+                case TextureFormat.ASTC_RGBA_6x6:
+                    if (!capabilities.SupportsAstcLdr) return false;
+                    glInternalFormat = srgb ? 0x93D4 : 0x93B4; // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR / GL_COMPRESSED_RGBA_ASTC_6x6_KHR
+                    return true;
+                case TextureFormat.ASTC_RGB_8x8:
+                case TextureFormat.ASTC_RGBA_8x8:
+                    if (!capabilities.SupportsAstcLdr) return false;
+                    glInternalFormat = srgb ? 0x93D7 : 0x93B7; // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR / GL_COMPRESSED_RGBA_ASTC_8x8_KHR
+                    return true;
+                case TextureFormat.ASTC_RGB_10x10:
+                case TextureFormat.ASTC_RGBA_10x10:
+                    if (!capabilities.SupportsAstcLdr) return false;
+                    glInternalFormat = srgb ? 0x93DB : 0x93BB; // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR / GL_COMPRESSED_RGBA_ASTC_10x10_KHR
+                    return true;
+                case TextureFormat.ASTC_RGB_12x12:
+                case TextureFormat.ASTC_RGBA_12x12:
+                    if (!capabilities.SupportsAstcLdr) return false;
+                    glInternalFormat = srgb ? 0x93DD : 0x93BD; // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR / GL_COMPRESSED_RGBA_ASTC_12x12_KHR
+                    return true;
+
+                case TextureFormat.ASTC_HDR_4x4:
+                    if (srgb || !capabilities.SupportsAstcHdr) return false;
+                    glInternalFormat = 0x93B0;
+                    return true;
+                case TextureFormat.ASTC_HDR_5x5:
+                    if (srgb || !capabilities.SupportsAstcHdr) return false;
+                    glInternalFormat = 0x93B2;
+                    return true;
+                case TextureFormat.ASTC_HDR_6x6:
+                    if (srgb || !capabilities.SupportsAstcHdr) return false;
+                    glInternalFormat = 0x93B4;
+                    return true;
+                case TextureFormat.ASTC_HDR_8x8:
+                    if (srgb || !capabilities.SupportsAstcHdr) return false;
+                    glInternalFormat = 0x93B7;
+                    return true;
+                case TextureFormat.ASTC_HDR_10x10:
+                    if (srgb || !capabilities.SupportsAstcHdr) return false;
+                    glInternalFormat = 0x93BB;
+                    return true;
+                case TextureFormat.ASTC_HDR_12x12:
+                    if (srgb || !capabilities.SupportsAstcHdr) return false;
+                    glInternalFormat = 0x93BD;
+                    return true;
+
+                default:
+                    return false;
             }
         }
 
@@ -418,6 +734,10 @@ void main()
         {
             textureWidth = width;
             textureHeight = height;
+
+            var capabilities = hasGlCapabilities
+                ? glCapabilities
+                : GlCapabilities.FromVersionAndExtensions(isOpenGles: false, majorVersion: 3, minorVersion: 3, extensions: null);
 
             byte[] dataToUpload = rawBytes;
             TextureFormat uploadFormat = format;
@@ -455,50 +775,10 @@ void main()
                 }
             }
 
-            // Slice the texture raw bytes array to the size of the first mipmap (mip 0)
             int mip0Size = GetMip0Size(uploadFormat, width, height);
-            if (dataToUpload.Length > mip0Size && mip0Size > 0)
-            {
-                byte[] slice = new byte[mip0Size];
-                System.Buffer.BlockCopy(dataToUpload, 0, slice, 0, mip0Size);
-                dataToUpload = slice;
-            }
-
-            // Determine if the format is natively supported by GPU (Compressed or Uncompressed)
-            bool isCompressed = false;
+            bool hasFullMip0 = mip0Size > 0 && dataToUpload.Length >= mip0Size;
             int glInternalFormat = 0;
-
-            switch (uploadFormat)
-            {
-                case TextureFormat.DXT1:
-                    isCompressed = true;
-                    glInternalFormat = 0x83F0; // GL_COMPRESSED_RGB_S3TC_DXT1_EXT
-                    break;
-                case TextureFormat.DXT3:
-                    isCompressed = true;
-                    glInternalFormat = 0x83F2; // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
-                    break;
-                case TextureFormat.DXT5:
-                    isCompressed = true;
-                    glInternalFormat = 0x83F3; // GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
-                    break;
-                case TextureFormat.BC4:
-                    isCompressed = true;
-                    glInternalFormat = 0x8DBB; // GL_COMPRESSED_RED_RGTC1
-                    break;
-                case TextureFormat.BC5:
-                    isCompressed = true;
-                    glInternalFormat = 0x8DBD; // GL_COMPRESSED_RG_RGTC2
-                    break;
-                case TextureFormat.BC6H:
-                    isCompressed = true;
-                    glInternalFormat = 0x8E8F; // GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT
-                    break;
-                case TextureFormat.BC7:
-                    isCompressed = true;
-                    glInternalFormat = 0x8E8C; // GL_COMPRESSED_RGBA_BPTC_UNORM
-                    break;
-            }
+            bool isCompressed = hasFullMip0 && TryResolveCompressedInternalFormat(uploadFormat, capabilities, out glInternalFormat);
 
             // Clear any previous GL errors
             while (GL.GetError() != ErrorCode.NoError) { }
@@ -510,7 +790,7 @@ void main()
             {
                 try
                 {
-                    GL.CompressedTexImage2D(TextureTarget.Texture2D, 0, (InternalFormat)glInternalFormat, width, height, 0, dataToUpload.Length, dataToUpload);
+                    GL.CompressedTexImage2D(TextureTarget.Texture2D, 0, (InternalFormat)glInternalFormat, width, height, 0, mip0Size, dataToUpload);
                     
                     ErrorCode err = GL.GetError();
                     if (err != ErrorCode.NoError)
@@ -535,25 +815,41 @@ void main()
             }
 
             // Uncompressed direct upload or fallback CPU decode
-            if (uploadFormat == TextureFormat.RGBA32)
+            if (hasFullMip0 && uploadFormat == TextureFormat.RGBA32)
             {
                 GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, dataToUpload);
             }
-            else if (uploadFormat == TextureFormat.BGRA32)
+            else if (hasFullMip0 && uploadFormat == TextureFormat.BGRA32)
             {
-                byte[] rgbaBytes = new byte[dataToUpload.Length];
-                System.Buffer.BlockCopy(dataToUpload, 0, rgbaBytes, 0, dataToUpload.Length);
-                for (int i = 0; i + 3 < rgbaBytes.Length; i += 4)
+                if (capabilities.SupportsBgraUpload)
                 {
-                    byte temp = rgbaBytes[i];
-                    rgbaBytes[i] = rgbaBytes[i + 2];
-                    rgbaBytes[i + 2] = temp;
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, dataToUpload);
                 }
-                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, rgbaBytes);
+                else
+                {
+                    byte[] rgbaBytes = BigArrayPool<byte>.Shared.Rent(mip0Size);
+                    try
+                    {
+                        Texture2DConverter.SwizzleRgbaBgra(dataToUpload.AsSpan(0, mip0Size), rgbaBytes.AsSpan(0, mip0Size));
+                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, rgbaBytes);
+                    }
+                    finally
+                    {
+                        BigArrayPool<byte>.Shared.Return(rgbaBytes);
+                    }
+                }
             }
-            else if (uploadFormat == TextureFormat.RGB24)
+            else if (hasFullMip0 && uploadFormat == TextureFormat.RGB24)
             {
-                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb, width, height, 0, PixelFormat.Rgb, PixelType.UnsignedByte, dataToUpload);
+                GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+                try
+                {
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb, width, height, 0, PixelFormat.Rgb, PixelType.UnsignedByte, dataToUpload);
+                }
+                finally
+                {
+                    GL.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+                }
             }
             else
             {
@@ -571,21 +867,32 @@ void main()
                         throw new OverflowException($"Decoded texture buffer size exceeds supported limits ({width}x{height}).");
                     }
 
-                    byte[] decodedBytes = new byte[checked((int)requiredBytes)];
-                    var converter = new Texture2DConverter(currentTexture);
-                    if (converter.DecodeTexture2D(decodedBytes))
+                    int byteCount = checked((int)requiredBytes);
+                    byte[] decodedBytes = BigArrayPool<byte>.Shared.Rent(byteCount);
+                    try
                     {
-                        for (int i = 0; i + 3 < decodedBytes.Length; i += 4)
+                        var converter = new Texture2DConverter(currentTexture);
+                        if (converter.DecodeTexture2D(decodedBytes.AsSpan(0, byteCount)))
                         {
-                            byte temp = decodedBytes[i];
-                            decodedBytes[i] = decodedBytes[i + 2];
-                            decodedBytes[i + 2] = temp;
+                            if (capabilities.SupportsBgraUpload)
+                            {
+                                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, decodedBytes);
+                            }
+                            else
+                            {
+                                var decodedSpan = decodedBytes.AsSpan(0, byteCount);
+                                Texture2DConverter.SwizzleRgbaBgra(decodedSpan, decodedSpan);
+                                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, decodedBytes);
+                            }
                         }
-                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, decodedBytes);
+                        else
+                        {
+                            throw new Exception($"Unable to decode texture format {format} on CPU.");
+                        }
                     }
-                    else
+                    finally
                     {
-                        throw new Exception($"Unable to decode texture format {format} on CPU.");
+                        BigArrayPool<byte>.Shared.Return(decodedBytes);
                     }
                 }
                 else

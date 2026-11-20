@@ -3,7 +3,6 @@ using AssetStudio;
 using SkiaSharp;
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -461,69 +460,64 @@ public partial class MainWindow
                         ApplyPreviewChannelMask(image, textureChannels, validChannel);
                     }
 
-                    using (var ms = new MemoryStream())
+                    var bitmap = CreateWriteableBitmapFromSKBitmap(image);
+
+                    infoText += "\nChannels: ";
+                    if (validChannel == 0)
                     {
-                        image.WriteToStream(ms, ImageFormat.Png);
-                        ms.Position = 0;
-                        var bitmap = new global::Avalonia.Media.Imaging.Bitmap(ms);
-
-                        infoText += "\nChannels: ";
-                        if (validChannel == 0)
+                        infoText += "None";
+                    }
+                    else
+                    {
+                        var channelNames = new string[4] { "R", "G", "B", "A" };
+                        var activeList = new List<string>();
+                        for (int i = 0; i < 4; i++)
                         {
-                            infoText += "None";
+                            if (textureChannels[i])
+                                activeList.Add(channelNames[i]);
                         }
-                        else
+                        infoText += string.Join(" ", activeList);
+                    }
+                    infoText += "\nRender mode: CPU (Fallback)";
+
+                    string finalInfoText = infoText;
+                    bool finalFromCache = previewFromCache;
+                    string? finalSourceKind = isTexture ? "texture-thumbnail-png" : "sprite";
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId == texturePreviewIdCounter)
                         {
-                            var channelNames = new string[4] { "R", "G", "B", "A" };
-                            var activeList = new List<string>();
-                            for (int i = 0; i < 4; i++)
+                            ImagePreviewBox.Source = bitmap;
+                            ImagePreviewBox.IsVisible = true;
+                            TextPreviewBox.IsVisible = false;
+                            PreviewLabel.IsVisible = false;
+
+                            if (displayInfo.IsChecked == true)
                             {
-                                if (textureChannels[i])
-                                    activeList.Add(channelNames[i]);
-                            }
-                            infoText += string.Join(" ", activeList);
-                        }
-                        infoText += "\nRender mode: CPU (Fallback)";
-
-                        string finalInfoText = infoText;
-                        bool finalFromCache = previewFromCache;
-                        string? finalSourceKind = isTexture ? "texture-thumbnail-png" : "sprite";
-                        Dispatcher.UIThread.Post(() =>
-                        {
-                            if (currentId == texturePreviewIdCounter)
-                            {
-                                ImagePreviewBox.Source = bitmap;
-                                ImagePreviewBox.IsVisible = true;
-                                TextPreviewBox.IsVisible = false;
-                                PreviewLabel.IsVisible = false;
-
-                                if (displayInfo.IsChecked == true)
-                                {
-                                    PreviewInfoOverlay.Text = finalInfoText;
-                                    PreviewInfoBorder.IsVisible = true;
-                                }
-                                else
-                                {
-                                    PreviewInfoBorder.IsVisible = false;
-                                }
-
-                                UpdatePreviewCacheBadge(fromCache: finalFromCache, sourceKind: finalSourceKind);
-
-                                if (isTexture)
-                                {
-                                    StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle");
-                                }
-                                else
-                                {
-                                    StatusStripUpdate(string.Empty);
-                                }
+                                PreviewInfoOverlay.Text = finalInfoText;
+                                PreviewInfoBorder.IsVisible = true;
                             }
                             else
                             {
-                                bitmap.Dispose();
+                                PreviewInfoBorder.IsVisible = false;
                             }
-                        });
-                    }
+
+                            UpdatePreviewCacheBadge(fromCache: finalFromCache, sourceKind: finalSourceKind);
+
+                            if (isTexture)
+                            {
+                                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle");
+                            }
+                            else
+                            {
+                                StatusStripUpdate(string.Empty);
+                            }
+                        }
+                        else
+                        {
+                            bitmap.Dispose();
+                        }
+                    });
                 }
             }
             catch (Exception ex)
@@ -545,6 +539,126 @@ public partial class MainWindow
                 ownedSpriteImage?.Dispose();
             }
         });
+    }
+
+    public static global::Avalonia.Media.Imaging.WriteableBitmap CreateWriteableBitmapFromSKBitmap(SKBitmap image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+
+        int width = image.Width;
+        int height = image.Height;
+        if (width <= 0 || height <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(image), $"Bitmap dimensions must be positive ({width}x{height}).");
+        }
+
+        SKBitmap source = image;
+        SKBitmap? converted = null;
+        try
+        {
+            if (image.ColorType != SKColorType.Bgra8888)
+            {
+                var targetAlpha = image.AlphaType switch
+                {
+                    SKAlphaType.Opaque => SKAlphaType.Opaque,
+                    SKAlphaType.Premul => SKAlphaType.Premul,
+                    _ => SKAlphaType.Unpremul
+                };
+                var targetInfo = new SKImageInfo(width, height, SKColorType.Bgra8888, targetAlpha);
+                converted = new SKBitmap(targetInfo);
+                using var pixmap = image.PeekPixels();
+                bool copied = pixmap != null
+                    ? pixmap.ReadPixels(targetInfo, converted.GetPixels(), converted.RowBytes, 0, 0)
+                    : image.CopyTo(converted, SKColorType.Bgra8888);
+                if (!copied)
+                {
+                    throw new InvalidOperationException($"Failed to convert bitmap from {image.ColorType} to Bgra8888.");
+                }
+                source = converted;
+            }
+
+            var alphaFormat = source.AlphaType switch
+            {
+                SKAlphaType.Opaque => global::Avalonia.Platform.AlphaFormat.Opaque,
+                SKAlphaType.Premul => global::Avalonia.Platform.AlphaFormat.Premul,
+                _ => global::Avalonia.Platform.AlphaFormat.Unpremul
+            };
+
+            var wb = new global::Avalonia.Media.Imaging.WriteableBitmap(
+                new global::Avalonia.PixelSize(width, height),
+                new global::Avalonia.Vector(96, 96),
+                global::Avalonia.Platform.PixelFormat.Bgra8888,
+                alphaFormat);
+            try
+            {
+                using var fb = wb.Lock();
+                CopyBgraBitmapToFramebuffer(source, fb.Address, fb.RowBytes);
+                return wb;
+            }
+            catch
+            {
+                wb.Dispose();
+                throw;
+            }
+        }
+        finally
+        {
+            converted?.Dispose();
+        }
+    }
+
+    public static unsafe void CopyBgraBitmapToFramebuffer(SKBitmap source, IntPtr destinationAddress, int destinationRowBytes)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (destinationAddress == IntPtr.Zero)
+        {
+            throw new ArgumentException("Destination framebuffer address is zero.", nameof(destinationAddress));
+        }
+
+        int width = source.Width;
+        int height = source.Height;
+        if (width <= 0 || height <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(source), $"Bitmap dimensions must be positive ({width}x{height}).");
+        }
+
+        int bytesPerRow = checked(width * 4);
+        int srcRowBytes = source.RowBytes;
+        if (srcRowBytes < bytesPerRow)
+        {
+            throw new InvalidOperationException($"Source bitmap RowBytes ({srcRowBytes}) is smaller than row byte width ({bytesPerRow}).");
+        }
+        if (destinationRowBytes < bytesPerRow)
+        {
+            throw new ArgumentOutOfRangeException(nameof(destinationRowBytes), $"Destination RowBytes ({destinationRowBytes}) is smaller than row byte width ({bytesPerRow}).");
+        }
+
+        IntPtr srcPtr = source.GetPixels();
+        if (srcPtr == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Source bitmap has no accessible pixel buffer.");
+        }
+
+        if (srcRowBytes == bytesPerRow && destinationRowBytes == bytesPerRow)
+        {
+            long totalBytes = (long)bytesPerRow * height;
+            Buffer.MemoryCopy((void*)srcPtr, (void*)destinationAddress, totalBytes, totalBytes);
+        }
+        else
+        {
+            byte* srcBase = (byte*)srcPtr;
+            byte* dstBase = (byte*)destinationAddress;
+            for (int y = 0; y < height; y++)
+            {
+                Buffer.MemoryCopy(
+                    srcBase + (long)y * srcRowBytes,
+                    dstBase + (long)y * destinationRowBytes,
+                    destinationRowBytes,
+                    bytesPerRow);
+            }
+        }
+
+        GC.KeepAlive(source);
     }
 
 }
