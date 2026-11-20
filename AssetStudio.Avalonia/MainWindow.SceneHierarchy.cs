@@ -112,7 +112,7 @@ public partial class MainWindow
         nextGameObjectSearchIndex = 0;
     }
 
-    private void GoToSceneHierarchy_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteGoToSceneHierarchy()
     {
         var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;
         if (!SceneHierarchy.TryNavigateToAssetNode(item))

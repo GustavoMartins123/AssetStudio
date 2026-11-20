@@ -1,5 +1,3 @@
-using Avalonia.Controls;
-using Avalonia.Threading;
 using System;
 
 namespace AssetStudio.Avalonia;
@@ -9,11 +7,11 @@ public partial class MainWindow
     internal const string PreviewCacheBadgeBorderControlName = "PreviewCacheBadgeBorder";
     internal const string PreviewCacheBadgeTextControlName = "PreviewCacheBadgeText";
 
-    internal string CurrentPreviewCacheBadgeText { get; private set; } = string.Empty;
-    internal bool IsPreviewCacheBadgeVisible { get; private set; }
-    internal bool LastPreviewWasFromCache { get; private set; }
-    internal string? LastPreviewSourceKind { get; private set; }
-    internal bool LastPreviewMaterialsLoading { get; private set; }
+    internal string CurrentPreviewCacheBadgeText => PreviewSession.CacheBadgeText;
+    internal bool IsPreviewCacheBadgeVisible => PreviewSession.IsCacheBadgeVisible;
+    internal bool LastPreviewWasFromCache => PreviewSession.LastPreviewWasFromCache;
+    internal string? LastPreviewSourceKind => PreviewSession.LastPreviewSourceKind;
+    internal bool LastPreviewMaterialsLoading => PreviewSession.LastPreviewMaterialsLoading;
 
     internal static string FormatPreviewCacheBadge(
         bool fromCache,
@@ -50,43 +48,12 @@ public partial class MainWindow
         string? sourceKind = null,
         bool materialsLoading = false)
     {
-        var badgeText = FormatPreviewCacheBadge(fromCache, sourceKind, materialsLoading);
-        var isVisible = !string.IsNullOrWhiteSpace(badgeText);
-
-        LastPreviewWasFromCache = fromCache;
-        LastPreviewSourceKind = sourceKind;
-        LastPreviewMaterialsLoading = materialsLoading;
-        CurrentPreviewCacheBadgeText = badgeText;
-        IsPreviewCacheBadgeVisible = isVisible;
-
-        if (Dispatcher.UIThread.CheckAccess())
-        {
-            ApplyPreviewCacheBadgeToControls(badgeText, isVisible);
-        }
-        else
-        {
-            Dispatcher.UIThread.Post(() => ApplyPreviewCacheBadgeToControls(badgeText, isVisible));
-        }
+        PreviewSession.UpdateCacheBadge(fromCache, sourceKind, materialsLoading);
     }
 
     internal void ClearPreviewCacheBadge()
     {
-        UpdatePreviewCacheBadge(fromCache: false, sourceKind: null, materialsLoading: false);
-    }
-
-    private void ApplyPreviewCacheBadgeToControls(string badgeText, bool isVisible)
-    {
-        var textControl = this.FindControl<TextBlock>(PreviewCacheBadgeTextControlName);
-        if (textControl != null)
-        {
-            textControl.Text = badgeText;
-        }
-
-        var borderControl = this.FindControl<Border>(PreviewCacheBadgeBorderControlName);
-        if (borderControl != null)
-        {
-            borderControl.IsVisible = isVisible;
-        }
+        PreviewSession.ClearCacheBadge();
     }
 
     private static string? NormalizePreviewSourceKind(string? sourceKind)

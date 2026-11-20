@@ -9,8 +9,6 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Input.Platform;
-using Avalonia.Layout;
-using Avalonia.Media;
 using Avalonia.Platform.Storage;
 
 namespace AssetStudio.Avalonia.Services
@@ -132,67 +130,10 @@ namespace AssetStudio.Avalonia.Services
                 return false;
             }
 
-            var dialog = new Window
-            {
-                Title = string.IsNullOrWhiteSpace(title) ? "Confirm" : title,
-                Width = 520,
-                Height = 240,
-                MinWidth = 420,
-                MinHeight = 180,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                CanResize = false,
-                Padding = new Thickness(16)
-            };
-
-            var grid = new Grid
-            {
-                RowDefinitions = new RowDefinitions("*,Auto"),
-                RowSpacing = 14
-            };
-
-            var textBlock = new TextBlock
-            {
-                Text = message ?? string.Empty,
-                TextWrapping = TextWrapping.Wrap
-            };
-
-            var scrollViewer = new ScrollViewer
-            {
-                Content = textBlock
-            };
-
-            var buttonPanel = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Spacing = 10
-            };
-
-            var cancelButton = new Button
-            {
-                Content = "Cancel",
-                MinWidth = 90
-            };
-            cancelButton.Click += (_, _) => dialog.Close(false);
-
-            var okButton = new Button
-            {
-                Content = "OK",
-                MinWidth = 90,
-                FontWeight = FontWeight.Bold
-            };
-            okButton.Click += (_, _) => dialog.Close(true);
-
-            buttonPanel.Children.Add(cancelButton);
-            buttonPanel.Children.Add(okButton);
-
-            Grid.SetRow(scrollViewer, 0);
-            Grid.SetRow(buttonPanel, 1);
-            grid.Children.Add(scrollViewer);
-            grid.Children.Add(buttonPanel);
-            dialog.Content = grid;
-
-            return await dialog.ShowDialog<bool>(owner);
+            return await MessageBox.ShowConfirmationAsync(
+                owner: owner,
+                text: message ?? string.Empty,
+                title: string.IsNullOrWhiteSpace(title) ? "Confirm" : title);
         }
 
         public async Task<RiskyLoadChoice> ShowRiskyLoadDialogAsync(string title, string message)
@@ -203,74 +144,10 @@ namespace AssetStudio.Avalonia.Services
                 return RiskyLoadChoice.Cancel;
             }
 
-            var dialog = new Window
-            {
-                Title = string.IsNullOrWhiteSpace(title) ? "Large Unity project detected" : title,
-                Width = 640,
-                Height = 440,
-                MinWidth = 540,
-                MinHeight = 340,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner
-            };
-
-            var grid = new Grid
-            {
-                RowDefinitions = new RowDefinitions("*,Auto"),
-                Margin = new Thickness(16),
-                RowSpacing = 12
-            };
-
-            var textBlock = new TextBlock
-            {
-                Text = message ?? string.Empty,
-                TextWrapping = TextWrapping.Wrap
-            };
-
-            var scrollViewer = new ScrollViewer
-            {
-                Content = textBlock
-            };
-
-            var buttonPanel = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Spacing = 10
-            };
-
-            var cancelButton = new Button
-            {
-                Content = "Cancel",
-                MinWidth = 90
-            };
-            cancelButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.Cancel);
-
-            var lazyButton = new Button
-            {
-                Content = "Load in Safe/Lazy Mode (Recommended)",
-                MinWidth = 240,
-                FontWeight = FontWeight.Bold
-            };
-            lazyButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.LazyLoad);
-
-            var loadButton = new Button
-            {
-                Content = "Load anyway (Eager)",
-                MinWidth = 150
-            };
-            loadButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.EagerLoad);
-
-            buttonPanel.Children.Add(cancelButton);
-            buttonPanel.Children.Add(lazyButton);
-            buttonPanel.Children.Add(loadButton);
-
-            Grid.SetRow(scrollViewer, 0);
-            Grid.SetRow(buttonPanel, 1);
-            grid.Children.Add(scrollViewer);
-            grid.Children.Add(buttonPanel);
-            dialog.Content = grid;
-
-            return await dialog.ShowDialog<RiskyLoadChoice>(owner);
+            return await MessageBox.ShowRiskyLoadAsync(
+                owner: owner,
+                message: message ?? string.Empty,
+                title: string.IsNullOrWhiteSpace(title) ? "Large Unity project detected" : title);
         }
 
         public async Task<MemoryPressureResult> ShowMemoryPressureDialogAsync(string title, string message)
@@ -281,74 +158,10 @@ namespace AssetStudio.Avalonia.Services
                 return MemoryPressureResult.Continue;
             }
 
-            var dialog = new Window
-            {
-                Title = string.IsNullOrWhiteSpace(title) ? "Memory pressure warning" : title,
-                Width = 600,
-                Height = 240,
-                MinWidth = 450,
-                MinHeight = 180,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner
-            };
-
-            var grid = new Grid
-            {
-                RowDefinitions = new RowDefinitions("*,Auto"),
-                Margin = new Thickness(16),
-                RowSpacing = 12
-            };
-
-            var textBlock = new TextBlock
-            {
-                Text = message ?? string.Empty,
-                TextWrapping = TextWrapping.Wrap
-            };
-
-            var scrollViewer = new ScrollViewer
-            {
-                Content = textBlock
-            };
-
-            var buttonPanel = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Spacing = 10
-            };
-
-            var cancelButton = new Button
-            {
-                Content = "Cancel loading",
-                MinWidth = 120
-            };
-            cancelButton.Click += (_, _) => dialog.Close(MemoryPressureResult.Cancel);
-
-            var stopButton = new Button
-            {
-                Content = "Stop and keep loaded",
-                MinWidth = 150
-            };
-            stopButton.Click += (_, _) => dialog.Close(MemoryPressureResult.StopAndKeep);
-
-            var continueButton = new Button
-            {
-                Content = "Ignore and continue",
-                MinWidth = 150,
-                FontWeight = FontWeight.Bold
-            };
-            continueButton.Click += (_, _) => dialog.Close(MemoryPressureResult.Continue);
-
-            buttonPanel.Children.Add(cancelButton);
-            buttonPanel.Children.Add(stopButton);
-            buttonPanel.Children.Add(continueButton);
-
-            Grid.SetRow(scrollViewer, 0);
-            Grid.SetRow(buttonPanel, 1);
-            grid.Children.Add(scrollViewer);
-            grid.Children.Add(buttonPanel);
-            dialog.Content = grid;
-
-            return await dialog.ShowDialog<MemoryPressureResult>(owner);
+            return await MessageBox.ShowMemoryPressureWarningAsync(
+                owner: owner,
+                message: message ?? string.Empty,
+                title: string.IsNullOrWhiteSpace(title) ? "Memory pressure warning" : title);
         }
 
         public async Task<bool> ShowExportOptionsAsync(AvaloniaAppSettings settings)

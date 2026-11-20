@@ -7,8 +7,9 @@
         xmlns:ffmpeg="using:AssetStudio.Avalonia.Controls"
         mc:Ignorable="d" d:DesignWidth="1264" d:DesignHeight="681"
         x:Class="AssetStudio.Avalonia.MainWindow"
+        x:CompileBindings="True"
         x:DataType="vm:MainWindowViewModel"
-        Title="AssetStudio (Avalonia Linux Port)"
+        Title="{Binding ProjectSession.WindowTitle}"
         Icon="/Assets/as.png"
         Width="1264" Height="681"
         WindowStartupLocation="CenterScreen">
@@ -16,55 +17,55 @@
     <DockPanel>
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="_File">
-                <MenuItem Header="Load file" Click="LoadFile_Click">
+                <MenuItem Header="Load file" Command="{Binding LoadFileCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Load folder" Click="LoadFolder_Click">
+                <MenuItem Header="Load folder" Command="{Binding LoadFolderCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Load folder (Full / Scene Hierarchy)" Click="LoadFolderEager_Click">
+                <MenuItem Header="Load folder (Full / Scene Hierarchy)" Command="{Binding LoadFolderEagerCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
-                <MenuItem Header="Extract file" Click="ExtractFile_Click">
+                <MenuItem Header="Extract file" Command="{Binding ExtractFileCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Extract folder" Click="ExtractFolder_Click">
+                <MenuItem Header="Extract folder" Command="{Binding ExtractFolderCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
             </MenuItem>
             <MenuItem Header="_Options">
-                <MenuItem x:Name="displayAll" Header="Display all assets" ToggleType="CheckBox" Click="DisplayAll_Click">
+                <MenuItem x:Name="displayAll" Header="Display all assets" ToggleType="CheckBox" IsChecked="{Binding Options.DisplayAll, Mode=TwoWay}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_eye}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem x:Name="enablePreview" Header="Enable preview" ToggleType="CheckBox" IsChecked="True" Click="EnablePreview_Click">
+                <MenuItem x:Name="enablePreview" Header="Enable preview" ToggleType="CheckBox" IsChecked="{Binding Options.EnablePreview, Mode=TwoWay}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_preview}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem x:Name="displayInfo" Header="Display asset information" ToggleType="CheckBox" IsChecked="True" Click="DisplayInfo_Click">
+                <MenuItem x:Name="displayInfo" Header="Display asset information" ToggleType="CheckBox" IsChecked="{Binding Options.DisplayInfo, Mode=TwoWay}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem x:Name="useDiskDecompressionCacheMenu" Header="Use disk decompression cache (Lazy Mode)" ToggleType="CheckBox" IsChecked="True" Click="UseDiskDecompressionCache_Click">
+                <MenuItem x:Name="useDiskDecompressionCacheMenu" Header="Use disk decompression cache (Lazy Mode)" ToggleType="CheckBox" IsChecked="{Binding Options.UseDiskDecompressionCache, Mode=TwoWay}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Set project root..." Click="SetProjectRoot_Click">
+                <MenuItem Header="Set project root..." Command="{Binding SetProjectRootCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
                     </MenuItem.Icon>
@@ -73,14 +74,14 @@
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
-                    <TextBox x:Name="SpecifyUnityVersionTextBox" Width="140" PlaceholderText="2020.3.48f1" Text="{Binding SpecifyUnityVersion, Mode=TwoWay}" />
+                    <TextBox x:Name="SpecifyUnityVersionTextBox" Width="140" PlaceholderText="2020.3.48f1" Text="{Binding Options.SpecifyUnityVersion, Mode=TwoWay}" />
                 </MenuItem>
-                <MenuItem Header="Export options" Click="ShowExportOptions_Click">
+                <MenuItem Header="Export options" Command="{Binding ShowExportOptionsCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Clear project cache" Click="ClearCurrentProjectCache_Click">
+                <MenuItem Header="Clear project cache" Command="{Binding ClearProjectCacheCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
@@ -90,62 +91,62 @@
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_theme}" Width="16" Height="16" />
                     </MenuItem.Icon>
-                    <MenuItem x:Name="themeDefault" Header="System Default" ToggleType="Radio" GroupName="ThemeGroup" Click="ThemeDefault_Click" />
-                    <MenuItem x:Name="themeLight" Header="Light" ToggleType="Radio" GroupName="ThemeGroup" Click="ThemeLight_Click" />
-                    <MenuItem x:Name="themeDark" Header="Dark" ToggleType="Radio" GroupName="ThemeGroup" Click="ThemeDark_Click" />
+                    <MenuItem x:Name="themeDefault" Header="System Default" ToggleType="Radio" GroupName="ThemeGroup" IsChecked="{Binding Options.IsThemeDefault, Mode=TwoWay}" Command="{Binding Options.SetThemeDefaultCommand}" />
+                    <MenuItem x:Name="themeLight" Header="Light" ToggleType="Radio" GroupName="ThemeGroup" IsChecked="{Binding Options.IsThemeLight, Mode=TwoWay}" Command="{Binding Options.SetThemeLightCommand}" />
+                    <MenuItem x:Name="themeDark" Header="Dark" ToggleType="Radio" GroupName="ThemeGroup" IsChecked="{Binding Options.IsThemeDark, Mode=TwoWay}" Command="{Binding Options.SetThemeDarkCommand}" />
                 </MenuItem>
             </MenuItem>
             <MenuItem Header="_Model">
-                <MenuItem Header="Export all objects (split)" Click="ExportAllObjectsSplit_Click">
+                <MenuItem Header="Export all objects (split)" Command="{Binding ExportAllObjectsSplitCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Export selected objects (split)" Click="ExportSelectedObjectsSplit_Click">
+                <MenuItem Header="Export selected objects (split)" Command="{Binding ExportSelectedObjectsSplitCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Export selected objects (split) + selected AnimationClips" Click="ExportSelectedObjectsSplitWithAnimationClip_Click">
+                <MenuItem Header="Export selected objects (split) + selected AnimationClips" Command="{Binding ExportSelectedObjectsSplitWithAnimationClipCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
-                <MenuItem Header="Export selected objects (merge)" Click="ExportSelectedObjectsMerge_Click">
+                <MenuItem Header="Export selected objects (merge)" Command="{Binding ExportSelectedObjectsMergeCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" Click="ExportSelectedObjectsMergeWithAnimationClip_Click">
+                <MenuItem Header="Export selected objects (merge) + selected AnimationClips" Command="{Binding ExportSelectedObjectsMergeWithAnimationClipCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
             </MenuItem>
             <MenuItem Header="_Export">
-                <MenuItem Header="All assets" Click="ExportAllAssets_Click">
+                <MenuItem Header="All assets" Command="{Binding ExportAllAssetsCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Selected assets" Click="ExportSelectedAssets_Click">
+                <MenuItem Header="Selected assets" Command="{Binding ExportSelectedAssetsCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Filtered assets" Click="ExportFilteredAssets_Click">
+                <MenuItem Header="Filtered assets" Command="{Binding ExportFilteredAssetsCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
-                <MenuItem Header="Export Model Group (FBX)..." Click="ExportModelGroupFbx_Click">
+                <MenuItem Header="Export Model Group (FBX)..." Command="{Binding ExportModelGroupFbxCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click">
+                <MenuItem Header="Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
                     </MenuItem.Icon>
@@ -155,53 +156,53 @@
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
-                    <MenuItem Header="All assets" Click="ExportAllAssetsRaw_Click" />
-                    <MenuItem Header="Selected assets" Click="ExportSelectedAssetsRaw_Click" />
-                    <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsRaw_Click" />
+                    <MenuItem Header="All assets" Command="{Binding ExportAllAssetsRawCommand}" />
+                    <MenuItem Header="Selected assets" Command="{Binding ExportSelectedAssetsRawCommand}" />
+                    <MenuItem Header="Filtered assets" Command="{Binding ExportFilteredAssetsRawCommand}" />
                 </MenuItem>
                 <MenuItem Header="Dump">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
                     </MenuItem.Icon>
-                    <MenuItem Header="All assets" Click="ExportAllAssetsDump_Click" />
-                    <MenuItem Header="Selected assets" Click="ExportSelectedAssetsDump_Click" />
-                    <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsDump_Click" />
+                    <MenuItem Header="All assets" Command="{Binding ExportAllAssetsDumpCommand}" />
+                    <MenuItem Header="Selected assets" Command="{Binding ExportSelectedAssetsDumpCommand}" />
+                    <MenuItem Header="Filtered assets" Command="{Binding ExportFilteredAssetsDumpCommand}" />
                 </MenuItem>
                 <Separator />
                 <MenuItem Header="Asset list to XML">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
                     </MenuItem.Icon>
-                    <MenuItem Header="All assets" Click="ExportAllAssetsXML_Click" />
-                    <MenuItem Header="Selected assets" Click="ExportSelectedAssetsXML_Click" />
-                    <MenuItem Header="Filtered assets" Click="ExportFilteredAssetsXML_Click" />
+                    <MenuItem Header="All assets" Command="{Binding ExportAllAssetsXmlCommand}" />
+                    <MenuItem Header="Selected assets" Command="{Binding ExportSelectedAssetsXmlCommand}" />
+                    <MenuItem Header="Filtered assets" Command="{Binding ExportFilteredAssetsXmlCommand}" />
                 </MenuItem>
                 <Separator />
-                <MenuItem Header="Error log" Click="ExportErrorLog_Click">
+                <MenuItem Header="Error log" Command="{Binding ExportErrorLogCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
             </MenuItem>
             <MenuItem x:Name="filterTypeMenu" Header="Filter _Type">
-                <MenuItem x:Name="filterTypeAll" Header="All" ToggleType="CheckBox" IsChecked="True" Click="FilterTypeAll_Click" />
+                <MenuItem x:Name="filterTypeAll" Header="All" ToggleType="CheckBox" IsChecked="True" Command="{Binding FilterTypeAllCommand}" />
             </MenuItem>
             <MenuItem Header="_Debug">
-                <MenuItem x:Name="showErrorMessageMenu" Header="Show error message" ToggleType="CheckBox" Click="ShowErrorMessage_Click">
+                <MenuItem x:Name="showErrorMessageMenu" Header="Show error message" ToggleType="CheckBox" IsChecked="{Binding Options.ShowErrorMessage, Mode=TwoWay}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_debug}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem x:Name="exportClassStructuresMenu" Header="Export class structures" Click="ExportClassStructures_Click">
+                <MenuItem x:Name="exportClassStructuresMenu" Header="Export class structures" Command="{Binding ExportClassStructuresCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_debug}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
             </MenuItem>
             <MenuItem x:Name="indexingMenu" Header="_Indexing" IsVisible="{Binding IsIndexingActive}">
-                <MenuItem x:Name="pauseIndexingMenu" Header="Pause Indexing" Click="PauseIndexing_Click" IsEnabled="{Binding IsPauseEnabled}" />
-                <MenuItem x:Name="resumeIndexingMenu" Header="Resume Indexing" Click="ResumeIndexing_Click" IsEnabled="{Binding IsResumeEnabled}" />
-                <MenuItem x:Name="stopIndexingMenu" Header="Stop/Cancel Indexing" Click="StopIndexing_Click" IsEnabled="{Binding IsStopEnabled}" />
+                <MenuItem x:Name="pauseIndexingMenu" Header="Pause Indexing" Command="{Binding PauseIndexingCommand}" />
+                <MenuItem x:Name="resumeIndexingMenu" Header="Resume Indexing" Command="{Binding ResumeIndexingCommand}" />
+                <MenuItem x:Name="stopIndexingMenu" Header="Stop/Cancel Indexing" Command="{Binding StopIndexingCommand}" />
             </MenuItem>
         </Menu>
 
@@ -211,8 +212,9 @@
                 BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
                 BorderThickness="0,0,0,1"
                 Padding="10,4"
-                IsVisible="False">
+                IsVisible="{Binding ProjectSession.HasRuntimeBanner}">
             <TextBlock x:Name="ProjectAnalysisBannerText"
+                       Text="{Binding ProjectSession.RuntimeBannerText}"
                        FontSize="12"
                        Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
                        TextTrimming="CharacterEllipsis"
@@ -229,7 +231,7 @@
             <TabControl x:Name="LeftTabControl" Grid.Column="0" Margin="2">
                 <TabItem Header="Scene Hierarchy">
                     <Grid RowDefinitions="Auto, *">
-                        <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2" TextChanged="TreeSearch_TextChanged" KeyDown="TreeSearch_KeyDown"/>
+                        <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2" Text="{Binding SceneHierarchy.SearchQuery, Mode=TwoWay}" TextChanged="TreeSearch_TextChanged" KeyDown="TreeSearch_KeyDown"/>
                         <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False" AutoScrollToSelectedItem="True">
                             <TreeView.Styles>
                                 <Style Selector="TreeViewItem">
@@ -251,18 +253,24 @@
                 <TabItem Header="Asset List">
                     <Grid RowDefinitions="Auto, *">
                         <DockPanel Grid.Row="0" Margin="0,0,0,2">
-                            <Button x:Name="ClearClassFilterButton" Content="Clear Class Filter" Click="ClearClassFilter_Click" IsVisible="False" DockPanel.Dock="Right" Margin="4,0,0,0" Padding="6,2"/>
-                            <TextBox x:Name="listSearch" PlaceholderText=" Filter " TextChanged="ListSearch_TextChanged"/>
+                            <Button x:Name="ClearClassFilterButton"
+                                    Content="{Binding AssetList.ClassFilterButtonText}"
+                                    Command="{Binding ClearClassFilterCommand}"
+                                    IsVisible="{Binding AssetList.HasClassFilterOverride}"
+                                    DockPanel.Dock="Right"
+                                    Margin="4,0,0,0"
+                                    Padding="6,2"/>
+                            <TextBox x:Name="listSearch" PlaceholderText=" Filter " Text="{Binding AssetList.SearchText, Mode=TwoWay}" TextChanged="ListSearch_TextChanged"/>
                         </DockPanel>
                         <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="True" x:DataType="local:AssetItem" SelectionChanged="AssetListDataGrid_SelectionChanged" CellPointerPressed="AssetListDataGrid_CellPointerPressed" Sorting="AssetListDataGrid_Sorting" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto" SelectionMode="Extended">
                             <DataGrid.ContextMenu>
-                                <ContextMenu Opened="AssetListContextMenu_Opened">
-                                    <MenuItem Header="Copy text" Click="CopyAssetCellText_Click" />
-                                    <MenuItem Header="Export selected assets" Click="ExportSelectedAssetsContext_Click" />
-                                    <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group (FBX)..." Click="ExportModelGroupFbx_Click" />
-                                    <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click" />
-                                    <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Click="GoToSceneHierarchy_Click" />
-                                    <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Click="ShowOriginalFile_Click" />
+                                <ContextMenu x:DataType="vm:MainWindowViewModel" Opened="AssetListContextMenu_Opened">
+                                    <MenuItem Header="Copy text" Command="{Binding CopyAssetCellTextCommand}" />
+                                    <MenuItem Header="Export selected assets" Command="{Binding ExportSelectedAssetsCommand}" />
+                                    <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group (FBX)..." Command="{Binding ExportModelGroupFbxCommand}" />
+                                    <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}" />
+                                    <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Command="{Binding GoToSceneHierarchyCommand}" />
+                                    <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Command="{Binding ShowOriginalFileCommand}" />
                                 </ContextMenu>
                             </DataGrid.ContextMenu>
                             <DataGrid.Columns>
@@ -278,11 +286,11 @@
 
                 <TabItem Header="Asset Classes">
                     <Grid RowDefinitions="Auto, *">
-                        <TextBox x:Name="classSearch" Grid.Row="0" PlaceholderText=" Filter classes " Margin="0,0,0,2" TextChanged="ClassSearch_TextChanged" />
+                        <TextBox x:Name="classSearch" Grid.Row="0" PlaceholderText=" Filter classes " Margin="0,0,0,2" Text="{Binding AssetList.ClassSearchText, Mode=TwoWay}" TextChanged="ClassSearch_TextChanged" />
                         <DataGrid x:Name="AssetClassesDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="True" x:DataType="local:AssetClassItem" SelectionChanged="AssetClassesDataGrid_SelectionChanged" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto">
                             <DataGrid.ContextMenu>
-                                <ContextMenu>
-                                    <MenuItem Header="Show instances in Asset List" Click="ShowClassInstances_Click" />
+                                <ContextMenu x:DataType="vm:MainWindowViewModel">
+                                    <MenuItem Header="Show instances in Asset List" Command="{Binding ShowClassInstancesCommand}" />
                                 </ContextMenu>
                             </DataGrid.ContextMenu>
                             <DataGrid.Columns>
@@ -304,28 +312,28 @@
             <TabControl x:Name="RightTabControl" Grid.Column="2" Margin="2" SelectionChanged="RightTabControl_SelectionChanged">
                 <TabItem Header="Preview">
                     <Grid RowDefinitions="Auto,*" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
-                        <Border x:Name="IndexingProgressPanel" Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="10,7" IsVisible="False">
+                        <Border x:Name="IndexingProgressPanel" Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="10,7" IsVisible="{Binding IndexingProgress.IsPanelVisible}">
                             <Grid RowDefinitions="Auto,4" ColumnDefinitions="*,Auto" RowSpacing="5" ColumnSpacing="12">
-                                <TextBlock x:Name="IndexingProgressText" Text="Indexing" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
-                                <TextBlock x:Name="IndexingProgressPercentText" Grid.Column="1" Text="0%" FontSize="12" FontFamily="Monospace" Opacity="0.82" VerticalAlignment="Center" />
-                                <ProgressBar x:Name="IndexingProgressBar" Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="0" Height="4" />
+                                <TextBlock x:Name="IndexingProgressText" Text="{Binding IndexingProgress.PrimaryStatusText}" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                <TextBlock x:Name="IndexingProgressPercentText" Grid.Column="1" Text="{Binding IndexingProgress.FormattedPercentText}" FontSize="12" FontFamily="Monospace" Opacity="0.82" VerticalAlignment="Center" />
+                                <ProgressBar x:Name="IndexingProgressBar" Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding IndexingProgress.ProgressPercent}" Height="4" />
                             </Grid>
                         </Border>
 
                         <Panel x:Name="PreviewContentHost" Grid.Row="1" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
                         <TextBox x:Name="TextPreviewBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
-                        <Border x:Name="TextAssetPreviewPanel" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="False">
+                        <Border x:Name="TextAssetPreviewPanel" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="{Binding PreviewSession.HasDialoguePreview}">
                             <Grid RowDefinitions="Auto,*">
                                 <Border Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="12,8">
                                     <Grid ColumnDefinitions="*,Auto">
                                         <StackPanel Spacing="2">
-                                            <TextBlock x:Name="TextAssetPreviewTitle" Text="TextAsset" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="14" FontWeight="SemiBold" />
-                                            <TextBlock x:Name="TextAssetPreviewSubtitle" Text="" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="11" />
+                                            <TextBlock x:Name="TextAssetPreviewTitle" Text="{Binding PreviewSession.PreviewTitle}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="14" FontWeight="SemiBold" />
+                                            <TextBlock x:Name="TextAssetPreviewSubtitle" Text="{Binding PreviewSession.PreviewSubtitle}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="11" />
                                         </StackPanel>
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-                                            <Button x:Name="TextAssetCardsViewButton" Content="Cards" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetCardsViewButton_Click" />
-                                            <Button x:Name="TextAssetDetailsViewButton" Content="Text" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetDetailsViewButton_Click" />
-                                            <Button x:Name="TextAssetInfoViewButton" Content="Info" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Click="TextAssetInfoViewButton_Click" />
+                                            <Button x:Name="TextAssetCardsViewButton" Content="Cards" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Command="{Binding ShowTextAssetCardsCommand}" />
+                                            <Button x:Name="TextAssetDetailsViewButton" Content="Text" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Command="{Binding ShowTextAssetDetailsCommand}" />
+                                            <Button x:Name="TextAssetInfoViewButton" Content="Info" MinWidth="64" Height="28" Padding="10,4" HorizontalContentAlignment="Center" Command="{Binding ShowTextAssetInfoCommand}" />
                                         </StackPanel>
                                     </Grid>
                                 </Border>
@@ -334,6 +342,7 @@
                                              Background="Transparent"
                                              BorderThickness="0"
                                              Padding="16"
+                                             IsVisible="{Binding PreviewSession.IsDialogueCardsVisible}"
                                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                              ScrollViewer.VerticalScrollBarVisibility="Auto">
                                         <ListBox.Styles>
@@ -394,7 +403,12 @@
                                             </DataTemplate>
                                         </ListBox.ItemTemplate>
                                     </ListBox>
-                                    <TextBox x:Name="TextAssetDetailsTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
+                                    <TextBox x:Name="TextAssetDetailsTextBox"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             IsReadOnly="True"
+                                             Text="{Binding PreviewSession.TextContent, Mode=OneWay}"
+                                             IsVisible="{Binding PreviewSession.IsDialogueDetailsVisible}" />
                                 </Grid>
                             </Grid>
                         </Border>
@@ -402,23 +416,23 @@
                         <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
                         <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True" />
                         <local:TextureGLPreviewControl x:Name="TextureGLPreview" IsVisible="False" Focusable="True" />
-                        <Border x:Name="PreviewInfoBorder" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="False">
+                        <Border x:Name="PreviewInfoBorder" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="{Binding PreviewSession.IsInfoOverlayVisible}">
                             <Grid RowDefinitions="Auto,*">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="8,4,8,4">
                                     <TextBlock Text="Mesh Information" VerticalAlignment="Center" Foreground="#AAA" FontWeight="Bold" FontSize="11" />
-                                    <Button Grid.Column="1" x:Name="TogglePreviewInfoBtn" Content="▼" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Click="TogglePreviewInfoBtn_Click" />
+                                    <Button Grid.Column="1" x:Name="TogglePreviewInfoBtn" Content="{Binding PreviewSession.InfoToggleGlyph}" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Command="{Binding TogglePreviewInfoCommand}" />
                                 </Grid>
-                                <ScrollViewer Grid.Row="1" x:Name="PreviewInfoScroll" MaxHeight="450" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
-                                    <TextBlock x:Name="PreviewInfoOverlay" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" Margin="8,0,8,8" />
+                                <ScrollViewer Grid.Row="1" x:Name="PreviewInfoScroll" IsVisible="{Binding PreviewSession.IsInfoExpanded}" MaxHeight="450" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                                    <TextBlock x:Name="PreviewInfoOverlay" Text="{Binding PreviewSession.PreviewMetadataSummary}" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" Margin="8,0,8,8" />
                                 </ScrollViewer>
                             </Grid>
                         </Border>
 
-                        <Border x:Name="AnimationPlaybackPanel" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="8,4" IsVisible="False">
+                        <Border x:Name="AnimationPlaybackPanel" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="8,4" IsVisible="{Binding MeshPreview.IsAnimationLoaded}">
                             <StackPanel Orientation="Horizontal" Spacing="8">
-                                <Button x:Name="AnimPlayPauseBtn" Content="Pause" Width="60" Height="28" FontSize="11" Click="AnimPlayPauseBtn_Click" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
-                                <Button x:Name="AnimRestartBtn" Content="Replay" Width="60" Height="28" FontSize="11" Click="AnimRestartBtn_Click" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
-                                <TextBlock x:Name="AnimFrameLabel" Text="Frame: 0/0" Foreground="White" VerticalAlignment="Center" FontSize="11" Margin="4,0" />
+                                <Button x:Name="AnimPlayPauseBtn" Content="{Binding MeshPreview.PlayPauseButtonText}" Width="60" Height="28" FontSize="11" Command="{Binding ToggleAnimationPlayPauseCommand}" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
+                                <Button x:Name="AnimRestartBtn" Content="Replay" Width="60" Height="28" FontSize="11" Command="{Binding RestartAnimationCommand}" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
+                                <TextBlock x:Name="AnimFrameLabel" Text="{Binding MeshPreview.FormattedFrameText}" Foreground="White" VerticalAlignment="Center" FontSize="11" Margin="4,0" />
                             </StackPanel>
                         </Border>
 
@@ -427,12 +441,12 @@
                             <StackPanel Spacing="8" MinWidth="204" MaxWidth="264" ClipToBounds="False">
                                 <Grid ColumnDefinitions="*,Auto" Margin="4,0,4,0">
                                     <TextBlock Text="Model Controls" VerticalAlignment="Center" Foreground="#AAA" FontWeight="Bold" FontSize="11" />
-                                    <Button Grid.Column="1" x:Name="ToggleMeshControlsBtn" Content="▲" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Click="ToggleMeshControlsBtn_Click" />
+                                    <Button Grid.Column="1" x:Name="ToggleMeshControlsBtn" Content="{Binding MeshPreview.ControlsToggleGlyph}" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Command="{Binding ToggleMeshControlsCommand}" />
                                 </Grid>
                                 
-                                <StackPanel x:Name="MeshViewerControlsContent" Spacing="8" ClipToBounds="False">
+                                <StackPanel x:Name="MeshViewerControlsContent" IsVisible="{Binding MeshPreview.IsControlsExpanded}" Spacing="8" ClipToBounds="False">
                                     <!-- Reset View Button -->
-                                    <Button x:Name="ResetViewBtn" Content="Reset View" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="ResetViewBtn_Click" Height="28" FontSize="11" />
+                                    <Button x:Name="ResetViewBtn" Content="Reset View" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ResetMeshViewCommand}" Height="28" FontSize="11" />
 
                                     <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
                                         <TextBlock Text="View" Foreground="White" FontSize="10" VerticalAlignment="Center" />
@@ -441,38 +455,38 @@
                                     
                                     <!-- Directional Rotation Buttons -->
                                     <Grid ColumnDefinitions="*,*,*,*" ColumnSpacing="4">
-                                        <Button Grid.Column="0" x:Name="RotateLeftBtn" Content="◀" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="RotateLeftBtn_Click" Height="26" FontSize="10" ToolTip.Tip="Rotate Left 90°" />
-                                        <Button Grid.Column="1" x:Name="RotateRightBtn" Content="▶" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="RotateRightBtn_Click" Height="26" FontSize="10" ToolTip.Tip="Rotate Right 90°" />
-                                        <Button Grid.Column="2" x:Name="RotateUpBtn" Content="▲" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="RotateUpBtn_Click" Height="26" FontSize="10" ToolTip.Tip="Rotate Up 90°" />
-                                        <Button Grid.Column="3" x:Name="RotateDownBtn" Content="▼" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Click="RotateDownBtn_Click" Height="26" FontSize="10" ToolTip.Tip="Rotate Down 90°" />
+                                        <Button Grid.Column="0" x:Name="RotateLeftBtn" Content="◀" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding RotateMeshLeftCommand}" Height="26" FontSize="10" ToolTip.Tip="Rotate Left 90°" />
+                                        <Button Grid.Column="1" x:Name="RotateRightBtn" Content="▶" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding RotateMeshRightCommand}" Height="26" FontSize="10" ToolTip.Tip="Rotate Right 90°" />
+                                        <Button Grid.Column="2" x:Name="RotateUpBtn" Content="▲" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding RotateMeshUpCommand}" Height="26" FontSize="10" ToolTip.Tip="Rotate Up 90°" />
+                                        <Button Grid.Column="3" x:Name="RotateDownBtn" Content="▼" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding RotateMeshDownCommand}" Height="26" FontSize="10" ToolTip.Tip="Rotate Down 90°" />
                                     </Grid>
                                     
-                                    <StackPanel x:Name="PreviewCandidateControlsContainer" Spacing="6" IsVisible="False">
-                                        <TextBlock x:Name="PreviewCandidateLabel" Text="Candidate" Foreground="White" FontSize="10" VerticalAlignment="Center" />
+                                    <StackPanel x:Name="PreviewCandidateControlsContainer" Spacing="6" IsVisible="{Binding PreviewSession.HasCandidates}">
+                                        <TextBlock x:Name="PreviewCandidateLabel" Text="{Binding PreviewSession.CandidateSelectorLabel}" Foreground="White" FontSize="10" VerticalAlignment="Center" />
                                         <ComboBox x:Name="PreviewCandidateSelector" MinHeight="28" MaxDropDownHeight="240" SelectionChanged="PreviewCandidateSelector_SelectionChanged" />
                                     </StackPanel>
 
                                     <!-- Preview Geometry Controls -->
-                                    <StackPanel x:Name="BoneSizeContainer" Spacing="6" IsVisible="False">
-                                        <StackPanel x:Name="BoneSizeControls" Spacing="6">
+                                    <StackPanel x:Name="BoneSizeContainer" Spacing="6" IsVisible="{Binding MeshPreview.IsGeometryControlsVisible}">
+                                        <StackPanel x:Name="BoneSizeControls" Spacing="6" IsVisible="{Binding MeshPreview.IsBoneControlsVisible}">
                                             <Grid ColumnDefinitions="*,Auto">
                                                 <TextBlock Text="Bone Size" Foreground="White" FontSize="10" VerticalAlignment="Center" />
-                                                <TextBlock x:Name="BoneSizeLabel" Grid.Column="1" Text="1.0x" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
+                                                <TextBlock x:Name="BoneSizeLabel" Grid.Column="1" Text="{Binding MeshPreview.FormattedBoneScaleText}" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
                                             </Grid>
-                                            <Slider x:Name="BoneSizeSlider" Minimum="0.1" Maximum="5.0" Value="1.0" Focusable="False" Height="28" Margin="8,0" ClipToBounds="False" ValueChanged="BoneSizeSlider_ValueChanged" />
+                                            <Slider x:Name="BoneSizeSlider" Minimum="0.1" Maximum="5.0" Value="{Binding MeshPreview.BoneScale, Mode=TwoWay}" Focusable="False" Height="28" Margin="8,0" ClipToBounds="False" ValueChanged="BoneSizeSlider_ValueChanged" />
                                         </StackPanel>
 
                                         <Grid ColumnDefinitions="*,Auto" Margin="0,2,0,0">
                                             <TextBlock Text="Mesh Vertices" Foreground="White" FontSize="10" VerticalAlignment="Center" />
-                                            <TextBlock x:Name="AvatarMeshDensityLabel" Grid.Column="1" Text="15%" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="AvatarMeshDensityLabel" Grid.Column="1" Text="{Binding MeshPreview.FormattedMeshDensityText}" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
                                         </Grid>
-                                        <Slider x:Name="AvatarMeshDensitySlider" Minimum="1" Maximum="100" Value="15" TickFrequency="1" Focusable="False" Height="28" Margin="8,0" ClipToBounds="False" ValueChanged="AvatarMeshDensitySlider_ValueChanged" />
+                                        <Slider x:Name="AvatarMeshDensitySlider" Minimum="1" Maximum="100" Value="{Binding MeshPreview.MeshDensityPercent, Mode=TwoWay}" TickFrequency="1" Focusable="False" Height="28" Margin="8,0" ClipToBounds="False" ValueChanged="AvatarMeshDensitySlider_ValueChanged" />
                                     </StackPanel>
 
-                                    <StackPanel x:Name="MeshMaterialControlsContainer" Spacing="6" IsVisible="False">
+                                    <StackPanel x:Name="MeshMaterialControlsContainer" Spacing="6" IsVisible="{Binding MeshPreview.HasMaterialSlots}">
                                         <Grid ColumnDefinitions="*,Auto">
                                             <TextBlock Text="Material" Foreground="White" FontSize="10" VerticalAlignment="Center" />
-                                            <Button x:Name="MeshMaterialResetColorButton" Content="Reset Color" MinWidth="82" Height="24" Padding="8,2" FontSize="10" HorizontalContentAlignment="Center" Click="MeshMaterialResetColorButton_Click" />
+                                            <Button x:Name="MeshMaterialResetColorButton" Content="Reset Color" MinWidth="82" Height="24" Padding="8,2" FontSize="10" HorizontalContentAlignment="Center" Command="{Binding ResetMeshMaterialColorCommand}" />
                                         </Grid>
                                         <ComboBox x:Name="MeshMaterialSelector" MinHeight="28" MaxDropDownHeight="240" SelectionChanged="MeshMaterialSelector_SelectionChanged" />
                                         <Border x:Name="MeshMaterialColorSwatch" Height="16" CornerRadius="3" BorderBrush="#66ffffff" BorderThickness="1" />
@@ -505,11 +519,11 @@
                             </StackPanel>
                         </Border>
 
-                        <Border x:Name="VideoClipPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Margin="10" IsVisible="False" BoxShadow="0 8 32 0 #40000000">
+                        <Border x:Name="VideoClipPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Margin="10" IsVisible="{Binding MediaPlayback.IsVideoActive}" BoxShadow="0 8 32 0 #40000000">
                             <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="VideoTitleLabel" Text="Video Player" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="VideoStatusLabel" Grid.Column="1" Text="Ready" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="VideoTitleLabel" Text="{Binding MediaPlayback.MediaTitle}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="VideoStatusLabel" Grid.Column="1" Text="{Binding MediaPlayback.StatusText}" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
                                 <StackPanel Grid.Row="1" Spacing="4">
@@ -517,7 +531,7 @@
                                     <TextBlock x:Name="VideoFrameRateLabel" Text="Frame Rate: 0 FPS" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12"/>
                                     <TextBlock x:Name="VideoFormatLabel" Text="Format: Unknown" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12"/>
                                     <TextBlock x:Name="VideoAudioLabel" Text="Audio: Checking..." Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12"/>
-                                    <TextBlock x:Name="VideoInfoLabel" Text="Loading preview..." Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="VideoInfoLabel" Text="{Binding MediaPlayback.EffectiveInfoText}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" TextWrapping="Wrap"/>
                                 </StackPanel>
                                 
                                 <Border Grid.Row="2" Background="Black" CornerRadius="8" ClipToBounds="True" MinHeight="100">
@@ -529,44 +543,44 @@
                                 <Grid Grid.Row="3" ColumnDefinitions="*,Auto" Margin="0,4">
                                     <Slider x:Name="VideoProgressBar" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32"
                                             ValueChanged="VideoProgressBar_ValueChanged"/>
-                                    <TextBlock x:Name="VideoTimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                    <TextBlock x:Name="VideoTimerLabel" Grid.Column="1" Text="{Binding MediaPlayback.FormattedTimeRange}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center" Margin="8,0,0,0"/>
                                 </Grid>
                                 
                                 <WrapPanel Grid.Row="4" Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Button x:Name="VideoPlayButton" Content="Play" Click="VideoPlayButton_Click" Width="60" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="VideoStopButton" Content="Stop" Click="VideoStopButton_Click" Width="60" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <CheckBox x:Name="VideoLoopButton" Content="Loop" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
+                                    <Button x:Name="VideoPlayButton" Content="{Binding MediaPlayback.VideoPlayButtonText}" Command="{Binding VideoPlayPauseCommand}" Width="60" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="VideoStopButton" Content="Stop" Command="{Binding VideoStopCommand}" Width="60" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <CheckBox x:Name="VideoLoopButton" Content="Loop" IsChecked="{Binding MediaPlayback.IsLooping, Mode=TwoWay}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
                                     
                                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,16,4">
                                         <TextBlock Text="Vol" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="11"/>
                                         <Slider x:Name="VideoVolumeBar" Minimum="0" Maximum="100" Value="80" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="VideoVolumeBar_ValueChanged"/>
                                     </StackPanel>
-                                    <Button x:Name="VideoExportButton" Content="Export" Click="VideoExportButton_Click" Width="70" HorizontalContentAlignment="Center" Margin="0,0,0,4"/>
+                                    <Button x:Name="VideoExportButton" Content="Export" Command="{Binding VideoExportCommand}" Width="70" HorizontalContentAlignment="Center" Margin="0,0,0,4"/>
                                 </WrapPanel>
                             </Grid>
                         </Border>
 
 
-                        <Border x:Name="AudioPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Center" MaxWidth="450" Margin="10" IsVisible="False" BoxShadow="0 8 32 0 #40000000">
+                        <Border x:Name="AudioPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Center" MaxWidth="450" Margin="10" IsVisible="{Binding MediaPlayback.IsAudioActive}" BoxShadow="0 8 32 0 #40000000">
                             <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="AudioTitleLabel" Text="Audio Player" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="AudioStatusLabel" Grid.Column="1" Text="Stopped" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioTitleLabel" Text="{Binding MediaPlayback.MediaTitle}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioStatusLabel" Grid.Column="1" Text="{Binding MediaPlayback.StatusText}" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
                                 <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="AudioInfoLabel" Text="44100 Hz" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="AudioTimerLabel" Grid.Column="1" Text="0:00.0 / 0:00.0" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioInfoLabel" Text="{Binding MediaPlayback.MediaInfoText}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioTimerLabel" Grid.Column="1" Text="{Binding MediaPlayback.FormattedTimeRange}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
                                 </Grid>
                                 
                                 <Slider x:Name="AudioProgressBar" Grid.Row="2" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32" 
                                         ValueChanged="AudioProgressBar_ValueChanged"/>
                                 
                                 <WrapPanel Grid.Row="3" Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Button x:Name="AudioPlayButton" Content="Play" Click="AudioPlayButton_Click" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="AudioPauseButton" Content="Pause" Click="AudioPauseButton_Click" Width="65" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="AudioStopButton" Content="Stop" Click="AudioStopButton_Click" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <CheckBox x:Name="AudioloopButton" Content="Loop" Click="AudioLoopButton_Click" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
+                                    <Button x:Name="AudioPlayButton" Content="Play" Command="{Binding AudioPlayCommand}" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="AudioPauseButton" Content="{Binding MediaPlayback.AudioPauseButtonText}" Command="{Binding AudioPauseCommand}" Width="65" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="AudioStopButton" Content="Stop" Command="{Binding AudioStopCommand}" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <CheckBox x:Name="AudioloopButton" Content="Loop" IsChecked="{Binding MediaPlayback.IsLooping, Mode=TwoWay}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
                                     
                                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,4">
                                         <TextBlock Text="Vol" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="11"/>
@@ -586,18 +600,18 @@
                                 HorizontalAlignment="Left"
                                 VerticalAlignment="Top"
                                 IsHitTestVisible="False"
-                                IsVisible="False">
+                                IsVisible="{Binding PreviewSession.IsCacheBadgeVisible}">
                             <TextBlock x:Name="PreviewCacheBadgeText"
                                        Foreground="#E6FFFFFF"
                                        FontSize="11"
                                        FontWeight="SemiBold"
-                                       Text="" />
+                                       Text="{Binding PreviewSession.CacheBadgeText}" />
                         </Border>
                         </Panel>
                     </Grid>
                 </TabItem>
                 <TabItem Header="Dump">
-                    <TextBox x:Name="DumpTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" FontFamily="Monospace" />
+                    <TextBox x:Name="DumpTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" FontFamily="Monospace" Text="{Binding PreviewSession.DumpTextContent, Mode=OneWay}" />
                 </TabItem>
             </TabControl>
 

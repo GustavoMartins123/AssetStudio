@@ -187,7 +187,7 @@ public partial class MainWindow
             ?? (float)Math.Clamp(appSettings.AvatarPreviewMeshDensityPercent, MinAvatarPreviewMeshDensityPercent, MaxAvatarPreviewMeshDensityPercent);
         var boneScale = GLPreviewControl?.BoneScale
             ?? (float)Math.Clamp(appSettings.AvatarPreviewBoneScale, MinAvatarPreviewBoneScale, MaxAvatarPreviewBoneScale);
-        var includeInfo = displayInfo.IsChecked == true;
+        var includeInfo = ViewModel.Options.DisplayInfo;
         StatusStripUpdate("Loading avatar relations & preparing rig...");
 
         _ = Task.Run(() =>
@@ -357,11 +357,6 @@ public partial class MainWindow
             GLPreviewControl.Focus();
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
-            if (displayInfo.IsChecked == true && !string.IsNullOrEmpty(infoText) && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-            {
-                PreviewInfoOverlay.Text = infoText;
-                PreviewInfoBorder.IsVisible = true;
-            }
             StatusStripUpdate($"OpenGL Avatar Preview | Mesh: {avatarMesh.m_Name} | Related meshes: {avatarCandidates.Count} | Skeleton Joints: {boneJointCount}");
             return;
         }

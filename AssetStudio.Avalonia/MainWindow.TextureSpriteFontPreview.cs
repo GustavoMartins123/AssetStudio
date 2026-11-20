@@ -49,11 +49,7 @@ public partial class MainWindow
             ImagePreviewBox.IsVisible = false;
             TextPreviewBox.IsVisible = true;
             PreviewLabel.IsVisible = false;
-            if (PreviewInfoBorder != null)
-            {
-                PreviewInfoBorder.IsVisible = false;
-            }
-            PreviewSession.ClearCacheBadge();
+            ClearPreviewInfoOverlay();
             ClearPreviewCacheBadge();
             return;
         }
@@ -87,15 +83,7 @@ public partial class MainWindow
                         ImagePreviewBox.IsVisible = true;
                         TextPreviewBox.IsVisible = false;
                         PreviewLabel.IsVisible = false;
-                        if (displayInfo.IsChecked == true && PreviewInfoOverlay != null && PreviewInfoBorder != null)
-                        {
-                            PreviewInfoOverlay.Text = fontPreview.InfoText;
-                            PreviewInfoBorder.IsVisible = true;
-                        }
-                        else if (PreviewInfoBorder != null)
-                        {
-                            PreviewInfoBorder.IsVisible = false;
-                        }
+                        SetPreviewInfoOverlay(fontPreview.InfoText);
                         StatusStripUpdate($"Font loaded: {m_Font.m_Name}");
                     }
                     else
@@ -118,7 +106,7 @@ public partial class MainWindow
                         ImagePreviewBox.IsVisible = false;
                         TextPreviewBox.IsVisible = true;
                         PreviewLabel.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
+                        ClearPreviewInfoOverlay();
                         StatusStripUpdate($"Unsupported font preview: {ex.Message}");
                     }
                 });
@@ -359,15 +347,7 @@ public partial class MainWindow
                             glControl.SetPreparedTexture(preparedPayload);
                             glControl.SetChannels(textureChannels);
 
-                            if (displayInfo.IsChecked == true)
-                            {
-                                PreviewInfoOverlay.Text = finalInfoText;
-                                PreviewInfoBorder.IsVisible = true;
-                            }
-                            else
-                            {
-                                PreviewInfoBorder.IsVisible = false;
-                            }
+                            SetPreviewInfoOverlay(finalInfoText);
 
                             ClearPreviewCacheBadge();
                             StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
@@ -485,7 +465,7 @@ public partial class MainWindow
                             ClearPreviewCacheBadge();
                             StatusStripUpdate(failReason);
                             ImagePreviewBox.IsVisible = false;
-                            PreviewInfoBorder.IsVisible = false;
+                            ClearPreviewInfoOverlay();
                         }
                     });
                     return;
@@ -545,15 +525,7 @@ public partial class MainWindow
                             TextPreviewBox.IsVisible = false;
                             PreviewLabel.IsVisible = false;
 
-                            if (displayInfo.IsChecked == true)
-                            {
-                                PreviewInfoOverlay.Text = finalInfoText;
-                                PreviewInfoBorder.IsVisible = true;
-                            }
-                            else
-                            {
-                                PreviewInfoBorder.IsVisible = false;
-                            }
+                            SetPreviewInfoOverlay(finalInfoText);
 
                             UpdatePreviewCacheBadge(fromCache: finalFromCache, sourceKind: finalSourceKind);
 
@@ -585,7 +557,7 @@ public partial class MainWindow
                         ClearPreviewCacheBadge();
                         StatusStripUpdate($"Error generating preview: {ex.Message}");
                         ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
+                        ClearPreviewInfoOverlay();
                     }
                 });
             }

@@ -27,19 +27,6 @@ public partial class MainWindow
     internal static int GetExportThreadCount(int requestedDegreeOfParallelism = 0)
         => AssetExportService.GetExportThreadCount(requestedDegreeOfParallelism);
 
-    private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsAsync(ExportMode.Convert);
-    private async void ExportSelectedAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
-    private async void ExportFilteredAssets_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsAsync(ExportMode.Convert);
-    private async void ExportAllAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsAsync(ExportMode.Raw);
-    private async void ExportSelectedAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Raw);
-    private async void ExportFilteredAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsAsync(ExportMode.Raw);
-    private async void ExportAllAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsAsync(ExportMode.Dump);
-    private async void ExportSelectedAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Dump);
-    private async void ExportFilteredAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsAsync(ExportMode.Dump);
-    private async void ExportAllAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsListAsync();
-    private async void ExportSelectedAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(GetSelectedAssets());
-    private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsListAsync();
-
     private Task ExportAllAssetsAsync(ExportMode mode)
     {
         return _isArenaAssetListMode
@@ -76,12 +63,9 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (folders == null || folders.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
         var arena = assetsManager.ProjectIndex.Arena;
 
@@ -145,9 +129,6 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-
         var arena = assetsManager.ProjectIndex.Arena;
         if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump))
         {
@@ -158,10 +139,9 @@ public partial class MainWindow
             }
         }
 
-        var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (exportFolders == null || exportFolders.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var savePath = exportFolders[0].Path.LocalPath;
         SaveExportFolder(savePath);
 
         BulkExportSummary summary = default;
@@ -193,7 +173,7 @@ public partial class MainWindow
                     toExport,
                     mode,
                     savePath,
-                    progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress),
+                    progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => ViewModel.LoadingProgress = progress),
                     cancellationToken: cancellationToken);
             });
         }
@@ -230,7 +210,7 @@ public partial class MainWindow
         }
     }
 
-    private async void ExportErrorLog_Click(object? sender, RoutedEventArgs e)
+    private async Task ExportErrorLogCommandHandlerAsync()
     {
         await ErrorExporter.ExportErrorLog(this, logger, StatusStripUpdate);
     }
@@ -243,12 +223,9 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (folders == null || folders.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
 
         var cancellationToken = ExportState.BeginExport(
@@ -316,19 +293,14 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-
         if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump) && toExport.Any(x => x.Type == ClassIDType.MonoBehaviour))
         {
             await EnsureAssemblyLoaderReadyAsync();
         }
 
-        var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        if (exportFolders == null || exportFolders.Count == 0) return;
-
-        var savePath = exportFolders[0].Path.LocalPath;
         SaveExportFolder(savePath);
 
         int total = toExport.Count;
@@ -349,7 +321,7 @@ public partial class MainWindow
                     toExport,
                     mode,
                     savePath,
-                    progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress),
+                    progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => ViewModel.LoadingProgress = progress),
                     cancellationToken: cancellationToken);
             });
         }
@@ -438,12 +410,9 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (folders == null || folders.Count == 0) return;
+        var selectedExportRoot = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(selectedExportRoot)) return;
 
-        var selectedExportRoot = folders[0].Path.LocalPath;
         SaveExportFolder(selectedExportRoot);
         var exportPath = Path.Combine(selectedExportRoot, "Animator");
         Directory.CreateDirectory(exportPath);
@@ -510,7 +479,7 @@ public partial class MainWindow
         }
     }
 
-    private async void ExportAllObjectsSplit_Click(object? sender, RoutedEventArgs e)
+    private async Task ExportAllObjectsSplitCommandHandlerAsync()
     {
         if (sceneTreeNodes.Count == 0)
         {
@@ -518,24 +487,11 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (folders == null || folders.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
         await ExportSplitObjects(savePath, sceneTreeNodes.SelectMany(x => x.Children).ToList(), null, createObjectFolders: true);
-    }
-
-    private async void ExportSelectedObjectsSplit_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportSelectedObjectsSplit(false);
-    }
-
-    private async void ExportSelectedObjectsSplitWithAnimationClip_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportSelectedObjectsSplit(true);
     }
 
     private async Task ExportSelectedObjectsSplit(bool includeAnimations)
@@ -547,26 +503,13 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (folders == null || folders.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
         var exportPath = Path.Combine(savePath, "GameObject");
         Directory.CreateDirectory(exportPath);
         await ExportSplitObjects(exportPath, selectedNodes, includeAnimations ? GetSelectedAnimationClips() : null, createObjectFolders: false);
-    }
-
-    private async void ExportSelectedObjectsMerge_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportSelectedObjectsMerge(false);
-    }
-
-    private async void ExportSelectedObjectsMergeWithAnimationClip_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportSelectedObjectsMerge(true);
     }
 
     private async Task ExportSelectedObjectsMerge(bool includeAnimations)
@@ -581,13 +524,9 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
         var suggestedName = FixFileName(gameObjects[0].m_Name) + " (merge).fbx";
-        var file = await topLevel.StorageProvider.SaveFilePickerAsync(await CreateFbxSaveOptions("Save merged FBX", suggestedName));
-        if (file == null) return;
-
-        var exportFile = file.Path.LocalPath;
+        var exportFile = await PickSaveFbxDialogAsync("Save merged FBX", suggestedName);
+        if (string.IsNullOrWhiteSpace(exportFile)) return;
         var exportFolder = Path.GetDirectoryName(exportFile);
         if (!string.IsNullOrEmpty(exportFolder))
         {
@@ -1174,14 +1113,9 @@ public partial class MainWindow
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-
         var suggestedName = FixFileName(AssetExportService.GetExportFileName(primaryAsset)) + ".fbx";
-        var file = await topLevel.StorageProvider.SaveFilePickerAsync(await CreateFbxSaveOptions("Export Model Group (FBX)", suggestedName));
-        if (file == null) return;
-
-        var exportFile = file.Path.LocalPath;
+        var exportFile = await PickSaveFbxDialogAsync("Export Model Group (FBX)", suggestedName);
+        if (string.IsNullOrWhiteSpace(exportFile)) return;
         var exportFolder = Path.GetDirectoryName(exportFile);
         if (!string.IsNullOrEmpty(exportFolder))
         {

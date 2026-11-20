@@ -160,10 +160,6 @@ public partial class MainWindow
         if (AudioProgressBar != null && !_isAudioDragging && snapshot.DurationMs > 0)
         {
             _isUpdatingAudioProgress = true;
-            if (AudioTimerLabel != null)
-            {
-                AudioTimerLabel.Text = MediaPlayback.FormattedTimeRange;
-            }
             try
             {
                 AudioProgressBar.Value = MediaPlayback.ProgressPermille;
@@ -181,11 +177,6 @@ public partial class MainWindow
         else if (!snapshot.IsPlaying && MediaPlayback.IsPlaying)
         {
             MediaPlayback.SetPaused();
-        }
-
-        if (AudioStatusLabel != null)
-        {
-            AudioStatusLabel.Text = snapshot.IsPlaying ? "Playing" : "Paused";
         }
     }
 
@@ -215,15 +206,11 @@ public partial class MainWindow
         MediaPlayback.ResetIfActive(ActiveMediaKind.Audio);
 
         if (AudioProgressBar != null) AudioProgressBar.Value = 0;
-        if (AudioTimerLabel != null) AudioTimerLabel.Text = MediaPlaybackViewModel.EmptyTimeRange;
-        if (AudioStatusLabel != null) AudioStatusLabel.Text = "Stopped";
-        if (AudioInfoLabel != null) AudioInfoLabel.Text = string.Empty;
-        if (AudioPauseButton != null) AudioPauseButton.Content = "Pause";
         if (AudioPlayButton != null) AudioPlayButton.IsEnabled = true;
         if (AudioPauseButton != null) AudioPauseButton.IsEnabled = true;
     }
 
-    private async void AudioPlayButton_Click(object? sender, RoutedEventArgs e)
+    private async Task ExecuteAudioPlayAsync()
     {
         var audioClip = currentPreviewAudioClip;
         if (audioClip == null)
@@ -247,7 +234,6 @@ public partial class MainWindow
             var sessionId = service.SessionId;
             MediaPlayback.SetPreparing();
             SetAudioTransportButtonsEnabled(false);
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
 
             AudioPreviewResult result;
             try
@@ -272,21 +258,17 @@ public partial class MainWindow
             if (!result.IsSuccess)
             {
                 MediaPlayback.SetError(result.Message, "Unsupported");
-                if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
                 StatusStripUpdate(result.Message);
                 return;
             }
 
             MediaPlayback.UpdatePosition(0);
             MediaPlayback.SetPlaying();
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
-            if (AudioPauseButton != null) AudioPauseButton.Content = "Pause";
             _audioTimer?.Start();
         }
         catch (Exception ex)
         {
             MediaPlayback.SetError(ex.Message, "Error");
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
             StatusStripUpdate($"Failed to play audio: {ex.Message}");
         }
     }
@@ -307,10 +289,6 @@ public partial class MainWindow
 
         var newMs = (long)(service.DurationMs * (AudioProgressBar.Value / 1000.0));
         MediaPlayback.UpdatePosition(newMs / 1000.0);
-        if (AudioTimerLabel != null)
-        {
-            AudioTimerLabel.Text = MediaPlayback.FormattedTimeRange;
-        }
 
         try
         {
@@ -330,18 +308,13 @@ public partial class MainWindow
 
         var preservedInfoText = MediaPlayback.IsAudioActive && !string.IsNullOrEmpty(MediaPlayback.MediaInfoText)
             ? MediaPlayback.MediaInfoText
-            : (AudioInfoLabel?.Text ?? string.Empty);
+            : string.Empty;
 
         AudioReset();
         currentPreviewAudioClip = audioClip;
         MediaPlayback.BeginAudioLoad(audioClip.m_Name, preservedInfoText);
-        if (AudioInfoLabel != null && !string.IsNullOrEmpty(preservedInfoText))
-        {
-            AudioInfoLabel.Text = preservedInfoText;
-        }
 
         SetAudioTransportButtonsEnabled(false);
-        if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
 
         var isLinux = UseLinuxAudioFallback;
         var preferTranscode = isLinux || Environment.GetEnvironmentVariable("ASSETSTUDIO_PREFER_TRANSCODE_PREVIEW") == "1";
@@ -375,7 +348,6 @@ public partial class MainWindow
                 _ => "Error"
             };
             MediaPlayback.SetError(result.Message, statusLabel);
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
             if (!string.IsNullOrEmpty(result.Message))
             {
                 StatusStripUpdate(result.Message);
@@ -389,12 +361,10 @@ public partial class MainWindow
             service.CanSeek,
             service.SourceDescription);
 
-        if (AudioInfoLabel != null) AudioInfoLabel.Text = MediaPlayback.MediaInfoText;
-        if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
         return true;
     }
 
-    private void AudioPauseButton_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteAudioPause()
     {
         var audioClip = currentPreviewAudioClip;
         var service = _audioPlaybackService;
@@ -409,15 +379,11 @@ public partial class MainWindow
             {
                 service.Pause();
                 MediaPlayback.SetPaused();
-                if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
-                if (AudioPauseButton != null) AudioPauseButton.Content = "Resume";
             }
             else
             {
                 service.Resume();
                 MediaPlayback.SetPlaying();
-                if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
-                if (AudioPauseButton != null) AudioPauseButton.Content = "Pause";
                 _audioTimer?.Start();
             }
         }
@@ -425,11 +391,6 @@ public partial class MainWindow
         {
             StatusStripUpdate($"Failed to pause audio: {ex.Message}");
         }
-    }
-
-    private void AudioStopButton_Click(object? sender, RoutedEventArgs e)
-    {
-        AudioStop();
     }
 
     private void RestartAudioPreviewPlayback()
@@ -446,8 +407,6 @@ public partial class MainWindow
             MediaPlayback.UpdatePosition(0);
             MediaPlayback.SetPlaying();
             _audioTimer?.Start();
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
-            if (AudioPauseButton != null) AudioPauseButton.Content = "Pause";
         }
         catch (Exception ex)
         {
@@ -463,16 +422,8 @@ public partial class MainWindow
             _audioTimer?.Stop();
             MediaPlayback.SetStopped();
             if (AudioProgressBar != null) AudioProgressBar.Value = 0;
-            if (AudioTimerLabel != null) AudioTimerLabel.Text = MediaPlayback.FormattedTimeRange;
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = MediaPlayback.StatusText;
-            if (AudioPauseButton != null) AudioPauseButton.Content = "Pause";
         }
         catch { }
-    }
-
-    private void AudioLoopButton_Click(object? sender, RoutedEventArgs e)
-    {
-        MediaPlayback.SetLooping(AudioloopButton?.IsChecked == true);
     }
 
     private void AudioVolumeBar_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
@@ -497,10 +448,6 @@ public partial class MainWindow
 
         var newMs = (long)(service.DurationMs * (AudioProgressBar.Value / 1000.0));
         MediaPlayback.UpdatePosition(newMs / 1000.0);
-        if (AudioTimerLabel != null)
-        {
-            AudioTimerLabel.Text = MediaPlayback.FormattedTimeRange;
-        }
 
         if (!_isAudioDragging)
         {
@@ -524,8 +471,7 @@ public partial class MainWindow
 
     private void HandleAudioPlaybackEnded()
     {
-        var loop = AudioloopButton?.IsChecked == true;
-        MediaPlayback.SetLooping(loop);
+        var loop = MediaPlayback.IsLooping;
         if (loop)
         {
             RestartAudioPreviewPlayback();
@@ -550,14 +496,7 @@ public partial class MainWindow
 
         var infoText = AudioPreviewPreparer.FormatAudioClipCompressionInfo(m_AudioClip);
         MediaPlayback.SelectAudio(m_AudioClip.m_Name, infoText);
-        MediaPlayback.SetLooping(AudioloopButton?.IsChecked == true);
 
-        AudioPanel.IsVisible = true;
-        AudioInfoLabel.Text = MediaPlayback.MediaInfoText;
-        AudioTimerLabel.Text = MediaPlayback.FormattedTimeRange;
-        AudioTitleLabel.Text = MediaPlayback.MediaTitle;
-        AudioStatusLabel.Text = MediaPlayback.StatusText;
-        AudioPauseButton.Content = "Pause";
         StatusStripUpdate($"Loaded audio metadata: {m_AudioClip.m_Name}");
     }
     #endregion

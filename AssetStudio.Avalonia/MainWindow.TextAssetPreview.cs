@@ -84,11 +84,7 @@ public partial class MainWindow
             TextureGLPreview.IsVisible = false;
         }
         PreviewLabel.IsVisible = false;
-        PreviewInfoBorder.IsVisible = false;
-
-        TextAssetPreviewTitle.Text = assetItem.Name;
-        TextAssetPreviewSubtitle.Text =
-            $"{preview.FormatName} | {preview.DialogueCards.Count:N0} dialogue-like strings | {preview.ParsedStringCount:N0} parsed strings";
+        ClearPreviewInfoOverlay();
 
         TextAssetDetailsTextBox.FontFamily = TextAssetMonoFontFamily;
         TextAssetDetailsTextBox.FontSize = 13;
@@ -106,7 +102,6 @@ public partial class MainWindow
         var vmCards = prebuiltCards ?? (TextAssetDialogueCardsList.ItemsSource as IReadOnlyList<TextAssetDialogueCardViewModel>);
         PreviewSession.ShowDialogueCards(assetItem, preview, vmCards, isDark);
 
-        TextAssetPreviewPanel.IsVisible = true;
         SetTextAssetPreviewMode(TextAssetPreviewMode.Cards);
     }
 
@@ -115,24 +110,18 @@ public partial class MainWindow
         _previewRequestCoordinator.CancelCurrent();
         currentTextAssetPreview = null;
         PreviewSession.ClearDialogueCards();
-        TextAssetPreviewPanel.IsVisible = false;
-        TextAssetDetailsTextBox.Text = string.Empty;
         TextAssetDialogueCardsList.ItemsSource = null;
     }
 
-    private void TextAssetCardsViewButton_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteSetTextAssetDisplayMode(TextAssetDisplayMode mode)
     {
-        SetTextAssetPreviewMode(TextAssetPreviewMode.Cards);
-    }
-
-    private void TextAssetDetailsViewButton_Click(object? sender, RoutedEventArgs e)
-    {
-        SetTextAssetPreviewMode(TextAssetPreviewMode.Text);
-    }
-
-    private void TextAssetInfoViewButton_Click(object? sender, RoutedEventArgs e)
-    {
-        SetTextAssetPreviewMode(TextAssetPreviewMode.Info);
+        var previewMode = mode switch
+        {
+            TextAssetDisplayMode.Text => TextAssetPreviewMode.Text,
+            TextAssetDisplayMode.Info => TextAssetPreviewMode.Info,
+            _ => TextAssetPreviewMode.Cards
+        };
+        SetTextAssetPreviewMode(previewMode);
     }
 
     private void SetTextAssetPreviewMode(TextAssetPreviewMode mode)
@@ -142,10 +131,6 @@ public partial class MainWindow
             return;
         }
 
-        bool showCards = mode == TextAssetPreviewMode.Cards;
-        TextAssetDialogueCardsList.IsVisible = showCards;
-        TextAssetDetailsTextBox.IsVisible = !showCards;
-
         currentPreviewMode = mode;
         var vmMode = mode switch
         {
@@ -154,15 +139,6 @@ public partial class MainWindow
             _ => TextAssetDisplayMode.Cards
         };
         PreviewSession.SetDialogueDisplayMode(vmMode, currentTextAssetPreview.PlainTextScript, currentTextAssetPreview.DetailsText);
-
-        if (mode == TextAssetPreviewMode.Text)
-        {
-            SetTextWithTruncation(TextAssetDetailsTextBox, currentTextAssetPreview.PlainTextScript);
-        }
-        else if (mode == TextAssetPreviewMode.Info)
-        {
-            SetTextWithTruncation(TextAssetDetailsTextBox, currentTextAssetPreview.DetailsText);
-        }
 
         bool isDark = ActualThemeVariant == global::Avalonia.Styling.ThemeVariant.Dark;
         IBrush inactiveBg = isDark ? InactiveModeDarkBackground : InactiveModeLightBackground;
@@ -271,7 +247,7 @@ public partial class MainWindow
         TextPreviewBox.Text = "Loading TextAsset preview...";
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
-        PreviewInfoBorder.IsVisible = false;
+        ClearPreviewInfoOverlay();
         StatusStripUpdate($"Loading TextAsset preview: {assetItem.Name}...");
 
         _ = Task.Run(() =>
@@ -319,7 +295,7 @@ public partial class MainWindow
                     TextPreviewBox.Text = truncatedDetails ?? string.Empty;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
-                    PreviewInfoBorder.IsVisible = false;
+                    ClearPreviewInfoOverlay();
 
                     StatusStripUpdate($"TextAsset preview loaded ({data.Length:N0} bytes).");
                 });
@@ -341,7 +317,7 @@ public partial class MainWindow
                     TextPreviewBox.Text = errorText;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
-                    PreviewInfoBorder.IsVisible = false;
+                    ClearPreviewInfoOverlay();
                     StatusStripUpdate($"TextAsset preview error: {ex.Message}");
                 });
             }

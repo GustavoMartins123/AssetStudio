@@ -1,10 +1,11 @@
 using Avalonia.Controls;
-using Avalonia.Interactivity;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
@@ -58,10 +59,6 @@ public partial class MainWindow
         lazySourcePathBySerializedFile.Clear();
         lazySourceFileSearchCache.Clear();
         resolvedSourcePathCache.Clear();
-        if (ClearClassFilterButton != null)
-        {
-            ClearClassFilterButton.IsVisible = false;
-        }
         AssetListDataGrid.SelectedItem = null;
         AssetListDataGrid.ItemsSource = visibleAssetItems;
         AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
@@ -78,20 +75,12 @@ public partial class MainWindow
         }
         nextGameObjectSearchIndex = 0;
         SceneTreeView.ItemsSource = null;
-        DumpTextBox.Text = string.Empty;
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
         ClearTextAssetPreview();
-        if (listSearch != null)
-        {
-            listSearch.Text = string.Empty;
-        }
-        classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
         ViewModel.ResetSession();
-        ViewModel.PreviewSession.IsPreviewEnabled = enablePreview?.IsChecked != false;
-        ViewModel.PreviewSession.IsDisplayInfoEnabled = displayInfo?.IsChecked != false;
         if (projectContext?.Project != null)
         {
             ViewModel.ProjectSession.SetLoadedProject(projectContext.Project, isLazyMode: assetsManager.LazyLoading);
@@ -100,7 +89,7 @@ public partial class MainWindow
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
 
-        Title = FormatWindowTitle();
+        ViewModel.ProjectSession.UpdateWindowTitle(projectContext?.Project.DisplayName);
 
         _currentlySelectedUniqueID = null;
         isRefreshingFilterList = false;
@@ -109,17 +98,12 @@ public partial class MainWindow
 
     private string FormatWindowTitle()
     {
-        var version = AppVersionInfo.PrefixedDisplayVersion;
-        return projectContext == null
-            ? $"AssetStudio {version}"
-            : $"AssetStudio {version} - {projectContext.Project.DisplayName}";
+        return ProjectSessionViewModel.FormatWindowTitle(projectContext?.Project.DisplayName);
     }
 
     private static string FormatLoadedWindowTitle(string? productName, SerializedFile firstFile)
     {
-        var version = AppVersionInfo.PrefixedDisplayVersion;
-        var label = !string.IsNullOrEmpty(productName) ? productName : "no productName";
-        return $"AssetStudio {version} - {label} - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
+        return ProjectSessionViewModel.FormatLoadedWindowTitle(productName, firstFile);
     }
 
     private static T? FindVisualChild<T>(global::Avalonia.Visual? visual) where T : class
@@ -136,7 +120,7 @@ public partial class MainWindow
 
     private void ApplyUnityVersionOption()
     {
-        assetsManager.SpecifyUnityVersion = ViewModel.SpecifyUnityVersion?.Trim() ?? string.Empty;
+        assetsManager.SpecifyUnityVersion = ViewModel.Options.SpecifyUnityVersion?.Trim() ?? string.Empty;
         if (appSettings.SpecifyUnityVersion != assetsManager.SpecifyUnityVersion)
         {
             appSettings.SpecifyUnityVersion = assetsManager.SpecifyUnityVersion;
@@ -146,6 +130,7 @@ public partial class MainWindow
 
     private void SaveAppSettings()
     {
+        ViewModel.Options.ApplyToSettings(appSettings);
         try
         {
             if (projectContext != null)
@@ -161,6 +146,16 @@ public partial class MainWindow
         {
             appSettings.Save();
         }
+    }
+
+    private void SetPreviewInfoOverlay(string? text)
+    {
+        PreviewSession.PreviewMetadataSummary = text ?? string.Empty;
+    }
+
+    private void ClearPreviewInfoOverlay()
+    {
+        PreviewSession.PreviewMetadataSummary = string.Empty;
     }
 
     private void ClearPreview(string message = "[Preview Panel]")
@@ -186,32 +181,14 @@ public partial class MainWindow
         ClearMeshMaterialControls();
         ClearPreviewCandidateControls();
         ClearPreviewCacheBadge();
-        if (AnimationPlaybackPanel != null)
-        {
-            AnimationPlaybackPanel.IsVisible = false;
-        }
+        HideAnimationPlayback();
         if (TextureGLPreview != null)
         {
             TextureGLPreview.IsVisible = false;
         }
-        if (PreviewInfoBorder != null)
-        {
-            PreviewInfoBorder.IsVisible = false;
-        }
-        if (PreviewInfoOverlay != null)
-        {
-            PreviewInfoOverlay.Text = string.Empty;
-        }
-        if (AudioPanel != null)
-        {
-            AudioPanel.IsVisible = false;
-            AudioReset();
-        }
-        if (VideoClipPanel != null)
-        {
-            VideoClipPanel.IsVisible = false;
-            VideoReset();
-        }
+        ClearPreviewInfoOverlay();
+        AudioReset();
+        VideoReset();
         currentPreviewTexture = null;
         currentPreviewSprite = null;
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);
@@ -257,9 +234,9 @@ public partial class MainWindow
         }
     }
 
-    private void DisplayAll_Click(object? sender, RoutedEventArgs e)
+    private void OnDisplayAllOptionChanged(bool displayAllEnabled)
     {
-        appSettings.DisplayAll = displayAll.IsChecked == true;
+        appSettings.DisplayAll = displayAllEnabled;
         SaveAppSettings();
         if (assetsManager.assetsFileList.Count > 0 || (assetsManager.LazyLoading && assetsManager.ProjectIndex.Count > 0))
         {
@@ -267,12 +244,12 @@ public partial class MainWindow
         }
     }
 
-    private void EnablePreview_Click(object? sender, RoutedEventArgs e)
+    private void OnEnablePreviewOptionChanged(bool enablePreviewEnabled)
     {
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
-        appSettings.EnablePreview = enablePreview.IsChecked == true;
+        appSettings.EnablePreview = enablePreviewEnabled;
         SaveAppSettings();
-        if (enablePreview.IsChecked != true)
+        if (!enablePreviewEnabled)
         {
             ClearPreview("Preview disabled");
         }
@@ -287,9 +264,8 @@ public partial class MainWindow
         return displayInfoEnabled && !string.IsNullOrWhiteSpace(previewInfoText);
     }
 
-    private void DisplayInfo_Click(object? sender, RoutedEventArgs e)
+    private void OnDisplayInfoOptionChanged(bool showInfo)
     {
-        var showInfo = displayInfo.IsChecked == true;
         appSettings.DisplayInfo = showInfo;
         SaveAppSettings();
         if (AssetListDataGrid.SelectedItem is AssetItem selected)
@@ -299,24 +275,15 @@ public partial class MainWindow
                 : string.Empty;
             PreviewLabel.IsVisible = showInfo
                 && !TextPreviewBox.IsVisible
-                && !TextAssetPreviewPanel.IsVisible
+                && !PreviewSession.HasDialoguePreview
                 && (ImagePreviewBox == null || !ImagePreviewBox.IsVisible)
                 && (TextureGLPreview == null || !TextureGLPreview.IsVisible)
                 && (GLPreviewControl == null || !GLPreviewControl.IsVisible);
-            if (PreviewInfoBorder != null)
-            {
-                PreviewInfoBorder.IsVisible = ShouldShowPreviewInfoOverlay(showInfo, PreviewInfoOverlay?.Text);
-            }
-        }
-        else if (PreviewInfoBorder != null && !showInfo)
-        {
-            PreviewInfoBorder.IsVisible = false;
         }
     }
 
-    private void UseDiskDecompressionCache_Click(object? sender, RoutedEventArgs e)
+    private void OnUseDiskDecompressionCacheOptionChanged(bool enabled)
     {
-        var enabled = useDiskDecompressionCacheMenu.IsChecked == true;
         appSettings.UseDiskDecompressionCache = enabled;
         SaveAppSettings();
 
@@ -338,39 +305,32 @@ public partial class MainWindow
             : "Disk decompression cache (Lazy Mode) disabled.");
     }
 
-    private void TogglePreviewInfoBtn_Click(object? sender, RoutedEventArgs e)
+    private void OnShowErrorMessageOptionChanged(bool showErrorMessage)
     {
-        if (PreviewInfoScroll != null && TogglePreviewInfoBtn != null)
-        {
-            bool isVisible = PreviewInfoScroll.IsVisible;
-            PreviewInfoScroll.IsVisible = !isVisible;
-            TogglePreviewInfoBtn.Content = !isVisible ? "▼" : "▲";
-        }
+        logger.ShowErrorMessage = showErrorMessage;
+        appSettings.ShowErrorMessage = showErrorMessage;
+        SaveAppSettings();
     }
 
-    private async void SetProjectRoot_Click(object? sender, RoutedEventArgs e)
+    private async Task SetProjectRootCommandHandlerAsync()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
+        var selectedFolder = await PickLoadFolderDialogAsync("Select project root");
+        if (string.IsNullOrWhiteSpace(selectedFolder)) return;
 
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select project root"));
-        if (folders == null || folders.Count == 0) return;
-
-        assetsManager.ProjectRoot = folders[0].Path.LocalPath;
+        assetsManager.ProjectRoot = selectedFolder;
         SaveLoadFolder(assetsManager.ProjectRoot);
         appSettings.ProjectRoot = assetsManager.ProjectRoot;
         SaveAppSettings();
         StatusStripUpdate($"Project root set to: {assetsManager.ProjectRoot}");
     }
 
-    private async void ShowExportOptions_Click(object? sender, RoutedEventArgs e)
+    private async Task ShowExportOptionsCommandHandlerAsync()
     {
-        var dialog = new ExportOptionsWindow(exportOptions.Clone());
-        var result = await dialog.ShowDialog<ExportOptionsState?>(this);
-        if (result == null) return;
+        appSettings.ExportOptions.CopyFrom(exportOptions);
+        var saved = await ViewModel.DialogService.ShowExportOptionsAsync(appSettings);
+        if (!saved) return;
 
-        exportOptions.CopyFrom(result);
-        appSettings.ExportOptions.CopyFrom(result);
+        exportOptions.CopyFrom(appSettings.ExportOptions);
         SaveAppSettings();
         StatusStripUpdate("Export options updated.");
     }
@@ -410,9 +370,10 @@ public partial class MainWindow
                 Header = type.ToString(),
                 ToggleType = MenuItemToggleType.CheckBox,
                 IsChecked = checkedTypes.Contains(type),
-                Tag = type
+                Tag = type,
+                Command = ViewModel.ToggleFilterTypeCommand,
+                CommandParameter = type
             };
-            item.Click += FilterType_Click;
             filterTypeMenu.Items.Add(item);
         }
 
@@ -427,7 +388,7 @@ public partial class MainWindow
         updatingFilterTypeMenu = false;
     }
 
-    private void FilterTypeAll_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteFilterTypeAllFromUi()
     {
         if (updatingFilterTypeMenu) return;
 
@@ -444,7 +405,7 @@ public partial class MainWindow
         _ = FilterAssetListAsync(CancellationToken.None);
     }
 
-    private void FilterType_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteToggleFilterTypeFromUi(ClassIDType type)
     {
         if (updatingFilterTypeMenu) return;
 
@@ -461,5 +422,4 @@ public partial class MainWindow
             .OfType<MenuItem>()
             .Where(x => x.Tag is ClassIDType);
     }
-
 }

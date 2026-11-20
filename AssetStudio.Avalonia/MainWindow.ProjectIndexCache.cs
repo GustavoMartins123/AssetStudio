@@ -20,12 +20,12 @@ public partial class MainWindow : Window
     private static string GetFolderCacheKey(string folderPath) =>
         ProjectLoadingService.GetFolderCacheKey(folderPath);
 
-    private void ClearCurrentProjectCache_Click(object? sender, RoutedEventArgs e)
+    private async Task ClearCurrentProjectCacheCommandHandlerAsync()
     {
         var folderPath = GetCurrentCacheFolderPath();
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
         {
-            MessageBox.Show(this, "No loaded project folder was found to clear.", "Clear project cache");
+            await ViewModel.DialogService.ShowMessageAsync("Clear project cache", "No loaded project folder was found to clear.");
             return;
         }
 
@@ -48,7 +48,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Failed to clear project cache:\n{ex.Message}", "Clear project cache");
+            await ViewModel.DialogService.ShowErrorAsync("Clear project cache", $"Failed to clear project cache:\n{ex.Message}");
             StatusStripUpdate("Failed to clear project cache.");
         }
     }

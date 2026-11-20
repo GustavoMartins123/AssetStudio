@@ -58,14 +58,13 @@ public partial class MainWindow
         MeshPreview.ActiveMeshName = m_Mesh.m_Name ?? assetItem.Name;
         PreviewLabel.IsVisible = false;
         StatusStripUpdate("Preparing mesh preview...");
-        if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+        if (ViewModel.Options.DisplayInfo)
         {
-            PreviewInfoOverlay.Text = "Loading details...";
-            PreviewInfoBorder.IsVisible = true;
+            SetPreviewInfoOverlay("Loading details...");
         }
 
         var localAssetItem = assetItem;
-        var includeMeshInfo = displayInfo.IsChecked == true;
+        var includeMeshInfo = ViewModel.Options.DisplayInfo;
         Task.Run(() =>
         {
             try
@@ -108,12 +107,6 @@ public partial class MainWindow
                         GLPreviewControl.IsVisible = true;
                         ShowPreviewGeometryControls(showBoneControls: false);
                         GLPreviewControl.Focus();
-                    }
-
-                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                    {
-                        PreviewInfoOverlay.Text = quickInfoText;
-                        PreviewInfoBorder.IsVisible = true;
                     }
 
                     StatusStripUpdate("OpenGL Preview | Mesh loaded | Loading materials...");
@@ -174,17 +167,7 @@ public partial class MainWindow
                         GLPreviewControl.Focus();
                     }
 
-                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
-                    {
-                        PreviewInfoOverlay.Text = infoText;
-                        PreviewInfoBorder.IsVisible = true;
-                    }
-
                     _activeMeshMaterialsLoading = false;
-                    PreviewSession.UpdateCacheBadge(
-                        fromCache: _activeMeshGeometryFromCache,
-                        sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
-                        materialsLoading: false);
                     UpdatePreviewCacheBadge(
                         fromCache: _activeMeshGeometryFromCache,
                         sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
@@ -204,13 +187,9 @@ public partial class MainWindow
                     {
                         _activeMeshMaterialsLoading = false;
                         PreviewSession.IsLoading = false;
-                        PreviewSession.ClearCacheBadge();
                         ClearPreviewCacheBadge();
                         StatusStripUpdate($"Mesh preview error: {ex.Message}");
-                        if (PreviewInfoOverlay != null)
-                        {
-                            PreviewInfoOverlay.Text = $"Failed to load mesh: {ex.Message}";
-                        }
+                        SetPreviewInfoOverlay($"Failed to load mesh: {ex.Message}");
                     }
                 });
             }

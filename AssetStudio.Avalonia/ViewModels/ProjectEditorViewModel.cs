@@ -13,11 +13,11 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly Func<string, bool> _directoryExists;
         private readonly Func<string, string?> _findProjectIcon;
         private readonly Func<string, string?> _createExecutableIconPreview;
-        private readonly SecondaryAsyncCommand _browseCommand;
-        private readonly SecondaryAsyncCommand _browseIconCommand;
-        private readonly SecondaryRelayCommand _detectIconCommand;
-        private readonly SecondaryRelayCommand _saveCommand;
-        private readonly SecondaryRelayCommand _cancelCommand;
+        private readonly AsyncRelayCommand _browseCommand;
+        private readonly AsyncRelayCommand _browseIconCommand;
+        private readonly RelayCommand _detectIconCommand;
+        private readonly RelayCommand _saveCommand;
+        private readonly RelayCommand _cancelCommand;
 
         private string _name = string.Empty;
         private bool _useAutoName;
@@ -47,11 +47,11 @@ namespace AssetStudio.Avalonia.ViewModels
             _findProjectIcon = findProjectIcon ?? (root => _store?.TryFindProjectIcon(root));
             _createExecutableIconPreview = createExecutableIconPreview ?? (path => _store?.TryCreateExecutableIconPreview(path));
 
-            _browseCommand = new SecondaryAsyncCommand(BrowseRootAsync);
-            _browseIconCommand = new SecondaryAsyncCommand(BrowseIconAsync);
-            _detectIconCommand = new SecondaryRelayCommand(DetectIcon);
-            _saveCommand = new SecondaryRelayCommand(Save, () => CanSave);
-            _cancelCommand = new SecondaryRelayCommand(Cancel);
+            _browseCommand = new AsyncRelayCommand(BrowseRootAsync);
+            _browseIconCommand = new AsyncRelayCommand(BrowseIconAsync);
+            _detectIconCommand = new RelayCommand(DetectIcon);
+            _saveCommand = new RelayCommand(Save, () => CanSave);
+            _cancelCommand = new RelayCommand(Cancel);
 
             _name = _project.Name;
             _useAutoName = _project.UseAutoName;

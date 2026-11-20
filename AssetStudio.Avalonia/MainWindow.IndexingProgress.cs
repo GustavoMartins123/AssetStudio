@@ -119,7 +119,6 @@ public partial class MainWindow : Window
         }
 
         ViewModel.IndexingProgress.ApplySnapshot(snapshot);
-        SyncIndexingProgressPanelFromViewModel();
     }
 
     private void HideIndexingProgressPanel()
@@ -131,16 +130,6 @@ public partial class MainWindow : Window
         }
 
         ViewModel.IndexingProgress.HidePanel();
-        SyncIndexingProgressPanelFromViewModel();
-    }
-
-    private void SyncIndexingProgressPanelFromViewModel()
-    {
-        var vm = ViewModel.IndexingProgress;
-        IndexingProgressPanel.IsVisible = vm.IsPanelVisible;
-        IndexingProgressText.Text = vm.PrimaryStatusText;
-        IndexingProgressPercentText.Text = vm.FormattedPercentText;
-        IndexingProgressBar.Value = vm.ProgressPercent;
     }
 
     private static string BuildIndexingProgressTitle(string status) =>

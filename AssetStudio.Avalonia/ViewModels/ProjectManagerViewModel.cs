@@ -333,16 +333,16 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly List<ProjectEntryViewModel> _allProjects = new();
         private readonly HashSet<string> _runningAnalysisProjectIds = new(StringComparer.Ordinal);
 
-        private readonly SecondaryAsyncCommand _openCommand;
-        private readonly SecondaryRelayCommand _openWithoutProjectCommand;
-        private readonly SecondaryAsyncCommand _newProjectCommand;
-        private readonly SecondaryAsyncCommand _editProjectCommand;
-        private readonly SecondaryAsyncCommand _deleteProjectCommand;
-        private readonly SecondaryAsyncCommand _rerunAnalysisCommand;
-        private readonly SecondaryAsyncCommand _browseIl2CppDumperCommand;
-        private readonly SecondaryAsyncCommand _saveAnalysisPreferencesCommand;
-        private readonly SecondaryAsyncCommand _refreshCommand;
-        private readonly SecondaryRelayCommand _closeCommand;
+        private readonly AsyncRelayCommand _openCommand;
+        private readonly RelayCommand _openWithoutProjectCommand;
+        private readonly AsyncRelayCommand _newProjectCommand;
+        private readonly AsyncRelayCommand _editProjectCommand;
+        private readonly AsyncRelayCommand _deleteProjectCommand;
+        private readonly AsyncRelayCommand _rerunAnalysisCommand;
+        private readonly AsyncRelayCommand _browseIl2CppDumperCommand;
+        private readonly AsyncRelayCommand _saveAnalysisPreferencesCommand;
+        private readonly AsyncRelayCommand _refreshCommand;
+        private readonly RelayCommand _closeCommand;
 
         private ProjectEntryViewModel? _selectedProject;
         private string _searchText = string.Empty;
@@ -376,16 +376,16 @@ namespace AssetStudio.Avalonia.ViewModels
 
             Projects = new ObservableCollection<ProjectEntryViewModel>();
 
-            _openCommand = new SecondaryAsyncCommand(OpenSelectedProjectAsync, () => CanOpen);
-            _openWithoutProjectCommand = new SecondaryRelayCommand(OpenWithoutProject, () => CanOpenWithoutProject);
-            _newProjectCommand = new SecondaryAsyncCommand(AddProjectAsync, () => CanAdd);
-            _editProjectCommand = new SecondaryAsyncCommand(EditSelectedProjectAsync, () => CanEdit);
-            _deleteProjectCommand = new SecondaryAsyncCommand(DeleteSelectedProjectAsync, () => CanDelete);
-            _rerunAnalysisCommand = new SecondaryAsyncCommand(RerunSelectedAnalysisAsync, () => CanRerunAnalysis);
-            _browseIl2CppDumperCommand = new SecondaryAsyncCommand(BrowseIl2CppDumperAsync, () => CanEditAnalysisPreferences);
-            _saveAnalysisPreferencesCommand = new SecondaryAsyncCommand(SaveSelectedAnalysisPreferencesAsync, () => CanEditAnalysisPreferences);
-            _refreshCommand = new SecondaryAsyncCommand(() => RefreshProjectsAsync());
-            _closeCommand = new SecondaryRelayCommand(Close);
+            _openCommand = new AsyncRelayCommand(OpenSelectedProjectAsync, () => CanOpen);
+            _openWithoutProjectCommand = new RelayCommand(OpenWithoutProject, () => CanOpenWithoutProject);
+            _newProjectCommand = new AsyncRelayCommand(AddProjectAsync, () => CanAdd);
+            _editProjectCommand = new AsyncRelayCommand(EditSelectedProjectAsync, () => CanEdit);
+            _deleteProjectCommand = new AsyncRelayCommand(DeleteSelectedProjectAsync, () => CanDelete);
+            _rerunAnalysisCommand = new AsyncRelayCommand(RerunSelectedAnalysisAsync, () => CanRerunAnalysis);
+            _browseIl2CppDumperCommand = new AsyncRelayCommand(BrowseIl2CppDumperAsync, () => CanEditAnalysisPreferences);
+            _saveAnalysisPreferencesCommand = new AsyncRelayCommand(SaveSelectedAnalysisPreferencesAsync, () => CanEditAnalysisPreferences);
+            _refreshCommand = new AsyncRelayCommand(() => RefreshProjectsAsync());
+            _closeCommand = new RelayCommand(Close);
 
             _store.AnalysisService.AnalysisUpdated += OnProjectAnalysisUpdated;
         }

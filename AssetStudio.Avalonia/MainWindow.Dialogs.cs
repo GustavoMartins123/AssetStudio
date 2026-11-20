@@ -1,7 +1,7 @@
-using Avalonia.Controls;
-using Avalonia.Platform.Storage;
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -11,81 +11,41 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private async Task<IStorageFolder?> TryGetFolder(string? path)
+    private Task<IReadOnlyList<string>> PickOpenFilesDialogAsync(string title, bool allowMultiple)
     {
-        if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
-        {
-            return null;
-        }
+        return ViewModel.DialogService.PickOpenFilesAsync(new FilePickerRequest(
+            title: title,
+            allowMultiple: allowMultiple,
+            suggestedStartDirectory: appSettings.LoadFolderPath));
+    }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null)
-        {
-            return null;
-        }
+    private Task<string?> PickLoadFolderDialogAsync(string title)
+    {
+        return ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+            title: title,
+            allowMultiple: false,
+            suggestedStartDirectory: appSettings.LoadFolderPath));
+    }
 
-        try
-        {
-            var absolutePath = Path.GetFullPath(path).Replace('\\', '/');
-            if (!absolutePath.StartsWith("/"))
+    private Task<string?> PickExportFolderDialogAsync(string title)
+    {
+        return ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
+            title: title,
+            allowMultiple: false,
+            suggestedStartDirectory: appSettings.ExportFolderPath));
+    }
+
+    private Task<string?> PickSaveFbxDialogAsync(string title, string suggestedFileName)
+    {
+        return ViewModel.DialogService.PickSaveFileAsync(new SaveFilePickerRequest(
+            title: title,
+            suggestedFileName: suggestedFileName,
+            defaultExtension: "fbx",
+            suggestedStartDirectory: appSettings.ExportFolderPath,
+            fileTypeFilters: new[]
             {
-                absolutePath = "/" + absolutePath;
-            }
-            var uri = new Uri("file://" + absolutePath);
-            return await topLevel.StorageProvider.TryGetFolderFromPathAsync(uri);
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private async Task<FilePickerOpenOptions> CreateOpenFileOptions(string title, bool allowMultiple)
-    {
-        return new FilePickerOpenOptions
-        {
-            Title = title,
-            AllowMultiple = allowMultiple,
-            SuggestedStartLocation = await TryGetFolder(appSettings.LoadFolderPath)
-        };
-    }
-
-    private async Task<FolderPickerOpenOptions> CreateLoadFolderOptions(string title, bool allowMultiple = false)
-    {
-        return new FolderPickerOpenOptions
-        {
-            Title = title,
-            AllowMultiple = allowMultiple,
-            SuggestedStartLocation = await TryGetFolder(appSettings.LoadFolderPath)
-        };
-    }
-
-    private async Task<FolderPickerOpenOptions> CreateExportFolderOptions(string title, bool allowMultiple = false)
-    {
-        return new FolderPickerOpenOptions
-        {
-            Title = title,
-            AllowMultiple = allowMultiple,
-            SuggestedStartLocation = await TryGetFolder(appSettings.ExportFolderPath)
-        };
-    }
-
-    private async Task<FilePickerSaveOptions> CreateFbxSaveOptions(string title, string suggestedFileName)
-    {
-        return new FilePickerSaveOptions
-        {
-            Title = title,
-            SuggestedFileName = suggestedFileName,
-            DefaultExtension = "fbx",
-            SuggestedStartLocation = await TryGetFolder(appSettings.ExportFolderPath),
-            FileTypeChoices = new[]
-            {
-                new FilePickerFileType("Fbx file")
-                {
-                    Patterns = new[] { "*.fbx" }
-                }
-            }
-        };
+                new FileTypeFilterSpec("Fbx file", "*.fbx")
+            }));
     }
 
     private void SaveLoadFolder(string path)
@@ -130,7 +90,7 @@ public partial class MainWindow
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Unable to scan folder before loading:\n{ex.Message}", "Folder scan failed");
+            await ViewModel.DialogService.ShowErrorAsync("Folder scan failed", $"Unable to scan folder before loading:\n{ex.Message}");
             return RiskyLoadChoice.EagerLoad;
         }
 
@@ -177,76 +137,9 @@ public partial class MainWindow
         return sb.ToString();
     }
 
-    private async Task<RiskyLoadChoice> ShowRiskyProjectDialog(string message)
+    private Task<RiskyLoadChoice> ShowRiskyProjectDialog(string message)
     {
-        var dialog = new Window
-        {
-            Title = "Large Unity project detected",
-            Width = 640,
-            Height = 440,
-            MinWidth = 540,
-            MinHeight = 340,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner
-        };
-
-        var grid = new Grid
-        {
-            RowDefinitions = new RowDefinitions("*,Auto"),
-            Margin = new global::Avalonia.Thickness(16),
-            RowSpacing = 12
-        };
-
-        var textBlock = new TextBlock
-        {
-            Text = message,
-            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
-        };
-
-        var scrollViewer = new ScrollViewer
-        {
-            Content = textBlock
-        };
-
-        var buttonPanel = new StackPanel
-        {
-            Orientation = global::Avalonia.Layout.Orientation.Horizontal,
-            HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right,
-            Spacing = 10
-        };
-
-        var cancelButton = new Button
-        {
-            Content = "Cancel",
-            MinWidth = 90
-        };
-        cancelButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.Cancel);
-
-        var lazyButton = new Button
-        {
-            Content = "Load in Safe/Lazy Mode (Recommended)",
-            MinWidth = 240,
-            FontWeight = global::Avalonia.Media.FontWeight.Bold
-        };
-        lazyButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.LazyLoad);
-
-        var loadButton = new Button
-        {
-            Content = "Load anyway (Eager)",
-            MinWidth = 150
-        };
-        loadButton.Click += (_, _) => dialog.Close(RiskyLoadChoice.EagerLoad);
-
-        buttonPanel.Children.Add(cancelButton);
-        buttonPanel.Children.Add(lazyButton);
-        buttonPanel.Children.Add(loadButton);
-
-        Grid.SetRow(scrollViewer, 0);
-        Grid.SetRow(buttonPanel, 1);
-        grid.Children.Add(scrollViewer);
-        grid.Children.Add(buttonPanel);
-        dialog.Content = grid;
-
-        return await dialog.ShowDialog<RiskyLoadChoice>(this);
+        return ViewModel.DialogService.ShowRiskyLoadDialogAsync("Large Unity project detected", message);
     }
 
     private static string FormatBytes(long bytes)
@@ -263,76 +156,9 @@ public partial class MainWindow
         return $"{value:0.##} {units[unit]}";
     }
 
-    private async Task<MemoryPressureResult> ShowMemoryPressureWarningDialog(string message)
+    private Task<MemoryPressureResult> ShowMemoryPressureWarningDialog(string message)
     {
-        var dialog = new Window
-        {
-            Title = "Memory pressure warning",
-            Width = 600,
-            Height = 240,
-            MinWidth = 450,
-            MinHeight = 180,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner
-        };
-
-        var grid = new Grid
-        {
-            RowDefinitions = new RowDefinitions("*,Auto"),
-            Margin = new global::Avalonia.Thickness(16),
-            RowSpacing = 12
-        };
-
-        var textBlock = new TextBlock
-        {
-            Text = message,
-            TextWrapping = global::Avalonia.Media.TextWrapping.Wrap
-        };
-
-        var scrollViewer = new ScrollViewer
-        {
-            Content = textBlock
-        };
-
-        var buttonPanel = new StackPanel
-        {
-            Orientation = global::Avalonia.Layout.Orientation.Horizontal,
-            HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Right,
-            Spacing = 10
-        };
-
-        var cancelButton = new Button
-        {
-            Content = "Cancel loading",
-            MinWidth = 120
-        };
-        cancelButton.Click += (_, _) => dialog.Close(MemoryPressureResult.Cancel);
-
-        var stopButton = new Button
-        {
-            Content = "Stop and keep loaded",
-            MinWidth = 150
-        };
-        stopButton.Click += (_, _) => dialog.Close(MemoryPressureResult.StopAndKeep);
-
-        var continueButton = new Button
-        {
-            Content = "Ignore and continue",
-            MinWidth = 150,
-            FontWeight = global::Avalonia.Media.FontWeight.Bold
-        };
-        continueButton.Click += (_, _) => dialog.Close(MemoryPressureResult.Continue);
-
-        buttonPanel.Children.Add(cancelButton);
-        buttonPanel.Children.Add(stopButton);
-        buttonPanel.Children.Add(continueButton);
-
-        Grid.SetRow(scrollViewer, 0);
-        Grid.SetRow(buttonPanel, 1);
-        grid.Children.Add(scrollViewer);
-        grid.Children.Add(buttonPanel);
-        dialog.Content = grid;
-
-        return await dialog.ShowDialog<MemoryPressureResult>(this);
+        return ViewModel.DialogService.ShowMemoryPressureDialogAsync("Memory pressure warning", message);
     }
 
     private void ShowMemoryPressureError(MemoryPressureException ex)
@@ -344,6 +170,6 @@ public partial class MainWindow
                   "• Close other applications to free RAM\n" +
                   "• Raise the limit with ASSETSTUDIO_MEMORY_LIMIT_PERCENT (current: " + ex.LimitPercent + ")";
         StatusStripUpdate($"Loading stopped: memory pressure at {ex.MemoryLoadPercent}%.");
-        MessageBox.Show(this, msg, "Memory pressure — loading stopped");
+        _ = ViewModel.DialogService.ShowErrorAsync("Memory pressure — loading stopped", msg);
     }
 }

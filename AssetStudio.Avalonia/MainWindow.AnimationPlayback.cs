@@ -6,50 +6,33 @@ public partial class MainWindow
 {
     private void HideAnimationPlayback()
     {
-        if (AnimationPlaybackPanel != null)
-        {
-            AnimationPlaybackPanel.IsVisible = false;
-        }
-
-        if (AnimFrameLabel != null)
-        {
-            AnimFrameLabel.Text = "Frame: 0/0";
-        }
-
-        if (AnimPlayPauseBtn != null)
-        {
-            AnimPlayPauseBtn.Content = "Pause";
-        }
+        MeshPreview.SetAnimationState(isLoaded: false);
     }
 
     private void ShowAnimationPlayback(int totalFrames)
     {
-        if (AnimationPlaybackPanel != null)
+        if (!MeshPreview.IsAnimationLoaded || MeshPreview.TotalFrames != totalFrames)
         {
-            AnimationPlaybackPanel.IsVisible = true;
+            MeshPreview.SetAnimationState(isLoaded: true, totalFrames: Math.Max(0, totalFrames), isPlaying: true);
         }
-
-        SetAnimationPlaybackPaused(false);
-        UpdateAnimationPlaybackFrame(0, totalFrames);
+        else
+        {
+            MeshPreview.SeekFrame(0, totalFrames);
+            MeshPreview.IsPlaying = true;
+        }
     }
 
     private void SetAnimationPlaybackPaused(bool paused)
     {
-        if (AnimPlayPauseBtn != null)
-        {
-            AnimPlayPauseBtn.Content = paused ? "Play" : "Pause";
-        }
+        MeshPreview.IsPlaying = !paused;
     }
 
     private void UpdateAnimationPlaybackFrame(int currentFrame, int totalFrames)
     {
-        if (AnimFrameLabel != null)
-        {
-            AnimFrameLabel.Text = $"Frame: {currentFrame}/{Math.Max(0, totalFrames)}";
-        }
+        MeshPreview.SeekFrame(currentFrame, totalFrames);
     }
 
-    private void AnimPlayPauseBtn_Click(object? sender, global::Avalonia.Interactivity.RoutedEventArgs e)
+    private void ExecuteToggleAnimationPlayPause()
     {
         if (_is2dAnimationPreviewActive)
         {
@@ -79,7 +62,7 @@ public partial class MainWindow
         }
     }
 
-    private void AnimRestartBtn_Click(object? sender, global::Avalonia.Interactivity.RoutedEventArgs e)
+    private void ExecuteRestartAnimation()
     {
         if (_is2dAnimationPreviewActive)
         {

@@ -99,7 +99,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsLooping
         {
             get => _isLooping;
-            private set => SetProperty(ref _isLooping, value);
+            set => Dispatch(() => SetProperty(ref _isLooping, value));
         }
 
         public bool IsMuted
@@ -143,7 +143,13 @@ namespace AssetStudio.Avalonia.ViewModels
         public string MediaInfoText
         {
             get => _mediaInfoText;
-            private set => SetProperty(ref _mediaInfoText, value);
+            private set
+            {
+                if (SetProperty(ref _mediaInfoText, value))
+                {
+                    OnPropertyChanged(nameof(EffectiveInfoText));
+                }
+            }
         }
 
         public string BackendDisplayName
@@ -155,8 +161,16 @@ namespace AssetStudio.Avalonia.ViewModels
         public string ErrorMessage
         {
             get => _errorMessage;
-            private set => SetProperty(ref _errorMessage, value);
+            private set
+            {
+                if (SetProperty(ref _errorMessage, value))
+                {
+                    OnPropertyChanged(nameof(EffectiveInfoText));
+                }
+            }
         }
+
+        public string EffectiveInfoText => !string.IsNullOrEmpty(_errorMessage) ? _errorMessage : _mediaInfoText;
 
         public bool IsAudioActive
         {
@@ -179,14 +193,30 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsPlaying
         {
             get => _isPlaying;
-            private set => SetProperty(ref _isPlaying, value);
+            private set
+            {
+                if (SetProperty(ref _isPlaying, value))
+                {
+                    OnPropertyChanged(nameof(VideoPlayButtonText));
+                }
+            }
         }
 
         public bool IsPaused
         {
             get => _isPaused;
-            private set => SetProperty(ref _isPaused, value);
+            private set
+            {
+                if (SetProperty(ref _isPaused, value))
+                {
+                    OnPropertyChanged(nameof(AudioPauseButtonText));
+                }
+            }
         }
+
+        public string VideoPlayButtonText => _isPlaying ? "Pause" : "Play";
+
+        public string AudioPauseButtonText => _isPaused ? "Resume" : "Pause";
 
         /// <summary>True when a media item is loaded/stopped/paused and ready to start or resume playback.</summary>
         public bool CanPlay
@@ -546,7 +576,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public void SetLooping(bool isLooping)
         {
-            Dispatch(() => IsLooping = isLooping);
+            IsLooping = isLooping;
         }
 
         public void SetMuted(bool isMuted)

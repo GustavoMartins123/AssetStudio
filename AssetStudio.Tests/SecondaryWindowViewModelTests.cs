@@ -16,7 +16,7 @@ namespace AssetStudio.Tests
     public class SecondaryWindowViewModelTests
     {
         // ------------------------------------------------------------------
-        // SecondaryWindowCommands tests
+        // Canonical RelayCommand / AsyncRelayCommand tests for secondary VMs
         // ------------------------------------------------------------------
 
         [Fact]
@@ -26,7 +26,7 @@ namespace AssetStudio.Tests
             var executed = 0;
             var canExecuteChangedCount = 0;
 
-            var cmd = new SecondaryRelayCommand(() => executed++, () => allow);
+            var cmd = new RelayCommand(() => executed++, () => allow);
             cmd.CanExecuteChanged += (_, _) => canExecuteChangedCount++;
 
             Assert.False(cmd.CanExecute(null));
@@ -48,14 +48,14 @@ namespace AssetStudio.Tests
             var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var invocations = 0;
 
-            var cmd = new SecondaryAsyncCommand(async () =>
+            var cmd = new AsyncRelayCommand(async () =>
             {
                 invocations++;
                 await gate.Task;
             });
 
             var firstRun = cmd.ExecuteAsync();
-            Assert.True(cmd.IsExecuting);
+            Assert.True(cmd.IsRunning);
             Assert.False(cmd.CanExecute(null));
 
             // Re-entrant call while executing should be ignored
@@ -65,13 +65,13 @@ namespace AssetStudio.Tests
             gate.SetResult(true);
             await firstRun;
 
-            Assert.False(cmd.IsExecuting);
+            Assert.False(cmd.IsRunning);
             Assert.True(cmd.CanExecute(null));
 
             Exception? captured = null;
             var errorRecorded = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var failingCmd = new SecondaryAsyncCommand(
-                executeAsync: () => Task.FromException(new InvalidOperationException("boom")),
+            var failingCmd = new AsyncRelayCommand(
+                execute: () => Task.FromException(new InvalidOperationException("boom")),
                 onException: ex =>
                 {
                     captured = ex;
@@ -823,8 +823,8 @@ namespace AssetStudio.Tests
                 typeof(ProjectManagerViewModel),
                 typeof(ProjectEntryViewModel),
                 typeof(MessageBoxViewModel),
-                typeof(SecondaryRelayCommand),
-                typeof(SecondaryAsyncCommand)
+                typeof(RelayCommand),
+                typeof(AsyncRelayCommand)
             };
 
             foreach (var type in vmTypes)

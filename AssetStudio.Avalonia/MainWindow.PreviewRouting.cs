@@ -145,7 +145,7 @@ public partial class MainWindow : Window
         {
             _currentlySelectedUniqueID = null;
             _dumpRequestCoordinator.CancelCurrent();
-            DumpTextBox.Text = string.Empty;
+            PreviewSession.DumpTextContent = string.Empty;
             CancelPendingPreview();
             ClearPreview("Preview Panel");
             lock (preloaderLock)
@@ -211,8 +211,8 @@ public partial class MainWindow : Window
 
         if (PreviewLabel != null)
         {
-            PreviewLabel.IsVisible = displayInfo.IsChecked == true;
-            PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
+            PreviewLabel.IsVisible = ViewModel.Options.DisplayInfo;
+            PreviewLabel.Text = ViewModel.Options.DisplayInfo ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
         }
 
         _ = Task.Run(async () =>
@@ -267,13 +267,11 @@ public partial class MainWindow : Window
         {
             PreviewSession.CancelPendingDump();
             PreviewSession.DumpTextContent = string.Empty;
-            DumpTextBox.Text = string.Empty;
             return;
         }
 
         var token = PreviewSession.BeginDumpRequest(out var requestId, "Loading dump...");
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
-        DumpTextBox.Text = PreviewSession.DumpTextContent;
         var shouldPauseIndexing = assetsManager.LazyLoading && assetItem.Handle != null;
         if (shouldPauseIndexing)
         {
@@ -303,7 +301,6 @@ public partial class MainWindow : Window
             if (asset == null)
             {
                 PreviewSession.CompleteDumpRequest(requestId, null, "No Dump Available", truncate: false);
-                DumpTextBox.Text = PreviewSession.DumpTextContent;
                 return;
             }
 
@@ -316,7 +313,6 @@ public partial class MainWindow : Window
                 return;
             }
             PreviewSession.CompleteDumpRequest(requestId, truncatedDump, "No Dump Available", truncate: false);
-            DumpTextBox.Text = PreviewSession.DumpTextContent;
         }
         catch (OperationCanceledException)
         {
@@ -330,7 +326,6 @@ public partial class MainWindow : Window
             }
             var dumpError = $"Dump {assetItem.Type}:{assetItem.Name} error{Environment.NewLine}{ex.Message}{Environment.NewLine}{ex.StackTrace}";
             PreviewSession.FailDumpRequest(requestId, dumpError);
-            DumpTextBox.Text = PreviewSession.DumpTextContent;
         }
         finally
         {
@@ -426,16 +421,9 @@ public partial class MainWindow : Window
 
     private async Task<string?> PickAssemblyFolderOnUiThreadAsync()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null)
+        var localPath = await PickLoadFolderDialogAsync("Select Assembly Folder");
+        if (!string.IsNullOrWhiteSpace(localPath))
         {
-            return null;
-        }
-
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
-        if (folders != null && folders.Count > 0)
-        {
-            var localPath = folders[0].Path.LocalPath;
             SaveLoadFolder(localPath);
             return localPath;
         }
@@ -660,7 +648,7 @@ public partial class MainWindow : Window
                         PreviewSession.ShowTextPreview(string.Empty, PreviewSurfaceKind.None, assetItem, truncate: false);
                         TextPreviewBox.Text = string.Empty;
                         TextPreviewBox.IsVisible = false;
-                        PreviewLabel.IsVisible = displayInfo.IsChecked == true;
+                        PreviewLabel.IsVisible = ViewModel.Options.DisplayInfo;
                     }
                 });
             }
@@ -693,7 +681,7 @@ public partial class MainWindow : Window
         _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         Interlocked.Increment(ref texturePreviewIdCounter);
-        if (enablePreview.IsChecked != true)
+        if (!ViewModel.Options.EnablePreview)
         {
             ClearPreview("Preview disabled");
             return;
@@ -731,25 +719,14 @@ public partial class MainWindow : Window
         {
             TextureGLPreview.IsVisible = false;
         }
-        if (PreviewInfoBorder != null)
+        ClearPreviewInfoOverlay();
+        if (asset is not AudioClip)
         {
-            PreviewInfoBorder.IsVisible = false;
+            AudioReset();
         }
-        if (AudioPanel != null)
+        if (asset is not VideoClip && asset is not VideoPlayer)
         {
-            AudioPanel.IsVisible = false;
-            if (asset is not AudioClip)
-            {
-                AudioReset();
-            }
-        }
-        if (VideoClipPanel != null)
-        {
-            VideoClipPanel.IsVisible = false;
-            if (asset is not VideoClip && asset is not VideoPlayer)
-            {
-                VideoReset();
-            }
+            VideoReset();
         }
         ClearMeshMaterialControls();
         ClearPreviewCandidateControls();
@@ -767,8 +744,8 @@ public partial class MainWindow : Window
         currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
 
-        PreviewLabel.IsVisible = displayInfo.IsChecked == true;
-        PreviewLabel.Text = displayInfo.IsChecked == true ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
+        PreviewLabel.IsVisible = ViewModel.Options.DisplayInfo;
+        PreviewLabel.Text = ViewModel.Options.DisplayInfo ? $"{assetItem.DisplayType}: {assetItem.Name}" : string.Empty;
 
         string fbxHeader = string.Empty;
         if (assetItem.DisplayType.Contains("FBX sub-asset"))

@@ -36,9 +36,9 @@ namespace AssetStudio.Avalonia.ViewModels
         };
 
         private readonly ExportOptionsState _targetState;
-        private readonly SecondaryRelayCommand _saveCommand;
-        private readonly SecondaryRelayCommand _cancelCommand;
-        private readonly SecondaryRelayCommand _resetDefaultsCommand;
+        private readonly RelayCommand _saveCommand;
+        private readonly RelayCommand _cancelCommand;
+        private readonly RelayCommand _resetDefaultsCommand;
 
         private AssetGroupOption _assetGrouping;
         private bool _convertTexture;
@@ -76,9 +76,9 @@ namespace AssetStudio.Avalonia.ViewModels
         public ExportOptionsViewModel(ExportOptionsState state)
         {
             _targetState = state ?? throw new ArgumentNullException(nameof(state));
-            _saveCommand = new SecondaryRelayCommand(Save, () => CanSave);
-            _cancelCommand = new SecondaryRelayCommand(Cancel);
-            _resetDefaultsCommand = new SecondaryRelayCommand(ResetDefaults);
+            _saveCommand = new RelayCommand(Save, () => CanSave);
+            _cancelCommand = new RelayCommand(Cancel);
+            _resetDefaultsCommand = new RelayCommand(ResetDefaults);
 
             LoadFrom(_targetState);
         }

@@ -71,7 +71,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _dumpTextContent = string.Empty;
         private bool _isDumpLoading;
         private bool _isDialogueCardsVisible;
+        private bool _hasDialoguePreview;
         private TextAssetDisplayMode _dialogueDisplayMode = TextAssetDisplayMode.Cards;
+        private bool _isInfoExpanded = true;
         private string _dialoguePlainTextScript = string.Empty;
         private string _dialogueDetailsText = string.Empty;
         private PreviewChannelMask _channelMask = PreviewChannelMask.All;
@@ -224,6 +226,40 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsInfoOverlayVisible =>
             _isDisplayInfoEnabled && !string.IsNullOrWhiteSpace(_previewMetadataSummary);
 
+        public bool IsInfoExpanded
+        {
+            get => _isInfoExpanded;
+            set
+            {
+                if (SetProperty(ref _isInfoExpanded, value))
+                {
+                    OnPropertyChanged(nameof(InfoToggleGlyph));
+                }
+            }
+        }
+
+        public string InfoToggleGlyph => _isInfoExpanded ? "▼" : "▲";
+
+        public bool ToggleInfoExpanded()
+        {
+            IsInfoExpanded = !_isInfoExpanded;
+            return _isInfoExpanded;
+        }
+
+        public bool HasDialoguePreview
+        {
+            get => _hasDialoguePreview;
+            private set
+            {
+                if (SetProperty(ref _hasDialoguePreview, value))
+                {
+                    OnPropertyChanged(nameof(IsDialogueDetailsVisible));
+                }
+            }
+        }
+
+        public bool IsDialogueDetailsVisible => _hasDialoguePreview && !_isDialogueCardsVisible;
+
         public string TextContent
         {
             get => _textContent;
@@ -250,6 +286,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 if (SetProperty(ref _isDialogueCardsVisible, value))
                 {
                     OnPropertyChanged(nameof(IsTextSurfaceVisible));
+                    OnPropertyChanged(nameof(IsDialogueDetailsVisible));
                 }
             }
         }
@@ -592,6 +629,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
                 if (kind != PreviewSurfaceKind.Text)
                 {
+                    HasDialoguePreview = false;
                     IsDialogueCardsVisible = false;
                 }
 
@@ -632,6 +670,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     PreviewTitle = $"{asset.DisplayType}: {asset.Name}";
                 }
 
+                HasDialoguePreview = false;
                 IsDialogueCardsVisible = false;
                 TextContent = finalText;
                 IsLoading = false;
@@ -661,6 +700,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 DialogueCards.ReplaceAll(cardList);
                 _dialogueDisplayMode = TextAssetDisplayMode.Cards;
                 OnPropertyChanged(nameof(DialogueDisplayMode));
+                HasDialoguePreview = true;
                 IsDialogueCardsVisible = true;
                 TextContent = string.Empty;
                 IsLoading = false;
@@ -730,6 +770,7 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 _dialoguePlainTextScript = string.Empty;
                 _dialogueDetailsText = string.Empty;
+                HasDialoguePreview = false;
                 IsDialogueCardsVisible = false;
                 DialogueDisplayMode = TextAssetDisplayMode.Cards;
                 if (DialogueCards.Count > 0)
@@ -984,6 +1025,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     TextContent = string.Empty;
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
+                    HasDialoguePreview = false;
                     IsDialogueCardsVisible = false;
                     DialogueDisplayMode = TextAssetDisplayMode.Cards;
                     if (DialogueCards.Count > 0)
@@ -1023,6 +1065,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     IsDumpLoading = false;
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
+                    HasDialoguePreview = false;
                     IsDialogueCardsVisible = false;
                     DialogueDisplayMode = TextAssetDisplayMode.Cards;
                     if (DialogueCards.Count > 0)

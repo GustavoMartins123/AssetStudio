@@ -322,7 +322,7 @@ public partial class MainWindow
         }
     }
 
-    private void ShowClassInstances_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteShowClassInstances()
     {
         if (AssetClassesDataGrid.SelectedItem is not AssetClassItem item)
         {
@@ -331,18 +331,15 @@ public partial class MainWindow
 
         PrioritizeUserInteraction();
         ViewModel.AssetList.SetClassFilterOverride(item);
-        ClearClassFilterButton.Content = ViewModel.AssetList.ClassFilterButtonText;
-        ClearClassFilterButton.IsVisible = ViewModel.AssetList.HasClassFilterOverride;
 
         LeftTabControl.SelectedIndex = 1;
         _ = FilterAssetListAsync(CancellationToken.None);
     }
 
-    private void ClearClassFilter_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteClearClassFilter()
     {
         PrioritizeUserInteraction();
         ViewModel.AssetList.ClearClassFilterOverride();
-        ClearClassFilterButton.IsVisible = ViewModel.AssetList.HasClassFilterOverride;
         _ = FilterAssetListAsync(CancellationToken.None);
     }
 }

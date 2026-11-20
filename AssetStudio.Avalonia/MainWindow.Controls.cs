@@ -67,27 +67,27 @@ public partial class MainWindow
     private const int PreviewCandidateInitialBatchSize = 64;
     private const int PreviewCandidateAppendBatchSize = 128;
 
-    private void ResetViewBtn_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteResetMeshView()
     {
         GLPreviewControl?.ResetView();
     }
 
-    private void RotateLeftBtn_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteRotateMeshLeft()
     {
         GLPreviewControl?.RotateLeft90();
     }
 
-    private void RotateRightBtn_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteRotateMeshRight()
     {
         GLPreviewControl?.RotateRight90();
     }
 
-    private void RotateUpBtn_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteRotateMeshUp()
     {
         GLPreviewControl?.RotateUp90();
     }
 
-    private void RotateDownBtn_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteRotateMeshDown()
     {
         GLPreviewControl?.RotateDown90();
     }
@@ -107,16 +107,6 @@ public partial class MainWindow
             GLPreviewControl.ViewPreset = preset;
         }
         QueueAvatarPreviewSettingsSave();
-    }
-
-    private void ToggleMeshControlsBtn_Click(object? sender, RoutedEventArgs e)
-    {
-        if (MeshViewerControlsContent != null && ToggleMeshControlsBtn != null)
-        {
-            bool isVisible = MeshViewerControlsContent.IsVisible;
-            MeshViewerControlsContent.IsVisible = !isVisible;
-            ToggleMeshControlsBtn.Content = !isVisible ? "▲" : "▼";
-        }
     }
 
     private void BoneSizeSlider_ValueChanged(object? sender, global::Avalonia.Controls.Primitives.RangeBaseValueChangedEventArgs e)
@@ -196,10 +186,6 @@ public partial class MainWindow
         {
             GLPreviewControl.BoneScale = (float)boneScale;
         }
-        if (BoneSizeLabel != null)
-        {
-            BoneSizeLabel.Text = $"{boneScale:0.0}x";
-        }
     }
 
     private void ApplyAvatarPreviewMeshDensity(double densityPercent)
@@ -209,36 +195,18 @@ public partial class MainWindow
         {
             GLPreviewControl.PreviewMeshDensityPercent = (float)densityPercent;
         }
-        if (AvatarMeshDensityLabel != null)
-        {
-            AvatarMeshDensityLabel.Text = densityPercent >= MaxAvatarPreviewMeshDensityPercent
-                ? "Original"
-                : $"{densityPercent:0}%";
-        }
     }
 
     private void ShowPreviewGeometryControls(bool showBoneControls)
     {
         MeshPreview.IsGeometryControlsVisible = true;
         MeshPreview.IsBoneControlsVisible = showBoneControls;
-        if (BoneSizeContainer != null)
-        {
-            BoneSizeContainer.IsVisible = true;
-        }
-        if (BoneSizeControls != null)
-        {
-            BoneSizeControls.IsVisible = showBoneControls;
-        }
     }
 
     private void HidePreviewGeometryControls()
     {
         MeshPreview.IsGeometryControlsVisible = false;
         MeshPreview.IsBoneControlsVisible = false;
-        if (BoneSizeContainer != null)
-        {
-            BoneSizeContainer.IsVisible = false;
-        }
     }
 
     private void ClearPreviewCandidateControls()
@@ -262,10 +230,6 @@ public partial class MainWindow
             }
 
             previewCandidateItems.Clear();
-            if (PreviewCandidateControlsContainer != null)
-            {
-                PreviewCandidateControlsContainer.IsVisible = false;
-            }
         }
         finally
         {
@@ -299,22 +263,12 @@ public partial class MainWindow
                 previewCandidateItems.Add(candidates[i]);
             }
 
-            if (PreviewCandidateLabel != null)
-            {
-                PreviewCandidateLabel.Text = label;
-            }
-
             if (PreviewCandidateSelector != null && previewCandidateItems.Count > 0)
             {
                 var selectedIndex = selectedCandidate == null
                     ? 0
                     : previewCandidateItems.IndexOf(selectedCandidate);
                 PreviewCandidateSelector.SelectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
-            }
-
-            if (PreviewCandidateControlsContainer != null)
-            {
-                PreviewCandidateControlsContainer.IsVisible = previewCandidateItems.Count > 0;
             }
         }
         finally
@@ -626,10 +580,6 @@ public partial class MainWindow
                 }
             }
             meshMaterialPreviewSlots.Clear();
-            if (MeshMaterialControlsContainer != null)
-            {
-                MeshMaterialControlsContainer.IsVisible = false;
-            }
         }
         finally
         {
@@ -674,11 +624,6 @@ public partial class MainWindow
             {
                 MeshMaterialSelector.SelectedIndex = meshMaterialPreviewSlots.Count > 0 ? 0 : -1;
             }
-
-            if (MeshMaterialControlsContainer != null)
-            {
-                MeshMaterialControlsContainer.IsVisible = meshMaterialPreviewSlots.Count > 0;
-            }
         }
         finally
         {
@@ -722,11 +667,6 @@ public partial class MainWindow
             if (MeshMaterialSelector != null)
             {
                 MeshMaterialSelector.SelectedIndex = meshMaterialPreviewSlots.Count > 0 ? 0 : -1;
-            }
-
-            if (MeshMaterialControlsContainer != null)
-            {
-                MeshMaterialControlsContainer.IsVisible = meshMaterialPreviewSlots.Count > 0;
             }
         }
         finally
@@ -824,7 +764,7 @@ public partial class MainWindow
         ApplyMeshMaterialOverrides();
     }
 
-    private void MeshMaterialResetColorButton_Click(object? sender, RoutedEventArgs e)
+    private void ExecuteResetMeshMaterialColor()
     {
         var slot = SelectedMeshMaterialSlot;
         if (slot == null)

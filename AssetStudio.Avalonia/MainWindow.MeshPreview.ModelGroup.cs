@@ -334,13 +334,12 @@ public partial class MainWindow
 
         var meshPreviewId = texturePreviewIdCounter;
         var localAssetItem = AssetListDataGrid.SelectedItem as AssetItem;
-        var includeMeshInfo = displayInfo.IsChecked == true;
+        var includeMeshInfo = ViewModel.Options.DisplayInfo;
         PreviewLabel.IsVisible = false;
         StatusStripUpdate($"Preparing model group preview ({meshes.Count:N0} parts)...");
-        if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+        if (includeMeshInfo)
         {
-            PreviewInfoOverlay.Text = "Loading model group details...";
-            PreviewInfoBorder.IsVisible = true;
+            SetPreviewInfoOverlay("Loading model group details...");
         }
 
         Task.Run(() =>
@@ -378,10 +377,9 @@ public partial class MainWindow
                         GLPreviewControl.Focus();
                     }
 
-                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    if (includeMeshInfo)
                     {
-                        PreviewInfoOverlay.Text = quickInfoText;
-                        PreviewInfoBorder.IsVisible = true;
+                        SetPreviewInfoOverlay(quickInfoText);
                     }
 
                     StatusStripUpdate($"OpenGL Preview | Model group loaded ({meshes.Count:N0} parts) | Loading materials...");
@@ -441,10 +439,9 @@ public partial class MainWindow
                         GLPreviewControl.Focus();
                     }
 
-                    if (includeMeshInfo && PreviewInfoBorder != null && PreviewInfoOverlay != null)
+                    if (includeMeshInfo)
                     {
-                        PreviewInfoOverlay.Text = infoText;
-                        PreviewInfoBorder.IsVisible = true;
+                        SetPreviewInfoOverlay(infoText);
                     }
 
                     _activeMeshMaterialsLoading = false;

@@ -180,7 +180,7 @@ public partial class MainWindow
                 PreviewSession.ShowTextPreview(string.Empty, PreviewSurfaceKind.MonoBehaviour, truncate: false);
                 TextPreviewBox.Text = string.Empty;
                 TextPreviewBox.IsVisible = false;
-                PreviewLabel.IsVisible = displayInfo.IsChecked == true;
+                PreviewLabel.IsVisible = ViewModel.Options.DisplayInfo;
             }
 
             StatusStripUpdate(statusMessage);

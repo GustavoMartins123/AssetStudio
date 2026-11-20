@@ -35,10 +35,10 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly StringBuilder _contentBuilder = new();
         private readonly List<string> _pendingLines = new();
         private readonly Action<Action> _dispatchToUi;
-        private readonly SecondaryRelayCommand _primaryCommand;
-        private readonly SecondaryRelayCommand _secondaryCommand;
-        private readonly SecondaryRelayCommand _cancelCommand;
-        private readonly SecondaryAsyncCommand _copyCommand;
+        private readonly RelayCommand _primaryCommand;
+        private readonly RelayCommand _secondaryCommand;
+        private readonly RelayCommand _cancelCommand;
+        private readonly AsyncRelayCommand _copyCommand;
 
         private string _title;
         private string _message;
@@ -147,10 +147,10 @@ namespace AssetStudio.Avalonia.ViewModels
                     break;
             }
 
-            _primaryCommand = new SecondaryRelayCommand(ExecutePrimary, () => ShowPrimaryButton);
-            _secondaryCommand = new SecondaryRelayCommand(ExecuteSecondary, () => ShowSecondaryButton);
-            _cancelCommand = new SecondaryRelayCommand(ExecuteCancel, () => ShowCancelButton);
-            _copyCommand = new SecondaryAsyncCommand(ExecuteCopyAsync, () => ShowCopyButton);
+            _primaryCommand = new RelayCommand(ExecutePrimary, () => ShowPrimaryButton);
+            _secondaryCommand = new RelayCommand(ExecuteSecondary, () => ShowSecondaryButton);
+            _cancelCommand = new RelayCommand(ExecuteCancel, () => ShowCancelButton);
+            _copyCommand = new AsyncRelayCommand(ExecuteCopyAsync, () => ShowCopyButton);
         }
 
         public event Action<MessageBoxResult>? RequestClose;

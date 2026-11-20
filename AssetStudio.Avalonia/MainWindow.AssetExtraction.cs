@@ -17,20 +17,16 @@ public partial class MainWindow
     internal static int GetExtractionThreadCount(int requestedDegreeOfParallelism = 0)
         => AssetExportService.GetExtractionThreadCount(requestedDegreeOfParallelism);
 
-    private async void ExtractFile_Click(object? sender, RoutedEventArgs e)
+    private async Task ExtractFileCommandHandlerAsync()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
+        var files = await PickOpenFilesDialogAsync("Select bundle or web file", true);
+        if (files.Count == 0) return;
 
-        var files = await topLevel.StorageProvider.OpenFilePickerAsync(await CreateOpenFileOptions("Select bundle or web file", true));
-        if (files == null || files.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (folders == null || folders.Count == 0) return;
-
-        var filePaths = files.Select(x => x.Path.LocalPath).Where(File.Exists).ToArray();
+        var filePaths = files.Where(File.Exists).ToArray();
         SaveLoadFolder(filePaths.FirstOrDefault() ?? string.Empty);
-        var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
 
         var cancellationToken = ExportState.BeginExport(
@@ -60,20 +56,15 @@ public partial class MainWindow
         }
     }
 
-    private async void ExtractFolder_Click(object? sender, RoutedEventArgs e)
+    private async Task ExtractFolderCommandHandlerAsync()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
+        var sourcePath = await PickLoadFolderDialogAsync("Select folder to extract");
+        if (string.IsNullOrWhiteSpace(sourcePath)) return;
 
-        var sourceFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select folder to extract"));
-        if (sourceFolders == null || sourceFolders.Count == 0) return;
+        var savePath = await PickExportFolderDialogAsync("Select the save folder");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var saveFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
-        if (saveFolders == null || saveFolders.Count == 0) return;
-
-        var sourcePath = sourceFolders[0].Path.LocalPath;
         SaveLoadFolder(sourcePath);
-        var savePath = saveFolders[0].Path.LocalPath;
         SaveExportFolder(savePath);
 
         var cancellationToken = ExportState.BeginExport(

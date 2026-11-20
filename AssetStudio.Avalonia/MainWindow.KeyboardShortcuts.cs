@@ -1,4 +1,5 @@
 using Avalonia.Input;
+using AssetStudio.Avalonia.ViewModels;
 
 namespace AssetStudio.Avalonia;
 
@@ -14,15 +15,15 @@ public partial class MainWindow
             switch (e.Key)
             {
                 case Key.W:
-                    GLPreviewControl.WireframeMode = (GLPreviewControl.WireframeMode + 1) % 3;
+                    ViewModel.CycleWireframeModeCommand.Execute();
                     handled = true;
                     break;
                 case Key.S:
-                    GLPreviewControl.ShadeMode = GLPreviewControl.ShadeMode == 0 ? 1 : 0;
+                    ViewModel.ToggleShadeModeCommand.Execute();
                     handled = true;
                     break;
                 case Key.N:
-                    GLPreviewControl.NormalMode = GLPreviewControl.NormalMode == 0 ? 1 : 0;
+                    ViewModel.ToggleNormalModeCommand.Execute();
                     handled = true;
                     break;
             }
@@ -39,29 +40,27 @@ public partial class MainWindow
             switch (e.Key)
             {
                 case Key.R:
-                    textureChannels[0] = !textureChannels[0];
+                    ViewModel.ToggleTextureChannelCommand.Execute(PreviewChannelMask.Red);
                     handled = true;
                     break;
                 case Key.G:
-                    textureChannels[1] = !textureChannels[1];
+                    ViewModel.ToggleTextureChannelCommand.Execute(PreviewChannelMask.Green);
                     handled = true;
                     break;
                 case Key.B:
-                    textureChannels[2] = !textureChannels[2];
+                    ViewModel.ToggleTextureChannelCommand.Execute(PreviewChannelMask.Blue);
                     handled = true;
                     break;
                 case Key.A:
-                    textureChannels[3] = !textureChannels[3];
+                    ViewModel.ToggleTextureChannelCommand.Execute(PreviewChannelMask.Alpha);
                     handled = true;
                     break;
             }
 
             if (handled)
             {
-                UpdateImagePreview();
                 e.Handled = true;
             }
         }
     }
-
 }

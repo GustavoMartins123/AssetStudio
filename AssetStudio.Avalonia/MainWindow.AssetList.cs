@@ -146,7 +146,7 @@ public partial class MainWindow
         exportModelGroupFbxMenuItem.IsVisible = hasModelGroupTarget;
     }
 
-    private async void CopyAssetCellText_Click(object? sender, RoutedEventArgs e)
+    private async Task CopyAssetCellTextCommandHandlerAsync()
     {
         var text = assetContextCellText;
         if (string.IsNullOrEmpty(text) && AssetListDataGrid.SelectedItem is AssetItem item)
@@ -154,34 +154,18 @@ public partial class MainWindow
             text = item.Name;
         }
 
-        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
-        if (clipboard != null)
+        if (await ViewModel.DialogService.CopyTextToClipboardAsync(text))
         {
-            await clipboard.SetTextAsync(text);
             StatusStripUpdate("Copied asset cell text.");
         }
     }
 
-    private async void ExportSelectedAssetsContext_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
-    }
-
-    private void ShowOriginalFile_Click(object? sender, RoutedEventArgs e)
+    private Task ShowOriginalFileCommandHandlerAsync()
     {
         var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;
-        if (item == null) return;
+        if (item == null) return Task.CompletedTask;
         ShowOriginalFile(item);
-    }
-
-    private async void ExportAnimatorWithSelectedAnimationClip_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportAnimatorWithSelectedAnimationClips(GetSelectedAssets());
-    }
-
-    private async void ExportModelGroupFbx_Click(object? sender, RoutedEventArgs e)
-    {
-        await ExportSelectedModelGroupFbxAsync();
+        return Task.CompletedTask;
     }
 
     private void SyncFilterInputsToAssetListViewModel()
@@ -327,7 +311,7 @@ public partial class MainWindow
                 else
                 {
                     _dumpRequestCoordinator.CancelCurrent();
-                    DumpTextBox.Text = string.Empty;
+                    PreviewSession.DumpTextContent = string.Empty;
                     CancelPendingPreview();
                     ClearPreview("Preview Panel");
                 }

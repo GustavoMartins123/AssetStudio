@@ -37,6 +37,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private double _meshDensityPercent = DefaultMeshDensityPercent;
         private bool _isGeometryControlsVisible;
         private bool _isBoneControlsVisible;
+        private bool _isControlsExpanded = true;
         private string _meshSummaryText = string.Empty;
         private string _associatedMaterialsSummary = string.Empty;
         private string _rigSummaryText = string.Empty;
@@ -198,6 +199,26 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _isBoneControlsVisible;
             set => SetProperty(ref _isBoneControlsVisible, value);
+        }
+
+        public bool IsControlsExpanded
+        {
+            get => _isControlsExpanded;
+            set
+            {
+                if (SetProperty(ref _isControlsExpanded, value))
+                {
+                    OnPropertyChanged(nameof(ControlsToggleGlyph));
+                }
+            }
+        }
+
+        public string ControlsToggleGlyph => _isControlsExpanded ? "▲" : "▼";
+
+        public bool ToggleControlsExpanded()
+        {
+            IsControlsExpanded = !_isControlsExpanded;
+            return _isControlsExpanded;
         }
 
         public string MeshSummaryText

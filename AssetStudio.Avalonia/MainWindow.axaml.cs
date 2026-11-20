@@ -152,8 +152,10 @@ public partial class MainWindow : Window
     public MainWindow(ProjectLaunchContext? projectContext)
     {
         var loadingService = new AssetLoadingService();
+        var dialogService = new AvaloniaDialogService(() => this);
         ViewModel = new MainWindowViewModel(
             loadingService,
+            dialogService: dialogService,
             dispatchToUi: static action =>
             {
                 if (Dispatcher.UIThread.CheckAccess())
@@ -169,9 +171,14 @@ public partial class MainWindow : Window
 
         this.projectContext = projectContext;
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
+        ViewModel.Options.LoadFromSettings(appSettings);
         if (projectContext?.Project != null)
         {
             ViewModel.ProjectSession.SetLoadedProject(projectContext.Project, isLazyMode: assetsManager.LazyLoading);
+        }
+        else
+        {
+            ViewModel.ProjectSession.UpdateWindowTitle(null);
         }
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
@@ -190,18 +197,12 @@ public partial class MainWindow : Window
         }
         catch { }
         logger = new GUILogger(StatusStripUpdate, this);
-        logger.ShowErrorMessage = appSettings.ShowErrorMessage;
+        logger.ShowErrorMessage = ViewModel.Options.ShowErrorMessage;
         Logger.Default = logger;
-        showErrorMessageMenu.IsChecked = appSettings.ShowErrorMessage;
         exportOptions.CopyFrom(appSettings.ExportOptions);
-        displayAll.IsChecked = appSettings.DisplayAll;
-        displayInfo.IsChecked = appSettings.DisplayInfo;
-        enablePreview.IsChecked = appSettings.EnablePreview;
-        useDiskDecompressionCacheMenu.IsChecked = appSettings.UseDiskDecompressionCache;
-        ProjectAnalysisReportUpdated += OnProjectAnalysisReportUpdated;
-        ViewModel.SpecifyUnityVersion = appSettings.SpecifyUnityVersion ?? string.Empty;
         SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
         ApplyUnityVersionOption();
+        WireViewModelCommandsAndOptions();
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
         AssetsManager.ShouldYieldForUserInteraction = ShouldPauseBackgroundWork;
         assetsManager.ShouldKeepFileCallback = fileName =>
@@ -237,8 +238,6 @@ public partial class MainWindow : Window
         InitializeVideoPlayer();
         FfmpegVideoPlayer.MediaEnded += FfmpegVideoPlayer_MediaEnded;
         FfmpegVideoPlayer.IsVisible = true;
-
-        Title = FormatWindowTitle();
 
         try
         {
@@ -329,15 +328,123 @@ public partial class MainWindow : Window
         ApplyAvatarPreviewControlSettings();
     }
 
-    private async void LoadFile_Click(object? sender, RoutedEventArgs e)
+    private void WireViewModelCommandsAndOptions()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var files = await topLevel.StorageProvider.OpenFilePickerAsync(await CreateOpenFileOptions("Select Game File", true));
+        var handlers = ViewModel.CommandHandlers;
 
-        if (files != null && files.Count > 0)
+        handlers.LoadFileAsync = LoadFileCommandHandlerAsync;
+        handlers.LoadFolderAsync = LoadFolderCommandHandlerAsync;
+        handlers.LoadFolderEagerAsync = LoadFolderEagerCommandHandlerAsync;
+        handlers.ExtractFileAsync = ExtractFileCommandHandlerAsync;
+        handlers.ExtractFolderAsync = ExtractFolderCommandHandlerAsync;
+
+        handlers.SetProjectRootAsync = SetProjectRootCommandHandlerAsync;
+        handlers.ShowExportOptionsAsync = ShowExportOptionsCommandHandlerAsync;
+        handlers.ClearProjectCacheAsync = ClearCurrentProjectCacheCommandHandlerAsync;
+
+        handlers.ExportAllObjectsSplitAsync = ExportAllObjectsSplitCommandHandlerAsync;
+        handlers.ExportSelectedObjectsSplitAsync = () => ExportSelectedObjectsSplit(false);
+        handlers.ExportSelectedObjectsSplitWithAnimationClipAsync = () => ExportSelectedObjectsSplit(true);
+        handlers.ExportSelectedObjectsMergeAsync = () => ExportSelectedObjectsMerge(false);
+        handlers.ExportSelectedObjectsMergeWithAnimationClipAsync = () => ExportSelectedObjectsMerge(true);
+
+        handlers.ExportAllAssetsAsync = () => ExportAllAssetsAsync(ExportMode.Convert);
+        handlers.ExportSelectedAssetsAsync = () => ExportAssets(GetSelectedAssets(), ExportMode.Convert);
+        handlers.ExportFilteredAssetsAsync = () => ExportFilteredAssetsAsync(ExportMode.Convert);
+        handlers.ExportModelGroupFbxAsync = ExportSelectedModelGroupFbxAsync;
+        handlers.ExportAnimatorWithSelectedAnimationClipAsync = () => ExportAnimatorWithSelectedAnimationClips(GetSelectedAssets());
+        handlers.ExportAllAssetsRawAsync = () => ExportAllAssetsAsync(ExportMode.Raw);
+        handlers.ExportSelectedAssetsRawAsync = () => ExportAssets(GetSelectedAssets(), ExportMode.Raw);
+        handlers.ExportFilteredAssetsRawAsync = () => ExportFilteredAssetsAsync(ExportMode.Raw);
+        handlers.ExportAllAssetsDumpAsync = () => ExportAllAssetsAsync(ExportMode.Dump);
+        handlers.ExportSelectedAssetsDumpAsync = () => ExportAssets(GetSelectedAssets(), ExportMode.Dump);
+        handlers.ExportFilteredAssetsDumpAsync = () => ExportFilteredAssetsAsync(ExportMode.Dump);
+        handlers.ExportAllAssetsXmlAsync = ExportAllAssetsListAsync;
+        handlers.ExportSelectedAssetsXmlAsync = () => ExportAssetsList(GetSelectedAssets());
+        handlers.ExportFilteredAssetsXmlAsync = ExportFilteredAssetsListAsync;
+        handlers.ExportErrorLogAsync = ExportErrorLogCommandHandlerAsync;
+
+        handlers.FilterTypeAll = ExecuteFilterTypeAllFromUi;
+        handlers.ToggleFilterType = ExecuteToggleFilterTypeFromUi;
+        handlers.ExportClassStructuresAsync = ExportClassStructuresCommandHandlerAsync;
+
+        handlers.PauseIndexing = () => BuildAssetStructures(incremental: true);
+
+        handlers.ClearClassFilter = ExecuteClearClassFilter;
+        handlers.CopyAssetCellTextAsync = CopyAssetCellTextCommandHandlerAsync;
+        handlers.GoToSceneHierarchy = ExecuteGoToSceneHierarchy;
+        handlers.ShowOriginalFileAsync = ShowOriginalFileCommandHandlerAsync;
+        handlers.ShowClassInstances = ExecuteShowClassInstances;
+
+        handlers.SetTextAssetDisplayMode = ExecuteSetTextAssetDisplayMode;
+        handlers.ToggleAnimationPlayPause = ExecuteToggleAnimationPlayPause;
+        handlers.RestartAnimation = ExecuteRestartAnimation;
+        handlers.ResetMeshView = ExecuteResetMeshView;
+        handlers.RotateMeshLeft = ExecuteRotateMeshLeft;
+        handlers.RotateMeshRight = ExecuteRotateMeshRight;
+        handlers.RotateMeshUp = ExecuteRotateMeshUp;
+        handlers.RotateMeshDown = ExecuteRotateMeshDown;
+        handlers.ResetMeshMaterialColor = ExecuteResetMeshMaterialColor;
+
+        handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;
+        handlers.VideoStopAsync = VideoStopAsync;
+        handlers.VideoExportAsync = ExecuteVideoExportAsync;
+        handlers.AudioPlayAsync = ExecuteAudioPlayAsync;
+        handlers.AudioPause = ExecuteAudioPause;
+        handlers.AudioStop = AudioStop;
+
+        handlers.WireframeModeChanged = mode =>
         {
-            var filePaths = files.Select(f => f.Path.LocalPath).ToArray();
+            if (GLPreviewControl != null)
+            {
+                GLPreviewControl.WireframeMode = mode;
+            }
+        };
+        handlers.ShadeModeChanged = mode =>
+        {
+            if (GLPreviewControl != null)
+            {
+                GLPreviewControl.ShadeMode = mode;
+            }
+        };
+        handlers.NormalModeChanged = mode =>
+        {
+            if (GLPreviewControl != null)
+            {
+                GLPreviewControl.NormalMode = mode;
+            }
+        };
+        handlers.TextureChannelToggled = _ =>
+        {
+            PreviewSession.CopyChannelsTo(textureChannels);
+            UpdateImagePreview();
+        };
+
+        ViewModel.Options.DisplayAllChanged += OnDisplayAllOptionChanged;
+        ViewModel.Options.EnablePreviewChanged += OnEnablePreviewOptionChanged;
+        ViewModel.Options.DisplayInfoChanged += OnDisplayInfoOptionChanged;
+        ViewModel.Options.UseDiskDecompressionCacheChanged += OnUseDiskDecompressionCacheOptionChanged;
+        ViewModel.Options.ShowErrorMessageChanged += OnShowErrorMessageOptionChanged;
+        ViewModel.Options.ThemeChanged += OnThemeOptionChanged;
+    }
+
+    private void UnwireViewModelOptions()
+    {
+        ViewModel.Options.DisplayAllChanged -= OnDisplayAllOptionChanged;
+        ViewModel.Options.EnablePreviewChanged -= OnEnablePreviewOptionChanged;
+        ViewModel.Options.DisplayInfoChanged -= OnDisplayInfoOptionChanged;
+        ViewModel.Options.UseDiskDecompressionCacheChanged -= OnUseDiskDecompressionCacheOptionChanged;
+        ViewModel.Options.ShowErrorMessageChanged -= OnShowErrorMessageOptionChanged;
+        ViewModel.Options.ThemeChanged -= OnThemeOptionChanged;
+    }
+
+    private async Task LoadFileCommandHandlerAsync()
+    {
+        var files = await PickOpenFilesDialogAsync("Select Game File", true);
+
+        if (files.Count > 0)
+        {
+            var filePaths = files.ToArray();
             currentScanResult = null;
             SaveLoadFolder(filePaths[0]);
             ResetForm();
@@ -357,7 +464,7 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, $"Error loading files:\n{ex.Message}", "Load failed");
+                await ViewModel.DialogService.ShowErrorAsync("Load failed", $"Error loading files:\n{ex.Message}");
                 StatusStripUpdate("Load failed.");
                 return;
             }
@@ -365,28 +472,22 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void LoadFolder_Click(object? sender, RoutedEventArgs e)
+    private async Task LoadFolderCommandHandlerAsync()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Game Folder"));
+        var folderPath = await PickLoadFolderDialogAsync("Select Game Folder");
 
-        if (folders != null && folders.Count > 0)
+        if (!string.IsNullOrWhiteSpace(folderPath))
         {
-            var folderPath = folders[0].Path.LocalPath;
             await BeginProgressiveLoadAsync(new[] { folderPath }, "Indexing folder");
         }
     }
 
-    private async void LoadFolderEager_Click(object? sender, RoutedEventArgs e)
+    private async Task LoadFolderEagerCommandHandlerAsync()
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Game Folder (Full / Scene Hierarchy)"));
+        var folderPath = await PickLoadFolderDialogAsync("Select Game Folder (Full / Scene Hierarchy)");
 
-        if (folders != null && folders.Count > 0)
+        if (!string.IsNullOrWhiteSpace(folderPath))
         {
-            var folderPath = folders[0].Path.LocalPath;
             await LoadFolderEagerAsync(folderPath);
         }
     }
@@ -614,11 +715,10 @@ public partial class MainWindow : Window
                     {
                         ViewModel.IndexingProgress.SetIncompletePreviousSession(previousIndexingState);
                         StatusStripUpdate(ViewModel.IndexingProgress.IncompleteSessionSummary);
-                        SyncIndexingProgressPanelFromViewModel();
                     }
 
                     // Warm-open fast path: check mmap/.idx & SQLite cache directly into ProjectIndex.Arena BEFORE any second disk walk.
-                    var displayAllChecked = displayAll.IsChecked == true;
+                    var displayAllChecked = ViewModel.Options.DisplayAll;
                     var filterText = listSearch?.Text?.Trim();
                     var classFilter = classFilterOverride;
                     var filterTypeChecked = filterTypeAll.IsChecked != true;
@@ -734,7 +834,6 @@ public partial class MainWindow : Window
                             EnsureAssetListItemsSource();
                             FilterAssetClasses();
 
-                            progressBar.Value = 100;
                             ViewModel.LoadingProgress = 100;
                             StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.");
 
@@ -1022,7 +1121,7 @@ public partial class MainWindow : Window
         SyncFilterInputsToAssetListViewModel();
         var addedCount = ViewModel.AssetList.AppendLazyArenaIndices(
             pendingIndices,
-            displayAll.IsChecked == true,
+            ViewModel.Options.DisplayAll,
             IsLazyExportableType,
             (serializedFileName, originalPath) =>
             {
@@ -1054,30 +1153,6 @@ public partial class MainWindow : Window
         assetItem.FullSize = handle.ByteSize;
         assetItem.Name = handle.Name ?? string.Empty;
         assetItem.Container = handle.Container ?? string.Empty;
-    }
-
-    private void PauseIndexing_Click(object? sender, RoutedEventArgs e)
-    {
-        ViewModel.LoadingService.PauseIndexing();
-        ViewModel.IsPauseEnabled = false;
-        ViewModel.IsResumeEnabled = true;
-        StatusStripUpdate("Indexing paused.");
-        BuildAssetStructures(incremental: true);
-    }
-
-    private void ResumeIndexing_Click(object? sender, RoutedEventArgs e)
-    {
-        ViewModel.LoadingService.ResumeIndexing();
-        ViewModel.IsPauseEnabled = true;
-        ViewModel.IsResumeEnabled = false;
-        StatusStripUpdate("Resuming indexing...");
-    }
-
-    private void StopIndexing_Click(object? sender, RoutedEventArgs e)
-    {
-        ViewModel.LoadingService.StopIndexing();
-        ViewModel.IsIndexingActive = false;
-        StatusStripUpdate("Stopping/cancelling indexing...");
     }
 
     private async void BuildAssetStructures(bool incremental = false)
@@ -1112,7 +1187,7 @@ public partial class MainWindow : Window
             PublishStructureStage(0, "Preparing asset structure build");
 
         // Capture required UI states on the UI thread
-        bool displayAllChecked = displayAll.IsChecked == true;
+        bool displayAllChecked = ViewModel.Options.DisplayAll;
         List<SerializedFile> filesListSnapshot;
         lock (assetsManager.loadLock)
         {
@@ -1262,9 +1337,14 @@ public partial class MainWindow : Window
             }
             StatusStripUpdate(lazyLog);
 
-            Title = assetsManager.assetsFileList.Count > 0
-                ? FormatLoadedWindowTitle(null, assetsManager.assetsFileList[0])
-                : FormatWindowTitle();
+            if (assetsManager.assetsFileList.Count > 0)
+            {
+                ViewModel.ProjectSession.UpdateWindowTitle(null, assetsManager.assetsFileList[0]);
+            }
+            else
+            {
+                ViewModel.ProjectSession.UpdateWindowTitle(projectContext?.Project.DisplayName);
+            }
 
             PublishStructureStage(6, "Saving project metadata");
             var finalExportableCount = ExportableAssetCount;
@@ -1499,9 +1579,14 @@ public partial class MainWindow : Window
         }
         StatusStripUpdate(log);
 
-        Title = assetsManager.assetsFileList.Count > 0
-            ? FormatLoadedWindowTitle(result.ProductName, assetsManager.assetsFileList[0])
-            : FormatWindowTitle();
+        if (assetsManager.assetsFileList.Count > 0)
+        {
+            ViewModel.ProjectSession.UpdateWindowTitle(result.ProductName, assetsManager.assetsFileList[0]);
+        }
+        else
+        {
+            ViewModel.ProjectSession.UpdateWindowTitle(projectContext?.Project.DisplayName);
+        }
 
         PublishStructureStage(6, "Saving project metadata");
         var eagerExportableCount = ExportableAssetCount;
@@ -1547,16 +1632,6 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Logger.Warning($"Failed to update project metadata: {ex.Message}");
-        }
-    }
-
-    private void ShowErrorMessage_Click(object? sender, RoutedEventArgs e)
-    {
-        if (sender is MenuItem menuItem)
-        {
-            logger.ShowErrorMessage = menuItem.IsChecked;
-            appSettings.ShowErrorMessage = menuItem.IsChecked;
-            SaveAppSettings();
         }
     }
 
@@ -1677,20 +1752,16 @@ public partial class MainWindow : Window
         return exportedCount;
     }
 
-    private async void ExportClassStructures_Click(object? sender, RoutedEventArgs e)
+    private async Task ExportClassStructuresCommandHandlerAsync()
     {
         if (assetClassItems.Count == 0)
         {
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null) return;
+        var savePath = await PickExportFolderDialogAsync("Select folder to export class structures");
+        if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select folder to export class structures"));
-        if (folders == null || folders.Count == 0) return;
-
-        var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
         var itemsSnapshot = assetClassItems.ToList();
         StatusStripUpdate("Exporting class structures...");
@@ -1716,63 +1787,16 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnProjectAnalysisReportUpdated(ProjectAnalysisReport report)
-    {
-        void ApplyBanner()
-        {
-            var text = FormatProjectAnalysisStatusText(report);
-            var isVisible = !string.IsNullOrWhiteSpace(text);
-            if (ProjectAnalysisBannerText != null)
-            {
-                ProjectAnalysisBannerText.Text = text;
-            }
-
-            if (ProjectAnalysisBannerBorder != null)
-            {
-                ProjectAnalysisBannerBorder.IsVisible = isVisible;
-            }
-        }
-
-        if (Dispatcher.UIThread.CheckAccess())
-        {
-            ApplyBanner();
-        }
-        else
-        {
-            Dispatcher.UIThread.Post(ApplyBanner, DispatcherPriority.Background);
-        }
-    }
-
     private void HideProjectAnalysisBanner()
     {
-        void ClearBanner()
-        {
-            if (ProjectAnalysisBannerText != null)
-            {
-                ProjectAnalysisBannerText.Text = string.Empty;
-            }
-
-            if (ProjectAnalysisBannerBorder != null)
-            {
-                ProjectAnalysisBannerBorder.IsVisible = false;
-            }
-        }
-
-        if (Dispatcher.UIThread.CheckAccess())
-        {
-            ClearBanner();
-        }
-        else
-        {
-            Dispatcher.UIThread.Post(ClearBanner);
-        }
+        ProjectSession.ApplyProjectAnalysis((ProjectAnalysisReport?)null);
     }
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
         lazyIndexingSessionId++;
         ViewModel.LoadingService.StopIndexing();
-        ProjectAnalysisReportUpdated -= OnProjectAnalysisReportUpdated;
+        UnwireViewModelOptions();
         CancelProjectAnalysis();
         CancelPendingArenaCoalescedSort();
         listSearchDebounce?.Cancel();

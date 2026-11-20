@@ -36,7 +36,7 @@ public partial class MainWindow
         TextPreviewBox.IsVisible = true;
         ImagePreviewBox.IsVisible = false;
         PreviewLabel.IsVisible = false;
-        PreviewInfoBorder.IsVisible = false;
+        ClearPreviewInfoOverlay();
         StatusStripUpdate("Loading material preview...");
 
         Task.Run(() =>
@@ -71,7 +71,7 @@ public partial class MainWindow
                         TextPreviewBox.Text = previewData.InfoText;
                         TextPreviewBox.IsVisible = true;
                         ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
+                        ClearPreviewInfoOverlay();
                         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
                         ClearPreviewCacheBadge();
                         StatusStripUpdate("Material loaded (no texture).");
@@ -94,7 +94,7 @@ public partial class MainWindow
                         TextPreviewBox.Text = previewData.InfoText;
                         TextPreviewBox.IsVisible = true;
                         ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
+                        ClearPreviewInfoOverlay();
                         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
                         ClearPreviewCacheBadge();
                         StatusStripUpdate("Material loaded (no preview texture support).");
@@ -151,25 +151,17 @@ public partial class MainWindow
                         TextPreviewBox.IsVisible = false;
                         PreviewLabel.IsVisible = false;
 
-                        if (displayInfo.IsChecked == true)
+                        var previewInfoText = previewData.InfoText;
+                        if (materialPreviewWasDownscaled)
                         {
-                            var previewInfoText = previewData.InfoText;
-                            if (materialPreviewWasDownscaled)
-                            {
-                                previewInfoText += $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}";
-                            }
-                            if (materialPreviewFromCache)
-                            {
-                                previewInfoText += "\nPreview texture loaded from cache";
-                            }
+                            previewInfoText += $"\nPreview texture downscaled to {materialPreviewWidth}x{materialPreviewHeight}";
+                        }
+                        if (materialPreviewFromCache)
+                        {
+                            previewInfoText += "\nPreview texture loaded from cache";
+                        }
 
-                            PreviewInfoOverlay.Text = previewInfoText;
-                            PreviewInfoBorder.IsVisible = true;
-                        }
-                        else
-                        {
-                            PreviewInfoBorder.IsVisible = false;
-                        }
+                        SetPreviewInfoOverlay(previewInfoText);
 
                         UpdatePreviewCacheBadge(fromCache: materialPreviewFromCache, sourceKind: "material");
                         StatusStripUpdate($"Material preview loaded: {postedPreviewTexture.m_Name}");
@@ -182,7 +174,7 @@ public partial class MainWindow
                             TextPreviewBox.Text = previewData.InfoText + "\n[Error showing preview texture: " + ex.Message + "]";
                             TextPreviewBox.IsVisible = true;
                             ImagePreviewBox.IsVisible = false;
-                            PreviewInfoBorder.IsVisible = false;
+                            ClearPreviewInfoOverlay();
                             if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
                             ClearPreviewCacheBadge();
                             StatusStripUpdate("Material preview UI error.");
@@ -203,7 +195,7 @@ public partial class MainWindow
                         TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\n[Error loading material preview: {ex.Message}]";
                         TextPreviewBox.IsVisible = true;
                         ImagePreviewBox.IsVisible = false;
-                        PreviewInfoBorder.IsVisible = false;
+                        ClearPreviewInfoOverlay();
                         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
                         ClearPreviewCacheBadge();
                         StatusStripUpdate("Material preview error.");

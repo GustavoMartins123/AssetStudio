@@ -1,65 +1,39 @@
 using Avalonia;
-using Avalonia.Controls;
-using Avalonia.Interactivity;
 using Avalonia.Styling;
-using System;
+using AssetStudio.Avalonia.ViewModels;
 
 namespace AssetStudio.Avalonia
 {
-public partial class MainWindow
-{
+    public partial class MainWindow
+    {
         private void InitializeTheme()
         {
-            ApplyTheme(appSettings.SelectedTheme);
-
-            if (themeDefault != null) themeDefault.IsChecked = appSettings.SelectedTheme == "Default";
-            if (themeLight != null) themeLight.IsChecked = appSettings.SelectedTheme == "Light";
-            if (themeDark != null) themeDark.IsChecked = appSettings.SelectedTheme == "Dark";
+            ApplyTheme(ViewModel.Options.SelectedTheme);
         }
 
-        private void ThemeDefault_Click(object? sender, RoutedEventArgs e)
+        private void OnThemeOptionChanged(AppThemePreference theme)
         {
-            SetThemeOption("Default");
-        }
-
-        private void ThemeLight_Click(object? sender, RoutedEventArgs e)
-        {
-            SetThemeOption("Light");
-        }
-
-        private void ThemeDark_Click(object? sender, RoutedEventArgs e)
-        {
-            SetThemeOption("Dark");
-        }
-
-        private void SetThemeOption(string themeName)
-        {
-            appSettings.SelectedTheme = themeName;
+            appSettings.SelectedTheme = WindowOptionsViewModel.FormatThemePreference(theme);
             SaveAppSettings();
+            ApplyTheme(theme);
 
-            if (themeDefault != null) themeDefault.IsChecked = themeName == "Default";
-            if (themeLight != null) themeLight.IsChecked = themeName == "Light";
-            if (themeDark != null) themeDark.IsChecked = themeName == "Dark";
-
-            ApplyTheme(themeName);
-
-            if (currentTextAssetPreview != null && TextAssetPreviewPanel != null && TextAssetPreviewPanel.IsVisible)
+            if (currentTextAssetPreview != null && PreviewSession.HasDialoguePreview)
             {
                 BuildTextAssetDialogueCards(currentTextAssetPreview);
                 SetTextAssetPreviewMode(currentPreviewMode);
             }
         }
 
-        private void ApplyTheme(string themeName)
+        private void ApplyTheme(AppThemePreference theme)
         {
             if (Application.Current is { } app)
             {
-                if (themeName == "Dark")
-                    app.RequestedThemeVariant = ThemeVariant.Dark;
-                else if (themeName == "Light")
-                    app.RequestedThemeVariant = ThemeVariant.Light;
-                else
-                    app.RequestedThemeVariant = ThemeVariant.Default;
+                app.RequestedThemeVariant = theme switch
+                {
+                    AppThemePreference.Dark => ThemeVariant.Dark,
+                    AppThemePreference.Light => ThemeVariant.Light,
+                    _ => ThemeVariant.Default
+                };
             }
         }
     }
