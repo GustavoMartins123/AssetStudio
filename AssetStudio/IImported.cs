@@ -176,7 +176,7 @@ namespace AssetStudio
         public string Path { get; set; } = string.Empty;
         public List<ImportedVertex> VertexList { get; set; } = new List<ImportedVertex>();
         public List<ImportedSubmesh> SubmeshList { get; set; } = new List<ImportedSubmesh>();
-        public List<ImportedBone> BoneList { get; set; } = new List<ImportedBone>();
+        public List<ImportedBone>? BoneList { get; set; }
         public bool hasNormal { get; set; }
         public bool[] hasUV { get; set; } = Array.Empty<bool>();
         public bool hasTangent { get; set; }
@@ -208,7 +208,7 @@ namespace AssetStudio
 
     public class ImportedBone
     {
-        public string Path { get; set; } = string.Empty;
+        public string? Path { get; set; }
         public Matrix4x4 Matrix { get; set; }
     }
 
@@ -236,7 +236,7 @@ namespace AssetStudio
     public class ImportedTexture
     {
         public string Name { get; set; }
-        public byte[] Data { get; set; }
+        public byte[]? Data { get; set; }
 
         public ImportedTexture(MemoryStream stream, string name)
         {
@@ -251,7 +251,7 @@ namespace AssetStudio
         public float SampleRate { get; set; }
         public List<ImportedAnimationKeyframedTrack> TrackList { get; set; } = new List<ImportedAnimationKeyframedTrack>();
 
-        public ImportedAnimationKeyframedTrack FindTrack(string path)
+        public ImportedAnimationKeyframedTrack FindTrack(string? path)
         {
             var track = TrackList.Find(x => x.Path == path);
             if (track == null)
@@ -266,7 +266,7 @@ namespace AssetStudio
 
     public class ImportedAnimationKeyframedTrack
     {
-        public string Path { get; set; } = string.Empty;
+        public string? Path { get; set; }
         public List<ImportedKeyframe<Vector3>> Scalings = new List<ImportedKeyframe<Vector3>>();
         public List<ImportedKeyframe<Vector3>> Rotations = new List<ImportedKeyframe<Vector3>>();
         public List<ImportedKeyframe<Vector3>> Translations = new List<ImportedKeyframe<Vector3>>();

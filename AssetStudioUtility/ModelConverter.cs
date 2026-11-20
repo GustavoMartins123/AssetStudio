@@ -195,7 +195,7 @@ namespace AssetStudio
                     Transform? m_Father = null;
                     if (!fatherPtr.TryGet(out m_Father))
                     {
-                        foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                        foreach (var sf in tempTransform.assetsFile.assetsManager.assetsFileList)
                         {
                             if (sf.ObjectsDic.TryGetValue(fatherPtr.m_PathID, out var obj) && obj is Transform foundFather)
                             {
@@ -231,12 +231,12 @@ namespace AssetStudio
             ConvertMeshRenderer(m_Transform);
         }
 
-        private void ConvertMeshRenderer(Transform m_Transform)
+        private void ConvertMeshRenderer(Transform? m_Transform)
         {
             ConvertMeshRenderer(m_Transform, new HashSet<Transform>());
         }
 
-        private void ConvertMeshRenderer(Transform m_Transform, HashSet<Transform> visited)
+        private void ConvertMeshRenderer(Transform? m_Transform, HashSet<Transform> visited)
         {
             if (m_Transform == null || !visited.Add(m_Transform))
                 return;
@@ -530,7 +530,7 @@ namespace AssetStudio
             return new Vector3(rotX * rad2deg, rotY * rad2deg, rotZ * rad2deg);
         }
 
-        private void ConvertTransforms(Transform trans, ImportedFrame? parent)
+        private void ConvertTransforms(Transform? trans, ImportedFrame? parent)
         {
             if (trans == null || transformDictionary.ContainsKey(trans))
             {
@@ -583,7 +583,7 @@ namespace AssetStudio
                     }
                 }
             }
-            iMesh.Path = m_GameObject2 != null ? GetTransformPath(m_GameObject2.m_Transform) : "";
+            iMesh.Path = (m_GameObject2 != null ? GetTransformPath(m_GameObject2.m_Transform) : null) ?? "";
             iMesh.SubmeshList = new List<ImportedSubmesh>();
             var subHashSet = new HashSet<int>();
             var combine = false;
@@ -688,6 +688,10 @@ namespace AssetStudio
             iMesh.VertexList = new List<ImportedVertex>((int)mesh.m_VertexCount);
             for (var j = 0; j < mesh.m_VertexCount; j++)
             {
+                if (mesh.m_Vertices == null)
+                {
+                    break;
+                }
                 var iVertex = new ImportedVertex();
                 //Vertices
                 int c = 3;
@@ -716,15 +720,18 @@ namespace AssetStudio
                     if (iMesh.hasUV[uv])
                     {
                         var m_UV = mesh.GetUV(uv);
-                        if (m_UV.Length == mesh.m_VertexCount * 2)
+                        if (m_UV != null)
                         {
-                            c = 2;
+                            if (m_UV.Length == mesh.m_VertexCount * 2)
+                            {
+                                c = 2;
+                            }
+                            else if (m_UV.Length == mesh.m_VertexCount * 3)
+                            {
+                                c = 3;
+                            }
+                            iVertex.UV[uv] = new[] { m_UV[j * c], m_UV[j * c + 1] };
                         }
-                        else if (m_UV.Length == mesh.m_VertexCount * 3)
-                        {
-                            c = 3;
-                        }
-                        iVertex.UV[uv] = new[] { m_UV[j * c], m_UV[j * c + 1] };
                     }
                 }
                 //Tangent
@@ -768,7 +775,7 @@ namespace AssetStudio
                  * 2 - m_BoneNameHashes
                  */
                 var boneType = 0;
-                if (sMesh.m_Bones.Length > 0)
+                if (sMesh.m_Bones.Length > 0 && mesh.m_BindPose != null)
                 {
                     if (sMesh.m_Bones.Length == mesh.m_BindPose.Length)
                     {
@@ -792,7 +799,7 @@ namespace AssetStudio
                         }
                     }
                 }
-                if (boneType == 0)
+                if (boneType == 0 && mesh.m_BindPose != null)
                 {
                     //尝试使用m_BoneNameHashes 4.3 and up
                     if (mesh.m_BindPose.Length > 0 && (mesh.m_BindPose.Length == mesh.m_BoneNameHashes?.Length))
@@ -805,7 +812,7 @@ namespace AssetStudio
                     }
                 }
 
-                if (boneType == 1)
+                if (boneType == 1 && mesh.m_BindPose != null)
                 {
                     var boneCount = sMesh.m_Bones.Length;
                     iMesh.BoneList = new List<ImportedBone>(boneCount);
@@ -821,7 +828,7 @@ namespace AssetStudio
                         iMesh.BoneList.Add(bone);
                     }
                 }
-                else if (boneType == 2 && mesh.m_BoneNameHashes != null)
+                else if (boneType == 2 && mesh.m_BoneNameHashes != null && mesh.m_BindPose != null)
                 {
                     var boneCount = mesh.m_BindPose.Length;
                     iMesh.BoneList = new List<ImportedBone>(boneCount);
@@ -927,7 +934,7 @@ namespace AssetStudio
             MeshList.Add(iMesh);
         }
 
-        private static bool TryGetBoneTransform(PPtr<Transform> bonePtr, Renderer meshR, out Transform transform)
+        private static bool TryGetBoneTransform(PPtr<Transform> bonePtr, Renderer meshR, [NotNullWhen(true)] out Transform? transform)
         {
             if (bonePtr.TryGet(out transform))
                 return true;
@@ -1002,9 +1009,9 @@ namespace AssetStudio
             return null;
         }
 
-        private string? GetTransformPath(Transform transform)
+        private string? GetTransformPath(Transform? transform)
         {
-            if (transformDictionary.TryGetValue(transform, out var frame))
+            if (transform != null && transformDictionary.TryGetValue(transform, out var frame))
             {
                 return frame.Path;
             }
@@ -1053,7 +1060,7 @@ namespace AssetStudio
 
         private ImportedMaterial ConvertMaterial(Material? mat)
         {
-            ImportedMaterial iMat;
+            ImportedMaterial? iMat;
             if (mat != null && !string.IsNullOrEmpty(mat.m_Name))
             {
                 iMat = ImportedHelpers.FindMaterial(mat.m_Name, MaterialList);
@@ -1543,12 +1550,12 @@ namespace AssetStudio
             return $"Bone_{hash}";
         }
 
-        private void CreateBonePathHash(Transform m_Transform)
+        private void CreateBonePathHash(Transform? m_Transform)
         {
             CreateBonePathHash(m_Transform, new HashSet<Transform>());
         }
 
-        private void CreateBonePathHash(Transform m_Transform, HashSet<Transform> visited)
+        private void CreateBonePathHash(Transform? m_Transform, HashSet<Transform> visited)
         {
             if (m_Transform == null || !visited.Add(m_Transform))
             {
@@ -2636,7 +2643,7 @@ namespace AssetStudio
         }
 
         private static void CollectConvertedRenderersAndMeshesFromHierarchy(
-            Transform rootTransform,
+            Transform? rootTransform,
             HashSet<Renderer> convertedRenderers,
             HashSet<Mesh> convertedMeshes)
         {
@@ -2814,7 +2821,7 @@ namespace AssetStudio
             System.Numerics.Matrix4x4[]? bindPoses = null;
             bool hasBindPose = false;
 
-            if (bestMesh != null && bestBoneCount > 0)
+            if (bestMesh != null && bestMesh.m_BindPose != null && bestBoneCount > 0)
             {
                 var meshBoneHashToIdx = new Dictionary<uint, int>(bestBoneCount);
                 for (int j = 0; j < bestBoneCount; j++)
@@ -3119,8 +3126,12 @@ namespace AssetStudio
             {
                 if (iMesh.hasUV[uv])
                 {
-                    uvArrays[uv] = mesh.GetUV(uv);
-                    uvStrides[uv] = uvArrays[uv].Length == vertexCount * 3 ? 3 : (uvArrays[uv].Length == vertexCount * 4 ? 4 : 2);
+                    var uvData = mesh.GetUV(uv);
+                    if (uvData != null)
+                    {
+                        uvArrays[uv] = uvData;
+                        uvStrides[uv] = uvData.Length == vertexCount * 3 ? 3 : (uvData.Length == vertexCount * 4 ? 4 : 2);
+                    }
                 }
             }
 

@@ -743,6 +743,8 @@ namespace AssetStudio
             var transform = NumericsToFbxArray(meshBindMatrix);
 
             var boneList = mesh.BoneList;
+            if (boneList == null || boneList.Count == 0)
+                return;
             var vertexList = mesh.VertexList;
             int boneCount = boneList.Count;
             int vertexCount = vertexList.Count;
@@ -1317,7 +1319,7 @@ namespace AssetStudio
             return NumericsToFbxArray(GetFrameMatrix(path, fallback));
         }
 
-        private System.Numerics.Matrix4x4 GetFrameMatrix(string path, System.Numerics.Matrix4x4 fallback)
+        private System.Numerics.Matrix4x4 GetFrameMatrix(string? path, System.Numerics.Matrix4x4 fallback)
         {
             var normalizedPath = NormalizeFramePath(path);
             if (!string.IsNullOrEmpty(normalizedPath))

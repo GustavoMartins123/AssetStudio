@@ -477,6 +477,7 @@ namespace AssetStudio.Tests
 
             var combined = ModelConverter.CombineMeshList(new[] { skinned, mirroredStatic }, mixRoot, "Combined");
             Assert.Equal(6, combined.VertexList.Count);
+            Assert.NotNull(combined.BoneList);
             Assert.Single(combined.BoneList);
 
             // Static vertices got zero weights safely

@@ -663,7 +663,7 @@ namespace AssetStudio
 
         private static Vector2[][] GetTriangles(SpriteRenderData m_RD)
         {
-            if (m_RD.vertices != null) //5.6 down
+            if (m_RD.vertices != null && m_RD.indices != null) //5.6 down
             {
                 var vertices = m_RD.vertices.Select(x => (Vector2)x.pos).ToArray();
                 var triangleCount = m_RD.indices.Length / 3;
@@ -678,7 +678,7 @@ namespace AssetStudio
                 }
                 return triangles;
             }
-            else //5.6 and up
+            else if (m_RD.m_VertexData != null && m_RD.m_IndexBuffer != null && m_RD.m_SubMeshes != null) //5.6 and up
             {
                 var triangles = new List<Vector2[]>();
                 var m_VertexData = m_RD.m_VertexData;
@@ -715,6 +715,8 @@ namespace AssetStudio
                 }
                 return triangles.ToArray();
             }
+
+            return Array.Empty<Vector2[]>();
         }
     }
 }

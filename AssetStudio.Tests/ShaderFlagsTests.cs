@@ -133,6 +133,7 @@ namespace AssetStudio.Tests
                 properties: Array.Empty<TestPropertySpec>(),
                 passes: new[] { new TestPassSpec() });
 
+            Assert.NotNull(shader.m_ParsedForm);
             Assert.Null(shader.m_ParsedForm.m_SubShaders[0].m_Passes[0].m_State.zClip);
             Assert.Null(shader.m_ParsedForm.m_SubShaders[0].m_Passes[0].m_State.conservative);
 

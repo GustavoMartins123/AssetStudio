@@ -1009,7 +1009,7 @@ namespace AssetStudio
         public uint[][] offsets = Array.Empty<uint[]>();
         public uint[][] compressedLengths = Array.Empty<uint[]>();
         public uint[][] decompressedLengths = Array.Empty<uint[]>();
-        public byte[] compressedBlob = Array.Empty<byte>();
+        public byte[]? compressedBlob;
 
         public Shader(ObjectReader reader) : base(reader)
         {

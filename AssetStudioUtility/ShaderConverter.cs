@@ -51,7 +51,7 @@ namespace AssetStudio
                 {
                     var program = new ShaderProgram(blobReader, shader.version);
                     program.Read(blobReader, 0);
-                    return header + program.Export(Encoding.UTF8.GetString(shader.m_Script));
+                    return header + program.Export(Encoding.UTF8.GetString(shader.m_Script ?? Array.Empty<byte>()));
                 }
             }
 
@@ -60,11 +60,16 @@ namespace AssetStudio
                 return header + ConvertSerializedShader(shader);
             }
 
-            return header + Encoding.UTF8.GetString(shader.m_Script);
+            return header + Encoding.UTF8.GetString(shader.m_Script ?? Array.Empty<byte>());
         }
 
         private static string ConvertSerializedShader(Shader shader)
         {
+            if (shader.m_ParsedForm == null || shader.compressedBlob == null)
+            {
+                return string.Empty;
+            }
+
             var length = shader.platforms.Length;
             var shaderPrograms = new ShaderProgram[length];
             for (var i = 0; i < length; i++)
