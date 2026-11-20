@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
 using System.Threading;
+using K4os.Compression.LZ4;
 using Microsoft.Data.Sqlite;
 
 namespace AssetStudio.Avalonia
@@ -57,11 +59,132 @@ namespace AssetStudio.Avalonia
     {
         public const long DefaultPreviewCacheMaxTotalBytes = 512L * 1024 * 1024;
         public const int DefaultPreviewCacheMaxEntryCount = 5000;
+        public const int DefaultPreviewCacheInlineBlobMaxBytes = 128 * 1024;
+        public const int PreviewPayloadCompressionNone = 0;
+        public const int PreviewPayloadCompressionLz4Pickler = 1;
         private const double PreviewCacheEvictionHighWaterRatio = 0.85;
         private static long s_lastPreviewCacheTimestampTicks;
 
         public long PreviewCacheMaxTotalBytes { get; set; } = DefaultPreviewCacheMaxTotalBytes;
         public int PreviewCacheMaxEntryCount { get; set; } = DefaultPreviewCacheMaxEntryCount;
+        public int PreviewCacheInlineBlobMaxBytes { get; set; } = DefaultPreviewCacheInlineBlobMaxBytes;
+
+        internal static void EnsurePreviewCacheColumns(SqliteConnection conn, SqliteTransaction? transaction = null)
+        {
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var infoCmd = conn.CreateCommand())
+            {
+                infoCmd.Transaction = transaction;
+                infoCmd.CommandText = "PRAGMA table_info(PreviewCacheEntries);";
+                using var reader = infoCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!reader.IsDBNull(1))
+                    {
+                        columns.Add(reader.GetString(1));
+                    }
+                }
+            }
+
+            if (columns.Count == 0)
+            {
+                return;
+            }
+
+            if (!columns.Contains("PayloadBlob"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.Transaction = transaction;
+                alterCmd.CommandText = "ALTER TABLE PreviewCacheEntries ADD COLUMN PayloadBlob BLOB;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!columns.Contains("PayloadCompression"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.Transaction = transaction;
+                alterCmd.CommandText = "ALTER TABLE PreviewCacheEntries ADD COLUMN PayloadCompression INTEGER NOT NULL DEFAULT 0;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!columns.Contains("UncompressedByteSize"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.Transaction = transaction;
+                alterCmd.CommandText = @"
+                    ALTER TABLE PreviewCacheEntries ADD COLUMN UncompressedByteSize INTEGER NOT NULL DEFAULT 0;
+                    UPDATE PreviewCacheEntries
+                    SET UncompressedByteSize = ByteSize
+                    WHERE UncompressedByteSize = 0 AND ByteSize > 0;";
+                alterCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static bool HasPreviewCacheBlobColumns(SqliteConnection conn)
+        {
+            bool hasPayloadBlob = false;
+            bool hasPayloadCompression = false;
+            bool hasUncompressedByteSize = false;
+
+            using var infoCmd = conn.CreateCommand();
+            infoCmd.CommandText = "PRAGMA table_info(PreviewCacheEntries);";
+            using var reader = infoCmd.ExecuteReader();
+            while (reader.Read())
+            {
+                if (reader.IsDBNull(1))
+                {
+                    continue;
+                }
+
+                var col = reader.GetString(1);
+                if (string.Equals(col, "PayloadBlob", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasPayloadBlob = true;
+                }
+                else if (string.Equals(col, "PayloadCompression", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasPayloadCompression = true;
+                }
+                else if (string.Equals(col, "UncompressedByteSize", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasUncompressedByteSize = true;
+                }
+            }
+
+            return hasPayloadBlob && hasPayloadCompression && hasUncompressedByteSize;
+        }
+
+        private static void TryEnsurePreviewCacheColumnsByDbPath(string dbPath)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath) || !File.Exists(dbPath))
+            {
+                return;
+            }
+
+            var lockTaken = false;
+            try
+            {
+                Monitor.TryEnter(WriteGate, TimeSpan.FromSeconds(2), ref lockTaken);
+                if (!lockTaken)
+                {
+                    return;
+                }
+
+                using var writeConn = CreateConnectionByDbPath(dbPath);
+                EnsurePreviewCacheColumns(writeConn);
+            }
+            catch
+            {
+                // Read-only DB files on disk are tolerated gracefully without throwing
+            }
+            finally
+            {
+                if (lockTaken)
+                {
+                    Monitor.Exit(WriteGate);
+                }
+            }
+        }
 
         internal bool TryLoadPreviewCacheEntry(
             string folderPath,
@@ -110,13 +233,13 @@ namespace AssetStudio.Avalonia
                         return null;
                     }
 
-                    entry = QueryPreviewCacheEntry(conn, projectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                    entry = QueryPreviewCacheEntry(conn, dbPath, projectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
                     if (entry == null && fromCache)
                     {
                         var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
                         if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
                         {
-                            entry = QueryPreviewCacheEntry(conn, verifiedProjectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                            entry = QueryPreviewCacheEntry(conn, dbPath, verifiedProjectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
                         }
                     }
                 }
@@ -136,8 +259,88 @@ namespace AssetStudio.Avalonia
             }
         }
 
+        public bool TryLoadPreviewCacheBytes(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            out byte[]? payloadBytes)
+        {
+            return TryLoadPreviewCacheBytes(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters,
+                out payloadBytes,
+                out _);
+        }
+
+        public bool TryLoadPreviewCacheBytes(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            out byte[]? payloadBytes,
+            out PreviewCacheEntry? entry)
+        {
+            payloadBytes = null;
+            entry = LoadPreviewCacheEntry(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters);
+            if (entry == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (entry.PayloadBlob != null && entry.PayloadBlob.Length > 0)
+                {
+                    if (entry.PayloadCompression == PreviewPayloadCompressionLz4Pickler)
+                    {
+                        payloadBytes = LZ4Pickler.Unpickle(entry.PayloadBlob);
+                    }
+                    else if (entry.PayloadCompression == PreviewPayloadCompressionNone)
+                    {
+                        payloadBytes = entry.PayloadBlob;
+                    }
+                    else
+                    {
+                        Logger.Warning($"Unsupported preview cache payload compression '{entry.PayloadCompression}'.");
+                        return false;
+                    }
+
+                    return payloadBytes != null;
+                }
+
+                if (!string.IsNullOrWhiteSpace(entry.PayloadPath) && File.Exists(entry.PayloadPath))
+                {
+                    payloadBytes = File.ReadAllBytes(entry.PayloadPath);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to decode preview cache payload bytes: {ex.Message}");
+                payloadBytes = null;
+            }
+
+            return false;
+        }
+
         private static PreviewCacheEntry? QueryPreviewCacheEntry(
             SqliteConnection conn,
+            string dbPath,
             long projectId,
             string assetUniqueId,
             string previewKind,
@@ -146,8 +349,25 @@ namespace AssetStudio.Avalonia
             out long? hitEntryId)
         {
             hitEntryId = null;
+            var hasBlobColumns = HasPreviewCacheBlobColumns(conn);
+            if (!hasBlobColumns)
+            {
+                TryEnsurePreviewCacheColumnsByDbPath(dbPath);
+                hasBlobColumns = HasPreviewCacheBlobColumns(conn);
+            }
+
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"
+            cmd.CommandText = hasBlobColumns
+                ? @"
+                SELECT Id, PayloadHash, PayloadPath, ByteSize, PayloadBlob, PayloadCompression, UncompressedByteSize
+                FROM PreviewCacheEntries
+                WHERE ProjectId = @projectId
+                  AND AssetUniqueID = @assetUniqueId
+                  AND PreviewKind = @previewKind
+                  AND AlgorithmVersion = @algorithmVersion
+                  AND Parameters = @parameters
+                LIMIT 1"
+                : @"
                 SELECT Id, PayloadHash, PayloadPath, ByteSize
                 FROM PreviewCacheEntries
                 WHERE ProjectId = @projectId
@@ -166,13 +386,161 @@ namespace AssetStudio.Avalonia
             if (reader.Read())
             {
                 hitEntryId = reader.GetInt64(0);
+                var payloadHash = reader.GetString(1);
+                var payloadPath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                var byteSize = reader.GetInt64(3);
+
+                if (!hasBlobColumns)
+                {
+                    return new PreviewCacheEntry(payloadHash, payloadPath, byteSize);
+                }
+
+                var payloadBlob = reader.IsDBNull(4) ? null : (byte[])reader.GetValue(4);
+                var payloadCompression = reader.IsDBNull(5) ? PreviewPayloadCompressionNone : reader.GetInt32(5);
+                var uncompressedByteSize = reader.IsDBNull(6) ? byteSize : reader.GetInt64(6);
                 return new PreviewCacheEntry(
-                    reader.GetString(1),
-                    reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
-                    reader.GetInt64(3));
+                    payloadHash,
+                    payloadPath,
+                    byteSize,
+                    payloadBlob,
+                    payloadCompression,
+                    uncompressedByteSize);
             }
 
             return null;
+        }
+
+        public void SavePreviewCachePayload(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            byte[] payloadBytes,
+            string? externalFilePathFallback = null,
+            string? payloadHash = null)
+        {
+            if (string.IsNullOrWhiteSpace(assetUniqueId)
+                || string.IsNullOrWhiteSpace(previewKind)
+                || payloadBytes == null
+                || payloadBytes.Length == 0)
+            {
+                return;
+            }
+
+            var effectiveHash = string.IsNullOrWhiteSpace(payloadHash)
+                ? Convert.ToHexStringLower(SHA256.HashData(payloadBytes))
+                : payloadHash;
+            var inlineLimit = Math.Max(0, PreviewCacheInlineBlobMaxBytes);
+            var uncompressedByteSize = payloadBytes.LongLength;
+
+            if (payloadBytes.Length <= inlineLimit)
+            {
+                var pickled = LZ4Pickler.Pickle(payloadBytes);
+                byte[] storedBytes;
+                int compression;
+                if (pickled != null && pickled.Length > 0 && pickled.Length < payloadBytes.Length)
+                {
+                    storedBytes = pickled;
+                    compression = PreviewPayloadCompressionLz4Pickler;
+                }
+                else
+                {
+                    storedBytes = payloadBytes;
+                    compression = PreviewPayloadCompressionNone;
+                }
+
+                UpsertPreviewCacheEntryCore(
+                    folderPath,
+                    signature,
+                    assetUniqueId,
+                    previewKind,
+                    algorithmVersion,
+                    parameters,
+                    effectiveHash,
+                    payloadPath: string.Empty,
+                    payloadBlob: storedBytes,
+                    payloadCompression: compression,
+                    byteSize: storedBytes.LongLength,
+                    uncompressedByteSize: uncompressedByteSize);
+                return;
+            }
+
+            var targetFilePath = string.IsNullOrWhiteSpace(externalFilePathFallback)
+                ? GetDefaultExternalPreviewPayloadPath(folderPath, effectiveHash, previewKind)
+                : externalFilePathFallback;
+
+            try
+            {
+                var directory = Path.GetDirectoryName(targetFilePath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                var tempPath = targetFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllBytes(tempPath, payloadBytes);
+                    File.Move(tempPath, targetFilePath, overwrite: true);
+                }
+                finally
+                {
+                    try
+                    {
+                        if (File.Exists(tempPath))
+                        {
+                            File.Delete(tempPath);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to write external preview cache payload file '{targetFilePath}': {ex.Message}");
+                return;
+            }
+
+            UpsertPreviewCacheEntryCore(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters,
+                effectiveHash,
+                payloadPath: targetFilePath,
+                payloadBlob: null,
+                payloadCompression: PreviewPayloadCompressionNone,
+                byteSize: uncompressedByteSize,
+                uncompressedByteSize: uncompressedByteSize);
+        }
+
+        public void SavePreviewCachePayload(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            string payloadHash,
+            byte[] payloadBytes,
+            string? externalFilePathFallback = null)
+        {
+            SavePreviewCachePayload(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters,
+                payloadBytes,
+                externalFilePathFallback,
+                payloadHash);
         }
 
         internal void SavePreviewCacheEntry(
@@ -194,9 +562,38 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
+            var effectiveByteSize = ResolvePayloadByteSize(payloadPath, byteSize);
+            UpsertPreviewCacheEntryCore(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters,
+                payloadHash,
+                payloadPath,
+                payloadBlob: null,
+                payloadCompression: PreviewPayloadCompressionNone,
+                byteSize: effectiveByteSize,
+                uncompressedByteSize: effectiveByteSize);
+        }
+
+        private void UpsertPreviewCacheEntryCore(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            string payloadHash,
+            string payloadPath,
+            byte[]? payloadBlob,
+            int payloadCompression,
+            long byteSize,
+            long uncompressedByteSize)
+        {
             EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
-            var effectiveByteSize = ResolvePayloadByteSize(payloadPath, byteSize);
             var nowUtc = NextMonotonicUtcTimestamp();
             List<string>? filesToDelete = null;
 
@@ -206,6 +603,8 @@ namespace AssetStudio.Avalonia
                 {
                     using var conn = CreateConnectionByDbPath(dbPath);
                     using var transaction = conn.BeginTransaction();
+                    EnsurePreviewCacheColumns(conn, transaction);
+
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
                     if (projectId == null)
                     {
@@ -221,15 +620,20 @@ namespace AssetStudio.Avalonia
                         cmd.CommandText = @"
                             INSERT INTO PreviewCacheEntries (
                                 ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters,
-                                PayloadHash, PayloadPath, ByteSize, UpdatedUtc, LastAccessedUtc)
+                                PayloadHash, PayloadPath, PayloadBlob, PayloadCompression,
+                                ByteSize, UncompressedByteSize, UpdatedUtc, LastAccessedUtc)
                             VALUES (
                                 @projectId, @assetUniqueId, @previewKind, @algorithmVersion, @parameters,
-                                @payloadHash, @payloadPath, @byteSize, @nowUtc, @nowUtc)
+                                @payloadHash, @payloadPath, @payloadBlob, @payloadCompression,
+                                @byteSize, @uncompressedByteSize, @nowUtc, @nowUtc)
                             ON CONFLICT(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters)
                             DO UPDATE SET
                                 PayloadHash = excluded.PayloadHash,
                                 PayloadPath = excluded.PayloadPath,
+                                PayloadBlob = excluded.PayloadBlob,
+                                PayloadCompression = excluded.PayloadCompression,
                                 ByteSize = excluded.ByteSize,
+                                UncompressedByteSize = excluded.UncompressedByteSize,
                                 UpdatedUtc = excluded.UpdatedUtc,
                                 LastAccessedUtc = excluded.LastAccessedUtc,
                                 LastAccessed = CURRENT_TIMESTAMP";
@@ -239,8 +643,12 @@ namespace AssetStudio.Avalonia
                         cmd.Parameters.AddWithValue("@algorithmVersion", algorithmVersion);
                         cmd.Parameters.AddWithValue("@parameters", parameters ?? string.Empty);
                         cmd.Parameters.AddWithValue("@payloadHash", payloadHash);
-                        cmd.Parameters.AddWithValue("@payloadPath", payloadPath);
-                        cmd.Parameters.AddWithValue("@byteSize", effectiveByteSize);
+                        cmd.Parameters.AddWithValue("@payloadPath", payloadPath ?? string.Empty);
+                        var blobParam = cmd.Parameters.Add("@payloadBlob", SqliteType.Blob);
+                        blobParam.Value = payloadBlob != null ? payloadBlob : DBNull.Value;
+                        cmd.Parameters.AddWithValue("@payloadCompression", payloadCompression);
+                        cmd.Parameters.AddWithValue("@byteSize", byteSize);
+                        cmd.Parameters.AddWithValue("@uncompressedByteSize", uncompressedByteSize);
                         cmd.Parameters.AddWithValue("@nowUtc", nowUtc);
                         cmd.ExecuteNonQuery();
                     }
@@ -293,6 +701,18 @@ namespace AssetStudio.Avalonia
             {
                 Logger.Warning($"Failed to save preview cache entry to SQLite: {ex.Message}");
             }
+        }
+
+        private string GetDefaultExternalPreviewPayloadPath(string folderPath, string payloadHash, string previewKind)
+        {
+            var safeHash = string.IsNullOrWhiteSpace(payloadHash) ? "empty" : payloadHash.ToLowerInvariant();
+            var prefix = safeHash.Length >= 2 ? safeHash.Substring(0, 2) : "00";
+            var ext = string.Equals(previewKind, "texture-thumbnail-png", StringComparison.OrdinalIgnoreCase)
+                ? ".texturepreview.png"
+                : string.Equals(previewKind, "mesh-geometry", StringComparison.OrdinalIgnoreCase)
+                    ? ".meshpreview"
+                    : ".bin";
+            return Path.Combine(_cacheDir, "PreviewPayloads", GetFolderCacheKey(folderPath), prefix, safeHash + ext);
         }
 
         public PreviewCacheEvictionResult EvictPreviewCache(
@@ -429,6 +849,7 @@ namespace AssetStudio.Avalonia
                 {
                     using var conn = CreateConnectionByDbPath(dbPath);
                     using var transaction = conn.BeginTransaction();
+                    EnsurePreviewCacheColumns(conn, transaction);
                     filesToDelete = EvictPreviewCacheEntriesInTransaction(
                         conn,
                         transaction,
@@ -470,8 +891,17 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnectionByDbPath(dbPath);
+                var hasBlobColumns = HasPreviewCacheBlobColumns(conn);
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = @"
+                cmd.CommandText = hasBlobColumns
+                    ? @"
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(CASE WHEN ByteSize > 0 THEN ByteSize ELSE COALESCE(LENGTH(PayloadBlob), 0) END), 0),
+                        MIN(NULLIF(LastAccessedUtc, '')),
+                        MAX(NULLIF(LastAccessedUtc, ''))
+                    FROM PreviewCacheEntries"
+                    : @"
                     SELECT
                         COUNT(*),
                         COALESCE(SUM(ByteSize), 0),
@@ -517,7 +947,7 @@ namespace AssetStudio.Avalonia
             {
                 statsCmd.Transaction = transaction;
                 statsCmd.CommandText = @"
-                    SELECT COUNT(*), COALESCE(SUM(ByteSize), 0)
+                    SELECT COUNT(*), COALESCE(SUM(CASE WHEN ByteSize > 0 THEN ByteSize ELSE COALESCE(LENGTH(PayloadBlob), 0) END), 0)
                     FROM PreviewCacheEntries";
                 using var reader = statsCmd.ExecuteReader();
                 if (reader.Read())
@@ -544,7 +974,7 @@ namespace AssetStudio.Avalonia
             {
                 selectCmd.Transaction = transaction;
                 selectCmd.CommandText = @"
-                    SELECT Id, PayloadPath, ByteSize
+                    SELECT Id, PayloadPath, CASE WHEN ByteSize > 0 THEN ByteSize ELSE COALESCE(LENGTH(PayloadBlob), 0) END
                     FROM PreviewCacheEntries
                     ORDER BY LastAccessedUtc ASC, UpdatedUtc ASC, Id ASC";
                 using var reader = selectCmd.ExecuteReader();

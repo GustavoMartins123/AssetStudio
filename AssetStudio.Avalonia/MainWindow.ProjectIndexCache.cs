@@ -143,25 +143,28 @@ public partial class MainWindow : Window
             var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
             var signature = _sqliteCache.GetFolderSignature(currentScanResult);
             var parameters = BuildMeshPreviewCacheParameters(mesh, densityPercent);
-            var entry = _sqliteCache.LoadPreviewCacheEntry(
+            if (!_sqliteCache.TryLoadPreviewCacheBytes(
                 folderPath,
                 signature,
                 assetId,
                 "mesh-geometry",
                 MeshPreviewGeometryCache.AlgorithmVersion,
-                parameters);
-
-            if (entry == null || string.IsNullOrWhiteSpace(entry.PayloadPath) || !File.Exists(entry.PayloadPath))
+                parameters,
+                out var bytes,
+                out var entry)
+                || bytes == null
+                || entry == null)
             {
                 return null;
             }
 
-            if (!IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))
+            if (!entry.IsInlineBlob
+                && (string.IsNullOrWhiteSpace(entry.PayloadPath)
+                    || !IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath)))
             {
                 return null;
             }
 
-            var bytes = File.ReadAllBytes(entry.PayloadPath);
             if (!string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
             {
                 return null;
@@ -194,18 +197,9 @@ public partial class MainWindow : Window
             var bytes = MeshPreviewGeometryCacheSerializer.Serialize(cache);
             var hash = ComputeSha256Hex(bytes);
             var payloadPath = GetPreviewCachePayloadPath(folderPath, hash);
-            Directory.CreateDirectory(Path.GetDirectoryName(payloadPath)!);
-
-            if (!File.Exists(payloadPath))
-            {
-                var tempPath = payloadPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                File.WriteAllBytes(tempPath, bytes);
-                File.Move(tempPath, payloadPath, overwrite: true);
-            }
-
             var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
             var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-            _sqliteCache.SavePreviewCacheEntry(
+            _sqliteCache.SavePreviewCachePayload(
                 folderPath,
                 signature,
                 assetId,
@@ -213,8 +207,8 @@ public partial class MainWindow : Window
                 MeshPreviewGeometryCache.AlgorithmVersion,
                 BuildMeshPreviewCacheParameters(mesh, densityPercent),
                 hash,
-                payloadPath,
-                bytes.LongLength);
+                bytes,
+                payloadPath);
         }
         catch (Exception ex)
         {
@@ -244,20 +238,21 @@ public partial class MainWindow : Window
                 var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
                 var signature = _sqliteCache.GetFolderSignature(currentScanResult!);
                 var parameters = BuildTexturePreviewCacheParameters(texture, maxDimension);
-                var entry = _sqliteCache.LoadPreviewCacheEntry(
+                if (_sqliteCache.TryLoadPreviewCacheBytes(
                     folderPath,
                     signature,
                     assetId,
                     "texture-thumbnail-png",
                     TexturePreviewThumbnailAlgorithmVersion,
-                    parameters);
-
-                if (entry != null
-                    && !string.IsNullOrWhiteSpace(entry.PayloadPath)
-                    && File.Exists(entry.PayloadPath)
-                    && IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))
+                    parameters,
+                    out var bytes,
+                    out var entry)
+                    && bytes != null
+                    && entry != null
+                    && (entry.IsInlineBlob
+                        || (!string.IsNullOrWhiteSpace(entry.PayloadPath)
+                            && IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))))
                 {
-                    var bytes = File.ReadAllBytes(entry.PayloadPath);
                     if (string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
                     {
                         var cachedImage = ImageExtensions.DecodeBgraUnpremul(bytes);
@@ -295,18 +290,9 @@ public partial class MainWindow : Window
                 var bytes = stream.ToArray();
                 var hash = ComputeSha256Hex(bytes);
                 var payloadPath = GetPreviewCachePayloadPath(folderPath, hash, ".texturepreview.png");
-                Directory.CreateDirectory(Path.GetDirectoryName(payloadPath)!);
-
-                if (!File.Exists(payloadPath))
-                {
-                    var tempPath = payloadPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                    File.WriteAllBytes(tempPath, bytes);
-                    File.Move(tempPath, payloadPath, overwrite: true);
-                }
-
                 var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
                 var signature = _sqliteCache.GetFolderSignature(currentScanResult!);
-                _sqliteCache.SavePreviewCacheEntry(
+                _sqliteCache.SavePreviewCachePayload(
                     folderPath,
                     signature,
                     assetId,
@@ -314,8 +300,8 @@ public partial class MainWindow : Window
                     TexturePreviewThumbnailAlgorithmVersion,
                     BuildTexturePreviewCacheParameters(texture, maxDimension),
                     hash,
-                    payloadPath,
-                    bytes.LongLength);
+                    bytes,
+                    payloadPath);
             }
             catch (Exception ex)
             {
