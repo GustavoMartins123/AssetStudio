@@ -18,6 +18,279 @@ namespace AssetStudio.Avalonia
             return LoadIndexCacheCore(folderPath, signature, allowMmapSidecar: false);
         }
 
+        public bool LoadIndexCacheIntoProjectIndex(
+            string folderPath,
+            string signature,
+            ProjectIndex targetIndex,
+            out List<SourceFileMetadata>? sourceFiles)
+        {
+            return LoadIndexCacheIntoProjectIndexCore(
+                folderPath,
+                signature,
+                targetIndex,
+                allowMmapSidecar: true,
+                out sourceFiles,
+                out _);
+        }
+
+        internal bool LoadIndexCacheIntoProjectIndex(
+            string folderPath,
+            string signature,
+            ProjectIndex targetIndex,
+            out List<SourceFileMetadata>? sourceFiles,
+            out bool hasMissingOriginalPaths)
+        {
+            return LoadIndexCacheIntoProjectIndexCore(
+                folderPath,
+                signature,
+                targetIndex,
+                allowMmapSidecar: true,
+                out sourceFiles,
+                out hasMissingOriginalPaths);
+        }
+
+        internal bool LoadIndexCacheIntoProjectIndexFromSqliteOnly(
+            string folderPath,
+            string signature,
+            ProjectIndex targetIndex,
+            out List<SourceFileMetadata>? sourceFiles)
+        {
+            return LoadIndexCacheIntoProjectIndexCore(
+                folderPath,
+                signature,
+                targetIndex,
+                allowMmapSidecar: false,
+                out sourceFiles,
+                out _);
+        }
+
+        private bool LoadIndexCacheIntoProjectIndexCore(
+            string folderPath,
+            string signature,
+            ProjectIndex targetIndex,
+            bool allowMmapSidecar,
+            out List<SourceFileMetadata>? sourceFiles,
+            out bool hasMissingOriginalPaths)
+        {
+            ArgumentNullException.ThrowIfNull(targetIndex);
+            sourceFiles = null;
+            hasMissingOriginalPaths = false;
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            var idxPath = MmapProjectIndexSidecar.GetSidecarPath(dbPath);
+            try
+            {
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
+                {
+                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
+                    if (projectId == null)
+                    {
+                        return false;
+                    }
+
+                    if (fromCache)
+                    {
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId == null)
+                        {
+                            return false;
+                        }
+
+                        projectId = verifiedProjectId;
+                    }
+
+                    var indexingStatus = LoadProjectIndexingStatus(conn, projectId.Value);
+                    if (IsIncompleteIndexCacheStatus(indexingStatus))
+                    {
+                        return false;
+                    }
+
+                    if (allowMmapSidecar
+                        && MmapProjectIndexSidecar.TryLoadIntoArena(
+                            idxPath,
+                            signature,
+                            SemanticSchemaVersion,
+                            targetIndex,
+                            out var mmapSourceFiles,
+                            out hasMissingOriginalPaths))
+                    {
+                        if (targetIndex.Count == 0)
+                        {
+                            sourceFiles = null;
+                            hasMissingOriginalPaths = false;
+                            return false;
+                        }
+
+                        sourceFiles = mmapSourceFiles;
+                        return true;
+                    }
+
+                    var loaded = LoadAssetRecordsIntoProjectIndex(
+                        conn,
+                        projectId.Value,
+                        targetIndex,
+                        out var sqliteSourceFiles,
+                        out hasMissingOriginalPaths,
+                        out var incomplete);
+                    if (incomplete || loaded == 0)
+                    {
+                        targetIndex.Clear();
+                        sourceFiles = null;
+                        hasMissingOriginalPaths = false;
+                        return false;
+                    }
+
+                    sourceFiles = sqliteSourceFiles;
+                    return true;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                targetIndex.Clear();
+                sourceFiles = null;
+                hasMissingOriginalPaths = false;
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                Logger.Warning($"Failed to load SQLite index cache into arena: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static int LoadAssetRecordsIntoProjectIndex(
+            SqliteConnection conn,
+            long projectId,
+            ProjectIndex targetIndex,
+            out List<SourceFileMetadata> sourceFiles,
+            out bool hasMissingOriginalPaths,
+            out bool incomplete)
+        {
+            sourceFiles = new List<SourceFileMetadata>();
+            hasMissingOriginalPaths = false;
+
+            var indexingStatus = LoadProjectIndexingStatus(conn, projectId);
+            if (IsIncompleteIndexCacheStatus(indexingStatus))
+            {
+                incomplete = true;
+                return 0;
+            }
+
+            incomplete = false;
+            var sourceOrigins = LoadSourceFileOriginsForProject(conn, projectId, sourceFiles);
+            var loadedCount = 0;
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT UniqueID, Name, Type, Container, SourceFileId, PathID, ByteStart, ByteSize
+                FROM Assets
+                WHERE ProjectId = @projectId";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+
+            long lastSourceFileId = long.MinValue;
+            var lastOrigin = AssetHandleOrigin.Empty;
+            var lastOriginMissingPath = true;
+
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                AssetHandleOrigin origin;
+                bool originMissingPath;
+                if (reader.IsDBNull(4))
+                {
+                    origin = AssetHandleOrigin.Empty;
+                    originMissingPath = true;
+                }
+                else
+                {
+                    var srcId = reader.GetInt64(4);
+                    if (srcId != lastSourceFileId)
+                    {
+                        lastSourceFileId = srcId;
+                        if (sourceOrigins.TryGetValue(srcId, out var resolved))
+                        {
+                            lastOrigin = resolved;
+                            lastOriginMissingPath = string.IsNullOrWhiteSpace(resolved.OriginalPath);
+                        }
+                        else
+                        {
+                            lastOrigin = AssetHandleOrigin.Empty;
+                            lastOriginMissingPath = true;
+                        }
+                    }
+
+                    origin = lastOrigin;
+                    originMissingPath = lastOriginMissingPath;
+                }
+
+                if (originMissingPath)
+                {
+                    hasMissingOriginalPaths = true;
+                }
+
+                var uniqueId = reader.GetString(0);
+                var name = reader.GetString(1);
+                var type = (ClassIDType)reader.GetInt32(2);
+                var container = reader.IsDBNull(3) ? string.Empty : reader.GetString(3);
+                var pathId = reader.GetInt64(5);
+                var byteStart = reader.GetInt64(6);
+                var byteSize = reader.GetInt64(7);
+
+                string? customUniqueId = uniqueId;
+                if (!ReferenceEquals(origin, AssetHandleOrigin.Empty)
+                    && !string.IsNullOrEmpty(uniqueId)
+                    && IsCanonicalUniqueIdForOrigin(uniqueId.AsSpan(), origin.UniqueIdPrefix.AsSpan(), pathId))
+                {
+                    customUniqueId = null;
+                }
+
+                targetIndex.AddRecord(
+                    serializedFileName: origin.SerializedFileName,
+                    originalPath: origin.OriginalPath,
+                    pathId: pathId,
+                    name: name,
+                    type: type,
+                    container: container,
+                    byteStart: byteStart,
+                    byteSize: byteSize,
+                    sourceHash: origin.SourceHash,
+                    unityVersion: origin.UnityVersion,
+                    customUniqueId: customUniqueId);
+                loadedCount++;
+            }
+
+            return loadedCount;
+        }
+
+        private static bool IsCanonicalUniqueIdForOrigin(
+            ReadOnlySpan<char> uniqueId,
+            ReadOnlySpan<char> originPrefix,
+            long pathId)
+        {
+            if (uniqueId.Length <= originPrefix.Length + 1 || uniqueId[originPrefix.Length] != '#')
+            {
+                return false;
+            }
+
+            if (!uniqueId.Slice(0, originPrefix.Length).SequenceEqual(originPrefix))
+            {
+                return false;
+            }
+
+            Span<char> pathIdBuf = stackalloc char[32];
+            if (!pathId.TryFormat(pathIdBuf, out var written, default, System.Globalization.CultureInfo.InvariantCulture))
+            {
+                return false;
+            }
+
+            return uniqueId.Length == originPrefix.Length + 1 + written
+                && uniqueId.Slice(originPrefix.Length + 1).SequenceEqual(pathIdBuf.Slice(0, written));
+        }
+
         private List<AssetHandle>? LoadIndexCacheCore(string folderPath, string signature, bool allowMmapSidecar)
         {
             EnsureInitialized(folderPath);
@@ -124,7 +397,10 @@ namespace AssetStudio.Avalonia
             return handles;
         }
 
-        private static Dictionary<long, AssetHandleOrigin> LoadSourceFileOriginsForProject(SqliteConnection conn, long projectId)
+        private static Dictionary<long, AssetHandleOrigin> LoadSourceFileOriginsForProject(
+            SqliteConnection conn,
+            long projectId,
+            List<SourceFileMetadata>? sourceFiles = null)
         {
             var result = new Dictionary<long, AssetHandleOrigin>();
             using var cmd = conn.CreateCommand();
@@ -138,6 +414,7 @@ namespace AssetStudio.Avalonia
             {
                 var serializedFileName = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
                 var originalPath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                sourceFiles?.Add(new SourceFileMetadata(serializedFileName, originalPath));
                 result[reader.GetInt64(0)] = AssetHandleOrigin.Intern(serializedFileName, originalPath);
             }
 

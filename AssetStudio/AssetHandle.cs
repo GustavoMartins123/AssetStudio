@@ -171,6 +171,7 @@ namespace AssetStudio
         {
             t_lastOrigin = null;
             OriginPool.Clear();
+            KeyOriginIdPool.Clear();
         }
     }
 

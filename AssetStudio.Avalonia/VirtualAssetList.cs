@@ -506,7 +506,7 @@ public sealed class VirtualAssetList :
         }
         else
         {
-            ClearProviderState();
+            ClearProviderState(releaseBackingStorage: true);
             _mode = BackingMode.List;
             _list = new List<AssetItem>();
             _array = null;
@@ -579,7 +579,7 @@ public sealed class VirtualAssetList :
             case BackingMode.Provider:
                 for (var i = 0; i < count; i++)
                 {
-                    array[arrayIndex + i] = GetProviderItem(i);
+                    array[arrayIndex + i] = TryPeekExistingItem(i) ?? _provider!(i);
                 }
                 break;
         }
@@ -696,6 +696,7 @@ public sealed class VirtualAssetList :
     {
         var generation = _generation;
         var count = _count;
+        var isProvider = _mode == BackingMode.Provider;
         for (var i = 0; i < count; i++)
         {
             if (generation != _generation)
@@ -703,7 +704,9 @@ public sealed class VirtualAssetList :
                 throw new InvalidOperationException("Collection was modified during enumeration.");
             }
 
-            yield return this[i];
+            yield return isProvider
+                ? (TryPeekExistingItem(i) ?? _provider!(i))
+                : this[i];
         }
     }
 
@@ -849,7 +852,7 @@ public sealed class VirtualAssetList :
         }
     }
 
-    private void ClearProviderState()
+    private void ClearProviderState(bool releaseBackingStorage = false)
     {
         if (_lruSlots != null && _lruCount > 0)
         {
@@ -858,6 +861,13 @@ public sealed class VirtualAssetList :
 
         _lruIndexToSlot?.Clear();
         _lruItemToIndex?.Clear();
+        if (releaseBackingStorage)
+        {
+            _lruSlots = null;
+            _lruIndexToSlot = null;
+            _lruItemToIndex = null;
+        }
+
         _lruCount = 0;
         _lruHead = -1;
         _lruTail = -1;

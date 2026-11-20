@@ -15,7 +15,11 @@ public partial class MainWindow
         lazyIndexingSessionId++;
         CancelProjectAnalysis();
         HideProjectAnalysisBanner();
-        ClearPreviewCacheBadge();
+        _animationPreviewCoordinator.CancelCurrent();
+        _animationRigPreviewCache.Clear();
+        ClearPreview();
+        ReleaseGlPreviewResources();
+        _sqliteCache.ReleaseReadConnections();
         assetsManager.DecompressionCache = null;
         BundleFile.CacheDirectory = "";
         lock (preloaderLock)
@@ -43,15 +47,16 @@ public partial class MainWindow
         }
         SpriteHelper.ClearAtlasCache();
         logger.ClearErrors();
-        exportableAssets.Clear();
-        visibleAssets.Clear();
+        ResetArenaAssetListState();
+        _eagerExportableAssets.Clear();
+        _eagerVisibleAssets.Clear();
         visibleAssetItems.Clear();
         lazyAssetItemsByHandleId.Clear();
         exportableAssetHandleIds.Clear();
         exportableAssetTypes.Clear();
         lazySourcePathBySerializedFile.Clear();
         lazySourceFileSearchCache.Clear();
-        lazyAssetItemOrdinal = 0;
+        resolvedSourcePathCache.Clear();
         assetClassItems.Clear();
         visibleAssetClassItems.Clear();
         classFilterOverride = null;
@@ -65,6 +70,8 @@ public partial class MainWindow
         sceneTreeNodes.Clear();
         treeSearchResults.Clear();
         listSearchDebounce?.Cancel();
+        listSearchDebounce?.Dispose();
+        listSearchDebounce = null;
         assetListSortMember = null;
         assetListSortDescending = false;
         assetContextCellText = string.Empty;
@@ -200,6 +207,8 @@ public partial class MainWindow
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        currentPreviewMesh = null;
+        currentPreviewAvatar = null;
         currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
         texturePreviewIdCounter++; // Cancel any running background image decoding task
@@ -212,6 +221,30 @@ public partial class MainWindow
         }
         PreviewLabel.Text = message;
         PreviewLabel.IsVisible = true;
+    }
+
+    private void ReleaseGlPreviewResources()
+    {
+        try
+        {
+            GLPreviewControl?.SetMeshGroup(Array.Empty<Mesh>());
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (TextureGLPreview != null)
+            {
+                using var emptyPixel = new SkiaSharp.SKBitmap(1, 1, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Unpremul);
+                TextureGLPreview.SetImage(emptyPixel);
+                TextureGLPreview.IsVisible = false;
+            }
+        }
+        catch
+        {
+        }
     }
 
     private void DisplayAll_Click(object? sender, RoutedEventArgs e)

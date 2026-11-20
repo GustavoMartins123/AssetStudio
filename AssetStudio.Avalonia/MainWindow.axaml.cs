@@ -29,7 +29,12 @@ public partial class MainWindow : Window
 {
     public MainWindowViewModel ViewModel { get; }
     private AssetsManager assetsManager = new AssetsManager();
-    private List<AssetItem> exportableAssets = new List<AssetItem>();
+    private List<AssetItem> _eagerExportableAssets = new List<AssetItem>();
+    private List<AssetItem> exportableAssets
+    {
+        get => _isArenaAssetListMode ? MaterializeArenaAssetItems(exportableArenaIndices) : _eagerExportableAssets;
+        set => _eagerExportableAssets = value;
+    }
     private Texture2D? currentPreviewTexture;
     private Sprite? currentPreviewSprite;
     private Mesh? currentPreviewMesh;
@@ -49,7 +54,8 @@ public partial class MainWindow : Window
     private const int UserPreviewPriorityMilliseconds = 1800;
     private const int UserInteractionYieldDelayMilliseconds = 40;
     private long userInteractionPriorityUntilTimestamp;
-    private List<AssetItem> visibleAssets = new();
+    private List<AssetItem> _eagerVisibleAssets = new();
+    private IReadOnlyList<AssetItem> visibleAssets => _isArenaAssetListMode ? visibleAssetItems : _eagerVisibleAssets;
     private readonly VirtualAssetList visibleAssetItems = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
@@ -99,7 +105,6 @@ public partial class MainWindow : Window
     private Dictionary<AssetHandleKey, AssetItem> lazyAssetItemsByHandleId = new();
     private HashSet<AssetHandleKey> exportableAssetHandleIds = new();
     private HashSet<ClassIDType> exportableAssetTypes = new();
-    private int lazyAssetItemOrdinal;
     private long lazyIndexingSessionId;
     private bool projectAutoIndexStarted;
     private int foregroundLazyLoadCount;
@@ -118,7 +123,7 @@ public partial class MainWindow : Window
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
-        visibleAssetItems.ReplaceBacking(visibleAssets);
+        visibleAssetItems.ReplaceBacking(_eagerVisibleAssets);
         AssetListDataGrid.ItemsSource = visibleAssetItems;
         GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
         GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
@@ -474,11 +479,46 @@ public partial class MainWindow : Window
         }
     }
 
+    internal static List<string> ResolveColdIndexFiles(
+        string folderPath,
+        ProjectScanResult? scanResult,
+        Action<string>? mergeSplitAssets = null,
+        Func<string, string[]>? enumerateFiles = null)
+    {
+        var mergeAction = mergeSplitAssets ?? (static path => ImportHelper.MergeSplitAssets(path, true));
+        var enumerateFunc = enumerateFiles ?? (static path => ImportHelper.GetFilesSafe(path, "*.*", true));
+
+        if (scanResult != null && scanResult.Files.Count > 0)
+        {
+            var hasSplitFiles = false;
+            var scannedPaths = new string[scanResult.Files.Count];
+            for (var i = 0; i < scanResult.Files.Count; i++)
+            {
+                var filePath = scanResult.Files[i].Path;
+                scannedPaths[i] = filePath;
+                if (!hasSplitFiles && filePath.EndsWith(".split0", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasSplitFiles = true;
+                }
+            }
+
+            if (!hasSplitFiles)
+            {
+                return ImportHelper.ProcessingSplitFiles(scannedPaths).ToList();
+            }
+        }
+
+        mergeAction(folderPath);
+        var enumerated = enumerateFunc(folderPath);
+        return ImportHelper.ProcessingSplitFiles(enumerated).ToList();
+    }
+
     private async void LoadPathsProgressiveAsync(string[] paths)
     {
         ResetForm();
         assetsManager.Clear();
         assetsManager.LazyLoading = true;
+        _isArenaAssetListMode = true;
         ApplyUnityVersionOption();
         StatusStripUpdate("Indexing assets with SQLite cache...");
 
@@ -506,32 +546,215 @@ public partial class MainWindow : Window
             assetsManager.DecompressionCache = null;
         }
 
+        var sessionId = lazyIndexingSessionId;
         try
         {
-            var files = new List<string>();
             if (paths.Length == 1 && Directory.Exists(paths[0]))
             {
                 var folderPath = paths[0];
                 SaveLoadFolder(folderPath);
-                await Task.Run(() => ImportHelper.MergeSplitAssets(folderPath, true));
-                var enumerated = await Task.Run(() => ImportHelper.GetFilesSafe(folderPath, "*.*", true));
-                files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(enumerated).ToList());
-            }
-            else
-            {
-                var targetFolder = Path.GetDirectoryName(Path.GetFullPath(paths[0])) ?? string.Empty;
-                if (!string.IsNullOrEmpty(targetFolder))
+
+                if (currentScanResult != null)
                 {
-                    SaveLoadFolder(targetFolder);
-                    await Task.Run(() => ImportHelper.MergeSplitAssets(targetFolder, false));
+                    var previousIndexingState = TryLoadIndexingProgress(folderPath, currentScanResult);
+                    if (previousIndexingState != null
+                        && !IsCompletedLazyIndexingStatus(previousIndexingState.Status))
+                    {
+                        var lastReadFile = string.IsNullOrWhiteSpace(previousIndexingState.LastReadFile)
+                            ? "none"
+                            : Path.GetFileName(previousIndexingState.LastReadFile);
+                        StatusStripUpdate(
+                            $"Previous indexing state: {previousIndexingState.Status}, {previousIndexingState.PercentComplete:0.##}% complete, last file: {lastReadFile}");
+                        ShowIndexingProgressPanel(previousIndexingState);
+                    }
+
+                    // Warm-open fast path: check mmap/.idx & SQLite cache directly into ProjectIndex.Arena BEFORE any second disk walk.
+                    var displayAllChecked = displayAll.IsChecked == true;
+                    var filterText = listSearch?.Text?.Trim();
+                    var classFilter = classFilterOverride;
+                    var filterTypeChecked = filterTypeAll.IsChecked != true;
+                    var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
+                        .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+                        .Select(x => (ClassIDType)x.Tag!)
+                        .ToHashSet() : null;
+                    var sortMember = assetListSortMember;
+                    var sortDescending = assetListSortDescending;
+                    var scanResultSnapshot = currentScanResult;
+                    var signature = _sqliteCache.GetFolderSignature(scanResultSnapshot);
+
+                    StatusStripUpdate("Loading project index from cache...");
+                    var warmResult = await Task.Run(() =>
+                    {
+                        if (!_sqliteCache.LoadIndexCacheIntoProjectIndex(
+                            folderPath,
+                            signature,
+                            assetsManager.ProjectIndex,
+                            out var loadedSources,
+                            out var missingPaths))
+                        {
+                            return (Loaded: false, MissingPaths: false, ExportableIndices: (List<int>?)null, ExportableBitset: (ulong[]?)null, ExportableTypes: (HashSet<ClassIDType>?)null, ClassItems: (List<AssetClassItem>?)null, VisibleIndices: (int[]?)null);
+                        }
+
+                        if (missingPaths)
+                        {
+                            assetsManager.ProjectIndex.Clear();
+                            return (Loaded: false, MissingPaths: true, ExportableIndices: (List<int>?)null, ExportableBitset: (ulong[]?)null, ExportableTypes: (HashSet<ClassIDType>?)null, ClassItems: (List<AssetClassItem>?)null, VisibleIndices: (int[]?)null);
+                        }
+
+                        if (loadedSources != null)
+                        {
+                            for (var i = 0; i < loadedSources.Count; i++)
+                            {
+                                var src = loadedSources[i];
+                                if (!string.IsNullOrWhiteSpace(src.OriginalPath))
+                                {
+                                    RememberLazySourcePathForSerializedFile(src.SerializedFileName, src.OriginalPath);
+                                    RememberLazySourcePathForSerializedFile(GetSafeFileName(src.OriginalPath), src.OriginalPath);
+                                }
+                            }
+                        }
+
+                        for (var i = 0; i < scanResultSnapshot.Files.Count; i++)
+                        {
+                            RememberLazySourcePath(scanResultSnapshot.Files[i].Path);
+                        }
+
+                        // Drain pending indices enqueued during bulk arena load so later preview loads only see new handles.
+                        _ = assetsManager.ProjectIndex.DrainPendingIndices();
+
+                        var arena = assetsManager.ProjectIndex.Arena;
+                        var totalCount = arena.Count;
+                        var localExportable = new List<int>(totalCount);
+                        var bitset = new ulong[(totalCount + 63) >> 6];
+                        var localTypes = new HashSet<ClassIDType>();
+
+                        for (var idx = 0; idx < totalCount; idx++)
+                        {
+                            var type = arena.GetType(idx);
+                            if (!displayAllChecked && !IsLazyExportableType(type))
+                            {
+                                continue;
+                            }
+
+                            localExportable.Add(idx);
+                            bitset[idx >> 6] |= 1UL << (idx & 63);
+                            localTypes.Add(type);
+                        }
+
+                        var classItems = AssetListQuery.BuildArenaAssetClassItems(arena);
+                        var exportableSnapshot = localExportable.ToArray();
+                        var visible = AssetListQuery.FilterArena(arena, exportableSnapshot, exportableSnapshot.Length, classFilter, selectedTypes, filterText, CancellationToken.None);
+                        AssetListQuery.SortArenaInPlace(arena, visible, visible.Length, sortMember, sortDescending);
+
+                        return (Loaded: true, MissingPaths: false, ExportableIndices: localExportable, ExportableBitset: bitset, ExportableTypes: localTypes, ClassItems: classItems, VisibleIndices: visible);
+                    });
+
+                    if (sessionId != lazyIndexingSessionId)
+                    {
+                        return;
+                    }
+
+                    if (warmResult.MissingPaths)
+                    {
+                        Logger.Info("SQLite index cache is missing source paths; rebuilding it once.");
+                    }
+                    else if (warmResult.Loaded && warmResult.ExportableIndices != null && warmResult.VisibleIndices != null)
+                    {
+                        ViewModel.IsIndexingActive = true;
+                        ViewModel.IsPauseEnabled = false;
+                        ViewModel.IsResumeEnabled = false;
+                        ViewModel.IsStopEnabled = false;
+
+                        try
+                        {
+                            _isArenaAssetListMode = true;
+                            exportableArenaIndices.Clear();
+                            exportableArenaIndices.AddRange(warmResult.ExportableIndices);
+                            _exportableArenaBitset = warmResult.ExportableBitset ?? Array.Empty<ulong>();
+                            exportableAssetTypes = warmResult.ExportableTypes ?? new HashSet<ClassIDType>();
+                            assetClassItems = warmResult.ClassItems ?? new List<AssetClassItem>();
+
+                            var isSorted = !string.IsNullOrEmpty(sortMember);
+                            var isIdentity = !isSorted && IsIdentityArenaIndices(warmResult.VisibleIndices, warmResult.VisibleIndices.Length);
+                            var isStrictlyIncreasing = !isSorted && (isIdentity || IsStrictlyIncreasingIndices(warmResult.VisibleIndices, warmResult.VisibleIndices.Length));
+
+                            BuildFilterTypeMenu();
+                            ApplyVisibleArenaIndices(warmResult.VisibleIndices, warmResult.VisibleIndices.Length, isStrictlyIncreasing, isIdentity);
+                            FilterAssetClasses();
+
+                            progressBar.Value = 100;
+                            ViewModel.LoadingProgress = 100;
+                            StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.");
+
+                            await BuildLazyConnectionsIfNeededAsync(paths);
+                            if (ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(paths))
+                            {
+                                return;
+                            }
+
+                            if (HasCompletedLazyStructureBuild(folderPath, scanResultSnapshot))
+                            {
+                                var completedStructureState = TryLoadIndexingProgress(folderPath, scanResultSnapshot);
+                                if (completedStructureState != null)
+                                {
+                                    ShowIndexingProgressPanel(completedStructureState);
+                                }
+                                SaveCurrentProjectAfterLoad(null, assetsManager.ProjectIndex.Count, ExportableAssetCount);
+                                return;
+                            }
+
+                            await BuildAssetStructuresAsync(incremental: true, showStructureProgress: true);
+                            return;
+                        }
+                        finally
+                        {
+                            ViewModel.IsIndexingActive = false;
+                            ViewModel.IsPauseEnabled = false;
+                            ViewModel.IsResumeEnabled = false;
+                            ViewModel.IsStopEnabled = false;
+                        }
+                    }
                 }
 
-                var list = paths
-                    .SelectMany(path => Directory.Exists(path)
-                        ? ImportHelper.GetFilesSafe(path, "*.*", true)
-                        : new[] { path })
-                    .Distinct(StringComparer.OrdinalIgnoreCase);
-                files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(list).ToList());
+                // Cold indexing path: reuse scanResult.Files whenever there are no .split0 files to merge.
+                var coldFiles = await Task.Run(() => ResolveColdIndexFiles(folderPath, currentScanResult));
+                if (sessionId != lazyIndexingSessionId)
+                {
+                    return;
+                }
+
+                if (coldFiles.Count == 0)
+                {
+                    StatusStripUpdate("No Unity files found.");
+                    return;
+                }
+
+                foreach (var file in coldFiles)
+                {
+                    RememberLazySourcePath(file);
+                }
+
+                StartProgressiveIndexing(coldFiles, paths);
+                return;
+            }
+
+            var targetFolder = Path.GetDirectoryName(Path.GetFullPath(paths[0])) ?? string.Empty;
+            if (!string.IsNullOrEmpty(targetFolder))
+            {
+                SaveLoadFolder(targetFolder);
+                await Task.Run(() => ImportHelper.MergeSplitAssets(targetFolder, false));
+            }
+
+            var list = paths
+                .SelectMany(path => Directory.Exists(path)
+                    ? ImportHelper.GetFilesSafe(path, "*.*", true)
+                    : new[] { path })
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+            var files = await Task.Run(() => ImportHelper.ProcessingSplitFiles(list).ToList());
+
+            if (sessionId != lazyIndexingSessionId)
+            {
+                return;
             }
 
             if (files.Count == 0)
@@ -543,82 +766,6 @@ public partial class MainWindow : Window
             foreach (var file in files)
             {
                 RememberLazySourcePath(file);
-            }
-
-            if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
-            {
-                var previousIndexingState = TryLoadIndexingProgress(paths[0], currentScanResult);
-                if (previousIndexingState != null
-                    && !IsCompletedLazyIndexingStatus(previousIndexingState.Status))
-                {
-                    var lastReadFile = string.IsNullOrWhiteSpace(previousIndexingState.LastReadFile)
-                        ? "none"
-                        : Path.GetFileName(previousIndexingState.LastReadFile);
-                    StatusStripUpdate(
-                        $"Previous indexing state: {previousIndexingState.Status}, {previousIndexingState.PercentComplete:0.##}% complete, last file: {lastReadFile}");
-                    ShowIndexingProgressPanel(previousIndexingState);
-                }
-            }
-
-            // Check cache
-            List<AssetHandle>? cachedHandles = null;
-            if (currentScanResult != null && paths.Length == 1 && Directory.Exists(paths[0]))
-            {
-                cachedHandles = await Task.Run(() => LoadIndexCache(paths[0], currentScanResult));
-            }
-
-            if (cachedHandles != null && cachedHandles.Any(handle => string.IsNullOrWhiteSpace(handle.OriginalPath)))
-            {
-                Logger.Info("SQLite index cache is missing source paths; rebuilding it once.");
-                cachedHandles = null;
-            }
-
-            if (cachedHandles != null)
-            {
-                ViewModel.IsIndexingActive = true;
-                ViewModel.IsPauseEnabled = false;
-                ViewModel.IsResumeEnabled = false;
-                ViewModel.IsStopEnabled = false;
-                ShowIndexingProgressPanel("running", 0, cachedHandles.Count, cachedHandles.Count, 0, string.Empty, string.Empty, null);
-
-                try
-                {
-                    StatusStripUpdate("Loading project index from SQLite cache...");
-                    var count = await LoadCachedHandlesIntoProjectIndexSmoothlyAsync(cachedHandles);
-                    progressBar.Value = 100;
-                    ViewModel.LoadingProgress = 100;
-                    StatusStripUpdate($"Loaded from cache. Showing {visibleAssets.Count:N0} assets ({count:N0} newly visible).");
-
-                    await BuildLazyConnectionsIfNeededAsync(paths);
-                    if (ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(paths))
-                    {
-                        return;
-                    }
-
-                    if (currentScanResult != null
-                        && paths.Length == 1
-                        && Directory.Exists(paths[0])
-                        && HasCompletedLazyStructureBuild(paths[0], currentScanResult))
-                    {
-                        var completedStructureState = TryLoadIndexingProgress(paths[0], currentScanResult);
-                        if (completedStructureState != null)
-                        {
-                            ShowIndexingProgressPanel(completedStructureState);
-                        }
-                        SaveCurrentProjectAfterLoad(null, assetsManager.ProjectIndex.Count, exportableAssets.Count);
-                        return;
-                    }
-
-                    await BuildAssetStructuresAsync(incremental: true, showStructureProgress: true);
-                    return;
-                }
-                finally
-                {
-                    ViewModel.IsIndexingActive = false;
-                    ViewModel.IsPauseEnabled = false;
-                    ViewModel.IsResumeEnabled = false;
-                    ViewModel.IsStopEnabled = false;
-                }
             }
 
             StartProgressiveIndexing(files, paths);
@@ -666,8 +813,8 @@ public partial class MainWindow : Window
                     ViewModel.LoadingProgress = progressPercent;
                     var addedAssets = AppendNewLazyAssetsFromProjectIndex();
                     StatusStripUpdate(addedAssets > 0
-                        ? $"{statusText} | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})"
-                        : $"{statusText} | Showing {visibleAssets.Count:N0} assets");
+                        ? $"{statusText} | Showing {VisibleAssetCount:N0} assets (+{addedAssets:N0})"
+                        : $"{statusText} | Showing {VisibleAssetCount:N0} assets");
                 });
             },
             (ex) =>
@@ -743,81 +890,59 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                foreach (var handle in batch)
+                var arenaIndices = new int[batch.Count];
+                var validCount = 0;
+                string? lastOriginalPath = null;
+                string? lastSerializedFile = null;
+                for (var i = 0; i < batch.Count; i++)
                 {
-                    RememberLazyHandleSourcePath(handle);
+                    var handle = batch[i];
+                    if (handle == null)
+                    {
+                        continue;
+                    }
+
+                    var originalPath = handle.OriginalPath;
+                    var serializedFile = handle.SerializedFileName;
+                    if (!string.Equals(originalPath, lastOriginalPath, StringComparison.Ordinal)
+                        || !string.Equals(serializedFile, lastSerializedFile, StringComparison.Ordinal))
+                    {
+                        RememberLazyHandleSourcePath(handle);
+                        lastOriginalPath = originalPath;
+                        lastSerializedFile = serializedFile;
+                    }
+
+                    var arenaIndex = handle.ArenaIndex;
+                    if (arenaIndex < 0 && handle.TryGetKey(out var key))
+                    {
+                        assetsManager.ProjectIndex.TryGetIndex(key, out arenaIndex);
+                    }
+
+                    if (arenaIndex >= 0)
+                    {
+                        arenaIndices[validCount++] = arenaIndex;
+                    }
+                }
+
+                if (validCount == 0)
+                {
+                    return;
+                }
+
+                if (validCount < arenaIndices.Length)
+                {
+                    Array.Resize(ref arenaIndices, validCount);
                 }
 
                 Dispatcher.UIThread.Post(() =>
                 {
                     if (indexingSessionId == lazyIndexingSessionId)
                     {
-                        AppendLazyHandles(batch);
+                        AppendLazyArenaIndices(arenaIndices);
                     }
                 });
             },
             handleFlushBatchSize: AssetLoadingService.DefaultHandleFlushBatchSize);
-    }
-
-    private async Task<int> LoadCachedHandlesIntoProjectIndexSmoothlyAsync(IReadOnlyList<AssetHandle> cachedHandles)
-    {
-        if (cachedHandles == null || cachedHandles.Count == 0)
-        {
-            return 0;
-        }
-
-        var sessionId = lazyIndexingSessionId;
-        var totalVisible = 0;
-        var totalHandles = cachedHandles.Count;
-        var coalescedBatchSize = Math.Max(CachedIndexLoadBatchSize * 20, (totalHandles + 7) / 8);
-
-        for (var offset = 0; offset < totalHandles;)
-        {
-            if (sessionId != lazyIndexingSessionId)
-            {
-                break;
-            }
-
-            var start = offset;
-            var targetBatchSize = start == 0 ? CachedIndexLoadBatchSize : coalescedBatchSize;
-            var count = Math.Min(targetBatchSize, totalHandles - start);
-            offset += count;
-
-            await Task.Run(() =>
-            {
-                AssetHandleOrigin? lastOrigin = null;
-                for (var i = start; i < start + count; i++)
-                {
-                    var handle = cachedHandles[i];
-                    var origin = handle.Origin;
-                    if (!ReferenceEquals(origin, lastOrigin))
-                    {
-                        RememberLazyHandleSourcePath(handle);
-                        lastOrigin = origin;
-                    }
-                    assetsManager.ProjectIndex.AddHandle(handle);
-                }
-            });
-
-            if (sessionId != lazyIndexingSessionId)
-            {
-                break;
-            }
-
-            totalVisible += AppendNewLazyAssetsFromProjectIndex(count);
-            var processed = start + count;
-            var percent = totalHandles == 0 ? 100 : Math.Min(100, processed * 100.0 / totalHandles);
-            progressBar.Value = percent;
-            ViewModel.LoadingProgress = (int)percent;
-            ShowIndexingProgressPanel("running", processed, totalHandles, totalHandles - processed, percent, string.Empty, string.Empty, null);
-            StatusStripUpdate($"Loading project index from SQLite cache... {processed:N0}/{totalHandles:N0} handles | Showing {visibleAssets.Count:N0} assets");
-            if (processed < totalHandles)
-            {
-                await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Background);
-            }
-        }
-
-        return totalVisible;
     }
 
     private int AppendNewLazyAssetsFromProjectIndex(int? maxHandlesToDrain = null)
@@ -827,86 +952,64 @@ public partial class MainWindow : Window
             return 0;
         }
 
-        var pendingHandles = maxHandlesToDrain.HasValue
-            ? assetsManager.ProjectIndex.DrainPendingHandles(maxHandlesToDrain.Value)
-            : assetsManager.ProjectIndex.DrainPendingHandles();
+        var pendingIndices = maxHandlesToDrain.HasValue
+            ? assetsManager.ProjectIndex.DrainPendingIndices(maxHandlesToDrain.Value)
+            : assetsManager.ProjectIndex.DrainPendingIndices();
 
-        return AppendLazyHandles(pendingHandles);
+        return AppendLazyArenaIndices(pendingIndices);
     }
 
-    private int AppendLazyHandles(IEnumerable<AssetHandle> pendingHandles)
+    private int AppendLazyArenaIndices(ReadOnlySpan<int> pendingIndices)
     {
-        if (!assetsManager.LazyLoading || pendingHandles == null)
+        if (!assetsManager.LazyLoading || pendingIndices.IsEmpty)
         {
             return 0;
         }
 
+        _isArenaAssetListMode = true;
+        var arena = assetsManager.ProjectIndex.Arena;
+        var arenaCount = arena.Count;
         var displayAllChecked = displayAll.IsChecked == true;
         var filterTypesChanged = false;
-        var newExportableItems = new List<AssetItem>();
+        var newExportableIndices = new List<int>(pendingIndices.Length);
         string? lastRememberedOriginalPath = null;
         string? lastRememberedSerializedFile = null;
 
-        foreach (var handle in pendingHandles)
+        for (var i = 0; i < pendingIndices.Length; i++)
         {
-            if (handle == null || !handle.TryGetKey(out var handleKey))
+            var idx = pendingIndices[i];
+            if ((uint)idx >= (uint)arenaCount)
             {
                 continue;
             }
 
-            var originalPath = handle.OriginalPath;
-            var serializedFileName = handle.SerializedFileName;
-            if (!string.Equals(originalPath, lastRememberedOriginalPath, StringComparison.Ordinal)
-                || !string.Equals(serializedFileName, lastRememberedSerializedFile, StringComparison.Ordinal))
+            var origin = arena.GetOrigin(idx);
+            var originalPath = origin.OriginalPath;
+            var serializedFileName = origin.SerializedFileName;
+            if (!string.IsNullOrWhiteSpace(originalPath)
+                && (!string.Equals(originalPath, lastRememberedOriginalPath, StringComparison.Ordinal)
+                    || !string.Equals(serializedFileName, lastRememberedSerializedFile, StringComparison.Ordinal)))
             {
-                RememberLazyHandleSourcePath(handle);
+                RememberLazySourcePathForSerializedFile(serializedFileName, originalPath);
+                RememberLazySourcePathForSerializedFile(GetSafeFileName(originalPath), originalPath);
                 lastRememberedOriginalPath = originalPath;
                 lastRememberedSerializedFile = serializedFileName;
             }
 
-            if (!lazyAssetItemsByHandleId.TryGetValue(handleKey, out var assetItem))
-            {
-                assetItem = handle.Tag as AssetItem;
-                if (assetItem == null)
-                {
-                    assetItem = new AssetItem(handle, lazyAssetItemOrdinal++);
-                }
-                else
-                {
-                    if (!assetItem.HasOrdinalOrUniqueId)
-                    {
-                        assetItem.SetOrdinal(lazyAssetItemOrdinal++);
-                    }
-                    UpdateLazyAssetItemHandle(assetItem, handle);
-                }
-
-                lazyAssetItemsByHandleId[handleKey] = assetItem;
-            }
-            else
-            {
-                if (!assetItem.HasOrdinalOrUniqueId)
-                {
-                    assetItem.SetOrdinal(lazyAssetItemOrdinal++);
-                }
-
-                UpdateLazyAssetItemHandle(assetItem, handle);
-            }
-
-            handle.Tag = assetItem;
-
-            if (!displayAllChecked && !IsLazyExportableType(handle.Type))
+            var type = arena.GetType(idx);
+            if (!displayAllChecked && !IsLazyExportableType(type))
             {
                 continue;
             }
 
-            if (!exportableAssetHandleIds.Add(handleKey))
+            if (!TryMarkExportableArenaIndex(idx))
             {
                 continue;
             }
 
-            exportableAssets.Add(assetItem);
-            newExportableItems.Add(assetItem);
-            if (exportableAssetTypes.Add(assetItem.Type))
+            exportableArenaIndices.Add(idx);
+            newExportableIndices.Add(idx);
+            if (exportableAssetTypes.Add(type))
             {
                 filterTypesChanged = true;
             }
@@ -917,8 +1020,8 @@ public partial class MainWindow : Window
             BuildFilterTypeMenu();
         }
 
-        AppendFilteredAssetsToVisible(newExportableItems);
-        return newExportableItems.Count;
+        AppendFilteredArenaIndicesToVisible(newExportableIndices);
+        return newExportableIndices.Count;
     }
 
     private static void UpdateLazyAssetItemHandle(AssetItem assetItem, AssetHandle handle)
@@ -996,23 +1099,12 @@ public partial class MainWindow : Window
             filesListSnapshot = assetsManager.assetsFileList.ToList();
         }
 
-        var result = await Task.Run(() =>
+        if (assetsManager.LazyLoading)
         {
-            PublishStructureStage(1, "Collecting containers and asset items");
-            string? localProductName = null;
-            var localExportableAssets = new List<AssetItem>();
-            var localSceneTreeNodes = new List<GameObjectNode>();
-            
-            var localTreeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
-            var localObjectAssetItemDic = new Dictionary<Object, AssetItem>();
-            var localPathIDAssetItemDic = new Dictionary<string, AssetItem>();
-            var localContainers = new List<(PPtr<Object>, string)>();
-            var localNewExportableAssets = new List<AssetItem>();
-
-            int i = 0;
-
-            if (assetsManager.LazyLoading)
+            var lazyResult = await Task.Run(() =>
             {
+                PublishStructureStage(1, "Collecting containers and arena indices");
+                var localContainers = new List<(PPtr<Object>, string)>();
                 foreach (var assetsFile in filesListSnapshot)
                 {
                     YieldBackgroundWorkForUserInteraction();
@@ -1033,36 +1125,176 @@ public partial class MainWindow : Window
                     }
                 }
 
-                var handles = assetsManager.ProjectIndex.GetHandles().ToArray();
-                BuildLazyAssetItemsBackground(
-                    handles,
-                    displayAllChecked,
-                    localPathIDAssetItemDic,
-                    localObjectAssetItemDic,
-                    localExportableAssets,
-                    localNewExportableAssets,
-                    populatePathIdDictionary: localContainers.Count > 0);
-                i += handles.Length;
+                PublishStructureStage(2, "Linking container paths");
+                var projectIndex = assetsManager.ProjectIndex;
+                var arena = projectIndex.Arena;
+                foreach ((var pptr, var container) in localContainers)
+                {
+                    if (pptr.TryGetAssetsFile(out var targetFile))
+                    {
+                        var targetKey = AssetHandle.BuildUniqueID(targetFile, pptr.m_PathID);
+                        if (projectIndex.TryGetIndexByUniqueId(targetKey, out var targetIdx))
+                        {
+                            var handle = arena.MaterializeHandle(targetIdx);
+                            handle.Container = container;
+                            if (handle.Type == ClassIDType.Material && string.IsNullOrEmpty(handle.Name))
+                            {
+                                var name = Path.GetFileNameWithoutExtension(container);
+                                if (!string.IsNullOrEmpty(name))
+                                {
+                                    handle.Name = name;
+                                }
+                            }
+                        }
+                    }
+                }
+                localContainers.Clear();
+
+                PublishStructureStage(3, "Indexing arena records");
+                _ = projectIndex.DrainPendingIndices();
+                var totalCount = arena.Count;
+                var localExportable = new List<int>(totalCount);
+                var localBitset = new ulong[(totalCount + 63) >> 6];
+                var localTypes = new HashSet<ClassIDType>();
+
+                for (var idx = 0; idx < totalCount; idx++)
+                {
+                    var type = arena.GetType(idx);
+                    if (!displayAllChecked && !IsLazyExportableType(type))
+                    {
+                        continue;
+                    }
+
+                    localExportable.Add(idx);
+                    localBitset[idx >> 6] |= 1UL << (idx & 63);
+                    localTypes.Add(type);
+                }
+
+                PublishStructureStage(4, "Building class structures");
+                List<AssetClassItem> localAssetClassItems;
+                if (filesListSnapshot.Count > 0)
+                {
+                    localAssetClassItems = new List<AssetClassItem>();
+                    var objectCounts = filesListSnapshot
+                        .SelectMany(file => file.m_Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.classID }))
+                        .GroupBy(x => (x.unityVersion, x.ClassID))
+                        .ToDictionary(x => x.Key, x => x.Count());
+
+                    var seen = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var assetsFile in filesListSnapshot)
+                    {
+                        YieldBackgroundWorkForUserInteraction();
+                        AddSerializedTypesBackground(assetsFile, assetsFile.m_Types, "Native", objectCounts, seen, localAssetClassItems);
+                        AddSerializedTypesBackground(assetsFile, assetsFile.m_RefTypes, "Reference", objectCounts, seen, localAssetClassItems);
+                    }
+
+                    localAssetClassItems = localAssetClassItems
+                        .OrderBy(x => x.UnityVersion, StringComparer.OrdinalIgnoreCase)
+                        .ThenBy(x => x.ClassID)
+                        .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                }
+                else
+                {
+                    localAssetClassItems = AssetListQuery.BuildArenaAssetClassItems(arena);
+                }
+
+                return (
+                    ExportableIndices: localExportable,
+                    ExportableBitset: localBitset,
+                    ExportableTypes: localTypes,
+                    AssetClassItems: localAssetClassItems);
+            });
+
+            await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
+            PublishStructureStage(5, "Applying asset structure to UI");
+
+            _isArenaAssetListMode = true;
+            var previousExportableCount = exportableArenaIndices.Count;
+            var needsFullRefresh = !incremental
+                || previousExportableCount == 0
+                || lazyResult.ExportableIndices.Count != previousExportableCount
+                || _arenaCoalescedSortCts != null;
+
+            exportableArenaIndices.Clear();
+            exportableArenaIndices.AddRange(lazyResult.ExportableIndices);
+            _exportableArenaBitset = lazyResult.ExportableBitset;
+            exportableAssetTypes = lazyResult.ExportableTypes;
+            _eagerExportableAssets.Clear();
+            _eagerVisibleAssets.Clear();
+            lazyAssetItemsByHandleId.Clear();
+            exportableAssetHandleIds.Clear();
+            assetClassItems = lazyResult.AssetClassItems;
+
+            BuildFilterTypeMenu();
+            if (needsFullRefresh)
+            {
+                await FilterAssetListAsync(CancellationToken.None);
+                FilterAssetClasses();
             }
             else
             {
-                BuildEagerAssetItemsBackground(
-                    filesListSnapshot,
-                    displayAllChecked,
-                    localTreeNodeDictionary,
-                    localObjectAssetItemDic,
-                    localPathIDAssetItemDic,
-                    localContainers,
-                    localExportableAssets,
-                    localSceneTreeNodes,
-                    out localProductName);
+                UpdateAssetClassesIncremental(lazyResult.AssetClassItems);
             }
 
-            PublishStructureStage(2, "Linking asset items");
-            if (!assetsManager.LazyLoading)
+            var lazyLog = $"Finished loading {assetsManager.assetsFileList.Count} files with {ExportableAssetCount:N0} exportable assets";
+            var lazyObjCount = assetsManager.ProjectIndex.Count;
+            if (lazyObjCount > 0)
             {
-                LinkAssetItemsToSceneNodesBackground(filesListSnapshot, localTreeNodeDictionary, localObjectAssetItemDic);
+                lazyLog += $" ({lazyObjCount:N0} indexed in arena)";
             }
+            StatusStripUpdate(lazyLog);
+
+            Title = assetsManager.assetsFileList.Count > 0
+                ? FormatLoadedWindowTitle(null, assetsManager.assetsFileList[0])
+                : FormatWindowTitle();
+
+            PublishStructureStage(6, "Saving project metadata");
+            var finalExportableCount = ExportableAssetCount;
+            await Task.Run(() => SaveCurrentProjectAfterLoad(null, lazyObjCount, finalExportableCount));
+
+            if (publishStructureProgress)
+            {
+                var folderPath = GetCurrentCacheFolderPath();
+                if (currentScanResult != null && HasSavedSemanticRelations(folderPath, currentScanResult))
+                {
+                    PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
+                }
+                else
+                {
+                    PublishStructureBuildProgress("structure_failed", structureBuildSteps, structureBuildSteps, "Asset structure built without saved connections");
+                }
+            }
+
+            return;
+        }
+
+        var result = await Task.Run(() =>
+        {
+            PublishStructureStage(1, "Collecting containers and asset items");
+            string? localProductName = null;
+            var localExportableAssets = new List<AssetItem>();
+            var localSceneTreeNodes = new List<GameObjectNode>();
+            
+            var localTreeNodeDictionary = new Dictionary<GameObject, GameObjectNode>();
+            var localObjectAssetItemDic = new Dictionary<Object, AssetItem>();
+            var localPathIDAssetItemDic = new Dictionary<string, AssetItem>();
+            var localContainers = new List<(PPtr<Object>, string)>();
+            var localNewExportableAssets = new List<AssetItem>();
+
+            BuildEagerAssetItemsBackground(
+                filesListSnapshot,
+                displayAllChecked,
+                localTreeNodeDictionary,
+                localObjectAssetItemDic,
+                localPathIDAssetItemDic,
+                localContainers,
+                localExportableAssets,
+                localSceneTreeNodes,
+                out localProductName);
+
+            PublishStructureStage(2, "Linking asset items");
+            LinkAssetItemsToSceneNodesBackground(filesListSnapshot, localTreeNodeDictionary, localObjectAssetItemDic);
 
             foreach ((var pptr, var container) in localContainers)
             {
@@ -1093,10 +1325,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            if (!assetsManager.LazyLoading)
-            {
-                LinkFbxSubAssetsToSceneNodesBackground(localExportableAssets, localSceneTreeNodes);
-            }
+            LinkFbxSubAssetsToSceneNodesBackground(localExportableAssets, localSceneTreeNodes);
             localContainers.Clear();
 
             var localObjectToAssetItemCache = new Dictionary<AssetStudio.Object, AssetItem>();
@@ -1114,28 +1343,25 @@ public partial class MainWindow : Window
             var localAnimationClipTransformBindingsCache = new Dictionary<AnimationClip, HashSet<uint>>();
 
             PublishStructureStage(3, "Building reference indexes");
-            if (!assetsManager.LazyLoading)
-            {
-                Parallel.Invoke(
-                    CreateStructureBuildParallelOptions(),
-                    () => BuildAssetReferenceIndexesBackground(
-                        filesListSnapshot,
-                        localExportableAssets,
-                        out localObjectToAssetItemCache,
-                        out localMeshToMaterialsCache,
-                        out localMeshAssociatedRenderersCache,
-                        out localMeshSourceTypesCache,
-                        out localMaterialMainTextureCache,
-                        out localMaterialPreviewMaterialCache,
-                        out localMaterialTextureSlotsCache,
-                        out localSemanticRelations),
-                    () => BuildAnimationPreviewIndexesBackground(
-                        filesListSnapshot,
-                        out localAnimationClipAvatarCache,
-                        out localAvatarMeshCache,
-                        out localMeshAvatarCache,
-                        out localAnimationClipTransformBindingsCache));
-            }
+            Parallel.Invoke(
+                CreateStructureBuildParallelOptions(),
+                () => BuildAssetReferenceIndexesBackground(
+                    filesListSnapshot,
+                    localExportableAssets,
+                    out localObjectToAssetItemCache,
+                    out localMeshToMaterialsCache,
+                    out localMeshAssociatedRenderersCache,
+                    out localMeshSourceTypesCache,
+                    out localMaterialMainTextureCache,
+                    out localMaterialPreviewMaterialCache,
+                    out localMaterialTextureSlotsCache,
+                    out localSemanticRelations),
+                () => BuildAnimationPreviewIndexesBackground(
+                    filesListSnapshot,
+                    out localAnimationClipAvatarCache,
+                    out localAvatarMeshCache,
+                    out localMeshAvatarCache,
+                    out localAnimationClipTransformBindingsCache));
 
             PublishStructureStage(4, "Building class structures");
             var localAssetClassItems = new List<AssetClassItem>();
@@ -1193,12 +1419,13 @@ public partial class MainWindow : Window
         PublishStructureStage(5, "Applying asset structure to UI");
 
         // Apply results back on the UI thread
+        _isArenaAssetListMode = false;
         var newExportableAssets = result.NewExportableAssets;
-        bool useIncrementalPath = incremental && exportableAssets.Count > 0 && newExportableAssets != null;
+        bool useIncrementalPath = incremental && _eagerExportableAssets.Count > 0 && newExportableAssets != null;
 
         if (useIncrementalPath && newExportableAssets!.Count == 0)
         {
-            exportableAssets = result.ExportableAssets;
+            _eagerExportableAssets = result.ExportableAssets;
             ApplyExportableAssetIndexes(result);
             assetClassItems = result.AssetClassItems;
             BuildFilterTypeMenu();
@@ -1207,7 +1434,7 @@ public partial class MainWindow : Window
         else if (useIncrementalPath)
         {
             // Incremental path: only append new items to avoid O(n) DataGrid notifications
-            exportableAssets = result.ExportableAssets;
+            _eagerExportableAssets = result.ExportableAssets;
             ApplyExportableAssetIndexes(result);
             assetClassItems = result.AssetClassItems;
 
@@ -1218,7 +1445,7 @@ public partial class MainWindow : Window
         else
         {
             // Full rebuild path (initial load, display all toggle, etc.)
-            exportableAssets = result.ExportableAssets;
+            _eagerExportableAssets = result.ExportableAssets;
             ApplyExportableAssetIndexes(result);
             sceneTreeNodes = result.SceneTreeNodes;
             treeSearchResults.Clear();
@@ -1243,15 +1470,13 @@ public partial class MainWindow : Window
             SceneTreeView.ItemsSource = sceneTreeNodes;
         }
 
-        var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {exportableAssets.Count} exportable assets";
+        var log = $"Finished loading {assetsManager.assetsFileList.Count} files with {ExportableAssetCount} exportable assets";
         var m_ObjectsCount = assetsManager.assetsFileList.Sum(x => x.m_Objects.Count);
         var objectsCount = assetsManager.assetsFileList.Sum(x => x.Objects.Count);
         if (m_ObjectsCount != objectsCount)
         {
             var deferredCount = m_ObjectsCount - objectsCount;
-            log += assetsManager.LazyLoading
-                ? $" and {deferredCount:N0} objects indexed for lazy loading"
-                : $" and {deferredCount:N0} assets failed to read";
+            log += $" and {deferredCount:N0} assets failed to read";
         }
         StatusStripUpdate(log);
 
@@ -1259,27 +1484,13 @@ public partial class MainWindow : Window
             ? FormatLoadedWindowTitle(result.ProductName, assetsManager.assetsFileList[0])
             : FormatWindowTitle();
 
-        var assetCountForStats = assetsManager.LazyLoading
-            ? assetsManager.ProjectIndex.Count
-            : m_ObjectsCount;
         PublishStructureStage(6, "Saving project metadata");
-        await Task.Run(() => SaveCurrentProjectAfterLoad(result.ProductName, assetCountForStats, exportableAssets.Count));
-
-        if (!assetsManager.LazyLoading)
-        {
-            await Task.Run(() => TrySaveSemanticRelations(result.SemanticRelations));
-        }
+        var eagerExportableCount = ExportableAssetCount;
+        await Task.Run(() => SaveCurrentProjectAfterLoad(result.ProductName, m_ObjectsCount, eagerExportableCount));
+        await Task.Run(() => TrySaveSemanticRelations(result.SemanticRelations));
         if (publishStructureProgress)
         {
-            var folderPath = GetCurrentCacheFolderPath();
-            if (!assetsManager.LazyLoading || (currentScanResult != null && HasSavedSemanticRelations(folderPath, currentScanResult)))
-            {
-                PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
-            }
-            else
-            {
-                PublishStructureBuildProgress("structure_failed", structureBuildSteps, structureBuildSteps, "Asset structure built without saved connections");
-            }
+            PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
         }
         }
         catch
@@ -1542,6 +1753,24 @@ public partial class MainWindow : Window
     {
         ProjectAnalysisReportUpdated -= OnProjectAnalysisReportUpdated;
         CancelProjectAnalysis();
+        CancelPendingArenaCoalescedSort();
+        listSearchDebounce?.Cancel();
+        listSearchDebounce?.Dispose();
+        listSearchDebounce = null;
+        _animationPreviewCoordinator.CancelCurrent();
+        _animationRigPreviewCache.Clear();
+        ClearPreview();
+        ReleaseGlPreviewResources();
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.LoadMeshPreviewGeometryCache = null;
+            GLPreviewControl.SaveMeshPreviewGeometryCache = null;
+        }
+        ResetArenaAssetListState();
+        visibleAssetItems.Clear();
+        resolvedSourcePathCache.Clear();
+        lazySourcePathBySerializedFile.Clear();
+        lazySourceFileSearchCache.Clear();
         assetsManager.DecompressionCache = null;
         AssetsManager.ShouldYieldForUserInteraction = null;
         FlushAvatarPreviewSettingsSave();
@@ -1549,6 +1778,7 @@ public partial class MainWindow : Window
         VideoReset();
         _pcmWavePreviewPlayer?.Dispose();
         SpriteHelper.ClearAtlasCache();
+        _sqliteCache.Dispose();
         assetsManager.Dispose();
         base.OnClosing(e);
     }
