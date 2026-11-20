@@ -69,20 +69,7 @@ namespace AssetStudio
             outPutSize = expectedOutput <= int.MaxValue ? (int)expectedOutput : 0;
         }
 
-        internal bool SupportsDirectSpanDecode
-        {
-            get
-            {
-                if (!RequiresNativeWholeImageArray(m_TextureFormat))
-                {
-                    return true;
-                }
-
-                long expectedOutputSize = (long)m_Width * m_Height * 4;
-                long minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
-                return ShouldUseStreamingDecode(expectedOutputSize, minDataSize);
-            }
-        }
+        public bool SupportsDirectSpanDecode => true;
 
         internal bool CanDecode()
         {
@@ -197,54 +184,24 @@ namespace AssetStudio
                     return false;
                 }
 
-                if (RequiresNativeWholeImageArray(m_TextureFormat))
+                if (m_TextureFormat == TextureFormat.ARGB4444
+                    || m_TextureFormat == TextureFormat.RGB565
+                    || m_TextureFormat == TextureFormat.DXT1
+                    || m_TextureFormat == TextureFormat.DXT3
+                    || m_TextureFormat == TextureFormat.DXT5)
                 {
-                    if (m_TextureFormat == TextureFormat.DXT1 || m_TextureFormat == TextureFormat.DXT5)
-                    {
-                        SwapBytesForXbox(buff);
-                    }
+                    SwapBytesForXbox(buff);
+                }
 
-                    if (backingArray != null)
-                    {
-                        flag = DecodeNativeFormat(m_TextureFormat, buff, backingArray);
-                    }
-                    else
-                    {
-                        int outLen = (int)expectedOutputSize;
-                        byte[] tempOut;
-                        try
-                        {
-                            tempOut = BigArrayPool<byte>.Shared.Rent(outLen);
-                        }
-                        catch (OutOfMemoryException)
-                        {
-                            Logger.Warning($"Out of memory allocating {outLen} bytes for native texture decode");
-                            return false;
-                        }
-                        try
-                        {
-                            flag = DecodeNativeFormat(m_TextureFormat, buff, tempOut);
-                            if (flag)
-                            {
-                                tempOut.AsSpan(0, outLen).CopyTo(bytes);
-                            }
-                        }
-                        finally
-                        {
-                            BigArrayPool<byte>.Shared.Return(tempOut);
-                        }
-                    }
+                ReadOnlySpan<byte> inputSpan = buff.AsSpan(0, allocSize);
+                Span<byte> outputSpan = bytes.Slice(0, (int)expectedOutputSize);
+                if (IsNativeDecodedFormat(m_TextureFormat))
+                {
+                    flag = DecodeNativeFormat(m_TextureFormat, inputSpan, outputSpan);
                 }
                 else
                 {
-                    if (m_TextureFormat == TextureFormat.ARGB4444
-                        || m_TextureFormat == TextureFormat.RGB565
-                        || m_TextureFormat == TextureFormat.DXT3)
-                    {
-                        SwapBytesForXbox(buff);
-                    }
-
-                    flag = DecodeManagedFormat(m_TextureFormat, buff.AsSpan(0, allocSize), bytes.Slice(0, (int)expectedOutputSize));
+                    flag = DecodeManagedFormat(m_TextureFormat, inputSpan, outputSpan);
                 }
             }
             finally
@@ -332,11 +289,12 @@ namespace AssetStudio
             };
         }
 
-        private static bool RequiresNativeWholeImageArray(TextureFormat format)
+        private static bool IsNativeDecodedFormat(TextureFormat format)
         {
             return format switch
             {
                 TextureFormat.DXT1 or
+                TextureFormat.DXT3 or
                 TextureFormat.DXT5 or
                 TextureFormat.BC6H or
                 TextureFormat.BC7 or
@@ -384,12 +342,14 @@ namespace AssetStudio
             };
         }
 
-        private bool DecodeNativeFormat(TextureFormat format, byte[] buff, byte[] bytes)
+        private bool DecodeNativeFormat(TextureFormat format, ReadOnlySpan<byte> buff, Span<byte> bytes)
         {
             switch (format)
             {
                 case TextureFormat.DXT1: //test pass
                     return DecodeDXT1(buff, bytes);
+                case TextureFormat.DXT3:
+                    return DecodeDXT3(buff, bytes);
                 case TextureFormat.DXT5: //test pass
                     return DecodeDXT5(buff, bytes);
                 case TextureFormat.BC6H: //test pass
@@ -487,8 +447,6 @@ namespace AssetStudio
                     return DecodeBGR24(buff, bytes);
                 case TextureFormat.R16: //test pass
                     return DecodeR16(buff, bytes);
-                case TextureFormat.DXT3:
-                    return DecodeDXT3(buff, bytes);
                 case TextureFormat.RGBA4444: //test pass
                     return DecodeRGBA4444(buff, bytes);
                 case TextureFormat.BGRA32: //test pass
@@ -894,96 +852,17 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeDXT1(byte[] image_data, byte[] buff)
+        private bool DecodeDXT1(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeDXT1(image_data, m_Width, m_Height, buff);
         }
 
         private bool DecodeDXT3(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
-            int blockCountX = (m_Width + 3) / 4;
-            int blockCountY = (m_Height + 3) / 4;
-            int bytesPerBlock = 16;
-            
-            for (int y = 0; y < blockCountY; y++)
-            {
-                for (int x = 0; x < blockCountX; x++)
-                {
-                    int blockIndex = (y * blockCountX + x) * bytesPerBlock;
-                    if (blockIndex + 16 > image_data.Length)
-                        continue;
-
-                    ulong alphaData = BinaryPrimitives.ReadUInt64LittleEndian(image_data.Slice(blockIndex, 8));
-                    ushort c0 = BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(blockIndex + 8, 2));
-                    ushort c1 = BinaryPrimitives.ReadUInt16LittleEndian(image_data.Slice(blockIndex + 10, 2));
-                    uint colorIndices = BinaryPrimitives.ReadUInt32LittleEndian(image_data.Slice(blockIndex + 12, 4));
-
-                    int r5_0 = (c0 >> 11) & 0x1F;
-                    int g6_0 = (c0 >> 5) & 0x3F;
-                    int b5_0 = c0 & 0x1F;
-                    byte r0 = (byte)((r5_0 << 3) | (r5_0 >> 2));
-                    byte g0 = (byte)((g6_0 << 2) | (g6_0 >> 4));
-                    byte b0 = (byte)((b5_0 << 3) | (b5_0 >> 2));
-
-                    int r5_1 = (c1 >> 11) & 0x1F;
-                    int g6_1 = (c1 >> 5) & 0x3F;
-                    int b5_1 = c1 & 0x1F;
-                    byte r1 = (byte)((r5_1 << 3) | (r5_1 >> 2));
-                    byte g1 = (byte)((g6_1 << 2) | (g6_1 >> 4));
-                    byte b1 = (byte)((b5_1 << 3) | (b5_1 >> 2));
-
-                    byte r2 = (byte)((2 * r0 + r1) / 3);
-                    byte g2 = (byte)((2 * g0 + g1) / 3);
-                    byte b2 = (byte)((2 * b0 + b1) / 3);
-
-                    byte r3 = (byte)((r0 + 2 * r1) / 3);
-                    byte g3 = (byte)((g0 + 2 * g1) / 3);
-                    byte b3 = (byte)((b0 + 2 * b1) / 3);
-
-                    for (int py = 0; py < 4; py++)
-                    {
-                        int pixelY = y * 4 + py;
-                        if (pixelY >= m_Height) continue;
-
-                        for (int px = 0; px < 4; px++)
-                        {
-                            int pixelX = x * 4 + px;
-                            if (pixelX >= m_Width) continue;
-
-                            int pixelIndexInBlock = py * 4 + px;
-                            
-                            int alphaShift = pixelIndexInBlock * 4;
-                            byte alpha4 = (byte)((alphaData >> alphaShift) & 0x0F);
-                            byte alpha = (byte)((alpha4 << 4) | alpha4);
-
-                            int colorShift = pixelIndexInBlock * 2;
-                            uint colorIndex = (colorIndices >> colorShift) & 0x03;
-
-                            byte r = 0, g = 0, b = 0;
-                            switch (colorIndex)
-                            {
-                                case 0: r = r0; g = g0; b = b0; break;
-                                case 1: r = r1; g = g1; b = b1; break;
-                                case 2: r = r2; g = g2; b = b2; break;
-                                case 3: r = r3; g = g3; b = b3; break;
-                            }
-
-                            int outIndex = (pixelY * m_Width + pixelX) * 4;
-                            if (outIndex + 4 <= buff.Length)
-                            {
-                                buff[outIndex] = b;
-                                buff[outIndex + 1] = g;
-                                buff[outIndex + 2] = r;
-                                buff[outIndex + 3] = alpha;
-                            }
-                        }
-                    }
-                }
-            }
-            return true;
+            return TextureDecoder.DecodeDXT3(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeDXT5(byte[] image_data, byte[] buff)
+        private bool DecodeDXT5(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeDXT5(image_data, m_Width, m_Height, buff);
         }
@@ -1151,27 +1030,27 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeBC4(byte[] image_data, byte[] buff)
+        private bool DecodeBC4(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeBC4(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeBC5(byte[] image_data, byte[] buff)
+        private bool DecodeBC5(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeBC5(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeBC6H(byte[] image_data, byte[] buff)
+        private bool DecodeBC6H(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeBC6(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeBC7(byte[] image_data, byte[] buff)
+        private bool DecodeBC7(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeBC7(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeDXT1Crunched(byte[] image_data, byte[] buff)
+        private bool DecodeDXT1Crunched(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             if (UnpackCrunch(image_data, out var result)
                 && result.Length >= GetMinimumDataSize(TextureFormat.DXT1, m_Width, m_Height))
@@ -1184,7 +1063,7 @@ namespace AssetStudio
             return false;
         }
 
-        private bool DecodeDXT5Crunched(byte[] image_data, byte[] buff)
+        private bool DecodeDXT5Crunched(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             if (UnpackCrunch(image_data, out var result)
                 && result.Length >= GetMinimumDataSize(TextureFormat.DXT5, m_Width, m_Height))
@@ -1197,62 +1076,62 @@ namespace AssetStudio
             return false;
         }
 
-        private bool DecodePVRTC(byte[] image_data, byte[] buff, bool is2bpp)
+        private bool DecodePVRTC(ReadOnlySpan<byte> image_data, Span<byte> buff, bool is2bpp)
         {
             return TextureDecoder.DecodePVRTC(image_data, m_Width, m_Height, buff, is2bpp);
         }
 
-        private bool DecodeETC1(byte[] image_data, byte[] buff)
+        private bool DecodeETC1(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeETC1(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeATCRGB4(byte[] image_data, byte[] buff)
+        private bool DecodeATCRGB4(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeATCRGB4(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeATCRGBA8(byte[] image_data, byte[] buff)
+        private bool DecodeATCRGBA8(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeATCRGBA8(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeEACR(byte[] image_data, byte[] buff)
+        private bool DecodeEACR(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeEACR(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeEACRSigned(byte[] image_data, byte[] buff)
+        private bool DecodeEACRSigned(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeEACRSigned(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeEACRG(byte[] image_data, byte[] buff)
+        private bool DecodeEACRG(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeEACRG(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeEACRGSigned(byte[] image_data, byte[] buff)
+        private bool DecodeEACRGSigned(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeEACRGSigned(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeETC2(byte[] image_data, byte[] buff)
+        private bool DecodeETC2(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeETC2(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeETC2A1(byte[] image_data, byte[] buff)
+        private bool DecodeETC2A1(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeETC2A1(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeETC2A8(byte[] image_data, byte[] buff)
+        private bool DecodeETC2A8(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             return TextureDecoder.DecodeETC2A8(image_data, m_Width, m_Height, buff);
         }
 
-        private bool DecodeASTC(byte[] image_data, byte[] buff, int blocksize)
+        private bool DecodeASTC(ReadOnlySpan<byte> image_data, Span<byte> buff, int blocksize)
         {
             return TextureDecoder.DecodeASTC(image_data, m_Width, m_Height, blocksize, blocksize, buff);
         }
@@ -1283,7 +1162,7 @@ namespace AssetStudio
             return true;
         }
 
-        private bool DecodeETC1Crunched(byte[] image_data, byte[] buff)
+        private bool DecodeETC1Crunched(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             if (UnpackCrunch(image_data, out var result)
                 && result.Length >= GetMinimumDataSize(TextureFormat.ETC_RGB4, m_Width, m_Height))
@@ -1296,7 +1175,7 @@ namespace AssetStudio
             return false;
         }
 
-        private bool DecodeETC2A8Crunched(byte[] image_data, byte[] buff)
+        private bool DecodeETC2A8Crunched(ReadOnlySpan<byte> image_data, Span<byte> buff)
         {
             if (UnpackCrunch(image_data, out var result)
                 && result.Length >= GetMinimumDataSize(TextureFormat.ETC2_RGBA8, m_Width, m_Height))
@@ -1352,7 +1231,7 @@ namespace AssetStudio
             return true;
         }
 
-        private bool UnpackCrunch(byte[] image_data, [NotNullWhen(true)] out byte[]? result)
+        private bool UnpackCrunch(ReadOnlySpan<byte> image_data, [NotNullWhen(true)] out byte[]? result)
         {
             if (version[0] > 2017 || (version[0] == 2017 && version[1] >= 3) //2017.3 and up
                 || m_TextureFormat == TextureFormat.ETC_RGB4Crunched
@@ -1609,25 +1488,14 @@ namespace AssetStudio
             return false;
         }
 
-        private bool DecodeBlockRow(TextureFormat format, byte[] compressedRow, int width, int height, int blockWidth, int blockHeight, byte[] outputRow)
+        private bool DecodeBlockRow(TextureFormat format, ReadOnlySpan<byte> compressedRow, int width, int height, int blockWidth, int blockHeight, Span<byte> outputRow)
         {
             switch (format)
             {
                 case TextureFormat.DXT1:
                     return TextureDecoder.DecodeDXT1(compressedRow, width, height, outputRow);
                 case TextureFormat.DXT3:
-                    {
-                        var originalHeight = m_Height;
-                        m_Height = height;
-                        try
-                        {
-                            return DecodeDXT3(compressedRow, outputRow);
-                        }
-                        finally
-                        {
-                            m_Height = originalHeight;
-                        }
-                    }
+                    return TextureDecoder.DecodeDXT3(compressedRow, width, height, outputRow);
                 case TextureFormat.DXT5:
                     return TextureDecoder.DecodeDXT5(compressedRow, width, height, outputRow);
                 case TextureFormat.BC4:
@@ -1727,14 +1595,11 @@ namespace AssetStudio
                 int stripBlocksY = Math.Min(blocksY, Math.Min(maxByDecoded, maxByCompressed));
 
                 int maxStripCompressedBytes = stripBlocksY * rowBytes;
-                int maxStripDecodedHeight = (int)Math.Min((long)stripBlocksY * blockHeight, m_Height);
-                int maxStripDecodedBytes = m_Width * maxStripDecodedHeight * 4;
 
                 bool needsXboxSwap = platform == BuildTarget.XBOX360 &&
                     (m_TextureFormat == TextureFormat.DXT1 || m_TextureFormat == TextureFormat.DXT3 || m_TextureFormat == TextureFormat.DXT5);
 
                 byte[] compressedStrip = BigArrayPool<byte>.Shared.Rent(maxStripCompressedBytes);
-                byte[] chunkDecoded = BigArrayPool<byte>.Shared.Rent(maxStripDecodedBytes);
                 try
                 {
                     int outputRowStride = m_Width * 4;
@@ -1756,19 +1621,17 @@ namespace AssetStudio
                             }
                         }
 
-                        if (!DecodeBlockRow(m_TextureFormat, compressedStrip, m_Width, chunkHeight, blockWidth, blockHeight, chunkDecoded))
+                        int dstOffset = by * blockHeight * outputRowStride;
+                        int dstLength = chunkHeight * outputRowStride;
+                        if (!DecodeBlockRow(m_TextureFormat, compressedStrip.AsSpan(0, stripBytes), m_Width, chunkHeight, blockWidth, blockHeight, bytes.Slice(dstOffset, dstLength)))
                         {
                             return false;
                         }
-
-                        int dstOffset = by * blockHeight * outputRowStride;
-                        chunkDecoded.AsSpan(0, chunkHeight * outputRowStride).CopyTo(bytes.Slice(dstOffset));
                     }
                     return true;
                 }
                 finally
                 {
-                    BigArrayPool<byte>.Shared.Return(chunkDecoded);
                     BigArrayPool<byte>.Shared.Return(compressedStrip);
                 }
             }

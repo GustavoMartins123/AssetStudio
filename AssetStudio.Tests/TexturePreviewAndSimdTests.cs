@@ -225,6 +225,108 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Theory]
+        [InlineData(4, 4)]
+        [InlineData(5, 7)]
+        [InlineData(13, 9)]
+        [InlineData(16, 16)]
+        public void Texture2DConverter_And_ConvertToImage_DirectSpanNativeDecode_Dxt3AndCompressedFormats_MatchReference(int width, int height)
+        {
+            int blocksX = (width + 3) / 4;
+            int blocksY = (height + 3) / 4;
+            int pixelBytes = width * height * 4;
+
+            var data8 = new byte[blocksX * blocksY * 8];
+            var data16 = new byte[blocksX * blocksY * 16];
+            var rng = new Random(7700 + width * 31 + height);
+            rng.NextBytes(data8);
+            rng.NextBytes(data16);
+
+            // Force valid ASTC 4x4 LDR header on each 16-byte block for ASTC_RGBA_4x4
+            var astc16 = (byte[])data16.Clone();
+            for (int i = 0; i < astc16.Length; i += 16)
+            {
+                astc16[i] = 0x45;
+                astc16[i + 1] = 0x00;
+            }
+
+            // 1) DXT3 parity against scalar reference (Array, Span, ConvertToImage unflipped & flipped, and Xbox360 endian swap)
+            var expectedDxt3 = ScalarDecodeDxt3(data16, width, height);
+            var texDxt3 = CreateSyntheticTexture(width, height, TextureFormat.DXT3, data16, pathId: 6100 + width);
+            var dxt3Converter = new Texture2DConverter(texDxt3);
+            Assert.True(dxt3Converter.SupportsDirectSpanDecode);
+
+            var actualDxt3Array = new byte[pixelBytes];
+            var actualDxt3Span = new byte[pixelBytes];
+            Assert.True(dxt3Converter.DecodeTexture2D(actualDxt3Array));
+            Assert.True(dxt3Converter.DecodeTexture2D(actualDxt3Span.AsSpan()));
+            Assert.Equal(expectedDxt3, actualDxt3Array);
+            Assert.Equal(expectedDxt3, actualDxt3Span);
+
+            using (var dxt3Img = texDxt3.ConvertToImage(flip: false))
+            {
+                Assert.NotNull(dxt3Img);
+                var imgBytes = new byte[pixelBytes];
+                dxt3Img!.CopyBgraPixelsTo(imgBytes);
+                Assert.Equal(expectedDxt3, imgBytes);
+            }
+
+            using (var dxt3ImgFlipped = texDxt3.ConvertToImage(flip: true))
+            {
+                Assert.NotNull(dxt3ImgFlipped);
+                var imgBytesFlipped = new byte[pixelBytes];
+                dxt3ImgFlipped!.CopyBgraPixelsTo(imgBytesFlipped);
+                Assert.Equal(FlipRowsCopy(expectedDxt3, width * 4, height), imgBytesFlipped);
+            }
+
+            // Verify Xbox360 byte-swap path on DXT3
+            var xboxDxt3Bytes = (byte[])data16.Clone();
+            var xboxWords = MemoryMarshal.Cast<byte, ushort>(xboxDxt3Bytes.AsSpan());
+            for (int i = 0; i < xboxWords.Length; i++)
+            {
+                xboxWords[i] = BinaryPrimitives.ReverseEndianness(xboxWords[i]);
+            }
+            var texDxt3Xbox = CreateSyntheticTexture(width, height, TextureFormat.DXT3, xboxDxt3Bytes, pathId: 6200 + width);
+            texDxt3Xbox.platform = BuildTarget.XBOX360;
+            var actualXboxOut = new byte[pixelBytes];
+            Assert.True(new Texture2DConverter(texDxt3Xbox).DecodeTexture2D(actualXboxOut.AsSpan()));
+            Assert.Equal(expectedDxt3, actualXboxOut);
+
+            // 2) Direct-span vs byte[] vs ConvertToImage parity across all native compressed families
+            var compressedCases = new (TextureFormat Format, byte[] Raw)[]
+            {
+                (TextureFormat.DXT1, data8),
+                (TextureFormat.DXT3, data16),
+                (TextureFormat.DXT5, data16),
+                (TextureFormat.BC4, data8),
+                (TextureFormat.BC5, data16),
+                (TextureFormat.BC7, data16),
+                (TextureFormat.ETC_RGB4, data8),
+                (TextureFormat.ETC2_RGB, data8),
+                (TextureFormat.ETC2_RGBA8, data16),
+                (TextureFormat.ASTC_RGBA_4x4, astc16),
+            };
+
+            foreach (var (format, rawBytes) in compressedCases)
+            {
+                var tex = CreateSyntheticTexture(width, height, format, rawBytes, pathId: 6300 + (int)format);
+                var converter = new Texture2DConverter(tex);
+                Assert.True(converter.SupportsDirectSpanDecode);
+
+                var outArray = new byte[pixelBytes];
+                var outSpan = new byte[pixelBytes];
+                Assert.True(converter.DecodeTexture2D(outArray));
+                Assert.True(converter.DecodeTexture2D(outSpan.AsSpan()));
+                Assert.Equal(outArray, outSpan);
+
+                using var bitmap = tex.ConvertToImage(flip: false);
+                Assert.NotNull(bitmap);
+                var outBitmap = new byte[pixelBytes];
+                bitmap!.CopyBgraPixelsTo(outBitmap);
+                Assert.Equal(outArray, outBitmap);
+            }
+        }
+
         [Fact]
         public void ImageExtensions_FlipVerticalInPlace_WithPaddedRowBytes_PreservesPaddingAndFlipsRows()
         {
@@ -526,6 +628,69 @@ namespace AssetStudio.Tests
                 Buffer.BlockCopy(src, (height - 1 - y) * rowBytes, dst, y * rowBytes, rowBytes);
             }
             return dst;
+        }
+
+        private static byte[] ScalarDecodeDxt3(ReadOnlySpan<byte> imageData, int width, int height)
+        {
+            var buff = new byte[width * height * 4];
+            int blockCountX = (width + 3) / 4;
+            int blockCountY = (height + 3) / 4;
+            for (int y = 0; y < blockCountY; y++)
+            {
+                for (int x = 0; x < blockCountX; x++)
+                {
+                    int blockIndex = (y * blockCountX + x) * 16;
+                    ulong alphaData = BinaryPrimitives.ReadUInt64LittleEndian(imageData.Slice(blockIndex, 8));
+                    ushort c0 = BinaryPrimitives.ReadUInt16LittleEndian(imageData.Slice(blockIndex + 8, 2));
+                    ushort c1 = BinaryPrimitives.ReadUInt16LittleEndian(imageData.Slice(blockIndex + 10, 2));
+                    uint colorIndices = BinaryPrimitives.ReadUInt32LittleEndian(imageData.Slice(blockIndex + 12, 4));
+
+                    byte r0 = (byte)(((c0 >> 8) & 0xF8) | (c0 >> 13));
+                    byte g0 = (byte)(((c0 >> 3) & 0xFC) | ((c0 >> 9) & 0x03));
+                    byte b0 = (byte)((c0 << 3) | ((c0 >> 2) & 0x07));
+
+                    byte r1 = (byte)(((c1 >> 8) & 0xF8) | (c1 >> 13));
+                    byte g1 = (byte)(((c1 >> 3) & 0xFC) | ((c1 >> 9) & 0x03));
+                    byte b1 = (byte)((c1 << 3) | ((c1 >> 2) & 0x07));
+
+                    byte r2 = (byte)((2 * r0 + r1) / 3);
+                    byte g2 = (byte)((2 * g0 + g1) / 3);
+                    byte b2 = (byte)((2 * b0 + b1) / 3);
+
+                    byte r3 = (byte)((r0 + 2 * r1) / 3);
+                    byte g3 = (byte)((g0 + 2 * g1) / 3);
+                    byte b3 = (byte)((b0 + 2 * b1) / 3);
+
+                    for (int py = 0; py < 4; py++)
+                    {
+                        int pixelY = y * 4 + py;
+                        if (pixelY >= height) continue;
+                        for (int px = 0; px < 4; px++)
+                        {
+                            int pixelX = x * 4 + px;
+                            if (pixelX >= width) continue;
+                            int idx = py * 4 + px;
+                            byte alpha4 = (byte)((alphaData >> (idx * 4)) & 0x0F);
+                            byte alpha = (byte)((alpha4 << 4) | alpha4);
+                            uint colorIndex = (colorIndices >> (idx * 2)) & 0x03;
+                            byte r = 0, g = 0, b = 0;
+                            switch (colorIndex)
+                            {
+                                case 0: r = r0; g = g0; b = b0; break;
+                                case 1: r = r1; g = g1; b = b1; break;
+                                case 2: r = r2; g = g2; b = b2; break;
+                                case 3: r = r3; g = g3; b = b3; break;
+                            }
+                            int outIndex = (pixelY * width + pixelX) * 4;
+                            buff[outIndex] = b;
+                            buff[outIndex + 1] = g;
+                            buff[outIndex + 2] = r;
+                            buff[outIndex + 3] = alpha;
+                        }
+                    }
+                }
+            }
+            return buff;
         }
 
         private static Texture2D CreateSyntheticTexture(int width, int height, TextureFormat format, byte[] rawBytes, long pathId)
