@@ -4,6 +4,7 @@ using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
@@ -19,25 +20,33 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private const int ArenaViewportLruCapacity = 512;
-    private const int ArenaInlineSortedMergeThreshold = 8192;
-
     private CancellationTokenSource? listSearchDebounce;
-    private bool isRefreshingFilterList;
     private bool isSorting;
-    private bool _isArenaAssetListMode;
-    private readonly List<int> exportableArenaIndices = new();
-    private ulong[] _exportableArenaBitset = Array.Empty<ulong>();
-    private int[] visibleArenaIndices = Array.Empty<int>();
-    private int visibleArenaCount;
-    private bool visibleArenaIsIdentity;
-    private bool visibleArenaIsStrictlyIncreasing;
-    private Dictionary<int, int>? visibleArenaRowByArenaIndex;
-    private CancellationTokenSource? _arenaCoalescedSortCts;
-    private int _arenaCoalescedSortVersion;
 
-    private int ExportableAssetCount => _isArenaAssetListMode ? exportableArenaIndices.Count : _eagerExportableAssets.Count;
-    private int VisibleAssetCount => _isArenaAssetListMode ? visibleArenaCount : _eagerVisibleAssets.Count;
+    private bool isRefreshingFilterList
+    {
+        get => ViewModel.AssetList.IsRefreshing;
+        set => ViewModel.AssetList.IsRefreshing = value;
+    }
+
+    private bool _isArenaAssetListMode
+    {
+        get => ViewModel.AssetList.IsArenaMode;
+        set
+        {
+            if (value)
+            {
+                ViewModel.AssetList.BeginArenaMode(assetsManager.ProjectIndex);
+            }
+            else
+            {
+                ViewModel.AssetList.ResetArenaState();
+            }
+        }
+    }
+
+    private int ExportableAssetCount => ViewModel.AssetList.TotalAssetCount;
+    private int VisibleAssetCount => ViewModel.AssetList.VisibleAssetCount;
 
     private async void ListSearch_TextChanged(object? sender, TextChangedEventArgs e)
     {
@@ -175,39 +184,87 @@ public partial class MainWindow
         await ExportSelectedModelGroupFbxAsync();
     }
 
-    private async Task FilterAssetListAsync(CancellationToken token)
+    private void SyncFilterInputsToAssetListViewModel()
     {
-        CancelPendingArenaCoalescedSort();
+        ViewModel.AssetList.SearchText = listSearch?.Text?.Trim() ?? string.Empty;
+        if (filterTypeAll.IsChecked == true)
+        {
+            ViewModel.AssetList.SelectAllClassTypes();
+        }
+        else
+        {
+            var selectedTypes = GetFilterTypeItems()
+                .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
+                .Select(x => (ClassIDType)x.Tag!);
+            ViewModel.AssetList.SetSelectedClassTypes(selectedTypes);
+        }
+    }
 
-        var filterText = listSearch?.Text?.Trim();
-        var classFilter = classFilterOverride;
-        var filterTypeChecked = filterTypeAll.IsChecked != true;
-        var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
-            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
-            .Select(x => (ClassIDType)x.Tag!)
-            .ToHashSet() : null;
-
-        var sortMember = assetListSortMember;
-        var sortDescending = assetListSortDescending;
-
-        // Capture selection before filtering
-        var selectedKeys = new HashSet<AssetSelectionKey>();
+    private AssetSelectionKey CaptureDataGridSelectionToViewModel()
+    {
         AssetSelectionKey oldSelectedKey = default;
         if (AssetListDataGrid.SelectedItems != null)
         {
-            foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
+            var primary = AssetListDataGrid.SelectedItem as AssetItem;
+            AssetListViewModel.TryGetAssetSelectionKey(primary, out oldSelectedKey);
+            ViewModel.AssetList.SetSelection(AssetListDataGrid.SelectedItems.OfType<AssetItem>(), primary);
+        }
+        else
+        {
+            ViewModel.AssetList.ClearSelection();
+        }
+
+        return oldSelectedKey;
+    }
+
+    private void RestoreDataGridSelectionFromViewModel()
+    {
+        var selectedItems = AssetListDataGrid.SelectedItems;
+        if (selectedItems == null)
+        {
+            return;
+        }
+
+        var vmSelected = ViewModel.AssetList.SelectedItems;
+        var vmKeys = ViewModel.AssetList.SelectedKeys;
+        if (vmKeys.Count == 0)
+        {
+            return;
+        }
+
+        if (selectedItems.Count > 0 && !_isArenaAssetListMode)
+        {
+            var preservedCount = 0;
+            foreach (var item in selectedItems.OfType<AssetItem>())
             {
-                if (TryGetAssetSelectionKey(item, out var key))
+                if (AssetListViewModel.TryGetAssetSelectionKey(item, out var key) && vmKeys.Contains(key))
                 {
-                    selectedKeys.Add(key);
+                    preservedCount++;
                 }
             }
 
-            if (AssetListDataGrid.SelectedItem is AssetItem selectedItem)
+            if (preservedCount == vmKeys.Count || preservedCount == selectedItems.Count)
             {
-                TryGetAssetSelectionKey(selectedItem, out oldSelectedKey);
+                return;
             }
         }
+
+        if (vmSelected.Count == 0 && selectedItems.Count == 0)
+        {
+            return;
+        }
+
+        selectedItems.Clear();
+        for (var i = 0; i < vmSelected.Count; i++)
+        {
+            selectedItems.Add(vmSelected[i]);
+        }
+    }
+
+    private async Task FilterAssetListAsync(CancellationToken token)
+    {
+        SyncFilterInputsToAssetListViewModel();
+        var oldSelectedKey = CaptureDataGridSelectionToViewModel();
 
         // Find scroll viewer and save scroll offset
         var scrollViewer = FindVisualChild<ScrollViewer>(AssetListDataGrid);
@@ -215,57 +272,22 @@ public partial class MainWindow
 
         try
         {
-            if (_isArenaAssetListMode)
+            var applied = await ViewModel.AssetList.FilterAsync(token);
+            if (!applied)
             {
-                var arena = assetsManager.ProjectIndex.Arena;
-                var indicesSnapshot = exportableArenaIndices.ToArray();
-                var arenaResult = await Task.Run(() =>
-                {
-                    var matches = AssetListQuery.FilterArena(arena, indicesSnapshot, indicesSnapshot.Length, classFilter, selectedTypes, filterText, token);
-                    token.ThrowIfCancellationRequested();
-                    AssetListQuery.SortArenaInPlace(arena, matches, matches.Length, sortMember, sortDescending);
-                    return matches;
-                }, token);
-
-                var isSorted = !string.IsNullOrEmpty(sortMember);
-                var isIdentity = !isSorted && IsIdentityArenaIndices(arenaResult, arenaResult.Length);
-                var isStrictlyIncreasing = !isSorted && (isIdentity || IsStrictlyIncreasingIndices(arenaResult, arenaResult.Length));
-
-                isRefreshingFilterList = true;
-                try
-                {
-                    ApplyVisibleArenaIndices(arenaResult, arenaResult.Length, isStrictlyIncreasing, isIdentity);
-                    StatusStripUpdate($"Showing {VisibleAssetCount:N0} assets");
-                    RestoreArenaSelectionIfNeeded(selectedKeys);
-                }
-                finally
-                {
-                    isRefreshingFilterList = false;
-                }
+                return;
             }
-            else
+
+            isRefreshingFilterList = true;
+            try
             {
-                var assetsSnapshot = _eagerExportableAssets.ToArray();
-                var result = await Task.Run(() =>
-                {
-                    var matches = AssetListQuery.Filter(assetsSnapshot, classFilter, selectedTypes, filterText, token);
-                    token.ThrowIfCancellationRequested();
-                    return AssetListQuery.SortInPlace(matches, sortMember, sortDescending);
-                }, token);
-
-                isRefreshingFilterList = true;
-                try
-                {
-                    ReplaceVisibleAssetsOwned(result);
-                    StatusStripUpdate($"Showing {VisibleAssetCount} assets");
-
-                    // Restore selection if DataGrid Reset did not already retain all matching items (e.g. re-materialized instances).
-                    RestoreSelectionIfNeeded(selectedKeys);
-                }
-                finally
-                {
-                    isRefreshingFilterList = false;
-                }
+                EnsureAssetListItemsSource();
+                RestoreDataGridSelectionFromViewModel();
+                StatusStripUpdate(ViewModel.AssetList.StatusSummary);
+            }
+            finally
+            {
+                isRefreshingFilterList = false;
             }
 
             // Restore scroll position
@@ -290,10 +312,10 @@ public partial class MainWindow
                     preloaderCts?.Cancel();
                 }
             }
-            TryGetAssetSelectionKey(newSelectedItem, out var newSelectedKey);
+            AssetListViewModel.TryGetAssetSelectionKey(newSelectedItem, out var newSelectedKey);
             if (newSelectedKey != oldSelectedKey)
             {
-                _currentlySelectedUniqueID = GetAssetUniqueKey(newSelectedItem);
+                _currentlySelectedUniqueID = AssetListViewModel.GetAssetUniqueKey(newSelectedItem);
                 if (newSelectedItem != null)
                 {
                     if (RightTabControl.SelectedIndex == 1)
@@ -324,60 +346,22 @@ public partial class MainWindow
 
     private async Task ApplyAssetListSortAsync()
     {
-        CancelPendingArenaCoalescedSort();
-
-        var sortMember = assetListSortMember;
-        var sortDescending = assetListSortDescending;
-        var selectedKeys = new HashSet<AssetSelectionKey>();
-        if (AssetListDataGrid.SelectedItems != null)
-        {
-            foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
-            {
-                if (TryGetAssetSelectionKey(item, out var key))
-                {
-                    selectedKeys.Add(key);
-                }
-            }
-        }
+        CaptureDataGridSelectionToViewModel();
 
         try
         {
-            if (_isArenaAssetListMode)
+            var applied = await ViewModel.AssetList.ApplySortAsync();
+            if (!applied)
             {
-                var arena = assetsManager.ProjectIndex.Arena;
-                var currentIndices = new int[visibleArenaCount];
-                if (visibleArenaCount > 0)
-                {
-                    Array.Copy(visibleArenaIndices, currentIndices, visibleArenaCount);
-                }
-
-                await Task.Run(() => AssetListQuery.SortArenaInPlace(arena, currentIndices, currentIndices.Length, sortMember, sortDescending));
-
-                isRefreshingFilterList = true;
-                try
-                {
-                    var isSorted = !string.IsNullOrEmpty(sortMember);
-                    var isIdentity = !isSorted && IsIdentityArenaIndices(currentIndices, currentIndices.Length);
-                    var isStrictlyIncreasing = !isSorted && (isIdentity || IsStrictlyIncreasingIndices(currentIndices, currentIndices.Length));
-                    ApplyVisibleArenaIndices(currentIndices, currentIndices.Length, isStrictlyIncreasing, isIdentity);
-                    RestoreArenaSelectionIfNeeded(selectedKeys);
-                    StatusStripUpdate($"Showing {VisibleAssetCount:N0} assets");
-                }
-                finally
-                {
-                    isRefreshingFilterList = false;
-                }
                 return;
             }
 
-            var currentAssets = new List<AssetItem>(_eagerVisibleAssets);
-            var sorted = await Task.Run(() => AssetListQuery.SortInPlace(currentAssets, sortMember, sortDescending));
             isRefreshingFilterList = true;
             try
             {
-                ReplaceVisibleAssetsOwned(sorted);
-                RestoreSelectionIfNeeded(selectedKeys);
-                StatusStripUpdate($"Showing {VisibleAssetCount} assets");
+                EnsureAssetListItemsSource();
+                RestoreDataGridSelectionFromViewModel();
+                StatusStripUpdate(ViewModel.AssetList.StatusSummary);
             }
             finally
             {
@@ -391,414 +375,28 @@ public partial class MainWindow
         }
     }
 
-    private readonly record struct AssetSelectionKey(AssetHandleKey HandleKey, string? FallbackUniqueId);
+    private bool TryMarkExportableArenaIndex(int arenaIndex) => ViewModel.AssetList.TryMarkExportableArenaIndex(arenaIndex);
 
-    private static bool TryGetAssetSelectionKey(AssetItem? item, out AssetSelectionKey key)
-    {
-        if (item == null)
-        {
-            key = default;
-            return false;
-        }
+    private void ResetArenaAssetListState() => ViewModel.AssetList.ResetArenaState();
 
-        if (item.Handle != null && item.Handle.TryGetKey(out var handleKey))
-        {
-            key = new AssetSelectionKey(handleKey, null);
-            return true;
-        }
+    private void CancelPendingArenaCoalescedSort() => ViewModel.AssetList.CancelPendingArenaCoalescedSort();
 
-        var uid = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
-        if (!string.IsNullOrEmpty(uid))
-        {
-            key = new AssetSelectionKey(default, uid);
-            return true;
-        }
+    private int[] SnapshotExportableArenaIndices() => ViewModel.AssetList.SnapshotExportableArenaIndices();
 
-        key = default;
-        return false;
-    }
+    private int[] SnapshotVisibleArenaIndices() => ViewModel.AssetList.SnapshotVisibleArenaIndices();
 
-    private static string? GetAssetUniqueKey(AssetItem? item)
-    {
-        if (item == null)
-        {
-            return null;
-        }
+    private AssetItem MaterializeArenaAssetItem(int arenaIndex) => ViewModel.AssetList.MaterializeArenaAssetItem(arenaIndex);
 
-        return item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
-    }
+    private List<AssetItem> MaterializeArenaAssetItems(IReadOnlyList<int> indices) => ViewModel.AssetList.MaterializeArenaAssetItems(indices);
 
-    private void RestoreSelectionIfNeeded(HashSet<AssetSelectionKey> selectedKeys)
-    {
-        if (selectedKeys.Count == 0)
-        {
-            return;
-        }
+    private static bool IsIdentityArenaIndices(int[] indices, int count) => AssetListViewModel.IsIdentityArenaIndices(indices, count);
 
-        var selectedItems = AssetListDataGrid.SelectedItems;
-        if (selectedItems == null)
-        {
-            return;
-        }
-
-        // VirtualAssetList keeps ItemsSource stable across Reset so DataGrid preserves surviving references automatically.
-        // Verify whether all surviving items are already selected; only scan visibleAssets if references were replaced.
-        if (selectedItems.Count > 0)
-        {
-            var preservedCount = 0;
-            foreach (var item in selectedItems.OfType<AssetItem>())
-            {
-                if (TryGetAssetSelectionKey(item, out var key) && selectedKeys.Contains(key))
-                {
-                    preservedCount++;
-                }
-            }
-
-            if (preservedCount == selectedKeys.Count || preservedCount == selectedItems.Count)
-            {
-                return;
-            }
-        }
-
-        var newSelectedItems = new List<AssetItem>();
-        foreach (var item in _eagerVisibleAssets)
-        {
-            if (TryGetAssetSelectionKey(item, out var key) && selectedKeys.Contains(key))
-            {
-                newSelectedItems.Add(item);
-            }
-        }
-
-        if (newSelectedItems.Count == 0 && selectedItems.Count == 0)
-        {
-            return;
-        }
-
-        selectedItems.Clear();
-        foreach (var item in newSelectedItems)
-        {
-            selectedItems.Add(item);
-        }
-    }
-
-    private void RestoreArenaSelectionIfNeeded(HashSet<AssetSelectionKey> selectedKeys)
-    {
-        if (selectedKeys.Count == 0)
-        {
-            return;
-        }
-
-        var selectedItems = AssetListDataGrid.SelectedItems;
-        if (selectedItems == null)
-        {
-            return;
-        }
-
-        var projectIndex = assetsManager.ProjectIndex;
-        var newSelectedItems = new List<AssetItem>(selectedKeys.Count);
-        foreach (var key in selectedKeys)
-        {
-            int arenaIdx = -1;
-            if (!key.HandleKey.IsEmpty)
-            {
-                projectIndex.TryGetIndex(key.HandleKey, out arenaIdx);
-            }
-            else if (!string.IsNullOrEmpty(key.FallbackUniqueId))
-            {
-                projectIndex.TryGetIndexByUniqueId(key.FallbackUniqueId, out arenaIdx);
-            }
-
-            if (arenaIdx < 0)
-            {
-                continue;
-            }
-
-            var visibleRow = LocateVisibleArenaRowByArenaIndex(arenaIdx);
-            if ((uint)visibleRow < (uint)visibleAssetItems.Count)
-            {
-                newSelectedItems.Add(visibleAssetItems[visibleRow]);
-            }
-        }
-
-        if (newSelectedItems.Count == 0 && selectedItems.Count == 0)
-        {
-            return;
-        }
-
-        selectedItems.Clear();
-        foreach (var item in newSelectedItems)
-        {
-            selectedItems.Add(item);
-        }
-    }
-
-    private bool TryMarkExportableArenaIndex(int arenaIndex)
-    {
-        if (arenaIndex < 0)
-        {
-            return false;
-        }
-
-        var wordIndex = arenaIndex >> 6;
-        if (wordIndex >= _exportableArenaBitset.Length)
-        {
-            var newLen = Math.Max(wordIndex + 1, _exportableArenaBitset.Length == 0 ? 16 : _exportableArenaBitset.Length * 2);
-            Array.Resize(ref _exportableArenaBitset, newLen);
-        }
-
-        var mask = 1UL << (arenaIndex & 63);
-        if ((_exportableArenaBitset[wordIndex] & mask) != 0)
-        {
-            return false;
-        }
-
-        _exportableArenaBitset[wordIndex] |= mask;
-        return true;
-    }
-
-    private void ResetArenaAssetListState()
-    {
-        CancelPendingArenaCoalescedSort();
-        _isArenaAssetListMode = false;
-        exportableArenaIndices.Clear();
-        exportableArenaIndices.TrimExcess();
-        _exportableArenaBitset = Array.Empty<ulong>();
-        visibleArenaIndices = Array.Empty<int>();
-        visibleArenaCount = 0;
-        visibleArenaIsIdentity = false;
-        visibleArenaIsStrictlyIncreasing = false;
-        visibleArenaRowByArenaIndex = null;
-    }
-
-    private void CancelPendingArenaCoalescedSort()
-    {
-        Interlocked.Increment(ref _arenaCoalescedSortVersion);
-        var cts = _arenaCoalescedSortCts;
-        _arenaCoalescedSortCts = null;
-        if (cts != null)
-        {
-            try
-            {
-                cts.Cancel();
-            }
-            catch
-            {
-            }
-            cts.Dispose();
-        }
-    }
-
-    private int[] SnapshotExportableArenaIndices()
-    {
-        return exportableArenaIndices.Count == 0
-            ? Array.Empty<int>()
-            : exportableArenaIndices.ToArray();
-    }
-
-    private int[] SnapshotVisibleArenaIndices()
-    {
-        var count = visibleArenaCount;
-        if (count <= 0)
-        {
-            return Array.Empty<int>();
-        }
-
-        var copy = new int[count];
-        Array.Copy(visibleArenaIndices, copy, count);
-        return copy;
-    }
-
-    private AssetItem MaterializeArenaAssetItem(int arenaIndex)
-    {
-        var arena = assetsManager.ProjectIndex.Arena;
-        var handle = arena.MaterializeHandle(arenaIndex);
-        return new AssetItem(handle, arenaIndex);
-    }
-
-    private List<AssetItem> MaterializeArenaAssetItems(IReadOnlyList<int> indices)
-    {
-        var count = indices.Count;
-        var list = new List<AssetItem>(count);
-        var arena = assetsManager.ProjectIndex.Arena;
-        var arenaCount = arena.Count;
-        for (var i = 0; i < count; i++)
-        {
-            var arenaIndex = indices[i];
-            if ((uint)arenaIndex < (uint)arenaCount)
-            {
-                list.Add(new AssetItem(arena.MaterializeHandle(arenaIndex), arenaIndex));
-            }
-        }
-
-        return list;
-    }
-
-    private int LocateVisibleArenaRowIndex(AssetItem item)
-    {
-        if (item?.Handle == null)
-        {
-            return -1;
-        }
-
-        var arenaIndex = item.Handle.ArenaIndex;
-        if (arenaIndex < 0 && item.Handle.TryGetKey(out var key))
-        {
-            if (!assetsManager.ProjectIndex.TryGetIndex(key, out arenaIndex))
-            {
-                return -1;
-            }
-        }
-
-        return LocateVisibleArenaRowByArenaIndex(arenaIndex);
-    }
-
-    private int LocateVisibleArenaRowByArenaIndex(int arenaIndex)
-    {
-        if (arenaIndex < 0 || visibleArenaCount <= 0)
-        {
-            return -1;
-        }
-
-        if (visibleArenaIsIdentity)
-        {
-            return (uint)arenaIndex < (uint)visibleArenaCount ? arenaIndex : -1;
-        }
-
-        if (visibleArenaIsStrictlyIncreasing)
-        {
-            var found = Array.BinarySearch(visibleArenaIndices, 0, visibleArenaCount, arenaIndex);
-            return found >= 0 ? found : -1;
-        }
-
-        var map = visibleArenaRowByArenaIndex;
-        if (map == null)
-        {
-            map = new Dictionary<int, int>(visibleArenaCount);
-            for (var i = 0; i < visibleArenaCount; i++)
-            {
-                map[visibleArenaIndices[i]] = i;
-            }
-            visibleArenaRowByArenaIndex = map;
-        }
-
-        return map.TryGetValue(arenaIndex, out var row) ? row : -1;
-    }
-
-    private static bool IsIdentityArenaIndices(int[] indices, int count)
-    {
-        for (var i = 0; i < count; i++)
-        {
-            if (indices[i] != i)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static bool IsStrictlyIncreasingIndices(int[] indices, int count)
-    {
-        for (var i = 1; i < count; i++)
-        {
-            if (indices[i] <= indices[i - 1])
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
+    private static bool IsStrictlyIncreasingIndices(int[] indices, int count) => AssetListViewModel.IsStrictlyIncreasingIndices(indices, count);
 
     private void ApplyVisibleArenaIndices(int[] indices, int count, bool isStrictlyIncreasing, bool isIdentity)
     {
-        visibleArenaIndices = indices;
-        visibleArenaCount = count;
-        visibleArenaIsStrictlyIncreasing = isStrictlyIncreasing;
-        visibleArenaIsIdentity = isIdentity;
-        visibleArenaRowByArenaIndex = null;
         EnsureAssetListItemsSource();
-        visibleAssetItems.ReplaceWithProvider(
-            count,
-            row => MaterializeArenaAssetItem(visibleArenaIndices[row]),
-            lruCapacity: ArenaViewportLruCapacity,
-            indexLocator: LocateVisibleArenaRowIndex);
-    }
-
-    private void QueueCoalescedArenaSort()
-    {
-        if (!_isArenaAssetListMode || string.IsNullOrEmpty(assetListSortMember) || visibleArenaCount <= 1)
-        {
-            return;
-        }
-
-        CancelPendingArenaCoalescedSort();
-        var cts = new CancellationTokenSource();
-        _arenaCoalescedSortCts = cts;
-        var token = cts.Token;
-        var sortVersion = _arenaCoalescedSortVersion;
-        var sessionId = lazyIndexingSessionId;
-        var sortMember = assetListSortMember;
-        var sortDescending = assetListSortDescending;
-        var expectedCount = visibleArenaCount;
-        var snapshot = new int[expectedCount];
-        Array.Copy(visibleArenaIndices, snapshot, expectedCount);
-        var arena = assetsManager.ProjectIndex.Arena;
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(60, token);
-                token.ThrowIfCancellationRequested();
-                AssetListQuery.SortArenaInPlace(arena, snapshot, snapshot.Length, sortMember, sortDescending);
-                token.ThrowIfCancellationRequested();
-
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (token.IsCancellationRequested
-                        || sortVersion != _arenaCoalescedSortVersion
-                        || sessionId != lazyIndexingSessionId
-                        || !_isArenaAssetListMode
-                        || visibleArenaCount != expectedCount
-                        || !string.Equals(assetListSortMember, sortMember, StringComparison.Ordinal)
-                        || assetListSortDescending != sortDescending)
-                    {
-                        return;
-                    }
-
-                    var selectedKeys = new HashSet<AssetSelectionKey>();
-                    if (AssetListDataGrid.SelectedItems != null)
-                    {
-                        foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
-                        {
-                            if (TryGetAssetSelectionKey(item, out var key))
-                            {
-                                selectedKeys.Add(key);
-                            }
-                        }
-                    }
-
-                    isRefreshingFilterList = true;
-                    try
-                    {
-                        ApplyVisibleArenaIndices(snapshot, snapshot.Length, isStrictlyIncreasing: false, isIdentity: false);
-                        RestoreArenaSelectionIfNeeded(selectedKeys);
-                    }
-                    finally
-                    {
-                        isRefreshingFilterList = false;
-                    }
-                }, DispatcherPriority.Background);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Coalesced arena sort failed: {ex.Message}");
-            }
-        }, token);
+        ViewModel.AssetList.ApplyVisibleArenaIndices(indices, count, isStrictlyIncreasing, isIdentity);
     }
 
     private static bool AssetMatchesClassFilter(AssetItem item, AssetClassItem classFilter)
@@ -815,6 +413,7 @@ public partial class MainWindow
     {
         return AssetListQuery.Compare(left, right, AssetListQuery.ResolveSortKey(sortMember), descending);
     }
+
     private static string GetAssetCellText(AssetItem item, string? member)
     {
         return member switch
@@ -829,34 +428,19 @@ public partial class MainWindow
 
     private void ReplaceVisibleAssets(IReadOnlyList<AssetItem>? items)
     {
-        _isArenaAssetListMode = false;
-        _eagerVisibleAssets = items is { Count: > 0 }
-            ? items.Where(static x => x != null).ToList()
-            : new List<AssetItem>();
-        RefreshAssetListItems();
+        EnsureAssetListItemsSource();
+        ViewModel.AssetList.ReplaceVisibleEagerAssets(items);
     }
 
     private void ReplaceVisibleAssetsOwned(List<AssetItem> ownedItems)
     {
-        _isArenaAssetListMode = false;
-        _eagerVisibleAssets = ownedItems;
-        RefreshAssetListItems();
+        EnsureAssetListItemsSource();
+        ViewModel.AssetList.ReplaceVisibleEagerAssetsOwned(ownedItems);
     }
 
     private void SyncExportableAssetHandleIds()
     {
-        lazyAssetItemsByHandleId.Clear();
-        exportableAssetHandleIds.Clear();
-        exportableAssetTypes.Clear();
-        foreach (var item in _eagerExportableAssets)
-        {
-            if (item.Handle != null && item.Handle.TryGetKey(out var handleKey))
-            {
-                lazyAssetItemsByHandleId[handleKey] = item;
-                exportableAssetHandleIds.Add(handleKey);
-            }
-            exportableAssetTypes.Add(item.Type);
-        }
+        ViewModel.AssetList.SyncExportableAssetHandleIds();
     }
 
     private void ApplyExportableAssetIndexes(BuildAssetStructuresResult result)
@@ -872,12 +456,6 @@ public partial class MainWindow
         {
             AssetListDataGrid.ItemsSource = visibleAssetItems;
         }
-    }
-
-    private void RefreshAssetListItems()
-    {
-        EnsureAssetListItemsSource();
-        visibleAssetItems.ReplaceBacking(_eagerVisibleAssets);
     }
 
     private void UpdateAssetListSortHeaderIndicators()
@@ -906,67 +484,9 @@ public partial class MainWindow
         if (newItems == null || newItems.Count == 0) return;
 
         EnsureAssetListItemsSource();
-        var filterText = listSearch?.Text?.Trim();
-        var textFilter = AssetListQuery.TextFilter.Create(filterText);
-        var classFilter = classFilterOverride;
-        var filterTypeChecked = filterTypeAll.IsChecked != true;
-        var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
-            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
-            .Select(x => (ClassIDType)x.Tag!)
-            .ToHashSet() : null;
-
-        var matchingBatch = new List<AssetItem>();
-        foreach (var x in newItems)
-        {
-            if (x == null)
-            {
-                continue;
-            }
-
-            if (classFilter != null)
-            {
-                if (!AssetMatchesClassFilter(x, classFilter))
-                {
-                    continue;
-                }
-            }
-            else if (selectedTypes != null)
-            {
-                if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
-                {
-                    continue;
-                }
-            }
-
-            if (textFilter != null && !textFilter.Matches(x))
-            {
-                continue;
-            }
-
-            matchingBatch.Add(x);
-        }
-
-        if (matchingBatch.Count == 0)
-        {
-            return;
-        }
-
-        visibleAssetItems.BeginUpdate();
-        try
-        {
-            if (!visibleAssetItems.IsBackedBy(_eagerVisibleAssets))
-            {
-                visibleAssetItems.ReplaceBacking(_eagerVisibleAssets);
-            }
-
-            AssetListQuery.MergeSortedBatch(_eagerVisibleAssets, matchingBatch, assetListSortMember, assetListSortDescending);
-        }
-        finally
-        {
-            visibleAssetItems.EndUpdate();
-        }
-
-        StatusStripUpdate($"Showing {VisibleAssetCount} assets");
+        SyncFilterInputsToAssetListViewModel();
+        ViewModel.AssetList.AppendFilteredEagerAssetsToVisible(newItems);
+        StatusStripUpdate(ViewModel.AssetList.StatusSummary);
     }
 
     private void AppendFilteredArenaIndicesToVisible(List<int> newArenaIndices)
@@ -976,95 +496,10 @@ public partial class MainWindow
             return;
         }
 
-        var arena = assetsManager.ProjectIndex.Arena;
-        var filterText = listSearch?.Text?.Trim();
-        var textFilter = AssetListQuery.TextFilter.Create(filterText);
-        var classFilter = classFilterOverride;
-        var filterTypeChecked = filterTypeAll.IsChecked != true;
-        var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
-            .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
-            .Select(x => (ClassIDType)x.Tag!)
-            .ToHashSet() : null;
-
-        var matchingIndices = new List<int>(newArenaIndices.Count);
-        for (var i = 0; i < newArenaIndices.Count; i++)
-        {
-            var idx = newArenaIndices[i];
-            if (AssetListQuery.AcceptsArena(arena, idx, classFilter, selectedTypes, textFilter))
-            {
-                matchingIndices.Add(idx);
-            }
-        }
-
-        if (matchingIndices.Count == 0)
-        {
-            return;
-        }
-
-        var sortMember = assetListSortMember;
-        var sortDescending = assetListSortDescending;
-
-        if (string.IsNullOrEmpty(sortMember))
-        {
-            var oldCount = visibleArenaCount;
-            var newCount = oldCount + matchingIndices.Count;
-            if (visibleArenaIndices.Length < newCount)
-            {
-                var nextCap = Math.Max(newCount, visibleArenaIndices.Length == 0 ? 1024 : visibleArenaIndices.Length * 2);
-                Array.Resize(ref visibleArenaIndices, nextCap);
-            }
-
-            var strictlyIncreasing = oldCount == 0 || visibleArenaIsStrictlyIncreasing;
-            var identity = oldCount == 0 || visibleArenaIsIdentity;
-            var prev = oldCount > 0 ? visibleArenaIndices[oldCount - 1] : -1;
-
-            for (var i = 0; i < matchingIndices.Count; i++)
-            {
-                var idx = matchingIndices[i];
-                var pos = oldCount + i;
-                visibleArenaIndices[pos] = idx;
-                if (strictlyIncreasing && idx <= prev)
-                {
-                    strictlyIncreasing = false;
-                }
-                if (identity && idx != pos)
-                {
-                    identity = false;
-                }
-                prev = idx;
-            }
-
-            ApplyVisibleArenaIndices(visibleArenaIndices, newCount, strictlyIncreasing, identity);
-        }
-        else if (visibleArenaCount < ArenaInlineSortedMergeThreshold)
-        {
-            var incomingArray = matchingIndices.ToArray();
-            var merged = AssetListQuery.MergeSortedArenaBatch(
-                arena,
-                visibleArenaIndices,
-                visibleArenaCount,
-                incomingArray,
-                incomingArray.Length,
-                sortMember,
-                sortDescending);
-            ApplyVisibleArenaIndices(merged, merged.Length, isStrictlyIncreasing: false, isIdentity: false);
-        }
-        else
-        {
-            var oldCount = visibleArenaCount;
-            var newCount = oldCount + matchingIndices.Count;
-            if (visibleArenaIndices.Length < newCount)
-            {
-                var nextCap = Math.Max(newCount, visibleArenaIndices.Length * 2);
-                Array.Resize(ref visibleArenaIndices, nextCap);
-            }
-
-            matchingIndices.CopyTo(visibleArenaIndices, oldCount);
-            ApplyVisibleArenaIndices(visibleArenaIndices, newCount, isStrictlyIncreasing: false, isIdentity: false);
-            QueueCoalescedArenaSort();
-        }
-
-        StatusStripUpdate($"Showing {VisibleAssetCount:N0} assets");
+        EnsureAssetListItemsSource();
+        SyncFilterInputsToAssetListViewModel();
+        ViewModel.AssetList.AppendFilteredArenaIndicesToVisible(newArenaIndices);
+        StatusStripUpdate(ViewModel.AssetList.StatusSummary);
     }
 }
 
@@ -1188,20 +623,64 @@ internal static class AssetListQuery
     internal sealed class TextFilter
     {
         private readonly SearchValues<string> _needle;
+        private readonly TextFilter[]? _subTerms;
         private readonly ConcurrentDictionary<ClassIDType, bool> _normalTypeMatchCache = new();
         private readonly ConcurrentDictionary<ClassIDType, bool> _fbxTypeMatchCache = new();
 
-        private TextFilter(string text)
+        private TextFilter(string text, TextFilter[]? subTerms = null)
         {
             _needle = SearchValues.Create(new[] { text }, StringComparison.OrdinalIgnoreCase);
+            _subTerms = subTerms;
         }
 
         public static TextFilter? Create(string? text)
         {
-            return string.IsNullOrEmpty(text) ? null : new TextFilter(text);
+            if (string.IsNullOrEmpty(text))
+            {
+                return null;
+            }
+
+            TextFilter[]? subTerms = null;
+            if (text.AsSpan().IndexOfAny(' ', '\t') >= 0)
+            {
+                var parts = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length > 1)
+                {
+                    subTerms = new TextFilter[parts.Length];
+                    for (var i = 0; i < parts.Length; i++)
+                    {
+                        subTerms[i] = new TextFilter(parts[i]);
+                    }
+                }
+            }
+
+            return new TextFilter(text, subTerms);
         }
 
         public bool Matches(AssetItem item)
+        {
+            if (MatchesSingleNeedle(item))
+            {
+                return true;
+            }
+
+            if (_subTerms == null)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < _subTerms.Length; i++)
+            {
+                if (!_subTerms[i].MatchesSingleNeedle(item))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private bool MatchesSingleNeedle(AssetItem item)
         {
             if (Has(item.Name) || Has(item.Container) || Has(item.TypeString))
             {
@@ -1225,6 +704,29 @@ internal static class AssetListQuery
         }
 
         internal bool Matches(AssetIndexArena arena, int arenaIndex, ClassIDType type)
+        {
+            if (MatchesSingleNeedle(arena, arenaIndex, type))
+            {
+                return true;
+            }
+
+            if (_subTerms == null)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < _subTerms.Length; i++)
+            {
+                if (!_subTerms[i].MatchesSingleNeedle(arena, arenaIndex, type))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private bool MatchesSingleNeedle(AssetIndexArena arena, int arenaIndex, ClassIDType type)
         {
             if (_normalTypeMatchCache.GetOrAdd(type, EvaluateNormalTypeMatch))
             {

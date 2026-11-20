@@ -1,3 +1,5 @@
+using System;
+using System.ComponentModel;
 using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia.ViewModels
@@ -13,12 +15,23 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _isStopEnabled;
         private string _specifyUnityVersion = string.Empty;
 
-        public MainWindowViewModel(AssetLoadingService loadingService)
+        public MainWindowViewModel(
+            AssetLoadingService loadingService,
+            AssetListViewModel? assetList = null,
+            IndexingProgressViewModel? indexingProgress = null,
+            Action<Action>? dispatchToUi = null)
         {
             _loadingService = loadingService;
+            AssetList = assetList ?? new AssetListViewModel(dispatchToUi);
+            IndexingProgress = indexingProgress ?? new IndexingProgressViewModel();
+            IndexingProgress.PropertyChanged += OnIndexingProgressPropertyChanged;
         }
 
         public AssetLoadingService LoadingService => _loadingService;
+
+        public AssetListViewModel AssetList { get; }
+
+        public IndexingProgressViewModel IndexingProgress { get; }
 
         public string StatusText
         {
@@ -60,6 +73,22 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _specifyUnityVersion;
             set => SetProperty(ref _specifyUnityVersion, value);
+        }
+
+        private void OnIndexingProgressPropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            switch (e.PropertyName)
+            {
+                case nameof(IndexingProgressViewModel.CanPause):
+                    IsPauseEnabled = IndexingProgress.CanPause;
+                    break;
+                case nameof(IndexingProgressViewModel.CanResume):
+                    IsResumeEnabled = IndexingProgress.CanResume;
+                    break;
+                case nameof(IndexingProgressViewModel.CanCancel):
+                    IsStopEnabled = IndexingProgress.CanCancel;
+                    break;
+            }
         }
     }
 }

@@ -21,7 +21,7 @@ public partial class MainWindow
 
     private void BuildAssetClasses()
     {
-        assetClassItems.Clear();
+        var items = new List<AssetClassItem>();
 
         var objectCounts = assetsManager.assetsFileList
             .SelectMany(file => file.Objects.Select(obj => new { file.unityVersion, ClassID = (int)obj.type }))
@@ -31,20 +31,21 @@ public partial class MainWindow
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var assetsFile in assetsManager.assetsFileList)
         {
-            AddSerializedTypes(assetsFile, assetsFile.m_Types, "Native", objectCounts, seen);
-            AddSerializedTypes(assetsFile, assetsFile.m_RefTypes, "Reference", objectCounts, seen);
+            AddSerializedTypes(assetsFile, assetsFile.m_Types, "Native", objectCounts, seen, items);
+            AddSerializedTypes(assetsFile, assetsFile.m_RefTypes, "Reference", objectCounts, seen, items);
         }
 
-        assetClassItems = assetClassItems
+        items = items
             .OrderBy(x => x.UnityVersion, StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => x.ClassID)
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        ViewModel.AssetList.SetAssetClasses(items);
         FilterAssetClasses();
     }
 
     private void AddSerializedTypes(SerializedFile assetsFile, IEnumerable<SerializedType>? types, string sourceKind,
-        Dictionary<(string UnityVersion, int ClassID), int> objectCounts, HashSet<string> seen)
+        Dictionary<(string UnityVersion, int ClassID), int> objectCounts, HashSet<string> seen, List<AssetClassItem> targetList)
     {
         if (types == null)
             return;
@@ -59,7 +60,7 @@ public partial class MainWindow
                 continue;
 
             objectCounts.TryGetValue((assetsFile.unityVersion, type.classID), out var objectCount);
-            assetClassItems.Add(new AssetClassItem
+            targetList.Add(new AssetClassItem
             {
                 ClassID = type.classID,
                 Name = name,
@@ -90,18 +91,6 @@ public partial class MainWindow
 
     private void FilterAssetClasses()
     {
-        var filter = classSearch.Text?.Trim();
-        IEnumerable<AssetClassItem> classes = assetClassItems;
-        if (!string.IsNullOrEmpty(filter))
-        {
-            classes = classes.Where(x =>
-                x.ClassID.ToString(CultureInfo.InvariantCulture).Contains(filter, StringComparison.OrdinalIgnoreCase)
-                || x.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
-                || x.Namespace.Contains(filter, StringComparison.OrdinalIgnoreCase)
-                || x.Assembly.Contains(filter, StringComparison.OrdinalIgnoreCase)
-                || x.SourceKind.Contains(filter, StringComparison.OrdinalIgnoreCase));
-        }
-
         // Save selection and scroll state
         var selectedItem = AssetClassesDataGrid.SelectedItem as AssetClassItem;
         (int ClassID, string Name, string Namespace, string Assembly, string UnityVersion, string SourceFile, string SourceKind)? selectedKey = selectedItem != null
@@ -111,12 +100,13 @@ public partial class MainWindow
         var scrollViewer = FindVisualChild<ScrollViewer>(AssetClassesDataGrid);
         var scrollOffset = scrollViewer?.Offset ?? default;
 
-        SyncAssetClassCollection(visibleAssetClassItems, classes.ToList());
+        ViewModel.AssetList.ClassSearchText = classSearch.Text?.Trim() ?? string.Empty;
+        ViewModel.AssetList.FilterAssetClasses();
 
         isRefreshingClassesList = true;
         try
         {
-            if (AssetClassesDataGrid.ItemsSource != visibleAssetClassItems)
+            if (!ReferenceEquals(AssetClassesDataGrid.ItemsSource, visibleAssetClassItems))
             {
                 AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
             }
@@ -323,44 +313,10 @@ public partial class MainWindow
     {
         if (updatedClassItems == null) return;
 
-        // Build lookup from updated class items
-        var updatedLookup = new Dictionary<(int ClassID, string Name, string Namespace, string Assembly, string UnityVersion, string SourceFile, string SourceKind), AssetClassItem>();
-        foreach (var item in updatedClassItems)
-        {
-            var key = (item.ClassID, item.Name, item.Namespace, item.Assembly, item.UnityVersion, item.SourceFile, item.SourceKind);
-            updatedLookup[key] = item;
-        }
+        ViewModel.AssetList.ClassSearchText = classSearch.Text?.Trim() ?? string.Empty;
+        ViewModel.AssetList.UpdateAssetClassesIncremental(updatedClassItems);
 
-        // Update counts for existing visible items
-        foreach (var existing in visibleAssetClassItems)
-        {
-            var key = (existing.ClassID, existing.Name, existing.Namespace, existing.Assembly, existing.UnityVersion, existing.SourceFile, existing.SourceKind);
-            if (updatedLookup.TryGetValue(key, out var updated))
-            {
-                existing.CopyFrom(updated);
-                updatedLookup.Remove(key);
-            }
-        }
-
-        // Append any genuinely new class items (filtered)
-        var filter = classSearch.Text?.Trim();
-        foreach (var newItem in updatedLookup.Values)
-        {
-            if (!string.IsNullOrEmpty(filter))
-            {
-                if (!newItem.ClassID.ToString(CultureInfo.InvariantCulture).Contains(filter, StringComparison.OrdinalIgnoreCase)
-                    && !newItem.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
-                    && !newItem.Namespace.Contains(filter, StringComparison.OrdinalIgnoreCase)
-                    && !newItem.Assembly.Contains(filter, StringComparison.OrdinalIgnoreCase)
-                    && !newItem.SourceKind.Contains(filter, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-            }
-            visibleAssetClassItems.Add(newItem);
-        }
-
-        if (AssetClassesDataGrid.ItemsSource != visibleAssetClassItems)
+        if (!ReferenceEquals(AssetClassesDataGrid.ItemsSource, visibleAssetClassItems))
         {
             AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
         }
@@ -374,9 +330,9 @@ public partial class MainWindow
         }
 
         PrioritizeUserInteraction();
-        classFilterOverride = item;
-        ClearClassFilterButton.Content = $"Clear Class Filter ({item.Name} v{item.UnityVersion})";
-        ClearClassFilterButton.IsVisible = true;
+        ViewModel.AssetList.SetClassFilterOverride(item);
+        ClearClassFilterButton.Content = ViewModel.AssetList.ClassFilterButtonText;
+        ClearClassFilterButton.IsVisible = ViewModel.AssetList.HasClassFilterOverride;
 
         LeftTabControl.SelectedIndex = 1;
         _ = FilterAssetListAsync(CancellationToken.None);
@@ -385,8 +341,8 @@ public partial class MainWindow
     private void ClearClassFilter_Click(object? sender, RoutedEventArgs e)
     {
         PrioritizeUserInteraction();
-        classFilterOverride = null;
-        ClearClassFilterButton.IsVisible = false;
+        ViewModel.AssetList.ClearClassFilterOverride();
+        ClearClassFilterButton.IsVisible = ViewModel.AssetList.HasClassFilterOverride;
         _ = FilterAssetListAsync(CancellationToken.None);
     }
 }

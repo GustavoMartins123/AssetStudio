@@ -54,33 +54,22 @@ public partial class MainWindow
         SpriteHelper.ClearAtlasCache();
         AssetExportHelper.ClearShaderGuidCache();
         logger.ClearErrors();
-        ResetArenaAssetListState();
-        _eagerExportableAssets.Clear();
-        _eagerVisibleAssets.Clear();
-        visibleAssetItems.Clear();
-        lazyAssetItemsByHandleId.Clear();
-        exportableAssetHandleIds.Clear();
-        exportableAssetTypes.Clear();
+        ViewModel.AssetList.Reset();
         lazySourcePathBySerializedFile.Clear();
         lazySourceFileSearchCache.Clear();
         resolvedSourcePathCache.Clear();
-        assetClassItems.Clear();
-        visibleAssetClassItems.Clear();
-        classFilterOverride = null;
         if (ClearClassFilterButton != null)
         {
             ClearClassFilterButton.IsVisible = false;
         }
         AssetListDataGrid.SelectedItem = null;
         AssetListDataGrid.ItemsSource = visibleAssetItems;
-        AssetClassesDataGrid.ItemsSource = null;
+        AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
         sceneTreeNodes.Clear();
         treeSearchResults.Clear();
         listSearchDebounce?.Cancel();
         listSearchDebounce?.Dispose();
         listSearchDebounce = null;
-        assetListSortMember = null;
-        assetListSortDescending = false;
         assetContextCellText = string.Empty;
         assetContextItem = null;
         lock (assemblyLoader)
@@ -93,9 +82,14 @@ public partial class MainWindow
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
         ClearTextAssetPreview();
+        if (listSearch != null)
+        {
+            listSearch.Text = string.Empty;
+        }
         classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
+        ViewModel.IndexingProgress.Reset();
         ViewModel.IsIndexingActive = false;
         ViewModel.LoadingProgress = 0;
         HideIndexingProgressPanel();

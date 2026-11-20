@@ -29,11 +29,15 @@ public partial class MainWindow : Window
 {
     public MainWindowViewModel ViewModel { get; }
     private AssetsManager assetsManager = new AssetsManager();
-    private List<AssetItem> _eagerExportableAssets = new List<AssetItem>();
+    private List<AssetItem> _eagerExportableAssets
+    {
+        get => ViewModel.AssetList.EagerExportableAssets;
+        set => ViewModel.AssetList.EagerExportableAssets = value;
+    }
     private List<AssetItem> exportableAssets
     {
-        get => _isArenaAssetListMode ? MaterializeArenaAssetItems(exportableArenaIndices) : _eagerExportableAssets;
-        set => _eagerExportableAssets = value;
+        get => ViewModel.AssetList.GetExportableAssetsSnapshot();
+        set => ViewModel.AssetList.EagerExportableAssets = value;
     }
     private Texture2D? currentPreviewTexture;
     private Sprite? currentPreviewSprite;
@@ -54,13 +58,21 @@ public partial class MainWindow : Window
     private const int UserPreviewPriorityMilliseconds = 1800;
     private const int UserInteractionYieldDelayMilliseconds = 40;
     private long userInteractionPriorityUntilTimestamp;
-    private List<AssetItem> _eagerVisibleAssets = new();
-    private IReadOnlyList<AssetItem> visibleAssets => _isArenaAssetListMode ? visibleAssetItems : _eagerVisibleAssets;
-    private readonly VirtualAssetList visibleAssetItems = new();
-    private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
-    private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
+    private List<AssetItem> _eagerVisibleAssets => ViewModel.AssetList.EagerVisibleAssets;
+    private IReadOnlyList<AssetItem> visibleAssets => ViewModel.AssetList.GetVisibleAssetsView();
+    private VirtualAssetList visibleAssetItems => ViewModel.AssetList.VisibleItems;
+    private List<AssetClassItem> assetClassItems
+    {
+        get => ViewModel.AssetList.AllAssetClasses.ToList();
+        set => ViewModel.AssetList.SetAssetClasses(value);
+    }
+    private BulkObservableCollection<AssetClassItem> visibleAssetClassItems => ViewModel.AssetList.AssetClasses;
 
-    private AssetClassItem? classFilterOverride;
+    private AssetClassItem? classFilterOverride
+    {
+        get => ViewModel.AssetList.ClassFilterOverride;
+        set => ViewModel.AssetList.ClassFilterOverride = value;
+    }
     private List<GameObjectNode> sceneTreeNodes = new List<GameObjectNode>();
     private readonly List<GameObjectNode> treeSearchResults = new List<GameObjectNode>();
     private readonly ExportOptionsState exportOptions = new();
@@ -68,11 +80,19 @@ public partial class MainWindow : Window
     private readonly ProjectLaunchContext? projectContext;
     private readonly AssemblyLoader assemblyLoader = new AssemblyLoader();
     private readonly GUILogger logger;
-    private string? assetListSortMember;
+    private string? assetListSortMember
+    {
+        get => ViewModel.AssetList.SortColumn;
+        set => ViewModel.AssetList.SortColumn = value;
+    }
     private string assetContextCellText = string.Empty;
     private AssetItem? assetContextItem;
     private int nextGameObjectSearchIndex;
-    private bool assetListSortDescending;
+    private bool assetListSortDescending
+    {
+        get => ViewModel.AssetList.SortDescending;
+        set => ViewModel.AssetList.SortDescending = value;
+    }
     private bool updatingFilterTypeMenu;
     private Dictionary<Mesh, List<Material?>>? meshToMaterialsCache;
     private Dictionary<Mesh, List<string>>? meshAssociatedRenderersCache;
@@ -100,11 +120,27 @@ public partial class MainWindow : Window
 
     private string? _pendingStatusText;
     private string? _currentlySelectedUniqueID;
-    private bool isRefreshingClassesList;
+    private bool isRefreshingClassesList
+    {
+        get => ViewModel.AssetList.IsRefreshingClasses;
+        set => ViewModel.AssetList.IsRefreshingClasses = value;
+    }
     private bool _statusUpdatePending;
-    private Dictionary<AssetHandleKey, AssetItem> lazyAssetItemsByHandleId = new();
-    private HashSet<AssetHandleKey> exportableAssetHandleIds = new();
-    private HashSet<ClassIDType> exportableAssetTypes = new();
+    private Dictionary<AssetHandleKey, AssetItem> lazyAssetItemsByHandleId
+    {
+        get => ViewModel.AssetList.LazyAssetItemsByHandleId;
+        set => ViewModel.AssetList.LazyAssetItemsByHandleId = value;
+    }
+    private HashSet<AssetHandleKey> exportableAssetHandleIds
+    {
+        get => ViewModel.AssetList.ExportableAssetHandleIds;
+        set => ViewModel.AssetList.ExportableAssetHandleIds = value;
+    }
+    private HashSet<ClassIDType> exportableAssetTypes
+    {
+        get => ViewModel.AssetList.ExportableAssetTypes;
+        set => ViewModel.AssetList.ExportableAssetTypes = value;
+    }
     private long lazyIndexingSessionId;
     private bool projectAutoIndexStarted;
     private int foregroundLazyLoadCount;
@@ -116,15 +152,27 @@ public partial class MainWindow : Window
     public MainWindow(ProjectLaunchContext? projectContext)
     {
         var loadingService = new AssetLoadingService();
-        ViewModel = new MainWindowViewModel(loadingService);
+        ViewModel = new MainWindowViewModel(
+            loadingService,
+            dispatchToUi: static action =>
+            {
+                if (Dispatcher.UIThread.CheckAccess())
+                {
+                    action();
+                }
+                else
+                {
+                    Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
+                }
+            });
         DataContext = ViewModel;
 
         this.projectContext = projectContext;
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
-        visibleAssetItems.ReplaceBacking(_eagerVisibleAssets);
         AssetListDataGrid.ItemsSource = visibleAssetItems;
+        AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
         GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
         GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
         PreviewContentHost.SizeChanged += (_, _) => Update2DAnimationImageLayout();
@@ -560,12 +608,9 @@ public partial class MainWindow : Window
                     if (previousIndexingState != null
                         && !IsCompletedLazyIndexingStatus(previousIndexingState.Status))
                     {
-                        var lastReadFile = string.IsNullOrWhiteSpace(previousIndexingState.LastReadFile)
-                            ? "none"
-                            : Path.GetFileName(previousIndexingState.LastReadFile);
-                        StatusStripUpdate(
-                            $"Previous indexing state: {previousIndexingState.Status}, {previousIndexingState.PercentComplete:0.##}% complete, last file: {lastReadFile}");
-                        ShowIndexingProgressPanel(previousIndexingState);
+                        ViewModel.IndexingProgress.SetIncompletePreviousSession(previousIndexingState);
+                        StatusStripUpdate(ViewModel.IndexingProgress.IncompleteSessionSummary);
+                        SyncIndexingProgressPanelFromViewModel();
                     }
 
                     // Warm-open fast path: check mmap/.idx & SQLite cache directly into ProjectIndex.Arena BEFORE any second disk walk.
@@ -667,19 +712,22 @@ public partial class MainWindow : Window
 
                         try
                         {
-                            _isArenaAssetListMode = true;
-                            exportableArenaIndices.Clear();
-                            exportableArenaIndices.AddRange(warmResult.ExportableIndices);
-                            _exportableArenaBitset = warmResult.ExportableBitset ?? Array.Empty<ulong>();
-                            exportableAssetTypes = warmResult.ExportableTypes ?? new HashSet<ClassIDType>();
-                            assetClassItems = warmResult.ClassItems ?? new List<AssetClassItem>();
-
                             var isSorted = !string.IsNullOrEmpty(sortMember);
                             var isIdentity = !isSorted && IsIdentityArenaIndices(warmResult.VisibleIndices, warmResult.VisibleIndices.Length);
                             var isStrictlyIncreasing = !isSorted && (isIdentity || IsStrictlyIncreasingIndices(warmResult.VisibleIndices, warmResult.VisibleIndices.Length));
 
+                            ViewModel.AssetList.ApplyWarmArenaState(
+                                assetsManager.ProjectIndex,
+                                warmResult.ExportableIndices,
+                                warmResult.ExportableBitset,
+                                warmResult.ExportableTypes,
+                                warmResult.ClassItems,
+                                warmResult.VisibleIndices,
+                                isStrictlyIncreasing,
+                                isIdentity);
+
                             BuildFilterTypeMenu();
-                            ApplyVisibleArenaIndices(warmResult.VisibleIndices, warmResult.VisibleIndices.Length, isStrictlyIncreasing, isIdentity);
+                            EnsureAssetListItemsSource();
                             FilterAssetClasses();
 
                             progressBar.Value = 100;
@@ -966,62 +1014,30 @@ public partial class MainWindow : Window
             return 0;
         }
 
-        _isArenaAssetListMode = true;
-        var arena = assetsManager.ProjectIndex.Arena;
-        var arenaCount = arena.Count;
-        var displayAllChecked = displayAll.IsChecked == true;
-        var filterTypesChanged = false;
-        var newExportableIndices = new List<int>(pendingIndices.Length);
-        string? lastRememberedOriginalPath = null;
-        string? lastRememberedSerializedFile = null;
-
-        for (var i = 0; i < pendingIndices.Length; i++)
-        {
-            var idx = pendingIndices[i];
-            if ((uint)idx >= (uint)arenaCount)
-            {
-                continue;
-            }
-
-            var origin = arena.GetOrigin(idx);
-            var originalPath = origin.OriginalPath;
-            var serializedFileName = origin.SerializedFileName;
-            if (!string.IsNullOrWhiteSpace(originalPath)
-                && (!string.Equals(originalPath, lastRememberedOriginalPath, StringComparison.Ordinal)
-                    || !string.Equals(serializedFileName, lastRememberedSerializedFile, StringComparison.Ordinal)))
+        EnsureAssetListItemsSource();
+        SyncFilterInputsToAssetListViewModel();
+        var addedCount = ViewModel.AssetList.AppendLazyArenaIndices(
+            pendingIndices,
+            displayAll.IsChecked == true,
+            IsLazyExportableType,
+            (serializedFileName, originalPath) =>
             {
                 RememberLazySourcePathForSerializedFile(serializedFileName, originalPath);
                 RememberLazySourcePathForSerializedFile(GetSafeFileName(originalPath), originalPath);
-                lastRememberedOriginalPath = originalPath;
-                lastRememberedSerializedFile = serializedFileName;
-            }
-
-            var type = arena.GetType(idx);
-            if (!displayAllChecked && !IsLazyExportableType(type))
-            {
-                continue;
-            }
-
-            if (!TryMarkExportableArenaIndex(idx))
-            {
-                continue;
-            }
-
-            exportableArenaIndices.Add(idx);
-            newExportableIndices.Add(idx);
-            if (exportableAssetTypes.Add(type))
-            {
-                filterTypesChanged = true;
-            }
-        }
+            },
+            out var filterTypesChanged);
 
         if (filterTypesChanged)
         {
             BuildFilterTypeMenu();
         }
 
-        AppendFilteredArenaIndicesToVisible(newExportableIndices);
-        return newExportableIndices.Count;
+        if (addedCount > 0)
+        {
+            StatusStripUpdate(ViewModel.AssetList.StatusSummary);
+        }
+
+        return addedCount;
     }
 
     private static void UpdateLazyAssetItemHandle(AssetItem assetItem, AssetHandle handle)
@@ -1209,22 +1225,19 @@ public partial class MainWindow : Window
             await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
             PublishStructureStage(5, "Applying asset structure to UI");
 
-            _isArenaAssetListMode = true;
-            var previousExportableCount = exportableArenaIndices.Count;
+            var previousExportableCount = ViewModel.AssetList.TotalAssetCount;
             var needsFullRefresh = !incremental
                 || previousExportableCount == 0
                 || lazyResult.ExportableIndices.Count != previousExportableCount
-                || _arenaCoalescedSortCts != null;
+                || ViewModel.AssetList.HasPendingArenaCoalescedSort;
 
-            exportableArenaIndices.Clear();
-            exportableArenaIndices.AddRange(lazyResult.ExportableIndices);
-            _exportableArenaBitset = lazyResult.ExportableBitset;
-            exportableAssetTypes = lazyResult.ExportableTypes;
-            _eagerExportableAssets.Clear();
-            _eagerVisibleAssets.Clear();
-            lazyAssetItemsByHandleId.Clear();
-            exportableAssetHandleIds.Clear();
-            assetClassItems = lazyResult.AssetClassItems;
+            ViewModel.AssetList.SetArenaAssets(
+                assetsManager.ProjectIndex,
+                lazyResult.ExportableIndices,
+                lazyResult.ExportableBitset,
+                lazyResult.ExportableTypes,
+                lazyResult.AssetClassItems,
+                applyFilterImmediately: false);
 
             BuildFilterTypeMenu();
             if (needsFullRefresh)
@@ -1774,8 +1787,8 @@ public partial class MainWindow : Window
             GLPreviewControl.LoadMeshPreviewGeometryCache = null;
             GLPreviewControl.SaveMeshPreviewGeometryCache = null;
         }
-        ResetArenaAssetListState();
-        visibleAssetItems.Clear();
+        ViewModel.AssetList.Reset();
+        ViewModel.IndexingProgress.Reset();
         resolvedSourcePathCache.Clear();
         lazySourcePathBySerializedFile.Clear();
         lazySourceFileSearchCache.Clear();

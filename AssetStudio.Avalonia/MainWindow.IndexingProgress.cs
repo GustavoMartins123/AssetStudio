@@ -1,6 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Threading;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.ViewModels;
 using AssetStudio;
 using System;
 using System.Diagnostics;
@@ -72,16 +73,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        ShowIndexingProgressPanel(
-            update.Status,
-            update.ProcessedFiles,
-            update.TotalFiles,
-            update.PendingFiles,
-            update.PercentComplete,
-            update.CurrentFile,
-            update.LastReadFile,
-            null,
-            percentDecimals);
+        ShowIndexingProgressPanel(IndexingProgressSnapshot.FromUpdate(update, percentDecimals));
     }
 
     private void ShowIndexingProgressPanel(ProjectIndexingState state, int percentDecimals = 1)
@@ -91,16 +83,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        ShowIndexingProgressPanel(
-            state.Status,
-            state.ProcessedFiles,
-            state.TotalFiles,
-            state.PendingFiles,
-            state.PercentComplete,
-            state.CurrentFile,
-            state.LastReadFile,
-            state.UpdatedAt,
-            percentDecimals);
+        ShowIndexingProgressPanel(IndexingProgressSnapshot.FromState(state, percentDecimals));
     }
 
     private void ShowIndexingProgressPanel(
@@ -114,43 +97,29 @@ public partial class MainWindow : Window
         DateTime? updatedAt,
         int percentDecimals = 1)
     {
+        ShowIndexingProgressPanel(new IndexingProgressSnapshot(
+            status: IndexingProgressViewModel.ParseStatus(status),
+            processedFiles: processedFiles,
+            totalFiles: totalFiles,
+            currentFile: currentFile,
+            lastReadFile: lastReadFile,
+            pendingFiles: pendingFiles,
+            percentComplete: percentComplete,
+            updatedAt: updatedAt,
+            rawStatus: status,
+            percentDecimals: percentDecimals));
+    }
+
+    private void ShowIndexingProgressPanel(IndexingProgressSnapshot snapshot)
+    {
         if (!Dispatcher.UIThread.CheckAccess())
         {
-            Dispatcher.UIThread.Post(() => ShowIndexingProgressPanel(
-                status,
-                processedFiles,
-                totalFiles,
-                pendingFiles,
-                percentComplete,
-                currentFile,
-                lastReadFile,
-                updatedAt,
-                percentDecimals));
+            Dispatcher.UIThread.Post(() => ShowIndexingProgressPanel(snapshot));
             return;
         }
 
-        var percent = Math.Clamp(percentComplete, 0, 100);
-        var isStageProgress = IsStageProgressStatus(status);
-        var progressDetail = !string.IsNullOrWhiteSpace(currentFile) ? currentFile : lastReadFile;
-        var fileName = string.IsNullOrWhiteSpace(progressDetail) || isStageProgress ? string.Empty : Path.GetFileName(progressDetail);
-        var unitLabel = isStageProgress ? "steps" : "files";
-        var countText = totalFiles > 0
-            ? $"{processedFiles:N0}/{totalFiles:N0} {unitLabel}"
-            : $"{processedFiles:N0} {unitLabel}";
-        var pendingText = pendingFiles > 0 ? $" | {pendingFiles:N0} pending" : string.Empty;
-        var fileText = isStageProgress
-            ? (string.IsNullOrWhiteSpace(progressDetail) ? string.Empty : $" | {progressDetail}")
-            : (string.IsNullOrWhiteSpace(fileName)
-                ? string.Empty
-                : $" | {(string.IsNullOrWhiteSpace(currentFile) ? "Last" : "Now")}: {fileName}");
-        var updatedText = updatedAt.HasValue
-            ? $" | Updated {updatedAt.Value.ToLocalTime():HH:mm:ss}"
-            : string.Empty;
-
-        IndexingProgressPanel.IsVisible = true;
-        IndexingProgressText.Text = $"{BuildIndexingProgressTitle(status)}: {countText}{pendingText}{fileText}{updatedText}";
-        IndexingProgressPercentText.Text = percent.ToString("0." + new string('#', Math.Max(0, percentDecimals)), CultureInfo.InvariantCulture) + "%";
-        IndexingProgressBar.Value = percent;
+        ViewModel.IndexingProgress.ApplySnapshot(snapshot);
+        SyncIndexingProgressPanelFromViewModel();
     }
 
     private void HideIndexingProgressPanel()
@@ -161,41 +130,24 @@ public partial class MainWindow : Window
             return;
         }
 
-        IndexingProgressPanel.IsVisible = false;
-        IndexingProgressText.Text = string.Empty;
-        IndexingProgressPercentText.Text = "0%";
-        IndexingProgressBar.Value = 0;
+        ViewModel.IndexingProgress.HidePanel();
+        SyncIndexingProgressPanelFromViewModel();
     }
 
-    private static string BuildIndexingProgressTitle(string status)
+    private void SyncIndexingProgressPanelFromViewModel()
     {
-        return (status ?? string.Empty).Trim().ToLowerInvariant() switch
-        {
-            "paused" => "Indexing paused",
-            "cancelling" => "Stopping indexing",
-            "cancelled" => "Indexing cancelled",
-            "saving_index" => "Saving index cache",
-            "saving_connections" => "Saving connections",
-            "connecting" => "Building connections",
-            "connections_completed" => "Connections complete",
-            "building_structure" => "Building asset structure",
-            "structure_completed" => "Asset structure complete",
-            "structure_failed" => "Asset structure failed",
-            "completed" => "Indexing complete",
-            "failed" => "Indexing failed",
-            "connections_failed" => "Connections build failed",
-            _ => "Indexing"
-        };
+        var vm = ViewModel.IndexingProgress;
+        IndexingProgressPanel.IsVisible = vm.IsPanelVisible;
+        IndexingProgressText.Text = vm.PrimaryStatusText;
+        IndexingProgressPercentText.Text = vm.FormattedPercentText;
+        IndexingProgressBar.Value = vm.ProgressPercent;
     }
 
-    private static bool IsStageProgressStatus(string? status)
-    {
-        return string.Equals(status, "saving_index", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "saving_connections", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
-    }
+    private static string BuildIndexingProgressTitle(string status) =>
+        IndexingProgressViewModel.BuildIndexingProgressTitle(status);
+
+    private static bool IsStageProgressStatus(string? status) =>
+        IndexingProgressViewModel.IsStageProgressStatus(status);
 
     private void PrioritizeUserInteraction(int milliseconds = UserInteractionPriorityMilliseconds)
     {
