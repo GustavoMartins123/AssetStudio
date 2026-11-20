@@ -1,49 +1,119 @@
+#nullable enable
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace AssetStudio
 {
     public class ProjectIndex
     {
-        private readonly ConcurrentDictionary<string, AssetHandle> _handles = new ConcurrentDictionary<string, AssetHandle>();
-        private readonly ConcurrentDictionary<string, ConcurrentBag<AssetHandle>> _handlesByFile = new ConcurrentDictionary<string, ConcurrentBag<AssetHandle>>();
-        private readonly ConcurrentQueue<AssetHandle> _pendingHandles = new ConcurrentQueue<AssetHandle>();
+        private readonly AssetIndexArena _arena = new AssetIndexArena();
 
-        public int Count => _handles.Count;
-        
+        public AssetIndexArena Arena => _arena;
+
+        public int Count => _arena.Count;
+
         public void AddHandle(AssetHandle handle)
         {
-            if (handle != null && !string.IsNullOrEmpty(handle.UniqueID))
+            if (handle != null && handle.HasUniqueId)
             {
-                _handles[handle.UniqueID] = handle;
-                _pendingHandles.Enqueue(handle);
-
-                if (!string.IsNullOrEmpty(handle.SerializedFileName))
-                {
-                    var fileBag = _handlesByFile.GetOrAdd(handle.SerializedFileName, _ => new ConcurrentBag<AssetHandle>());
-                    fileBag.Add(handle);
-                }
+                _arena.AddHandle(handle);
             }
+        }
+
+        public int AddRecord(
+            string? serializedFileName,
+            string? originalPath,
+            long pathId,
+            string? name,
+            ClassIDType type,
+            string? container = null,
+            long byteStart = 0,
+            long byteSize = 0,
+            string? sourceHash = null,
+            string? unityVersion = null,
+            SerializedFile? sourceFile = null,
+            Object? realObject = null,
+            object? tag = null,
+            string? customUniqueId = null)
+        {
+            return _arena.AddRecord(
+                serializedFileName,
+                originalPath,
+                pathId,
+                name,
+                type,
+                container,
+                byteStart,
+                byteSize,
+                sourceHash,
+                unityVersion,
+                sourceFile,
+                realObject,
+                tag,
+                customUniqueId);
+        }
+
+        public bool TryGetIndex(AssetHandleKey key, out int index)
+        {
+            return _arena.TryGetIndex(key, out index);
+        }
+
+        public bool TryGetIndexByUniqueId(ReadOnlySpan<char> uniqueId, out int index)
+        {
+            return _arena.TryGetIndexByUniqueId(uniqueId, out index);
+        }
+
+        public bool TryGetIndexByUniqueId(string? uniqueId, out int index)
+        {
+            return _arena.TryGetIndexByUniqueId(uniqueId, out index);
+        }
+
+        public AssetHandle MaterializeHandle(int index)
+        {
+            return _arena.MaterializeHandle(index);
         }
 
         public AssetHandle? GetHandle(string? uniqueID)
         {
-            if (string.IsNullOrEmpty(uniqueID)) return null;
-            _handles.TryGetValue(uniqueID, out var handle);
-            return handle;
+            if (string.IsNullOrEmpty(uniqueID))
+            {
+                return null;
+            }
+
+            if (_arena.TryGetIndexByUniqueId(uniqueID.AsSpan(), out int index)
+                && _arena.TryMaterializeHandle(index, out AssetHandle? handle))
+            {
+                return handle;
+            }
+
+            return null;
         }
 
         public IEnumerable<AssetHandle> GetHandles()
         {
-            return _handles.Values;
+            int count = _arena.Count;
+            for (int i = 0; i < count; i++)
+            {
+                if (_arena.TryMaterializeHandle(i, out AssetHandle? handle) && handle != null)
+                {
+                    yield return handle;
+                }
+            }
+        }
+
+        public int[] DrainPendingIndices(int maxCount = int.MaxValue)
+        {
+            return _arena.DrainPendingIndices(maxCount);
         }
 
         public IEnumerable<AssetHandle> DrainPendingHandles()
         {
-            while (_pendingHandles.TryDequeue(out var handle))
+            while (_arena.TryDequeuePendingIndex(out int index))
             {
-                yield return handle;
+                if (_arena.TryMaterializeHandle(index, out AssetHandle? handle) && handle != null)
+                {
+                    yield return handle;
+                }
             }
         }
 
@@ -54,28 +124,47 @@ namespace AssetStudio
                 yield break;
             }
 
-            var drained = 0;
-            while (drained < maxCount && _pendingHandles.TryDequeue(out var handle))
+            int drained = 0;
+            while (drained < maxCount && _arena.TryDequeuePendingIndex(out int index))
             {
-                drained++;
-                yield return handle;
+                if (_arena.TryMaterializeHandle(index, out AssetHandle? handle) && handle != null)
+                {
+                    drained++;
+                    yield return handle;
+                }
             }
         }
 
         public IEnumerable<AssetHandle> GetHandlesForFile(string fileName)
         {
-            if (string.IsNullOrEmpty(fileName)) return Array.Empty<AssetHandle>();
-            _handlesByFile.TryGetValue(fileName, out var fileBag);
-            return fileBag ?? (IEnumerable<AssetHandle>)Array.Empty<AssetHandle>();
+            if (string.IsNullOrEmpty(fileName))
+            {
+                return Array.Empty<AssetHandle>();
+            }
+
+            int[] indices = _arena.GetIndicesForFile(fileName);
+            if (indices.Length == 0)
+            {
+                return Array.Empty<AssetHandle>();
+            }
+
+            return MaterializeIndices(indices);
+        }
+
+        private IEnumerable<AssetHandle> MaterializeIndices(int[] indices)
+        {
+            for (int i = 0; i < indices.Length; i++)
+            {
+                if (_arena.TryMaterializeHandle(indices[i], out AssetHandle? handle) && handle != null)
+                {
+                    yield return handle;
+                }
+            }
         }
 
         public void Clear()
         {
-            _handles.Clear();
-            _handlesByFile.Clear();
-            while (_pendingHandles.TryDequeue(out _))
-            {
-            }
+            _arena.Clear();
         }
     }
 }
