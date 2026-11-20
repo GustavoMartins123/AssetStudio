@@ -67,35 +67,61 @@ namespace AssetStudio.Avalonia
             }
 
             incomplete = false;
+            var sourceFiles = LoadSourceFileOriginsForProject(conn, projectId);
             var handles = new List<AssetHandle>();
             using (var cmd = conn.CreateCommand())
             {
+                // Schema v13: handles live once in the clustered Assets table (PRIMARY KEY (ProjectId, UniqueID));
+                // origins are resolved from the per-project SourceFiles map so path strings are shared, not duplicated.
                 cmd.CommandText = @"
-                    SELECT UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize
-                    FROM AssetHandles
+                    SELECT UniqueID, Name, Type, Container, SourceFileId, PathID, ByteStart, ByteSize
+                    FROM Assets
                     WHERE ProjectId = @projectId";
                 cmd.Parameters.AddWithValue("@projectId", projectId);
                 using (var reader = cmd.ExecuteReader())
                 {
                     while (reader.Read())
                     {
+                        var origin = !reader.IsDBNull(4) && sourceFiles.TryGetValue(reader.GetInt64(4), out var resolved)
+                            ? resolved
+                            : (SerializedFileName: string.Empty, OriginalPath: string.Empty);
                         handles.Add(new AssetHandle
                         {
                             UniqueID = reader.GetString(0),
                             Name = reader.GetString(1),
                             Type = (ClassIDType)reader.GetInt32(2),
                             Container = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
-                            OriginalPath = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
-                            SerializedFileName = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
-                            PathID = reader.GetInt64(6),
-                            ByteStart = reader.GetInt64(7),
-                            ByteSize = reader.GetInt64(8)
+                            OriginalPath = origin.OriginalPath,
+                            SerializedFileName = origin.SerializedFileName,
+                            PathID = reader.GetInt64(5),
+                            ByteStart = reader.GetInt64(6),
+                            ByteSize = reader.GetInt64(7)
                         });
                     }
                 }
             }
 
             return handles;
+        }
+
+        private static Dictionary<long, (string SerializedFileName, string OriginalPath)> LoadSourceFileOriginsForProject(SqliteConnection conn, long projectId)
+        {
+            var result = new Dictionary<long, (string SerializedFileName, string OriginalPath)>();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT Id, SerializedFileName, OriginalPath
+                FROM SourceFiles
+                WHERE ProjectId = @projectId";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                result[reader.GetInt64(0)] = (
+                    reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                    reader.IsDBNull(2) ? string.Empty : reader.GetString(2));
+            }
+
+            return result;
         }
 
         public bool SaveIndexCache(
@@ -112,7 +138,8 @@ namespace AssetStudio.Avalonia
             try
             {
                 var handleList = handles?.ToList() ?? new List<AssetHandle>();
-                var totalWork = Math.Max(1, handleList.Count * 2 + Math.Max(1, scanResult.TotalFiles));
+                // v13 writes every handle exactly once (unified Assets table) plus one row per source file.
+                var totalWork = Math.Max(1, handleList.Count + Math.Max(1, scanResult.TotalFiles));
                 var reporter = new ThrottledProgressReporter(totalWork, progress);
 
                 reporter.Report("Waiting for SQLite writer", force: true);
@@ -133,52 +160,9 @@ namespace AssetStudio.Avalonia
                                 var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
                                 reporter.Report("Clearing previous index rows", force: true);
                                 ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
-                                DropIndexBulkSecondaryIndexes(conn, transaction);
 
-                                // Insert handles in batch using parameterized query
-                                using (var cmd = conn.CreateCommand())
-                                {
-                                    cmd.CommandText = @"
-                                        INSERT INTO AssetHandles (ProjectId, UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize)
-                                        VALUES (@projectId, @uniqueId, @name, @type, @container, @originalPath, @serializedFile, @pathId, @byteStart, @byteSize)";
-                                    cmd.Transaction = transaction;
-
-                                    var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
-                                    var pUniqueId = cmd.Parameters.Add("@uniqueId", SqliteType.Text);
-                                    var pName = cmd.Parameters.Add("@name", SqliteType.Text);
-                                    var pType = cmd.Parameters.Add("@type", SqliteType.Integer);
-                                    var pContainer = cmd.Parameters.Add("@container", SqliteType.Text);
-                                    var pOriginalPath = cmd.Parameters.Add("@originalPath", SqliteType.Text);
-                                    var pSerializedFile = cmd.Parameters.Add("@serializedFile", SqliteType.Text);
-                                    var pPathId = cmd.Parameters.Add("@pathId", SqliteType.Integer);
-                                    var pByteStart = cmd.Parameters.Add("@byteStart", SqliteType.Integer);
-                                    var pByteSize = cmd.Parameters.Add("@byteSize", SqliteType.Integer);
-
-                                    pProjectId.Value = projectId;
-
-                                    var savedHandleRows = 0;
-                                    foreach (var h in handleList)
-                                    {
-                                        pUniqueId.Value = h.UniqueID ?? string.Empty;
-                                        pName.Value = h.Name ?? string.Empty;
-                                        pType.Value = (int)h.Type;
-                                        pContainer.Value = h.Container ?? (object)DBNull.Value;
-                                        pOriginalPath.Value = h.OriginalPath ?? (object)DBNull.Value;
-                                        pSerializedFile.Value = h.SerializedFileName ?? (object)DBNull.Value;
-                                        pPathId.Value = h.PathID;
-                                        pByteStart.Value = h.ByteStart;
-                                        pByteSize.Value = h.ByteSize;
-
-                                        cmd.ExecuteNonQuery();
-                                        savedHandleRows++;
-                                        reporter.Advance($"Saving handles: {savedHandleRows:N0}/{handleList.Count:N0}");
-                                    }
-                                }
-
+                                // Single write pass into the unified clustered Assets table (no secondary indexes to rebuild).
                                 InsertSourceFilesAndAssets(conn, transaction, projectId, handleList, reporter.Advance);
-
-                                reporter.Report("Rebuilding index cache indexes", force: true);
-                                CreateIndexBulkSecondaryIndexes(conn, transaction);
 
                                 reporter.Report("Committing SQLite transaction", force: true);
                                 transaction.Commit();
@@ -304,13 +288,11 @@ namespace AssetStudio.Avalonia
             var tables = preserveSemanticRelations
                 ? new[]
                 {
-                    "AssetHandles",
                     "Assets",
                     "SourceFiles"
                 }
                 : new[]
                 {
-                    "AssetHandles",
                     "MaterialTextures",
                     "MeshMaterials",
                     "MeshRenderers",
@@ -412,7 +394,9 @@ namespace AssetStudio.Avalonia
 
                 pProjectId.Value = projectId;
                 var assetRowIndex = 0;
-                foreach (var handle in handles)
+                // Insert in PRIMARY KEY order so the WITHOUT ROWID B-tree is filled by sequential appends
+                // instead of random page splits (SQLite BINARY collation ~ ordinal comparison).
+                foreach (var handle in handles.OrderBy(h => h.UniqueID ?? string.Empty, StringComparer.Ordinal))
                 {
                     var sourceKey = GetSourceFileKey(handle.SerializedFileName ?? string.Empty, handle.OriginalPath ?? string.Empty);
                     pSourceFileId.Value = sourceFileIds.TryGetValue(sourceKey, out var sourceFileId)

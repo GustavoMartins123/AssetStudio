@@ -23,6 +23,7 @@ namespace AssetStudio.Tests
         {
             "idx_projects_path",
             "idx_handles_project",
+            "idx_handles_lookup",
             "idx_source_files_project",
             "idx_assets_project",
             "idx_assets_unique",
@@ -51,7 +52,6 @@ namespace AssetStudio.Tests
         private static readonly string[] ExpectedActiveIndexes =
         {
             "idx_projects_lookup",
-            "idx_handles_lookup",
             "idx_source_files_unique",
             "idx_asset_edges_target_kind",
             "idx_model_groups_unique",
@@ -116,7 +116,7 @@ namespace AssetStudio.Tests
                 using (var versionCmd = conn.CreateCommand())
                 {
                     versionCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("12", versionCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("13", versionCmd.ExecuteScalar()?.ToString());
                 }
 
                 var tableDdl = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -599,7 +599,7 @@ namespace AssetStudio.Tests
                         cmd.Parameters.AddWithValue("@projectId", projectId);
                         cmd.Parameters.AddWithValue("@uniqueId", sampleIds.MeshId);
                     });
-                Assert.Contains(handleLookupPlan, line => line.Contains("SEARCH AssetHandles USING INDEX idx_handles_lookup", StringComparison.OrdinalIgnoreCase));
+                Assert.Contains(handleLookupPlan, line => line.Contains("SEARCH Assets USING PRIMARY KEY", StringComparison.OrdinalIgnoreCase));
             }
             finally
             {
@@ -775,7 +775,7 @@ namespace AssetStudio.Tests
                 {
                     using var versionCmd = conn.CreateCommand();
                     versionCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("12", versionCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("13", versionCmd.ExecuteScalar()?.ToString());
 
                     foreach (var table in ClusteredWithoutRowIdTables)
                     {

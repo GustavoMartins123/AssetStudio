@@ -7,7 +7,32 @@ namespace AssetStudio.Avalonia
 {
     public partial class SQLiteProjectIndexCache
     {
-        internal const int SemanticSchemaVersion = 12;
+        /// <summary>
+        /// v13: the physical <c>AssetHandles</c> table was folded into the clustered <c>Assets</c>
+        /// table (WITHOUT ROWID, PRIMARY KEY (ProjectId, UniqueID)). Every handle is written exactly
+        /// once; <c>OriginalPath</c>/<c>SerializedFileName</c> are normalized through <c>SourceFiles</c>
+        /// and a read-only <c>AssetHandles</c> compatibility view keeps legacy queries working.
+        /// </summary>
+        internal const int SemanticSchemaVersion = 13;
+
+        private const string AssetHandlesCompatibilityViewSql = @"
+            CREATE VIEW IF NOT EXISTS AssetHandles AS
+            SELECT
+                Assets.ProjectId AS ProjectId,
+                Assets.UniqueID AS UniqueID,
+                Assets.Name AS Name,
+                Assets.Type AS Type,
+                Assets.Container AS Container,
+                COALESCE(SourceFiles.OriginalPath, '') AS OriginalPath,
+                COALESCE(SourceFiles.SerializedFileName, '') AS SerializedFileName,
+                Assets.PathID AS PathID,
+                Assets.ByteStart AS ByteStart,
+                Assets.ByteSize AS ByteSize,
+                Assets.SourceFileId AS SourceFileId
+            FROM Assets
+            LEFT JOIN SourceFiles
+              ON SourceFiles.ProjectId = Assets.ProjectId
+             AND SourceFiles.Id = Assets.SourceFileId;";
 
         private static bool TryUpgradeOrRebuildSchema(SqliteConnection conn)
         {
@@ -17,9 +42,19 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            if (existingVersion == 11 && CanPreserveV11ProjectsAndPreviewCache(conn))
+            if ((existingVersion == 11 || existingVersion == 12) && CanPreserveV11ProjectsAndPreviewCache(conn))
             {
-                UpgradeV11ToV12(conn);
+                if (existingVersion == 12 && CanPreserveV12UnifiedAssets(conn))
+                {
+                    // v12 Assets already holds every handle column (paths via SourceFiles): keep the
+                    // whole index cache and just drop the duplicated physical AssetHandles table.
+                    UpgradeV12ToV13InPlace(conn);
+                }
+                else
+                {
+                    DropLegacyIndexTables(conn);
+                }
+
                 return true;
             }
 
@@ -98,8 +133,65 @@ namespace AssetStudio.Avalonia
             return columns;
         }
 
-        private static void UpgradeV11ToV12(SqliteConnection conn)
+        private static bool CanPreserveV12UnifiedAssets(SqliteConnection conn)
         {
+            string assetsDdl;
+            using (var ddlCmd = conn.CreateCommand())
+            {
+                ddlCmd.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'Assets' LIMIT 1";
+                assetsDdl = ddlCmd.ExecuteScalar()?.ToString() ?? string.Empty;
+            }
+
+            if (assetsDdl.IndexOf("WITHOUT ROWID", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return false;
+            }
+
+            var assetColumns = GetTableColumnNames(conn, "Assets");
+            var sourceColumns = GetTableColumnNames(conn, "SourceFiles");
+            var hasExpectedColumns = assetColumns.Contains("ProjectId")
+                && assetColumns.Contains("UniqueID")
+                && assetColumns.Contains("SourceFileId")
+                && assetColumns.Contains("Name")
+                && assetColumns.Contains("Type")
+                && assetColumns.Contains("Container")
+                && assetColumns.Contains("PathID")
+                && assetColumns.Contains("ByteStart")
+                && assetColumns.Contains("ByteSize")
+                && sourceColumns.Contains("Id")
+                && sourceColumns.Contains("SerializedFileName")
+                && sourceColumns.Contains("OriginalPath");
+            if (!hasExpectedColumns)
+            {
+                return false;
+            }
+
+            // Every asset row must resolve its origin through SourceFiles, otherwise handles would
+            // hydrate without OriginalPath/SerializedFileName; fall back to a re-index in that case.
+            using var orphanCmd = conn.CreateCommand();
+            orphanCmd.CommandText = @"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM Assets
+                    LEFT JOIN SourceFiles ON SourceFiles.Id = Assets.SourceFileId
+                    WHERE SourceFiles.Id IS NULL
+                )";
+            return Convert.ToInt64(orphanCmd.ExecuteScalar()) == 0;
+        }
+
+        private static void UpgradeV12ToV13InPlace(SqliteConnection conn)
+        {
+            DropAssetHandlesSchemaObject(conn);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                DROP INDEX IF EXISTS idx_handles_lookup;
+                DROP INDEX IF EXISTS idx_projects_path;";
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void DropLegacyIndexTables(SqliteConnection conn)
+        {
+            DropAssetHandlesSchemaObject(conn);
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"
                 PRAGMA foreign_keys = OFF;
@@ -113,7 +205,6 @@ namespace AssetStudio.Avalonia
                 DROP TABLE IF EXISTS AssetEdges;
                 DROP TABLE IF EXISTS Assets;
                 DROP TABLE IF EXISTS SourceFiles;
-                DROP TABLE IF EXISTS AssetHandles;
                 DROP INDEX IF EXISTS idx_projects_path;
                 PRAGMA foreign_keys = ON;";
             cmd.ExecuteNonQuery();
@@ -121,6 +212,7 @@ namespace AssetStudio.Avalonia
 
         private static void RebuildSchema(SqliteConnection conn)
         {
+            DropAssetHandlesSchemaObject(conn);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = @"
@@ -136,12 +228,37 @@ namespace AssetStudio.Avalonia
                     DROP TABLE IF EXISTS AssetEdges;
                     DROP TABLE IF EXISTS Assets;
                     DROP TABLE IF EXISTS SourceFiles;
-                    DROP TABLE IF EXISTS AssetHandles;
                     DROP TABLE IF EXISTS Projects;
                     DROP TABLE IF EXISTS CacheSchema;
                     PRAGMA foreign_keys = ON;";
                 cmd.ExecuteNonQuery();
             }
+        }
+
+        /// <summary>
+        /// Drops <c>AssetHandles</c> whether it is the legacy (v12 and older) physical table or the
+        /// v13 compatibility view. SQLite rejects <c>DROP TABLE</c> on a view and vice versa, even
+        /// with <c>IF EXISTS</c>, so the object type is resolved first.
+        /// </summary>
+        private static void DropAssetHandlesSchemaObject(SqliteConnection conn)
+        {
+            string? objectType;
+            using (var typeCmd = conn.CreateCommand())
+            {
+                typeCmd.CommandText = "SELECT type FROM sqlite_master WHERE name = 'AssetHandles' AND type IN ('table', 'view') LIMIT 1";
+                objectType = typeCmd.ExecuteScalar()?.ToString();
+            }
+
+            if (string.IsNullOrEmpty(objectType))
+            {
+                return;
+            }
+
+            using var dropCmd = conn.CreateCommand();
+            dropCmd.CommandText = string.Equals(objectType, "view", StringComparison.OrdinalIgnoreCase)
+                ? "DROP VIEW IF EXISTS AssetHandles;"
+                : "PRAGMA foreign_keys = OFF; DROP INDEX IF EXISTS idx_handles_lookup; DROP TABLE IF EXISTS AssetHandles; PRAGMA foreign_keys = ON;";
+            dropCmd.ExecuteNonQuery();
         }
 
         private static void CreateSchema(SqliteConnection conn)
@@ -158,20 +275,6 @@ namespace AssetStudio.Avalonia
                                 UnityBundleCount INTEGER NOT NULL,
                                 LastIndexed DATETIME DEFAULT CURRENT_TIMESTAMP,
                                 UnityVersion TEXT
-                            );
-
-                            CREATE TABLE IF NOT EXISTS AssetHandles (
-                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
-                                UniqueID TEXT NOT NULL,
-                                Name TEXT NOT NULL,
-                                Type INTEGER NOT NULL,
-                                Container TEXT,
-                                OriginalPath TEXT,
-                                SerializedFileName TEXT,
-                                PathID INTEGER NOT NULL,
-                                ByteStart INTEGER NOT NULL,
-                                ByteSize INTEGER NOT NULL
                             );
 
                             CREATE INDEX IF NOT EXISTS idx_projects_lookup ON Projects(FolderPath COLLATE NOCASE, SignatureHash, LastIndexed DESC);
@@ -298,7 +401,10 @@ namespace AssetStudio.Avalonia
                                 CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
                                 LastAccessed DATETIME DEFAULT CURRENT_TIMESTAMP,
                                 UpdatedUtc TEXT NOT NULL DEFAULT '',
-                                LastAccessedUtc TEXT NOT NULL DEFAULT ''
+                                LastAccessedUtc TEXT NOT NULL DEFAULT '',
+                                PayloadBlob BLOB,
+                                PayloadCompression INTEGER NOT NULL DEFAULT 0,
+                                UncompressedByteSize INTEGER NOT NULL DEFAULT 0
                             );
 
                             CREATE TABLE IF NOT EXISTS ProjectIndexingState (
@@ -334,7 +440,6 @@ namespace AssetStudio.Avalonia
                             VALUES ('SemanticSchemaVersion', '{SemanticSchemaVersion.ToString(CultureInfo.InvariantCulture)}');
 
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_source_files_unique ON SourceFiles(ProjectId, SerializedFileName, OriginalPath);
-                            CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SlotName, SourceAssetUniqueID, SlotIndex);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_groups_unique ON ModelGroups(ProjectId, GroupAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
@@ -349,23 +454,13 @@ namespace AssetStudio.Avalonia
                 cmd.ExecuteNonQuery();
             }
 
+            using (var viewCmd = conn.CreateCommand())
+            {
+                viewCmd.CommandText = AssetHandlesCompatibilityViewSql;
+                viewCmd.ExecuteNonQuery();
+            }
+
             EnsurePreviewCacheSchemaUpgrades(conn);
-        }
-
-        private static void DropIndexBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = transaction;
-            cmd.CommandText = "DROP INDEX IF EXISTS idx_handles_lookup;";
-            cmd.ExecuteNonQuery();
-        }
-
-        private static void CreateIndexBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = transaction;
-            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);";
-            cmd.ExecuteNonQuery();
         }
 
         private static void DropSemanticBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
@@ -417,6 +512,28 @@ namespace AssetStudio.Avalonia
                     UPDATE PreviewCacheEntries
                     SET LastAccessedUtc = COALESCE(NULLIF(LastAccessed, ''), NULLIF(UpdatedUtc, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                     WHERE LastAccessedUtc = '';";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            // v13 inline preview payload columns (idempotent for preserved v11/v12 tables).
+            if (!columns.Contains("PayloadBlob"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.CommandText = "ALTER TABLE PreviewCacheEntries ADD COLUMN PayloadBlob BLOB;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!columns.Contains("PayloadCompression"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.CommandText = "ALTER TABLE PreviewCacheEntries ADD COLUMN PayloadCompression INTEGER NOT NULL DEFAULT 0;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!columns.Contains("UncompressedByteSize"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.CommandText = "ALTER TABLE PreviewCacheEntries ADD COLUMN UncompressedByteSize INTEGER NOT NULL DEFAULT 0;";
                 alterCmd.ExecuteNonQuery();
             }
 

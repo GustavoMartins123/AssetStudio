@@ -160,7 +160,7 @@ namespace AssetStudio.Tests
                     var tables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     using (var tableCmd = conn.CreateCommand())
                     {
-                        tableCmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table';";
+                        tableCmd.CommandText = "SELECT name FROM sqlite_master WHERE type IN ('table', 'view');";
                         using var reader = tableCmd.ExecuteReader();
                         while (reader.Read())
                         {
