@@ -1,11 +1,9 @@
 using AssetStudio;
 using AssetStudio.Avalonia.Services.ProjectAnalysis;
+using AssetStudio.Avalonia.ViewModels;
 using Avalonia.Controls;
 using Avalonia.Threading;
 using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -18,10 +16,36 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _projectAnalysisCts;
     private ProjectAnalysisResult? _currentProjectAnalysis;
     private ProjectAnalysisReport? _currentProjectAnalysisReport;
+    private ProjectSessionViewModel? _projectSession;
+
+    internal ProjectSessionViewModel ProjectSession =>
+        _projectSession ??= CreateProjectSessionViewModel();
 
     internal ProjectAnalysisReport? CurrentProjectAnalysisReport => _currentProjectAnalysisReport;
     internal ProjectAnalysisResult? CurrentProjectAnalysisResult => _currentProjectAnalysis;
     internal event Action<ProjectAnalysisReport>? ProjectAnalysisReportUpdated;
+
+    private ProjectSessionViewModel CreateProjectSessionViewModel()
+    {
+        var vm = new ProjectSessionViewModel(static action =>
+        {
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
+            }
+        });
+
+        if (projectContext?.Project != null)
+        {
+            vm.SetLoadedProject(projectContext.Project, isLazyMode: assetsManager.LazyLoading);
+        }
+
+        return vm;
+    }
 
     internal void StartProjectAnalysisAsync(string projectRoot, bool forceRefresh = false)
     {
@@ -29,6 +53,13 @@ public partial class MainWindow : Window
         {
             return;
         }
+
+        ProjectSession.SetLoadedProject(
+            projectFolderPath: projectRoot,
+            displayName: projectContext?.Project != null && IsSameProjectRoot(projectContext.Project.ProjectRoot, projectRoot)
+                ? projectContext.Project.DisplayName
+                : null,
+            isLazyMode: assetsManager.LazyLoading);
 
         CancellationTokenSource cts;
         lock (_projectAnalysisLock)
@@ -55,53 +86,12 @@ public partial class MainWindow : Window
 
     internal string FormatProjectAnalysisStatusText(ProjectAnalysisReport report)
     {
-        return FormatProjectAnalysisBannerText(report);
+        return ProjectSessionViewModel.FormatRuntimeBannerText(report);
     }
 
     internal static string FormatProjectAnalysisBannerText(ProjectAnalysisReport? report)
     {
-        if (report == null)
-        {
-            return string.Empty;
-        }
-
-        switch (report.Status)
-        {
-            case ProjectAnalysisStatus.Pending:
-                return "Analysis: Pending";
-
-            case ProjectAnalysisStatus.Running:
-                return "Analysis: Running...";
-
-            case ProjectAnalysisStatus.Failed:
-                return string.IsNullOrWhiteSpace(report.ErrorMessage)
-                    ? "Analysis: Failed"
-                    : $"Analysis: Failed ({report.ErrorMessage})";
-
-            case ProjectAnalysisStatus.Ready:
-            {
-                var parts = new List<string> { "Analysis: Ready", report.BuildRuntimeBadge() };
-                if (report.Il2CppScriptCount > 0)
-                {
-                    parts.Add(string.Create(CultureInfo.InvariantCulture, $"{report.Il2CppScriptCount:N0} scripts"));
-                }
-
-                if (report.AddressablesBundleCount > 0)
-                {
-                    parts.Add(string.Create(CultureInfo.InvariantCulture, $"{report.AddressablesBundleCount:N0} bundles"));
-                }
-
-                if (report.DecryptionHintCount > 0)
-                {
-                    parts.Add(string.Create(CultureInfo.InvariantCulture, $"{report.DecryptionHintCount:N0} decryption hint{(report.DecryptionHintCount == 1 ? string.Empty : "s")}"));
-                }
-
-                return string.Join(" \u2022 ", parts);
-            }
-
-            default:
-                return "Analysis: Unknown";
-        }
+        return ProjectSessionViewModel.FormatRuntimeBannerText(report);
     }
 
     private ProjectAnalysisOptions BuildProjectAnalysisOptions(string projectRoot, bool forceRefresh)
@@ -155,7 +145,7 @@ public partial class MainWindow : Window
             }
 
             _currentProjectAnalysis = result;
-            PublishProjectAnalysisReportToUi(result.Report);
+            PublishProjectAnalysisReportToUi(result.Report, result);
 
             if (projectContext != null)
             {
@@ -209,18 +199,27 @@ public partial class MainWindow : Window
         }
     }
 
-    private void PublishProjectAnalysisReportToUi(ProjectAnalysisReport report)
+    private void PublishProjectAnalysisReportToUi(ProjectAnalysisReport report, ProjectAnalysisResult? fullResult = null)
     {
         var snapshot = report.Clone();
         _currentProjectAnalysisReport = snapshot;
 
         Dispatcher.UIThread.Post(() =>
         {
+            if (fullResult != null)
+            {
+                ProjectSession.ApplyProjectAnalysis(fullResult);
+            }
+            else
+            {
+                ProjectSession.ApplyProjectAnalysis(snapshot);
+            }
+
             ProjectAnalysisReportUpdated?.Invoke(snapshot);
             if (!IsProgressiveIndexingActive()
                 && (snapshot.Status == ProjectAnalysisStatus.Ready || snapshot.Status == ProjectAnalysisStatus.Failed))
             {
-                StatusStripUpdate(FormatProjectAnalysisStatusText(snapshot));
+                StatusStripUpdate(ProjectSession.RuntimeBannerText);
             }
         }, DispatcherPriority.Background);
     }
@@ -245,21 +244,6 @@ public partial class MainWindow : Window
 
     private static bool IsSameProjectRoot(string? left, string? right)
     {
-        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
-        {
-            return false;
-        }
-
-        try
-        {
-            var fullLeft = Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            var fullRight = Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-            return string.Equals(fullLeft, fullRight, comparison);
-        }
-        catch
-        {
-            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
-        }
+        return ProjectSessionViewModel.IsSameProjectRoot(left, right);
     }
 }

@@ -1,7 +1,9 @@
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -13,15 +15,48 @@ namespace AssetStudio.Avalonia;
 public partial class MainWindow
 {
     private readonly SceneTreeSearchSession treeSearchSession = new();
-    private GameObjectNode[]? appliedTreeSearchMatches;
+    private SceneHierarchyViewModel? _sceneHierarchy;
+
+    internal SceneHierarchyViewModel SceneHierarchy =>
+        _sceneHierarchy ??= new SceneHierarchyViewModel(DispatchToSceneHierarchyUi, treeSearchSession);
+
+    private GameObjectNode[]? appliedTreeSearchMatches
+    {
+        get => SceneHierarchy.AppliedMatchesArray;
+        set
+        {
+            if (value == null)
+            {
+                SceneHierarchy.InvalidateSearchCache();
+            }
+        }
+    }
+
+    private static void DispatchToSceneHierarchyUi(Action action)
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            action();
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
+        }
+    }
+
+    internal void ResetSceneTreeSearchState()
+    {
+        treeSearchSession.Invalidate();
+        SceneHierarchy.InvalidateSearchCache();
+        treeSearchResults.Clear();
+        nextGameObjectSearchIndex = 0;
+    }
 
     private void TreeSearch_TextChanged(object? sender, TextChangedEventArgs e)
     {
         // Latest-wins: a new query supersedes any in-flight traversal and its cached matches.
-        treeSearchSession.Invalidate();
-        appliedTreeSearchMatches = null;
-        treeSearchResults.Clear();
-        nextGameObjectSearchIndex = 0;
+        SceneHierarchy.SearchQuery = treeSearch.Text ?? string.Empty;
+        ResetSceneTreeSearchState();
     }
 
     private async void TreeSearch_KeyDown(object? sender, KeyEventArgs e)
@@ -41,67 +76,52 @@ public partial class MainWindow
         // Reset/reload paths clear treeSearchResults directly; treat that as a cache invalidation.
         if (appliedTreeSearchMatches != null && treeSearchResults.Count != appliedTreeSearchMatches.Length)
         {
-            treeSearchSession.Invalidate();
-            appliedTreeSearchMatches = null;
+            ResetSceneTreeSearchState();
         }
 
         var roots = sceneTreeNodes;
-        if (!treeSearchSession.TryGetCached(roots, searchText, out var matches))
+        SceneHierarchy.BindRootNodesReference(roots);
+        if (!SceneHierarchy.TryGetCachedMatches(searchText, out _) && !SceneHierarchy.IsSearching)
         {
-            if (!treeSearchSession.IsSearching)
-            {
-                StatusStripUpdate($"Searching scene hierarchy for '{searchText}'...");
-            }
-
-            GameObjectNode[]? searched;
-            try
-            {
-                searched = await treeSearchSession.SearchAsync(roots, searchText);
-            }
-            catch (Exception ex)
-            {
-                StatusStripUpdate($"Scene hierarchy search failed: {ex.Message}");
-                return;
-            }
-
-            // Superseded by a newer query, or the tree/query changed while we were searching.
-            if (searched == null
-                || !ReferenceEquals(roots, sceneTreeNodes)
-                || !string.Equals(searchText, treeSearch.Text?.Trim(), StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            matches = searched;
+            StatusStripUpdate($"Searching scene hierarchy for '{searchText}'...");
         }
 
-        ApplyTreeSearchMatches(matches);
-        if (treeSearchResults.Count == 0)
+        var selectedNode = await SceneHierarchy.SearchNextAsync(searchText);
+        if (SceneHierarchy.WasLastSearchSuperseded
+            || !ReferenceEquals(roots, sceneTreeNodes)
+            || !string.Equals(searchText, treeSearch.Text?.Trim(), StringComparison.Ordinal))
         {
-            StatusStripUpdate($"No scene hierarchy match for '{searchText}'.");
             return;
         }
 
-        if (nextGameObjectSearchIndex >= treeSearchResults.Count || nextGameObjectSearchIndex < 0)
+        var currentMatches = SceneHierarchy.AppliedMatchesArray;
+        if (currentMatches != null)
         {
-            nextGameObjectSearchIndex = 0;
+            ApplyTreeSearchMatches(currentMatches);
+            nextGameObjectSearchIndex = SceneHierarchy.CurrentMatchIndex;
         }
 
-        var selectedNode = treeSearchResults[nextGameObjectSearchIndex];
-        selectedNode.ExpandAncestors();
+        if (selectedNode == null)
+        {
+            if (!string.IsNullOrEmpty(SceneHierarchy.SearchStatusText))
+            {
+                StatusStripUpdate(SceneHierarchy.SearchStatusText);
+            }
+            return;
+        }
+
         SceneTreeView.SelectedItem = selectedNode;
-        nextGameObjectSearchIndex++;
-        StatusStripUpdate($"Scene hierarchy match {nextGameObjectSearchIndex}/{treeSearchResults.Count}: {selectedNode.Name}");
+        StatusStripUpdate(SceneHierarchy.SearchStatusText);
     }
 
     private void ApplyTreeSearchMatches(GameObjectNode[] matches)
     {
-        if (ReferenceEquals(matches, appliedTreeSearchMatches))
+        if (treeSearchResults.Count == matches.Length
+            && (matches.Length == 0 || ReferenceEquals(treeSearchResults[0], matches[0])))
         {
             return;
         }
 
-        appliedTreeSearchMatches = matches;
         treeSearchResults.Clear();
         treeSearchResults.AddRange(matches);
         nextGameObjectSearchIndex = 0;
@@ -110,15 +130,14 @@ public partial class MainWindow
     private void GoToSceneHierarchy_Click(object? sender, RoutedEventArgs e)
     {
         var item = assetContextItem ?? AssetListDataGrid.SelectedItem as AssetItem;
-        if (item?.TreeNode == null)
+        if (!SceneHierarchy.TryNavigateToAssetNode(item))
         {
-            StatusStripUpdate("Selected asset has no scene hierarchy node.");
+            StatusStripUpdate(SceneHierarchy.SearchStatusText);
             return;
         }
 
-        item.TreeNode.ExpandAncestors();
         LeftTabControl.SelectedIndex = 0;
-        SceneTreeView.SelectedItem = item.TreeNode;
+        SceneTreeView.SelectedItem = SceneHierarchy.SelectedNode;
         SceneTreeView.Focus();
     }
 
