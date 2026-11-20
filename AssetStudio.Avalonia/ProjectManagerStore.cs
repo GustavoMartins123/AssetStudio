@@ -137,20 +137,31 @@ public sealed class ProjectManagerStore
 
     private readonly string _dbPath;
     private readonly string _iconsDirectory;
-    private readonly SQLiteProjectIndexCache _indexCache = new();
+    private readonly SQLiteProjectIndexCache _indexCache;
     private readonly Task _initTask;
 
     public ProjectManagerStore()
+        : this(
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio",
+                "ProjectManager"),
+            new SQLiteProjectIndexCache())
     {
-        var baseDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AssetStudio",
-            "ProjectManager");
+    }
+
+    internal ProjectManagerStore(string baseDirectory, SQLiteProjectIndexCache? indexCache = null)
+    {
+        if (string.IsNullOrWhiteSpace(baseDirectory))
+        {
+            throw new ArgumentException("Base directory must not be empty.", nameof(baseDirectory));
+        }
 
         Directory.CreateDirectory(baseDirectory);
         _iconsDirectory = Path.Combine(baseDirectory, "Icons");
         Directory.CreateDirectory(_iconsDirectory);
         _dbPath = Path.Combine(baseDirectory, "projects.db");
+        _indexCache = indexCache ?? new SQLiteProjectIndexCache(Path.Combine(baseDirectory, "IndexCache"));
 
         _initTask = Task.Run(InitializeDatabase);
     }

@@ -19,8 +19,18 @@ namespace AssetStudio.Avalonia
         private readonly object _initLock = new object();
 
         public SQLiteProjectIndexCache()
+            : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache"))
         {
-            _cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache");
+        }
+
+        internal SQLiteProjectIndexCache(string cacheDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(cacheDirectory))
+            {
+                throw new ArgumentException("Cache directory must not be empty.", nameof(cacheDirectory));
+            }
+
+            _cacheDir = cacheDirectory;
             Directory.CreateDirectory(_cacheDir);
         }
 
@@ -44,7 +54,7 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private string GetDbPath(string folderPath)
+        internal string GetDbPath(string folderPath)
         {
             var folderKey = GetFolderCacheKey(folderPath);
             return Path.Combine(_cacheDir, $"project_index_{folderKey}.db");
@@ -2107,7 +2117,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2231,7 +2241,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2318,7 +2328,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2374,7 +2384,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2449,7 +2459,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2501,7 +2511,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2551,7 +2561,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2622,7 +2632,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2698,7 +2708,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2766,7 +2776,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -2922,7 +2932,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
@@ -3007,7 +3017,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var conn = CreateReadConnection(folderPath);
-                using var transaction = conn.BeginTransaction();
+                using var transaction = conn.BeginTransaction(deferred: true);
                 var projectId = FindProjectId(conn, transaction, folderPath, signature);
                 if (projectId == null)
                 {
