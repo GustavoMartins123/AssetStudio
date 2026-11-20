@@ -489,6 +489,148 @@ namespace AssetStudio.Avalonia
             cmd.ExecuteNonQuery();
         }
 
+        internal static readonly string[] SemanticStagingTableNames =
+        {
+            "Stage_SourceFiles",
+            "Stage_AssetEdges",
+            "Stage_ModelGroups",
+            "Stage_ModelGroupMeshes",
+            "Stage_MeshRenderers",
+            "Stage_MeshMaterials",
+            "Stage_MaterialTextures"
+        };
+
+        internal static void DropSemanticStagingTables(SqliteConnection conn, SqliteTransaction? transaction = null)
+        {
+            var stageTables = new List<string>(SemanticStagingTableNames);
+            using (var listCmd = conn.CreateCommand())
+            {
+                listCmd.Transaction = transaction;
+                listCmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'Stage_%';";
+                using var reader = listCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!reader.IsDBNull(0))
+                    {
+                        var tableName = reader.GetString(0);
+                        if (!string.IsNullOrWhiteSpace(tableName))
+                        {
+                            stageTables.Add(tableName);
+                        }
+                    }
+                }
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var tableName in stageTables)
+            {
+                if (!seen.Add(tableName))
+                {
+                    continue;
+                }
+
+                var escapedName = tableName.Replace("\"", "\"\"");
+                using var dropCmd = conn.CreateCommand();
+                dropCmd.Transaction = transaction;
+                dropCmd.CommandText = $"DROP TABLE IF EXISTS \"{escapedName}\";";
+                dropCmd.ExecuteNonQuery();
+            }
+        }
+
+        internal static void CreateSemanticStagingTables(SqliteConnection conn, SqliteTransaction? transaction = null)
+        {
+            DropSemanticStagingTables(conn, transaction);
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                CREATE TABLE Stage_SourceFiles (
+                    ProjectId INTEGER NOT NULL,
+                    SerializedFileName TEXT NOT NULL,
+                    OriginalPath TEXT NOT NULL DEFAULT '',
+                    UnityVersion TEXT NOT NULL DEFAULT '',
+                    ObjectCount INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE Stage_AssetEdges (
+                    ProjectId INTEGER NOT NULL,
+                    SourceAssetUniqueID TEXT NOT NULL,
+                    EdgeKind TEXT NOT NULL,
+                    SlotName TEXT NOT NULL DEFAULT '',
+                    SlotIndex INTEGER NOT NULL DEFAULT -1,
+                    TargetAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    SourceFileId INTEGER NOT NULL DEFAULT 0,
+                    SourcePathID INTEGER NOT NULL DEFAULT 0,
+                    TargetFileId INTEGER NOT NULL DEFAULT 0,
+                    TargetPathID INTEGER NOT NULL DEFAULT 0,
+                    IsResolved INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE Stage_ModelGroups (
+                    ProjectId INTEGER NOT NULL,
+                    GroupAssetUniqueID TEXT NOT NULL,
+                    GroupKind TEXT NOT NULL DEFAULT '',
+                    GroupName TEXT NOT NULL DEFAULT '',
+                    RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RootGameObjectName TEXT NOT NULL DEFAULT '',
+                    AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    SourceFileName TEXT NOT NULL DEFAULT '',
+                    Confidence INTEGER NOT NULL DEFAULT 0,
+                    ConfidenceReason TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE Stage_ModelGroupMeshes (
+                    ProjectId INTEGER NOT NULL,
+                    GroupAssetUniqueID TEXT NOT NULL,
+                    MeshAssetUniqueID TEXT NOT NULL,
+                    RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RendererType TEXT NOT NULL DEFAULT '',
+                    GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    GameObjectName TEXT NOT NULL DEFAULT '',
+                    SlotIndex INTEGER NOT NULL DEFAULT -1,
+                    TransformMatrix BLOB,
+                    Confidence INTEGER NOT NULL DEFAULT 0,
+                    ConfidenceReason TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE Stage_MeshRenderers (
+                    ProjectId INTEGER NOT NULL,
+                    MeshAssetUniqueID TEXT NOT NULL,
+                    RendererAssetUniqueID TEXT NOT NULL,
+                    RendererType TEXT NOT NULL,
+                    GameObjectAssetUniqueID TEXT,
+                    GameObjectName TEXT,
+                    Description TEXT
+                );
+
+                CREATE TABLE Stage_MeshMaterials (
+                    ProjectId INTEGER NOT NULL,
+                    MeshAssetUniqueID TEXT NOT NULL,
+                    RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    SubMeshIndex INTEGER NOT NULL,
+                    MaterialSlotIndex INTEGER NOT NULL DEFAULT -1,
+                    MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RendererType TEXT NOT NULL DEFAULT '',
+                    MaterialScore INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE Stage_MaterialTextures (
+                    ProjectId INTEGER NOT NULL,
+                    MaterialAssetUniqueID TEXT NOT NULL,
+                    SlotName TEXT NOT NULL,
+                    SlotIndex INTEGER NOT NULL,
+                    TextureFileId INTEGER NOT NULL DEFAULT 0,
+                    TexturePathID INTEGER NOT NULL DEFAULT 0,
+                    TextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    IsResolved INTEGER NOT NULL DEFAULT 0,
+                    IsMainTexture INTEGER NOT NULL DEFAULT 0
+                );";
+            cmd.ExecuteNonQuery();
+        }
+
         private static void EnsurePreviewCacheSchemaUpgrades(SqliteConnection conn)
         {
             var columns = GetTableColumnNames(conn, "PreviewCacheEntries");

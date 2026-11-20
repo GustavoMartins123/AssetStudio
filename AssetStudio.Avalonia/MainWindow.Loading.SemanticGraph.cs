@@ -108,6 +108,45 @@ namespace AssetStudio.Avalonia
             semanticRelationsOut = localSemanticRelations;
         }
 
+        internal static void BuildSemanticRelationsForFilesBackground(
+            IReadOnlyList<SerializedFile> assetsFileList,
+            SemanticAssetRelations targetRelations)
+        {
+            if (assetsFileList == null || assetsFileList.Count == 0 || targetRelations == null)
+            {
+                return;
+            }
+
+            if (assetsFileList.Count == 1)
+            {
+                var singleFile = assetsFileList[0];
+                if (singleFile != null)
+                {
+                    var singleResult = BuildAssetReferenceIndexForFile(singleFile);
+                    targetRelations.Merge(singleResult.SemanticRelations);
+                }
+                return;
+            }
+
+            var fileResults = new SemanticAssetRelations?[assetsFileList.Count];
+            Parallel.For(0, assetsFileList.Count, CreateStructureBuildParallelOptions(), index =>
+            {
+                var file = assetsFileList[index];
+                if (file != null)
+                {
+                    fileResults[index] = BuildAssetReferenceIndexForFile(file).SemanticRelations;
+                }
+            });
+
+            foreach (var fileRelations in fileResults)
+            {
+                if (fileRelations != null)
+                {
+                    targetRelations.Merge(fileRelations);
+                }
+            }
+        }
+
         private static AssetReferenceIndexBuildResult BuildAssetReferenceIndexForFile(SerializedFile file)
         {
             var result = new AssetReferenceIndexBuildResult();

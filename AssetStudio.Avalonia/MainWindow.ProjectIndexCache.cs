@@ -15,6 +15,24 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow : Window
 {
+    internal const int LazyConnectionStagingFlushRowThreshold = 10_000;
+
+    internal static int CountBufferedSemanticRelationRows(SemanticAssetRelations? relations)
+    {
+        if (relations == null)
+        {
+            return 0;
+        }
+
+        return relations.SourceFiles.Count
+            + relations.AssetEdges.Count
+            + relations.ModelGroups.Count
+            + relations.ModelGroupMeshes.Count
+            + relations.MeshRenderers.Count
+            + relations.MeshMaterials.Count
+            + relations.MaterialTextures.Count;
+    }
+
     private static string GetFolderCacheKey(string folderPath)
     {
         var hashBytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
@@ -756,6 +774,9 @@ public partial class MainWindow : Window
             StatusStripUpdate($"Building connections... 0/{sourcePaths.Count:N0} files");
             PublishLazyConnectionProgress(folderPath, scanResult, "connecting", 0, sourcePaths.Count, string.Empty, string.Empty);
 
+            var signature = _sqliteCache.GetFolderSignature(scanResult);
+            using var stagingSession = await Task.Run(() => _sqliteCache.BeginSemanticStagingSession(folderPath, signature));
+
             var buildResult = await Task.Run(async () => await BuildLazySemanticRelationsForSourcesAsync(
                 sourcePaths,
                 (processedFiles, currentSourcePath) =>
@@ -779,22 +800,26 @@ public partial class MainWindow : Window
                         ViewModel.LoadingProgress = (int)percent;
                         StatusStripUpdate($"Building connections... {processedFiles:N0}/{sourcePaths.Count:N0} files ({percent:0.#}%)");
                     }, DispatcherPriority.Background);
-                }));
+                },
+                stagingSession,
+                LazyConnectionStagingFlushRowThreshold));
             var relations = buildResult.Relations;
             var diagnostics = buildResult.Diagnostics;
-            var diagnosticSummary = diagnostics.FormatStatusSummary(sourcePaths.Count, relations);
-            Logger.Info($"Lazy connection diagnostics: {diagnostics.FormatDetailedSummary(sourcePaths.Count, relations)}");
+            var diagnosticSummary = FormatLazyConnectionStatusSummary(sourcePaths.Count, diagnostics);
+            Logger.Info($"Lazy connection diagnostics: {FormatLazyConnectionDetailedSummary(sourcePaths.Count, diagnostics, relations)}");
 
-            if (!relations.HasMaterialRelations)
+            if (!stagingSession.HasStagedMaterialRelations)
             {
+                stagingSession.Abort();
                 PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, diagnosticSummary, lastSourcePath);
                 StatusStripUpdate($"Connections build produced no mesh/material/texture relations. {diagnosticSummary}");
                 return;
             }
 
-            var saved = await Task.Run(() => TrySaveSemanticRelations(folderPath, scanResult, relations, replaceExisting: true));
+            var saved = await Task.Run(() => TryCommitSemanticStagingSession(folderPath, scanResult, stagingSession));
             if (!saved)
             {
+                stagingSession.Abort();
                 PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", sourcePaths.Count, sourcePaths.Count, diagnosticSummary, lastSourcePath);
                 StatusStripUpdate($"Connections build finished, but saving to SQLite failed. {diagnosticSummary}");
                 return;
@@ -803,7 +828,7 @@ public partial class MainWindow : Window
             PublishLazyConnectionProgress(folderPath, scanResult, "connections_completed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
             ViewModel.LoadingProgress = 100;
             StatusStripUpdate(
-                $"Connections complete. Model groups: {relations.ModelGroups.Count:N0}, group meshes: {relations.ModelGroupMeshes.Count:N0}, edges: {relations.AssetEdges.Count:N0}, mesh materials: {relations.MeshMaterials.Count:N0}, material textures: {relations.MaterialTextures.Count:N0}.");
+                $"Connections complete. Model groups: {diagnostics.ModelGroups:N0}, group meshes: {diagnostics.ModelGroupMeshes:N0}, edges: {diagnostics.AssetEdges:N0}, mesh materials: {diagnostics.MeshMaterials:N0}, material textures: {diagnostics.MaterialTextures:N0}.");
         }
         catch (MemoryPressureException ex)
         {
@@ -973,14 +998,90 @@ public partial class MainWindow : Window
         return sourcePaths;
     }
 
+    private bool TryCommitSemanticStagingSession(
+        string folderPath,
+        ProjectScanResult scanResult,
+        SQLiteProjectIndexCache.SemanticStagingSession stagingSession)
+    {
+        if (stagingSession == null || scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            PublishDatabaseWriteProgress(
+                folderPath,
+                scanResult,
+                "saving_connections",
+                0,
+                1,
+                "Waiting for SQLite writer",
+                persist: true);
+
+            var saved = stagingSession.Commit(
+                (processed, total, stage) => PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "saving_connections",
+                    processed,
+                    total,
+                    stage,
+                    persist: false));
+
+            if (saved)
+            {
+                PublishDatabaseWriteProgress(
+                    folderPath,
+                    scanResult,
+                    "saving_connections",
+                    1,
+                    1,
+                    "Semantic relations saved",
+                    persist: false);
+            }
+
+            return saved;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to commit semantic relation staging cache: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static string FormatLazyConnectionStatusSummary(int totalSources, LazyConnectionBuildDiagnostics diagnostics)
+    {
+        return $"sources {totalSources:N0}, matched {diagnostics.SourcesWithLoadedFiles:N0}, no files {diagnostics.SourcesWithoutLoadedFiles:N0}, " +
+            $"handles {diagnostics.CandidateHandles:N0}, objects {diagnostics.ResolvedObjects:N0}, " +
+            $"model-groups {diagnostics.ModelGroups:N0}, group-meshes {diagnostics.ModelGroupMeshes:N0}, " +
+            $"mesh-material {diagnostics.MeshMaterials:N0}, material-texture {diagnostics.MaterialTextures:N0}, edges {diagnostics.AssetEdges:N0}";
+    }
+
+    private static string FormatLazyConnectionDetailedSummary(
+        int totalSources,
+        LazyConnectionBuildDiagnostics diagnostics,
+        SemanticAssetRelations remainingRelations)
+    {
+        var placeholderPrefix = diagnostics.FormatStatusSummary(totalSources, remainingRelations);
+        var fullDetailed = diagnostics.FormatDetailedSummary(totalSources, remainingRelations);
+        var actualPrefix = FormatLazyConnectionStatusSummary(totalSources, diagnostics);
+        return fullDetailed.StartsWith(placeholderPrefix, StringComparison.Ordinal)
+            ? actualPrefix + fullDetailed.Substring(placeholderPrefix.Length)
+            : fullDetailed;
+    }
+
     private async Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
         IReadOnlyList<string> sourcePaths,
-        Action<int, string> reportProgress)
+        Action<int, string> reportProgress,
+        SQLiteProjectIndexCache.SemanticStagingSession? stagingSession = null,
+        int stagingFlushRowThreshold = LazyConnectionStagingFlushRowThreshold)
     {
         var mergedRelations = new SemanticAssetRelations();
         var diagnostics = new LazyConnectionBuildDiagnostics();
         diagnostics.SourceCount = sourcePaths.Count;
         var failedSources = new List<string>();
+        var effectiveFlushThreshold = Math.Max(1, stagingFlushRowThreshold);
         const int batchSize = 32;
 
         for (var i = 0; i < sourcePaths.Count; i += batchSize)
@@ -1016,20 +1117,17 @@ public partial class MainWindow : Window
                             var objectsAfter = filesForSource.Sum(file => file.Objects.Count);
                             diagnostics.RecordMaterializedSource(sourcePath, objectsBefore, objectsAfter);
 
-                            BuildAssetReferenceIndexesBackground(
-                                filesForSource,
-                                new List<AssetItem>(),
-                                out _,
-                                out _,
-                                out _,
-                                out _,
-                                out _,
-                                out _,
-                                out _,
-                                out var semanticRelations);
+                            var semanticRelations = new SemanticAssetRelations();
+                            BuildSemanticRelationsForFilesBackground(filesForSource, semanticRelations);
 
                             mergedRelations.Merge(semanticRelations);
                             diagnostics.RecordRelationsPass(semanticRelations);
+
+                            if (stagingSession != null
+                                && CountBufferedSemanticRelationRows(mergedRelations) >= effectiveFlushThreshold)
+                            {
+                                stagingSession.FlushBatch(mergedRelations, clearBatch: true);
+                            }
                         }
                         UnloadConnectionBuildObjects(filesForSource);
                     }
@@ -1069,6 +1167,11 @@ public partial class MainWindow : Window
                 await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
                 assetsManager.ClearLoadedFilesKeepIndex();
             }
+        }
+
+        if (stagingSession != null && CountBufferedSemanticRelationRows(mergedRelations) > 0)
+        {
+            stagingSession.FlushBatch(mergedRelations, clearBatch: true);
         }
 
         if (failedSources.Count > 0)
