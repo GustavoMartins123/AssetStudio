@@ -1,4 +1,3 @@
-using Org.Brotli.Dec;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -80,7 +79,7 @@ namespace AssetStudio
             using (reader)
             {
                 var stream = new MemoryStream((int)(reader.BaseStream.Length * 2));
-                using (var brotliStream = new BrotliInputStream(reader.BaseStream))
+                using (var brotliStream = new BrotliStream(reader.BaseStream, CompressionMode.Decompress))
                 {
                     brotliStream.CopyTo(stream);
                 }

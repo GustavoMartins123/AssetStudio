@@ -1404,7 +1404,7 @@ namespace AssetStudio
                         result[i] = BitConverter.ToSingle(inputBytes, i * 4);
                         break;
                     case VertexFormat.Float16:
-                        result[i] = Half.ToHalf(inputBytes, i * 2);
+                        result[i] = (float)BitConverter.ToHalf(inputBytes, i * 2);
                         break;
                     case VertexFormat.UNorm8:
                         result[i] = inputBytes[i] / 255f;

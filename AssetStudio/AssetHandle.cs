@@ -65,21 +65,9 @@ namespace AssetStudio
 
         private static string ComputeSourceHash(string key)
         {
-#if NET5_0_OR_GREATER
+            // First 8 bytes of SHA-256 as 16 lowercase hex chars (persisted in UniqueIDs / SQLite cache).
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(key));
-            return Convert.ToHexString(bytes).Substring(0, 16).ToLowerInvariant();
-#else
-            using (var sha256 = SHA256.Create())
-            {
-                var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(key));
-                var sb = new StringBuilder(bytes.Length * 2);
-                foreach (var b in bytes)
-                {
-                    sb.Append(b.ToString("x2"));
-                }
-                return sb.ToString(0, 16);
-            }
-#endif
+            return Convert.ToHexStringLower(bytes.AsSpan(0, 8));
         }
 
         private static string NormalizeSourcePath(string? path)

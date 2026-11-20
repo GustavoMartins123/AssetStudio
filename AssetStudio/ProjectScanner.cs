@@ -240,7 +240,6 @@ namespace AssetStudio
 
         private static long GetAvailableMemoryBytes()
         {
-#if NET6_0_OR_GREATER
             try
             {
                 var memInfo = GC.GetGCMemoryInfo();
@@ -251,7 +250,6 @@ namespace AssetStudio
             {
                 // Silent fallback
             }
-#endif
 
             // Linux fallback: read MemAvailable from /proc/meminfo
             try

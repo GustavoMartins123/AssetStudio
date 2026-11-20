@@ -63,9 +63,7 @@ namespace AssetStudio
         private static readonly ConcurrentDictionary<string, int> ConfiguredThreadCountOrDefaultCache = new ConcurrentDictionary<string, int>();
         private static readonly int DefaultLazyLoadThreadCount = GetConfiguredThreadCount("ASSETSTUDIO_LAZY_LOAD_THREADS", DefaultLazyLoadThreadRatio);
         private static readonly int DefaultLazyReadThreadCount = GetConfiguredThreadCount("ASSETSTUDIO_LAZY_READ_THREADS", DefaultLazyReadThreadRatio);
-#if NET6_0_OR_GREATER
         private static long lastGCCollectTime = 0;
-#endif
 
         public static bool DisableMemoryPressureCheck = false;
         public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;
@@ -1576,7 +1574,6 @@ namespace AssetStudio
             return DefaultMemoryLimitPercent;
         }
 
-#if NET6_0_OR_GREATER
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         private class MEMORYSTATUSEX
         {
@@ -1639,11 +1636,9 @@ namespace AssetStudio
             }
             return 0;
         }
-#endif
 
         public static void ThrowIfMemoryPressureTooHigh(string operation)
         {
-#if NET6_0_OR_GREATER
             if (DisableMemoryPressureCheck)
             {
                 return;
@@ -1720,13 +1715,11 @@ namespace AssetStudio
                     throw new MemoryPressureException(operation, memoryLoadPercent, limitPercent);
                 }
             }
-#endif
         }
 
         private static bool TryGetMemoryLoadPercent(out int memoryLoadPercent)
         {
             memoryLoadPercent = 0;
-#if NET6_0_OR_GREATER
             var memoryInfo = GC.GetGCMemoryInfo();
             if (memoryInfo.HighMemoryLoadThresholdBytes <= 0 || memoryInfo.MemoryLoadBytes <= 0)
             {
@@ -1735,9 +1728,6 @@ namespace AssetStudio
 
             memoryLoadPercent = (int)Math.Ceiling(memoryInfo.MemoryLoadBytes * 100d / memoryInfo.HighMemoryLoadThresholdBytes);
             return true;
-#else
-            return false;
-#endif
         }
 
         private void ProcessAssets()
