@@ -1,23 +1,34 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="using:AssetStudio.Avalonia"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
         x:Class="AssetStudio.Avalonia.ProjectManagerWindow"
-        x:CompileBindings="False"
+        x:CompileBindings="True"
+        x:DataType="vm:ProjectManagerViewModel"
         Title="AssetStudio Projects"
         Icon="/Assets/as.png"
         Width="980" Height="620"
         MinWidth="820" MinHeight="520"
         WindowStartupLocation="CenterScreen">
 
+    <Window.Resources>
+        <local:ProjectIconPathToBitmapConverter x:Key="ProjectIconConverter" />
+    </Window.Resources>
+
     <Grid Margin="16" RowDefinitions="Auto,*,Auto" RowSpacing="14">
         <DockPanel Grid.Row="0" LastChildFill="True">
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="8">
-                <Button x:Name="AddProjectButton" Click="AddProject_Click" MinWidth="128">
+                <Button x:Name="AddProjectButton"
+                        Command="{Binding NewProjectCommand}"
+                        MinWidth="128">
                     <StackPanel Orientation="Horizontal" Spacing="7">
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
                         <TextBlock Text="Add project" />
                     </StackPanel>
                 </Button>
-                <Button x:Name="OpenWithoutProjectButton" Click="OpenWithoutProject_Click" MinWidth="152">
+                <Button x:Name="OpenWithoutProjectButton"
+                        Command="{Binding OpenWithoutProjectCommand}"
+                        MinWidth="152">
                     <StackPanel Orientation="Horizontal" Spacing="7">
                         <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
                         <TextBlock Text="Open without project" />
@@ -32,17 +43,22 @@
 
         <Grid Grid.Row="1" ColumnDefinitions="360,*" ColumnSpacing="16">
             <Border Grid.Column="0" BorderThickness="1" BorderBrush="Gray" Padding="8">
-                <Grid RowDefinitions="Auto,*">
-                    <TextBlock Text="Project list" FontWeight="SemiBold" Margin="4,0,0,8" />
-                    <Grid Grid.Row="1">
+                <Grid RowDefinitions="Auto,Auto,*" RowSpacing="8">
+                    <TextBlock Grid.Row="0" Text="Project list" FontWeight="SemiBold" Margin="4,0,0,0" />
+                    <TextBox Grid.Row="1"
+                             PlaceholderText="Search projects..."
+                             Text="{Binding SearchText, Mode=TwoWay}" />
+                    <Grid Grid.Row="2">
                         <ListBox x:Name="ProjectListBox"
-                                 SelectionChanged="ProjectListBox_SelectionChanged"
+                                 ItemsSource="{Binding Projects}"
+                                 SelectedItem="{Binding SelectedProject, Mode=TwoWay}"
                                  DoubleTapped="ProjectListBox_DoubleTapped">
                             <ListBox.ItemTemplate>
-                                <DataTemplate>
+                                <DataTemplate x:DataType="vm:ProjectEntryViewModel">
                                     <Grid ColumnDefinitions="54,*" ColumnSpacing="10" Margin="4,6">
                                         <Border Width="46" Height="46" BorderThickness="1" BorderBrush="Gray" Padding="4">
-                                            <Image Source="{Binding Icon}" Stretch="Uniform" />
+                                            <Image Source="{Binding IconPath, Converter={StaticResource ProjectIconConverter}}"
+                                                   Stretch="Uniform" />
                                         </Border>
                                         <StackPanel Grid.Column="1" Spacing="2">
                                             <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
@@ -56,7 +72,8 @@
                             </ListBox.ItemTemplate>
                         </ListBox>
                         <TextBlock x:Name="EmptyProjectsText"
-                                   Text="No projects yet."
+                                   Text="{Binding EmptyListMessage}"
+                                   IsVisible="{Binding IsEmpty}"
                                    HorizontalAlignment="Center"
                                    VerticalAlignment="Center"
                                    Opacity="0.7" />
@@ -69,46 +86,58 @@
                     <ScrollViewer Grid.Row="0" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
                         <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="12" Margin="0,0,12,0">
                             <DockPanel Grid.Row="0" LastChildFill="True">
-                                <Image x:Name="DetailIcon" DockPanel.Dock="Right" Width="72" Height="72" Stretch="Uniform" />
+                                <Image x:Name="DetailIcon"
+                                       DockPanel.Dock="Right"
+                                       Source="{Binding DetailIconPath, Converter={StaticResource ProjectIconConverter}}"
+                                       Width="72"
+                                       Height="72"
+                                       Stretch="Uniform" />
                                 <StackPanel>
-                                    <TextBlock x:Name="DetailName" Text="Select a project" FontSize="22" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock x:Name="DetailSubtitle" Text="Project metadata appears here." Opacity="0.68" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="DetailName"
+                                               Text="{Binding DetailName}"
+                                               FontSize="22"
+                                               FontWeight="SemiBold"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="DetailSubtitle"
+                                               Text="{Binding DetailSubtitle}"
+                                               Opacity="0.68"
+                                               TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
                             </DockPanel>
 
                             <Grid Grid.Row="1" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Project root" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailRoot" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailRoot" Grid.Column="1" Text="{Binding DetailRoot}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="2" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Last load folder" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailLastLoad" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailLastLoad" Grid.Column="1" Text="{Binding DetailLastLoad}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="3" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Last export folder" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailLastExport" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailLastExport" Grid.Column="1" Text="{Binding DetailLastExport}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="4" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Dates" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailDates" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailDates" Grid.Column="1" Text="{Binding DetailDates}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="5" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Stats" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailStats" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailStats" Grid.Column="1" Text="{Binding DetailStats}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="6" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Indexing" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailIndexing" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailIndexing" Grid.Column="1" Text="{Binding DetailIndexing}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="7" ColumnDefinitions="150,*" ColumnSpacing="12">
                                 <TextBlock Text="Analysis" FontWeight="SemiBold" />
-                                <TextBlock x:Name="DetailAnalysis" Grid.Column="1" Text="-" TextWrapping="Wrap" />
+                                <TextBlock x:Name="DetailAnalysis" Grid.Column="1" Text="{Binding DetailAnalysis}" TextWrapping="Wrap" />
                             </Grid>
 
                             <Grid Grid.Row="8" ColumnDefinitions="150,*" ColumnSpacing="12">
@@ -116,20 +145,21 @@
                                 <StackPanel Grid.Column="1" Spacing="6">
                                     <CheckBox x:Name="AllowIl2CppDumperCheckBox"
                                               Content="Allow optional external Il2CppDumper execution"
-                                              IsEnabled="False"
-                                              IsCheckedChanged="AllowIl2CppDumperCheckBox_IsCheckedChanged" />
+                                              IsChecked="{Binding AllowIl2CppDumper, Mode=TwoWay}"
+                                              IsEnabled="{Binding CanEditAnalysisPreferences}" />
                                     <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                                         <TextBox x:Name="Il2CppDumperPathTextBox"
                                                  Grid.Column="0"
                                                  PlaceholderText="Optional path to Il2CppDumper executable"
-                                                 IsEnabled="False"
+                                                 Text="{Binding Il2CppDumperPath, Mode=TwoWay}"
+                                                 IsEnabled="{Binding CanEditAnalysisPreferences}"
                                                  LostFocus="Il2CppDumperPathTextBox_LostFocus" />
                                         <Button x:Name="BrowseIl2CppDumperButton"
                                                 Grid.Column="1"
                                                 Content="Browse..."
                                                 MinWidth="84"
-                                                IsEnabled="False"
-                                                Click="BrowseIl2CppDumper_Click" />
+                                                Command="{Binding BrowseIl2CppDumperCommand}"
+                                                IsEnabled="{Binding CanEditAnalysisPreferences}" />
                                     </Grid>
                                 </StackPanel>
                             </Grid>
@@ -137,25 +167,33 @@
                     </ScrollViewer>
 
                     <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" VerticalAlignment="Bottom">
-                        <Button x:Name="RerunAnalysisButton" Click="RerunAnalysis_Click" MinWidth="136" IsEnabled="False">
+                        <Button x:Name="RerunAnalysisButton"
+                                Command="{Binding RerunAnalysisCommand}"
+                                MinWidth="136">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_debug}" Width="16" Height="16" />
                                 <TextBlock Text="Re-run Analysis" />
                             </StackPanel>
                         </Button>
-                        <Button x:Name="EditProjectButton" Click="EditProject_Click" MinWidth="92" IsEnabled="False">
+                        <Button x:Name="EditProjectButton"
+                                Command="{Binding EditProjectCommand}"
+                                MinWidth="92">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                                 <TextBlock Text="Edit" />
                             </StackPanel>
                         </Button>
-                        <Button x:Name="RemoveProjectButton" Click="RemoveProject_Click" MinWidth="100" IsEnabled="False">
+                        <Button x:Name="RemoveProjectButton"
+                                Command="{Binding DeleteProjectCommand}"
+                                MinWidth="100">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
                                 <TextBlock Text="Delete" />
                             </StackPanel>
                         </Button>
-                        <Button x:Name="OpenProjectButton" Click="OpenProject_Click" MinWidth="112" IsEnabled="False">
+                        <Button x:Name="OpenProjectButton"
+                                Command="{Binding OpenCommand}"
+                                MinWidth="112">
                             <StackPanel Orientation="Horizontal" Spacing="7">
                                 <PathIcon Data="{StaticResource icon_preview}" Width="16" Height="16" />
                                 <TextBlock Text="Open" />
@@ -166,6 +204,10 @@
             </Border>
         </Grid>
 
-        <TextBlock x:Name="StatusText" Grid.Row="2" Opacity="0.72" TextTrimming="CharacterEllipsis" />
+        <TextBlock x:Name="StatusText"
+                   Grid.Row="2"
+                   Text="{Binding StatusText}"
+                   Opacity="0.72"
+                   TextTrimming="CharacterEllipsis" />
     </Grid>
 </Window>

@@ -1,0 +1,89 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:sys="using:System"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.MessageBoxWindow"
+        x:CompileBindings="True"
+        x:DataType="vm:MessageBoxViewModel"
+        Title="{Binding Title}"
+        WindowStartupLocation="CenterOwner"
+        Padding="20">
+
+    <Window.Styles>
+        <Style Selector="Button.bold">
+            <Setter Property="FontWeight" Value="Bold" />
+        </Style>
+        <Style Selector="Button.destructive">
+            <Setter Property="Foreground" Value="OrangeRed" />
+        </Style>
+    </Window.Styles>
+
+    <Grid RowDefinitions="*,Auto" RowSpacing="15">
+        <ListBox x:Name="LinesListBox"
+                 Grid.Row="0"
+                 IsVisible="{Binding UseMonospaceLines}"
+                 ItemsSource="{Binding Lines}"
+                 HorizontalAlignment="Stretch"
+                 VerticalAlignment="Stretch"
+                 Background="Transparent"
+                 BorderThickness="1"
+                 BorderBrush="LightGray">
+            <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="sys:String">
+                    <TextBlock Text="{Binding}"
+                               FontFamily="Consolas, DejaVu Sans Mono, Courier New, monospace"
+                               FontSize="12"
+                               TextWrapping="NoWrap"
+                               Margin="0,1" />
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <ScrollViewer Grid.Row="0"
+                      IsVisible="{Binding UseWrappedMessage}"
+                      VerticalScrollBarVisibility="Auto">
+            <TextBlock Text="{Binding Message}"
+                       TextWrapping="Wrap" />
+        </ScrollViewer>
+
+        <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto">
+            <Button Grid.Column="0"
+                    Content="{Binding CopyButtonLabel}"
+                    IsVisible="{Binding ShowCopyButton}"
+                    Command="{Binding CopyCommand}"
+                    MinWidth="90"
+                    Height="30"
+                    HorizontalContentAlignment="Center"
+                    VerticalContentAlignment="Center" />
+
+            <StackPanel Grid.Column="2"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        Spacing="10">
+                <Button Content="{Binding CancelButtonLabel}"
+                        IsVisible="{Binding ShowCancelButton}"
+                        Command="{Binding CancelCommand}"
+                        MinWidth="90"
+                        Height="30"
+                        HorizontalContentAlignment="Center"
+                        VerticalContentAlignment="Center" />
+                <Button Content="{Binding SecondaryButtonLabel}"
+                        IsVisible="{Binding ShowSecondaryButton}"
+                        Command="{Binding SecondaryCommand}"
+                        MinWidth="90"
+                        Height="30"
+                        HorizontalContentAlignment="Center"
+                        VerticalContentAlignment="Center" />
+                <Button Content="{Binding PrimaryButtonLabel}"
+                        IsVisible="{Binding ShowPrimaryButton}"
+                        Command="{Binding PrimaryCommand}"
+                        Classes.bold="{Binding IsPrimaryBold}"
+                        Classes.destructive="{Binding IsPrimaryDestructive}"
+                        MinWidth="90"
+                        Height="30"
+                        HorizontalContentAlignment="Center"
+                        VerticalContentAlignment="Center" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

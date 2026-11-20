@@ -1,0 +1,101 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.ProjectEditorWindow"
+        x:CompileBindings="True"
+        x:DataType="vm:ProjectEditorViewModel"
+        Title="{Binding WindowTitle}"
+        Width="620"
+        Height="430"
+        MinWidth="520"
+        MinHeight="390"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False">
+
+    <Window.Styles>
+        <Style Selector="TextBlock.validationError">
+            <Setter Property="Foreground" Value="OrangeRed" />
+            <Setter Property="Opacity" Value="1.0" />
+        </Style>
+    </Window.Styles>
+
+    <Grid Margin="18" RowDefinitions="Auto,Auto,Auto,Auto,*,Auto" RowSpacing="14">
+        <TextBlock Grid.Row="0"
+                   Text="Project"
+                   FontSize="20"
+                   FontWeight="SemiBold" />
+
+        <Grid Grid.Row="1" ColumnDefinitions="130,*" ColumnSpacing="10">
+            <TextBlock Text="Name" VerticalAlignment="Center" FontWeight="SemiBold" />
+            <TextBox Grid.Column="1" Text="{Binding Name, Mode=TwoWay}" />
+        </Grid>
+
+        <Grid Grid.Row="2" ColumnDefinitions="130,*" ColumnSpacing="10">
+            <CheckBox Grid.Column="1"
+                      Content="Use game name automatically when detected"
+                      IsChecked="{Binding UseAutoName, Mode=TwoWay}" />
+        </Grid>
+
+        <Grid Grid.Row="3" ColumnDefinitions="130,*,Auto" ColumnSpacing="10">
+            <TextBlock Text="Project root" VerticalAlignment="Center" FontWeight="SemiBold" />
+            <TextBox Grid.Column="1"
+                     PlaceholderText="Example: D:\Games\GameName"
+                     Text="{Binding ProjectRoot, Mode=TwoWay}" />
+            <Button Grid.Column="2"
+                    Content="Browse..."
+                    MinWidth="92"
+                    Command="{Binding BrowseCommand}" />
+        </Grid>
+
+        <Grid Grid.Row="4" ColumnDefinitions="*,Auto" ColumnSpacing="16">
+            <Grid Grid.Column="0" ColumnDefinitions="130,*,Auto,Auto" ColumnSpacing="10" VerticalAlignment="Top">
+                <TextBlock Text="Icon" VerticalAlignment="Center" FontWeight="SemiBold" />
+                <TextBox Grid.Column="1"
+                         PlaceholderText="Optional image or game .exe"
+                         Text="{Binding IconPath, Mode=TwoWay}" />
+                <Button Grid.Column="2"
+                        Content="Choose..."
+                        MinWidth="92"
+                        Command="{Binding BrowseIconCommand}" />
+                <Button Grid.Column="3"
+                        Content="Detect"
+                        MinWidth="80"
+                        Command="{Binding DetectIconCommand}" />
+            </Grid>
+
+            <Border Grid.Column="1"
+                    Width="78"
+                    Height="78"
+                    VerticalAlignment="Top"
+                    BorderThickness="1"
+                    BorderBrush="Gray"
+                    Padding="6">
+                <Image x:Name="IconPreviewImage"
+                       Width="64"
+                       Height="64"
+                       Stretch="Uniform" />
+            </Border>
+        </Grid>
+
+        <Grid Grid.Row="5" ColumnDefinitions="*,Auto" ColumnSpacing="12">
+            <TextBlock Grid.Column="0"
+                       Text="{Binding StatusText}"
+                       TextWrapping="Wrap"
+                       Opacity="0.78"
+                       Classes.validationError="{Binding HasValidationMessage}" />
+
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        Spacing="8"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Bottom">
+                <Button Content="Cancel"
+                        MinWidth="86"
+                        Command="{Binding CancelCommand}" />
+                <Button Content="Save"
+                        MinWidth="86"
+                        Command="{Binding SaveCommand}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>
