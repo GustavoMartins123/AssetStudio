@@ -70,6 +70,36 @@ namespace AssetStudio
         }
     }
 
+    internal static class PackedVectorHelper
+    {
+        public const int MaxUnpackItemCount = 16_777_216;
+
+        public static uint ReadBits(byte[] data, int bitSize, ref int indexPos, ref int bitPos)
+        {
+            uint value = 0;
+            int bits = 0;
+            while (bits < bitSize)
+            {
+                if ((uint)indexPos >= (uint)data.Length)
+                {
+                    throw new InvalidDataException($"Packed bit stream exceeded data buffer length ({data.Length} bytes).");
+                }
+                value |= ((uint)(data[indexPos] >> bitPos)) << bits;
+                int num = Math.Min(bitSize - bits, 8 - bitPos);
+                bitPos += num;
+                bits += num;
+                if (bitPos == 8)
+                {
+                    indexPos++;
+                    bitPos = 0;
+                }
+            }
+
+            uint mask = bitSize == 32 ? uint.MaxValue : (1u << bitSize) - 1u;
+            return value & mask;
+        }
+    }
+
     public class PackedFloatVector
     {
         public uint m_NumItems;
@@ -78,6 +108,8 @@ namespace AssetStudio
         public byte[] m_Data;
         public byte m_BitSize;
 
+        public PackedFloatVector() { }
+
         public PackedFloatVector(ObjectReader reader)
         {
             m_NumItems = reader.ReadUInt32();
@@ -85,6 +117,7 @@ namespace AssetStudio
             m_Start = reader.ReadSingle();
 
             int numData = reader.ReadInt32();
+            reader.CheckArrayLength(numData);
             m_Data = reader.ReadBytes(numData);
             reader.AlignStream();
 
@@ -94,40 +127,98 @@ namespace AssetStudio
 
         public float[] UnpackFloats(int itemCountInChunk, int chunkStride, int start = 0, int numChunks = -1)
         {
-            int bitPos = m_BitSize * start;
-            int indexPos = bitPos / 8;
-            bitPos %= 8;
-
-            float scale = 1.0f / m_Range;
-            if (numChunks == -1)
-                numChunks = (int)m_NumItems / itemCountInChunk;
-            var end = chunkStride * numChunks / 4;
-            var data = new List<float>();
-            for (var index = 0; index != end; index += chunkStride / 4)
+            if (itemCountInChunk <= 0)
             {
-                for (int i = 0; i < itemCountInChunk; ++i)
-                {
-                    uint x = 0;
-
-                    int bits = 0;
-                    while (bits < m_BitSize)
-                    {
-                        x |= (uint)((m_Data[indexPos] >> bitPos) << bits);
-                        int num = Math.Min(m_BitSize - bits, 8 - bitPos);
-                        bitPos += num;
-                        bits += num;
-                        if (bitPos == 8)
-                        {
-                            indexPos++;
-                            bitPos = 0;
-                        }
-                    }
-                    x &= (uint)(1 << m_BitSize) - 1u;
-                    data.Add(x / (scale * ((1 << m_BitSize) - 1)) + m_Start);
-                }
+                throw new ArgumentOutOfRangeException(nameof(itemCountInChunk), itemCountInChunk, "itemCountInChunk must be positive.");
+            }
+            if (chunkStride < 4 || (chunkStride % 4) != 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(chunkStride), chunkStride, "chunkStride must be a positive multiple of 4 bytes.");
+            }
+            if (start < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(start), start, "start must be non-negative.");
+            }
+            if (numChunks < -1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(numChunks), numChunks, "numChunks must be -1 or non-negative.");
+            }
+            if (m_BitSize > 32)
+            {
+                throw new InvalidDataException($"Invalid PackedFloatVector bit size: {m_BitSize}. Maximum supported is 32.");
             }
 
-            return data.ToArray();
+            long resolvedNumChunks;
+            if (numChunks == -1)
+            {
+                if (m_NumItems == 0)
+                {
+                    if (start > 0)
+                    {
+                        throw new InvalidDataException($"Start item index {start} exceeds PackedFloatVector item count {m_NumItems}.");
+                    }
+                    return Array.Empty<float>();
+                }
+                if ((long)start > m_NumItems)
+                {
+                    throw new InvalidDataException($"Start item index {start} exceeds PackedFloatVector item count {m_NumItems}.");
+                }
+                resolvedNumChunks = ((long)m_NumItems - start) / itemCountInChunk;
+            }
+            else
+            {
+                resolvedNumChunks = numChunks;
+            }
+
+            long totalItems = resolvedNumChunks * itemCountInChunk;
+            if (totalItems > PackedVectorHelper.MaxUnpackItemCount)
+            {
+                throw new InvalidDataException($"PackedFloatVector unpack count {totalItems} exceeds maximum allowed limit ({PackedVectorHelper.MaxUnpackItemCount}).");
+            }
+            if ((long)start + totalItems > m_NumItems)
+            {
+                throw new InvalidDataException($"Requested unpack range [{start}, {(long)start + totalItems}) exceeds PackedFloatVector item count {m_NumItems}.");
+            }
+            if (totalItems == 0)
+            {
+                return Array.Empty<float>();
+            }
+            if (m_Data == null)
+            {
+                throw new InvalidDataException("PackedFloatVector data buffer is null.");
+            }
+
+            int outputCount = (int)totalItems;
+            if (m_BitSize == 0)
+            {
+                var constantData = new float[outputCount];
+                Array.Fill(constantData, m_Start);
+                return constantData;
+            }
+
+            long startBitPos = (long)m_BitSize * start;
+            long totalBits = totalItems * m_BitSize;
+            long requiredBytes = (startBitPos + totalBits + 7) / 8;
+            if (requiredBytes > m_Data.Length)
+            {
+                throw new InvalidDataException($"PackedFloatVector data length ({m_Data.Length} bytes) is smaller than required ({requiredBytes} bytes for {outputCount} items at {m_BitSize} bits starting at item {start}).");
+            }
+
+            int indexPos = (int)(startBitPos / 8);
+            int bitPos = (int)(startBitPos % 8);
+
+            uint maxValue = m_BitSize == 32 ? uint.MaxValue : (1u << m_BitSize) - 1u;
+            float scale = 1.0f / m_Range;
+            float divisor = scale * maxValue;
+
+            var data = new float[outputCount];
+            for (int outIndex = 0; outIndex < outputCount; outIndex++)
+            {
+                uint x = PackedVectorHelper.ReadBits(m_Data, m_BitSize, ref indexPos, ref bitPos);
+                data[outIndex] = x / divisor + m_Start;
+            }
+
+            return data;
         }
     }
 
@@ -137,11 +228,14 @@ namespace AssetStudio
         public byte[] m_Data;
         public byte m_BitSize;
 
+        public PackedIntVector() { }
+
         public PackedIntVector(ObjectReader reader)
         {
             m_NumItems = reader.ReadUInt32();
 
             int numData = reader.ReadInt32();
+            reader.CheckArrayLength(numData);
             m_Data = reader.ReadBytes(numData);
             reader.AlignStream();
 
@@ -151,26 +245,42 @@ namespace AssetStudio
 
         public int[] UnpackInts()
         {
-            var data = new int[m_NumItems];
+            if (m_BitSize > 32)
+            {
+                throw new InvalidDataException($"Invalid PackedIntVector bit size: {m_BitSize}. Maximum supported is 32.");
+            }
+            if (m_NumItems == 0)
+            {
+                return Array.Empty<int>();
+            }
+            if (m_NumItems > PackedVectorHelper.MaxUnpackItemCount)
+            {
+                throw new InvalidDataException($"PackedIntVector item count {m_NumItems} exceeds maximum allowed limit ({PackedVectorHelper.MaxUnpackItemCount}).");
+            }
+            if (m_Data == null)
+            {
+                throw new InvalidDataException("PackedIntVector data buffer is null.");
+            }
+
+            int count = (int)m_NumItems;
+            if (m_BitSize == 0)
+            {
+                return new int[count];
+            }
+
+            long totalBits = (long)count * m_BitSize;
+            long requiredBytes = (totalBits + 7) / 8;
+            if (requiredBytes > m_Data.Length)
+            {
+                throw new InvalidDataException($"PackedIntVector data length ({m_Data.Length} bytes) is smaller than required ({requiredBytes} bytes for {count} items at {m_BitSize} bits).");
+            }
+
+            var data = new int[count];
             int indexPos = 0;
             int bitPos = 0;
-            for (int i = 0; i < m_NumItems; i++)
+            for (int i = 0; i < count; i++)
             {
-                int bits = 0;
-                data[i] = 0;
-                while (bits < m_BitSize)
-                {
-                    data[i] |= (m_Data[indexPos] >> bitPos) << bits;
-                    int num = Math.Min(m_BitSize - bits, 8 - bitPos);
-                    bitPos += num;
-                    bits += num;
-                    if (bitPos == 8)
-                    {
-                        indexPos++;
-                        bitPos = 0;
-                    }
-                }
-                data[i] &= (1 << m_BitSize) - 1;
+                data[i] = (int)PackedVectorHelper.ReadBits(m_Data, m_BitSize, ref indexPos, ref bitPos);
             }
             return data;
         }
@@ -181,11 +291,14 @@ namespace AssetStudio
         public uint m_NumItems;
         public byte[] m_Data;
 
+        public PackedQuatVector() { }
+
         public PackedQuatVector(ObjectReader reader)
         {
             m_NumItems = reader.ReadUInt32();
 
             int numData = reader.ReadInt32();
+            reader.CheckArrayLength(numData);
             m_Data = reader.ReadBytes(numData);
 
             reader.AlignStream();
@@ -193,29 +306,34 @@ namespace AssetStudio
 
         public Quaternion[] UnpackQuats()
         {
-            var data = new Quaternion[m_NumItems];
+            if (m_NumItems == 0)
+            {
+                return Array.Empty<Quaternion>();
+            }
+            if (m_NumItems > PackedVectorHelper.MaxUnpackItemCount)
+            {
+                throw new InvalidDataException($"PackedQuatVector item count {m_NumItems} exceeds maximum allowed limit ({PackedVectorHelper.MaxUnpackItemCount}).");
+            }
+            if (m_Data == null)
+            {
+                throw new InvalidDataException("PackedQuatVector data buffer is null.");
+            }
+
+            int count = (int)m_NumItems;
+            // Each packed quaternion uses 3 flag bits + 9 bits + 10 bits + 10 bits = 32 bits (4 bytes).
+            long requiredBytes = (long)count * 4;
+            if (requiredBytes > m_Data.Length)
+            {
+                throw new InvalidDataException($"PackedQuatVector data length ({m_Data.Length} bytes) is smaller than required ({requiredBytes} bytes for {count} quaternions).");
+            }
+
+            var data = new Quaternion[count];
             int indexPos = 0;
             int bitPos = 0;
 
-            for (int i = 0; i < m_NumItems; i++)
+            for (int i = 0; i < count; i++)
             {
-                uint flags = 0;
-
-                int bits = 0;
-                while (bits < 3)
-                {
-                    flags |= (uint)((m_Data[indexPos] >> bitPos) << bits);
-                    int num = Math.Min(3 - bits, 8 - bitPos);
-                    bitPos += num;
-                    bits += num;
-                    if (bitPos == 8)
-                    {
-                        indexPos++;
-                        bitPos = 0;
-                    }
-                }
-                flags &= 7;
-
+                uint flags = PackedVectorHelper.ReadBits(m_Data, 3, ref indexPos, ref bitPos);
 
                 var q = new Quaternion();
                 float sum = 0;
@@ -224,29 +342,15 @@ namespace AssetStudio
                     if ((flags & 3) != j)
                     {
                         int bitSize = ((flags & 3) + 1) % 4 == j ? 9 : 10;
-                        uint x = 0;
-
-                        bits = 0;
-                        while (bits < bitSize)
-                        {
-                            x |= (uint)((m_Data[indexPos] >> bitPos) << bits);
-                            int num = Math.Min(bitSize - bits, 8 - bitPos);
-                            bitPos += num;
-                            bits += num;
-                            if (bitPos == 8)
-                            {
-                                indexPos++;
-                                bitPos = 0;
-                            }
-                        }
-                        x &= (uint)((1 << bitSize) - 1);
+                        uint x = PackedVectorHelper.ReadBits(m_Data, bitSize, ref indexPos, ref bitPos);
                         q[j] = x / (0.5f * ((1 << bitSize) - 1)) - 1;
                         sum += q[j] * q[j];
                     }
                 }
 
                 int lastComponent = (int)(flags & 3);
-                q[lastComponent] = (float)Math.Sqrt(1 - sum);
+                float remaining = 1.0f - sum;
+                q[lastComponent] = remaining > 0f ? (float)Math.Sqrt(remaining) : 0f;
                 if ((flags & 4) != 0u)
                     q[lastComponent] = -q[lastComponent];
                 data[i] = q;

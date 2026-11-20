@@ -9,6 +9,7 @@ using Xunit;
 
 namespace AssetStudio.Tests
 {
+    [Collection("ResourceReaderXorHeuristic")]
     public class CoreParserTests
     {
         [Fact]
@@ -309,7 +310,7 @@ namespace AssetStudio.Tests
                 Assert.Equal(0xAA, oversizedBuffer[i]);
             }
 
-            // Stream-backed ResourceReader with >50% 0x01 XOR trigger must only transform [0..toRead)
+            // Stream-backed ResourceReader with >50% 0x01 XOR trigger (when opt-in heuristic is enabled) must only transform [0..toRead)
             var xorPayload = new byte[64];
             Array.Fill(xorPayload, (byte)0x01);
             xorPayload[0] = 0x42;
@@ -320,7 +321,16 @@ namespace AssetStudio.Tests
             var poolBuffer = new byte[256];
             Array.Fill(poolBuffer, (byte)0x55);
 
-            streamReader.GetData(poolBuffer);
+            bool previousXorSetting = ResourceReader.EnableXorInversionHeuristic;
+            ResourceReader.EnableXorInversionHeuristic = true;
+            try
+            {
+                streamReader.GetData(poolBuffer);
+            }
+            finally
+            {
+                ResourceReader.EnableXorInversionHeuristic = previousXorSetting;
+            }
 
             Assert.Equal((byte)(0x42 ^ 0xFF), poolBuffer[0]);
             for (int i = 1; i < xorPayload.Length; i++)

@@ -6,6 +6,19 @@ namespace AssetStudio
 {
     public class ResourceReader
     {
+        private static volatile bool s_enableXorInversionHeuristic;
+
+        /// <summary>
+        /// Enables the legacy heuristic that XOR-inverts (0xFF) resource payloads when more than 50%
+        /// of the first 1024 bytes equal 0x01. Disabled by default to prevent corrupting legitimate
+        /// dark R8/Alpha8 textures and binary payloads.
+        /// </summary>
+        public static bool EnableXorInversionHeuristic
+        {
+            get => s_enableXorInversionHeuristic;
+            set => s_enableXorInversionHeuristic = value;
+        }
+
         private bool needSearch;
         private string path;
         private SerializedFile assetsFile;
@@ -406,6 +419,34 @@ namespace AssetStudio
             return totalRead;
         }
 
+        private static bool ShouldApplyXorInversionHeuristic(ReadOnlySpan<byte> data)
+        {
+            int sampleSize = Math.Min(data.Length, 1024);
+            if (sampleSize == 0)
+            {
+                return false;
+            }
+
+            int count01 = 0;
+            for (int i = 0; i < sampleSize; i++)
+            {
+                if (data[i] == 0x01)
+                {
+                    count01++;
+                }
+            }
+
+            return count01 * 2 > sampleSize;
+        }
+
+        private static void ApplyXorInversionInPlace(Span<byte> data)
+        {
+            for (int i = 0; i < data.Length; i++)
+            {
+                data[i] ^= 0xFF;
+            }
+        }
+
         public byte[] GetData()
         {
             if (rawData != null)
@@ -425,22 +466,9 @@ namespace AssetStudio
                     throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {data.Length} bytes.");
                 }
 
-                // Testa se a maioria dos bytes é 0x01 (indicativo de XOR)
-                int sampleSize = Math.Min(data.Length, 1024);
-                int count01 = 0;
-                for (int i = 0; i < sampleSize; i++)
+                if (EnableXorInversionHeuristic && ShouldApplyXorInversionHeuristic(data))
                 {
-                    if (data[i] == 0x01)
-                        count01++;
-                }
-
-                // Se for criptografado com XOR
-                if (sampleSize > 0 && count01 > sampleSize * 0.5)
-                {
-                    for (int i = 0; i < data.Length; i++)
-                    {
-                        data[i] ^= 0xFF;
-                    }
+                    ApplyXorInversionInPlace(data);
                 }
 
                 return data;
@@ -456,6 +484,10 @@ namespace AssetStudio
 
         public void GetData(byte[] buff)
         {
+            if (buff == null)
+            {
+                throw new ArgumentNullException(nameof(buff));
+            }
             if (size < 0 || size > buff.Length)
             {
                 throw new ArgumentOutOfRangeException(nameof(buff), $"Destination buffer ({buff.Length} bytes) is smaller than resource size ({size} bytes).");
@@ -479,20 +511,10 @@ namespace AssetStudio
                 }
 
                 // Inspect and transform only the 'toRead' bytes actually read — buff may be oversized from BigArrayPool.
-                int sampleSize = Math.Min(toRead, 1024);
-                int count01 = 0;
-                for (int i = 0; i < sampleSize; i++)
+                var payloadSpan = buff.AsSpan(0, toRead);
+                if (EnableXorInversionHeuristic && ShouldApplyXorInversionHeuristic(payloadSpan))
                 {
-                    if (buff[i] == 0x01)
-                        count01++;
-                }
-
-                if (sampleSize > 0 && count01 > sampleSize * 0.5)
-                {
-                    for (int i = 0; i < toRead; i++)
-                    {
-                        buff[i] ^= 0xFF;
-                    }
+                    ApplyXorInversionInPlace(payloadSpan);
                 }
             }
             finally
