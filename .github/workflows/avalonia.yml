@@ -36,10 +36,13 @@ jobs:
         run: bash -n scripts/publish-linux.sh scripts/package-linux.sh
 
       - name: Restore Avalonia
-        run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj
+        run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj --locked-mode
 
       - name: Build Avalonia
         run: dotnet build AssetStudio.Avalonia/AssetStudio.Avalonia.csproj --configuration Release --no-restore
 
+      - name: Restore Tests
+        run: dotnet restore AssetStudio.Tests/AssetStudio.Tests.csproj --locked-mode
+
       - name: Run Tests
-        run: dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --verbosity normal
+        run: dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --no-restore --verbosity normal
