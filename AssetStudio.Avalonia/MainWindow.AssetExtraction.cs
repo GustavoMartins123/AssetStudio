@@ -152,7 +152,7 @@ public partial class MainWindow
         return ExtractStreamFiles(extractPath, webFile.fileList);
     }
 
-    private static int ExtractStreamFiles(string extractPath, StreamFile[] fileList)
+    internal static int ExtractStreamFiles(string extractPath, StreamFile[] fileList)
     {
         var extractedCount = 0;
         var rootFullPath = Path.GetFullPath(extractPath)
@@ -167,7 +167,7 @@ public partial class MainWindow
             try
             {
                 var rawPath = file.path ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(rawPath))
+                if (string.IsNullOrWhiteSpace(rawPath) || file.stream == null)
                 {
                     continue;
                 }
@@ -179,7 +179,7 @@ public partial class MainWindow
                 }
 
                 var rawSegments = rawPath.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-                if (rawSegments.Length == 0 || rawSegments.Any(part => part == "." || part == ".."))
+                if (rawSegments.Length == 0 || rawSegments.Any(part => part.Trim() is "." or ".."))
                 {
                     Logger.Warning($"Blocked path traversal attempt in bundle entry: '{rawPath}'");
                     continue;

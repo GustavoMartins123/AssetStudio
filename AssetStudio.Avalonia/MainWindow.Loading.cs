@@ -363,17 +363,7 @@ namespace AssetStudio.Avalonia
         private static List<(PPtr<AssetStudio.Object>, string)> CollectAssetBundleContainers(AssetBundle assetBundle)
         {
             var containers = new List<(PPtr<AssetStudio.Object>, string)>();
-            foreach (var container in assetBundle.m_Container)
-            {
-                var preloadIndex = container.Value.preloadIndex;
-                var preloadSize = container.Value.preloadSize;
-                var preloadEnd = preloadIndex + preloadSize;
-                for (int k = preloadIndex; k < preloadEnd; k++)
-                {
-                    containers.Add((assetBundle.m_PreloadTable[k], container.Key));
-                }
-            }
-
+            CollectSafeAssetBundleContainers(assetBundle, containers);
             return containers;
         }
 
@@ -980,14 +970,18 @@ namespace AssetStudio.Avalonia
                     references.Add(assetInfo.asset);
                 }
 
-                var preloadStart = Math.Max(0, assetInfo?.preloadIndex ?? 0);
-                var preloadEnd = Math.Min(assetBundle.m_PreloadTable.Length, preloadStart + Math.Max(0, assetInfo?.preloadSize ?? 0));
-                for (var i = preloadStart; i < preloadEnd; i++)
+                var preloadIndex = assetInfo?.preloadIndex ?? -1;
+                var preloadSize = assetInfo?.preloadSize ?? 0;
+                if (preloadIndex >= 0 && preloadSize > 0 && preloadIndex < assetBundle.m_PreloadTable.Length)
                 {
-                    var reference = assetBundle.m_PreloadTable[i];
-                    if (reference != null && !reference.IsNull)
+                    var preloadEnd = (int)Math.Min((long)preloadIndex + preloadSize, assetBundle.m_PreloadTable.Length);
+                    for (var i = preloadIndex; i < preloadEnd; i++)
                     {
-                        references.Add(reference);
+                        var reference = assetBundle.m_PreloadTable[i];
+                        if (reference != null && !reference.IsNull)
+                        {
+                            references.Add(reference);
+                        }
                     }
                 }
 

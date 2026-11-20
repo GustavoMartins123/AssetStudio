@@ -844,12 +844,17 @@ public partial class MainWindow
         return Path.Combine(savePath, FixFileName(serializedFileName ?? "Unknown") + "_export");
     }
 
-    private static string GetSafeRelativeExportDirectory(string container)
+    internal static string GetSafeRelativeExportDirectory(string? container)
     {
+        if (string.IsNullOrWhiteSpace(container))
+        {
+            return string.Empty;
+        }
+
         var directory = Path.GetDirectoryName(container.Replace('\\', '/')) ?? string.Empty;
         var safeParts = directory
-            .Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Where(part => part != "." && part != "..")
+            .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(part => part.Trim() is not "." and not "..")
             .Select(FixFileName)
             .Where(part => !string.IsNullOrWhiteSpace(part))
             .ToArray();
@@ -1033,7 +1038,7 @@ public partial class MainWindow
         }
     }
 
-    private static void TryDeletePartialExport(string filePath)
+    internal static void TryDeletePartialExport(string filePath)
     {
         try
         {
@@ -1799,33 +1804,60 @@ public partial class MainWindow
             : value.ToString(CultureInfo.InvariantCulture);
     }
 
-    private static string FixFileName(string? name)
+    internal static string FixFileName(string? name)
     {
         if (string.IsNullOrWhiteSpace(name)) return "unnamed";
 
+        var invalidChars = Path.GetInvalidFileNameChars();
         var builder = new StringBuilder(name.Length);
         foreach (var character in name)
         {
-            builder.Append(character < 32 || character is '<' or '>' or ':' or '"' or '/' or '\\' or '|' or '?' or '*'
+            builder.Append(character < 32
+                || character is '<' or '>' or ':' or '"' or '/' or '\\' or '|' or '?' or '*'
+                || Array.IndexOf(invalidChars, character) >= 0
                 ? '_'
                 : character);
         }
 
-        name = builder.ToString().Trim().TrimEnd('.');
+        name = builder.ToString().Trim().TrimEnd(' ', '.');
         if (string.IsNullOrWhiteSpace(name))
         {
             return "unnamed";
         }
 
+        while (name.Contains("..", StringComparison.Ordinal))
+        {
+            name = name.Replace("..", "_", StringComparison.Ordinal);
+        }
+
+        name = name.Trim().TrimEnd(' ', '.');
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return "unnamed";
+        }
+
+        if (name.Length > 120)
+        {
+            name = name.Substring(0, 120).TrimEnd(' ', '.');
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return "unnamed";
+            }
+        }
+
         var dotIndex = name.IndexOf('.');
-        var deviceName = (dotIndex >= 0 ? name.Substring(0, dotIndex) : name).ToUpperInvariant();
+        var deviceName = (dotIndex >= 0 ? name.Substring(0, dotIndex) : name).Trim().ToUpperInvariant();
         if (deviceName is "CON" or "PRN" or "AUX" or "NUL"
             or "COM1" or "COM2" or "COM3" or "COM4" or "COM5" or "COM6" or "COM7" or "COM8" or "COM9"
             or "LPT1" or "LPT2" or "LPT3" or "LPT4" or "LPT5" or "LPT6" or "LPT7" or "LPT8" or "LPT9")
         {
             name = "_" + name;
+            if (name.Length > 120)
+            {
+                name = name.Substring(0, 120).TrimEnd(' ', '.');
+            }
         }
 
-        return name.Length <= 120 ? name : name.Substring(0, 120).TrimEnd(' ', '.');
+        return name;
     }
 }

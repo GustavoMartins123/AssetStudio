@@ -221,20 +221,35 @@ public partial class MainWindow
         }
     }
 
+    internal static bool ShouldShowPreviewInfoOverlay(bool displayInfoEnabled, string? previewInfoText)
+    {
+        return displayInfoEnabled && !string.IsNullOrWhiteSpace(previewInfoText);
+    }
+
     private void DisplayInfo_Click(object? sender, RoutedEventArgs e)
     {
-        appSettings.DisplayInfo = displayInfo.IsChecked == true;
+        var showInfo = displayInfo.IsChecked == true;
+        appSettings.DisplayInfo = showInfo;
         SaveAppSettings();
         if (AssetListDataGrid.SelectedItem is AssetItem selected)
         {
-            PreviewLabel.Text = displayInfo.IsChecked == true
+            PreviewLabel.Text = showInfo
                 ? $"{selected.TypeString}: {selected.Name}"
                 : string.Empty;
-            PreviewLabel.IsVisible = displayInfo.IsChecked == true && !TextPreviewBox.IsVisible && !TextAssetPreviewPanel.IsVisible && (ImagePreviewBox == null || !ImagePreviewBox.IsVisible);
+            PreviewLabel.IsVisible = showInfo
+                && !TextPreviewBox.IsVisible
+                && !TextAssetPreviewPanel.IsVisible
+                && (ImagePreviewBox == null || !ImagePreviewBox.IsVisible)
+                && (TextureGLPreview == null || !TextureGLPreview.IsVisible)
+                && (GLPreviewControl == null || !GLPreviewControl.IsVisible);
             if (PreviewInfoBorder != null)
             {
-                PreviewInfoBorder.IsVisible = displayInfo.IsChecked == true && (currentPreviewTexture != null || currentPreviewSprite != null);
+                PreviewInfoBorder.IsVisible = ShouldShowPreviewInfoOverlay(showInfo, PreviewInfoOverlay?.Text);
             }
+        }
+        else if (PreviewInfoBorder != null && !showInfo)
+        {
+            PreviewInfoBorder.IsVisible = false;
         }
     }
 

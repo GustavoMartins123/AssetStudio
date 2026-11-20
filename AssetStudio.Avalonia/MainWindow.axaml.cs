@@ -922,16 +922,7 @@ public partial class MainWindow : Window
                     {
                         if (asset is AssetBundle m_AssetBundle)
                         {
-                            foreach (var m_Container in m_AssetBundle.m_Container)
-                            {
-                                var preloadIndex = m_Container.Value.preloadIndex;
-                                var preloadSize = m_Container.Value.preloadSize;
-                                var preloadEnd = preloadIndex + preloadSize;
-                                for (int k = preloadIndex; k < preloadEnd; k++)
-                                {
-                                    localContainers.Add((m_AssetBundle.m_PreloadTable[k], m_Container.Key));
-                                }
-                            }
+                            CollectSafeAssetBundleContainers(m_AssetBundle, localContainers);
                         }
                         else if (asset is ResourceManager m_ResourceManager)
                         {
@@ -1255,34 +1246,159 @@ public partial class MainWindow : Window
         }
     }
 
+    internal static void CollectSafeAssetBundleContainers(
+        AssetBundle? assetBundle,
+        List<(PPtr<Object>, string)> containers)
+    {
+        ArgumentNullException.ThrowIfNull(containers);
+        if (assetBundle?.m_Container == null || assetBundle.m_PreloadTable == null)
+        {
+            return;
+        }
+
+        var preloadTable = assetBundle.m_PreloadTable;
+        foreach (var m_Container in assetBundle.m_Container)
+        {
+            var assetInfo = m_Container.Value;
+            if (assetInfo == null)
+            {
+                continue;
+            }
+
+            var preloadIndex = assetInfo.preloadIndex;
+            var preloadSize = assetInfo.preloadSize;
+            if (preloadIndex < 0 || preloadSize <= 0 || preloadIndex >= preloadTable.Length)
+            {
+                continue;
+            }
+
+            long preloadEnd = Math.Min((long)preloadIndex + preloadSize, preloadTable.Length);
+            for (int k = preloadIndex; k < preloadEnd; k++)
+            {
+                containers.Add((preloadTable[k], m_Container.Key));
+            }
+        }
+    }
+
+    internal static string BuildSafeClassStructurePath(string savePath, string? unityVersion, string? typeName)
+    {
+        if (string.IsNullOrWhiteSpace(savePath))
+        {
+            throw new ArgumentException("Save path must not be empty.", nameof(savePath));
+        }
+
+        var rootFullPath = Path.GetFullPath(savePath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        var safeVersion = FixFileName(unityVersion);
+        if (string.IsNullOrWhiteSpace(safeVersion) || safeVersion is "." or "..")
+        {
+            throw new IOException($"Blocked invalid Unity version directory segment: '{unityVersion}'");
+        }
+
+        var safeTypeName = FixFileName(typeName);
+        if (string.IsNullOrWhiteSpace(safeTypeName) || safeTypeName is "." or "..")
+        {
+            throw new IOException($"Blocked invalid class structure file name: '{typeName}'");
+        }
+
+        var fileName = safeTypeName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)
+            ? safeTypeName
+            : safeTypeName + ".txt";
+
+        var versionDirectory = Path.GetFullPath(Path.Combine(rootFullPath, safeVersion));
+        var versionDirectoryWithSeparator = versionDirectory
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        if (!versionDirectoryWithSeparator.StartsWith(rootFullPath, comparison)
+            || string.Equals(versionDirectoryWithSeparator, rootFullPath, comparison))
+        {
+            throw new IOException($"Blocked class structure version directory outside destination root: '{unityVersion}'");
+        }
+
+        var fullPath = Path.GetFullPath(Path.Combine(versionDirectory, fileName));
+        if (!fullPath.StartsWith(versionDirectoryWithSeparator, comparison)
+            || !fullPath.StartsWith(rootFullPath, comparison))
+        {
+            throw new IOException($"Blocked class structure output path outside destination root: '{unityVersion}/{typeName}'");
+        }
+
+        return fullPath;
+    }
+
+    internal static int ExportClassStructuresToDisk(
+        string savePath,
+        IEnumerable<(string UnityVersion, string TypeName, string Content)> items,
+        Action<int, int>? progressCallback = null)
+    {
+        if (string.IsNullOrWhiteSpace(savePath))
+        {
+            throw new ArgumentException("Save path must not be empty.", nameof(savePath));
+        }
+
+        ArgumentNullException.ThrowIfNull(items);
+
+        var itemList = items as IReadOnlyList<(string UnityVersion, string TypeName, string Content)> ?? items.ToList();
+        var totalCount = itemList.Count;
+        var exportedCount = 0;
+
+        foreach (var item in itemList)
+        {
+            var saveFile = BuildSafeClassStructurePath(savePath, item.UnityVersion, item.TypeName);
+            var versionPath = Path.GetDirectoryName(saveFile);
+            if (!string.IsNullOrEmpty(versionPath))
+            {
+                Directory.CreateDirectory(versionPath);
+            }
+
+            WriteTextExport(saveFile, item.Content ?? string.Empty);
+            exportedCount++;
+            progressCallback?.Invoke(exportedCount, totalCount);
+        }
+
+        return exportedCount;
+    }
+
     private async void ExportClassStructures_Click(object? sender, RoutedEventArgs e)
     {
-        if (assetClassItems.Count > 0)
+        if (assetClassItems.Count == 0)
         {
-            var topLevel = TopLevel.GetTopLevel(this);
-            if (topLevel == null) return;
+            return;
+        }
 
-            var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select folder to export class structures"));
-            if (folders != null && folders.Count > 0)
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select folder to export class structures"));
+        if (folders == null || folders.Count == 0) return;
+
+        var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+        var itemsSnapshot = assetClassItems.ToList();
+        StatusStripUpdate("Exporting class structures...");
+        Progress.Reset();
+
+        try
+        {
+            var exportedCount = await Task.Run(() =>
             {
-                var savePath = folders[0].Path.LocalPath;
-                var count = assetClassItems.Count;
-                int i = 0;
-                Progress.Reset();
-                foreach (var item in assetClassItems)
-                {
-                    var versionPath = Path.Combine(savePath, item.UnityVersion);
-                    Directory.CreateDirectory(versionPath);
+                var exportItems = itemsSnapshot.Select(item => (
+                    item.UnityVersion,
+                    TypeName: $"{item.ClassID.ToString(CultureInfo.InvariantCulture)} {item.Name}",
+                    Content: FormatAssetClass(item)));
+                return ExportClassStructuresToDisk(savePath, exportItems, Progress.Report);
+            });
 
-                    var cleanClassName = FixFileName(item.Name);
-                    var saveFile = Path.Combine(versionPath, $"{item.ClassID} {cleanClassName}.txt");
-                    File.WriteAllText(saveFile, FormatAssetClass(item));
-
-                    Progress.Report(++i, count);
-                }
-
-                StatusStripUpdate("Finished exporting class structures");
-            }
+            StatusStripUpdate($"Finished exporting {exportedCount} class structures");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Error exporting class structures", ex);
+            StatusStripUpdate($"Error exporting class structures: {ex.Message}");
         }
     }
 
