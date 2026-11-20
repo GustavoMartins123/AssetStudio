@@ -53,6 +53,7 @@ namespace AssetStudio.Avalonia
                 or ClassIDType.Mesh
                 or ClassIDType.Material
                 or ClassIDType.TextAsset
+                or ClassIDType.MonoScript
                 or ClassIDType.MonoBehaviour
                 or ClassIDType.Font
                 or ClassIDType.Sprite

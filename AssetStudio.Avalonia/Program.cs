@@ -52,15 +52,30 @@ class Program
 
     internal static void WriteCrashLog(string title, Exception? exception)
     {
+        var sb = new StringBuilder();
+        sb.AppendLine("AssetStudio Avalonia crash report");
+        sb.AppendLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine(title);
+        sb.AppendLine(exception?.ToString() ?? "No managed exception object was available.");
+        sb.AppendLine(new string('=', 80));
+        var content = sb.ToString();
+
         try
         {
-            var sb = new StringBuilder();
-            sb.AppendLine("AssetStudio Avalonia crash report");
-            sb.AppendLine($"Created at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine(title);
-            sb.AppendLine(exception?.ToString() ?? "No managed exception object was available.");
-            sb.AppendLine(new string('=', 80));
-            File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), sb.ToString());
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "crash.log"), content);
+            return;
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var fallbackDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio");
+            Directory.CreateDirectory(fallbackDir);
+            File.AppendAllText(Path.Combine(fallbackDir, "crash.log"), content);
         }
         catch
         {

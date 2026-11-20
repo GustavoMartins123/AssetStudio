@@ -803,10 +803,42 @@ public partial class MainWindow
         return exportOptions.AssetGrouping switch
         {
             AssetGroupOption.Container when !string.IsNullOrEmpty(asset.Container) => Path.Combine(savePath, GetSafeRelativeExportDirectory(asset.Container)),
-            AssetGroupOption.SourceFile => Path.Combine(savePath, FixFileName(asset.SourceFile?.fileName ?? asset.Handle?.SerializedFileName ?? "Unknown") + "_export"),
+            AssetGroupOption.SourceFile => GetSourceFileExportPath(savePath, asset),
             AssetGroupOption.TypeName => Path.Combine(savePath, FixFileName(asset.TypeString)),
+            AssetGroupOption.None => savePath,
             _ => savePath
         };
+    }
+
+    private static string GetSourceFileExportPath(string savePath, AssetItem asset)
+    {
+        var originalPath = !string.IsNullOrWhiteSpace(asset.SourceFile?.originalPath)
+            ? asset.SourceFile.originalPath
+            : asset.Handle?.OriginalPath;
+        var serializedFileName = !string.IsNullOrWhiteSpace(asset.SourceFile?.fileName)
+            ? asset.SourceFile.fileName
+            : asset.Handle?.SerializedFileName;
+
+        if (!string.IsNullOrWhiteSpace(originalPath))
+        {
+            var containerFileName = Path.GetFileName(originalPath);
+            if (!string.IsNullOrWhiteSpace(containerFileName)
+                && !string.IsNullOrWhiteSpace(serializedFileName)
+                && !string.Equals(containerFileName, serializedFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return Path.Combine(
+                    savePath,
+                    FixFileName(containerFileName) + "_export",
+                    FixFileName(serializedFileName));
+            }
+
+            if (!string.IsNullOrWhiteSpace(containerFileName))
+            {
+                return Path.Combine(savePath, FixFileName(containerFileName) + "_export");
+            }
+        }
+
+        return Path.Combine(savePath, FixFileName(serializedFileName ?? "Unknown") + "_export");
     }
 
     private static string GetSafeRelativeExportDirectory(string container)
@@ -827,15 +859,63 @@ public partial class MainWindow
         return asset.Asset switch
         {
             Texture2D => ".tex",
-            TextAsset => ".txt",
+            TextAsset => GetTextAssetExtension(asset),
             Shader => ".shader",
             Font m_Font when m_Font.m_FontData?.Length >= 4 && m_Font.m_FontData[0] == 79 && m_Font.m_FontData[1] == 84 && m_Font.m_FontData[2] == 84 && m_Font.m_FontData[3] == 79 => ".otf",
             Font => ".ttf",
             MovieTexture => ".ogv",
-            VideoClip m_VideoClip when !string.IsNullOrEmpty(m_VideoClip.m_OriginalPath) => Path.GetExtension(m_VideoClip.m_OriginalPath),
+            VideoClip m_VideoClip when !string.IsNullOrEmpty(m_VideoClip.m_OriginalPath) => SanitizeExtension(Path.GetExtension(m_VideoClip.m_OriginalPath), ".mp4"),
             AudioClip m_AudioClip => new AudioClipConverter(m_AudioClip).GetExtensionName(),
             _ => ".dat"
         };
+    }
+
+    private string GetTextAssetExtension(AssetItem asset)
+    {
+        if (exportOptions.RestoreExtensionName && !string.IsNullOrEmpty(asset.Container))
+        {
+            return SanitizeExtension(Path.GetExtension(asset.Container), ".txt");
+        }
+
+        return ".txt";
+    }
+
+    private static string SanitizeExtension(string? extension, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return fallback;
+        }
+
+        var raw = extension.Trim().TrimStart('.');
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return fallback;
+        }
+
+        var builder = new StringBuilder(raw.Length);
+        foreach (var character in raw)
+        {
+            if (character < 32 || character is '<' or '>' or ':' or '"' or '/' or '\\' or '|' or '?' or '*' or '.')
+            {
+                continue;
+            }
+
+            builder.Append(character);
+        }
+
+        var sanitized = builder.ToString().Trim();
+        if (string.IsNullOrWhiteSpace(sanitized))
+        {
+            return fallback;
+        }
+
+        if (sanitized.Length > 32)
+        {
+            sanitized = sanitized.Substring(0, 32);
+        }
+
+        return "." + sanitized;
     }
 
     private static void WriteCurrentExport(string path, AssetItem asset, int index, int count)
@@ -1139,7 +1219,8 @@ public partial class MainWindow
             }
             case TextAsset m_TextAsset:
             {
-                if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".txt", item, out var filePath)) return false;
+                var extension = GetTextAssetExtension(item);
+                if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
                 File.WriteAllBytes(filePath, m_TextAsset.m_Script);
                 return true;
             }
@@ -1176,13 +1257,14 @@ public partial class MainWindow
             }
             case Sprite m_Sprite:
             {
-                var image = m_Sprite.GetImage();
+                using var image = m_Sprite.GetImage();
                 if (image == null) return false;
-                if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".png", item, out var filePath)) return false;
-                using (image)
+                var format = exportOptions.ConvertTextureFormat;
+                var extension = "." + format.ToString().ToLowerInvariant();
+                if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
                 using (var file = File.OpenWrite(filePath))
                 {
-                    image.WriteToStream(file, ImageFormat.Png);
+                    image.WriteToStream(file, format);
                 }
                 AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Sprite);
                 return true;

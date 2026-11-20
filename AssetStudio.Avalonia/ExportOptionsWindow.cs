@@ -12,7 +12,8 @@ public enum AssetGroupOption
 {
     TypeName,
     Container,
-    SourceFile
+    SourceFile,
+    None
 }
 
 public sealed class ExportOptionsState
@@ -20,7 +21,7 @@ public sealed class ExportOptionsState
     public AssetGroupOption AssetGrouping { get; set; } = AssetGroupOption.TypeName;
     public bool ConvertTexture { get; set; } = true;
     public ImageFormat ConvertTextureFormat { get; set; } = ImageFormat.Png;
-    public bool ConvertAudio { get; set; } = false;
+    public bool ConvertAudio { get; set; } = true;
     public bool RestoreExtensionName { get; set; } = true;
     public bool OpenAfterExport { get; set; } = true;
     public bool EulerFilter { get; set; } = true;
@@ -73,7 +74,7 @@ public sealed class ExportOptionsWindow : Window
     private readonly ComboBox assetGrouping = new();
     private readonly CheckBox convertTexture = new() { Content = "Convert texture" };
     private readonly ComboBox convertTextureFormat = new();
-    private readonly CheckBox convertAudio = new() { Content = "Convert audio" };
+    private readonly CheckBox convertAudio = new() { Content = "Convert AudioClip to WAV(PCM)" };
     private readonly CheckBox restoreExtensionName = new() { Content = "Restore extension name" };
     private readonly CheckBox openAfterExport = new() { Content = "Open after export" };
     private readonly CheckBox eulerFilter = new() { Content = "Euler filter" };
@@ -101,7 +102,7 @@ public sealed class ExportOptionsWindow : Window
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         CanResize = false;
 
-        assetGrouping.ItemsSource = new[] { "Type name", "Container path", "Source file" };
+        assetGrouping.ItemsSource = new[] { "Type name", "Container path", "Source file", "Do not group" };
         convertTextureFormat.ItemsSource = Enum.GetNames<ImageFormat>();
         fbxVersion.ItemsSource = new[] { "FBX 6.1", "FBX 7.1", "FBX 7.2", "FBX 7.3", "FBX 7.4", "FBX 7.5" };
         fbxFormat.ItemsSource = new[] { "Binary", "ASCII" };
@@ -113,6 +114,7 @@ public sealed class ExportOptionsWindow : Window
         panel.Children.Add(assetGrouping);
         panel.Children.Add(convertTexture);
         panel.Children.Add(Labeled("Texture format", convertTextureFormat));
+        panel.Children.Add(convertAudio);
         panel.Children.Add(restoreExtensionName);
         panel.Children.Add(openAfterExport);
         panel.Children.Add(Separator());
@@ -154,10 +156,10 @@ public sealed class ExportOptionsWindow : Window
 
     private void LoadState()
     {
-        assetGrouping.SelectedIndex = (int)state.AssetGrouping;
+        assetGrouping.SelectedIndex = Math.Clamp((int)state.AssetGrouping, 0, 3);
         convertTexture.IsChecked = state.ConvertTexture;
         convertTextureFormat.SelectedItem = state.ConvertTextureFormat.ToString();
-        convertAudio.IsChecked = false;
+        convertAudio.IsChecked = state.ConvertAudio;
         restoreExtensionName.IsChecked = state.RestoreExtensionName;
         openAfterExport.IsChecked = state.OpenAfterExport;
         eulerFilter.IsChecked = state.EulerFilter;
@@ -179,10 +181,10 @@ public sealed class ExportOptionsWindow : Window
 
     private void Ok_Click(object? sender, RoutedEventArgs e)
     {
-        state.AssetGrouping = (AssetGroupOption)Math.Max(0, assetGrouping.SelectedIndex);
+        state.AssetGrouping = (AssetGroupOption)Math.Clamp(assetGrouping.SelectedIndex, 0, 3);
         state.ConvertTexture = convertTexture.IsChecked == true;
         state.ConvertTextureFormat = Enum.Parse<ImageFormat>((string?)convertTextureFormat.SelectedItem ?? ImageFormat.Png.ToString());
-        state.ConvertAudio = false;
+        state.ConvertAudio = convertAudio.IsChecked == true;
         state.RestoreExtensionName = restoreExtensionName.IsChecked == true;
         state.OpenAfterExport = openAfterExport.IsChecked == true;
         state.EulerFilter = eulerFilter.IsChecked == true;

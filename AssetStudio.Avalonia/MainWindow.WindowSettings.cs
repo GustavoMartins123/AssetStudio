@@ -76,6 +76,7 @@ public partial class MainWindow
         ViewModel.LoadingService.StopIndexing();
         ViewModel.IsIndexingActive = false;
         ViewModel.LoadingProgress = 0;
+        HideIndexingProgressPanel();
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
 
@@ -198,7 +199,7 @@ public partial class MainWindow
     {
         appSettings.DisplayAll = displayAll.IsChecked == true;
         SaveAppSettings();
-        if (assetsManager.assetsFileList.Count > 0)
+        if (assetsManager.assetsFileList.Count > 0 || (assetsManager.LazyLoading && assetsManager.ProjectIndex.Count > 0))
         {
             BuildAssetStructures();
         }

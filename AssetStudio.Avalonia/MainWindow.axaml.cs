@@ -287,6 +287,7 @@ public partial class MainWindow : Window
             ResetForm();
             StatusStripUpdate("Loading files...");
             assetsManager.Clear();
+            assetsManager.LazyLoading = false;
             ApplyUnityVersionOption();
             try
             {
@@ -295,6 +296,12 @@ public partial class MainWindow : Window
             catch (MemoryPressureException ex)
             {
                 ShowMemoryPressureError(ex);
+                return;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Error loading files:\n{ex.Message}", "Load failed");
+                StatusStripUpdate("Load failed.");
                 return;
             }
             BuildAssetStructures();
@@ -312,6 +319,62 @@ public partial class MainWindow : Window
             var folderPath = folders[0].Path.LocalPath;
             await BeginProgressiveLoadAsync(new[] { folderPath }, "Indexing folder");
         }
+    }
+
+    private async void LoadFolderEager_Click(object? sender, RoutedEventArgs e)
+    {
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Game Folder (Full / Scene Hierarchy)"));
+
+        if (folders != null && folders.Count > 0)
+        {
+            var folderPath = folders[0].Path.LocalPath;
+            await LoadFolderEagerAsync(folderPath);
+        }
+    }
+
+    private async Task LoadFolderEagerAsync(string folderPath)
+    {
+        var choice = await ConfirmFolderLoadIfRisky(folderPath);
+        if (choice == RiskyLoadChoice.Cancel)
+        {
+            StatusStripUpdate("Folder load cancelled.");
+            return;
+        }
+
+        if (choice == RiskyLoadChoice.LazyLoad)
+        {
+            LoadPathsProgressiveAsync(new[] { folderPath });
+            return;
+        }
+
+        SaveLoadFolder(folderPath);
+        ResetForm();
+        StatusStripUpdate("Loading folder (Full / Scene Hierarchy)...");
+        assetsManager.Clear();
+        assetsManager.LazyLoading = false;
+        assetsManager.ProjectRoot = !string.IsNullOrWhiteSpace(appSettings.ProjectRoot)
+            ? appSettings.ProjectRoot
+            : folderPath;
+        ApplyUnityVersionOption();
+        try
+        {
+            await Task.Run(() => assetsManager.LoadFolderAsync(folderPath));
+        }
+        catch (MemoryPressureException ex)
+        {
+            ShowMemoryPressureError(ex);
+            return;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Error loading folder:\n{ex.Message}", "Load failed");
+            StatusStripUpdate("Folder load failed.");
+            return;
+        }
+
+        await BuildAssetStructuresAsync();
     }
 
     private void Window_DragOver(object? sender, DragEventArgs e)
