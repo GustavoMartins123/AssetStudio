@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
@@ -25,7 +25,7 @@ namespace AssetStudio
             return sb.ToString();
         }
 
-        private static void ReadStringValue(StringBuilder sb, List<TypeTreeNode> m_Nodes, BinaryReader reader, ref int i)
+        private static void ReadStringValue(StringBuilder sb, List<TypeTreeNode> m_Nodes, ObjectReader reader, ref int i)
         {
             var m_Node = m_Nodes[i];
             var level = m_Node.m_Level;
@@ -95,6 +95,7 @@ namespace AssetStudio
                         sb.AppendFormat("{0}{1} {2}\r\n", (new string('\t', level)), varTypeStr, varNameStr);
                         sb.AppendFormat("{0}{1} {2}\r\n", (new string('\t', level + 1)), "Array", "Array");
                         var size = reader.ReadInt32();
+                        reader.CheckArrayLength(size);
                         sb.AppendFormat("{0}{1} {2} = {3}\r\n", (new string('\t', level + 1)), "int", "size", size);
                         var map = GetNodes(m_Nodes, i);
                         i += map.Count - 1;
@@ -116,6 +117,7 @@ namespace AssetStudio
                     {
                         append = false;
                         var size = reader.ReadInt32();
+                        reader.CheckArrayLength(size);
                         reader.ReadBytes(size);
                         i += 2;
                         sb.AppendFormat("{0}{1} {2}\r\n", (new string('\t', level)), varTypeStr, varNameStr);
@@ -132,6 +134,7 @@ namespace AssetStudio
                             sb.AppendFormat("{0}{1} {2}\r\n", (new string('\t', level)), varTypeStr, varNameStr);
                             sb.AppendFormat("{0}{1} {2}\r\n", (new string('\t', level + 1)), "Array", "Array");
                             var size = reader.ReadInt32();
+                            reader.CheckArrayLength(size);
                             sb.AppendFormat("{0}{1} {2} = {3}\r\n", (new string('\t', level + 1)), "int", "size", size);
                             var vector = GetNodes(m_Nodes, i);
                             i += vector.Count - 1;
@@ -182,7 +185,7 @@ namespace AssetStudio
             return obj;
         }
 
-        private static object ReadValue(List<TypeTreeNode> m_Nodes, BinaryReader reader, ref int i)
+        private static object ReadValue(List<TypeTreeNode> m_Nodes, ObjectReader reader, ref int i)
         {
             var m_Node = m_Nodes[i];
             var varTypeStr = m_Node.m_Type;
@@ -249,6 +252,7 @@ namespace AssetStudio
                         var next = 4 + first.Count;
                         var second = GetNodes(map, next);
                         var size = reader.ReadInt32();
+                        reader.CheckArrayLength(size);
                         var dic = new List<KeyValuePair<object, object>>(size);
                         for (int j = 0; j < size; j++)
                         {
@@ -262,6 +266,7 @@ namespace AssetStudio
                 case "TypelessData":
                     {
                         var size = reader.ReadInt32();
+                        reader.CheckArrayLength(size);
                         value = reader.ReadBytes(size);
                         i += 2;
                         break;
@@ -275,6 +280,7 @@ namespace AssetStudio
                             var vector = GetNodes(m_Nodes, i);
                             i += vector.Count - 1;
                             var size = reader.ReadInt32();
+                            reader.CheckArrayLength(size);
                             var list = new List<object>(size);
                             for (int j = 0; j < size; j++)
                             {

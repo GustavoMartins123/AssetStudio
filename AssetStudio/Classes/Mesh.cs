@@ -613,10 +613,10 @@ namespace AssetStudio
                         m_Normals[v * 3] = reader.ReadSingle();
                         m_Normals[v * 3 + 1] = reader.ReadSingle();
                         m_Normals[v * 3 + 2] = reader.ReadSingle();
-                        m_Tangents[v * 3] = reader.ReadSingle();
-                        m_Tangents[v * 3 + 1] = reader.ReadSingle();
-                        m_Tangents[v * 3 + 2] = reader.ReadSingle();
-                        m_Tangents[v * 3 + 3] = reader.ReadSingle(); //handedness
+                        m_Tangents[v * 4] = reader.ReadSingle();
+                        m_Tangents[v * 4 + 1] = reader.ReadSingle();
+                        m_Tangents[v * 4 + 2] = reader.ReadSingle();
+                        m_Tangents[v * 4 + 3] = reader.ReadSingle(); //handedness
                     }
                 }
                 else //2.6.0 and later
@@ -861,11 +861,15 @@ namespace AssetStudio
                                     {
                                         InitMSkin();
                                     }
-                                    for (int i = 0; i < m_VertexCount; i++)
                                     {
-                                        for (int j = 0; j < m_Channel.dimension; j++)
+                                        // BoneWeights4 holds at most 4 influences; dimension can be up to 15.
+                                        var weightCount = Math.Min((int)m_Channel.dimension, 4);
+                                        for (int i = 0; i < m_VertexCount; i++)
                                         {
-                                            m_Skin[i].weight[j] = componentsFloatArray[i * m_Channel.dimension + j];
+                                            for (int j = 0; j < weightCount; j++)
+                                            {
+                                                m_Skin[i].weight[j] = componentsFloatArray[i * m_Channel.dimension + j];
+                                            }
                                         }
                                     }
                                     break;
@@ -874,11 +878,14 @@ namespace AssetStudio
                                     {
                                         InitMSkin();
                                     }
-                                    for (int i = 0; i < m_VertexCount; i++)
                                     {
-                                        for (int j = 0; j < m_Channel.dimension; j++)
+                                        var indexCount = Math.Min((int)m_Channel.dimension, 4);
+                                        for (int i = 0; i < m_VertexCount; i++)
                                         {
-                                            m_Skin[i].boneIndex[j] = componentsIntArray[i * m_Channel.dimension + j];
+                                            for (int j = 0; j < indexCount; j++)
+                                            {
+                                                m_Skin[i].boneIndex[j] = componentsIntArray[i * m_Channel.dimension + j];
+                                            }
                                         }
                                     }
                                     break;
@@ -1141,7 +1148,9 @@ namespace AssetStudio
                 {
                     // de-stripify :
                     uint triIndex = 0;
-                    for (int i = 0; i < indexCount - 2; i++)
+                    // 'i + 2 < indexCount' instead of 'i < indexCount - 2': indexCount is uint and
+                    // would underflow to 0xFFFFFFFE for strips with fewer than 2 indices.
+                    for (int i = 0; i + 2 < indexCount; i++)
                     {
                         var a = m_IndexBuffer[firstIndex + i];
                         var b = m_IndexBuffer[firstIndex + i + 1];

@@ -83,6 +83,8 @@ namespace AssetStudio
 
         internal ConcurrentDictionary<string, int> assetsFileIndexCache = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         internal ConcurrentDictionary<string, BinaryReader> resourceFileReaders = new ConcurrentDictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
+        // Tracks every registered resource BinaryReader so Clear() disposes overwritten duplicates too.
+        private readonly ConcurrentBag<BinaryReader> ownedResourceReaders = new ConcurrentBag<BinaryReader>();
 
         private ConcurrentDictionary<string, byte> assetsFileListHash = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
         private ConcurrentDictionary<string, System.Threading.ManualResetEventSlim> assetsFileLoadEvents = new ConcurrentDictionary<string, System.Threading.ManualResetEventSlim>(StringComparer.OrdinalIgnoreCase);
@@ -114,8 +116,53 @@ namespace AssetStudio
             return value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
         }
 
-        private void RegisterResourceFileReader(BinaryReader reader, params string[] keys)
+        private static string BuildSafeContainerPath(string baseDirectory, string entryPath)
         {
+            var baseDir = baseDirectory ?? string.Empty;
+            var safeSegments = (entryPath ?? string.Empty)
+                .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(seg => seg != "." && seg != ".." && !seg.Contains(':'))
+                .ToArray();
+            if (safeSegments.Length == 0)
+            {
+                return Path.Combine(baseDir, "unnamed");
+            }
+
+            return Path.Combine(baseDir, Path.Combine(safeSegments));
+        }
+
+        private static bool IsPathWithinDirectory(string candidatePath, string directoryPath)
+        {
+            if (string.IsNullOrEmpty(candidatePath) || string.IsNullOrEmpty(directoryPath))
+            {
+                return false;
+            }
+
+            try
+            {
+                var fullCandidate = Path.GetFullPath(candidatePath);
+                var fullDirectory = Path.GetFullPath(directoryPath)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    + Path.DirectorySeparatorChar;
+                var comparison = OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal;
+                return fullCandidate.StartsWith(fullDirectory, comparison);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal void RegisterResourceFileReader(BinaryReader reader, params string[] keys)
+        {
+            if (reader == null)
+            {
+                return;
+            }
+
+            ownedResourceReaders.Add(reader);
             foreach (var key in keys)
             {
                 if (string.IsNullOrEmpty(key))
@@ -127,6 +174,28 @@ namespace AssetStudio
                 var normalizedKey = NormalizeResourceKey(key);
                 resourceFileReaders[normalizedKey] = reader;
             }
+        }
+
+        private void DisposeResourceReaders()
+        {
+            var disposed = new HashSet<BinaryReader>(ReferenceEqualityComparer.Instance);
+            while (ownedResourceReaders.TryTake(out var ownedReader))
+            {
+                if (ownedReader != null && disposed.Add(ownedReader))
+                {
+                    ownedReader.Close();
+                }
+            }
+
+            foreach (var resourceFileReader in resourceFileReaders)
+            {
+                if (resourceFileReader.Value != null && disposed.Add(resourceFileReader.Value))
+                {
+                    resourceFileReader.Value.Close();
+                }
+            }
+
+            resourceFileReaders.Clear();
         }
 
         private System.Threading.ManualResetEventSlim GetAssetsFileLoadEvent(string fileName)
@@ -431,29 +500,42 @@ namespace AssetStudio
                     assetsFileListHash.TryAdd(assetsFile.fileName, 0);
                     GetAssetsFileLoadEvent(assetsFile.fileName).Set();
 
+                    var readerDir = Path.GetDirectoryName(reader.FullPath);
                     foreach (var sharedFile in assetsFile.m_Externals)
                     {
                         var sharedFileName = sharedFile.fileName;
+                        if (string.IsNullOrEmpty(sharedFileName)
+                            || sharedFileName == "."
+                            || sharedFileName == ".."
+                            || sharedFileName.IndexOfAny(new[] { '/', '\\', ':' }) >= 0
+                            || string.IsNullOrEmpty(readerDir))
+                        {
+                            continue;
+                        }
 
                         bool containsShared = context.ImportFilesHash.ContainsKey(sharedFileName);
 
                         if (!containsShared)
                         {
-                            var sharedFilePath = Path.Combine(Path.GetDirectoryName(reader.FullPath), sharedFileName);
+                            var sharedFilePath = Path.Combine(readerDir, sharedFileName);
+                            if (!IsPathWithinDirectory(sharedFilePath, readerDir))
+                            {
+                                continue;
+                            }
                             
                             bool containsNoExist = context.NoExistFiles.ContainsKey(sharedFilePath);
 
                             if (!containsNoExist)
                             {
-                                 if (!File.Exists(sharedFilePath))
+                                if (!File.Exists(sharedFilePath))
                                 {
-                                    var findFiles = ImportHelper.GetFilesSafe(Path.GetDirectoryName(reader.FullPath), sharedFileName, true);
-                                    if (findFiles.Length > 0)
+                                    var findFiles = ImportHelper.GetFilesSafe(readerDir, sharedFileName, true);
+                                    if (findFiles.Length > 0 && IsPathWithinDirectory(findFiles[0], readerDir))
                                     {
                                         sharedFilePath = findFiles[0];
                                     }
                                 }
-                                if (File.Exists(sharedFilePath))
+                                if (File.Exists(sharedFilePath) && IsPathWithinDirectory(sharedFilePath, readerDir))
                                 {
                                     context.ImportFiles.Add(sharedFilePath);
                                     context.ImportFilesHash.TryAdd(sharedFileName, 0);
@@ -519,29 +601,45 @@ namespace AssetStudio
                     assetsFileListHash.TryRemove(reader.FileName, out _);
                     eventHandle.Set();
                     Logger.Error($"Error while reading assets file {reader.FullPath} from {Path.GetFileName(originalPath)}", e);
-                    RegisterResourceFileReader(reader, reader.FileName, reader.FullPath);
+                    reader.Dispose();
                 }
             }
             else
             {
                 Logger.Info($"Skipping {originalPath} ({reader.FileName})");
+                reader.Dispose();
             }
         }
 
         private void LoadBundleFile(FileReader reader, LoadContext context, string originalPath = null)
         {
             Logger.Info("Loading " + reader.FullPath);
+            BundleFile bundleFile = null;
+            int handedOffCount = 0;
             try
             {
-                var bundleFile = new BundleFile(reader);
+                bundleFile = new BundleFile(reader);
                 if (bundleFile.BlocksStream != null)
                 {
                     bundleStreams.Add(bundleFile.BlocksStream);
                 }
-                foreach (var file in bundleFile.fileList)
+                var baseDir = Path.GetDirectoryName(reader.FullPath);
+                for (int i = 0; i < bundleFile.fileList.Length; i++)
                 {
-                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.path);
-                    var subReader = new FileReader(dummyPath, file.stream);
+                    var file = bundleFile.fileList[i];
+                    var dummyPath = BuildSafeContainerPath(baseDir, file.path);
+                    FileReader subReader;
+                    try
+                    {
+                        subReader = new FileReader(dummyPath, file.stream);
+                    }
+                    catch
+                    {
+                        file.stream.Dispose();
+                        handedOffCount = i + 1;
+                        throw;
+                    }
+                    handedOffCount = i + 1;
                     if (subReader.FileType == FileType.AssetsFile)
                     {
                         LoadAssetsFromMemory(subReader, context, originalPath ?? reader.FullPath, bundleFile.m_Header.unityRevision);
@@ -554,6 +652,13 @@ namespace AssetStudio
             }
             catch (Exception e)
             {
+                if (bundleFile?.fileList != null)
+                {
+                    for (int i = handedOffCount; i < bundleFile.fileList.Length; i++)
+                    {
+                        bundleFile.fileList[i]?.stream?.Dispose();
+                    }
+                }
                 var str = $"Error while reading bundle file {reader.FullPath}";
                 if (originalPath != null)
                 {
@@ -570,13 +675,28 @@ namespace AssetStudio
         private void LoadWebFile(FileReader reader, LoadContext context)
         {
             Logger.Info("Loading " + reader.FullPath);
+            WebFile webFile = null;
+            int handedOffCount = 0;
             try
             {
-                var webFile = new WebFile(reader);
-                foreach (var file in webFile.fileList)
+                webFile = new WebFile(reader);
+                var baseDir = Path.GetDirectoryName(reader.FullPath);
+                for (int i = 0; i < webFile.fileList.Length; i++)
                 {
-                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), file.path);
-                    var subReader = new FileReader(dummyPath, file.stream);
+                    var file = webFile.fileList[i];
+                    var dummyPath = BuildSafeContainerPath(baseDir, file.path);
+                    FileReader subReader;
+                    try
+                    {
+                        subReader = new FileReader(dummyPath, file.stream);
+                    }
+                    catch
+                    {
+                        file.stream.Dispose();
+                        handedOffCount = i + 1;
+                        throw;
+                    }
+                    handedOffCount = i + 1;
                     switch (subReader.FileType)
                     {
                         case FileType.AssetsFile:
@@ -591,11 +711,21 @@ namespace AssetStudio
                         case FileType.ResourceFile:
                             RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
                             break;
+                        default:
+                            subReader.Dispose();
+                            break;
                     }
                 }
             }
             catch (Exception e)
             {
+                if (webFile?.fileList != null)
+                {
+                    for (int i = handedOffCount; i < webFile.fileList.Length; i++)
+                    {
+                        webFile.fileList[i]?.stream?.Dispose();
+                    }
+                }
                 Logger.Error($"Error while reading web file {reader.FullPath}", e);
             }
             finally
@@ -609,6 +739,8 @@ namespace AssetStudio
             Logger.Info("Loading " + reader.FileName);
             try
             {
+                var readerDir = Path.GetDirectoryName(reader.FullPath) ?? string.Empty;
+                var zipEntryBaseDir = Path.Combine(readerDir, reader.FileName);
                 using (ZipArchive archive = new ZipArchive(reader.BaseStream, ZipArchiveMode.Read))
                 {
                     List<string> splitFiles = new List<string>();
@@ -616,6 +748,10 @@ namespace AssetStudio
                     // and find split files
                     foreach (ZipArchiveEntry entry in archive.Entries)
                     {
+                        if (string.IsNullOrEmpty(entry.Name))
+                        {
+                            continue;
+                        }
                         if (entry.Name.Contains(".split"))
                         {
                             string baseName = Path.GetFileNameWithoutExtension(entry.Name);
@@ -638,6 +774,7 @@ namespace AssetStudio
                         Stream splitStream = null;
                         try
                         {
+                            var safeSplitPath = BuildSafeContainerPath(readerDir, basePath);
                             long totalSize = 0;
                             int i = 0;
                             while (true)
@@ -647,31 +784,71 @@ namespace AssetStudio
                                 if (entry == null)
                                     break;
                                 totalSize += entry.Length;
+                                if (totalSize > ImportHelper.MaxDecompressedSize)
+                                {
+                                    throw new InvalidDataException($"Zip split file '{basePath}' exceeds safety limit of {ImportHelper.MaxDecompressedSize} bytes.");
+                                }
                             }
 
                             if (BundleFile.ShouldUseTemporaryStream(totalSize))
                             {
-                                splitStream = BundleFile.CreateTemporaryStream(basePath, "split");
+                                splitStream = BundleFile.CreateTemporaryStream(safeSplitPath, "split");
                             }
                             else
                             {
-                                splitStream = new MemoryStream((int)totalSize);
+                                var initialCapacity = (int)Math.Min(Math.Max(totalSize, 0L), 16L * 1024 * 1024);
+                                splitStream = new MemoryStream(initialCapacity);
                             }
 
-                            i = 0;
-                            while (true)
+                            long totalWritten = 0;
+                            var copyBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(81920);
+                            try
                             {
-                                string path = $"{basePath}.split{i++}";
-                                ZipArchiveEntry entry = archive.GetEntry(path);
-                                if (entry == null)
-                                    break;
-                                using (Stream entryStream = entry.Open())
+                                i = 0;
+                                while (true)
                                 {
-                                    entryStream.CopyTo(splitStream);
+                                    string path = $"{basePath}.split{i++}";
+                                    ZipArchiveEntry entry = archive.GetEntry(path);
+                                    if (entry == null)
+                                        break;
+                                    using (Stream entryStream = entry.Open())
+                                    {
+                                        int bytesRead;
+                                        while ((bytesRead = entryStream.Read(copyBuffer, 0, copyBuffer.Length)) > 0)
+                                        {
+                                            totalWritten += bytesRead;
+                                            if (totalWritten > ImportHelper.MaxDecompressedSize)
+                                            {
+                                                throw new InvalidDataException($"Zip split file '{basePath}' exceeds safety limit of {ImportHelper.MaxDecompressedSize} bytes.");
+                                            }
+                                            if (splitStream is MemoryStream && BundleFile.ShouldUseTemporaryStream(totalWritten))
+                                            {
+                                                var tempStream = BundleFile.CreateTemporaryStream(safeSplitPath, "split");
+                                                try
+                                                {
+                                                    splitStream.Position = 0;
+                                                    splitStream.CopyTo(tempStream);
+                                                }
+                                                catch
+                                                {
+                                                    tempStream.Dispose();
+                                                    throw;
+                                                }
+                                                splitStream.Dispose();
+                                                splitStream = tempStream;
+                                            }
+                                            splitStream.Write(copyBuffer, 0, bytesRead);
+                                        }
+                                    }
                                 }
                             }
+                            finally
+                            {
+                                System.Buffers.ArrayPool<byte>.Shared.Return(copyBuffer);
+                            }
                             splitStream.Seek(0, SeekOrigin.Begin);
-                            FileReader entryReader = new FileReader(basePath, splitStream);
+                            FileReader entryReader = new FileReader(safeSplitPath, splitStream);
+                            splitStream = null; // ownership transferred to entryReader
                             LoadFile(entryReader, context);
                         }
                         catch (Exception e)
@@ -684,27 +861,22 @@ namespace AssetStudio
                     // load all entries
                     foreach (ZipArchiveEntry entry in archive.Entries)
                     {
+                        if (string.IsNullOrEmpty(entry.Name))
+                        {
+                            continue;
+                        }
                         Stream streamReader = null;
                         try
                         {
-                            string dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), reader.FileName, entry.FullName);
-                            
-                            if (BundleFile.ShouldUseTemporaryStream(entry.Length))
-                            {
-                                streamReader = BundleFile.CreateTemporaryStream(dummyPath, "zipentry");
-                            }
-                            else
-                            {
-                                streamReader = new MemoryStream((int)entry.Length);
-                            }
+                            string dummyPath = BuildSafeContainerPath(zipEntryBaseDir, entry.FullName);
 
                             using (Stream entryStream = entry.Open())
                             {
-                                entryStream.CopyTo(streamReader);
+                                streamReader = ImportHelper.CopyDecompressedWithLimits(entryStream, dummyPath, "zipentry", Math.Max(0L, entry.Length));
                             }
-                            streamReader.Position = 0;
 
                             FileReader entryReader = new FileReader(dummyPath, streamReader);
+                            streamReader = null; // ownership transferred to entryReader
                             if (entryReader.FileType == FileType.ResourceFile)
                             {
                                 entryReader.Position = 0;
@@ -977,6 +1149,9 @@ namespace AssetStudio
         {
             DisableMemoryPressureCheck = false;
             ShouldStopLoading = false;
+            LazyLoading = false;
+            ProjectRoot = null;
+            LruCache.Clear();
             ProjectIndex.Clear();
             foreach (var assetsFile in assetsFileList)
             {
@@ -991,11 +1166,7 @@ namespace AssetStudio
             }
             assetsFileLoadEvents.Clear();
 
-            foreach (var resourceFileReader in resourceFileReaders)
-            {
-                resourceFileReader.Value.Close();
-            }
-            resourceFileReaders.Clear();
+            DisposeResourceReaders();
 
             while (bundleStreams.TryTake(out var stream))
             {
@@ -1004,6 +1175,7 @@ namespace AssetStudio
 
             assetsFileIndexCache.Clear();
             inferredUnityVersion = "";
+            DecryptionHelper.Clear();
         }
 
         public void Dispose()
@@ -1056,11 +1228,7 @@ namespace AssetStudio
                 }
                 assetsFileLoadEvents.Clear();
 
-                foreach (var resourceFileReader in resourceFileReaders)
-                {
-                    resourceFileReader.Value.Close();
-                }
-                resourceFileReaders.Clear();
+                DisposeResourceReaders();
 
                 while (bundleStreams.TryTake(out var stream))
                 {
@@ -1661,9 +1829,10 @@ namespace AssetStudio
             }
 
             var currentTime = Environment.TickCount64;
-            if (currentTime - lastGCCollectTime >= 5000)
+            var prevTime = System.Threading.Interlocked.Read(ref lastGCCollectTime);
+            if (currentTime - prevTime >= 5000 &&
+                System.Threading.Interlocked.CompareExchange(ref lastGCCollectTime, currentTime, prevTime) == prevTime)
             {
-                lastGCCollectTime = currentTime;
                 EvictLruCachesAcrossAllManagers(150);
                 GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
             }

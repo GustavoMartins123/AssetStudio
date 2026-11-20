@@ -12,6 +12,7 @@ namespace AssetStudio
         private long offset;
         private long size;
         private BinaryReader reader;
+        private readonly byte[] rawData;
         private bool isEmbedded;
 
         public int Size { get => (int)size; }
@@ -27,9 +28,9 @@ namespace AssetStudio
 
         public ResourceReader(byte[] data)
         {
-            reader = new BinaryReader(new MemoryStream(data));
+            rawData = data ?? Array.Empty<byte>();
             offset = 0;
-            size = data.Length;
+            size = rawData.Length;
         }
 
         public ResourceReader(BinaryReader reader, long offset, long size)
@@ -52,8 +53,8 @@ namespace AssetStudio
             shouldDispose = false;
             if (needSearch)
             {
-                var resourceFileName = Path.GetFileName(path);
                 var normalizedPath = NormalizePath(path);
+                var resourceFileName = Path.GetFileName(normalizedPath);
 
                 if (assetsFile != null && (string.Equals(resourceFileName, assetsFile.fileName, StringComparison.OrdinalIgnoreCase)
                     || string.Equals(normalizedPath, assetsFile.fileName, StringComparison.OrdinalIgnoreCase)))
@@ -73,7 +74,7 @@ namespace AssetStudio
                     needSearch = false;
                     return CloneIfFileReader(reader, out shouldDispose);
                 }
-                if (!HasDirectory(path)
+                if (!HasDirectory(normalizedPath)
                     && assetsFile.assetsManager.resourceFileReaders.TryGetValue(resourceFileName, out reader)
                     && CanReadRange(reader))
                 {
@@ -87,11 +88,13 @@ namespace AssetStudio
                     var resolvedKey = NormalizePath(Path.GetFullPath(resourceFilePath));
                     needSearch = false;
                     var fileReader = new FileReader(resourceFilePath);
-                    assetsFile.assetsManager.resourceFileReaders[normalizedPath] = fileReader;
-                    assetsFile.assetsManager.resourceFileReaders[resolvedKey] = fileReader;
-                    if (!HasDirectory(path) && !assetsFile.assetsManager.resourceFileReaders.ContainsKey(resourceFileName))
+                    if (!HasDirectory(normalizedPath) && !assetsFile.assetsManager.resourceFileReaders.ContainsKey(resourceFileName))
                     {
-                        assetsFile.assetsManager.resourceFileReaders[resourceFileName] = fileReader;
+                        assetsFile.assetsManager.RegisterResourceFileReader(fileReader, normalizedPath, resolvedKey, resourceFileName);
+                    }
+                    else
+                    {
+                        assetsFile.assetsManager.RegisterResourceFileReader(fileReader, normalizedPath, resolvedKey);
                     }
                     reader = fileReader;
                     return CloneIfFileReader(reader, out shouldDispose);
@@ -153,66 +156,88 @@ namespace AssetStudio
 
         private string ResolveResourceFilePath(string resourceFileName, string normalizedPath)
         {
-            if (Path.IsPathRooted(path) && File.Exists(path))
+            var searchRoots = GetSearchRoots();
+            if (searchRoots.Length == 0 || string.IsNullOrEmpty(normalizedPath))
             {
-                return path;
+                return null;
             }
 
-            if (Path.IsPathRooted(path))
+            bool hasValidFileName = !string.IsNullOrEmpty(resourceFileName)
+                && resourceFileName != "."
+                && resourceFileName != "..";
+
+            // Confine rooted paths strictly inside the allowed search roots to block arbitrary host file reads.
+            if (Path.IsPathRooted(normalizedPath))
             {
-                var dir = Path.GetDirectoryName(path);
-                if (dir != null && Directory.Exists(dir))
+                if (IsPathWithinAnyRoot(normalizedPath, searchRoots))
                 {
-                    var file = Path.GetFileName(path);
-                    var matchedFile = Directory.EnumerateFiles(dir)
-                        .FirstOrDefault(f => string.Equals(Path.GetFileName(f), file, StringComparison.OrdinalIgnoreCase));
-                    if (matchedFile != null)
+                    if (File.Exists(normalizedPath))
                     {
-                        return matchedFile;
+                        return Path.GetFullPath(normalizedPath);
+                    }
+
+                    var dir = Path.GetDirectoryName(normalizedPath);
+                    if (hasValidFileName && dir != null && Directory.Exists(dir))
+                    {
+                        var matchedFile = Directory.EnumerateFiles(dir)
+                            .FirstOrDefault(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase));
+                        if (matchedFile != null && IsPathWithinAnyRoot(matchedFile, searchRoots))
+                        {
+                            return Path.GetFullPath(matchedFile);
+                        }
                     }
                 }
             }
 
-            foreach (var root in GetSearchRoots())
+            foreach (var root in searchRoots)
             {
-                var directPath = Path.Combine(root, path);
-                if (File.Exists(directPath))
+                if (!Path.IsPathRooted(normalizedPath))
                 {
-                    return directPath;
+                    var directPath = Path.Combine(root, normalizedPath);
+                    if (IsPathWithinRoot(directPath, root))
+                    {
+                        if (File.Exists(directPath))
+                        {
+                            return Path.GetFullPath(directPath);
+                        }
+
+                        var directDir = Path.GetDirectoryName(directPath);
+                        if (directDir != null && Directory.Exists(directDir))
+                        {
+                            var fileToFind = Path.GetFileName(directPath);
+                            var matchedFile = Directory.EnumerateFiles(directDir)
+                                .FirstOrDefault(f => string.Equals(Path.GetFileName(f), fileToFind, StringComparison.OrdinalIgnoreCase));
+                            if (matchedFile != null && IsPathWithinRoot(matchedFile, root))
+                            {
+                                return Path.GetFullPath(matchedFile);
+                            }
+                        }
+                    }
+                }
+
+                if (!hasValidFileName)
+                {
+                    continue;
                 }
 
                 var resourceFilePath = Path.Combine(root, resourceFileName);
-                if (File.Exists(resourceFilePath))
+                if (IsPathWithinRoot(resourceFilePath, root) && File.Exists(resourceFilePath))
                 {
-                    return resourceFilePath;
-                }
-
-                var directDir = Path.GetDirectoryName(directPath);
-                if (directDir != null && Directory.Exists(directDir))
-                {
-                    var fileToFind = Path.GetFileName(directPath);
-                    var matchedFile = Directory.EnumerateFiles(directDir)
-                        .FirstOrDefault(f => string.Equals(Path.GetFileName(f), fileToFind, StringComparison.OrdinalIgnoreCase));
-                    if (matchedFile != null)
-                    {
-                        return matchedFile;
-                    }
+                    return Path.GetFullPath(resourceFilePath);
                 }
 
                 if (Directory.Exists(root))
                 {
                     var matchedFile = Directory.EnumerateFiles(root)
                         .FirstOrDefault(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase));
-                    if (matchedFile != null)
+                    if (matchedFile != null && IsPathWithinRoot(matchedFile, root))
                     {
-                        return matchedFile;
+                        return Path.GetFullPath(matchedFile);
                     }
-                }
 
-                if (Directory.Exists(root))
-                {
                     var findFiles = ImportHelper.GetFilesSafe(root, "*", true)
-                        .Where(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase))
+                        .Where(f => string.Equals(Path.GetFileName(f), resourceFileName, StringComparison.OrdinalIgnoreCase)
+                            && IsPathWithinRoot(f, root))
                         .ToArray();
 
                     var suffixMatches = findFiles
@@ -220,7 +245,7 @@ namespace AssetStudio
                         .ToArray();
                     if (suffixMatches.Length == 1)
                     {
-                        return suffixMatches[0];
+                        return Path.GetFullPath(suffixMatches[0]);
                     }
                     if (suffixMatches.Length > 1)
                     {
@@ -228,14 +253,14 @@ namespace AssetStudio
                     }
                     if (findFiles.Length == 1)
                     {
-                        return findFiles[0];
+                        return Path.GetFullPath(findFiles[0]);
                     }
                 }
             }
 
             // Fallback for renamed companion files (like level77 + level77.resS / level77.assets.resS)
             var assetsFileDir = Path.GetDirectoryName(assetsFile.fullName);
-            if (!string.IsNullOrEmpty(assetsFileDir))
+            if (hasValidFileName && !string.IsNullOrEmpty(assetsFileDir))
             {
                 var assetsFileNameWithoutExt = Path.GetFileNameWithoutExtension(assetsFile.fullName);
                 var resourceExtension = Path.GetExtension(resourceFileName); // e.g. ".resS" or ".resource"
@@ -251,9 +276,9 @@ namespace AssetStudio
                     foreach (var name in possibleNames)
                     {
                         var companionPath = Path.Combine(assetsFileDir, name);
-                        if (File.Exists(companionPath))
+                        if (IsPathWithinAnyRoot(companionPath, searchRoots) && File.Exists(companionPath))
                         {
-                            return companionPath;
+                            return Path.GetFullPath(companionPath);
                         }
                     }
                 }
@@ -264,17 +289,59 @@ namespace AssetStudio
 
         private string[] GetSearchRoots()
         {
-            var assetsFileDirectory = Path.GetDirectoryName(assetsFile.fullName);
-            if (!string.IsNullOrEmpty(assetsFile.assetsManager.ProjectRoot))
+            var candidates = new[]
             {
-                return new[] { assetsFileDirectory, assetsFile.assetsManager.ProjectRoot }
-                    .Where(x => !string.IsNullOrEmpty(x) && Directory.Exists(x))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-            }
-            return new[] { assetsFileDirectory }
+                Path.GetDirectoryName(assetsFile.fullName),
+                Path.GetDirectoryName(assetsFile.originalPath),
+                assetsFile.assetsManager?.ProjectRoot
+            };
+
+            return candidates
                 .Where(x => !string.IsNullOrEmpty(x) && Directory.Exists(x))
+                .Select(x =>
+                {
+                    try { return Path.GetFullPath(x); }
+                    catch { return null; }
+                })
+                .Where(x => !string.IsNullOrEmpty(x))
+                .Distinct(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal)
                 .ToArray();
+        }
+
+        private static bool IsPathWithinAnyRoot(string candidatePath, string[] roots)
+        {
+            foreach (var root in roots)
+            {
+                if (IsPathWithinRoot(candidatePath, root))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool IsPathWithinRoot(string candidatePath, string rootDir)
+        {
+            if (string.IsNullOrEmpty(candidatePath) || string.IsNullOrEmpty(rootDir))
+            {
+                return false;
+            }
+
+            try
+            {
+                var fullCandidate = Path.GetFullPath(candidatePath);
+                var fullRoot = Path.GetFullPath(rootDir)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    + Path.DirectorySeparatorChar;
+                var comparison = OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal;
+                return fullCandidate.StartsWith(fullRoot, comparison);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static string NormalizePath(string value)
@@ -324,8 +391,30 @@ namespace AssetStudio
             }
         }
 
+        private static int ReadExact(BinaryReader binaryReader, byte[] buffer, int bufferOffset, int count)
+        {
+            int totalRead = 0;
+            while (totalRead < count)
+            {
+                int read = binaryReader.Read(buffer, bufferOffset + totalRead, count - totalRead);
+                if (read <= 0)
+                {
+                    break;
+                }
+                totalRead += read;
+            }
+            return totalRead;
+        }
+
         public byte[] GetData()
         {
+            if (rawData != null)
+            {
+                var copy = new byte[size];
+                Buffer.BlockCopy(rawData, 0, copy, 0, (int)size);
+                return copy;
+            }
+
             var binaryReader = GetReader(out var shouldDispose);
             try
             {
@@ -367,17 +456,30 @@ namespace AssetStudio
 
         public void GetData(byte[] buff)
         {
+            if (size < 0 || size > buff.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(buff), $"Destination buffer ({buff.Length} bytes) is smaller than resource size ({size} bytes).");
+            }
+
+            int toRead = (int)size;
+            if (rawData != null)
+            {
+                Buffer.BlockCopy(rawData, 0, buff, 0, toRead);
+                return;
+            }
+
             var binaryReader = GetReader(out var shouldDispose);
             try
             {
                 binaryReader.BaseStream.Position = offset;
-                var read = binaryReader.Read(buff, 0, (int)size);
-                if (read != size)
+                var read = ReadExact(binaryReader, buff, 0, toRead);
+                if (read != toRead)
                 {
                     throw new EndOfStreamException($"Unable to read {size} bytes from resource {path} at offset {offset}. Read {read} bytes.");
                 }
 
-                int sampleSize = Math.Min(buff.Length, 1024);
+                // Inspect and transform only the 'toRead' bytes actually read — buff may be oversized from BigArrayPool.
+                int sampleSize = Math.Min(toRead, 1024);
                 int count01 = 0;
                 for (int i = 0; i < sampleSize; i++)
                 {
@@ -387,7 +489,7 @@ namespace AssetStudio
 
                 if (sampleSize > 0 && count01 > sampleSize * 0.5)
                 {
-                    for (int i = 0; i < buff.Length; i++)
+                    for (int i = 0; i < toRead; i++)
                     {
                         buff[i] ^= 0xFF;
                     }
@@ -404,30 +506,24 @@ namespace AssetStudio
 
         public void ReadSegment(long segmentOffset, byte[] buffer, int bufferOffset, int count)
         {
+            if (rawData != null)
+            {
+                if (segmentOffset < 0 || count < 0 || segmentOffset > size - count)
+                {
+                    throw new EndOfStreamException($"Unable to read {count} bytes from resource {path} at segment offset {segmentOffset} (size {size}).");
+                }
+                Buffer.BlockCopy(rawData, (int)segmentOffset, buffer, bufferOffset, count);
+                return;
+            }
+
             var binaryReader = GetReader(out var shouldDispose);
             try
             {
                 binaryReader.BaseStream.Position = this.offset + segmentOffset;
-                var read = binaryReader.Read(buffer, bufferOffset, count);
+                var read = ReadExact(binaryReader, buffer, bufferOffset, count);
                 if (read != count)
                 {
                     throw new EndOfStreamException($"Unable to read {count} bytes from resource {path} at segment offset {segmentOffset}. Read {read} bytes.");
-                }
-
-                int sampleSize = Math.Min(count, 1024);
-                int count01 = 0;
-                for (int i = 0; i < sampleSize; i++)
-                {
-                    if (buffer[bufferOffset + i] == 0x01)
-                        count01++;
-                }
-
-                if (sampleSize > 0 && count01 > sampleSize * 0.5)
-                {
-                    for (int i = 0; i < count; i++)
-                    {
-                        buffer[bufferOffset + i] ^= 0xFF;
-                    }
                 }
             }
             finally
@@ -441,11 +537,20 @@ namespace AssetStudio
 
         public void WriteData(string path)
         {
+            if (rawData != null)
+            {
+                using (var writer = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    writer.Write(rawData, 0, (int)size);
+                }
+                return;
+            }
+
             var binaryReader = GetReader(out var shouldDispose);
             try
             {
                 binaryReader.BaseStream.Position = offset;
-                using (var writer = File.OpenWrite(path))
+                using (var writer = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
                     binaryReader.BaseStream.CopyTo(writer, size);
                 }

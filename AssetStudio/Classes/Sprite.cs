@@ -151,6 +151,8 @@ namespace AssetStudio
                 if (version[0] == 2018 && version[1] < 2) //2018.2 down
                 {
                     var m_SourceSkinSize = reader.ReadInt32();
+                    reader.CheckArrayLength(m_SourceSkinSize);
+                    m_SourceSkin = new BoneWeights4[m_SourceSkinSize];
                     for (int i = 0; i < m_SourceSkinSize; i++)
                     {
                         m_SourceSkin[i] = new BoneWeights4(reader);

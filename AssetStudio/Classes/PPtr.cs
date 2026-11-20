@@ -101,13 +101,12 @@ namespace AssetStudio
 
         private bool TryGetObject<TObject>(SerializedFile sourceFile, out TObject result) where TObject : Object
         {
-            lock (sourceFile)
+            // SerializedFile.TryGetObject synchronizes on the file's internal objectCollectionLock,
+            // the same lock used by AddObject/RemoveObject (lazy materialization / LRU eviction).
+            if (sourceFile.TryGetObject(m_PathID, out var existing) && existing is TObject existingObject)
             {
-                if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj) && obj is TObject variable)
-                {
-                    result = variable;
-                    return true;
-                }
+                result = existingObject;
+                return true;
             }
 
             var handle = sourceFile.assetsManager?.ProjectIndex?.GetHandle(AssetHandle.BuildUniqueID(sourceFile, m_PathID));

@@ -1,3 +1,5 @@
+using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -7,6 +9,8 @@ namespace AssetStudio
 {
     public static class ImportHelper
     {
+        public static long MaxDecompressedSize { get; set; } = 4L * 1024 * 1024 * 1024; // 4 GiB safety cap
+
         public static void MergeSplitAssets(string path, bool allDirectories = false)
         {
             var splitFiles = GetFilesSafe(path, "*.split0", allDirectories);
@@ -64,13 +68,11 @@ namespace AssetStudio
         {
             using (reader)
             {
-                var stream = new MemoryStream((int)(reader.BaseStream.Length * 2));
                 using (var gs = new GZipStream(reader.BaseStream, CompressionMode.Decompress))
                 {
-                    gs.CopyTo(stream);
+                    var stream = CopyDecompressedWithLimits(gs, reader.FullPath, "gzip", reader.BaseStream.Length);
+                    return new FileReader(reader.FullPath, stream);
                 }
-                stream.Position = 0;
-                return new FileReader(reader.FullPath, stream);
             }
         }
 
@@ -78,13 +80,62 @@ namespace AssetStudio
         {
             using (reader)
             {
-                var stream = new MemoryStream((int)(reader.BaseStream.Length * 2));
                 using (var brotliStream = new BrotliStream(reader.BaseStream, CompressionMode.Decompress))
                 {
-                    brotliStream.CopyTo(stream);
+                    var stream = CopyDecompressedWithLimits(brotliStream, reader.FullPath, "brotli", reader.BaseStream.Length);
+                    return new FileReader(reader.FullPath, stream);
                 }
-                stream.Position = 0;
-                return new FileReader(reader.FullPath, stream);
+            }
+        }
+
+        internal static Stream CopyDecompressedWithLimits(Stream source, string sourcePath, string kind, long compressedHintBytes)
+        {
+            var initialCapacity = (int)Math.Min(Math.Max(compressedHintBytes, 4096L), 16L * 1024 * 1024);
+            Stream output = new MemoryStream(initialCapacity);
+            var buffer = ArrayPool<byte>.Shared.Rent(81920);
+            try
+            {
+                long totalWritten = 0;
+                int bytesRead;
+                while ((bytesRead = source.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    totalWritten += bytesRead;
+                    if (totalWritten > MaxDecompressedSize)
+                    {
+                        throw new InvalidDataException($"Decompressed {kind} stream '{Path.GetFileName(sourcePath)}' exceeds safety limit of {MaxDecompressedSize} bytes.");
+                    }
+
+                    if (output is MemoryStream && BundleFile.ShouldUseTemporaryStream(totalWritten))
+                    {
+                        var tempStream = BundleFile.CreateTemporaryStream(sourcePath, kind);
+                        try
+                        {
+                            output.Position = 0;
+                            output.CopyTo(tempStream);
+                        }
+                        catch
+                        {
+                            tempStream.Dispose();
+                            throw;
+                        }
+                        output.Dispose();
+                        output = tempStream;
+                    }
+
+                    output.Write(buffer, 0, bytesRead);
+                }
+
+                output.Position = 0;
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 

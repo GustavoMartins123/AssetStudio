@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -94,6 +95,7 @@ namespace AssetStudio
 
             // Read Types
             int typeCount = reader.ReadInt32();
+            ValidateCount(typeCount, 4, "type");
             m_Types = new List<SerializedType>(typeCount);
             for (int i = 0; i < typeCount; i++)
             {
@@ -115,6 +117,7 @@ namespace AssetStudio
 
             // Read Objects
             int objectCount = reader.ReadInt32();
+            ValidateCount(objectCount, 16, "object");
             m_Objects = new List<ObjectInfo>(objectCount);
             Objects = new List<Object>(objectCount);
             ObjectsDic = new Dictionary<long, Object>(objectCount);
@@ -151,6 +154,10 @@ namespace AssetStudio
                 }
                 else
                 {
+                    if (objectInfo.typeID < 0 || objectInfo.typeID >= m_Types.Count)
+                    {
+                        throw new InvalidDataException($"Object {objectInfo.m_PathID} references type index {objectInfo.typeID}, but only {m_Types.Count} types are defined.");
+                    }
                     var type = m_Types[objectInfo.typeID];
                     objectInfo.serializedType = type;
                     objectInfo.classID = type.classID;
@@ -176,6 +183,7 @@ namespace AssetStudio
             if (header.m_Version >= SerializedFileFormatVersion.HasScriptTypeIndex)
             {
                 int scriptCount = reader.ReadInt32();
+                ValidateCount(scriptCount, 8, "script type");
                 m_ScriptTypes = new List<LocalSerializedObjectIdentifier>(scriptCount);
                 for (int i = 0; i < scriptCount; i++)
                 {
@@ -195,6 +203,7 @@ namespace AssetStudio
             }
 
             int externalsCount = reader.ReadInt32();
+            ValidateCount(externalsCount, 1, "external");
             m_Externals = new List<FileIdentifier>(externalsCount);
             for (int i = 0; i < externalsCount; i++)
             {
@@ -209,13 +218,14 @@ namespace AssetStudio
                     m_External.type = reader.ReadInt32();
                 }
                 m_External.pathName = reader.ReadStringToNull();
-                m_External.fileName = Path.GetFileName(m_External.pathName);
+                m_External.fileName = Path.GetFileName(m_External.pathName.Replace('\\', '/'));
                 m_Externals.Add(m_External);
             }
 
             if (header.m_Version >= SerializedFileFormatVersion.SupportsRefObject)
             {
                 int refTypesCount = reader.ReadInt32();
+                ValidateCount(refTypesCount, 4, "reference type");
                 m_RefTypes = new List<SerializedType>(refTypesCount);
                 for (int i = 0; i < refTypesCount; i++)
                 {
@@ -233,13 +243,29 @@ namespace AssetStudio
 
         public void SetVersion(string stringVersion)
         {
-            if (stringVersion != strippedVersion)
+            if (stringVersion != null && stringVersion != strippedVersion)
             {
                 unityVersion = stringVersion;
+                // Build type letter ("f", "p", "b", "a"...) is optional, e.g. "2021.3.16" has none.
                 var buildSplit = Regex.Replace(stringVersion, @"\d", "").Split(new[] { "." }, StringSplitOptions.RemoveEmptyEntries);
-                buildType = new BuildType(buildSplit[0]);
+                buildType = new BuildType(buildSplit.Length > 0 ? buildSplit[0] : string.Empty);
                 var versionSplit = Regex.Replace(stringVersion, @"\D", ".").Split(new[] { "." }, StringSplitOptions.RemoveEmptyEntries);
-                version = versionSplit.Select(int.Parse).ToArray();
+                // Deserializers index version[0..3] unconditionally, so always keep at least 4 components.
+                var parsedVersion = new int[Math.Max(4, versionSplit.Length)];
+                for (int i = 0; i < versionSplit.Length; i++)
+                {
+                    int.TryParse(versionSplit[i], NumberStyles.None, CultureInfo.InvariantCulture, out parsedVersion[i]);
+                }
+                version = parsedVersion;
+            }
+        }
+
+        private void ValidateCount(int count, int minBytesPerItem, string name)
+        {
+            var remaining = reader.BaseStream.Length - reader.BaseStream.Position;
+            if (count < 0 || (long)count * minBytesPerItem > remaining)
+            {
+                throw new InvalidDataException($"Invalid {name} count {count} in {fileName}: only {remaining} bytes remain.");
             }
         }
 
@@ -302,8 +328,14 @@ namespace AssetStudio
             return type;
         }
 
+        private const int MaxTypeTreeDepth = 64;
+
         private void ReadTypeTree(TypeTree m_Type, int level = 0)
         {
+            if (level > MaxTypeTreeDepth)
+            {
+                throw new InvalidDataException($"TypeTree recursion depth exceeded limit ({MaxTypeTreeDepth}).");
+            }
             var typeTreeNode = new TypeTreeNode();
             m_Type.m_Nodes.Add(typeTreeNode);
             typeTreeNode.m_Level = level;
@@ -326,6 +358,8 @@ namespace AssetStudio
             }
 
             int childrenCount = reader.ReadInt32();
+            // Smallest legacy node: two empty strings + 4 Int32 fields.
+            ValidateCount(childrenCount, 18, "TypeTree child");
             for (int i = 0; i < childrenCount; i++)
             {
                 ReadTypeTree(m_Type, level + 1);
@@ -336,6 +370,8 @@ namespace AssetStudio
         {
             int numberOfNodes = reader.ReadInt32();
             int stringBufferSize = reader.ReadInt32();
+            ValidateCount(numberOfNodes, 24, "TypeTree node");
+            ValidateCount(stringBufferSize, 1, "TypeTree string buffer byte");
             for (int i = 0; i < numberOfNodes; i++)
             {
                 var typeTreeNode = new TypeTreeNode();
@@ -370,6 +406,10 @@ namespace AssetStudio
                 var isOffset = (value & 0x80000000) == 0;
                 if (isOffset)
                 {
+                    if (value >= m_Type.m_StringBuffer.Length)
+                    {
+                        throw new InvalidDataException($"Invalid TypeTree string offset {value} (string buffer size {m_Type.m_StringBuffer.Length}).");
+                    }
                     stringBufferReader.BaseStream.Position = value;
                     return stringBufferReader.ReadStringToNull();
                 }

@@ -1,5 +1,6 @@
 #nullable enable
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -9,13 +10,30 @@ namespace AssetStudio
 {
     public static class DecryptionHelper
     {
-        private static readonly Dictionary<string, (string BundleName, string Hash, string Crc)> metadataMap = 
-            new Dictionary<string, (string, string, string)>(StringComparer.OrdinalIgnoreCase);
-        
-        private static readonly HashSet<string> loadedCatalogs = 
+        // Read lock-free from many loader threads; written only while catalogLock is held.
+        private static readonly ConcurrentDictionary<string, (string BundleName, string Hash, string Crc)> metadataMap =
+            new ConcurrentDictionary<string, (string BundleName, string Hash, string Crc)>(StringComparer.OrdinalIgnoreCase);
+
+        // Guarded by catalogLock. A catalog is only marked as loaded AFTER it has been fully parsed,
+        // and the lock is held for the whole parse, so concurrent callers either wait for the parse
+        // to finish or observe a fully populated metadataMap.
+        private static readonly HashSet<string> loadedCatalogs =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object catalogLock = new object();
 
         private static readonly byte[] encryptionMagic = Encoding.ASCII.GetBytes("Encryption");
+
+        /// <summary>
+        /// Forgets all parsed Addressables catalogs so they are re-read (e.g. after catalog.json changed).
+        /// </summary>
+        public static void Clear()
+        {
+            lock (catalogLock)
+            {
+                loadedCatalogs.Clear();
+                metadataMap.Clear();
+            }
+        }
 
         public static Stream? CheckAndDecryptStream(Stream? stream, string? filePath)
         {
@@ -53,21 +71,18 @@ namespace AssetStudio
                 return stream;
 
             // Try to find metadata for this file
-            if (!metadataMap.ContainsKey(fileName))
+            if (!metadataMap.TryGetValue(fileName, out var meta))
             {
                 // Try to locate and parse catalog.json
                 LocateAndParseCatalog(filePath);
+                if (!metadataMap.TryGetValue(fileName, out meta))
+                {
+                    return stream;
+                }
             }
 
-            if (metadataMap.TryGetValue(fileName, out var meta))
-            {
-                string token = $"{meta.BundleName}_{meta.Hash}-{meta.Crc}";
-                return new DecryptedStream(stream, token);
-            }
-            else
-            {
-                return stream;
-            }
+            string token = $"{meta.BundleName}_{meta.Hash}-{meta.Crc}";
+            return new DecryptedStream(stream, token);
         }
 
         private static void LocateAndParseCatalog(string? filePath)
@@ -113,13 +128,26 @@ namespace AssetStudio
         private static void ParseCatalog(string catalogPath)
         {
             string fullPath = Path.GetFullPath(catalogPath);
-            lock (loadedCatalogs)
+            lock (catalogLock)
             {
                 if (loadedCatalogs.Contains(fullPath))
                     return;
-                loadedCatalogs.Add(fullPath);
-            }
 
+                try
+                {
+                    ParseCatalogCore(fullPath);
+                }
+                finally
+                {
+                    // Mark as loaded only after parsing finished (successfully or not) so that
+                    // no thread can skip parsing while metadataMap is still being populated.
+                    loadedCatalogs.Add(fullPath);
+                }
+            }
+        }
+
+        private static void ParseCatalogCore(string fullPath)
+        {
             try
             {
                 // Read catalog
@@ -207,10 +235,7 @@ namespace AssetStudio
                                     string fileName = Path.GetFileName(internalPath);
                                     if (!string.IsNullOrEmpty(fileName))
                                     {
-                                        lock (metadataMap)
-                                        {
-                                            metadataMap[fileName] = (bundleName, hash, crc);
-                                        }
+                                        metadataMap[fileName] = (bundleName, hash, crc);
                                     }
                                 }
                             }

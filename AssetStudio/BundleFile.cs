@@ -281,7 +281,11 @@ namespace AssetStudio
             m_Header.size = reader.ReadUInt32();
             var numberOfLevelsToDownloadBeforeStreaming = reader.ReadUInt32();
             var levelCount = reader.ReadInt32();
-            m_BlocksInfo = new StorageBlock[1];
+            if (levelCount < 0 || (long)levelCount * 8 > reader.BaseStream.Length - reader.Position)
+            {
+                throw new InvalidDataException($"Invalid bundle level count {levelCount}.");
+            }
+            m_BlocksInfo = levelCount > 0 ? new StorageBlock[1] : Array.Empty<StorageBlock>();
             for (int i = 0; i < levelCount; i++)
             {
                 var storageBlock = new StorageBlock()
@@ -371,6 +375,10 @@ namespace AssetStudio
             blocksStream.Position = 0;
             var blocksReader = new EndianBinaryReader(blocksStream);
             var nodesCount = blocksReader.ReadInt32();
+            if (nodesCount < 0 || (long)nodesCount * 9 > blocksStream.Length - blocksStream.Position)
+            {
+                throw new InvalidDataException($"Invalid bundle directory node count {nodesCount}.");
+            }
             m_DirectoryInfo = new Node[nodesCount];
             for (int i = 0; i < nodesCount; i++)
             {
@@ -546,36 +554,70 @@ namespace AssetStudio
             return hash;
         }
 
+        private static void ReadExact(EndianBinaryReader reader, byte[] buffer, int count)
+        {
+            int totalRead = 0;
+            while (totalRead < count)
+            {
+                int read = reader.Read(buffer, totalRead, count - totalRead);
+                if (read <= 0)
+                {
+                    throw new EndOfStreamException($"Unexpected end of bundle stream: expected {count} bytes, read {totalRead} bytes.");
+                }
+                totalRead += read;
+            }
+        }
+
         private void ReadBlocksAndDirectory(EndianBinaryReader reader, Stream blocksStream)
         {
             var isCompressed = m_Header.signature == "UnityWeb";
             foreach (var blockInfo in m_BlocksInfo)
             {
+                if (blockInfo.compressedSize > int.MaxValue)
+                {
+                    throw new InvalidDataException($"Bundle block compressed size {blockInfo.compressedSize} exceeds maximum buffer size.");
+                }
                 var compressedSize = (int)blockInfo.compressedSize;
                 if (isCompressed)
                 {
                     var compressedBytes = BigArrayPool<byte>.Shared.Rent(compressedSize);
-                    reader.Read(compressedBytes, 0, compressedSize);
-                    using (var memoryStream = new MemoryStream(compressedBytes, 0, compressedSize))
+                    try
                     {
-                        using (var decompressStream = SevenZipHelper.StreamDecompress(memoryStream))
+                        ReadExact(reader, compressedBytes, compressedSize);
+                        using (var memoryStream = new MemoryStream(compressedBytes, 0, compressedSize))
                         {
-                            decompressStream.CopyTo(blocksStream);
+                            using (var decompressStream = SevenZipHelper.StreamDecompress(memoryStream))
+                            {
+                                decompressStream.CopyTo(blocksStream);
+                            }
                         }
                     }
-                    BigArrayPool<byte>.Shared.Return(compressedBytes);
+                    finally
+                    {
+                        BigArrayPool<byte>.Shared.Return(compressedBytes);
+                    }
                 }
                 else
                 {
                     var buffer = BigArrayPool<byte>.Shared.Rent(compressedSize);
-                    reader.Read(buffer, 0, compressedSize);
-                    blocksStream.Write(buffer, 0, compressedSize);
-                    BigArrayPool<byte>.Shared.Return(buffer);
+                    try
+                    {
+                        ReadExact(reader, buffer, compressedSize);
+                        blocksStream.Write(buffer, 0, compressedSize);
+                    }
+                    finally
+                    {
+                        BigArrayPool<byte>.Shared.Return(buffer);
+                    }
                 }
             }
             blocksStream.Position = 0;
             var blocksReader = new EndianBinaryReader(blocksStream);
             var nodesCount = blocksReader.ReadInt32();
+            if (nodesCount < 0 || (long)nodesCount * 9 > blocksStream.Length - blocksStream.Position)
+            {
+                throw new InvalidDataException($"Invalid bundle directory node count {nodesCount}.");
+            }
             m_DirectoryInfo = new Node[nodesCount];
             for (int i = 0; i < nodesCount; i++)
             {
@@ -590,6 +632,15 @@ namespace AssetStudio
 
         public void ReadFiles(Stream blocksStream, string path)
         {
+            var streamLength = blocksStream.Length;
+            foreach (var node in m_DirectoryInfo)
+            {
+                if (node.offset < 0 || node.size < 0 || node.offset > streamLength - node.size)
+                {
+                    throw new InvalidDataException($"Invalid bundle node '{node.path}' range (offset {node.offset}, size {node.size}, stream length {streamLength}).");
+                }
+            }
+
             fileList = new StreamFile[m_DirectoryInfo.Length];
             if (blocksStream is MemoryStream memStream)
             {
@@ -606,10 +657,14 @@ namespace AssetStudio
                 for (int i = 0; i < m_DirectoryInfo.Length; i++)
                 {
                     var node = m_DirectoryInfo[i];
+                    if (node.offset > int.MaxValue || node.size > int.MaxValue || node.offset > sharedBuffer.Length - node.size)
+                    {
+                        throw new InvalidDataException($"Bundle node '{node.path}' exceeds in-memory buffer bounds.");
+                    }
                     var file = new StreamFile();
                     fileList[i] = file;
                     file.path = node.path;
-                    file.fileName = Path.GetFileName(node.path);
+                    file.fileName = Path.GetFileName(node.path.Replace('\\', '/'));
                     
                     // Directly wrap the shared buffer! Zero memory copy, zero allocation!
                     file.stream = new MemoryStream(sharedBuffer, (int)node.offset, (int)node.size, false);
@@ -624,7 +679,7 @@ namespace AssetStudio
                     var file = new StreamFile();
                     fileList[i] = file;
                     file.path = node.path;
-                    file.fileName = Path.GetFileName(node.path);
+                    file.fileName = Path.GetFileName(node.path.Replace('\\', '/'));
 
                     // Directly wrap in a SubStream pointing to the single temp file!
                     // Zero disk copy! Zero extra temp files!
@@ -637,10 +692,14 @@ namespace AssetStudio
                 for (int i = 0; i < m_DirectoryInfo.Length; i++)
                 {
                     var node = m_DirectoryInfo[i];
+                    if (node.size > int.MaxValue)
+                    {
+                        throw new InvalidDataException($"Bundle node '{node.path}' size {node.size} exceeds MemoryStream limit.");
+                    }
                     var file = new StreamFile();
                     fileList[i] = file;
                     file.path = node.path;
-                    file.fileName = Path.GetFileName(node.path);
+                    file.fileName = Path.GetFileName(node.path.Replace('\\', '/'));
                     file.stream = new MemoryStream((int)node.size);
                     
                     blocksStream.Position = node.offset;
@@ -669,16 +728,33 @@ namespace AssetStudio
             {
                 reader.AlignStream(16);
             }
+            if (m_Header.compressedBlocksInfoSize > int.MaxValue || m_Header.compressedBlocksInfoSize > reader.BaseStream.Length)
+            {
+                throw new InvalidDataException($"Invalid compressed blocks info size {m_Header.compressedBlocksInfoSize} (file length {reader.BaseStream.Length}).");
+            }
+            if (m_Header.uncompressedBlocksInfoSize > int.MaxValue)
+            {
+                throw new InvalidDataException($"Invalid uncompressed blocks info size {m_Header.uncompressedBlocksInfoSize}.");
+            }
+            var compressedBlocksInfoSize = (int)m_Header.compressedBlocksInfoSize;
             if ((m_Header.flags & ArchiveFlags.BlocksInfoAtTheEnd) != 0)
             {
                 var position = reader.Position;
-                reader.Position = reader.BaseStream.Length - m_Header.compressedBlocksInfoSize;
-                blocksInfoBytes = reader.ReadBytes((int)m_Header.compressedBlocksInfoSize);
+                reader.Position = reader.BaseStream.Length - compressedBlocksInfoSize;
+                blocksInfoBytes = reader.ReadBytes(compressedBlocksInfoSize);
                 reader.Position = position;
             }
             else //0x40 BlocksAndDirectoryInfoCombined
             {
-                blocksInfoBytes = reader.ReadBytes((int)m_Header.compressedBlocksInfoSize);
+                if (compressedBlocksInfoSize > reader.BaseStream.Length - reader.Position)
+                {
+                    throw new EndOfStreamException($"Compressed blocks info size {compressedBlocksInfoSize} exceeds remaining bundle stream.");
+                }
+                blocksInfoBytes = reader.ReadBytes(compressedBlocksInfoSize);
+            }
+            if (blocksInfoBytes.Length != compressedBlocksInfoSize)
+            {
+                throw new EndOfStreamException($"Unexpected end of bundle while reading blocks info: expected {compressedBlocksInfoSize}, got {blocksInfoBytes.Length}.");
             }
             MemoryStream blocksInfoUncompresseddStream;
             var uncompressedSize = m_Header.uncompressedBlocksInfoSize;
@@ -719,6 +795,10 @@ namespace AssetStudio
             {
                 var uncompressedDataHash = blocksInfoReader.ReadBytes(16);
                 var blocksInfoCount = blocksInfoReader.ReadInt32();
+                if (blocksInfoCount < 0 || (long)blocksInfoCount * 10 > blocksInfoUncompresseddStream.Length - blocksInfoUncompresseddStream.Position)
+                {
+                    throw new InvalidDataException($"Invalid bundle blocks info count {blocksInfoCount}.");
+                }
                 m_BlocksInfo = new StorageBlock[blocksInfoCount];
                 for (int i = 0; i < blocksInfoCount; i++)
                 {
@@ -731,6 +811,10 @@ namespace AssetStudio
                 }
 
                 var nodesCount = blocksInfoReader.ReadInt32();
+                if (nodesCount < 0 || (long)nodesCount * 21 > blocksInfoUncompresseddStream.Length - blocksInfoUncompresseddStream.Position)
+                {
+                    throw new InvalidDataException($"Invalid bundle directory node count {nodesCount}.");
+                }
                 m_DirectoryInfo = new Node[nodesCount];
                 for (int i = 0; i < nodesCount; i++)
                 {
@@ -773,6 +857,10 @@ namespace AssetStudio
                         case CompressionType.Lz4:
                         case CompressionType.Lz4HC:
                             {
+                                if (blockInfo.compressedSize > int.MaxValue || blockInfo.uncompressedSize > int.MaxValue)
+                                {
+                                    throw new InvalidDataException($"LZ4 block size exceeds buffer limit (compressed {blockInfo.compressedSize}, uncompressed {blockInfo.uncompressedSize}).");
+                                }
                                 var compressedSize = (int)blockInfo.compressedSize;
                                 if (compressedBuffer == null || compressedBuffer.Length < compressedSize)
                                 {
@@ -784,7 +872,7 @@ namespace AssetStudio
                                     }
                                     compressedBuffer = BigArrayPool<byte>.Shared.Rent(compressedSize);
                                 }
-                                reader.Read(compressedBuffer, 0, compressedSize);
+                                ReadExact(reader, compressedBuffer, compressedSize);
 
                                 var uncompressedSize = (int)blockInfo.uncompressedSize;
                                 if (uncompressedBuffer == null || uncompressedBuffer.Length < uncompressedSize)

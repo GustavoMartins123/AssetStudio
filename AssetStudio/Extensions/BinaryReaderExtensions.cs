@@ -39,7 +39,7 @@ namespace AssetStudio
         {
             var bytes = new List<byte>();
             int count = 0;
-            while (reader.BaseStream.Position != reader.BaseStream.Length && count < maxLength)
+            while (reader.BaseStream.Position < reader.BaseStream.Length && count < maxLength)
             {
                 var b = reader.ReadByte();
                 if (b == 0)
