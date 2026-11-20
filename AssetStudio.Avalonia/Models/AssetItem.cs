@@ -1,7 +1,6 @@
 using System;
 using System.Globalization;
-using System.IO;
-using System.Linq;
+using System.Threading;
 using AssetStudio;
 
 namespace AssetStudio.Avalonia;
@@ -32,15 +31,60 @@ public class AssetItem : IAssetHandleTag
     public SerializedFile? SourceFile { get; set; }
     public GameObjectNode? TreeNode { get; set; }
     public string Name { get; set; } = string.Empty;
-    public string Container { get; set; } = string.Empty;
-    public string TypeString { get; set; }
-    public string DisplayType => GetDisplayType();
+    private string _container = string.Empty;
+    private string _typeString = string.Empty;
+    private ClassIDType _type;
+    private string? _displayType;
+    private byte _fbxState; // 0 = not computed, 1 = false, 2 = true (races are benign: value is idempotent)
+
+    public string Container
+    {
+        get => _container;
+        set
+        {
+            _container = value;
+            InvalidateDerivedState();
+        }
+    }
+
+    public string TypeString
+    {
+        get => _typeString;
+        set
+        {
+            _typeString = value;
+            InvalidateDerivedState();
+        }
+    }
+
+    public string DisplayType => Volatile.Read(ref _displayType) ?? CacheDisplayType();
     public string UniqueID { get; set; } = string.Empty;
     public long PathID { get; set; }
     public string PathIDString { get; set; } = string.Empty;
     public long Size { get; set; }
     public long FullSize { get; set; }
-    public ClassIDType Type { get; set; }
+    public ClassIDType Type
+    {
+        get => _type;
+        set
+        {
+            _type = value;
+            InvalidateDerivedState();
+        }
+    }
+
+    private void InvalidateDerivedState()
+    {
+        Volatile.Write(ref _displayType, null);
+        Volatile.Write(ref _fbxState, 0);
+    }
+
+    private string CacheDisplayType()
+    {
+        var computed = GetDisplayType();
+        Volatile.Write(ref _displayType, computed);
+        return computed;
+    }
 
     public AssetItem(Object asset)
     {
@@ -104,7 +148,7 @@ public class AssetItem : IAssetHandleTag
         return display ?? string.Empty;
     }
 
-    private bool IsComponentType(ClassIDType type)
+    private static bool IsComponentType(ClassIDType type)
     {
         return type == ClassIDType.Transform ||
                type == ClassIDType.MeshRenderer ||
@@ -120,13 +164,49 @@ public class AssetItem : IAssetHandleTag
 
     public bool IsFbxSubAsset()
     {
-        if (string.IsNullOrEmpty(Container))
+        var state = Volatile.Read(ref _fbxState);
+        if (state == 0)
+        {
+            state = ContainsFbxSegment(_container) ? (byte)2 : (byte)1;
+            Volatile.Write(ref _fbxState, state);
+        }
+
+        return state == 2;
+    }
+
+    /// <summary>
+    /// Zero-allocation equivalent of splitting on '/' and '\' (dropping empty segments) and checking
+    /// whether any segment has a ".fbx" extension (case-insensitive).
+    /// </summary>
+    internal static bool ContainsFbxSegment(string? container)
+    {
+        if (string.IsNullOrEmpty(container))
         {
             return false;
         }
 
-        return Container
-            .Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
-            .Any(part => string.Equals(Path.GetExtension(part), ".fbx", StringComparison.OrdinalIgnoreCase));
+        ReadOnlySpan<char> remaining = container.AsSpan();
+        while (!remaining.IsEmpty)
+        {
+            var sep = remaining.IndexOfAny('/', '\\');
+            ReadOnlySpan<char> segment;
+            if (sep < 0)
+            {
+                segment = remaining;
+                remaining = default;
+            }
+            else
+            {
+                segment = remaining.Slice(0, sep);
+                remaining = remaining.Slice(sep + 1);
+            }
+
+            if (segment.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

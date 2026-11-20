@@ -5,9 +5,11 @@ using Avalonia.Interactivity;
 using Avalonia.Threading;
 using AssetStudio;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -167,7 +169,7 @@ public partial class MainWindow
 
         var sortMember = assetListSortMember;
         var sortDescending = assetListSortDescending;
-        var assetsSnapshot = exportableAssets.ToList();
+        var assetsSnapshot = exportableAssets.ToArray();
 
         // Capture selection before filtering
         var selectedUniqueIds = new HashSet<string>();
@@ -198,46 +200,15 @@ public partial class MainWindow
         {
             var result = await Task.Run(() =>
             {
-                var matches = new List<AssetItem>();
-                foreach (var x in assetsSnapshot)
-                {
-                    token.ThrowIfCancellationRequested();
-                    if (x == null)
-                    {
-                        continue;
-                    }
-
-                    if (classFilter != null)
-                    {
-                        if (!AssetMatchesClassFilter(x, classFilter))
-                        {
-                            continue;
-                        }
-                    }
-                    else if (selectedTypes != null)
-                    {
-                        if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
-                        {
-                            continue;
-                        }
-                    }
-
-                    if (!string.IsNullOrEmpty(filterText) && !AssetMatchesTextFilter(x, filterText))
-                    {
-                        continue;
-                    }
-
-                    matches.Add(x);
-                }
-
+                var matches = AssetListQuery.Filter(assetsSnapshot, classFilter, selectedTypes, filterText, token);
                 token.ThrowIfCancellationRequested();
-                return SortAssetList(matches, sortMember, sortDescending);
+                return AssetListQuery.SortInPlace(matches, sortMember, sortDescending);
             }, token);
 
             isRefreshingFilterList = true;
             try
             {
-                ReplaceVisibleAssets(result);
+                ReplaceVisibleAssetsOwned(result);
                 StatusStripUpdate($"Showing {visibleAssets.Count} assets");
 
                 // Restore selection
@@ -330,8 +301,8 @@ public partial class MainWindow
 
         try
         {
-            var sorted = await Task.Run(() => SortAssetList(currentAssets, sortMember, sortDescending));
-            ReplaceVisibleAssets(sorted);
+            var sorted = await Task.Run(() => AssetListQuery.SortInPlace(currentAssets, sortMember, sortDescending));
+            ReplaceVisibleAssetsOwned(sorted);
             StatusStripUpdate($"Showing {visibleAssets.Count} assets");
         }
         catch (Exception ex)
@@ -343,113 +314,18 @@ public partial class MainWindow
 
     private static bool AssetMatchesClassFilter(AssetItem item, AssetClassItem classFilter)
     {
-        return (int)item.Type == classFilter.ClassID
-            && string.Equals(
-                item.SourceFile?.unityVersion ?? string.Empty,
-                classFilter.UnityVersion ?? string.Empty,
-                StringComparison.Ordinal);
-    }
-
-    private static bool AssetMatchesTextFilter(AssetItem item, string filterText)
-    {
-        return ContainsIgnoreCase(item.Name, filterText)
-            || ContainsIgnoreCase(item.Container, filterText)
-            || ContainsIgnoreCase(item.TypeString, filterText)
-            || ContainsIgnoreCase(item.DisplayType, filterText)
-            || ContainsIgnoreCase(item.PathIDString, filterText);
-    }
-
-    private static bool ContainsIgnoreCase(string? value, string filterText)
-    {
-        return !string.IsNullOrEmpty(value)
-            && value.Contains(filterText, StringComparison.OrdinalIgnoreCase);
+        return AssetListQuery.MatchesClassFilter(item, classFilter);
     }
 
     private static List<AssetItem> SortAssetList(IEnumerable<AssetItem>? assets, string? sortMember, bool descending)
     {
-        var sorted = assets?
-            .Where(static x => x != null)
-            .ToList() ?? new List<AssetItem>();
-
-        if (sorted.Count <= 1 || string.IsNullOrEmpty(sortMember))
-        {
-            return sorted;
-        }
-
-        sorted.Sort((left, right) => CompareAssetItems(left, right, sortMember, descending));
-        return sorted;
+        return AssetListQuery.Sort(assets, sortMember, descending);
     }
 
     private static int CompareAssetItems(AssetItem? left, AssetItem? right, string sortMember, bool descending)
     {
-        if (ReferenceEquals(left, right))
-        {
-            return 0;
-        }
-        if (left == null)
-        {
-            return 1;
-        }
-        if (right == null)
-        {
-            return -1;
-        }
-
-        int result = sortMember switch
-        {
-            "PathID" => left.PathID.CompareTo(right.PathID),
-            "FullSize" or "Size" => left.FullSize.CompareTo(right.FullSize),
-            "Container" => CompareNullableText(left.Container, right.Container),
-            "DisplayType" or "Type" => CompareNullableText(left.DisplayType, right.DisplayType),
-            "Name" => CompareNullableText(left.Name, right.Name),
-            _ => 0
-        };
-
-        if (descending)
-        {
-            result = -result;
-        }
-
-        if (result != 0)
-        {
-            return result;
-        }
-
-        result = left.PathID.CompareTo(right.PathID);
-        if (result != 0)
-        {
-            return result;
-        }
-
-        result = CompareNullableText(left.UniqueID, right.UniqueID);
-        if (result != 0)
-        {
-            return result;
-        }
-
-        return CompareNullableText(left.Name, right.Name);
+        return AssetListQuery.Compare(left, right, AssetListQuery.ResolveSortKey(sortMember), descending);
     }
-
-    private static int CompareNullableText(string? left, string? right)
-    {
-        var leftMissing = string.IsNullOrEmpty(left);
-        var rightMissing = string.IsNullOrEmpty(right);
-        if (leftMissing && rightMissing)
-        {
-            return 0;
-        }
-        if (leftMissing)
-        {
-            return 1;
-        }
-        if (rightMissing)
-        {
-            return -1;
-        }
-
-        return StringComparer.OrdinalIgnoreCase.Compare(left, right);
-    }
-
     private static string GetAssetCellText(AssetItem item, string? member)
     {
         return member switch
@@ -467,6 +343,12 @@ public partial class MainWindow
         visibleAssets = items is { Count: > 0 }
             ? items.Where(static x => x != null).ToList()
             : new List<AssetItem>();
+        RefreshAssetListItems();
+    }
+
+    private void ReplaceVisibleAssetsOwned(List<AssetItem> ownedItems)
+    {
+        visibleAssets = ownedItems;
         RefreshAssetListItems();
     }
 
@@ -534,6 +416,7 @@ public partial class MainWindow
 
         EnsureAssetListItemsSource();
         var filterText = listSearch?.Text?.Trim();
+        var textFilter = AssetListQuery.TextFilter.Create(filterText);
         var classFilter = classFilterOverride;
         var filterTypeChecked = filterTypeAll.IsChecked != true;
         var selectedTypes = filterTypeChecked ? GetFilterTypeItems()
@@ -566,7 +449,7 @@ public partial class MainWindow
                     }
                 }
 
-                if (!string.IsNullOrEmpty(filterText) && !AssetMatchesTextFilter(x, filterText))
+                if (textFilter != null && !textFilter.Matches(x))
                 {
                     continue;
                 }
@@ -614,5 +497,385 @@ public partial class MainWindow
         }
 
         return low;
+    }
+}
+
+/// <summary>
+/// Pure (UI-free) filtering and sorting engine for the asset list. Filtering is order-preserving and runs in parallel
+/// over large snapshots; text matching uses a vectorized <see cref="SearchValues{T}"/> needle.
+/// </summary>
+internal static class AssetListQuery
+{
+    internal const int ParallelFilterThreshold = 4096;
+    internal const int FilterChunkSize = 2048;
+    internal const int ParallelSortThreshold = 16384;
+
+    internal enum SortKey
+    {
+        None,
+        PathID,
+        FullSize,
+        Container,
+        DisplayType,
+        Name,
+    }
+
+    internal sealed class TextFilter
+    {
+        private readonly SearchValues<string> _needle;
+
+        private TextFilter(string text)
+        {
+            _needle = SearchValues.Create(new[] { text }, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static TextFilter? Create(string? text)
+        {
+            return string.IsNullOrEmpty(text) ? null : new TextFilter(text);
+        }
+
+        public bool Matches(AssetItem item)
+        {
+            if (Has(item.Name) || Has(item.Container) || Has(item.TypeString))
+            {
+                return true;
+            }
+
+            var displayType = item.DisplayType;
+            if (!ReferenceEquals(displayType, item.TypeString) && Has(displayType))
+            {
+                return true;
+            }
+
+            return Has(item.PathIDString);
+        }
+
+        private bool Has(string? value)
+        {
+            return !string.IsNullOrEmpty(value) && value.AsSpan().ContainsAny(_needle);
+        }
+    }
+
+    internal static bool MatchesClassFilter(AssetItem item, AssetClassItem classFilter)
+    {
+        return (int)item.Type == classFilter.ClassID
+            && string.Equals(
+                item.SourceFile?.unityVersion ?? string.Empty,
+                classFilter.UnityVersion ?? string.Empty,
+                StringComparison.Ordinal);
+    }
+
+    private static bool Accepts(AssetItem? x, AssetClassItem? classFilter, HashSet<ClassIDType>? selectedTypes, TextFilter? textFilter)
+    {
+        if (x == null)
+        {
+            return false;
+        }
+
+        if (classFilter != null)
+        {
+            if (!MatchesClassFilter(x, classFilter))
+            {
+                return false;
+            }
+        }
+        else if (selectedTypes != null)
+        {
+            if (selectedTypes.Count == 0 || !selectedTypes.Contains(x.Type))
+            {
+                return false;
+            }
+        }
+
+        return textFilter == null || textFilter.Matches(x);
+    }
+
+    /// <summary>Filters <paramref name="snapshot"/> preserving relative order (deterministic).</summary>
+    internal static List<AssetItem> Filter(
+        IReadOnlyList<AssetItem?> snapshot,
+        AssetClassItem? classFilter,
+        HashSet<ClassIDType>? selectedTypes,
+        string? filterText,
+        CancellationToken token)
+    {
+        var textFilter = TextFilter.Create(filterText);
+        var count = snapshot.Count;
+        var arraySnapshot = snapshot as AssetItem?[];
+
+        if (count < ParallelFilterThreshold)
+        {
+            var matches = new List<AssetItem>();
+            for (var i = 0; i < count; i++)
+            {
+                token.ThrowIfCancellationRequested();
+                var x = arraySnapshot != null ? arraySnapshot[i] : snapshot[i];
+                if (Accepts(x, classFilter, selectedTypes, textFilter))
+                {
+                    matches.Add(x!);
+                }
+            }
+
+            return matches;
+        }
+
+        var chunkCount = (count + FilterChunkSize - 1) / FilterChunkSize;
+        var chunkResults = new List<AssetItem>[chunkCount];
+        var options = new ParallelOptions
+        {
+            CancellationToken = token,
+            MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1),
+        };
+
+        Parallel.For(0, chunkCount, options, chunk =>
+        {
+            token.ThrowIfCancellationRequested();
+            var start = chunk * FilterChunkSize;
+            var end = Math.Min(count, start + FilterChunkSize);
+            var local = new List<AssetItem>();
+            for (var i = start; i < end; i++)
+            {
+                var x = arraySnapshot != null ? arraySnapshot[i] : snapshot[i];
+                if (Accepts(x, classFilter, selectedTypes, textFilter))
+                {
+                    local.Add(x!);
+                }
+            }
+
+            chunkResults[chunk] = local;
+        });
+
+        var total = 0;
+        foreach (var local in chunkResults)
+        {
+            total += local.Count;
+        }
+
+        var result = new List<AssetItem>(total);
+        foreach (var local in chunkResults)
+        {
+            result.AddRange(local);
+        }
+
+        return result;
+    }
+
+    internal static List<AssetItem> Sort(IEnumerable<AssetItem>? assets, string? sortMember, bool descending)
+    {
+        var sorted = assets?
+            .Where(static x => x != null)
+            .ToList() ?? new List<AssetItem>();
+        return SortInPlace(sorted, sortMember, descending);
+    }
+
+    /// <summary>Sorts a list that is already known to contain no null entries.</summary>
+    internal static List<AssetItem> SortInPlace(List<AssetItem> sorted, string? sortMember, bool descending)
+    {
+        if (sorted.Count <= 1 || string.IsNullOrEmpty(sortMember))
+        {
+            return sorted;
+        }
+
+        var key = ResolveSortKey(sortMember);
+        Comparison<AssetItem> comparison = (left, right) => Compare(left, right, key, descending);
+
+        if (sorted.Count < ParallelSortThreshold)
+        {
+            sorted.Sort(comparison);
+            return sorted;
+        }
+
+        var count = sorted.Count;
+        var work = ArrayPool<AssetItem>.Shared.Rent(count);
+        var scratch = ArrayPool<AssetItem>.Shared.Rent(count);
+        try
+        {
+            var listSpan = CollectionsMarshal.AsSpan(sorted);
+            listSpan.CopyTo(work);
+            ParallelSortCore(work, scratch, count, comparison);
+            work.AsSpan(0, count).CopyTo(listSpan);
+        }
+        finally
+        {
+            ArrayPool<AssetItem>.Shared.Return(work, clearArray: true);
+            ArrayPool<AssetItem>.Shared.Return(scratch, clearArray: true);
+        }
+
+        return sorted;
+    }
+
+    internal static void ParallelSort(AssetItem[] items, Comparison<AssetItem> comparison)
+    {
+        var n = items.Length;
+        var scratch = ArrayPool<AssetItem>.Shared.Rent(n);
+        try
+        {
+            ParallelSortCore(items, scratch, n, comparison);
+        }
+        finally
+        {
+            ArrayPool<AssetItem>.Shared.Return(scratch, clearArray: true);
+        }
+    }
+
+    private static void ParallelSortCore(AssetItem[] items, AssetItem[] scratch, int n, Comparison<AssetItem> comparison)
+    {
+        var parts = Math.Min(Environment.ProcessorCount, n / 4096);
+        if (parts < 2)
+        {
+            Array.Sort(items, 0, n, Comparer<AssetItem>.Create(comparison));
+            return;
+        }
+
+        var bounds = new int[parts + 1];
+        for (var i = 0; i <= parts; i++)
+        {
+            bounds[i] = (int)((long)n * i / parts);
+        }
+
+        Parallel.For(0, parts, i =>
+        {
+            new Span<AssetItem>(items, bounds[i], bounds[i + 1] - bounds[i]).Sort(comparison);
+        });
+
+        var src = items;
+        var dst = scratch;
+        var runs = bounds;
+        while (runs.Length > 2)
+        {
+            var runCount = runs.Length - 1;
+            var pairs = (runCount + 1) / 2;
+            var nextRuns = new int[pairs + 1];
+            var from = src;
+            var to = dst;
+            var currentRuns = runs;
+            Parallel.For(0, pairs, p =>
+            {
+                var a = currentRuns[2 * p];
+                var b = currentRuns[Math.Min(2 * p + 1, runCount)];
+                var c = currentRuns[Math.Min(2 * p + 2, runCount)];
+                Merge(from, a, b, c, to, comparison);
+            });
+
+            for (var p = 0; p < pairs; p++)
+            {
+                nextRuns[p] = currentRuns[2 * p];
+            }
+
+            nextRuns[pairs] = n;
+            runs = nextRuns;
+            (src, dst) = (dst, src);
+        }
+
+        if (!ReferenceEquals(src, items))
+        {
+            Array.Copy(src, items, n);
+        }
+    }
+
+    private static void Merge(AssetItem[] source, int start, int mid, int end, AssetItem[] target, Comparison<AssetItem> comparison)
+    {
+        int i = start, j = mid, k = start;
+        while (i < mid && j < end)
+        {
+            target[k++] = comparison(source[i], source[j]) <= 0 ? source[i++] : source[j++];
+        }
+
+        while (i < mid)
+        {
+            target[k++] = source[i++];
+        }
+
+        while (j < end)
+        {
+            target[k++] = source[j++];
+        }
+    }
+
+    internal static SortKey ResolveSortKey(string? sortMember)
+    {
+        return sortMember switch
+        {
+            "PathID" => SortKey.PathID,
+            "FullSize" or "Size" => SortKey.FullSize,
+            "Container" => SortKey.Container,
+            "DisplayType" or "Type" => SortKey.DisplayType,
+            "Name" => SortKey.Name,
+            _ => SortKey.None,
+        };
+    }
+
+    internal static int Compare(AssetItem? left, AssetItem? right, SortKey key, bool descending)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return 0;
+        }
+        if (left == null)
+        {
+            return 1;
+        }
+        if (right == null)
+        {
+            return -1;
+        }
+
+        var result = key switch
+        {
+            SortKey.PathID => left.PathID.CompareTo(right.PathID),
+            SortKey.FullSize => left.FullSize.CompareTo(right.FullSize),
+            SortKey.Container => CompareNullableText(left.Container, right.Container),
+            SortKey.DisplayType => CompareNullableText(left.DisplayType, right.DisplayType),
+            SortKey.Name => CompareNullableText(left.Name, right.Name),
+            _ => 0,
+        };
+
+        if (descending)
+        {
+            result = -result;
+        }
+
+        if (result != 0)
+        {
+            return result;
+        }
+
+        result = left.PathID.CompareTo(right.PathID);
+        if (result != 0)
+        {
+            return result;
+        }
+
+        result = CompareNullableText(left.UniqueID, right.UniqueID);
+        if (result != 0)
+        {
+            return result;
+        }
+
+        return CompareNullableText(left.Name, right.Name);
+    }
+
+    internal static int CompareNullableText(string? left, string? right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return 0;
+        }
+
+        var leftMissing = string.IsNullOrEmpty(left);
+        var rightMissing = string.IsNullOrEmpty(right);
+        if (leftMissing && rightMissing)
+        {
+            return 0;
+        }
+        if (leftMissing)
+        {
+            return 1;
+        }
+        if (rightMissing)
+        {
+            return -1;
+        }
+
+        return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
     }
 }

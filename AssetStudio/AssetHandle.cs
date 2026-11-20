@@ -1,5 +1,6 @@
 #nullable enable
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Security.Cryptography;
@@ -10,6 +11,10 @@ namespace AssetStudio
     public class AssetHandle
     {
         private static readonly ConcurrentDictionary<string, string> SourceHashCache = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+
+        // Raw (originalPath, serializedFileName) -> hash. Only populated for fully-qualified or empty paths so the
+        // cached result can never depend on the process current directory.
+        private static readonly ConcurrentDictionary<(string, string), string> RawSourceHashCache = new ConcurrentDictionary<(string, string), string>();
 
         public string UniqueID { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
@@ -55,21 +60,130 @@ namespace AssetStudio
 
         public static string BuildSourceHash(string serializedFileName, string? originalPath)
         {
-            var normalizedPath = NormalizeSourcePath(originalPath);
-            var key = string.IsNullOrEmpty(normalizedPath)
-                ? serializedFileName ?? string.Empty
-                : $"{normalizedPath}\u001f{serializedFileName ?? string.Empty}";
+            var rawPath = originalPath ?? string.Empty;
+            var rawName = serializedFileName ?? string.Empty;
+            var cacheable = string.IsNullOrWhiteSpace(rawPath) || Path.IsPathFullyQualified(rawPath);
+            if (cacheable && RawSourceHashCache.TryGetValue((rawPath, rawName), out var cached))
+            {
+                return cached;
+            }
 
-            return SourceHashCache.GetOrAdd(key, ComputeSourceHash);
+            string hash;
+            if (string.IsNullOrWhiteSpace(originalPath))
+            {
+                hash = SourceHashCache.GetOrAdd(rawName, static k => ComputeSourceHash(k.AsSpan()));
+            }
+            else if (TryGetNormalizedPathSpan(originalPath, out var normalizedFull))
+            {
+                if (normalizedFull.IsEmpty)
+                {
+                    hash = SourceHashCache.GetOrAdd(rawName, static k => ComputeSourceHash(k.AsSpan()));
+                }
+                else
+                {
+                    var lookup = SourceHashCache.GetAlternateLookup<ReadOnlySpan<char>>();
+                    var keyLen = normalizedFull.Length + 1 + rawName.Length;
+                    char[]? rentedChars = null;
+                    Span<char> keyBuf = keyLen <= 512
+                        ? stackalloc char[512]
+                        : (rentedChars = ArrayPool<char>.Shared.Rent(keyLen));
+                    try
+                    {
+                        var written = normalizedFull.ToUpperInvariant(keyBuf);
+                        if (written == normalizedFull.Length)
+                        {
+                            keyBuf[written] = '\u001f';
+                            rawName.AsSpan().CopyTo(keyBuf.Slice(written + 1));
+                            var keySpan = keyBuf.Slice(0, written + 1 + rawName.Length);
+                            if (!lookup.TryGetValue(keySpan, out hash!))
+                            {
+                                hash = ComputeSourceHash(keySpan);
+                                if (!lookup.TryAdd(keySpan, hash) && lookup.TryGetValue(keySpan, out var existing))
+                                {
+                                    hash = existing;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var key = $"{NormalizeSourcePath(originalPath)}\u001f{rawName}";
+                            hash = SourceHashCache.GetOrAdd(key, static k => ComputeSourceHash(k.AsSpan()));
+                        }
+                    }
+                    finally
+                    {
+                        if (rentedChars != null)
+                        {
+                            ArrayPool<char>.Shared.Return(rentedChars);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var normalizedPath = NormalizeSourcePath(originalPath);
+                var key = string.IsNullOrEmpty(normalizedPath)
+                    ? rawName
+                    : $"{normalizedPath}\u001f{rawName}";
+                hash = SourceHashCache.GetOrAdd(key, static k => ComputeSourceHash(k.AsSpan()));
+            }
+
+            if (cacheable)
+            {
+                RawSourceHashCache.TryAdd((rawPath, rawName), hash);
+            }
+
+            return hash;
         }
 
-        public static void ClearSourceHashCache() => SourceHashCache.Clear();
+        public static void ClearSourceHashCache()
+        {
+            SourceHashCache.Clear();
+            RawSourceHashCache.Clear();
+        }
 
-        private static string ComputeSourceHash(string key)
+        private static string ComputeSourceHash(ReadOnlySpan<char> key)
         {
             // First 8 bytes of SHA-256 as 16 lowercase hex chars (persisted in UniqueIDs / SQLite cache).
-            var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(key));
-            return Convert.ToHexStringLower(bytes.AsSpan(0, 8));
+            var maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
+            byte[]? rented = null;
+            Span<byte> utf8Buf = maxBytes <= 1024
+                ? stackalloc byte[1024]
+                : (rented = ArrayPool<byte>.Shared.Rent(maxBytes));
+            try
+            {
+                var written = Encoding.UTF8.GetBytes(key, utf8Buf);
+                Span<byte> digest = stackalloc byte[32];
+                SHA256.HashData(utf8Buf.Slice(0, written), digest);
+                return Convert.ToHexStringLower(digest.Slice(0, 8));
+            }
+            finally
+            {
+                if (rented != null)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        private static bool TryGetNormalizedPathSpan(string path, out ReadOnlySpan<char> trimmedFullPath)
+        {
+            try
+            {
+                var span = Path.GetFullPath(path).AsSpan();
+                while (!span.IsEmpty && (span[^1] == Path.DirectorySeparatorChar || span[^1] == Path.AltDirectorySeparatorChar))
+                {
+                    span = span.Slice(0, span.Length - 1);
+                }
+
+                trimmedFullPath = span;
+                return true;
+            }
+            catch
+            {
+                trimmedFullPath = default;
+                return false;
+            }
         }
 
         private static string NormalizeSourcePath(string? path)

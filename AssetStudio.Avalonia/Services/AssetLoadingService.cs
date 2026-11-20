@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Buffers;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -59,6 +60,80 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
+        private static readonly string[][] PriorityKeywordGroups =
+        {
+            new[] { "texture", "sprite", "atlas", "image", "pic" },
+            new[] { "audio", "sound", "music", "sfx", "clip" },
+            new[] { "mesh", "model", "geom", "3d" },
+            new[] { "anim", "motion", "controller" },
+            new[] { "shader" },
+            new[] { "script", "behavior", "mono" },
+        };
+
+        // One lazily-built SearchValues<string> per combination of keyword groups (2^6 combinations).
+        private static readonly SearchValues<string>?[] PriorityKeywordSearchCache = new SearchValues<string>?[1 << PriorityKeywordGroups.Length];
+
+        internal static SearchValues<string>? GetPriorityKeywordSearch(ICollection<ClassIDType>? activeFilters)
+        {
+            if (activeFilters == null || activeFilters.Count == 0)
+            {
+                return null;
+            }
+
+            var mask = 0;
+            foreach (var filter in activeFilters)
+            {
+                switch (filter)
+                {
+                    case ClassIDType.Texture2D or ClassIDType.Sprite:
+                        mask |= 1 << 0;
+                        break;
+                    case ClassIDType.AudioClip:
+                        mask |= 1 << 1;
+                        break;
+                    case ClassIDType.Mesh:
+                        mask |= 1 << 2;
+                        break;
+                    case ClassIDType.AnimationClip or ClassIDType.Animator:
+                        mask |= 1 << 3;
+                        break;
+                    case ClassIDType.Shader:
+                        mask |= 1 << 4;
+                        break;
+                    case ClassIDType.MonoBehaviour:
+                        mask |= 1 << 5;
+                        break;
+                }
+
+                if (mask == (1 << PriorityKeywordGroups.Length) - 1)
+                {
+                    break;
+                }
+            }
+
+            if (mask == 0)
+            {
+                return null;
+            }
+
+            var cached = Volatile.Read(ref PriorityKeywordSearchCache[mask]);
+            if (cached != null)
+            {
+                return cached;
+            }
+
+            var keywords = new List<string>();
+            for (int g = 0; g < PriorityKeywordGroups.Length; g++)
+            {
+                if ((mask & (1 << g)) != 0)
+                {
+                    keywords.AddRange(PriorityKeywordGroups[g]);
+                }
+            }
+
+            var created = SearchValues.Create(keywords.ToArray(), StringComparison.OrdinalIgnoreCase);
+            return Interlocked.CompareExchange(ref PriorityKeywordSearchCache[mask], created, null) ?? created;
+        }
         public void StartProgressiveIndexing(
             AssetsManager assetsManager,
             List<string> files,
@@ -158,27 +233,13 @@ namespace AssetStudio.Avalonia.Services
                     var batch = new List<string>();
                     lock (_pendingFilesToIndex)
                     {
-                        var keywords = new List<string>();
-                        if (activeFilters.Contains(ClassIDType.Texture2D) || activeFilters.Contains(ClassIDType.Sprite))
-                            keywords.AddRange(new[] { "texture", "sprite", "atlas", "image", "pic" });
-                        if (activeFilters.Contains(ClassIDType.AudioClip))
-                            keywords.AddRange(new[] { "audio", "sound", "music", "sfx", "clip" });
-                        if (activeFilters.Contains(ClassIDType.Mesh))
-                            keywords.AddRange(new[] { "mesh", "model", "geom", "3d" });
-                        if (activeFilters.Contains(ClassIDType.AnimationClip) || activeFilters.Contains(ClassIDType.Animator))
-                            keywords.AddRange(new[] { "anim", "motion", "controller" });
-                        if (activeFilters.Contains(ClassIDType.Shader))
-                            keywords.Add("shader");
-                        if (activeFilters.Contains(ClassIDType.MonoBehaviour))
-                            keywords.AddRange(new[] { "script", "behavior", "mono" });
-
-                        if (keywords.Count > 0)
+                        var keywordSearch = GetPriorityKeywordSearch(activeFilters);
+                        if (keywordSearch != null)
                         {
                             for (int i = 0; i < _pendingFilesToIndex.Count && batch.Count < batchSize; i++)
                             {
                                 var file = _pendingFilesToIndex[i];
-                                var fileName = Path.GetFileName(file).ToLowerInvariant();
-                                if (keywords.Any(k => fileName.Contains(k)))
+                                if (Path.GetFileName(file.AsSpan()).ContainsAny(keywordSearch))
                                 {
                                     batch.Add(file);
                                     _pendingFilesToIndex.RemoveAt(i);
@@ -186,7 +247,6 @@ namespace AssetStudio.Avalonia.Services
                                 }
                             }
                         }
-
                         while (_pendingFilesToIndex.Count > 0 && batch.Count < batchSize)
                         {
                             batch.Add(_pendingFilesToIndex[0]);

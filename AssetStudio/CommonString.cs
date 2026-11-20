@@ -1,10 +1,11 @@
-﻿using System.Collections.Generic;
+using System.Collections.Frozen;
+using System.Collections.Generic;
 
 namespace AssetStudio
 {
     public static class CommonString
     {
-        public static readonly Dictionary<uint, string> StringBuffer = new Dictionary<uint, string>
+        public static readonly FrozenDictionary<uint, string> StringBuffer = new Dictionary<uint, string>
         {
             {0, "AABB"},
             {5, "AnimationClip"},
@@ -115,6 +116,6 @@ namespace AssetStudio
             {1138, "m_PrefabAsset"},
             {1152, "FileSize"},
             {1161, "Hash128"}
-        };
+        }.ToFrozenDictionary();
     }
 }

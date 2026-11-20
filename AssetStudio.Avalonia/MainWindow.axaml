@@ -254,7 +254,7 @@
                             <Button x:Name="ClearClassFilterButton" Content="Clear Class Filter" Click="ClearClassFilter_Click" IsVisible="False" DockPanel.Dock="Right" Margin="4,0,0,0" Padding="6,2"/>
                             <TextBox x:Name="listSearch" PlaceholderText=" Filter " TextChanged="ListSearch_TextChanged"/>
                         </DockPanel>
-                        <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetListDataGrid_SelectionChanged" CellPointerPressed="AssetListDataGrid_CellPointerPressed" Sorting="AssetListDataGrid_Sorting" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto" SelectionMode="Extended">
+                        <DataGrid x:Name="AssetListDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="True" x:DataType="local:AssetItem" SelectionChanged="AssetListDataGrid_SelectionChanged" CellPointerPressed="AssetListDataGrid_CellPointerPressed" Sorting="AssetListDataGrid_Sorting" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto" SelectionMode="Extended">
                             <DataGrid.ContextMenu>
                                 <ContextMenu Opened="AssetListContextMenu_Opened">
                                     <MenuItem Header="Copy text" Click="CopyAssetCellText_Click" />
@@ -279,7 +279,7 @@
                 <TabItem Header="Asset Classes">
                     <Grid RowDefinitions="Auto, *">
                         <TextBox x:Name="classSearch" Grid.Row="0" PlaceholderText=" Filter classes " Margin="0,0,0,2" TextChanged="ClassSearch_TextChanged" />
-                        <DataGrid x:Name="AssetClassesDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="False" SelectionChanged="AssetClassesDataGrid_SelectionChanged" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto">
+                        <DataGrid x:Name="AssetClassesDataGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All" x:CompileBindings="True" x:DataType="local:AssetClassItem" SelectionChanged="AssetClassesDataGrid_SelectionChanged" CanUserResizeColumns="True" CanUserSortColumns="True" HorizontalScrollBarVisibility="Auto">
                             <DataGrid.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="Show instances in Asset List" Click="ShowClassInstances_Click" />
