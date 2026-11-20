@@ -53,7 +53,7 @@ namespace AssetStudio
             Loaded = true;
         }
 
-        public TypeDefinition GetTypeDefinition(string assemblyName, string fullName)
+        public TypeDefinition? GetTypeDefinition(string assemblyName, string fullName)
         {
             if (string.IsNullOrEmpty(assemblyName)) return null;
 

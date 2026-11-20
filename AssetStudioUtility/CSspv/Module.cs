@@ -60,13 +60,16 @@ namespace SpirV
 					case OpSpecConstant sc:
 					case OpConstant oc:
 						{
-							Type t = instruction.ResultType;
-							Debug.Assert (t != null);
-							Debug.Assert (t is ScalarType);
-							
-							object constant = ConvertConstant(instruction.ResultType as ScalarType, instruction.Words, 3);
-							instruction.Operands[2].Value = constant;
-							instruction.Value = constant;
+							Type? t = instruction.ResultType;
+							Debug.Assert(t != null);
+							Debug.Assert(t is ScalarType);
+
+							if (t is ScalarType scalarType &&
+								ConvertConstant(scalarType, instruction.Words, 3) is object constant)
+							{
+								instruction.Operands[2].Value = constant;
+								instruction.Value = constant;
+							}
 						}
 						break;
 				}
@@ -78,8 +81,10 @@ namespace SpirV
 				{
 					case OpMemberName mn:
 						{
-							StructType t = (StructType)objects[instruction.Words[1]].ResultType;
-							t.SetMemberName((uint)instruction.Operands[1].Value, (string)instruction.Operands[2].Value);
+							if (objects[instruction.Words[1]].ResultType is StructType t)
+							{
+								t.SetMemberName((uint)instruction.Operands[1].Value, (string)instruction.Operands[2].Value);
+							}
 						}
 						break;
 
@@ -112,7 +117,7 @@ namespace SpirV
 			uint generatorMagicNumber = reader.ReadDWord();
 			int generatorToolId = (int)(generatorMagicNumber >> 16);
 			string generatorVendor = "unknown";
-			string generatorName = null;
+			string? generatorName = null;
 
 			if (Meta.Tools.ContainsKey(generatorToolId))
 			{
@@ -175,19 +180,19 @@ namespace SpirV
 
 				case OpTypeVector t:
 					{
-						i.ResultType = new VectorType((ScalarType)objects[i.Words[2]].ResultType, (int)i.Words[3]);
+						i.ResultType = new VectorType((ScalarType)RequireResultType(objects[i.Words[2]]), (int)i.Words[3]);
 					}
 					break;
 
 				case OpTypeMatrix t:
 					{
-						i.ResultType = new MatrixType((VectorType)objects[i.Words[2]].ResultType, (int)i.Words[3]);
+						i.ResultType = new MatrixType((VectorType)RequireResultType(objects[i.Words[2]]), (int)i.Words[3]);
 					}
 					break;
 
 				case OpTypeArray t:
 					{
-						object constant = objects[i.Words[3]].Value;
+						object? constant = objects[i.Words[3]].Value;
 						int size = 0;
 
 						switch (constant)
@@ -217,13 +222,13 @@ namespace SpirV
 								break;
 						}
 
-						i.ResultType = new ArrayType(objects[i.Words[2]].ResultType, size);
+						i.ResultType = new ArrayType(RequireResultType(objects[i.Words[2]]), size);
 					}
 					break;
 
 				case OpTypeRuntimeArray t:
 					{
-						i.ResultType = new RuntimeArrayType((Type)objects[i.Words[2]].ResultType);
+						i.ResultType = new RuntimeArrayType(RequireResultType(objects[i.Words[2]]));
 					}
 					break;
 
@@ -247,7 +252,7 @@ namespace SpirV
 
 				case OpTypeImage t:
 					{
-						Type sampledType = objects[i.Operands[1].GetId ()].ResultType;
+						Type sampledType = RequireResultType(objects[i.Operands[1].GetId()]);
 						Dim dim = i.Operands[2].GetSingleEnumValue<Dim>();
 						uint depth = (uint)i.Operands[3].Value;
 						bool isArray = (uint)i.Operands[4].Value != 0;
@@ -271,7 +276,7 @@ namespace SpirV
 
 				case OpTypeSampledImage t:
 					{
-						i.ResultType = new SampledImageType((ImageType)objects[i.Words[2]].ResultType);
+						i.ResultType = new SampledImageType((ImageType)RequireResultType(objects[i.Words[2]]));
 					}
 					break;
 
@@ -280,9 +285,9 @@ namespace SpirV
 						List<Type> parameterTypes = new List<Type>();
 						for (int j = 3; j < i.Words.Count; ++j)
 						{
-							parameterTypes.Add(objects[i.Words[j]].ResultType);
+							parameterTypes.Add(RequireResultType(objects[i.Words[j]]));
 						}
-						i.ResultType = new FunctionType(objects[i.Words[2]].ResultType, parameterTypes);
+						i.ResultType = new FunctionType(RequireResultType(objects[i.Words[2]]), parameterTypes);
 					}
 					break;
 
@@ -301,14 +306,18 @@ namespace SpirV
 							// If there is something present, it must have been
 							// a forward reference. The storage type must
 							// match
-							PointerType pt = (PointerType)i.ResultType;
-							Debug.Assert (pt != null);
-							Debug.Assert (pt.StorageClass == (StorageClass)i.Words[2]);
-							pt.ResolveForwardReference (objects[i.Words[3]].ResultType);
+							PointerType? pt = i.ResultType as PointerType;
+							Debug.Assert(pt != null);
+							if (pt == null)
+							{
+								throw new InvalidOperationException("Expected forward pointer type.");
+							}
+							Debug.Assert(pt.StorageClass == (StorageClass)i.Words[2]);
+							pt.ResolveForwardReference(RequireResultType(objects[i.Words[3]]));
 						}
 						else
 						{
-							i.ResultType = new PointerType((StorageClass)i.Words[2], objects[i.Words[3]].ResultType);
+							i.ResultType = new PointerType((StorageClass)i.Words[2], RequireResultType(objects[i.Words[3]]));
 						}
 					}
 					break;
@@ -318,7 +327,7 @@ namespace SpirV
 						List<Type> memberTypes = new List<Type>();
 						for (int j = 2; j < i.Words.Count; ++j)
 						{
-							memberTypes.Add(objects[i.Words[j]].ResultType);
+							memberTypes.Add(RequireResultType(objects[i.Words[j]]));
 						}
 						i.ResultType = new StructType(memberTypes);
 					}
@@ -326,7 +335,12 @@ namespace SpirV
 			}
 		}
 
-		private static object ConvertConstant(ScalarType type, IReadOnlyList<uint> words, int index)
+		private static Type RequireResultType(ParsedInstruction instruction)
+		{
+			return instruction.ResultType ?? throw new InvalidOperationException($"Missing result type for instruction {instruction.Instruction.Name}.");
+		}
+
+		private static object? ConvertConstant(ScalarType? type, IReadOnlyList<uint> words, int index)
 		{
 			switch (type)
 			{

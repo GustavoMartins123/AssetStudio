@@ -383,7 +383,7 @@ namespace SpirV
 		}
 
 		public StorageClass StorageClass { get; }
-		public Type Type { get; private set; }
+		public Type? Type { get; private set; }
 	}
 
 	public class FunctionType : Type

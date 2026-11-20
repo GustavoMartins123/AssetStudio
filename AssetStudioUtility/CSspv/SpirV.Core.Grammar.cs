@@ -106,7 +106,7 @@ namespace SpirV
         {new IdRef(), };
         }
 
-        public override Parameter CreateParameter(object value)
+        public override Parameter? CreateParameter(object value)
         {
             switch ((ImageOperands)value)
             {
@@ -176,7 +176,7 @@ namespace SpirV
         {new LiteralInteger(), };
         }
 
-        public override Parameter CreateParameter(object value)
+        public override Parameter? CreateParameter(object value)
         {
             switch ((LoopControl)value)
             {
@@ -239,7 +239,7 @@ namespace SpirV
         {new LiteralInteger(), };
         }
 
-        public override Parameter CreateParameter(object value)
+        public override Parameter? CreateParameter(object value)
         {
             switch ((MemoryAccess)value)
             {
@@ -457,7 +457,7 @@ namespace SpirV
         {new IdRef(), };
         }
 
-        public override Parameter CreateParameter(object value)
+        public override Parameter? CreateParameter(object value)
         {
             switch ((ExecutionMode)value)
             {
@@ -982,7 +982,7 @@ namespace SpirV
         {new LiteralInteger(), };
         }
 
-        public override Parameter CreateParameter(object value)
+        public override Parameter? CreateParameter(object value)
         {
             switch ((Decoration)value)
             {

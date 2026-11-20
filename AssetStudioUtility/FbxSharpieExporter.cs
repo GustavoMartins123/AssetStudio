@@ -23,12 +23,12 @@ namespace AssetStudio
         private bool _castToBone;
         private bool _exportMeshes;
         private float _boneSize;
-        private string _exportDirectory;
-        private ImportedFrame _rootFrame;
+        private string? _exportDirectory;
+        private ImportedFrame? _rootFrame;
         private Dictionary<string, long> _frameIdMap = new Dictionary<string, long>();
-        private Dictionary<string, string> _frameUniqueSuffixMap = new Dictionary<string, string>();
+        private Dictionary<string, string?> _frameUniqueSuffixMap = new Dictionary<string, string?>();
         private Dictionary<string, ImportedFrame> _frameByPathMap = new Dictionary<string, ImportedFrame>();
-        private Dictionary<string, ImportedFrame> _frameUniqueLeafMap = new Dictionary<string, ImportedFrame>();
+        private Dictionary<string, ImportedFrame?> _frameUniqueLeafMap = new Dictionary<string, ImportedFrame?>();
         private Dictionary<string, System.Numerics.Matrix4x4> _frameGlobalMatrixMap = new Dictionary<string, System.Numerics.Matrix4x4>();
         private Dictionary<string, long> _materialIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _meshIdMap = new Dictionary<string, long>();
@@ -59,7 +59,7 @@ namespace AssetStudio
 
         private class MeshDiagnosticInfo
         {
-            public string Path { get; set; }
+            public string Path { get; set; } = string.Empty;
             public int VertexCount { get; set; }
             public int PolygonCount { get; set; }
             public int MaxIndex { get; set; } = -1;
@@ -75,7 +75,7 @@ namespace AssetStudio
             public int BaseVertex { get; set; }
             public int VertexCount { get; set; }
             public int IndexCount { get; set; }
-            public string Material { get; set; }
+            public string Material { get; set; } = string.Empty;
             public int MinIndex { get; set; } = int.MaxValue;
             public int MaxIndex { get; set; } = -1;
         }
@@ -330,7 +330,7 @@ namespace AssetStudio
             if (mesh.hasColor)
                 BuildLayerElementColor(geo, mesh, resolvedFaces.Indices);
 
-            List<string> materialOrder = null;
+            List<string>? materialOrder = null;
             if (mesh.SubmeshList != null && mesh.SubmeshList.Count > 0)
             {
                 materialOrder = GetMeshMaterialOrder(mesh);
@@ -401,7 +401,7 @@ namespace AssetStudio
                 Submeshes = new List<SubmeshDiagnosticInfo>(submeshCount)
             };
 
-            for (int subIdx = 0; subIdx < submeshCount; subIdx++)
+            for (int subIdx = 0; submeshList != null && subIdx < submeshCount; subIdx++)
             {
                 var sub = submeshList[subIdx];
                 var faceList = sub.FaceList;
@@ -417,7 +417,7 @@ namespace AssetStudio
                     IndexCount = subFaceCount * 3
                 };
 
-                for (int f = 0; f < subFaceCount; f++)
+                for (int f = 0; faceList != null && f < subFaceCount; f++)
                 {
                     if (!TryResolveFaceIndices(faceList[f], baseVertex, vertexCount, out var index0, out var index1, out var index2))
                     {
@@ -697,7 +697,7 @@ namespace AssetStudio
             layer.AddNode(el);
         }
 
-        private void ConnectMaterialsToModel(List<string> materialOrder, long modelId, IImported convert)
+        private void ConnectMaterialsToModel(List<string>? materialOrder, long modelId, IImported convert)
         {
             if (modelId == 0 || convert.MaterialList == null || materialOrder == null)
                 return;
@@ -1003,7 +1003,7 @@ namespace AssetStudio
             }
         }
 
-        private ImportedFrame FindFrameFast(string normalizedPath)
+        private ImportedFrame? FindFrameFast(string normalizedPath)
         {
             if (string.IsNullOrEmpty(normalizedPath))
                 return null;
@@ -1409,7 +1409,7 @@ namespace AssetStudio
             }
         }
 
-        private void AddBonePathWithParent(ImportedFrame frame, string fallbackPath)
+        private void AddBonePathWithParent(ImportedFrame? frame, string fallbackPath)
         {
             var normalizedPath = NormalizeFramePath(frame?.Path ?? fallbackPath);
             if (string.IsNullOrEmpty(normalizedPath))
@@ -1443,9 +1443,9 @@ namespace AssetStudio
             return false;
         }
 
-        private static string NormalizeFramePath(string path)
+        private static string NormalizeFramePath(string? path)
         {
-            return path?.Replace('\\', '/').Trim('/');
+            return string.IsNullOrEmpty(path) ? string.Empty : path.Replace('\\', '/').Trim('/');
         }
 
         private void ExportCurveNode1D(long layerId, long targetId, string channelName, string propName, List<ImportedKeyframe<float>> keyframes)

@@ -316,7 +316,7 @@ namespace AssetStudio
             {
                 sb.Append($"  ZTest [{m_State.zTest.name}]\n");
             }
-            else if (m_State.zTest.val != 4f) //ZTest LEqual
+            else if (m_State.zTest != null && m_State.zTest.val != 4f) //ZTest LEqual
             {
                 sb.Append("  ZTest ");
                 switch (m_State.zTest.val) //enum CompareFunction
@@ -354,7 +354,7 @@ namespace AssetStudio
             {
                 sb.Append($"  ZWrite [{m_State.zWrite.name}]\n");
             }
-            else if (m_State.zWrite.val != 1f) //ZWrite On
+            else if (m_State.zWrite != null && m_State.zWrite.val != 1f) //ZWrite On
             {
                 sb.Append("  ZWrite Off\n");
             }
@@ -363,7 +363,7 @@ namespace AssetStudio
             {
                 sb.Append($"  Cull [{m_State.culling.name}]\n");
             }
-            else if (m_State.culling.val != 2f) //Cull Back
+            else if (m_State.culling != null && m_State.culling.val != 2f) //Cull Back
             {
                 sb.Append("  Cull ");
                 switch (m_State.culling.val) //enum CullMode
@@ -625,7 +625,7 @@ namespace AssetStudio
                 {
                     sb.Append($"  ColorMask [{blend.colMask.name}] {i}\n");
                 }
-                else
+                else if (blend.colMask != null)
                 {
                     var val = (int)blend.colMask.val;
                     if (val != 0xf)
@@ -779,7 +779,7 @@ namespace AssetStudio
             return sb.ToString();
         }
 
-        public static string FormatPropertyFlags(uint rawFlags, string[] existingAttributes = null)
+        public static string FormatPropertyFlags(uint rawFlags, string[]? existingAttributes = null)
         {
             var flags = (SerializedPropertyFlag)rawFlags;
             if (flags == SerializedPropertyFlag.None)
@@ -1076,7 +1076,7 @@ namespace AssetStudio
         private int m_Version;
         public ShaderGpuProgramType m_ProgramType;
         public string[] m_Keywords;
-        public string[] m_LocalKeywords;
+        public string[]? m_LocalKeywords;
         public byte[] m_ProgramCode;
 
         public ShaderSubProgram(BinaryReader reader)

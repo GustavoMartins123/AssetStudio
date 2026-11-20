@@ -16,29 +16,35 @@ namespace Unity.SerializationLogic
     {
         public int Count;
         public IGenericInstance GenericInstance;
+
+        public GenericInstanceHolder(IGenericInstance genericInstance)
+        {
+            Count = 1;
+            GenericInstance = genericInstance;
+        }
     }
 
     public class TypeResolver
     {
-        private readonly IGenericInstance _typeDefinitionContext;
-        private readonly IGenericInstance _methodDefinitionContext;
+        private readonly IGenericInstance? _typeDefinitionContext;
+        private readonly IGenericInstance? _methodDefinitionContext;
         private readonly Dictionary<string, GenericInstanceHolder> _context = new Dictionary<string, GenericInstanceHolder>();
 
         public TypeResolver()
         {
         }
 
-        public TypeResolver(IGenericInstance typeDefinitionContext)
+        public TypeResolver(IGenericInstance? typeDefinitionContext)
         {
             _typeDefinitionContext = typeDefinitionContext;
         }
 
-        public TypeResolver(GenericInstanceMethod methodDefinitionContext)
+        public TypeResolver(GenericInstanceMethod? methodDefinitionContext)
         {
             _methodDefinitionContext = methodDefinitionContext;
         }
 
-        public TypeResolver(IGenericInstance typeDefinitionContext, IGenericInstance methodDefinitionContext)
+        public TypeResolver(IGenericInstance? typeDefinitionContext, IGenericInstance? methodDefinitionContext)
         {
             _typeDefinitionContext = typeDefinitionContext;
             _methodDefinitionContext = methodDefinitionContext;
@@ -169,9 +175,7 @@ namespace Unity.SerializationLogic
 
         private void Add(string key, IGenericInstance value)
         {
-            GenericInstanceHolder oldValue;
-
-            if (_context.TryGetValue(key, out oldValue))
+            if (_context.TryGetValue(key, out GenericInstanceHolder? oldValue))
             {
                 var memberReference = value as MemberReference;
                 if (memberReference == null)
@@ -186,14 +190,12 @@ namespace Unity.SerializationLogic
                 return;
             }
 
-            _context.Add(key, new GenericInstanceHolder { Count = 1, GenericInstance = value });
+            _context.Add(key, new GenericInstanceHolder(value));
         }
 
         private void Remove(string key, IGenericInstance value)
         {
-            GenericInstanceHolder oldValue;
-
-            if (_context.TryGetValue(key, out oldValue))
+            if (_context.TryGetValue(key, out GenericInstanceHolder? oldValue))
             {
                 var memberReference = value as MemberReference;
                 if (memberReference == null)
@@ -219,7 +221,7 @@ namespace Unity.SerializationLogic
     {
         public static bool WillUnitySerialize(FieldDefinition fieldDefinition)
         {
-            return WillUnitySerialize(fieldDefinition, new TypeResolver(null));
+            return WillUnitySerialize(fieldDefinition, new TypeResolver());
         }
 
         public static bool WillUnitySerialize(FieldDefinition fieldDefinition, TypeResolver typeResolver)
@@ -281,7 +283,7 @@ namespace Unity.SerializationLogic
 
         public static bool ShouldFieldBePPtrRemapped(FieldDefinition fieldDefinition)
         {
-            return ShouldFieldBePPtrRemapped(fieldDefinition, new TypeResolver(null));
+            return ShouldFieldBePPtrRemapped(fieldDefinition, new TypeResolver());
         }
 
         public static bool ShouldFieldBePPtrRemapped(FieldDefinition fieldDefinition, TypeResolver typeResolver)
@@ -327,8 +329,12 @@ namespace Unity.SerializationLogic
                 var genericBaseInstanceType = baseType as GenericInstanceType;
                 if (genericBaseInstanceType != null)
                     typeResolver.Add(genericBaseInstanceType);
-                foreach (var kv in AllFieldsFor(baseType.Resolve(), typeResolver))
-                    yield return kv;
+                var resolvedBaseType = baseType.Resolve();
+                if (resolvedBaseType != null)
+                {
+                    foreach (var kv in AllFieldsFor(resolvedBaseType, typeResolver))
+                        yield return kv;
+                }
                 if (genericBaseInstanceType != null)
                     typeResolver.Remove(genericBaseInstanceType);
             }
@@ -465,7 +471,7 @@ namespace Unity.SerializationLogic
             return GetFixedBufferAttribute(fieldDefinition) != null;
         }
 
-        public static CustomAttribute GetFixedBufferAttribute(FieldDefinition fieldDefinition)
+        public static CustomAttribute? GetFixedBufferAttribute(FieldDefinition fieldDefinition)
         {
             if (!fieldDefinition.HasCustomAttributes)
                 return null;

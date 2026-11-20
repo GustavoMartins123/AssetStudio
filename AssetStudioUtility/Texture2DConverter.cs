@@ -1,5 +1,6 @@
 using System;
 using System.Buffers.Binary;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Texture2DDecoder;
@@ -897,7 +898,7 @@ namespace AssetStudio
             return true;
         }
 
-        private bool UnpackCrunch(byte[] image_data, out byte[] result)
+        private bool UnpackCrunch(byte[] image_data, [NotNullWhen(true)] out byte[]? result)
         {
             if (version[0] > 2017 || (version[0] == 2017 && version[1] >= 3) //2017.3 and up
                 || m_TextureFormat == TextureFormat.ETC_RGB4Crunched

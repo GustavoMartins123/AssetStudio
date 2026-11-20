@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -151,7 +152,7 @@ namespace AssetStudio
             return "{fileID: 0}";
         }
 
-        private static string InferShaderName(Material material)
+        private static string? InferShaderName(Material material)
         {
             var texEnvNames = material.m_SavedProperties?.m_TexEnvs?.Select(x => x.Key) ?? Enumerable.Empty<string>();
             var floatNames = material.m_SavedProperties?.m_Floats?.Select(x => x.Key) ?? Enumerable.Empty<string>();
@@ -201,7 +202,7 @@ namespace AssetStudio
             sb.AppendLine("  version: 10");
         }
 
-        private static bool TryGetExportedTextureGuid(string materialExportPath, Texture2D texture, ImageFormat textureFormat, out string guid)
+        private static bool TryGetExportedTextureGuid(string materialExportPath, Texture2D texture, ImageFormat textureFormat, [NotNullWhen(true)] out string? guid)
         {
             guid = null;
             var textureFolder = GetTextureExportFolder(materialExportPath);
@@ -216,7 +217,7 @@ namespace AssetStudio
             return true;
         }
 
-        private static bool TryGetShaderGuid(string path, string shaderName, out string guid)
+        private static bool TryGetShaderGuid(string path, string? shaderName, [NotNullWhen(true)] out string? guid)
         {
             guid = null;
             if (string.IsNullOrEmpty(shaderName))
@@ -253,7 +254,7 @@ namespace AssetStudio
             return false;
         }
 
-        private static bool TryReadGuid(string metaPath, out string guid)
+        private static bool TryReadGuid(string metaPath, [NotNullWhen(true)] out string? guid)
         {
             guid = null;
             foreach (var line in File.ReadLines(metaPath))
@@ -267,7 +268,7 @@ namespace AssetStudio
             return false;
         }
 
-        private static string FindUnityProjectRoot(string path)
+        private static string? FindUnityProjectRoot(string path)
         {
             var directory = new DirectoryInfo(path);
             while (directory != null)
@@ -301,7 +302,7 @@ namespace AssetStudio
             WriteTextureMetaIfMissing(texturePath, null);
         }
 
-        public static void WriteTextureMetaIfMissing(string texturePath, Object obj)
+        public static void WriteTextureMetaIfMissing(string texturePath, Object? obj)
         {
             var metaPath = texturePath + ".meta";
             if (File.Exists(metaPath))
@@ -312,7 +313,7 @@ namespace AssetStudio
             File.WriteAllText(metaPath, BuildTextureMeta(GenerateStableGuid(obj)), Encoding.UTF8);
         }
 
-        public static string GenerateStableGuid(Object obj)
+        public static string GenerateStableGuid(Object? obj)
         {
             if (obj == null)
                 return GenerateUnityGuid();
@@ -384,7 +385,7 @@ TextureImporter:
 ";
         }
 
-        private static string YamlString(string value)
+        private static string YamlString(string? value)
         {
             if (string.IsNullOrEmpty(value))
             {
@@ -494,15 +495,15 @@ TextureImporter:
 
         private class CustomCurve<T>
         {
-            public string Path;
-            public string Attribute;
+            public required string Path;
+            public string Attribute = string.Empty;
             public List<CustomKeyframe<T>> Keyframes = new List<CustomKeyframe<T>>();
         }
 
         private class CustomKeyframe<T>
         {
             public float Time;
-            public T Value;
+            public required T Value;
         }
 
         public static Dictionary<uint, string> BuildBonePathHash(List<SerializedFile> assetsFileList)
@@ -1178,7 +1179,7 @@ TextureImporter:
                         var pathHash = GetCrc(pptrCurve.path);
                         var attrHash = GetCrc(pptrCurve.attribute);
                         
-                        GenericBinding match = null;
+                        GenericBinding? match = null;
                         if (clip.m_ClipBindingConstant?.genericBindings != null)
                         {
                             match = clip.m_ClipBindingConstant.genericBindings.FirstOrDefault(b => b.path == pathHash && b.isPPtrCurve == 1);
@@ -1297,7 +1298,7 @@ TextureImporter:
         #endregion
 
         #region Skeleton
-        private static void WriteSkeleton(StringBuilder sb, string indent, Skeleton skeleton)
+        private static void WriteSkeleton(StringBuilder sb, string indent, Skeleton? skeleton)
         {
             if (skeleton == null)
             {
@@ -1387,7 +1388,7 @@ TextureImporter:
             }
         }
 
-        private static void WriteSkeletonPose(StringBuilder sb, string indent, SkeletonPose pose)
+        private static void WriteSkeletonPose(StringBuilder sb, string indent, SkeletonPose? pose)
         {
             if (pose == null || pose.m_X == null || pose.m_X.Length == 0)
             {
@@ -1403,7 +1404,7 @@ TextureImporter:
             }
         }
 
-        private static void WriteHuman(StringBuilder sb, string indent, Human human)
+        private static void WriteHuman(StringBuilder sb, string indent, Human? human)
         {
             if (human == null)
             {
@@ -1734,7 +1735,7 @@ TextureImporter:
             sb.AppendLine("    m_HasExtraRoot: 1");
             sb.AppendLine("    m_SkeletonHasParents: 1");
 
-            Directory.CreateDirectory(Path.GetDirectoryName(avatarFullPath));
+            EnsureParentDirectory(avatarFullPath);
             File.WriteAllText(avatarFullPath, sb.ToString(), Encoding.UTF8);
             return true;
         }
@@ -1768,7 +1769,7 @@ TextureImporter:
                 }
             }
 
-            Directory.CreateDirectory(Path.GetDirectoryName(exportFullPath));
+            EnsureParentDirectory(exportFullPath);
             File.WriteAllText(exportFullPath, sb.ToString(), Encoding.UTF8);
             return true;
         }
@@ -1807,14 +1808,23 @@ TextureImporter:
                 }
             }
 
-            Directory.CreateDirectory(Path.GetDirectoryName(exportFullPath));
+            EnsureParentDirectory(exportFullPath);
             File.WriteAllText(exportFullPath, sb.ToString(), Encoding.UTF8);
             return true;
         }
         #endregion
 
+        private static void EnsureParentDirectory(string filePath)
+        {
+            var directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+        }
+
         #region Unity Model and Animation Helpers
-        public static void WriteModelMetaIfMissing(string modelFbxPath, Object obj = null)
+        public static void WriteModelMetaIfMissing(string modelFbxPath, Object? obj = null)
         {
             var metaPath = modelFbxPath + ".meta";
             if (File.Exists(metaPath)) return;
@@ -1823,7 +1833,7 @@ TextureImporter:
             File.WriteAllText(metaPath, metaContent, Encoding.UTF8);
         }
 
-        public static void WriteAnimationMetaIfMissing(string animFbxPath, Object obj = null)
+        public static void WriteAnimationMetaIfMissing(string animFbxPath, Object? obj = null)
         {
             var metaPath = animFbxPath + ".meta";
             if (File.Exists(metaPath)) return;

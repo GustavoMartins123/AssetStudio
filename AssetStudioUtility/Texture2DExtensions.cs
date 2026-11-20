@@ -6,7 +6,7 @@ namespace AssetStudio
 {
     public static class Texture2DExtensions
     {
-        public static SKBitmap ConvertToImage(this Texture2D m_Texture2D, bool flip)
+        public static SKBitmap? ConvertToImage(this Texture2D m_Texture2D, bool flip)
         {
             if (m_Texture2D.m_Width <= 0 || m_Texture2D.m_Height <= 0)
             {
@@ -50,7 +50,7 @@ namespace AssetStudio
             }
         }
 
-        private static SKBitmap ConvertEncodedImage(this Texture2D m_Texture2D, bool flip)
+        private static SKBitmap? ConvertEncodedImage(this Texture2D m_Texture2D, bool flip)
         {
             try
             {
@@ -79,7 +79,7 @@ namespace AssetStudio
             }
         }
 
-        public static MemoryStream ConvertToStream(this Texture2D m_Texture2D, ImageFormat imageFormat, bool flip)
+        public static MemoryStream? ConvertToStream(this Texture2D m_Texture2D, ImageFormat imageFormat, bool flip)
         {
             var image = ConvertToImage(m_Texture2D, flip);
             if (image != null)

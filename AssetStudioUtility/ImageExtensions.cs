@@ -7,7 +7,7 @@ namespace AssetStudio
 {
     public static class ImageExtensions
     {
-        public static Span<byte> GetWritablePixelSpan(this SKBitmap bitmap)
+        public static Span<byte> GetWritablePixelSpan(this SKBitmap? bitmap)
         {
             if (bitmap == null)
             {
@@ -31,7 +31,7 @@ namespace AssetStudio
         {
             if (width <= 0 || height <= 0)
             {
-                return null;
+                throw new ArgumentOutOfRangeException(width <= 0 ? nameof(width) : nameof(height), "Bitmap dimensions must be positive.");
             }
 
             long requiredBytes = (long)width * height * 4L;
@@ -69,7 +69,7 @@ namespace AssetStudio
             }
         }
 
-        public static SKBitmap DecodeBgraUnpremul(byte[] data)
+        public static SKBitmap? DecodeBgraUnpremul(byte[]? data)
         {
             if (data == null || data.Length == 0)
             {
@@ -108,7 +108,7 @@ namespace AssetStudio
             }
         }
 
-        public static void FlipVerticalInPlace(this SKBitmap bitmap)
+        public static void FlipVerticalInPlace(this SKBitmap? bitmap)
         {
             if (bitmap == null || bitmap.Height <= 1)
             {
@@ -160,7 +160,7 @@ namespace AssetStudio
             }
 
             SKBitmap source = bitmap;
-            SKBitmap converted = null;
+            SKBitmap? converted = null;
             try
             {
                 if (bitmap.ColorType != SKColorType.Bgra8888)
@@ -279,7 +279,7 @@ namespace AssetStudio
             }
 
             SKBitmap source = image;
-            SKBitmap converted = null;
+            SKBitmap? converted = null;
             try
             {
                 if (image.ColorType != SKColorType.Bgra8888)
@@ -334,7 +334,7 @@ namespace AssetStudio
             }
 
             SKBitmap source = image;
-            SKBitmap converted = null;
+            SKBitmap? converted = null;
             try
             {
                 if (image.ColorType != SKColorType.Bgra8888)

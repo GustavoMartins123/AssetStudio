@@ -17,7 +17,7 @@ namespace AssetStudio
         public TypeDefinitionConverter(TypeDefinition typeDef, SerializedTypeHelper helper, int indent)
         {
             TypeDef = typeDef;
-            TypeResolver = new TypeResolver(null);
+            TypeResolver = new TypeResolver();
             Helper = helper;
             Indent = indent;
         }
@@ -129,7 +129,11 @@ namespace AssetStudio
         private TypeReference ResolveDeclaringType(TypeReference declaringType)
         {
             var typeDefinition = declaringType.Resolve();
-            if (typeDefinition == null || !typeDefinition.HasGenericParameters)
+            if (typeDefinition == null)
+            {
+                return declaringType;
+            }
+            if (!typeDefinition.HasGenericParameters)
             {
                 return typeDefinition;
             }

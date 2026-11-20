@@ -20,14 +20,14 @@ namespace SpirV
 
 	public class Operand
 	{
-		public Operand(OperandType kind, string name, OperandQuantifier quantifier)
+		public Operand(OperandType kind, string? name, OperandQuantifier quantifier)
 		{
 			Name = name;
 			Type = kind;
 			Quantifier = quantifier;
 		}
 
-		public string Name { get; }
+		public string? Name { get; }
 		public OperandType Type { get; }
 		public OperandQuantifier Quantifier { get; }
 	}

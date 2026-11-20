@@ -44,7 +44,10 @@ namespace SpirV
 		public T GetBitEnumValue<T>()
 			where T : Enum
 		{
-			var v = Value as IBitEnumOperandValue;
+			if (Value is not IBitEnumOperandValue v)
+			{
+				throw new InvalidOperationException($"Operand value is not {nameof(IBitEnumOperandValue)}.");
+			}
 
 			uint result = 0;
 			foreach (var k in v.Values.Keys)
@@ -162,7 +165,7 @@ namespace SpirV
 		}
 
 		public uint Id { get; }
-		public ParsedInstruction Reference { get; private set; }
+		public ParsedInstruction? Reference { get; private set; }
 	}
 
 	public class ParsedInstruction
@@ -186,7 +189,7 @@ namespace SpirV
 			int currentOperand = 0;
 			List<object> varyingOperandValues = new List<object>();
 			int varyingWordStart = 0;
-			Operand varyingOperand = null;
+			Operand? varyingOperand = null;
 
 			while (currentWord < Words.Count)
 			{
@@ -239,7 +242,7 @@ namespace SpirV
 			}
 		}
 
-		public Type ResultType { get; set; }
+		public Type? ResultType { get; set; }
 		public uint ResultId
 		{
 			get
@@ -259,7 +262,7 @@ namespace SpirV
 		public IReadOnlyList<uint> Words { get; }
 		public Instruction Instruction { get; }
 		public IList<ParsedOperand> Operands { get; } = new List<ParsedOperand>();
-		public string Name { get; set; }
-		public object Value { get; set; }
+		public string? Name { get; set; }
+		public object? Value { get; set; }
 	}
 }

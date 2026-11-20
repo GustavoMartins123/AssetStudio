@@ -25,7 +25,7 @@ namespace AssetStudio
 
         public static void ClearAtlasCache()
         {
-            List<AtlasCacheEntry> toDispose = null;
+            List<AtlasCacheEntry>? toDispose = null;
             lock (_cacheLock)
             {
                 _cacheGeneration++;
@@ -37,7 +37,7 @@ namespace AssetStudio
             DisposeEntries(toDispose);
         }
 
-        public static SKBitmap GetImage(this Sprite m_Sprite)
+        public static SKBitmap? GetImage(this Sprite m_Sprite)
         {
             if (m_Sprite.m_SpriteAtlas != null && m_Sprite.m_SpriteAtlas.TryGet(out var m_SpriteAtlas))
             {
@@ -56,7 +56,7 @@ namespace AssetStudio
             return null;
         }
 
-        private static SKBitmap CutImage(Sprite m_Sprite, Texture2D m_Texture2D, Rectf textureRect, Vector2 textureRectOffset, float downscaleMultiplier, SpriteSettings settingsRaw)
+        private static SKBitmap? CutImage(Sprite m_Sprite, Texture2D m_Texture2D, Rectf textureRect, Vector2 textureRectOffset, float downscaleMultiplier, SpriteSettings settingsRaw)
         {
             if (m_Texture2D == null)
             {
@@ -75,7 +75,7 @@ namespace AssetStudio
                 }
             }
 
-            SKBitmap spriteImage;
+            SKBitmap? spriteImage;
             SKRectI rect;
             using (var atlasLease = AcquireAtlasLease(m_Texture2D, targetWidth, targetHeight))
             {
@@ -270,7 +270,7 @@ namespace AssetStudio
             }
         }
 
-        private static SKBitmap CropSpriteRegion(AtlasCacheEntry entry, Rectf textureRect, out SKRectI rect)
+        private static SKBitmap? CropSpriteRegion(AtlasCacheEntry entry, Rectf textureRect, out SKRectI rect)
         {
             lock (entry.SyncRoot)
             {
@@ -325,12 +325,12 @@ namespace AssetStudio
                 targetWidth,
                 targetHeight);
 
-            AtlasCacheEntry cachedHit = null;
-            InFlightDecode flightToWait = null;
-            InFlightDecode flightToLead = null;
+            AtlasCacheEntry? cachedHit = null;
+            InFlightDecode? flightToWait = null;
+            InFlightDecode? flightToLead = null;
             long capturedGeneration = 0;
             bool bypassInFlight = false;
-            List<AtlasCacheEntry> toDispose = null;
+            List<AtlasCacheEntry>? toDispose = null;
 
             lock (_cacheLock)
             {
@@ -340,7 +340,7 @@ namespace AssetStudio
                 {
                     if (cached.Matches(m_Texture2D))
                     {
-                        if (cached.LruNode != _lruList.First)
+                        if (cached.LruNode != null && cached.LruNode != _lruList.First)
                         {
                             _lruList.Remove(cached.LruNode);
                             _lruList.AddFirst(cached.LruNode);
@@ -404,7 +404,12 @@ namespace AssetStudio
                 return new AtlasLease(directEntry);
             }
 
-            AtlasCacheEntry decodedEntry = null;
+            if (flightToLead == null)
+            {
+                return default;
+            }
+
+            AtlasCacheEntry? decodedEntry = null;
             try
             {
                 var decoded = DecodeAtlasImage(m_Texture2D, targetWidth, targetHeight);
@@ -416,7 +421,7 @@ namespace AssetStudio
             }
             finally
             {
-                List<AtlasCacheEntry> evictedToDispose = null;
+                List<AtlasCacheEntry>? evictedToDispose = null;
                 lock (_cacheLock)
                 {
                     if (_inFlight.TryGetValue(key, out var current) && ReferenceEquals(current, flightToLead))
@@ -454,7 +459,7 @@ namespace AssetStudio
             return decodedEntry != null ? new AtlasLease(decodedEntry) : default;
         }
 
-        private static SKBitmap DecodeAtlasImage(Texture2D m_Texture2D, int targetWidth, int targetHeight)
+        private static SKBitmap? DecodeAtlasImage(Texture2D m_Texture2D, int targetWidth, int targetHeight)
         {
             var originalImage = m_Texture2D.ConvertToImage(false);
             if (originalImage == null)
@@ -481,7 +486,7 @@ namespace AssetStudio
             return originalImage;
         }
 
-        private static void PruneDeadEntriesLocked(ref List<AtlasCacheEntry> toDispose)
+        private static void PruneDeadEntriesLocked(ref List<AtlasCacheEntry>? toDispose)
         {
             var node = _lruList.First;
             while (node != null)
@@ -495,7 +500,7 @@ namespace AssetStudio
             }
         }
 
-        private static void EvictOverflowLocked(ref List<AtlasCacheEntry> toDispose)
+        private static void EvictOverflowLocked(ref List<AtlasCacheEntry>? toDispose)
         {
             while (_lruList.Count > MaxCachedAtlases || _currentCachedBytes > MaxCachedBytes)
             {
@@ -508,7 +513,7 @@ namespace AssetStudio
             }
         }
 
-        private static void RemoveEntryLocked(AtlasCacheEntry entry, ref List<AtlasCacheEntry> toDispose)
+        private static void RemoveEntryLocked(AtlasCacheEntry entry, ref List<AtlasCacheEntry>? toDispose)
         {
             if (entry.LruNode == null)
             {
@@ -530,7 +535,7 @@ namespace AssetStudio
             }
         }
 
-        private static void DisposeEntries(List<AtlasCacheEntry> entries)
+        private static void DisposeEntries(List<AtlasCacheEntry>? entries)
         {
             if (entries == null)
             {
@@ -551,7 +556,7 @@ namespace AssetStudio
             public readonly int TargetWidth;
             public readonly int TargetHeight;
 
-            public AtlasCacheKey(string fileKey, long pathId, int identityHash, int targetWidth, int targetHeight)
+            public AtlasCacheKey(string? fileKey, long pathId, int identityHash, int targetWidth, int targetHeight)
             {
                 FileKey = fileKey ?? string.Empty;
                 PathId = pathId;
@@ -569,7 +574,7 @@ namespace AssetStudio
                     && string.Equals(FileKey, other.FileKey, StringComparison.Ordinal);
             }
 
-            public override bool Equals(object obj) => obj is AtlasCacheKey other && Equals(other);
+            public override bool Equals(object? obj) => obj is AtlasCacheKey other && Equals(other);
 
             public override int GetHashCode() => HashCode.Combine(FileKey, PathId, IdentityHash, TargetWidth, TargetHeight);
         }
@@ -581,7 +586,7 @@ namespace AssetStudio
             public readonly SKBitmap Image;
             public readonly long EstimatedBytes;
             public readonly object SyncRoot = new object();
-            public LinkedListNode<AtlasCacheEntry> LruNode;
+            public LinkedListNode<AtlasCacheEntry>? LruNode;
 
             private int _refCount;
 
@@ -624,7 +629,7 @@ namespace AssetStudio
         private sealed class InFlightDecode
         {
             public readonly WeakReference<Texture2D> TextureRef;
-            public readonly TaskCompletionSource<AtlasCacheEntry> Completion = new TaskCompletionSource<AtlasCacheEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public readonly TaskCompletionSource<AtlasCacheEntry?> Completion = new TaskCompletionSource<AtlasCacheEntry?>(TaskCreationOptions.RunContinuationsAsynchronously);
             public int WaiterCount = 1;
 
             public InFlightDecode(Texture2D texture)
@@ -640,9 +645,9 @@ namespace AssetStudio
 
         private readonly struct AtlasLease : IDisposable
         {
-            public readonly AtlasCacheEntry Entry;
+            public readonly AtlasCacheEntry? Entry;
 
-            public AtlasLease(AtlasCacheEntry entry)
+            public AtlasLease(AtlasCacheEntry? entry)
             {
                 Entry = entry;
             }

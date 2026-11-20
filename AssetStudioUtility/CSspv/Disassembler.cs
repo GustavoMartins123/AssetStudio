@@ -8,7 +8,7 @@ namespace SpirV
 	{
 		public Version Version { get; set; }
 		public string GeneratorVendor { get; set; }
-		public string GeneratorName { get; set; }
+		public string? GeneratorName { get; set; }
 		public int GeneratorVersion { get; set; }
 		public uint Bound { get; set; }
 		public uint Reserved { get; set; }
@@ -109,7 +109,7 @@ namespace SpirV
 			{
 				if (options.HasFlag(DisassemblyOptions.ShowTypes))
 				{
-					instruction.ResultType.ToString(sb).Append(' ');
+					instruction.ResultType?.ToString(sb).Append(' ');
 				}
 				++currentOperand;
 			}

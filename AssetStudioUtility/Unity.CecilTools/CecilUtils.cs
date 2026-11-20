@@ -12,7 +12,7 @@ namespace Unity.CecilTools
 {
     public static class CecilUtils
     {
-        public static MethodDefinition FindInTypeExplicitImplementationFor(MethodDefinition interfaceMethod, TypeDefinition typeDefinition)
+        public static MethodDefinition? FindInTypeExplicitImplementationFor(MethodDefinition interfaceMethod, TypeDefinition typeDefinition)
         {
             return typeDefinition.Methods.SingleOrDefault(m => m.Overrides.Any(o => o.CheckedResolve().SameAs(interfaceMethod)));
         }
