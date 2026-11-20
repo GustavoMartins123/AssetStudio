@@ -29,6 +29,12 @@ jobs:
           cmake -S Texture2DDecoderNative -B Texture2DDecoderNative/build -DCMAKE_BUILD_TYPE=Release
           cmake --build Texture2DDecoderNative/build --parallel
 
+      # Linux FFmpeg shared libraries (AssetStudio.Avalonia/Libraries/x64/ffmpeg/) are
+      # intentionally omitted from Git and fetched on demand by scripts/publish-linux.sh
+      # during Linux release packaging; the managed + native decoder CI build works without them.
+      - name: Validate Linux packaging scripts
+        run: bash -n scripts/publish-linux.sh scripts/package-linux.sh
+
       - name: Restore Avalonia
         run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj
 

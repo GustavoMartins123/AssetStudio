@@ -20,9 +20,8 @@
 [Rr]eleases/
 x64/
 x86/
-!AssetStudio.Avalonia/Libraries/x64/
-!AssetStudio.Avalonia/Libraries/x64/ffmpeg/
-!AssetStudio.Avalonia/Libraries/x64/ffmpeg/**
+# FFmpeg Linux shared libraries (~222 MiB) are fetched on demand by scripts/publish-linux.sh instead of committed to Git.
+AssetStudio.Avalonia/Libraries/x64/ffmpeg/
 [Aa][Rr][Mm]/
 [Aa][Rr][Mm]64/
 bld/

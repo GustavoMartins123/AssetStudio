@@ -9,7 +9,66 @@ SELF_CONTAINED="true"
 OUTPUT_DIR=""
 SKIP_NATIVE="false"
 SKIP_FFMPEG="false"
-FFMPEG_SOURCE_OVERRIDE="${ASSETSTUDIO_FFMPEG_SOURCE_DIR:-}"
+SKIP_FFMPEG_DOWNLOAD="${SKIP_FFMPEG_DOWNLOAD:-0}"
+FFMPEG_SOURCE_OVERRIDE="${FFMPEG_LINUX_DIR:-${ASSETSTUDIO_FFMPEG_SOURCE_DIR:-}}"
+
+# Pinned official FFmpeg-Builds (formerly BtbN/FFmpeg-Builds) 8.1 LGPL shared Linux x64 release.
+# Required ABI for FFmpegVideoPlayer.Avalonia 2.8.0: libavcodec.so.62, libavformat.so.62,
+# libavutil.so.60, libswresample.so.6, libswscale.so.9.
+DEFAULT_FFMPEG_LINUX_URL="https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n8.1.3-27-g8dca1586f4-linux64-lgpl-shared-8.1.tar.xz"
+DEFAULT_FFMPEG_LINUX_SHA256="493e89a48da02b9a7d217b60f7f60c3c917c9bed73459d8a106e5e987da082ef"
+FFMPEG_LINUX_URL_IS_CUSTOM="false"
+if [[ -n "${FFMPEG_LINUX_URL:-}" ]]; then
+    FFMPEG_LINUX_URL_IS_CUSTOM="true"
+else
+    FFMPEG_LINUX_URL="$DEFAULT_FFMPEG_LINUX_URL"
+fi
+if [[ -z "${FFMPEG_LINUX_SHA256:-}" ]]; then
+    if [[ "$FFMPEG_LINUX_URL_IS_CUSTOM" == "false" ]]; then
+        FFMPEG_LINUX_SHA256="$DEFAULT_FFMPEG_LINUX_SHA256"
+    else
+        FFMPEG_LINUX_SHA256=""
+    fi
+fi
+
+FFMPEG_TMP_DIR=""
+cleanup_ffmpeg_tmp() {
+    if [[ -n "${FFMPEG_TMP_DIR:-}" && -d "$FFMPEG_TMP_DIR" ]]; then
+        rm -rf "$FFMPEG_TMP_DIR"
+    fi
+}
+trap cleanup_ffmpeg_tmp EXIT
+
+is_truthy() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+print_usage() {
+    cat <<EOF
+Usage: $0 [-c Release|Debug] [-f net10.0] [-r linux-x64] [--self-contained true|false] [-o output-dir] [--skip-native] [--skip-ffmpeg] [--skip-ffmpeg-download] [--ffmpeg-dir DIR]
+
+Options:
+  -c, --configuration CFG   Build configuration (default: Release)
+  -f, --framework TFM       Target framework (default: net10.0)
+  -r, --runtime RID         Target runtime identifier (default: linux-x64)
+  --self-contained BOOL     Publish self-contained (default: true)
+  -o, --output DIR          Custom publish output directory
+  --skip-native             Skip building/copying Texture2DDecoderNative
+  --skip-ffmpeg             Do not bundle FFmpeg shared libraries (rely on system FFmpeg)
+  --skip-ffmpeg-download    Skip automatic FFmpeg download (use pre-staged libs or system FFmpeg)
+  --ffmpeg-dir DIR          Copy Linux FFmpeg shared libraries from a local directory
+  --ffmpeg-source DIR       Alias for --ffmpeg-dir
+
+Environment variables:
+  FFMPEG_LINUX_DIR          Local FFmpeg directory override (alias: ASSETSTUDIO_FFMPEG_SOURCE_DIR)
+  FFMPEG_LINUX_URL          Custom FFmpeg .tar.xz download URL
+  FFMPEG_LINUX_SHA256       Expected SHA-256 checksum for FFMPEG_LINUX_URL
+  SKIP_FFMPEG_DOWNLOAD=1    Skip automatic FFmpeg download
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -41,12 +100,16 @@ while [[ $# -gt 0 ]]; do
             SKIP_FFMPEG="true"
             shift
             ;;
-        --ffmpeg-source)
+        --skip-ffmpeg-download)
+            SKIP_FFMPEG_DOWNLOAD="1"
+            shift
+            ;;
+        --ffmpeg-dir|--ffmpeg-source)
             FFMPEG_SOURCE_OVERRIDE="$2"
             shift 2
             ;;
         -h|--help)
-            echo "Usage: $0 [-c Release|Debug] [-f net10.0] [-r linux-x64] [--self-contained true|false] [-o output-dir] [--skip-native] [--skip-ffmpeg] [--ffmpeg-source DIR]"
+            print_usage
             exit 0
             ;;
         *)
@@ -93,17 +156,49 @@ if [[ "$SKIP_NATIVE" != "true" ]]; then
     echo "Copied libTexture2DDecoderNative.so to $NATIVE_TARGET_DIR and $PUBLISH_DIR"
 fi
 
+has_required_ffmpeg_libs() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        return 1
+    fi
+
+    local pattern
+    for pattern in \
+        'libavcodec.so.62*' \
+        'libavformat.so*' \
+        'libavutil.so*' \
+        'libswresample.so*' \
+        'libswscale.so*'; do
+        if [[ -z "$(find "$dir" -maxdepth 3 -name "$pattern" -print -quit)" ]]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+ensure_ffmpeg_soname_alias() {
+    local target_dir="$1"
+    local alias_name="$2"
+    local version_pattern="$3"
+    local alias_path="$target_dir/$alias_name"
+    local source_file
+
+    if [[ -L "$alias_path" && -e "$alias_path" ]] || [[ -f "$alias_path" && $(stat -c%s "$alias_path" 2>/dev/null || echo 0) -gt 1024 ]]; then
+        return
+    fi
+
+    source_file="$(find "$target_dir" -maxdepth 1 -type f -name "$version_pattern" -size +1024c -print -quit)"
+    if [[ -n "$source_file" ]]; then
+        ln -sf "$(basename "$source_file")" "$alias_path"
+    fi
+}
+
 copy_ffmpeg_libs() {
     local source_dir="$1"
     local target_dir="$2"
 
-    if [[ ! -d "$source_dir" ]]; then
-        return 1
-    fi
-
-    local codec
-    codec="$(find "$source_dir" -maxdepth 3 \( -name 'libavcodec.so.62' -o -name 'libavcodec.so.62.*' \) -print -quit)"
-    if [[ -z "$codec" ]]; then
+    if ! has_required_ffmpeg_libs "$source_dir"; then
         return 1
     fi
 
@@ -127,7 +222,7 @@ copy_ffmpeg_libs() {
 
     while IFS= read -r notice; do
         cp "$notice" "$target_dir/"
-    done < <(find "$source_dir" -maxdepth 1 -type f \( \
+    done < <(find "$source_dir" -maxdepth 2 -type f \( \
         -iname 'LICENSE*' -o \
         -iname 'COPYING*' -o \
         -iname 'NOTICE*' -o \
@@ -152,21 +247,81 @@ copy_ffmpeg_libs() {
     return 0
 }
 
-ensure_ffmpeg_soname_alias() {
-    local target_dir="$1"
-    local alias_name="$2"
-    local version_pattern="$3"
-    local alias_path="$target_dir/$alias_name"
-    local source_file
-
-    if [[ -L "$alias_path" && -e "$alias_path" ]] || [[ -f "$alias_path" && $(stat -c%s "$alias_path" 2>/dev/null || echo 0) -gt 1024 ]]; then
-        return
+ensure_linux_ffmpeg_bundle() {
+    if has_required_ffmpeg_libs "$FFMPEG_SOURCE_DIR"; then
+        return 0
     fi
 
-    source_file="$(find "$target_dir" -maxdepth 1 -type f -name "$version_pattern" -size +1024c -print -quit)"
-    if [[ -n "$source_file" ]]; then
-        ln -sf "$(basename "$source_file")" "$alias_path"
+    if is_truthy "$SKIP_FFMPEG_DOWNLOAD"; then
+        echo "Skipping automatic FFmpeg download (--skip-ffmpeg-download / SKIP_FFMPEG_DOWNLOAD=1)."
+        echo "No pre-staged FFmpeg libraries found in $FFMPEG_SOURCE_DIR; relying on system FFmpeg."
+        return 2
     fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "Error: curl is required to download Linux FFmpeg libraries from $FFMPEG_LINUX_URL." >&2
+        echo "Install curl, pass --ffmpeg-dir DIR (or FFMPEG_LINUX_DIR), or rerun with --skip-ffmpeg-download." >&2
+        return 1
+    fi
+
+    if ! command -v tar >/dev/null 2>&1; then
+        echo "Error: tar is required to extract Linux FFmpeg libraries." >&2
+        return 1
+    fi
+
+    FFMPEG_TMP_DIR="$(mktemp -d)"
+    local archive_path="$FFMPEG_TMP_DIR/ffmpeg-linux64.tar.xz"
+    local archive_list="$FFMPEG_TMP_DIR/archive.list"
+    local extract_dir="$FFMPEG_TMP_DIR/extracted"
+    local staged_dir="$FFMPEG_TMP_DIR/staged"
+    mkdir -p "$extract_dir"
+
+    echo "Downloading Linux x64 FFmpeg shared libraries from:"
+    echo "  $FFMPEG_LINUX_URL"
+    curl -fsSL --retry 3 --retry-delay 2 -o "$archive_path" "$FFMPEG_LINUX_URL"
+
+    if [[ -n "$FFMPEG_LINUX_SHA256" ]]; then
+        if ! command -v sha256sum >/dev/null 2>&1; then
+            echo "Error: sha256sum is required to verify the FFmpeg archive checksum." >&2
+            return 1
+        fi
+        echo "Verifying FFmpeg archive SHA-256 checksum..."
+        echo "${FFMPEG_LINUX_SHA256}  ${archive_path}" | sha256sum --check --strict
+    else
+        echo "Warning: FFMPEG_LINUX_SHA256 is not set for custom FFMPEG_LINUX_URL; skipping checksum verification." >&2
+    fi
+
+    tar -tJf "$archive_path" > "$archive_list"
+
+    local -a archive_members=()
+    mapfile -t archive_members < <(
+        grep -vE '(^/|(^|/)\.\.(/|$))' "$archive_list" \
+            | grep -E '(^|/)(lib/lib(avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)\.so(\.[0-9]+)*|bin/ffplay)$|^([^/]+/)?(LICENSE|COPYING|NOTICE|README)[^/]*$' \
+            || true
+    )
+
+    if [[ ${#archive_members[@]} -eq 0 ]]; then
+        echo "Error: Downloaded FFmpeg archive did not contain expected shared libraries (lib/*.so*)." >&2
+        return 1
+    fi
+
+    echo "Extracting FFmpeg shared libraries, ffplay, and license notices..."
+    tar -xJf "$archive_path" -C "$extract_dir" "${archive_members[@]}"
+
+    if ! copy_ffmpeg_libs "$extract_dir" "$staged_dir"; then
+        echo "Error: Extracted FFmpeg archive is missing required FFmpeg 8.x shared libraries." >&2
+        echo "Required ABI for FFmpegVideoPlayer 2.8.0: libavcodec.so.62 plus libavformat/libavutil/libswresample/libswscale." >&2
+        return 1
+    fi
+
+    rm -rf "$FFMPEG_SOURCE_DIR"
+    mkdir -p "$(dirname "$FFMPEG_SOURCE_DIR")"
+    mv "$staged_dir" "$FFMPEG_SOURCE_DIR"
+
+    rm -rf "$FFMPEG_TMP_DIR"
+    FFMPEG_TMP_DIR=""
+    echo "Staged Linux x64 FFmpeg libraries into $FFMPEG_SOURCE_DIR"
+    return 0
 }
 
 ensure_ffmpeg_libs() {
@@ -180,9 +335,17 @@ ensure_ffmpeg_libs() {
             return
         fi
 
-        echo "FFmpeg libraries were not found in --ffmpeg-source '$FFMPEG_SOURCE_OVERRIDE'." >&2
-        echo "Expected libavcodec.so.62, libavformat.so.*, libavutil.so.*, libswscale.so.*, and libswresample.so.*." >&2
+        echo "FFmpeg libraries were not found in --ffmpeg-dir '$FFMPEG_SOURCE_OVERRIDE'." >&2
+        echo "Expected libavcodec.so.62, libavformat.so.*, libavutil.so.*, libswresample.so.*, and libswscale.so.*." >&2
         exit 1
+    fi
+
+    local bundle_rc=0
+    ensure_linux_ffmpeg_bundle || bundle_rc=$?
+    if [[ "$bundle_rc" -eq 2 ]]; then
+        return
+    elif [[ "$bundle_rc" -ne 0 ]]; then
+        exit "$bundle_rc"
     fi
 
     if copy_ffmpeg_libs "$FFMPEG_SOURCE_DIR" "$FFMPEG_TARGET_DIR"; then
@@ -191,9 +354,9 @@ ensure_ffmpeg_libs() {
     fi
 
     echo "Bundled FFmpeg libraries were not found in $FFMPEG_SOURCE_DIR" >&2
-    echo "Place the ready-to-ship Linux x64 FFmpeg shared libraries there, or pass --ffmpeg-source DIR." >&2
-    echo "Required ABI for FFmpegVideoPlayer 2.8.0: libavcodec.so.62 plus matching libavformat/libavutil/libswscale/libswresample." >&2
-    echo "Use --skip-ffmpeg only if you intentionally want to rely on system FFmpeg." >&2
+    echo "Place the ready-to-ship Linux x64 FFmpeg shared libraries there, pass --ffmpeg-dir DIR, or set FFMPEG_LINUX_URL." >&2
+    echo "Required ABI for FFmpegVideoPlayer 2.8.0: libavcodec.so.62 plus matching libavformat/libavutil/libswresample/libswscale." >&2
+    echo "Use --skip-ffmpeg or --skip-ffmpeg-download to rely on system FFmpeg." >&2
     exit 1
 }
 
