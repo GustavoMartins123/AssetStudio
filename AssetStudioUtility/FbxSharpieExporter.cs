@@ -899,9 +899,7 @@ namespace AssetStudio
 
         private static string FixTextureFileName(string name)
         {
-            foreach (var c in Path.GetInvalidFileNameChars())
-                name = name.Replace(c, '_');
-            return name;
+            return AssetExportHelper.FixFileName(name);
         }
 
         private static int GetFaceCount(ImportedMesh mesh)

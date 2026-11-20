@@ -22,31 +22,50 @@ namespace AssetStudio
             Indent = indent;
         }
 
+        private const int MaxIndentDepth = 10;
+
         public List<TypeTreeNode> ConvertToTypeTreeNodes()
         {
             var nodes = new List<TypeTreeNode>();
+            if (TypeDef == null || Indent > MaxIndentDepth)
+            {
+                return nodes;
+            }
 
             var baseTypes = new Stack<TypeReference>();
+            var visitedBaseTypes = new HashSet<string>();
             var lastBaseType = TypeDef.BaseType;
-            while (!UnitySerializationLogic.IsNonSerialized(lastBaseType))
+            while (lastBaseType != null && !UnitySerializationLogic.IsNonSerialized(lastBaseType))
             {
+                if (!visitedBaseTypes.Add(lastBaseType.FullName))
+                {
+                    break;
+                }
+                var resolvedBaseType = lastBaseType.Resolve();
+                if (resolvedBaseType == null)
+                {
+                    break;
+                }
                 var genericInstanceType = lastBaseType as GenericInstanceType;
                 if (genericInstanceType != null)
                 {
                     TypeResolver.Add(genericInstanceType);
                 }
                 baseTypes.Push(lastBaseType);
-                lastBaseType = lastBaseType.Resolve().BaseType;
+                lastBaseType = resolvedBaseType.BaseType;
             }
             while (baseTypes.Count > 0)
             {
                 var typeReference = baseTypes.Pop();
                 var typeDefinition = typeReference.Resolve();
-                foreach (var fieldDefinition in typeDefinition.Fields.Where(WillUnitySerialize))
+                if (typeDefinition != null)
                 {
-                    if (!IsHiddenByParentClass(baseTypes, fieldDefinition, TypeDef))
+                    foreach (var fieldDefinition in typeDefinition.Fields.Where(WillUnitySerialize))
                     {
-                        nodes.AddRange(ProcessingFieldRef(ResolveGenericFieldReference(fieldDefinition)));
+                        if (!IsHiddenByParentClass(baseTypes, fieldDefinition, TypeDef))
+                        {
+                            nodes.AddRange(ProcessingFieldRef(ResolveGenericFieldReference(fieldDefinition)));
+                        }
                     }
                 }
 
@@ -90,7 +109,7 @@ namespace AssetStudio
 
         private static bool IsHiddenByParentClass(IEnumerable<TypeReference> parentTypes, FieldDefinition fieldDefinition, TypeDefinition processingType)
         {
-            return processingType.Fields.Any(f => f.Name == fieldDefinition.Name) || parentTypes.Any(t => t.Resolve().Fields.Any(f => f.Name == fieldDefinition.Name));
+            return processingType.Fields.Any(f => f.Name == fieldDefinition.Name) || parentTypes.Any(t => t.Resolve()?.Fields.Any(f => f.Name == fieldDefinition.Name) == true);
         }
 
         private IEnumerable<FieldDefinition> FilteredFields()
@@ -98,7 +117,7 @@ namespace AssetStudio
             return TypeDef.Fields.Where(WillUnitySerialize).Where(f =>
                 UnitySerializationLogic.IsSupportedCollection(f.FieldType) ||
                 !f.FieldType.IsGenericInstance ||
-                UnitySerializationLogic.ShouldImplementIDeserializable(f.FieldType.Resolve()));
+                (f.FieldType.Resolve() is TypeDefinition resolved && UnitySerializationLogic.ShouldImplementIDeserializable(resolved)));
         }
 
         private FieldReference ResolveGenericFieldReference(FieldReference fieldRef)
@@ -135,7 +154,7 @@ namespace AssetStudio
 
         private static bool IsEnum(TypeReference typeRef)
         {
-            return !typeRef.IsArray && typeRef.Resolve().IsEnum;
+            return !typeRef.IsArray && typeRef.Resolve()?.IsEnum == true;
         }
 
         private static bool RequiresAlignment(TypeReference typeRef)
@@ -161,17 +180,21 @@ namespace AssetStudio
 
         private List<TypeTreeNode> TypeRefToTypeTreeNodes(TypeReference typeRef, string name, int indent, bool isElement)
         {
+            var nodes = new List<TypeTreeNode>();
+            if (typeRef == null || indent > MaxIndentDepth)
+            {
+                return nodes;
+            }
+
             var align = false;
 
-            if (!IsStruct(TypeDef) || !UnityEngineTypePredicates.IsUnityEngineValueType(TypeDef))
+            if (TypeDef == null || !IsStruct(TypeDef) || !UnityEngineTypePredicates.IsUnityEngineValueType(TypeDef))
             {
                 if (IsStruct(typeRef) || RequiresAlignment(typeRef))
                 {
                     align = true;
                 }
             }
-
-            var nodes = new List<TypeTreeNode>();
             if (typeRef.IsPrimitive)
             {
                 var primitiveName = typeRef.Name;
@@ -282,8 +305,11 @@ namespace AssetStudio
             {
                 nodes.Add(new TypeTreeNode(typeRef.Name, name, indent, align));
                 var typeDef = typeRef.Resolve();
-                var typeDefinitionConverter = new TypeDefinitionConverter(typeDef, Helper, indent + 1);
-                nodes.AddRange(typeDefinitionConverter.ConvertToTypeTreeNodes());
+                if (typeDef != null && indent < MaxIndentDepth)
+                {
+                    var typeDefinitionConverter = new TypeDefinitionConverter(typeDef, Helper, indent + 1);
+                    nodes.AddRange(typeDefinitionConverter.ConvertToTypeTreeNodes());
+                }
             }
 
             return nodes;

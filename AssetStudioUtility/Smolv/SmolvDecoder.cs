@@ -52,7 +52,7 @@ namespace Smolv
 			}
 
 			int bufferSize = GetDecodedBufferSize(data);
-			if (bufferSize == 0)
+			if (bufferSize <= 0)
 			{
 				// invalid SMOL-V
 				return null;
@@ -79,7 +79,7 @@ namespace Smolv
 			}
 
 			int bufferSize = GetDecodedBufferSize(data);
-			if (bufferSize > output.Length)
+			if (bufferSize <= 0 || bufferSize > output.Length)
 			{
 				return false;
 			}
@@ -112,7 +112,7 @@ namespace Smolv
 			{
 				throw new ArgumentNullException(nameof(outputStream));
 			}
-			if (inputStream.Length < HeaderSize)
+			if (inputSize < HeaderSize || inputStream.Position + HeaderSize > inputStream.Length)
 			{
 				return false;
 			}
@@ -121,7 +121,7 @@ namespace Smolv
 			{
 				using (BinaryWriter output = new BinaryWriter(outputStream, Encoding.UTF8, true))
 				{
-					long inputEndPosition = input.BaseStream.Position + inputSize;
+					long inputEndPosition = Math.Min(input.BaseStream.Length, input.BaseStream.Position + inputSize);
 					long outputStartPosition = output.BaseStream.Position;
 
 					// Header
@@ -217,6 +217,10 @@ namespace Smolv
 
 						if (wasSwizzle && instrLen <= 9)
 						{
+							if (input.BaseStream.Position >= input.BaseStream.Length)
+							{
+								return false;
+							}
 							uint swizzle = input.ReadByte();
 							if (instrLen > 5) output.Write(swizzle >> 6);
 							if (instrLen > 6) output.Write((swizzle >> 4) & 3);
@@ -302,20 +306,20 @@ namespace Smolv
 		{
 			uint v = 0;
 			int shift = 0;
-			while (input.BaseStream.Position < input.BaseStream.Length)
+			while (input.BaseStream.Position < input.BaseStream.Length && shift < 35)
 			{
 				byte b = input.ReadByte();
 				v |= unchecked((uint)(b & 127) << shift);
 				shift += 7;
 				if ((b & 128) == 0)
 				{
-					break;
+					value = v;
+					return true;
 				}
 			}
 
-			value = v;
-			// @TODO: report failures
-			return true;
+			value = 0;
+			return false;
 		}
 
 		private static bool ReadLengthOp(BinaryReader input, out uint len, out SpvOp op)

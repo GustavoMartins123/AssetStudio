@@ -65,8 +65,9 @@ namespace AssetStudio
             bw.Write((uint)0);
 
             var nameBytes = Encoding.UTF8.GetBytes(node.Identifier?.Value ?? "");
-            bw.Write((byte)nameBytes.Length);
-            bw.Write(nameBytes);
+            int nameLen = Math.Min(nameBytes.Length, 255);
+            bw.Write((byte)nameLen);
+            bw.Write(nameBytes, 0, nameLen);
 
             long propStart = bw.BaseStream.Position;
             foreach (var prop in node.Properties)

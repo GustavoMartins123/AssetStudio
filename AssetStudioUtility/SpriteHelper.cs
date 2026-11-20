@@ -43,15 +43,23 @@ namespace AssetStudio
                     {
                         var width = (int)(m_Texture2D.m_Width / downscaleMultiplier);
                         var height = (int)(m_Texture2D.m_Height / downscaleMultiplier);
+                        if (width <= 0 || height <= 0)
+                        {
+                            return null;
+                        }
                         originalImage.Mutate(x => x.Resize(width, height));
                     }
-                    var rectX = (int)Math.Floor(textureRect.x);
-                    var rectY = (int)Math.Floor(textureRect.y);
-                    var rectRight = (int)Math.Ceiling(textureRect.x + textureRect.width);
-                    var rectBottom = (int)Math.Ceiling(textureRect.y + textureRect.height);
-                    rectRight = Math.Min(rectRight, originalImage.Width);
-                    rectBottom = Math.Min(rectBottom, originalImage.Height);
-                    var rect = new Rectangle(rectX, rectY, rectRight - rectX, rectBottom - rectY);
+                    var rectX = Math.Max(0, (int)Math.Floor(textureRect.x));
+                    var rectY = Math.Max(0, (int)Math.Floor(textureRect.y));
+                    var rectRight = Math.Min((int)Math.Ceiling(textureRect.x + textureRect.width), originalImage.Width);
+                    var rectBottom = Math.Min((int)Math.Ceiling(textureRect.y + textureRect.height), originalImage.Height);
+                    var rectWidth = rectRight - rectX;
+                    var rectHeight = rectBottom - rectY;
+                    if (rectWidth <= 0 || rectHeight <= 0)
+                    {
+                        return null;
+                    }
+                    var rect = new Rectangle(rectX, rectY, rectWidth, rectHeight);
                     var spriteImage = originalImage.Clone(x => x.Crop(rect));
                     if (settingsRaw.packed == 1)
                     {

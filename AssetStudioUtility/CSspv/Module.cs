@@ -2,30 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
 
 namespace SpirV
 {
 	public class Module
 	{
-		[StructLayout(LayoutKind.Explicit)]
-		private struct FloatUIntUnion
-		{
-			[FieldOffset(0)]
-			public uint Int;
-			[FieldOffset(0)]
-			public float Float;
-		}
-
-		[StructLayout(LayoutKind.Explicit)]
-		private struct DoubleULongUnion
-		{
-			[FieldOffset(0)]
-			public ulong Long;
-			[FieldOffset(0)]
-			public double Double;
-		}
-
 		public Module(ModuleHeader header, IReadOnlyList<ParsedInstruction> instructions)
 		{
 			Header = header;
@@ -389,11 +370,11 @@ namespace SpirV
 					{
 						if (f.Width == 32)
 						{
-							return new FloatUIntUnion { Int = words[0] }.Float;
+							return BitConverter.UInt32BitsToSingle(words[index]);
 						}
 						else if (f.Width == 64)
 						{
-							return new DoubleULongUnion { Long = (words[index] | (ulong)(words[index + 1]) << 32) }.Double;
+							return BitConverter.UInt64BitsToDouble(words[index] | (ulong)(words[index + 1]) << 32);
 						}
 						else
 						{

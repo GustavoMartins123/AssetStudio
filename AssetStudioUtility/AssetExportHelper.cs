@@ -397,9 +397,16 @@ TextureImporter:
             {
                 return string.Empty;
             }
-            return value.IndexOfAny(new[] { ':', '#', '{', '}', '[', ']', ',', '"' }) >= 0
-                ? "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
-                : value;
+            if (value.IndexOfAny(new[] { ':', '#', '{', '}', '[', ']', ',', '"', '\r', '\n', '\t', '\\' }) >= 0)
+            {
+                return "\"" + value
+                    .Replace("\\", "\\\\")
+                    .Replace("\"", "\\\"")
+                    .Replace("\r", "\\r")
+                    .Replace("\n", "\\n")
+                    .Replace("\t", "\\t") + "\"";
+            }
+            return value;
         }
 
         private static string F(float value)
@@ -410,8 +417,84 @@ TextureImporter:
 
         public static string FixFileName(string name)
         {
-            if (name.Length >= 260) return Path.GetRandomFileName();
-            return Path.GetInvalidFileNameChars().Aggregate(name, (current, c) => current.Replace(c, '_'));
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return "unnamed";
+            }
+
+            var invalidChars = Path.GetInvalidFileNameChars();
+            var builder = new StringBuilder(name.Length);
+            foreach (var character in name)
+            {
+                if (character < 32
+                    || character == '<' || character == '>' || character == ':'
+                    || character == '"' || character == '/' || character == '\\'
+                    || character == '|' || character == '?' || character == '*'
+                    || Array.IndexOf(invalidChars, character) >= 0)
+                {
+                    builder.Append('_');
+                }
+                else
+                {
+                    builder.Append(character);
+                }
+            }
+
+            name = builder.ToString().Replace("..", "_").Trim().TrimEnd('.');
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return "unnamed";
+            }
+
+            var dotIndex = name.IndexOf('.');
+            var deviceName = (dotIndex >= 0 ? name.Substring(0, dotIndex) : name).ToUpperInvariant();
+            switch (deviceName)
+            {
+                case "CON":
+                case "PRN":
+                case "AUX":
+                case "NUL":
+                case "COM1":
+                case "COM2":
+                case "COM3":
+                case "COM4":
+                case "COM5":
+                case "COM6":
+                case "COM7":
+                case "COM8":
+                case "COM9":
+                case "LPT1":
+                case "LPT2":
+                case "LPT3":
+                case "LPT4":
+                case "LPT5":
+                case "LPT6":
+                case "LPT7":
+                case "LPT8":
+                case "LPT9":
+                    name = "_" + name;
+                    break;
+            }
+
+            if (name.Length > 180)
+            {
+                var ext = Path.GetExtension(name);
+                if (!string.IsNullOrEmpty(ext) && ext.Length <= 16)
+                {
+                    var stem = name.Substring(0, Math.Max(1, 180 - ext.Length)).TrimEnd(' ', '.');
+                    name = (string.IsNullOrWhiteSpace(stem) ? "unnamed" : stem) + ext;
+                }
+                else
+                {
+                    name = name.Substring(0, 180).TrimEnd(' ', '.');
+                    if (string.IsNullOrWhiteSpace(name))
+                    {
+                        return "unnamed";
+                    }
+                }
+            }
+
+            return name;
         }
 
         #region Animation
@@ -461,11 +544,21 @@ TextureImporter:
 
         private static string GetTransformPath(Transform transform)
         {
+            return GetTransformPath(transform, new HashSet<Transform>());
+        }
+
+        private static string GetTransformPath(Transform transform, HashSet<Transform> visited)
+        {
+            if (transform == null || !visited.Add(transform))
+            {
+                return "";
+            }
             if (transform.m_GameObject.TryGet(out var m_GameObject))
             {
-                if (transform.m_Father.TryGet(out var father))
+                if (transform.m_Father.TryGet(out var father) && !visited.Contains(father))
                 {
-                    return GetTransformPath(father) + "/" + m_GameObject.m_Name;
+                    var fatherPath = GetTransformPath(father, visited);
+                    return string.IsNullOrEmpty(fatherPath) ? m_GameObject.m_Name : fatherPath + "/" + m_GameObject.m_Name;
                 }
                 return m_GameObject.m_Name;
             }
@@ -2089,7 +2182,7 @@ ModelImporter:
                     sb.AppendLine("      m_PreInfinity: 2");
                     sb.AppendLine("      m_PostInfinity: 2");
                     sb.AppendLine("      m_RotationOrder: 4");
-                    sb.AppendLine($"    path: {path}");
+                    sb.AppendLine($"    path: {YamlString(path)}");
                 }
             }
 
@@ -2118,7 +2211,7 @@ ModelImporter:
                     sb.AppendLine("      m_PreInfinity: 2");
                     sb.AppendLine("      m_PostInfinity: 2");
                     sb.AppendLine("      m_RotationOrder: 4");
-                    sb.AppendLine($"    path: {path}");
+                    sb.AppendLine($"    path: {YamlString(path)}");
                 }
             }
 
@@ -2147,7 +2240,7 @@ ModelImporter:
                     sb.AppendLine("      m_PreInfinity: 2");
                     sb.AppendLine("      m_PostInfinity: 2");
                     sb.AppendLine("      m_RotationOrder: 4");
-                    sb.AppendLine($"    path: {path}");
+                    sb.AppendLine($"    path: {YamlString(path)}");
                 }
             }
 
@@ -2201,26 +2294,6 @@ ModelImporter:
 
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
             File.WriteAllText(outputPath, sb.ToString(), Encoding.UTF8);
-        }
-
-        public static void GenerateUnityGuide(string folderPath, string modelName)
-        {
-            var guidePath = Path.Combine(folderPath, "UNITY_GUIDE.md");
-            var text = $@"# Unity Integration Guide - {modelName}
-
-This asset was exported for **Unity Engine** with automatic **Humanoid Rig** configuration and native `.anim` clips.
-
----
-
-## 📁 File Structure
-
-- **`{modelName}.fbx`**: Clean Autodesk Binary 7400 FBX model.
-- **`{modelName}.fbx.meta`**: Pre-configured Unity Humanoid Rig importer settings.
-- **`*.fbx` / `*.fbx.meta`**: Humanoid animation clips in FBX format.
-- **`*.anim`**: Native Unity YAML AnimationClips ready to drag & drop into any Animator Controller.
-Exported by AssetStudio.
-";
-            File.WriteAllText(guidePath, text, Encoding.UTF8);
         }
         #endregion
     }

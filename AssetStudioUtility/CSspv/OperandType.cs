@@ -170,7 +170,7 @@ namespace SpirV
 							object[] resultItems = new object[p.OperandTypes.Count];
 							for (int j = 0; j < p.OperandTypes.Count; ++j)
 							{
-								p.OperandTypes[j].ReadValue(words, 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
+								p.OperandTypes[j].ReadValue(words, index + 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
 								wordsUsedForParameters += pWordsUsed;
 								resultItems[j] = pValue;
 							}
@@ -193,7 +193,7 @@ namespace SpirV
 					resultItems = new object[p.OperandTypes.Count];
 					for (int j = 0; j < p.OperandTypes.Count; ++j)
 					{
-						p.OperandTypes[j].ReadValue(words, 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
+						p.OperandTypes[j].ReadValue(words, index + 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
 						wordsUsedForParameters += pWordsUsed;
 						resultItems[j] = pValue;
 					}

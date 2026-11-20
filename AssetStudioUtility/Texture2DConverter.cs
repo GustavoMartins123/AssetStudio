@@ -24,17 +24,25 @@ namespace AssetStudio
             m_TextureFormat = m_Texture2D.m_TextureFormat;
             version = m_Texture2D.version;
             platform = m_Texture2D.platform;
-            outPutSize = m_Width * m_Height * 4;
+            long expectedOutput = (m_Width > 0 && m_Height > 0) ? (long)m_Width * m_Height * 4 : 0;
+            outPutSize = expectedOutput <= int.MaxValue ? (int)expectedOutput : 0;
         }
 
         public bool DecodeTexture2D(byte[] bytes)
         {
-            if (reader.Size == 0 || m_Width == 0 || m_Height == 0)
+            if (bytes == null || reader.Size <= 0 || m_Width <= 0 || m_Height <= 0)
             {
                 return false;
             }
 
-            if (outPutSize >= 16 * 1024 * 1024 && GetFormatParams(m_TextureFormat, out _))
+            var minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
+            long expectedOutputSize = (long)m_Width * m_Height * 4;
+            if (minDataSize > int.MaxValue || expectedOutputSize <= 0 || expectedOutputSize > bytes.Length)
+            {
+                return false;
+            }
+
+            if (expectedOutputSize >= 16 * 1024 * 1024 && minDataSize > 0 && reader.Size >= minDataSize && GetFormatParams(m_TextureFormat, out _))
             {
                 try
                 {
@@ -49,7 +57,6 @@ namespace AssetStudio
                 }
             }
 
-            var minDataSize = GetMinimumDataSize(m_TextureFormat, m_Width, m_Height);
             var truncated = minDataSize > 0 && reader.Size < minDataSize;
             if (truncated)
             {
@@ -544,7 +551,7 @@ namespace AssetStudio
             {
                 buff[i] = 0;
                 buff[i + 1] = 0;
-                buff[i + 2] = (byte)Math.Round(Half.ToHalf(image_data, i / 2) * 255f);
+                buff[i + 2] = FloatToByte((float)BitConverter.ToHalf(image_data, i / 2));
                 buff[i + 3] = 255;
             }
             return true;
@@ -555,8 +562,8 @@ namespace AssetStudio
             for (var i = 0; i < outPutSize; i += 4)
             {
                 buff[i] = 0;
-                buff[i + 1] = (byte)Math.Round(Half.ToHalf(image_data, i + 2) * 255f);
-                buff[i + 2] = (byte)Math.Round(Half.ToHalf(image_data, i) * 255f);
+                buff[i + 1] = FloatToByte((float)BitConverter.ToHalf(image_data, i + 2));
+                buff[i + 2] = FloatToByte((float)BitConverter.ToHalf(image_data, i));
                 buff[i + 3] = 255;
             }
             return true;
@@ -566,10 +573,10 @@ namespace AssetStudio
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                buff[i] = (byte)Math.Round(Half.ToHalf(image_data, i * 2 + 4) * 255f);
-                buff[i + 1] = (byte)Math.Round(Half.ToHalf(image_data, i * 2 + 2) * 255f);
-                buff[i + 2] = (byte)Math.Round(Half.ToHalf(image_data, i * 2) * 255f);
-                buff[i + 3] = (byte)Math.Round(Half.ToHalf(image_data, i * 2 + 6) * 255f);
+                buff[i] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2 + 4));
+                buff[i + 1] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2 + 2));
+                buff[i + 2] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2));
+                buff[i + 3] = FloatToByte((float)BitConverter.ToHalf(image_data, i * 2 + 6));
             }
             return true;
         }
@@ -634,7 +641,11 @@ namespace AssetStudio
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static byte FloatToByte(float value)
         {
-            return ClampByte((int)Math.Round(value * 255f));
+            if (float.IsNaN(value) || value <= 0f)
+                return 0;
+            if (value >= 1f)
+                return 255;
+            return (byte)Math.Round(value * 255f);
         }
 
         private bool DecodeYUY2(byte[] image_data, byte[] buff)
@@ -707,7 +718,8 @@ namespace AssetStudio
 
         private bool DecodeDXT1Crunched(byte[] image_data, byte[] buff)
         {
-            if (UnpackCrunch(image_data, out var result))
+            if (UnpackCrunch(image_data, out var result)
+                && result.Length >= GetMinimumDataSize(TextureFormat.DXT1, m_Width, m_Height))
             {
                 if (DecodeDXT1(result, buff))
                 {
@@ -719,7 +731,8 @@ namespace AssetStudio
 
         private bool DecodeDXT5Crunched(byte[] image_data, byte[] buff)
         {
-            if (UnpackCrunch(image_data, out var result))
+            if (UnpackCrunch(image_data, out var result)
+                && result.Length >= GetMinimumDataSize(TextureFormat.DXT5, m_Width, m_Height))
             {
                 if (DecodeDXT5(result, buff))
                 {
@@ -817,7 +830,8 @@ namespace AssetStudio
 
         private bool DecodeETC1Crunched(byte[] image_data, byte[] buff)
         {
-            if (UnpackCrunch(image_data, out var result))
+            if (UnpackCrunch(image_data, out var result)
+                && result.Length >= GetMinimumDataSize(TextureFormat.ETC_RGB4, m_Width, m_Height))
             {
                 if (DecodeETC1(result, buff))
                 {
@@ -829,7 +843,8 @@ namespace AssetStudio
 
         private bool DecodeETC2A8Crunched(byte[] image_data, byte[] buff)
         {
-            if (UnpackCrunch(image_data, out var result))
+            if (UnpackCrunch(image_data, out var result)
+                && result.Length >= GetMinimumDataSize(TextureFormat.ETC2_RGBA8, m_Width, m_Height))
             {
                 if (DecodeETC2A8(result, buff))
                 {
@@ -902,10 +917,14 @@ namespace AssetStudio
         }
         private static long GetMinimumDataSize(TextureFormat format, int width, int height)
         {
+            if (width <= 0 || height <= 0)
+            {
+                return 0;
+            }
             long pixels = (long)width * height;
-            int bw = (width + 3) / 4;
-            int bh = (height + 3) / 4;
-            long blocks = (long)bw * bh;
+            long bw = ((long)width + 3) / 4;
+            long bh = ((long)height + 3) / 4;
+            long blocks = bw * bh;
             switch (format)
             {
                 case TextureFormat.Alpha8:
@@ -918,6 +937,7 @@ namespace AssetStudio
                 case TextureFormat.RG16:
                     return pixels * 2;
                 case TextureFormat.RGB24:
+                case TextureFormat.BGR24:
                     return pixels * 3;
                 case TextureFormat.RGBA32:
                 case TextureFormat.ARGB32:
@@ -938,7 +958,10 @@ namespace AssetStudio
                     return pixels * 4;
                 case TextureFormat.RGFloat:
                     return pixels * 8;
+                case TextureFormat.RGBFloat:
+                    return pixels * 12;
                 case TextureFormat.RGBAFloat:
+                case TextureFormat.ARGBFloat:
                     return pixels * 16;
                 case TextureFormat.YUY2:
                     return pixels * 2;
@@ -968,33 +991,33 @@ namespace AssetStudio
                 case TextureFormat.ASTC_RGB_4x4:
                 case TextureFormat.ASTC_RGBA_4x4:
                 case TextureFormat.ASTC_HDR_4x4:
-                    return (long)((width + 3) / 4) * ((height + 3) / 4) * 16;
+                    return (((long)width + 3) / 4) * (((long)height + 3) / 4) * 16;
                 case TextureFormat.ASTC_RGB_5x5:
                 case TextureFormat.ASTC_RGBA_5x5:
                 case TextureFormat.ASTC_HDR_5x5:
-                    return (long)((width + 4) / 5) * ((height + 4) / 5) * 16;
+                    return (((long)width + 4) / 5) * (((long)height + 4) / 5) * 16;
                 case TextureFormat.ASTC_RGB_6x6:
                 case TextureFormat.ASTC_RGBA_6x6:
                 case TextureFormat.ASTC_HDR_6x6:
-                    return (long)((width + 5) / 6) * ((height + 5) / 6) * 16;
+                    return (((long)width + 5) / 6) * (((long)height + 5) / 6) * 16;
                 case TextureFormat.ASTC_RGB_8x8:
                 case TextureFormat.ASTC_RGBA_8x8:
                 case TextureFormat.ASTC_HDR_8x8:
-                    return (long)((width + 7) / 8) * ((height + 7) / 8) * 16;
+                    return (((long)width + 7) / 8) * (((long)height + 7) / 8) * 16;
                 case TextureFormat.ASTC_RGB_10x10:
                 case TextureFormat.ASTC_RGBA_10x10:
                 case TextureFormat.ASTC_HDR_10x10:
-                    return (long)((width + 9) / 10) * ((height + 9) / 10) * 16;
+                    return (((long)width + 9) / 10) * (((long)height + 9) / 10) * 16;
                 case TextureFormat.ASTC_RGB_12x12:
                 case TextureFormat.ASTC_RGBA_12x12:
                 case TextureFormat.ASTC_HDR_12x12:
-                    return (long)((width + 11) / 12) * ((height + 11) / 12) * 16;
+                    return (((long)width + 11) / 12) * (((long)height + 11) / 12) * 16;
                 case TextureFormat.PVRTC_RGB2:
                 case TextureFormat.PVRTC_RGBA2:
-                    return Math.Max(pixels / 4, 2);
+                    return (((long)width + 7) / 8) * (((long)height + 3) / 4) * 8;
                 case TextureFormat.PVRTC_RGB4:
                 case TextureFormat.PVRTC_RGBA4:
-                    return Math.Max(pixels / 2, 2);
+                    return blocks * 8;
                 case TextureFormat.ATC_RGB4:
                     return blocks * 8;
                 case TextureFormat.ATC_RGBA8:
@@ -1239,8 +1262,9 @@ namespace AssetStudio
                         // Read row of blocks
                         reader.ReadSegment(offset, compressedRow, 0, rowBytes);
 
-                        // Xbox 360 swap bytes
-                        if (platform == BuildTarget.XBOX360)
+                        // Xbox 360 swap bytes (only DXT1/DXT3/DXT5 among compressed formats)
+                        if (platform == BuildTarget.XBOX360 &&
+                            (m_TextureFormat == TextureFormat.DXT1 || m_TextureFormat == TextureFormat.DXT3 || m_TextureFormat == TextureFormat.DXT5))
                         {
                             for (var i = 0; i < rowBytes / 2; i++)
                             {
@@ -1314,6 +1338,18 @@ namespace AssetStudio
                                         bytes[outIdx] = tempRow[x * 3 + 2];
                                         bytes[outIdx + 1] = tempRow[x * 3 + 1];
                                         bytes[outIdx + 2] = tempRow[x * 3 + 0];
+                                        bytes[outIdx + 3] = 255;
+                                    }
+                                }
+                                break;
+                            case TextureFormat.BGR24:
+                                {
+                                    for (int x = 0; x < m_Width; x++)
+                                    {
+                                        int outIdx = (y * m_Width + x) * 4;
+                                        bytes[outIdx] = tempRow[x * 3 + 0];
+                                        bytes[outIdx + 1] = tempRow[x * 3 + 1];
+                                        bytes[outIdx + 2] = tempRow[x * 3 + 2];
                                         bytes[outIdx + 3] = 255;
                                     }
                                 }

@@ -80,7 +80,7 @@ namespace AssetStudio
                 _ => 1
             };
             IsStereo = NumChannels == 2;
-            DataOffset = (uint)((int)Bits(raw, 7, 27) * 32);
+            DataOffset = (uint)(Bits(raw, 7, 27) * 32UL);
             SampleCount = (uint)Bits(raw, 34, 30);
         }
 
@@ -136,9 +136,11 @@ namespace AssetStudio
             { 0, 0 }
         };
 
+        private const long MaxPcmSamples = 256L * 1024L * 1024L;
+
         public static byte[]? ConvertToWav(byte[] containerData)
         {
-            if (containerData == null || containerData.Length < 32)
+            if (containerData == null || containerData.Length < 60)
                 return null;
 
             using (var stream = new MemoryStream(containerData))
@@ -159,12 +161,24 @@ namespace AssetStudio
                 var codec = (UnityAudioCodec)codecValue;
 
                 uint headerSize = (version == 0) ? 64u : 60u;
-                
+                long sampleHeadersEnd = (long)headerSize + sizeOfSampleHeaders;
+                long audioDataStart = sampleHeadersEnd + sizeOfNameTable;
+                if (containerData.Length < headerSize
+                    || numSamples == 0
+                    || (long)numSamples * 8 > sizeOfSampleHeaders
+                    || sampleHeadersEnd > containerData.Length
+                    || audioDataStart > containerData.Length)
+                {
+                    return null;
+                }
+
                 // Read sample headers
                 stream.Position = headerSize;
                 var sampleMetadatas = new List<UnityAudioSampleMetadata>((int)numSamples);
                 for (int i = 0; i < numSamples; i++)
                 {
+                    if (stream.Position + 8 > sampleHeadersEnd)
+                        return null;
                     var meta = new UnityAudioSampleMetadata();
                     meta.Read(reader);
                     sampleMetadatas.Add(meta);
@@ -179,11 +193,17 @@ namespace AssetStudio
                         bool moreChunks = true;
                         while (moreChunks)
                         {
+                            if (stream.Position + 4 > sampleHeadersEnd)
+                                return null;
                             uint rawChunk = reader.ReadUInt32();
                             moreChunks = (rawChunk & 1) == 1;
                             uint chunkSize = (rawChunk >> 1) & 0xFFFFFF;
                             uint chunkType = (rawChunk >> 25) & 0x7F;
+                            if (chunkSize > sampleHeadersEnd - stream.Position)
+                                return null;
                             byte[] chunkData = reader.ReadBytes((int)chunkSize);
+                            if (chunkData.Length < chunkSize)
+                                return null;
                             meta.Chunks.Add(new UnityAudioChunk(chunkType, chunkData));
 
                             // Override frequency if FREQUENCY chunk (type 2)
@@ -201,20 +221,19 @@ namespace AssetStudio
                     }
                 }
 
-                if (numSamples == 0)
-                    return null;
-
                 // For simplicity, we decode the first sample.
                 var activeSample = sampleMetadatas[0];
-                long audioDataStart = headerSize + sizeOfSampleHeaders + sizeOfNameTable;
+                if (activeSample.NumChannels <= 0 || activeSample.NumChannels > 16 || activeSample.Frequency <= 0)
+                    return null;
+
                 long sampleOffset = audioDataStart + activeSample.DataOffset;
-                long sampleSize = sizeOfData - activeSample.DataOffset;
+                long sampleSize = (long)sizeOfData - activeSample.DataOffset;
                 if (numSamples > 1)
                 {
-                    sampleSize = sampleMetadatas[1].DataOffset - activeSample.DataOffset;
+                    sampleSize = (long)sampleMetadatas[1].DataOffset - activeSample.DataOffset;
                 }
 
-                if (sampleOffset + sampleSize > containerData.Length)
+                if (sampleOffset < 0 || sampleSize <= 0 || sampleSize > int.MaxValue || sampleOffset > containerData.Length - sampleSize)
                 {
                     return null;
                 }
@@ -226,6 +245,11 @@ namespace AssetStudio
 
                 if (codec == UnityAudioCodec.ImaAdpcm)
                 {
+                    long totalSamples = (long)activeSample.SampleCount * activeSample.NumChannels;
+                    long maxAllowedSamples = sampleSize * 2 + 64L * activeSample.NumChannels;
+                    if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
+                        return null;
+
                     if (activeSample.NumChannels == 2)
                     {
                         decodedPcm = DecodeImaAdpcmStereo(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels);
@@ -241,6 +265,11 @@ namespace AssetStudio
                 }
                 else if (codec == UnityAudioCodec.Gcadpcm)
                 {
+                    long totalSamples = (long)activeSample.SampleCount * activeSample.NumChannels;
+                    long maxAllowedSamples = sampleSize * 2 + 64L * activeSample.NumChannels;
+                    if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
+                        return null;
+
                     // Find DSPCOEFF chunk (type 7)
                     UnityAudioChunk? dspCoeffChunk = activeSample.Chunks.Find(c => c.ChunkType == 7);
                     if (dspCoeffChunk != null)
@@ -259,7 +288,12 @@ namespace AssetStudio
                         UnityAudioCodec.Pcm32 => 4,
                         _ => 2
                     };
-                    int sampleLength = (int)activeSample.SampleCount * activeSample.NumChannels;
+                    long sampleLength64 = (long)activeSample.SampleCount * activeSample.NumChannels;
+                    long maxSamplesFromPayload = sampleSize / bytesPerSample + 1024;
+                    if (sampleLength64 <= 0 || sampleLength64 > MaxPcmSamples || sampleLength64 > maxSamplesFromPayload)
+                        return null;
+
+                    int sampleLength = (int)sampleLength64;
                     decodedPcm = new short[sampleLength];
                     for (int i = 0; i < sampleLength; i++)
                     {
@@ -284,7 +318,7 @@ namespace AssetStudio
                     }
                 }
 
-                if (decodedPcm == null)
+                if (decodedPcm == null || decodedPcm.Length == 0)
                     return null;
 
                 return CreateWavFile(decodedPcm, activeSample.Frequency, activeSample.NumChannels);
@@ -415,10 +449,15 @@ namespace AssetStudio
             return array;
         }
 
-        private static short[] DecodeFadpcm(byte[] sampleBytes, int channels)
+        private static short[]? DecodeFadpcm(byte[] sampleBytes, int channels)
         {
+            if (channels <= 0 || channels > 16)
+                return null;
             int numBlocks = sampleBytes.Length / 140;
-            short[] array = new short[numBlocks * 256];
+            long totalSamples = (long)numBlocks * 256;
+            if (numBlocks <= 0 || totalSamples > MaxPcmSamples)
+                return null;
+            short[] array = new short[totalSamples];
             int[] prev1 = new int[channels];
             int[] prev2 = new int[channels];
 
@@ -588,9 +627,12 @@ namespace AssetStudio
             return (uint)(data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24));
         }
 
-        private static byte[] CreateWavFile(short[] pcmSamples, int sampleRate, int channels)
+        private static byte[]? CreateWavFile(short[] pcmSamples, int sampleRate, int channels)
         {
-            int dataLength = pcmSamples.Length * 2;
+            long dataLength64 = (long)pcmSamples.Length * 2;
+            if (dataLength64 <= 0 || dataLength64 > int.MaxValue - 44)
+                return null;
+            int dataLength = (int)dataLength64;
             byte[] wavBytes = new byte[44 + dataLength];
 
             wavBytes[0] = (byte)'R'; wavBytes[1] = (byte)'I'; wavBytes[2] = (byte)'F'; wavBytes[3] = (byte)'F';

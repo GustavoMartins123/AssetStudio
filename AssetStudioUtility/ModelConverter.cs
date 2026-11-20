@@ -168,7 +168,12 @@ namespace AssetStudio
             else
             {
                 var frameList = new List<ImportedFrame>();
+                var visitedFathers = new HashSet<Transform>();
                 var tempTransform = m_Transform;
+                if (tempTransform != null)
+                {
+                    visitedFathers.Add(tempTransform);
+                }
                 while (tempTransform != null)
                 {
                     var fatherPtr = tempTransform.m_Father;
@@ -186,7 +191,7 @@ namespace AssetStudio
                             }
                         }
                     }
-                    if (m_Father == null)
+                    if (m_Father == null || !visitedFathers.Add(m_Father))
                         break;
                     frameList.Add(ConvertTransform(m_Father));
                     tempTransform = m_Father;
@@ -215,6 +220,14 @@ namespace AssetStudio
 
         private void ConvertMeshRenderer(Transform m_Transform)
         {
+            ConvertMeshRenderer(m_Transform, new HashSet<Transform>());
+        }
+
+        private void ConvertMeshRenderer(Transform m_Transform, HashSet<Transform> visited)
+        {
+            if (m_Transform == null || !visited.Add(m_Transform))
+                return;
+
             if (!m_Transform.m_GameObject.TryGet(out var m_GameObject))
             {
                 foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
@@ -282,7 +295,7 @@ namespace AssetStudio
                     }
                 }
                 if (child != null)
-                    ConvertMeshRenderer(child);
+                    ConvertMeshRenderer(child, visited);
             }
         }
 
@@ -602,7 +615,7 @@ namespace AssetStudio
                 var submesh = mesh.m_SubMeshes[i];
                 var iSubmesh = new ImportedSubmesh();
                 Material mat = null;
-                if (i - firstSubMesh < meshR.m_Materials.Length)
+                if (i - firstSubMesh >= 0 && i - firstSubMesh < meshR.m_Materials.Length)
                 {
                     var matPPtr = meshR.m_Materials[i - firstSubMesh];
                     if (matPPtr != null && !matPPtr.IsNull)
@@ -641,6 +654,10 @@ namespace AssetStudio
                 var end = firstFace + numFaces;
                 for (int f = firstFace; f < end; f++)
                 {
+                    if (f * 3 + 2 >= mesh.m_Indices.Count)
+                    {
+                        break;
+                    }
                     var face = new ImportedFace();
                     face.VertexIndices = new int[3];
                     face.VertexIndices[0] = (int)(mesh.m_Indices[f * 3 + 2] - submesh.firstVertex);
@@ -830,6 +847,8 @@ namespace AssetStudio
                         var frameEnd = shapeChannel.frameIndex + shapeChannel.frameCount;
                         for (int frameIdx = shapeChannel.frameIndex; frameIdx < frameEnd; frameIdx++)
                         {
+                            if (frameIdx < 0 || frameIdx >= mesh.m_Shapes.fullWeights.Length || frameIdx >= mesh.m_Shapes.shapes.Length)
+                                break;
                             var keyframe = new ImportedMorphKeyframe();
                             channel.KeyframeList.Add(keyframe);
                             keyframe.Weight = mesh.m_Shapes.fullWeights[frameIdx];
@@ -840,9 +859,12 @@ namespace AssetStudio
                             var vertexEnd = shape.firstVertex + shape.vertexCount;
                             for (uint j = shape.firstVertex; j < vertexEnd; j++)
                             {
-                                var destVertex = new ImportedMorphVertex();
-                                keyframe.VertexList.Add(destVertex);
+                                if (j >= (uint)mesh.m_Shapes.vertices.Length)
+                                    break;
                                 var morphVertex = mesh.m_Shapes.vertices[j];
+                                if (morphVertex.index >= (uint)iMesh.VertexList.Count)
+                                    continue;
+                                var destVertex = new ImportedMorphVertex();
                                 destVertex.Index = morphVertex.index;
                                 var sourceVertex = iMesh.VertexList[(int)morphVertex.index];
                                 destVertex.Vertex = new ImportedVertex();
@@ -858,6 +880,7 @@ namespace AssetStudio
                                     var morphTangent = morphVertex.tangent;
                                     destVertex.Vertex.Tangent = new Vector4(-morphTangent.X, morphTangent.Y, morphTangent.Z, 0);
                                 }
+                                keyframe.VertexList.Add(destVertex);
                             }
                         }
                     }
@@ -989,13 +1012,24 @@ namespace AssetStudio
 
         private static string GetTransformPathByFather(Transform transform)
         {
-            transform.m_GameObject.TryGet(out var m_GameObject);
-            if (transform.m_Father.TryGet(out var father))
+            return GetTransformPathByFather(transform, new HashSet<Transform>());
+        }
+
+        private static string GetTransformPathByFather(Transform transform, HashSet<Transform> visited)
+        {
+            if (transform == null || !visited.Add(transform))
             {
-                return GetTransformPathByFather(father) + "/" + m_GameObject.m_Name;
+                return "";
+            }
+            transform.m_GameObject.TryGet(out var m_GameObject);
+            var goName = m_GameObject?.m_Name ?? "";
+            if (transform.m_Father.TryGet(out var father) && !visited.Contains(father))
+            {
+                var fatherPath = GetTransformPathByFather(father, visited);
+                return string.IsNullOrEmpty(fatherPath) ? goName : fatherPath + "/" + goName;
             }
 
-            return m_GameObject.m_Name;
+            return goName;
         }
 
         private ImportedMaterial ConvertMaterial(Material mat)
@@ -1483,6 +1517,15 @@ namespace AssetStudio
 
         private void CreateBonePathHash(Transform m_Transform)
         {
+            CreateBonePathHash(m_Transform, new HashSet<Transform>());
+        }
+
+        private void CreateBonePathHash(Transform m_Transform, HashSet<Transform> visited)
+        {
+            if (m_Transform == null || !visited.Add(m_Transform))
+            {
+                return;
+            }
             var name = GetTransformPathByFather(m_Transform);
             var crc = new SevenZip.CRC();
             var bytes = Encoding.UTF8.GetBytes(name);
@@ -1500,7 +1543,7 @@ namespace AssetStudio
             foreach (var pptr in m_Transform.m_Children)
             {
                 if (pptr.TryGet(out var child))
-                    CreateBonePathHash(child);
+                    CreateBonePathHash(child, visited);
             }
         }
 

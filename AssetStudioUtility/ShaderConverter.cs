@@ -773,9 +773,9 @@ namespace AssetStudio
                 case ShaderCompilerPlatform.GLES20:
                     return programType == ShaderGpuProgramType.GLES;
                 case ShaderCompilerPlatform.NaCl: //Obsolete
-                    throw new NotSupportedException();
+                    return false;
                 case ShaderCompilerPlatform.Flash: //Obsolete
-                    throw new NotSupportedException();
+                    return false;
                 case ShaderCompilerPlatform.D3D11_9x:
                     return programType == ShaderGpuProgramType.DX10Level9Vertex
                         || programType == ShaderGpuProgramType.DX10Level9Pixel;
@@ -784,7 +784,7 @@ namespace AssetStudio
                         || programType == ShaderGpuProgramType.GLES31
                         || programType == ShaderGpuProgramType.GLES3;
                 case ShaderCompilerPlatform.PSM: //Unknown
-                    throw new NotSupportedException();
+                    return false;
                 case ShaderCompilerPlatform.Metal:
                     return programType == ShaderGpuProgramType.MetalVS
                         || programType == ShaderGpuProgramType.MetalFS;
@@ -795,7 +795,7 @@ namespace AssetStudio
                 case ShaderCompilerPlatform.Vulkan:
                     return programType == ShaderGpuProgramType.SPIRV;
                 default:
-                    throw new NotSupportedException();
+                    return false;
             }
         }
 
