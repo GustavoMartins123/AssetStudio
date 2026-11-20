@@ -172,23 +172,22 @@ public partial class MainWindow
         var assetsSnapshot = exportableAssets.ToArray();
 
         // Capture selection before filtering
-        var selectedUniqueIds = new HashSet<string>();
+        var selectedUniqueIds = new HashSet<string>(StringComparer.Ordinal);
         string? oldSelectedUniqueId = null;
         if (AssetListDataGrid.SelectedItems != null)
         {
             foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
             {
-                var id = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
+                var id = GetAssetUniqueKey(item);
                 if (!string.IsNullOrEmpty(id))
                 {
                     selectedUniqueIds.Add(id);
                 }
             }
 
-            var selectedItem = AssetListDataGrid.SelectedItem as AssetItem;
-            if (selectedItem != null)
+            if (AssetListDataGrid.SelectedItem is AssetItem selectedItem)
             {
-                oldSelectedUniqueId = selectedItem.Handle != null ? selectedItem.Handle.UniqueID : selectedItem.UniqueID;
+                oldSelectedUniqueId = GetAssetUniqueKey(selectedItem);
             }
         }
 
@@ -211,29 +210,8 @@ public partial class MainWindow
                 ReplaceVisibleAssetsOwned(result);
                 StatusStripUpdate($"Showing {visibleAssets.Count} assets");
 
-                // Restore selection
-                if (selectedUniqueIds.Count > 0)
-                {
-                    var newSelectedItems = new List<AssetItem>();
-                    foreach (var item in visibleAssets)
-                    {
-                        var id = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
-                        if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
-                        {
-                            newSelectedItems.Add(item);
-                        }
-                    }
-
-                    var selectedItems = AssetListDataGrid.SelectedItems;
-                    if (selectedItems != null)
-                    {
-                        selectedItems.Clear();
-                        foreach (var item in newSelectedItems)
-                        {
-                            selectedItems.Add(item);
-                        }
-                    }
-                }
+                // Restore selection if DataGrid Reset did not already retain all matching items (e.g. re-materialized instances).
+                RestoreSelectionIfNeeded(selectedUniqueIds);
             }
             finally
             {
@@ -262,7 +240,7 @@ public partial class MainWindow
                     preloaderCts?.Cancel();
                 }
             }
-            var newSelectedUniqueId = newSelectedItem != null ? (newSelectedItem.Handle != null ? newSelectedItem.Handle.UniqueID : newSelectedItem.UniqueID) : null;
+            var newSelectedUniqueId = GetAssetUniqueKey(newSelectedItem);
             if (newSelectedUniqueId != oldSelectedUniqueId)
             {
                 _currentlySelectedUniqueID = newSelectedUniqueId;
@@ -297,18 +275,104 @@ public partial class MainWindow
     {
         var sortMember = assetListSortMember;
         var sortDescending = assetListSortDescending;
-        var currentAssets = visibleAssets.ToList();
+        var currentAssets = new List<AssetItem>(visibleAssets);
+        var selectedUniqueIds = new HashSet<string>(StringComparer.Ordinal);
+        if (AssetListDataGrid.SelectedItems != null)
+        {
+            foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
+            {
+                var id = GetAssetUniqueKey(item);
+                if (!string.IsNullOrEmpty(id))
+                {
+                    selectedUniqueIds.Add(id);
+                }
+            }
+        }
 
         try
         {
             var sorted = await Task.Run(() => AssetListQuery.SortInPlace(currentAssets, sortMember, sortDescending));
-            ReplaceVisibleAssetsOwned(sorted);
-            StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+            isRefreshingFilterList = true;
+            try
+            {
+                ReplaceVisibleAssetsOwned(sorted);
+                RestoreSelectionIfNeeded(selectedUniqueIds);
+                StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+            }
+            finally
+            {
+                isRefreshingFilterList = false;
+            }
         }
         catch (Exception ex)
         {
             Logger.Error("Error sorting asset list", ex);
             StatusStripUpdate("Error sorting asset list. See error log.");
+        }
+    }
+
+    private static string? GetAssetUniqueKey(AssetItem? item)
+    {
+        if (item == null)
+        {
+            return null;
+        }
+
+        return item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
+    }
+
+    private void RestoreSelectionIfNeeded(HashSet<string> selectedUniqueIds)
+    {
+        if (selectedUniqueIds.Count == 0)
+        {
+            return;
+        }
+
+        var selectedItems = AssetListDataGrid.SelectedItems;
+        if (selectedItems == null)
+        {
+            return;
+        }
+
+        // VirtualAssetList keeps ItemsSource stable across Reset so DataGrid preserves surviving references automatically.
+        // Verify whether all surviving items are already selected; only scan visibleAssets if references were replaced.
+        if (selectedItems.Count > 0)
+        {
+            var preservedCount = 0;
+            foreach (var item in selectedItems.OfType<AssetItem>())
+            {
+                var id = GetAssetUniqueKey(item);
+                if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+                {
+                    preservedCount++;
+                }
+            }
+
+            if (preservedCount == selectedUniqueIds.Count || preservedCount == selectedItems.Count)
+            {
+                return;
+            }
+        }
+
+        var newSelectedItems = new List<AssetItem>();
+        foreach (var item in visibleAssets)
+        {
+            var id = GetAssetUniqueKey(item);
+            if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+            {
+                newSelectedItems.Add(item);
+            }
+        }
+
+        if (newSelectedItems.Count == 0 && selectedItems.Count == 0)
+        {
+            return;
+        }
+
+        selectedItems.Clear();
+        foreach (var item in newSelectedItems)
+        {
+            selectedItems.Add(item);
         }
     }
 
@@ -377,7 +441,7 @@ public partial class MainWindow
 
     private void EnsureAssetListItemsSource()
     {
-        if (AssetListDataGrid.ItemsSource != visibleAssetItems)
+        if (!ReferenceEquals(AssetListDataGrid.ItemsSource, visibleAssetItems))
         {
             AssetListDataGrid.ItemsSource = visibleAssetItems;
         }
@@ -385,8 +449,8 @@ public partial class MainWindow
 
     private void RefreshAssetListItems()
     {
-        visibleAssetItems = new BulkObservableCollection<AssetItem>(visibleAssets);
         EnsureAssetListItemsSource();
+        visibleAssetItems.ReplaceBacking(visibleAssets);
     }
 
     private void UpdateAssetListSortHeaderIndicators()
@@ -424,7 +488,7 @@ public partial class MainWindow
             .Select(x => (ClassIDType)x.Tag!)
             .ToHashSet() : null;
 
-        visibleAssetItems.BeginUpdate();
+        var updated = false;
         try
         {
             foreach (var x in newItems)
@@ -454,29 +518,52 @@ public partial class MainWindow
                     continue;
                 }
 
+                if (!updated)
+                {
+                    visibleAssetItems.BeginUpdate();
+                    if (!visibleAssetItems.IsBackedBy(visibleAssets))
+                    {
+                        visibleAssetItems.ReplaceBacking(visibleAssets);
+                    }
+                    updated = true;
+                }
+
                 AddVisibleAssetItem(x);
             }
         }
         finally
         {
-            visibleAssetItems.EndUpdate();
+            if (updated)
+            {
+                visibleAssetItems.EndUpdate();
+            }
         }
 
-        StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+        if (updated)
+        {
+            StatusStripUpdate($"Showing {visibleAssets.Count} assets");
+        }
     }
 
     private void AddVisibleAssetItem(AssetItem item)
     {
+        var sharedBacking = visibleAssetItems.IsBackedBy(visibleAssets);
         if (string.IsNullOrEmpty(assetListSortMember))
         {
             visibleAssets.Add(item);
-            visibleAssetItems.Add(item);
+            if (!sharedBacking)
+            {
+                visibleAssetItems.Add(item);
+            }
             return;
         }
 
         var insertIndex = FindSortedInsertIndex(visibleAssets, item, assetListSortMember, assetListSortDescending);
         visibleAssets.Insert(insertIndex, item);
-        visibleAssetItems.Insert(insertIndex, item);
+        if (!sharedBacking)
+        {
+            visibleAssetItems.Insert(insertIndex, item);
+        }
     }
 
     private static int FindSortedInsertIndex(List<AssetItem> items, AssetItem item, string sortMember, bool descending)
@@ -547,7 +634,9 @@ internal static class AssetListQuery
                 return true;
             }
 
-            return Has(item.PathIDString);
+            Span<char> pathIdBuffer = stackalloc char[32];
+            item.TryGetPathIDSearchSpan(pathIdBuffer, out var pathIdSpan);
+            return !pathIdSpan.IsEmpty && pathIdSpan.ContainsAny(_needle);
         }
 
         private bool Has(string? value)
@@ -845,7 +934,7 @@ internal static class AssetListQuery
             return result;
         }
 
-        result = CompareNullableText(left.UniqueID, right.UniqueID);
+        result = AssetItem.CompareUniqueId(left, right);
         if (result != 0)
         {
             return result;

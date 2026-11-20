@@ -1,5 +1,9 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
+using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using AssetStudio;
 
@@ -7,6 +11,31 @@ namespace AssetStudio.Avalonia;
 
 public class AssetItem : IAssetHandleTag
 {
+    private sealed class CustomStringOverrides
+    {
+        public string? TypeString;
+        public string? PathIDString;
+    }
+
+    private const int SmallTypeCacheSize = 512;
+    private const int FbxStateShift = 29;
+    private const int FbxStateMask = 0b11 << FbxStateShift;
+    private const int HasOrdinalFlag = 1 << 28;
+    private const int HasCustomTypeFlag = 1 << 27;
+    private const int HasCustomPathIdFlag = 1 << 26;
+    private const int MaxPackedOrdinal = (1 << 26) - 1;
+    private const int OrdinalMask = MaxPackedOrdinal;
+
+    private static readonly string?[] SmallTypeStrings = BuildSmallTypeStrings();
+    private static readonly FrozenDictionary<ClassIDType, string> SparseTypeStrings = BuildSparseTypeStrings();
+    private static readonly ConcurrentDictionary<int, string> UndefinedTypeStrings = new();
+
+    private static readonly string?[] SmallNormalDisplayTypes = BuildSmallDisplayTypes(fbx: false);
+    private static readonly string?[] SmallFbxDisplayTypes = BuildSmallDisplayTypes(fbx: true);
+    private static readonly FrozenDictionary<ClassIDType, (string Normal, string Fbx)> SparseDisplayTypes = BuildSparseDisplayTypes();
+    private static readonly ConcurrentDictionary<(int TypeId, bool IsFbx), string> UndefinedDisplayTypes = new();
+    private static readonly ConditionalWeakTable<AssetItem, CustomStringOverrides> CustomStrings = new();
+
     private Object? _asset;
     public Object? Asset
     {
@@ -32,68 +61,245 @@ public class AssetItem : IAssetHandleTag
     public GameObjectNode? TreeNode { get; set; }
     public string Name { get; set; } = string.Empty;
     private string _container = string.Empty;
-    private string _typeString = string.Empty;
+    private string? _uniqueId;
+    public long PathID { get; set; }
+    public long Size { get; set; }
+    public long FullSize { get; set; }
     private ClassIDType _type;
-    private string? _displayType;
-    private byte _fbxState; // 0 = not computed, 1 = false, 2 = true (races are benign: value is idempotent)
+    private int _state;
 
     public string Container
     {
         get => _container;
         set
         {
-            _container = value;
-            InvalidateDerivedState();
+            var normalized = value ?? string.Empty;
+            if (string.Equals(_container, normalized, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _container = normalized;
+            InvalidateFbxState();
         }
     }
 
     public string TypeString
     {
-        get => _typeString;
+        get
+        {
+            if ((Volatile.Read(ref _state) & HasCustomTypeFlag) != 0 &&
+                CustomStrings.TryGetValue(this, out var custom) &&
+                custom.TypeString != null)
+            {
+                return custom.TypeString;
+            }
+
+            return GetCachedTypeString(_type);
+        }
         set
         {
-            _typeString = value;
-            InvalidateDerivedState();
+            var normalized = value ?? string.Empty;
+            if (string.Equals(normalized, GetCachedTypeString(_type), StringComparison.Ordinal))
+            {
+                if ((Volatile.Read(ref _state) & HasCustomTypeFlag) != 0)
+                {
+                    if (CustomStrings.TryGetValue(this, out var custom))
+                    {
+                        custom.TypeString = null;
+                    }
+                    ClearStateBits(HasCustomTypeFlag);
+                }
+                return;
+            }
+
+            CustomStrings.GetOrCreateValue(this).TypeString = normalized;
+            SetStateBits(HasCustomTypeFlag);
         }
     }
 
-    public string DisplayType => Volatile.Read(ref _displayType) ?? CacheDisplayType();
-    public string UniqueID { get; set; } = string.Empty;
-    public long PathID { get; set; }
-    public string PathIDString { get; set; } = string.Empty;
-    public long Size { get; set; }
-    public long FullSize { get; set; }
+    public string DisplayType
+    {
+        get
+        {
+            var isFbx = IsFbxSubAsset();
+            if ((Volatile.Read(ref _state) & HasCustomTypeFlag) != 0 &&
+                CustomStrings.TryGetValue(this, out var custom) &&
+                custom.TypeString != null)
+            {
+                return FormatDisplayType(_type, custom.TypeString, isFbx);
+            }
+
+            return GetCachedDisplayType(_type, isFbx);
+        }
+    }
+
+    public string UniqueID
+    {
+        get
+        {
+            var existing = Volatile.Read(ref _uniqueId);
+            if (existing != null)
+            {
+                return existing;
+            }
+
+            var s = Volatile.Read(ref _state);
+            if ((s & HasOrdinalFlag) == 0)
+            {
+                return string.Empty;
+            }
+
+            var formatted = " #" + (s & OrdinalMask).ToString(CultureInfo.InvariantCulture);
+            return Interlocked.CompareExchange(ref _uniqueId, formatted, null) ?? formatted;
+        }
+        set
+        {
+            ClearStateBits(HasOrdinalFlag | OrdinalMask);
+            Volatile.Write(ref _uniqueId, value ?? string.Empty);
+        }
+    }
+
+    public string PathIDString
+    {
+        get
+        {
+            if ((Volatile.Read(ref _state) & HasCustomPathIdFlag) != 0 &&
+                CustomStrings.TryGetValue(this, out var custom) &&
+                custom.PathIDString != null)
+            {
+                return custom.PathIDString;
+            }
+
+            return PathID.ToString(CultureInfo.InvariantCulture);
+        }
+        set
+        {
+            var normalized = value ?? string.Empty;
+            Span<char> buffer = stackalloc char[32];
+            if (PathID.TryFormat(buffer, out var written, provider: CultureInfo.InvariantCulture) &&
+                normalized.AsSpan().SequenceEqual(buffer.Slice(0, written)))
+            {
+                if ((Volatile.Read(ref _state) & HasCustomPathIdFlag) != 0)
+                {
+                    if (CustomStrings.TryGetValue(this, out var custom))
+                    {
+                        custom.PathIDString = null;
+                    }
+                    ClearStateBits(HasCustomPathIdFlag);
+                }
+                return;
+            }
+
+            CustomStrings.GetOrCreateValue(this).PathIDString = normalized;
+            SetStateBits(HasCustomPathIdFlag);
+        }
+    }
+
     public ClassIDType Type
     {
         get => _type;
-        set
+        set => _type = value;
+    }
+
+    internal bool HasOrdinalOrUniqueId =>
+        Volatile.Read(ref _uniqueId) != null || (Volatile.Read(ref _state) & HasOrdinalFlag) != 0;
+
+    internal void SetOrdinal(int ordinal)
+    {
+        if ((uint)ordinal <= MaxPackedOrdinal)
         {
-            _type = value;
-            InvalidateDerivedState();
+            Volatile.Write(ref _uniqueId, null);
+            UpdateStateBits(HasOrdinalFlag | OrdinalMask, HasOrdinalFlag | ordinal);
+        }
+        else
+        {
+            ClearStateBits(HasOrdinalFlag | OrdinalMask);
+            Volatile.Write(ref _uniqueId, " #" + ordinal.ToString(CultureInfo.InvariantCulture));
         }
     }
 
-    private void InvalidateDerivedState()
+    internal bool TryGetPathIDSearchSpan(Span<char> scratch, out ReadOnlySpan<char> span)
     {
-        Volatile.Write(ref _displayType, null);
-        Volatile.Write(ref _fbxState, 0);
+        if ((Volatile.Read(ref _state) & HasCustomPathIdFlag) != 0 &&
+            CustomStrings.TryGetValue(this, out var custom) &&
+            custom.PathIDString != null)
+        {
+            span = custom.PathIDString.AsSpan();
+            return true;
+        }
+
+        if (PathID.TryFormat(scratch, out var written, provider: CultureInfo.InvariantCulture))
+        {
+            span = scratch.Slice(0, written);
+            return true;
+        }
+
+        span = PathIDString.AsSpan();
+        return true;
     }
 
-    private string CacheDisplayType()
+    internal static int CompareUniqueId(AssetItem left, AssetItem right)
     {
-        var computed = GetDisplayType();
-        Volatile.Write(ref _displayType, computed);
-        return computed;
+        if (Volatile.Read(ref left._uniqueId) == null &&
+            Volatile.Read(ref right._uniqueId) == null)
+        {
+            var leftState = Volatile.Read(ref left._state);
+            var rightState = Volatile.Read(ref right._state);
+            var leftHasOrdinal = (leftState & HasOrdinalFlag) != 0;
+            var rightHasOrdinal = (rightState & HasOrdinalFlag) != 0;
+
+            if (!leftHasOrdinal && !rightHasOrdinal)
+            {
+                return 0;
+            }
+            if (!leftHasOrdinal)
+            {
+                return 1;
+            }
+            if (!rightHasOrdinal)
+            {
+                return -1;
+            }
+
+            Span<char> leftBuf = stackalloc char[16];
+            Span<char> rightBuf = stackalloc char[16];
+            if (TryFormatOrdinal(leftState & OrdinalMask, leftBuf, out var leftLen) &&
+                TryFormatOrdinal(rightState & OrdinalMask, rightBuf, out var rightLen))
+            {
+                return leftBuf.Slice(0, leftLen).CompareTo(rightBuf.Slice(0, rightLen), StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        return AssetListQuery.CompareNullableText(left.UniqueID, right.UniqueID);
+    }
+
+    private static bool TryFormatOrdinal(int ordinal, Span<char> destination, out int length)
+    {
+        if (destination.Length < 3)
+        {
+            length = 0;
+            return false;
+        }
+
+        destination[0] = ' ';
+        destination[1] = '#';
+        if (ordinal.TryFormat(destination.Slice(2), out var written, provider: CultureInfo.InvariantCulture))
+        {
+            length = 2 + written;
+            return true;
+        }
+
+        length = 0;
+        return false;
     }
 
     public AssetItem(Object asset)
     {
-        Asset = asset;
+        _asset = asset;
         SourceFile = asset.assetsFile;
-        TypeString = asset.type.ToString() ?? string.Empty;
-        Type = asset.type;
+        _type = asset.type;
         PathID = asset.m_PathID;
-        PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
         Size = asset.byteSize;
         FullSize = asset.byteSize;
     }
@@ -102,50 +308,143 @@ public class AssetItem : IAssetHandleTag
     {
         Handle = handle;
         SourceFile = handle.SourceFile;
-        TypeString = handle.Type.ToString() ?? string.Empty;
-        Type = handle.Type;
+        _type = handle.Type;
         PathID = handle.PathID;
-        PathIDString = PathID.ToString(CultureInfo.InvariantCulture);
         Size = handle.ByteSize;
         FullSize = handle.ByteSize;
         Name = handle.Name ?? string.Empty;
-        Container = handle.Container ?? string.Empty;
+        _container = handle.Container ?? string.Empty;
     }
 
-    private string GetDisplayType()
+    internal AssetItem(AssetHandle handle, int ordinal)
+        : this(handle)
     {
-        var display = TypeString ?? string.Empty;
-        if (Type == ClassIDType.PrefabInstance)
+        if (ordinal >= 0)
         {
-            display = "Prefab (Composite)";
+            SetOrdinal(ordinal);
         }
-        else if (Type == ClassIDType.GameObject)
+    }
+
+    public static string GetCachedTypeString(ClassIDType type)
+    {
+        var id = (int)type;
+        if ((uint)id < SmallTypeCacheSize)
         {
-            display = "GameObject (Hierarchy Node)";
+            var cached = SmallTypeStrings[id];
+            if (cached != null)
+            {
+                return cached;
+            }
         }
-        else if (Type == ClassIDType.MonoBehaviour)
+        else if (SparseTypeStrings.TryGetValue(type, out var sparse))
         {
-            display = "MonoBehaviour (Script Instance)";
-        }
-        else if (Type == ClassIDType.Mesh)
-        {
-            display = "Mesh (Geometry)";
-        }
-        else if (Type == ClassIDType.Material)
-        {
-            display = "Material (Shader Settings)";
-        }
-        else if (IsComponentType(Type))
-        {
-            display = $"{TypeString} (Component)";
+            return sparse;
         }
 
-        if (IsFbxSubAsset())
+        return UndefinedTypeStrings.GetOrAdd(id, static k => ((ClassIDType)k).ToString());
+    }
+
+    private static string GetCachedDisplayType(ClassIDType type, bool isFbx)
+    {
+        var id = (int)type;
+        if ((uint)id < SmallTypeCacheSize)
         {
-            return $"{display} (FBX sub-asset)";
+            var table = isFbx ? SmallFbxDisplayTypes : SmallNormalDisplayTypes;
+            var cached = table[id];
+            if (cached != null)
+            {
+                return cached;
+            }
+        }
+        else if (SparseDisplayTypes.TryGetValue(type, out var pair))
+        {
+            return isFbx ? pair.Fbx : pair.Normal;
         }
 
-        return display ?? string.Empty;
+        return UndefinedDisplayTypes.GetOrAdd(
+            (id, isFbx),
+            static key =>
+            {
+                var t = (ClassIDType)key.TypeId;
+                var typeStr = GetCachedTypeString(t);
+                return FormatDisplayType(t, typeStr, key.IsFbx);
+            });
+    }
+
+    private static string FormatDisplayType(ClassIDType type, string typeString, bool isFbx)
+    {
+        var display = type switch
+        {
+            ClassIDType.PrefabInstance => "Prefab (Composite)",
+            ClassIDType.GameObject => "GameObject (Hierarchy Node)",
+            ClassIDType.MonoBehaviour => "MonoBehaviour (Script Instance)",
+            ClassIDType.Mesh => "Mesh (Geometry)",
+            ClassIDType.Material => "Material (Shader Settings)",
+            _ when IsComponentType(type) => $"{typeString} (Component)",
+            _ => typeString
+        };
+
+        return isFbx ? $"{display} (FBX sub-asset)" : display;
+    }
+
+    private static string?[] BuildSmallTypeStrings()
+    {
+        var table = new string?[SmallTypeCacheSize];
+        foreach (ClassIDType value in Enum.GetValues<ClassIDType>())
+        {
+            var id = (int)value;
+            if ((uint)id < SmallTypeCacheSize)
+            {
+                table[id] ??= value.ToString();
+            }
+        }
+        return table;
+    }
+
+    private static FrozenDictionary<ClassIDType, string> BuildSparseTypeStrings()
+    {
+        var map = new Dictionary<ClassIDType, string>();
+        foreach (ClassIDType value in Enum.GetValues<ClassIDType>())
+        {
+            var id = (int)value;
+            if ((uint)id >= SmallTypeCacheSize)
+            {
+                map.TryAdd(value, value.ToString());
+            }
+        }
+        return map.ToFrozenDictionary();
+    }
+
+    private static string?[] BuildSmallDisplayTypes(bool fbx)
+    {
+        var table = new string?[SmallTypeCacheSize];
+        foreach (ClassIDType value in Enum.GetValues<ClassIDType>())
+        {
+            var id = (int)value;
+            if ((uint)id < SmallTypeCacheSize && table[id] == null)
+            {
+                var baseTypeStr = SmallTypeStrings[id] ?? value.ToString();
+                table[id] = FormatDisplayType(value, baseTypeStr, fbx);
+            }
+        }
+        return table;
+    }
+
+    private static FrozenDictionary<ClassIDType, (string Normal, string Fbx)> BuildSparseDisplayTypes()
+    {
+        var map = new Dictionary<ClassIDType, (string Normal, string Fbx)>();
+        foreach (ClassIDType value in Enum.GetValues<ClassIDType>())
+        {
+            var id = (int)value;
+            if ((uint)id >= SmallTypeCacheSize && !map.ContainsKey(value))
+            {
+                var baseTypeStr = SparseTypeStrings[value];
+                map[value] = (
+                    FormatDisplayType(value, baseTypeStr, isFbx: false),
+                    FormatDisplayType(value, baseTypeStr, isFbx: true));
+            }
+        }
+        return map.ToFrozenDictionary();
     }
 
     private static bool IsComponentType(ClassIDType type)
@@ -164,14 +463,57 @@ public class AssetItem : IAssetHandleTag
 
     public bool IsFbxSubAsset()
     {
-        var state = Volatile.Read(ref _fbxState);
-        if (state == 0)
+        var s = Volatile.Read(ref _state);
+        var fbxBits = (s & FbxStateMask) >> FbxStateShift;
+        if (fbxBits == 0)
         {
-            state = ContainsFbxSegment(_container) ? (byte)2 : (byte)1;
-            Volatile.Write(ref _fbxState, state);
+            var computed = ContainsFbxSegment(_container) ? 2 : 1;
+            UpdateStateBits(FbxStateMask, computed << FbxStateShift);
+            fbxBits = computed;
         }
 
-        return state == 2;
+        return fbxBits == 2;
+    }
+
+    private void InvalidateFbxState()
+    {
+        ClearStateBits(FbxStateMask);
+    }
+
+    private void SetStateBits(int bits)
+    {
+        int current;
+        int next;
+        do
+        {
+            current = Volatile.Read(ref _state);
+            next = current | bits;
+        }
+        while (Interlocked.CompareExchange(ref _state, next, current) != current);
+    }
+
+    private void ClearStateBits(int mask)
+    {
+        int current;
+        int next;
+        do
+        {
+            current = Volatile.Read(ref _state);
+            next = current & ~mask;
+        }
+        while (Interlocked.CompareExchange(ref _state, next, current) != current);
+    }
+
+    private void UpdateStateBits(int mask, int valueBits)
+    {
+        int current;
+        int next;
+        do
+        {
+            current = Volatile.Read(ref _state);
+            next = (current & ~mask) | (valueBits & mask);
+        }
+        while (Interlocked.CompareExchange(ref _state, next, current) != current);
     }
 
     /// <summary>

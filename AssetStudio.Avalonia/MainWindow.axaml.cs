@@ -50,7 +50,7 @@ public partial class MainWindow : Window
     private const int UserInteractionYieldDelayMilliseconds = 40;
     private long userInteractionPriorityUntilTimestamp;
     private List<AssetItem> visibleAssets = new();
-    private BulkObservableCollection<AssetItem> visibleAssetItems = new();
+    private readonly VirtualAssetList visibleAssetItems = new();
     private List<AssetClassItem> assetClassItems = new List<AssetClassItem>();
     private System.Collections.ObjectModel.ObservableCollection<AssetClassItem> visibleAssetClassItems = new();
 
@@ -118,6 +118,8 @@ public partial class MainWindow : Window
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
+        visibleAssetItems.ReplaceBacking(visibleAssets);
+        AssetListDataGrid.ItemsSource = visibleAssetItems;
         GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
         GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
         PreviewContentHost.SizeChanged += (_, _) => Update2DAnimationImageLayout();
@@ -856,22 +858,29 @@ public partial class MainWindow : Window
                 assetItem = handle.Tag as AssetItem;
                 if (assetItem == null)
                 {
-                    assetItem = new AssetItem(handle)
+                    assetItem = new AssetItem(handle, lazyAssetItemOrdinal++);
+                }
+                else
+                {
+                    if (!assetItem.HasOrdinalOrUniqueId)
                     {
-                        UniqueID = " #" + lazyAssetItemOrdinal.ToString(CultureInfo.InvariantCulture)
-                    };
-                    lazyAssetItemOrdinal++;
+                        assetItem.SetOrdinal(lazyAssetItemOrdinal++);
+                    }
+                    UpdateLazyAssetItemHandle(assetItem, handle);
                 }
 
                 lazyAssetItemsByHandleId[handle.UniqueID] = assetItem;
             }
-            else if (string.IsNullOrEmpty(assetItem.UniqueID))
+            else
             {
-                assetItem.UniqueID = " #" + lazyAssetItemOrdinal.ToString(CultureInfo.InvariantCulture);
-                lazyAssetItemOrdinal++;
+                if (!assetItem.HasOrdinalOrUniqueId)
+                {
+                    assetItem.SetOrdinal(lazyAssetItemOrdinal++);
+                }
+
+                UpdateLazyAssetItemHandle(assetItem, handle);
             }
 
-            UpdateLazyAssetItemHandle(assetItem, handle);
             handle.Tag = assetItem;
 
             if (!displayAllChecked && !IsLazyExportableType(handle.Type))
@@ -905,10 +914,8 @@ public partial class MainWindow : Window
     {
         assetItem.Handle = handle;
         assetItem.SourceFile = handle.SourceFile;
-        assetItem.TypeString = handle.Type.ToString() ?? string.Empty;
         assetItem.Type = handle.Type;
         assetItem.PathID = handle.PathID;
-        assetItem.PathIDString = handle.PathID.ToString(CultureInfo.InvariantCulture);
         assetItem.Size = handle.ByteSize;
         assetItem.FullSize = handle.ByteSize;
         assetItem.Name = handle.Name ?? string.Empty;
