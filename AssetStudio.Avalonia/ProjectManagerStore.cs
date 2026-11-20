@@ -1,4 +1,5 @@
 using AssetStudio;
+using AssetStudio.Avalonia.Services.ProjectAnalysis;
 using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
@@ -10,6 +11,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using SkiaSharp;
 
 namespace AssetStudio.Avalonia;
@@ -28,6 +30,9 @@ public sealed class ManagedProject
     public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime? LastAccessedAtUtc { get; set; }
     public ManagedProjectStats Stats { get; set; } = new();
+    public bool AllowAutoIl2CppDumper { get; set; }
+    public string? Il2CppDumperPath { get; set; }
+    public ProjectAnalysisSummary AnalysisSummary { get; set; } = new();
 
     public string PendingIconSourcePath { get; set; } = string.Empty;
 
@@ -69,7 +74,10 @@ public sealed class ManagedProject
             CreatedAtUtc = CreatedAtUtc,
             UpdatedAtUtc = UpdatedAtUtc,
             LastAccessedAtUtc = LastAccessedAtUtc,
-            Stats = Stats.Clone()
+            Stats = Stats.Clone(),
+            AllowAutoIl2CppDumper = AllowAutoIl2CppDumper,
+            Il2CppDumperPath = Il2CppDumperPath,
+            AnalysisSummary = AnalysisSummary.Clone()
         };
     }
 }
@@ -130,7 +138,14 @@ public sealed class ProjectRemovalCleanup
 public sealed class ProjectManagerStore
 {
     private const string AppSettingsJsonKey = "app_settings_json";
+    private const string ProjectAnalysisJsonKey = "project_analysis_json";
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions AnalysisJsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() }
+    };
     private static readonly string[] ImageExtensions = { ".png", ".jpg", ".jpeg", ".ico", ".bmp", ".webp" };
 
     public static ProjectManagerStore Shared { get; } = new();
@@ -138,6 +153,7 @@ public sealed class ProjectManagerStore
     private readonly string _dbPath;
     private readonly string _iconsDirectory;
     private readonly SQLiteProjectIndexCache _indexCache;
+    private readonly ProjectAnalysisService _analysisService;
     private readonly Task _initTask;
 
     public ProjectManagerStore()
@@ -146,11 +162,15 @@ public sealed class ProjectManagerStore
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "AssetStudio",
                 "ProjectManager"),
-            new SQLiteProjectIndexCache())
+            new SQLiteProjectIndexCache(),
+            ProjectAnalysisService.Shared)
     {
     }
 
-    internal ProjectManagerStore(string baseDirectory, SQLiteProjectIndexCache? indexCache = null)
+    internal ProjectManagerStore(
+        string baseDirectory,
+        SQLiteProjectIndexCache? indexCache = null,
+        ProjectAnalysisService? analysisService = null)
     {
         if (string.IsNullOrWhiteSpace(baseDirectory))
         {
@@ -162,9 +182,12 @@ public sealed class ProjectManagerStore
         Directory.CreateDirectory(_iconsDirectory);
         _dbPath = Path.Combine(baseDirectory, "projects.db");
         _indexCache = indexCache ?? new SQLiteProjectIndexCache(Path.Combine(baseDirectory, "IndexCache"));
+        _analysisService = analysisService ?? new ProjectAnalysisService(Path.Combine(baseDirectory, "ProjectAnalysis"));
 
         _initTask = Task.Run(InitializeDatabase);
     }
+
+    internal ProjectAnalysisService AnalysisService => _analysisService;
 
     private void EnsureInitialized()
     {
@@ -279,9 +302,11 @@ public sealed class ProjectManagerStore
                 s.AssetCount,
                 s.ExportableAssetCount,
                 s.LastScanSignature,
-                s.LastScannedAtUtc
+                s.LastScannedAtUtc,
+                a.Value
             FROM ManagedProjects p
             LEFT JOIN ManagedProjectStats s ON s.ProjectId = p.Id
+            LEFT JOIN ManagedProjectSettings a ON a.ProjectId = p.Id AND a.Key = 'project_analysis_json'
             ORDER BY
                 CASE WHEN p.LastAccessedAtUtc IS NULL THEN 1 ELSE 0 END,
                 p.LastAccessedAtUtc DESC,
@@ -321,9 +346,11 @@ public sealed class ProjectManagerStore
                 s.AssetCount,
                 s.ExportableAssetCount,
                 s.LastScanSignature,
-                s.LastScannedAtUtc
+                s.LastScannedAtUtc,
+                a.Value
             FROM ManagedProjects p
             LEFT JOIN ManagedProjectStats s ON s.ProjectId = p.Id
+            LEFT JOIN ManagedProjectSettings a ON a.ProjectId = p.Id AND a.Key = 'project_analysis_json'
             WHERE p.Id = @id
             LIMIT 1";
         cmd.Parameters.AddWithValue("@id", projectId);
@@ -335,6 +362,68 @@ public sealed class ProjectManagerStore
     internal ProjectIndexingState? LoadLatestIndexingState(string projectRoot)
     {
         return _indexCache.LoadLatestIndexingState(projectRoot);
+    }
+
+    public ProjectAnalysisReport? LoadCachedProjectAnalysisReport(string projectRoot)
+    {
+        return _analysisService.TryLoadCachedReport(projectRoot);
+    }
+
+    public void SaveProjectAnalysisPreferences(string projectId, bool allowAutoIl2CppDumper, string? il2CppDumperPath)
+    {
+        if (string.IsNullOrWhiteSpace(projectId))
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var existing = DeserializeAnalysisMetadata(GetProjectSetting(projectId, ProjectAnalysisJsonKey)) ?? new StoredProjectAnalysisMetadata();
+        existing.AllowAutoIl2CppDumper = allowAutoIl2CppDumper;
+        existing.Il2CppDumperPath = string.IsNullOrWhiteSpace(il2CppDumperPath) ? null : il2CppDumperPath.Trim();
+
+        using var conn = CreateConnection();
+        using var transaction = conn.BeginTransaction();
+        UpsertProjectAnalysisMetadata(conn, transaction, projectId, existing, now);
+        transaction.Commit();
+    }
+
+    public void SaveProjectAnalysisReport(string projectId, ProjectAnalysisReport report)
+    {
+        if (string.IsNullOrWhiteSpace(projectId) || report == null)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var existing = DeserializeAnalysisMetadata(GetProjectSetting(projectId, ProjectAnalysisJsonKey)) ?? new StoredProjectAnalysisMetadata();
+        existing.AnalysisSummary = ProjectAnalysisSummary.FromReport(report);
+
+        using var conn = CreateConnection();
+        using var transaction = conn.BeginTransaction();
+        UpsertProjectAnalysisMetadata(conn, transaction, projectId, existing, now);
+        transaction.Commit();
+    }
+
+    public void SaveProjectAnalysisReportByRoot(string projectRoot, ProjectAnalysisReport report)
+    {
+        if (string.IsNullOrWhiteSpace(projectRoot) || report == null)
+        {
+            return;
+        }
+
+        var targetHash = ProjectRuntimeDetector.ComputeProjectHash(projectRoot);
+        foreach (var project in GetProjects())
+        {
+            if (string.IsNullOrWhiteSpace(project.ProjectRoot))
+            {
+                continue;
+            }
+
+            if (string.Equals(ProjectRuntimeDetector.ComputeProjectHash(project.ProjectRoot), targetHash, StringComparison.OrdinalIgnoreCase))
+            {
+                SaveProjectAnalysisReport(project.Id, report);
+            }
+        }
     }
 
     public void SaveProject(ManagedProject project)
@@ -386,6 +475,7 @@ public sealed class ProjectManagerStore
         }
 
         UpsertStats(conn, transaction, project.Id, project.Stats);
+        UpsertProjectAnalysisMetadata(conn, transaction, project.Id, project, now);
 
         if (storedIcon != null)
         {
@@ -474,6 +564,14 @@ public sealed class ProjectManagerStore
         try
         {
             _indexCache.DeleteIndexCache(cleanup.ProjectRoot);
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _analysisService.DeleteProjectAnalysisCache(cleanup.ProjectRoot);
         }
         catch
         {
@@ -715,7 +813,7 @@ public sealed class ProjectManagerStore
 
     private static ManagedProject ReadProject(SqliteDataReader reader)
     {
-        return new ManagedProject
+        var project = new ManagedProject
         {
             Id = reader.GetString(0),
             Name = reader.GetString(1),
@@ -741,6 +839,90 @@ public sealed class ProjectManagerStore
                 LastScannedAtUtc = reader.IsDBNull(19) ? null : ParseDbDate(reader.GetString(19))
             }
         };
+
+        if (reader.FieldCount > 20 && !reader.IsDBNull(20))
+        {
+            ApplyStoredAnalysisMetadata(project, reader.GetString(20));
+        }
+
+        return project;
+    }
+
+    private static void UpsertProjectAnalysisMetadata(
+        SqliteConnection conn,
+        SqliteTransaction transaction,
+        string projectId,
+        ManagedProject project,
+        DateTime now)
+    {
+        var dto = new StoredProjectAnalysisMetadata
+        {
+            AllowAutoIl2CppDumper = project.AllowAutoIl2CppDumper,
+            Il2CppDumperPath = string.IsNullOrWhiteSpace(project.Il2CppDumperPath) ? null : project.Il2CppDumperPath.Trim(),
+            AnalysisSummary = project.AnalysisSummary?.Clone() ?? new ProjectAnalysisSummary()
+        };
+        UpsertProjectAnalysisMetadata(conn, transaction, projectId, dto, now);
+    }
+
+    private static void UpsertProjectAnalysisMetadata(
+        SqliteConnection conn,
+        SqliteTransaction transaction,
+        string projectId,
+        StoredProjectAnalysisMetadata metadata,
+        DateTime now)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = @"
+            INSERT INTO ManagedProjectSettings (ProjectId, Key, Value, UpdatedAtUtc)
+            VALUES (@projectId, @key, @value, @updatedAt)
+            ON CONFLICT(ProjectId, Key) DO UPDATE SET
+                Value = excluded.Value,
+                UpdatedAtUtc = excluded.UpdatedAtUtc";
+        cmd.Parameters.AddWithValue("@projectId", projectId);
+        cmd.Parameters.AddWithValue("@key", ProjectAnalysisJsonKey);
+        cmd.Parameters.AddWithValue("@value", JsonSerializer.Serialize(metadata, AnalysisJsonOptions));
+        cmd.Parameters.AddWithValue("@updatedAt", ToDb(now));
+        cmd.ExecuteNonQuery();
+    }
+
+    private static void ApplyStoredAnalysisMetadata(ManagedProject project, string? json)
+    {
+        var metadata = DeserializeAnalysisMetadata(json);
+        if (metadata == null)
+        {
+            return;
+        }
+
+        project.AllowAutoIl2CppDumper = metadata.AllowAutoIl2CppDumper;
+        project.Il2CppDumperPath = string.IsNullOrWhiteSpace(metadata.Il2CppDumperPath)
+            ? null
+            : metadata.Il2CppDumperPath.Trim();
+        project.AnalysisSummary = metadata.AnalysisSummary?.Clone() ?? new ProjectAnalysisSummary();
+    }
+
+    private static StoredProjectAnalysisMetadata? DeserializeAnalysisMetadata(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<StoredProjectAnalysisMetadata>(json, AnalysisJsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private sealed class StoredProjectAnalysisMetadata
+    {
+        public bool AllowAutoIl2CppDumper { get; set; }
+        public string? Il2CppDumperPath { get; set; }
+        public ProjectAnalysisSummary? AnalysisSummary { get; set; }
     }
 
     private void AddProjectParameters(SqliteCommand cmd, ManagedProject project)

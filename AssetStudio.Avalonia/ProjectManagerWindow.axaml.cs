@@ -1,3 +1,4 @@
+using AssetStudio.Avalonia.Services.ProjectAnalysis;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
@@ -7,9 +8,12 @@ using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -21,11 +25,13 @@ public partial class ProjectManagerWindow : Window
 {
     private readonly ProjectManagerStore _store = ProjectManagerStore.Shared;
     private readonly ObservableCollection<ProjectListItem> _projects = new();
+    private readonly HashSet<string> _runningAnalysisProjectIds = new(StringComparer.Ordinal);
     private Bitmap? _defaultIcon;
     private int _refreshVersion;
     private bool _isRefreshingProjects;
     private bool _isOpeningProject;
     private bool _isDeletingProject;
+    private bool _isUpdatingAnalysisControls;
 
     public ProjectManagerWindow()
     {
@@ -40,8 +46,15 @@ public partial class ProjectManagerWindow : Window
         }
 
         _defaultIcon = LoadDefaultIcon();
+        _store.AnalysisService.AnalysisUpdated += OnProjectAnalysisUpdated;
         ProjectListBox.ItemsSource = _projects;
         RefreshProjects();
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _store.AnalysisService.AnalysisUpdated -= OnProjectAnalysisUpdated;
+        base.OnClosed(e);
     }
 
     private async void RefreshProjects(string? selectProjectId = null)
@@ -54,7 +67,20 @@ public partial class ProjectManagerWindow : Window
         try
         {
             var projects = await Task.Run(() => _store.GetProjects()
-                .Select(project => (Project: project, IndexingState: _store.LoadLatestIndexingState(project.ProjectRoot)))
+                .Select(project =>
+                {
+                    if (project.AnalysisSummary.Status == ProjectAnalysisStatus.Pending
+                        && !string.IsNullOrWhiteSpace(project.ProjectRoot))
+                    {
+                        var cached = _store.LoadCachedProjectAnalysisReport(project.ProjectRoot);
+                        if (cached != null)
+                        {
+                            project.AnalysisSummary = ProjectAnalysisSummary.FromReport(cached);
+                        }
+                    }
+
+                    return (Project: project, IndexingState: _store.LoadLatestIndexingState(project.ProjectRoot));
+                })
                 .ToList());
             if (refreshVersion != _refreshVersion)
             {
@@ -334,41 +360,247 @@ public partial class ProjectManagerWindow : Window
         var selected = GetSelectedProject();
         var busy = _isRefreshingProjects || _isOpeningProject || _isDeletingProject;
         var enabled = selected != null && !busy;
+        var isRunningAnalysis = selected != null && _runningAnalysisProjectIds.Contains(selected.Project.Id);
+        var hasRoot = selected != null && !string.IsNullOrWhiteSpace(selected.Project.ProjectRoot);
+
         AddProjectButton.IsEnabled = !busy;
         OpenWithoutProjectButton.IsEnabled = !busy;
         OpenProjectButton.IsEnabled = enabled;
         EditProjectButton.IsEnabled = enabled;
         RemoveProjectButton.IsEnabled = enabled;
+        RerunAnalysisButton.IsEnabled = enabled && hasRoot && !isRunningAnalysis;
 
+        _isUpdatingAnalysisControls = true;
+        try
+        {
+            if (selected == null)
+            {
+                DetailIcon.Source = _defaultIcon;
+                DetailName.Text = "Select a project";
+                DetailSubtitle.Text = "Project metadata appears here.";
+                DetailRoot.Text = "-";
+                DetailLastLoad.Text = "-";
+                DetailLastExport.Text = "-";
+                DetailDates.Text = "-";
+                DetailStats.Text = "-";
+                DetailIndexing.Text = "-";
+                DetailAnalysis.Text = "-";
+                AllowIl2CppDumperCheckBox.IsChecked = false;
+                AllowIl2CppDumperCheckBox.IsEnabled = false;
+                Il2CppDumperPathTextBox.Text = string.Empty;
+                Il2CppDumperPathTextBox.IsEnabled = false;
+                BrowseIl2CppDumperButton.IsEnabled = false;
+                return;
+            }
+
+            var project = selected.Project;
+            DetailIcon.Source = selected.Icon ?? _defaultIcon;
+            DetailName.Text = selected.DisplayName;
+            DetailSubtitle.Text = project.UseAutoName
+                ? "Automatic game name is enabled."
+                : "Custom project name.";
+            DetailRoot.Text = Blank(project.ProjectRoot);
+            DetailLastLoad.Text = Blank(project.LastLoadPath);
+            DetailLastExport.Text = Blank(project.LastExportPath);
+            DetailDates.Text =
+                $"Created: {FormatDate(project.CreatedAtUtc)}  |  " +
+                $"Updated: {FormatDate(project.UpdatedAtUtc)}  |  " +
+                $"Last accessed: {FormatNullableDate(project.LastAccessedAtUtc)}";
+            DetailStats.Text = selected.StatsDetail;
+            DetailIndexing.Text = selected.IndexingDetail;
+            DetailAnalysis.Text = selected.AnalysisDetail;
+
+            AllowIl2CppDumperCheckBox.IsChecked = project.AllowAutoIl2CppDumper;
+            AllowIl2CppDumperCheckBox.IsEnabled = enabled && !isRunningAnalysis;
+            Il2CppDumperPathTextBox.Text = project.Il2CppDumperPath ?? string.Empty;
+            Il2CppDumperPathTextBox.IsEnabled = enabled && !isRunningAnalysis;
+            BrowseIl2CppDumperButton.IsEnabled = enabled && !isRunningAnalysis;
+        }
+        finally
+        {
+            _isUpdatingAnalysisControls = false;
+        }
+    }
+
+    private async void AllowIl2CppDumperCheckBox_IsCheckedChanged(object? sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingAnalysisControls)
+        {
+            return;
+        }
+
+        await SaveSelectedAnalysisPreferencesAsync();
+    }
+
+    private async void Il2CppDumperPathTextBox_LostFocus(object? sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingAnalysisControls)
+        {
+            return;
+        }
+
+        await SaveSelectedAnalysisPreferencesAsync();
+    }
+
+    private async void BrowseIl2CppDumper_Click(object? sender, RoutedEventArgs e)
+    {
+        var selected = GetSelectedProject();
         if (selected == null)
         {
-            DetailIcon.Source = _defaultIcon;
-            DetailName.Text = "Select a project";
-            DetailSubtitle.Text = "Project metadata appears here.";
-            DetailRoot.Text = "-";
-            DetailLastLoad.Text = "-";
-            DetailLastExport.Text = "-";
-            DetailDates.Text = "-";
-            DetailStats.Text = "-";
-            DetailIndexing.Text = "-";
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null)
+        {
+            return;
+        }
+
+        var files = await topLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Select Il2CppDumper executable",
+            AllowMultiple = false,
+            FileTypeFilter = new[]
+            {
+                new FilePickerFileType("Executables")
+                {
+                    Patterns = new[] { "*.exe", "*" }
+                }
+            }
+        });
+
+        if (files == null || files.Count == 0)
+        {
+            return;
+        }
+
+        _isUpdatingAnalysisControls = true;
+        try
+        {
+            Il2CppDumperPathTextBox.Text = files[0].Path.LocalPath;
+        }
+        finally
+        {
+            _isUpdatingAnalysisControls = false;
+        }
+
+        await SaveSelectedAnalysisPreferencesAsync();
+    }
+
+    private async Task SaveSelectedAnalysisPreferencesAsync()
+    {
+        var selected = GetSelectedProject();
+        if (selected == null)
+        {
+            return;
+        }
+
+        var allow = AllowIl2CppDumperCheckBox.IsChecked == true;
+        var path = string.IsNullOrWhiteSpace(Il2CppDumperPathTextBox.Text)
+            ? null
+            : Il2CppDumperPathTextBox.Text.Trim();
+
+        selected.Project.AllowAutoIl2CppDumper = allow;
+        selected.Project.Il2CppDumperPath = path;
+
+        var projectId = selected.Project.Id;
+        try
+        {
+            await Task.Run(() => _store.SaveProjectAnalysisPreferences(projectId, allow, path));
+            StatusText.Text = allow
+                ? "Saved optional Il2CppDumper execution preference (enabled)."
+                : "Saved optional Il2CppDumper execution preference (disabled).";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Unable to save analysis preference: {ex.Message}";
+        }
+    }
+
+    private async void RerunAnalysis_Click(object? sender, RoutedEventArgs e)
+    {
+        var selected = GetSelectedProject();
+        if (selected == null)
+        {
             return;
         }
 
         var project = selected.Project;
-        DetailIcon.Source = selected.Icon ?? _defaultIcon;
-        DetailName.Text = selected.DisplayName;
-        DetailSubtitle.Text = project.UseAutoName
-            ? "Automatic game name is enabled."
-            : "Custom project name.";
-        DetailRoot.Text = Blank(project.ProjectRoot);
-        DetailLastLoad.Text = Blank(project.LastLoadPath);
-        DetailLastExport.Text = Blank(project.LastExportPath);
-        DetailDates.Text =
-            $"Created: {FormatDate(project.CreatedAtUtc)}  |  " +
-            $"Updated: {FormatDate(project.UpdatedAtUtc)}  |  " +
-            $"Last accessed: {FormatNullableDate(project.LastAccessedAtUtc)}";
-        DetailStats.Text = selected.StatsDetail;
-        DetailIndexing.Text = selected.IndexingDetail;
+        if (string.IsNullOrWhiteSpace(project.ProjectRoot))
+        {
+            StatusText.Text = "Set a project root before running analysis.";
+            return;
+        }
+
+        if (!_runningAnalysisProjectIds.Add(project.Id))
+        {
+            return;
+        }
+
+        UpdateDetails();
+        StatusText.Text = $"Analyzing {selected.DisplayName}...";
+
+        try
+        {
+            var options = new ProjectAnalysisOptions
+            {
+                ForceRefresh = true,
+                AllowExternalIl2CppDumper = project.AllowAutoIl2CppDumper,
+                Il2CppDumperExecutablePath = project.Il2CppDumperPath
+            };
+
+            var result = await _store.AnalysisService.AnalyzeProjectAsync(project.ProjectRoot, options);
+            await Task.Run(() => _store.SaveProjectAnalysisReport(project.Id, result.Report));
+
+            var summary = ProjectAnalysisSummary.FromReport(result.Report);
+            selected.UpdateAnalysisSummary(summary);
+            StatusText.Text = result.Report.Status == ProjectAnalysisStatus.Ready
+                ? $"Analysis complete for {selected.DisplayName}: {summary.RuntimeBadge}"
+                : $"Analysis failed for {selected.DisplayName}: {result.Report.ErrorMessage}";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Analysis failed: {ex.Message}";
+        }
+        finally
+        {
+            _runningAnalysisProjectIds.Remove(project.Id);
+            UpdateDetails();
+        }
+    }
+
+    private void OnProjectAnalysisUpdated(string projectRoot, ProjectAnalysisReport report)
+    {
+        var summary = ProjectAnalysisSummary.FromReport(report);
+        Dispatcher.UIThread.Post(() =>
+        {
+            var updatedSelected = false;
+            var selected = GetSelectedProject();
+            foreach (var item in _projects)
+            {
+                if (string.IsNullOrWhiteSpace(item.Project.ProjectRoot))
+                {
+                    continue;
+                }
+
+                if (string.Equals(
+                    ProjectRuntimeDetector.ComputeProjectHash(item.Project.ProjectRoot),
+                    report.ProjectHash,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    item.UpdateAnalysisSummary(summary);
+                    if (ReferenceEquals(item, selected))
+                    {
+                        updatedSelected = true;
+                    }
+                }
+            }
+
+            if (updatedSelected)
+            {
+                UpdateDetails();
+            }
+        }, DispatcherPriority.Background);
     }
 
     private async void OpenProject(string projectId)
@@ -457,10 +689,12 @@ public partial class ProjectManagerWindow : Window
         return date.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
     }
 
-    private sealed class ProjectListItem
+    private sealed class ProjectListItem : INotifyPropertyChanged
     {
         private readonly ProjectIndexingState? _indexingState;
         private readonly string _indexingListDisplay;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
 
         public ProjectListItem(ManagedProject project, Bitmap? defaultIcon, ProjectIndexingState? indexingState)
         {
@@ -480,6 +714,101 @@ public partial class ProjectManagerWindow : Window
         public string IndexingListDisplay => _indexingListDisplay;
         public bool HasIndexingDisplay => !string.IsNullOrWhiteSpace(_indexingListDisplay);
         public string IndexingDetail => FormatIndexingDetail(_indexingState);
+        public string AnalysisListDisplay => FormatAnalysisListDisplay(Project.AnalysisSummary);
+        public bool HasAnalysisDisplay => !string.IsNullOrWhiteSpace(Project.ProjectRoot);
+        public string AnalysisDetail => FormatAnalysisDetail(Project.AnalysisSummary);
+
+        public void UpdateAnalysisSummary(ProjectAnalysisSummary summary)
+        {
+            Project.AnalysisSummary = summary.Clone();
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(AnalysisListDisplay)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(AnalysisDetail)));
+        }
+
+        private static string FormatAnalysisListDisplay(ProjectAnalysisSummary? summary)
+        {
+            if (summary == null)
+            {
+                return "Analysis: Pending";
+            }
+
+            return summary.Status switch
+            {
+                ProjectAnalysisStatus.Pending => "Analysis: Pending",
+                ProjectAnalysisStatus.Running => "Analysis: Running...",
+                ProjectAnalysisStatus.Failed => "Analysis: Failed",
+                ProjectAnalysisStatus.Ready => string.IsNullOrWhiteSpace(summary.RuntimeBadge)
+                    ? "Analysis: Ready"
+                    : $"Analysis: Ready \u2022 {summary.RuntimeBadge}",
+                _ => "Analysis: Pending"
+            };
+        }
+
+        private static string FormatAnalysisDetail(ProjectAnalysisSummary? summary)
+        {
+            if (summary == null)
+            {
+                return "Pending (not analyzed yet).";
+            }
+
+            var lines = new List<string>
+            {
+                summary.Status switch
+                {
+                    ProjectAnalysisStatus.Pending => "Status: Pending (click Re-run Analysis or open project)",
+                    ProjectAnalysisStatus.Running => "Status: Running...",
+                    ProjectAnalysisStatus.Failed => string.IsNullOrWhiteSpace(summary.ErrorMessage)
+                        ? "Status: Failed"
+                        : $"Status: Failed ({summary.ErrorMessage})",
+                    ProjectAnalysisStatus.Ready => string.IsNullOrWhiteSpace(summary.RuntimeBadge)
+                        ? "Status: Ready"
+                        : $"Status: Ready ({summary.RuntimeBadge})",
+                    _ => "Status: Pending"
+                }
+            };
+
+            if (summary.Status == ProjectAnalysisStatus.Ready)
+            {
+                var metrics = new List<string>();
+                if (summary.ManagedAssemblyCount > 0)
+                {
+                    metrics.Add($"{summary.ManagedAssemblyCount:N0} managed DLLs");
+                }
+
+                if (summary.Il2CppScriptCount > 0)
+                {
+                    metrics.Add($"{summary.Il2CppScriptCount:N0} IL2CPP symbols");
+                }
+                else if (summary.ScriptingBackend == UnityScriptingBackend.Il2Cpp)
+                {
+                    metrics.Add(summary.Il2CppDumperArtifactsDetected
+                        ? "Il2CppDumper artifacts detected"
+                        : "No Il2CppDumper artifacts yet");
+                }
+
+                if (summary.HasAddressables)
+                {
+                    metrics.Add($"{summary.AddressablesBundleCount:N0} Addressables bundles");
+                }
+
+                if (summary.DecryptionHintCount > 0)
+                {
+                    metrics.Add($"{summary.DecryptionHintCount:N0} decryption hint{(summary.DecryptionHintCount == 1 ? string.Empty : "s")}");
+                }
+
+                if (metrics.Count > 0)
+                {
+                    lines.Add(string.Join(" | ", metrics));
+                }
+
+                if (summary.AnalyzedAtUtc.HasValue)
+                {
+                    lines.Add("Analyzed: " + FormatDate(summary.AnalyzedAtUtc.Value));
+                }
+            }
+
+            return string.Join(Environment.NewLine, lines);
+        }
 
         public string StatsDetail
         {
