@@ -39,7 +39,9 @@ namespace AssetStudio.Tests
                 var stagedRoot = Path.Combine(tempRoot, "Staged");
                 var baselineRoot = Path.Combine(tempRoot, "Baseline");
                 var (stagedCache, stagedProjectDir, stagedSig, stagedScan, sourcePath) = CreateSampleProject(stagedRoot, groupCount);
+                using var _stagedCache = stagedCache;
                 var (baselineCache, baselineProjectDir, baselineSig, baselineScan, _) = CreateSampleProject(baselineRoot, groupCount, existingProjectDir: stagedProjectDir);
+                using var _baselineCache = baselineCache;
 
                 var (handles, batches, mergedBaseline, sampleIds) = BuildMultiBatchSyntheticGraphWithOverlaps(sourcePath, groupCount, batchCount);
 
@@ -133,6 +135,7 @@ namespace AssetStudio.Tests
             {
                 const int groupCount = 12;
                 var (cache, projectDir, signature, scanResult, sourcePath) = CreateSampleProject(tempRoot, groupCount);
+                using var _cache = cache;
                 var (handles, v1Batches, v1Merged, sampleIds) = BuildMultiBatchSyntheticGraphWithOverlaps(sourcePath, groupCount, batchCount: 2);
 
                 Assert.True(cache.SaveIndexCache(projectDir, signature, scanResult, "2022.3.10f1", handles, preserveSemanticRelations: false));
@@ -216,6 +219,7 @@ namespace AssetStudio.Tests
             {
                 const int groupCount = 10;
                 var (cache, projectDir, signature, scanResult, sourcePath) = CreateSampleProject(tempRoot, groupCount);
+                using var _cache = cache;
                 var (handles, batches, _, sampleIds) = BuildMultiBatchSyntheticGraphWithOverlaps(sourcePath, groupCount, batchCount: 2);
 
                 Assert.True(cache.SaveIndexCache(projectDir, signature, scanResult, "2022.3.10f1", handles, preserveSemanticRelations: false));
@@ -300,6 +304,7 @@ namespace AssetStudio.Tests
             {
                 const int groupCount = 8;
                 var (cache, projectDir, signature, scanResult, sourcePath) = CreateSampleProject(tempRoot, groupCount);
+                using var _cache = cache;
                 var (handles, batches, _, sampleIds) = BuildMultiBatchSyntheticGraphWithOverlaps(sourcePath, groupCount, batchCount: 2);
 
                 Assert.True(cache.SaveIndexCache(projectDir, signature, scanResult, "2022.3.10f1", handles, preserveSemanticRelations: false));
@@ -361,16 +366,18 @@ namespace AssetStudio.Tests
                     if (bundleFiles.Count > 0)
                     {
                         VerifyRealBundlesParityAndFlatBuffers(tempRoot, OthercideBundlesDir, bundleFiles);
-                        return;
                     }
                 }
 
-                // Fallback when running on a machine without the local Steam Othercide directory.
+                // Always verify synthetic multi-batch fallback parity and read-pool disposal as well
+                // so local runs and CI runners without Othercide exercise the exact same code paths.
                 const int fallbackGroups = 40;
                 var stagedRoot = Path.Combine(tempRoot, "FallbackStaged");
                 var baselineRoot = Path.Combine(tempRoot, "FallbackBaseline");
                 var (stagedCache, projectDir, sig1, scan1, sourcePath) = CreateSampleProject(stagedRoot, fallbackGroups);
+                using var _stagedCache = stagedCache;
                 var (baselineCache, _, sig2, scan2, _) = CreateSampleProject(baselineRoot, fallbackGroups, existingProjectDir: projectDir);
+                using var _baselineCache = baselineCache;
                 var (handles, batches, merged, sampleIds) = BuildMultiBatchSyntheticGraphWithOverlaps(sourcePath, fallbackGroups, batchCount: 4);
 
                 Assert.True(stagedCache.SaveIndexCache(projectDir, sig1, scan1, "2022.3.10f1", handles, preserveSemanticRelations: false));
@@ -404,8 +411,8 @@ namespace AssetStudio.Tests
         {
             var stagedCacheDir = Path.Combine(tempRoot, "StagedIndexCache");
             var baselineCacheDir = Path.Combine(tempRoot, "BaselineIndexCache");
-            var stagedCache = new SQLiteProjectIndexCache(stagedCacheDir);
-            var baselineCache = new SQLiteProjectIndexCache(baselineCacheDir);
+            using var stagedCache = new SQLiteProjectIndexCache(stagedCacheDir);
+            using var baselineCache = new SQLiteProjectIndexCache(baselineCacheDir);
 
             var scanResult = ProjectScanner.ScanFolder(readOnlyProjectFolder);
             var signature = stagedCache.GetFolderSignature(scanResult);

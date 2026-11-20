@@ -38,8 +38,12 @@ mkdir -p "$DIST_DIR"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-VERSION=$(grep -h -oP '(?<=<Version>)[^<]+' "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" "$REPO_ROOT/Directory.Build.props" 2>/dev/null | head -n 1 || true)
-VERSION="${VERSION:-0.17.1}"
+if [[ -n "${RELEASE_VERSION:-}" ]]; then
+    VERSION="${RELEASE_VERSION#[vV]}"
+elif [[ -z "${VERSION:-}" ]]; then
+    VERSION=$(grep -h -oP '(?<=<Version>)[^<]+' "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" "$REPO_ROOT/Directory.Build.props" 2>/dev/null | head -n 1 || true)
+    VERSION="${VERSION:-0.17.1}"
+fi
 echo "--> Detected version: $VERSION"
 
 build_appimage() {
