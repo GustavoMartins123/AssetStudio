@@ -1,0 +1,312 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional version tag for artifact naming (e.g. v0.17.1). Leave empty to use project <Version>.'
+        required: false
+        type: string
+        default: ''
+      draft:
+        description: 'Create GitHub Release as draft (applies when triggered on a v* tag ref)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $raw = ""
+          if ($env:REF -like "refs/tags/v*") {
+            $raw = $env:REF_NAME
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_RELEASE_TAG)) {
+            $raw = $env:INPUT_RELEASE_TAG.Trim()
+          }
+          else {
+            foreach ($projFile in @("AssetStudio.Avalonia/AssetStudio.Avalonia.csproj", "Directory.Build.props")) {
+              if (Test-Path -LiteralPath $projFile) {
+                [xml]$xml = Get-Content -LiteralPath $projFile
+                $candidate = $xml.Project.PropertyGroup.Version | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                  $raw = $candidate.Trim()
+                  break
+                }
+              }
+            }
+            if ([string]::IsNullOrWhiteSpace($raw)) {
+              $raw = "0.17.1"
+            }
+          }
+
+          $version = $raw -replace '^[vV]', ''
+          if ($version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
+            throw "Invalid release version '$version' derived from '$raw'."
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Resolved release version: $version"
+
+      - name: Build Texture2DDecoderNative (x64 Release)
+        run: msbuild Texture2DDecoderNative/Texture2DDecoderNative.vcxproj /p:Configuration=Release /p:Platform=x64 /m /verbosity:minimal
+
+      - name: Restore Tests
+        run: dotnet restore AssetStudio.Tests/AssetStudio.Tests.csproj --locked-mode
+
+      - name: Run Tests
+        run: dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --no-restore --verbosity normal
+
+      # Use -p:RuntimeIdentifier=win-x64 instead of -r win-x64 so NuGet preserves
+      # <RuntimeIdentifiers> from Directory.Build.props when validating multi-RID lockfiles.
+      - name: Restore AssetStudio.Avalonia (win-x64)
+        run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj -p:RuntimeIdentifier=win-x64 --locked-mode
+
+      - name: Publish AssetStudio.Avalonia (win-x64)
+        env:
+          RestoreLockedMode: 'true'
+        run: pwsh -File scripts/publish-windows.ps1 -Configuration Release -Platform x64 -SkipNative
+
+      - name: Verify and archive Windows release output
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publishDir = "AssetStudio.Avalonia/bin/Release/net10.0/win-x64/publish"
+          foreach ($required in @(
+            (Join-Path $publishDir "AssetStudio.Avalonia.exe"),
+            (Join-Path $publishDir "x64/Texture2DDecoderNative.dll")
+          )) {
+            if (-not (Test-Path -LiteralPath $required)) {
+              throw "Expected release file was not found: '$required'."
+            }
+          }
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $zipPath = "dist/AssetStudio-win-x64-$($env:RELEASE_VERSION).zip"
+          Compress-Archive -Path "$publishDir/*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          Get-Item -LiteralPath $zipPath | Select-Object Name, Length
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: dist/AssetStudio-win-x64-*.zip
+          if-no-files-found: error
+
+  build-linux-x64:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Linux build and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ dpkg-dev file tar xz-utils
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          raw=""
+          if [[ "$REF" == refs/tags/v* ]]; then
+            raw="$REF_NAME"
+          elif [[ -n "${INPUT_RELEASE_TAG//[[:space:]]/}" ]]; then
+            raw="${INPUT_RELEASE_TAG#"${INPUT_RELEASE_TAG%%[![:space:]]*}"}"
+            raw="${raw%"${raw##*[![:space:]]}"}"
+          else
+            raw="$(grep -oP '(?<=<Version>)[^<]+' AssetStudio.Avalonia/AssetStudio.Avalonia.csproj | head -n 1 || true)"
+            if [[ -z "$raw" ]]; then
+              raw="$(grep -oP '(?<=<Version>)[^<]+' Directory.Build.props | head -n 1 || true)"
+            fi
+            raw="${raw:-0.17.1}"
+          fi
+
+          version="${raw#[vV]}"
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "Invalid release version '$version' derived from '$raw'." >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $version"
+
+      - name: Build Texture2DDecoderNative (Linux x64)
+        run: |
+          cmake -S Texture2DDecoderNative -B Texture2DDecoderNative/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build Texture2DDecoderNative/build --parallel
+
+      - name: Restore Tests
+        run: dotnet restore AssetStudio.Tests/AssetStudio.Tests.csproj --locked-mode
+
+      - name: Run Tests
+        run: dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --no-restore --verbosity normal
+
+      # Use -p:RuntimeIdentifier=linux-x64 instead of -r linux-x64 so NuGet preserves
+      # <RuntimeIdentifiers> from Directory.Build.props when validating multi-RID lockfiles.
+      - name: Restore AssetStudio.Avalonia (linux-x64)
+        run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj -p:RuntimeIdentifier=linux-x64 --locked-mode
+
+      - name: Validate Linux packaging scripts
+        run: bash -n scripts/publish-linux.sh scripts/package-linux.sh
+
+      # scripts/package-linux.sh invokes scripts/publish-linux.sh internally (downloading
+      # SHA-256-verified FFmpeg 8.1.3 LGPL shared libs and publishing self-contained linux-x64),
+      # strips Windows-only runtime artifacts, and builds the .AppImage and .deb packages into dist/.
+      - name: Publish and package Linux x64 (.AppImage and .deb)
+        env:
+          RestoreLockedMode: 'true'
+        run: bash scripts/package-linux.sh
+
+      - name: Verify Linux publish output and create portable .tar.gz
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          publish_dir="AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish"
+
+          if [[ ! -x "$publish_dir/AssetStudio.Avalonia" ]]; then
+            echo "Expected published executable was not found: '$publish_dir/AssetStudio.Avalonia'." >&2
+            exit 1
+          fi
+          if [[ ! -f "$publish_dir/x64/libTexture2DDecoderNative.so" ]]; then
+            echo "Expected native texture decoder was not found: '$publish_dir/x64/libTexture2DDecoderNative.so'." >&2
+            exit 1
+          fi
+          if [[ ! -e "$publish_dir/x64/ffmpeg/libavcodec.so.62" ]]; then
+            echo "Expected bundled FFmpeg library was not found: '$publish_dir/x64/ffmpeg/libavcodec.so.62'." >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          appimages=(dist/*.AppImage)
+          debs=(dist/*.deb)
+          if [[ ${#appimages[@]} -eq 0 ]]; then
+            echo "Expected AppImage package was not produced in dist/." >&2
+            exit 1
+          fi
+          if [[ ${#debs[@]} -eq 0 ]]; then
+            echo "Expected .deb package was not produced in dist/." >&2
+            exit 1
+          fi
+
+          stage_dir="$(mktemp -d)"
+          trap 'rm -rf "$stage_dir"' EXIT
+          cp -a "$publish_dir" "$stage_dir/AssetStudio-linux-x64"
+          tarball="dist/AssetStudio-linux-x64-${RELEASE_VERSION}.tar.gz"
+          tar -czf "$tarball" -C "$stage_dir" AssetStudio-linux-x64
+          ls -lh dist/
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/AssetStudio-linux-x64-*.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows-x64, build-linux-x64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          rm -f SHA256SUMS.txt
+          shopt -s nullglob
+          files=(*)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No release artifacts were downloaded." >&2
+            exit 1
+          fi
+          LC_ALL=C sha256sum -- "${files[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+            echo "Release '$TAG' already exists; uploading/replacing assets..."
+            gh release upload "$TAG" release-assets/* --clobber --repo "$GITHUB_REPO"
+          else
+            flags=(--title "$TAG" --generate-notes --verify-tag --repo "$GITHUB_REPO")
+            if [[ "$INPUT_DRAFT" == "true" ]]; then
+              flags+=(--draft)
+            fi
+            if [[ "$TAG" == *-* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" release-assets/* "${flags[@]}"
+          fi

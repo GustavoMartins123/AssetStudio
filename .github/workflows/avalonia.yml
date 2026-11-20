@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Check out source
@@ -46,3 +46,22 @@ jobs:
 
       - name: Run Tests
         run: dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --no-restore --verbosity normal
+
+      - name: Smoke Test Linux Publish (linux-x64)
+        env:
+          RestoreLockedMode: 'true'
+        run: bash scripts/publish-linux.sh -c Release -r linux-x64 --skip-native --skip-ffmpeg-download
+
+      - name: Verify Linux Publish Output
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish_dir="AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish"
+          if [[ ! -x "$publish_dir/AssetStudio.Avalonia" ]]; then
+            echo "Expected published binary was not found or is not executable: '$publish_dir/AssetStudio.Avalonia'." >&2
+            exit 1
+          fi
+          if [[ ! -f "$publish_dir/x64/libTexture2DDecoderNative.so" ]]; then
+            echo "Expected native texture decoder was not copied to '$publish_dir/x64/libTexture2DDecoderNative.so'." >&2
+            exit 1
+          fi
