@@ -14,11 +14,8 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private readonly SceneTreeSearchSession treeSearchSession = new();
-    private SceneHierarchyViewModel? _sceneHierarchy;
-
-    internal SceneHierarchyViewModel SceneHierarchy =>
-        _sceneHierarchy ??= new SceneHierarchyViewModel(DispatchToSceneHierarchyUi, treeSearchSession);
+    internal SceneHierarchyViewModel SceneHierarchy => ViewModel.SceneHierarchy;
+    private SceneTreeSearchSession treeSearchSession => SceneHierarchy.SearchSession;
 
     private GameObjectNode[]? appliedTreeSearchMatches
     {
@@ -29,18 +26,6 @@ public partial class MainWindow
             {
                 SceneHierarchy.InvalidateSearchCache();
             }
-        }
-    }
-
-    private static void DispatchToSceneHierarchyUi(Action action)
-    {
-        if (Dispatcher.UIThread.CheckAccess())
-        {
-            action();
-        }
-        else
-        {
-            Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
         }
     }
 

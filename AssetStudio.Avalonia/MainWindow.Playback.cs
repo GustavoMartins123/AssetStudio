@@ -7,14 +7,11 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private MediaPlaybackViewModel? _mediaPlayback;
-
     /// <summary>
-    /// Unified headless state machine for AudioClip / VideoClip preview transport.
-    /// Exposed internally so the MVVM integrator can promote it onto <see cref="MainWindowViewModel"/>.
+    /// Unified headless state machine for AudioClip / VideoClip preview transport,
+    /// delegated directly to the canonical instance on <see cref="MainWindowViewModel"/>.
     /// </summary>
-    internal MediaPlaybackViewModel MediaPlayback =>
-        _mediaPlayback ??= new MediaPlaybackViewModel(DispatchMediaPlaybackToUi);
+    internal MediaPlaybackViewModel MediaPlayback => ViewModel.MediaPlayback;
 
     private static void DispatchMediaPlaybackToUi(Action action)
     {

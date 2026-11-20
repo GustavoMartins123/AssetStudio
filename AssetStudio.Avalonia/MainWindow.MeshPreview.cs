@@ -12,8 +12,7 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private MeshPreviewViewModel? _meshPreview;
-    internal MeshPreviewViewModel MeshPreview => _meshPreview ??= new MeshPreviewViewModel(DispatchToPreviewUi);
+    internal MeshPreviewViewModel MeshPreview => ViewModel.MeshPreview;
     private long _activeMeshBadgePreviewId;
     private string? _activeMeshBadgeSourceKind;
     private bool _activeMeshGeometryFromCache;

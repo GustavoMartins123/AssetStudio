@@ -705,6 +705,110 @@ namespace AssetStudio.Tests
                 vm.IncompleteSessionSummary);
         }
 
+        [Fact]
+        public async Task MainWindowViewModel_HeadlessInstantiation_ExposesAll8ViewModels_ResetsSession_AndDisposesCleanly()
+        {
+            var dispatchedActions = 0;
+            using var mainVm = new MainWindowViewModel(dispatchToUi: action =>
+            {
+                dispatchedActions++;
+                action();
+            });
+
+            // 1) All 8 canonical sub-ViewModels are non-null and initialized
+            Assert.NotNull(mainVm.LoadingService);
+            Assert.NotNull(mainVm.AssetList);
+            Assert.NotNull(mainVm.IndexingProgress);
+            Assert.NotNull(mainVm.PreviewSession);
+            Assert.NotNull(mainVm.MeshPreview);
+            Assert.NotNull(mainVm.Export);
+            Assert.NotNull(mainVm.SceneHierarchy);
+            Assert.NotNull(mainVm.ProjectSession);
+            Assert.NotNull(mainVm.MediaPlayback);
+            Assert.Equal("Ready", mainVm.StatusText);
+
+            // Default parameterless construction also works 100% headlessly
+            using var defaultMainVm = new MainWindowViewModel();
+            Assert.NotNull(defaultMainVm.AssetList);
+            Assert.NotNull(defaultMainVm.IndexingProgress);
+            Assert.NotNull(defaultMainVm.PreviewSession);
+            Assert.NotNull(defaultMainVm.MeshPreview);
+            Assert.NotNull(defaultMainVm.Export);
+            Assert.NotNull(defaultMainVm.SceneHierarchy);
+            Assert.NotNull(defaultMainVm.ProjectSession);
+            Assert.NotNull(defaultMainVm.MediaPlayback);
+
+            // 2) Mutate state across all 8 ViewModels
+            var (projectIndex, eagerItems) = BuildTestDataset(20);
+            mainVm.AssetList.SetArenaAssets(projectIndex);
+            Assert.Equal(20, mainVm.AssetList.TotalAssetCount);
+
+            mainVm.IndexingProgress.BeginIndexing(totalFiles: 50, currentFile: "level0");
+            Assert.True(mainVm.IsPauseEnabled);
+            Assert.True(mainVm.IsStopEnabled);
+
+            mainVm.PreviewSession.ShowTextPreview("Shader source", PreviewSurfaceKind.Shader, eagerItems[0], "HeroShader");
+            Assert.Equal(PreviewSurfaceKind.Shader, mainVm.PreviewSession.ActiveKind);
+            Assert.True(mainVm.PreviewSession.HasActivePreview);
+
+            mainVm.MeshPreview.SetAnimationState(isLoaded: true, clipName: "Run", durationSeconds: 1.5, isPlaying: true, totalFrames: 45);
+            Assert.True(mainVm.MeshPreview.IsAnimationLoaded);
+            Assert.True(mainVm.MeshPreview.IsPlaying);
+
+            var exportToken = mainVm.Export.BeginExport(ExportOperationMode.Convert, totalCount: 25, targetFolder: "Exports");
+            Assert.True(mainVm.Export.IsBusy);
+            Assert.False(exportToken.IsCancellationRequested);
+
+            var rootNode = new GameObjectNode { Name = "SceneRoot" };
+            mainVm.SceneHierarchy.SetRootNodes(new[] { rootNode });
+            var match = await mainVm.SceneHierarchy.SearchNextAsync("SceneRoot");
+            Assert.Same(rootNode, match);
+            Assert.Equal(1, mainVm.SceneHierarchy.TotalRootCount);
+
+            mainVm.ProjectSession.SetLoadedProject("GameFolder", displayName: "TestGame", isLazyMode: true, unityVersion: "2022.3.10f1");
+            Assert.True(mainVm.ProjectSession.HasLoadedProject);
+            Assert.True(mainVm.ProjectSession.IsLazyMode);
+
+            mainVm.MediaPlayback.SelectAudio("BattleTheme", "Vorbis");
+            mainVm.MediaPlayback.MarkAudioReady(durationSeconds: 90.0, backendName: "MockAudio", canSeek: true);
+            mainVm.MediaPlayback.SetPlaying();
+            Assert.True(mainVm.MediaPlayback.IsPlaying);
+
+            mainVm.StatusText = "Working...";
+            mainVm.LoadingProgress = 75.0;
+            mainVm.IsIndexingActive = true;
+            Assert.True(dispatchedActions > 0);
+
+            // 3) ResetSession() clears all 8 ViewModels and cancels in-flight export
+            mainVm.ResetSession();
+            Assert.Equal(0, mainVm.AssetList.TotalAssetCount);
+            Assert.Equal(IndexingStatus.Idle, mainVm.IndexingProgress.Status);
+            Assert.Equal(PreviewSurfaceKind.None, mainVm.PreviewSession.ActiveKind);
+            Assert.False(mainVm.PreviewSession.HasActivePreview);
+            Assert.False(mainVm.MeshPreview.IsAnimationLoaded);
+            Assert.False(mainVm.MeshPreview.IsPlaying);
+            Assert.False(mainVm.Export.IsBusy);
+            Assert.Equal(ExportOperationStatus.Idle, mainVm.Export.Status);
+            Assert.True(exportToken.IsCancellationRequested);
+            Assert.Equal(0, mainVm.SceneHierarchy.TotalRootCount);
+            Assert.Empty(mainVm.SceneHierarchy.Nodes);
+            Assert.False(mainVm.ProjectSession.HasLoadedProject);
+            Assert.Equal(ActiveMediaKind.None, mainVm.MediaPlayback.MediaKind);
+            Assert.Equal(MediaPlaybackState.Stopped, mainVm.MediaPlayback.PlaybackState);
+            Assert.Equal("Ready", mainVm.StatusText);
+            Assert.Equal(0.0, mainVm.LoadingProgress);
+            Assert.False(mainVm.IsIndexingActive);
+            Assert.False(mainVm.IsPauseEnabled);
+            Assert.False(mainVm.IsResumeEnabled);
+            Assert.False(mainVm.IsStopEnabled);
+
+            // 4) Dispose() is idempotent and unsubscribes IndexingProgress events
+            mainVm.Dispose();
+            mainVm.Dispose();
+            mainVm.IndexingProgress.BeginIndexing(totalFiles: 10, currentFile: "after_dispose.bundle");
+            Assert.False(mainVm.IsPauseEnabled);
+        }
+
         private static void AssertViewportParity(AssetListViewModel left, AssetListViewModel right)
         {
             Assert.Equal(left.VisibleItems.Count, right.VisibleItems.Count);

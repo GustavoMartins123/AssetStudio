@@ -99,23 +99,10 @@ internal sealed class AsyncPreviewRequestCoordinator : IDisposable
 public partial class MainWindow : Window
 {
     private const int MaxPreviewTextChars = PreviewSessionViewModel.MaxPreviewTextChars;
-    private PreviewSessionViewModel? _previewSession;
-    internal PreviewSessionViewModel PreviewSession => _previewSession ??= new PreviewSessionViewModel(DispatchToPreviewUi);
+    internal PreviewSessionViewModel PreviewSession => ViewModel.PreviewSession;
     private AsyncPreviewRequestCoordinator _previewRequestCoordinator => PreviewSession.PreviewCoordinator;
     private AsyncPreviewRequestCoordinator _dumpRequestCoordinator => PreviewSession.DumpCoordinator;
     private readonly SemaphoreSlim _assemblyLoaderGate = new(1, 1);
-
-    private static void DispatchToPreviewUi(Action action)
-    {
-        if (Dispatcher.UIThread.CheckAccess())
-        {
-            action();
-        }
-        else
-        {
-            Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
-        }
-    }
 
     private CancellationToken BeginAsyncPreviewRequest(out long requestId, out long previewVersion)
     {

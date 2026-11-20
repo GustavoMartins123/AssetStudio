@@ -169,6 +169,10 @@ public partial class MainWindow : Window
 
         this.projectContext = projectContext;
         appSettings = projectContext?.Settings ?? ProjectManagerStore.Shared.LoadGlobalSettings();
+        if (projectContext?.Project != null)
+        {
+            ViewModel.ProjectSession.SetLoadedProject(projectContext.Project, isLazyMode: assetsManager.LazyLoading);
+        }
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
         AssetListDataGrid.ItemsSource = visibleAssetItems;
@@ -1787,8 +1791,8 @@ public partial class MainWindow : Window
             GLPreviewControl.LoadMeshPreviewGeometryCache = null;
             GLPreviewControl.SaveMeshPreviewGeometryCache = null;
         }
-        ViewModel.AssetList.Reset();
-        ViewModel.IndexingProgress.Reset();
+        ViewModel.ResetSession();
+        ViewModel.Dispose();
         resolvedSourcePathCache.Clear();
         lazySourcePathBySerializedFile.Clear();
         lazySourceFileSearchCache.Clear();
@@ -1797,6 +1801,7 @@ public partial class MainWindow : Window
         FlushAvatarPreviewSettingsSave();
         AudioReset(recreateAudioPlayer: false);
         VideoReset();
+        _audioPlaybackService?.Dispose();
         _pcmWavePreviewPlayer?.Dispose();
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         SpriteHelper.ClearAtlasCache();

@@ -89,9 +89,13 @@ public partial class MainWindow
         classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
-        ViewModel.IndexingProgress.Reset();
-        ViewModel.IsIndexingActive = false;
-        ViewModel.LoadingProgress = 0;
+        ViewModel.ResetSession();
+        ViewModel.PreviewSession.IsPreviewEnabled = enablePreview?.IsChecked != false;
+        ViewModel.PreviewSession.IsDisplayInfoEnabled = displayInfo?.IsChecked != false;
+        if (projectContext?.Project != null)
+        {
+            ViewModel.ProjectSession.SetLoadedProject(projectContext.Project, isLazyMode: assetsManager.LazyLoading);
+        }
         HideIndexingProgressPanel();
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");

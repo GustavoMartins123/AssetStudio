@@ -20,22 +20,9 @@ public partial class MainWindow
     internal const int DefaultCurrentExportWriteIntervalMs = AssetExportService.DefaultCurrentExportWriteIntervalMs;
     internal const int DefaultExportUiProgressIntervalMs = AssetExportService.DefaultExportUiProgressIntervalMs;
 
-    private readonly ExportViewModel _exportState = new(dispatchToUi: DispatchExportUiAction);
     private readonly AssetExportService _exportService = new();
 
-    internal ExportViewModel ExportState => _exportState;
-
-    private static void DispatchExportUiAction(Action action)
-    {
-        if (global::Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
-        {
-            action();
-        }
-        else
-        {
-            global::Avalonia.Threading.Dispatcher.UIThread.Post(action, global::Avalonia.Threading.DispatcherPriority.Background);
-        }
-    }
+    internal ExportViewModel ExportState => ViewModel.Export;
 
     internal static int GetExportThreadCount(int requestedDegreeOfParallelism = 0)
         => AssetExportService.GetExportThreadCount(requestedDegreeOfParallelism);

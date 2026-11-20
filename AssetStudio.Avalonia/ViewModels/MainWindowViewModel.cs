@@ -4,9 +4,10 @@ using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia.ViewModels
 {
-    public class MainWindowViewModel : ViewModelBase
+    public class MainWindowViewModel : ViewModelBase, IDisposable
     {
         private readonly AssetLoadingService _loadingService;
+        private bool _disposed;
         private string _statusText = "Ready";
         private double _loadingProgress;
         private bool _isIndexingActive;
@@ -15,15 +16,33 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _isStopEnabled;
         private string _specifyUnityVersion = string.Empty;
 
+        public MainWindowViewModel(Action<Action>? dispatchToUi)
+            : this(loadingService: null, dispatchToUi: dispatchToUi)
+        {
+        }
+
         public MainWindowViewModel(
-            AssetLoadingService loadingService,
+            AssetLoadingService? loadingService = null,
             AssetListViewModel? assetList = null,
             IndexingProgressViewModel? indexingProgress = null,
+            PreviewSessionViewModel? previewSession = null,
+            MeshPreviewViewModel? meshPreview = null,
+            ExportViewModel? export = null,
+            SceneHierarchyViewModel? sceneHierarchy = null,
+            ProjectSessionViewModel? projectSession = null,
+            MediaPlaybackViewModel? mediaPlayback = null,
             Action<Action>? dispatchToUi = null)
         {
-            _loadingService = loadingService;
-            AssetList = assetList ?? new AssetListViewModel(dispatchToUi);
+            var effectiveDispatch = dispatchToUi ?? (static action => action());
+            _loadingService = loadingService ?? new AssetLoadingService();
+            AssetList = assetList ?? new AssetListViewModel(effectiveDispatch);
             IndexingProgress = indexingProgress ?? new IndexingProgressViewModel();
+            PreviewSession = previewSession ?? new PreviewSessionViewModel(effectiveDispatch);
+            MeshPreview = meshPreview ?? new MeshPreviewViewModel(effectiveDispatch);
+            Export = export ?? new ExportViewModel(effectiveDispatch);
+            SceneHierarchy = sceneHierarchy ?? new SceneHierarchyViewModel(effectiveDispatch);
+            ProjectSession = projectSession ?? new ProjectSessionViewModel(effectiveDispatch);
+            MediaPlayback = mediaPlayback ?? new MediaPlaybackViewModel(effectiveDispatch);
             IndexingProgress.PropertyChanged += OnIndexingProgressPropertyChanged;
         }
 
@@ -32,6 +51,18 @@ namespace AssetStudio.Avalonia.ViewModels
         public AssetListViewModel AssetList { get; }
 
         public IndexingProgressViewModel IndexingProgress { get; }
+
+        public PreviewSessionViewModel PreviewSession { get; }
+
+        public MeshPreviewViewModel MeshPreview { get; }
+
+        public ExportViewModel Export { get; }
+
+        public SceneHierarchyViewModel SceneHierarchy { get; }
+
+        public ProjectSessionViewModel ProjectSession { get; }
+
+        public MediaPlaybackViewModel MediaPlayback { get; }
 
         public string StatusText
         {
@@ -89,6 +120,51 @@ namespace AssetStudio.Avalonia.ViewModels
                     IsStopEnabled = IndexingProgress.CanCancel;
                     break;
             }
+        }
+
+        public void ResetSession(bool keepSavedProjects = true)
+        {
+            _loadingService.StopIndexing();
+            AssetList.Reset();
+            IndexingProgress.Reset();
+            PreviewSession.Reset();
+            MeshPreview.Reset();
+            Export.Reset();
+            SceneHierarchy.Reset();
+            ProjectSession.ResetSession(keepSavedProjects);
+            MediaPlayback.Reset();
+            StatusText = "Ready";
+            LoadingProgress = 0;
+            IsIndexingActive = false;
+            IsPauseEnabled = false;
+            IsResumeEnabled = false;
+            IsStopEnabled = false;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            IndexingProgress.PropertyChanged -= OnIndexingProgressPropertyChanged;
+            _loadingService.StopIndexing();
+            PreviewSession.Dispose();
+            Export.Dispose();
+            AssetList.Reset();
+            IndexingProgress.Reset();
+            MeshPreview.Reset();
+            SceneHierarchy.Reset();
+            ProjectSession.ResetSession();
+            MediaPlayback.Reset();
+            StatusText = "Ready";
+            LoadingProgress = 0;
+            IsIndexingActive = false;
+            IsPauseEnabled = false;
+            IsResumeEnabled = false;
+            IsStopEnabled = false;
         }
     }
 }

@@ -16,36 +16,12 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _projectAnalysisCts;
     private ProjectAnalysisResult? _currentProjectAnalysis;
     private ProjectAnalysisReport? _currentProjectAnalysisReport;
-    private ProjectSessionViewModel? _projectSession;
 
-    internal ProjectSessionViewModel ProjectSession =>
-        _projectSession ??= CreateProjectSessionViewModel();
+    internal ProjectSessionViewModel ProjectSession => ViewModel.ProjectSession;
 
     internal ProjectAnalysisReport? CurrentProjectAnalysisReport => _currentProjectAnalysisReport;
     internal ProjectAnalysisResult? CurrentProjectAnalysisResult => _currentProjectAnalysis;
     internal event Action<ProjectAnalysisReport>? ProjectAnalysisReportUpdated;
-
-    private ProjectSessionViewModel CreateProjectSessionViewModel()
-    {
-        var vm = new ProjectSessionViewModel(static action =>
-        {
-            if (Dispatcher.UIThread.CheckAccess())
-            {
-                action();
-            }
-            else
-            {
-                Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
-            }
-        });
-
-        if (projectContext?.Project != null)
-        {
-            vm.SetLoadedProject(projectContext.Project, isLazyMode: assetsManager.LazyLoading);
-        }
-
-        return vm;
-    }
 
     internal void StartProjectAnalysisAsync(string projectRoot, bool forceRefresh = false)
     {
