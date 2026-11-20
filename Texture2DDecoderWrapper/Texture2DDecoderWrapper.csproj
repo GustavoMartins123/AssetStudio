@@ -7,8 +7,4 @@
     <DebugType>embedded</DebugType>
   </PropertyGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="..\AssetStudio.PInvoke\AssetStudio.PInvoke.csproj" />
-  </ItemGroup>
-
 </Project>

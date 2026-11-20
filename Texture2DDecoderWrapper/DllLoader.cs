@@ -5,9 +5,9 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace AssetStudio.PInvoke
+namespace Texture2DDecoder
 {
-    public static class DllLoader
+    internal static class DllLoader
     {
         private static readonly ConcurrentDictionary<Assembly, byte> RegisteredAssemblies = new();
         private static readonly ConcurrentDictionary<string, IntPtr> LoadedLibraries = new(StringComparer.Ordinal);

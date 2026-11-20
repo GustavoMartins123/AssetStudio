@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Runtime.InteropServices;
-using AssetStudio.PInvoke;
 
 namespace Texture2DDecoder
 {
