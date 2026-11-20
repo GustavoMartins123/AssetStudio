@@ -190,8 +190,7 @@ public partial class MainWindow
         VideoResolutionLabel.Text = $"Resolution: {m_VideoClip.m_Width}x{m_VideoClip.m_Height} (Proxy: {m_VideoClip.m_ProxyWidth}x{m_VideoClip.m_ProxyHeight})";
         VideoFrameRateLabel.Text = $"Frame Rate: {m_VideoClip.m_FrameRate:F2} FPS | Frames: {m_VideoClip.m_FrameCount}";
         
-        var ext = Path.GetExtension(m_VideoClip.m_OriginalPath);
-        if (string.IsNullOrEmpty(ext)) ext = ".mp4";
+        var ext = SanitizeExtension(Path.GetExtension(m_VideoClip.m_OriginalPath), ".mp4");
         VideoFormatLabel.Text = $"Format: {ext.ToUpperInvariant().TrimStart('.')}";
 
         SetInitialVideoAudioLabel(m_VideoClip);
@@ -404,15 +403,25 @@ public partial class MainWindow
             return null;
         }
 
-        var ext = Path.GetExtension(videoClip.m_OriginalPath);
-        if (string.IsNullOrEmpty(ext)) ext = ".mp4";
+        var ext = SanitizeExtension(Path.GetExtension(videoClip.m_OriginalPath), ".mp4");
 
-        var tempDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
+        var tempDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AssetStudio",
+            "Temp");
         Directory.CreateDirectory(tempDir);
 
         token.ThrowIfCancellationRequested();
         var tempPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}{ext}");
-        videoClip.m_VideoData.WriteData(tempPath);
+        try
+        {
+            videoClip.m_VideoData.WriteData(tempPath);
+        }
+        catch
+        {
+            TryDeletePartialExport(tempPath);
+            throw;
+        }
 
         token.ThrowIfCancellationRequested();
         return File.Exists(tempPath) && new FileInfo(tempPath).Length > 0 ? tempPath : null;
@@ -602,8 +611,7 @@ public partial class MainWindow
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        var extension = Path.GetExtension(videoClip.m_OriginalPath);
-        if (string.IsNullOrEmpty(extension)) extension = ".mp4";
+        var extension = SanitizeExtension(Path.GetExtension(videoClip.m_OriginalPath), ".mp4");
 
         var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
         if (exportFolders == null || exportFolders.Count == 0) return;
@@ -632,6 +640,7 @@ public partial class MainWindow
         }
         catch (Exception ex)
         {
+            TryDeletePartialExport(filePath);
             StatusStripUpdate($"Failed to export video: {ex.Message}");
         }
     }

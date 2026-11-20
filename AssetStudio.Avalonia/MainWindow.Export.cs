@@ -54,38 +54,40 @@ public partial class MainWindow
         StatusStripUpdate("Exporting asset list to XML...");
         await Task.Run(() =>
         {
+            var filename = Path.Combine(savePath, "assets.xml");
             try
             {
-                var filename = Path.Combine(savePath, "assets.xml");
                 var settings = new XmlWriterSettings
                 {
                     Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
                     Indent = true,
                     CloseOutput = true
                 };
-                using var output = new FileStream(filename, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.SequentialScan);
-                using var writer = XmlWriter.Create(output, settings);
-                writer.WriteStartDocument();
-                writer.WriteStartElement("Assets");
-                writer.WriteAttributeString("filename", filename);
-                writer.WriteAttributeString("createdAt", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
-                foreach (var asset in toExport)
+                using (var output = new FileStream(filename, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+                using (var writer = XmlWriter.Create(output, settings))
                 {
-                    writer.WriteStartElement("Asset");
-                    writer.WriteElementString("Name", asset.Name ?? string.Empty);
-                    writer.WriteElementString("Container", asset.Container ?? string.Empty);
-                    writer.WriteStartElement("Type");
-                    writer.WriteAttributeString("id", ((int)asset.Type).ToString(CultureInfo.InvariantCulture));
-                    writer.WriteString(asset.DisplayType ?? string.Empty);
+                    writer.WriteStartDocument();
+                    writer.WriteStartElement("Assets");
+                    writer.WriteAttributeString("filename", filename);
+                    writer.WriteAttributeString("createdAt", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+                    foreach (var asset in toExport)
+                    {
+                        writer.WriteStartElement("Asset");
+                        writer.WriteElementString("Name", asset.Name ?? string.Empty);
+                        writer.WriteElementString("Container", asset.Container ?? string.Empty);
+                        writer.WriteStartElement("Type");
+                        writer.WriteAttributeString("id", ((int)asset.Type).ToString(CultureInfo.InvariantCulture));
+                        writer.WriteString(asset.DisplayType ?? string.Empty);
+                        writer.WriteEndElement();
+                        writer.WriteElementString("PathID", asset.PathID.ToString(CultureInfo.InvariantCulture));
+                        writer.WriteElementString("Source", GetAssetSourcePath(asset));
+                        writer.WriteElementString("Size", asset.FullSize.ToString(CultureInfo.InvariantCulture));
+                        writer.WriteEndElement();
+                    }
                     writer.WriteEndElement();
-                    writer.WriteElementString("PathID", asset.PathID.ToString(CultureInfo.InvariantCulture));
-                    writer.WriteElementString("Source", GetAssetSourcePath(asset));
-                    writer.WriteElementString("Size", asset.FullSize.ToString(CultureInfo.InvariantCulture));
-                    writer.WriteEndElement();
+                    writer.WriteEndDocument();
+                    writer.Flush();
                 }
-                writer.WriteEndElement();
-                writer.WriteEndDocument();
-                writer.Flush();
 
                 StatusStripUpdate($"Finished exporting asset list to XML with {toExport.Count} items.");
                 if (exportOptions.OpenAfterExport)
@@ -95,6 +97,7 @@ public partial class MainWindow
             }
             catch (Exception ex)
             {
+                TryDeletePartialExport(filename);
                 Logger.Error("Error exporting asset list to XML", ex);
                 StatusStripUpdate($"Error exporting asset list to XML: {ex.Message}");
             }
@@ -219,7 +222,7 @@ public partial class MainWindow
                                 {
                                     dump = assetObj.Dump();
                                 }
-                                File.WriteAllText(dumpFilePath, dump ?? "");
+                                WriteTextExport(dumpFilePath, dump ?? "");
                                 exported++;
                             }
                             break;
@@ -1044,6 +1047,35 @@ public partial class MainWindow
         }
     }
 
+    private static void WriteBytesExport(string filePath, byte[] data)
+    {
+        try
+        {
+            using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
+            file.Write(data, 0, data.Length);
+        }
+        catch
+        {
+            TryDeletePartialExport(filePath);
+            throw;
+        }
+    }
+
+    private static void WriteTextExport(string filePath, string text)
+    {
+        try
+        {
+            using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
+            using var writer = new StreamWriter(file, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            writer.Write(text);
+        }
+        catch
+        {
+            TryDeletePartialExport(filePath);
+            throw;
+        }
+    }
+
     private static string? WriteErrorReport(string savePath, List<string> exportErrors, GUILogger logger)
     {
         var loadErrors = logger.GetMessages(LoggerEvent.Error);
@@ -1177,19 +1209,24 @@ public partial class MainWindow
                 if (!exportOptions.ConvertTexture)
                 {
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".tex", item, out var rawPath)) return false;
-                    File.WriteAllBytes(rawPath, m_Texture2D.image_data.GetData());
+                    WriteBytesExport(rawPath, m_Texture2D.image_data.GetData());
                     AssetExportHelper.WriteTextureMetaIfMissing(rawPath, m_Texture2D);
                     return true;
                 }
 
-                var image = m_Texture2D.ConvertToImage(true);
+                using var image = m_Texture2D.ConvertToImage(true);
                 if (image == null) return false;
                 var extension = "." + exportOptions.ConvertTextureFormat.ToString().ToLowerInvariant();
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
-                using (image)
-                using (var file = File.OpenWrite(filePath))
+                try
                 {
+                    using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
                     image.WriteToStream(file, exportOptions.ConvertTextureFormat);
+                }
+                catch
+                {
+                    TryDeletePartialExport(filePath);
+                    throw;
                 }
                 AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Texture2D);
                 return true;
@@ -1204,12 +1241,12 @@ public partial class MainWindow
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".wav", item, out var filePath)) return false;
                     var buffer = converter.ConvertToWav();
                     if (buffer == null) return false;
-                    File.WriteAllBytes(filePath, buffer);
+                    WriteBytesExport(filePath, buffer);
                 }
                 else
                 {
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, converter.GetExtensionName(), item, out var filePath)) return false;
-                    File.WriteAllBytes(filePath, m_AudioData);
+                    WriteBytesExport(filePath, m_AudioData);
                 }
                 return true;
             }
@@ -1221,7 +1258,7 @@ public partial class MainWindow
             {
                 var extension = GetTextAssetExtension(item);
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
-                File.WriteAllBytes(filePath, m_TextAsset.m_Script);
+                WriteBytesExport(filePath, m_TextAsset.m_Script);
                 return true;
             }
             case MonoScript m_MonoScript:
@@ -1231,14 +1268,14 @@ public partial class MainWindow
                 sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
                 sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
                 sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
-                File.WriteAllText(filePath, sb.ToString());
+                WriteTextExport(filePath, sb.ToString());
                 return true;
             }
             case Shader m_Shader:
             {
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".shader", item, out var filePath)) return false;
                 var str = m_Shader.Convert();
-                File.WriteAllText(filePath, str);
+                WriteTextExport(filePath, str);
                 return true;
             }
             case Font m_Font:
@@ -1252,7 +1289,7 @@ public partial class MainWindow
                     && m_Font.m_FontData[3] == 79)
                     ext = ".otf";
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ext, item, out var filePath)) return false;
-                File.WriteAllBytes(filePath, m_Font.m_FontData);
+                WriteBytesExport(filePath, m_Font.m_FontData);
                 return true;
             }
             case Sprite m_Sprite:
@@ -1262,9 +1299,15 @@ public partial class MainWindow
                 var format = exportOptions.ConvertTextureFormat;
                 var extension = "." + format.ToString().ToLowerInvariant();
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
-                using (var file = File.OpenWrite(filePath))
+                try
                 {
+                    using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
                     image.WriteToStream(file, format);
+                }
+                catch
+                {
+                    TryDeletePartialExport(filePath);
+                    throw;
                 }
                 AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Sprite);
                 return true;
@@ -1272,9 +1315,17 @@ public partial class MainWindow
             case VideoClip m_VideoClip:
             {
                 if (m_VideoClip.m_ExternalResources.m_Size <= 0) return false;
-                var extension = Path.GetExtension(m_VideoClip.m_OriginalPath);
+                var extension = SanitizeExtension(Path.GetExtension(m_VideoClip.m_OriginalPath), ".mp4");
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
-                m_VideoClip.m_VideoData.WriteData(filePath);
+                try
+                {
+                    m_VideoClip.m_VideoData.WriteData(filePath);
+                }
+                catch
+                {
+                    TryDeletePartialExport(filePath);
+                    throw;
+                }
                 return true;
             }
             case VideoPlayer m_VideoPlayer:
@@ -1282,15 +1333,23 @@ public partial class MainWindow
                 if (m_VideoPlayer.m_VideoClip.TryGet(out var resolvedClip) && resolvedClip != null)
                 {
                     if (resolvedClip.m_ExternalResources.m_Size <= 0) return false;
-                    var extension = Path.GetExtension(resolvedClip.m_OriginalPath);
+                    var extension = SanitizeExtension(Path.GetExtension(resolvedClip.m_OriginalPath), ".mp4");
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
-                    resolvedClip.m_VideoData.WriteData(filePath);
+                    try
+                    {
+                        resolvedClip.m_VideoData.WriteData(filePath);
+                    }
+                    catch
+                    {
+                        TryDeletePartialExport(filePath);
+                        throw;
+                    }
                     return true;
                 }
                 else if (m_VideoPlayer.m_Source == 1 && !string.IsNullOrEmpty(m_VideoPlayer.m_Url))
                 {
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName + "_url", ".txt", item, out var filePath)) return false;
-                    File.WriteAllText(filePath, m_VideoPlayer.m_Url);
+                    WriteTextExport(filePath, m_VideoPlayer.m_Url);
                     return true;
                 }
                 return false;
@@ -1298,7 +1357,7 @@ public partial class MainWindow
             case MovieTexture m_MovieTexture:
             {
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".ogv", item, out var filePath)) return false;
-                File.WriteAllBytes(filePath, m_MovieTexture.m_MovieData);
+                WriteBytesExport(filePath, m_MovieTexture.m_MovieData);
                 return true;
             }
             case MonoBehaviour m_MonoBehaviour:
@@ -1317,7 +1376,7 @@ public partial class MainWindow
                 {
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".json", item, out var filePath)) return false;
                     var str = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
-                    File.WriteAllText(filePath, str);
+                    WriteTextExport(filePath, str);
                     return true;
                 }
 
@@ -1335,7 +1394,7 @@ public partial class MainWindow
                 if (dumpStr != null)
                 {
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".txt", item, out var dumpPath)) return false;
-                    File.WriteAllText(dumpPath, dumpStr);
+                    WriteTextExport(dumpPath, dumpStr);
                     return true;
                 }
 
@@ -1345,7 +1404,7 @@ public partial class MainWindow
             {
                 if (!conversionContext.TryGetAssetFilePath(exportPath, fileName + "_prefab_report", ".txt", item, out var filePath)) return false;
                 var report = FormatPrefab(obj);
-                File.WriteAllText(filePath, report);
+                WriteTextExport(filePath, report);
                 return true;
             }
             default:
@@ -1581,19 +1640,27 @@ public partial class MainWindow
             {
                 AnimationList = new List<ImportedKeyframedAnimation>()
             };
-            ModelExporter.ExportFbx(exportFile, mainConvert,
-                exportOptions.EulerFilter,
-                (float)exportOptions.FilterPrecision,
-                exportOptions.ExportAllNodes,
-                exportOptions.ExportSkins,
-                false, // Disable animation for main export
-                exportOptions.ExportBlendShape,
-                exportOptions.CastToBone,
-                (float)exportOptions.BoneSize,
-                exportOptions.ExportAllUvsAsDiffuseMaps,
-                (float)exportOptions.ScaleFactor,
-                exportOptions.FbxVersion,
-                exportOptions.FbxFormat == 1);
+            try
+            {
+                ModelExporter.ExportFbx(exportFile, mainConvert,
+                    exportOptions.EulerFilter,
+                    (float)exportOptions.FilterPrecision,
+                    exportOptions.ExportAllNodes,
+                    exportOptions.ExportSkins,
+                    false, // Disable animation for main export
+                    exportOptions.ExportBlendShape,
+                    exportOptions.CastToBone,
+                    (float)exportOptions.BoneSize,
+                    exportOptions.ExportAllUvsAsDiffuseMaps,
+                    (float)exportOptions.ScaleFactor,
+                    exportOptions.FbxVersion,
+                    exportOptions.FbxFormat == 1);
+            }
+            catch
+            {
+                TryDeletePartialExport(exportFile);
+                throw;
+            }
 
             if (exportOptions.ExportUnityMeta)
             {
@@ -1610,19 +1677,27 @@ public partial class MainWindow
                 {
                     AnimationList = new List<ImportedKeyframedAnimation> { anim }
                 };
-                ModelExporter.ExportFbx(animFile, animConvert,
-                    exportOptions.EulerFilter,
-                    (float)exportOptions.FilterPrecision,
-                    exportOptions.ExportAllNodes,
-                    exportOptions.ExportSkins,
-                    true,
-                    exportOptions.ExportBlendShape,
-                    exportOptions.CastToBone,
-                    (float)exportOptions.BoneSize,
-                    exportOptions.ExportAllUvsAsDiffuseMaps,
-                    (float)exportOptions.ScaleFactor,
-                    exportOptions.FbxVersion,
-                    exportOptions.FbxFormat == 1);
+                try
+                {
+                    ModelExporter.ExportFbx(animFile, animConvert,
+                        exportOptions.EulerFilter,
+                        (float)exportOptions.FilterPrecision,
+                        exportOptions.ExportAllNodes,
+                        exportOptions.ExportSkins,
+                        true,
+                        exportOptions.ExportBlendShape,
+                        exportOptions.CastToBone,
+                        (float)exportOptions.BoneSize,
+                        exportOptions.ExportAllUvsAsDiffuseMaps,
+                        (float)exportOptions.ScaleFactor,
+                        exportOptions.FbxVersion,
+                        exportOptions.FbxFormat == 1);
+                }
+                catch
+                {
+                    TryDeletePartialExport(animFile);
+                    throw;
+                }
 
                 if (exportOptions.ExportUnityMeta)
                 {
@@ -1640,19 +1715,27 @@ public partial class MainWindow
         }
         else
         {
-            ModelExporter.ExportFbx(exportFile, convert,
-                exportOptions.EulerFilter,
-                (float)exportOptions.FilterPrecision,
-                exportOptions.ExportAllNodes,
-                exportOptions.ExportSkins,
-                exportOptions.ExportAnimations,
-                exportOptions.ExportBlendShape,
-                exportOptions.CastToBone,
-                (float)exportOptions.BoneSize,
-                exportOptions.ExportAllUvsAsDiffuseMaps,
-                (float)exportOptions.ScaleFactor,
-                exportOptions.FbxVersion,
-                exportOptions.FbxFormat == 1);
+            try
+            {
+                ModelExporter.ExportFbx(exportFile, convert,
+                    exportOptions.EulerFilter,
+                    (float)exportOptions.FilterPrecision,
+                    exportOptions.ExportAllNodes,
+                    exportOptions.ExportSkins,
+                    exportOptions.ExportAnimations,
+                    exportOptions.ExportBlendShape,
+                    exportOptions.CastToBone,
+                    (float)exportOptions.BoneSize,
+                    exportOptions.ExportAllUvsAsDiffuseMaps,
+                    (float)exportOptions.ScaleFactor,
+                    exportOptions.FbxVersion,
+                    exportOptions.FbxFormat == 1);
+            }
+            catch
+            {
+                TryDeletePartialExport(exportFile);
+                throw;
+            }
 
             if (exportOptions.ExportUnityMeta)
             {

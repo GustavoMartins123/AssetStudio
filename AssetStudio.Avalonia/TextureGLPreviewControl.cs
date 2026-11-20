@@ -544,7 +544,7 @@ void main()
             {
                 byte[] rgbaBytes = new byte[dataToUpload.Length];
                 System.Buffer.BlockCopy(dataToUpload, 0, rgbaBytes, 0, dataToUpload.Length);
-                for (int i = 0; i < rgbaBytes.Length; i += 4)
+                for (int i = 0; i + 3 < rgbaBytes.Length; i += 4)
                 {
                     byte temp = rgbaBytes[i];
                     rgbaBytes[i] = rgbaBytes[i + 2];
@@ -561,11 +561,22 @@ void main()
                 // Fallback: Use CPU decoder to decode to BGRA32, then upload
                 if (currentTexture != null)
                 {
-                    byte[] decodedBytes = new byte[width * height * 4];
+                    if (width <= 0 || height <= 0)
+                    {
+                        throw new Exception($"Invalid texture dimensions: {width}x{height}.");
+                    }
+
+                    long requiredBytes = checked((long)width * height * 4L);
+                    if (requiredBytes > Array.MaxLength)
+                    {
+                        throw new OverflowException($"Decoded texture buffer size exceeds supported limits ({width}x{height}).");
+                    }
+
+                    byte[] decodedBytes = new byte[checked((int)requiredBytes)];
                     var converter = new Texture2DConverter(currentTexture);
                     if (converter.DecodeTexture2D(decodedBytes))
                     {
-                        for (int i = 0; i < decodedBytes.Length; i += 4)
+                        for (int i = 0; i + 3 < decodedBytes.Length; i += 4)
                         {
                             byte temp = decodedBytes[i];
                             decodedBytes[i] = decodedBytes[i + 2];
