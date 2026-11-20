@@ -24,11 +24,6 @@ if [[ -d "$PUBLISH_DIR/runtimes/win-x64" ]]; then
     rmdir "$PUBLISH_DIR/runtimes" 2>/dev/null || true
 fi
 
-if [[ -d "$PUBLISH_DIR/libvlc" ]]; then
-    echo "    Removing unused libvlc directory..."
-    rm -rf "$PUBLISH_DIR/libvlc"
-fi
-
 if [[ -d "$PUBLISH_DIR/temp" ]]; then
     echo "    Removing temporary files..."
     rm -rf "$PUBLISH_DIR/temp"
@@ -77,17 +72,22 @@ MimeType=application/octet-stream;
 EOF
     chmod +x "$appdir/AssetStudio.desktop"
 
+    local tool_version="${APPIMAGETOOL_VERSION:-1.9.1}"
+    local expected_sha256="${APPIMAGETOOL_SHA256:-ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0}"
     local tool_path="$BUILD_DIR/appimagetool-x86_64.AppImage"
-    echo "    Obtaining appimagetool..."
-    local tool_url="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-    if command -v wget >/dev/null; then
+    local tool_url="https://github.com/AppImage/appimagetool/releases/download/${tool_version}/appimagetool-x86_64.AppImage"
+    echo "    Obtaining appimagetool ${tool_version}..."
+    if command -v curl >/dev/null; then
+        curl -fsSL -o "$tool_path" "$tool_url"
+    elif command -v wget >/dev/null; then
         wget -q -O "$tool_path" "$tool_url"
-    elif command -v curl >/dev/null; then
-        curl -L -q -o "$tool_path" "$tool_url"
     else
-        echo "Error: wget or curl is required to download appimagetool." >&2
+        echo "Error: curl or wget is required to download appimagetool." >&2
         return 1
     fi
+
+    echo "    Verifying appimagetool SHA-256 checksum..."
+    echo "${expected_sha256}  ${tool_path}" | sha256sum --check --strict
     chmod +x "$tool_path"
 
     echo "    Running appimagetool..."
@@ -111,6 +111,7 @@ build_deb() {
 
     cat > "$debdir/usr/bin/assetstudio" <<'WRAPPER_EOF'
 #!/bin/sh
+export LD_LIBRARY_PATH="/opt/assetstudio:/opt/assetstudio/x64:/opt/assetstudio/x64/ffmpeg:${LD_LIBRARY_PATH:-}"
 exec /opt/assetstudio/AssetStudio.Avalonia "$@"
 WRAPPER_EOF
     chmod +x "$debdir/usr/bin/assetstudio"

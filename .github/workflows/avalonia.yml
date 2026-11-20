@@ -24,6 +24,11 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Build Texture2DDecoderNative (Linux x64)
+        run: |
+          cmake -S Texture2DDecoderNative -B Texture2DDecoderNative/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build Texture2DDecoderNative/build --parallel
+
       - name: Restore Avalonia
         run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj
 

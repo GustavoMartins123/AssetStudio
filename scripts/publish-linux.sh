@@ -135,12 +135,19 @@ copy_ffmpeg_libs() {
     \))
 
     ensure_ffmpeg_soname_alias "$target_dir" "libavcodec.so.62" "libavcodec.so.62.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavcodec.so" "libavcodec.so.62.*"
     ensure_ffmpeg_soname_alias "$target_dir" "libavdevice.so.62" "libavdevice.so.62.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavdevice.so" "libavdevice.so.62.*"
     ensure_ffmpeg_soname_alias "$target_dir" "libavfilter.so.11" "libavfilter.so.11.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavfilter.so" "libavfilter.so.11.*"
     ensure_ffmpeg_soname_alias "$target_dir" "libavformat.so.62" "libavformat.so.62.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavformat.so" "libavformat.so.62.*"
     ensure_ffmpeg_soname_alias "$target_dir" "libavutil.so.60" "libavutil.so.60.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libavutil.so" "libavutil.so.60.*"
     ensure_ffmpeg_soname_alias "$target_dir" "libswscale.so.9" "libswscale.so.9.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libswscale.so" "libswscale.so.9.*"
     ensure_ffmpeg_soname_alias "$target_dir" "libswresample.so.6" "libswresample.so.6.*"
+    ensure_ffmpeg_soname_alias "$target_dir" "libswresample.so" "libswresample.so.6.*"
 
     return 0
 }
@@ -149,15 +156,16 @@ ensure_ffmpeg_soname_alias() {
     local target_dir="$1"
     local alias_name="$2"
     local version_pattern="$3"
+    local alias_path="$target_dir/$alias_name"
     local source_file
 
-    if [[ -e "$target_dir/$alias_name" ]]; then
+    if [[ -L "$alias_path" && -e "$alias_path" ]] || [[ -f "$alias_path" && $(stat -c%s "$alias_path" 2>/dev/null || echo 0) -gt 1024 ]]; then
         return
     fi
 
-    source_file="$(find "$target_dir" -maxdepth 1 -name "$version_pattern" -print -quit)"
+    source_file="$(find "$target_dir" -maxdepth 1 -type f -name "$version_pattern" -size +1024c -print -quit)"
     if [[ -n "$source_file" ]]; then
-        cp "$source_file" "$target_dir/$alias_name"
+        ln -sf "$(basename "$source_file")" "$alias_path"
     fi
 }
 

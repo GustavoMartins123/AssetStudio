@@ -2,39 +2,51 @@ name: AssetStudioBuild
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
-
+    branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
+    timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v2
-      - uses: microsoft/setup-msbuild@v1.1
-      
+      - name: Check out source
+        uses: actions/checkout@v4
 
-
-      - name: Nuget Restore
-        run: nuget restore
-      
-      - name: Build .Net472
-        run: msbuild /p:Configuration=Release /p:TargetFramework=net472 /verbosity:minimal
-
-      - name: Build .Net10
-        run: msbuild /t:AssetStudioGUI:publish /p:Configuration=Release /p:TargetFramework=net10.0-windows /p:SelfContained=false /verbosity:minimal
-
-      - name: Upload .Net472 Artifact
-        uses: actions/upload-artifact@v2
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
         with:
-          name: AssetStudio.net472
-          path: AssetStudioGUI/bin/Release/net472
+          dotnet-version: 10.0.x
 
-      - name: Upload .Net10 Artifact
-        uses: actions/upload-artifact@v2
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Texture2DDecoderNative (x64 Release)
+        run: msbuild Texture2DDecoderNative/Texture2DDecoderNative.vcxproj /p:Configuration=Release /p:Platform=x64 /m /verbosity:minimal
+
+      - name: Restore AssetStudio.Avalonia
+        run: dotnet restore AssetStudio.Avalonia/AssetStudio.Avalonia.csproj -r win-x64
+
+      - name: Publish AssetStudio.Avalonia (win-x64)
+        run: pwsh -File scripts/publish-windows.ps1 -Configuration Release -Platform x64 -SkipNative
+
+      - name: Verify Native Texture Decoder in Publish Output
+        shell: pwsh
+        run: |
+          $dll = "AssetStudio.Avalonia/bin/Release/net10.0/win-x64/publish/x64/Texture2DDecoderNative.dll"
+          if (-not (Test-Path $dll)) {
+            throw "Expected native texture decoder was not copied to '$dll'."
+          }
+
+      - name: Upload AssetStudio.Avalonia (win-x64) Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: AssetStudio.net10
-          path: AssetStudioGUI/bin/Release/net10.0-windows/publish
+          name: AssetStudio.Avalonia-win-x64
+          path: AssetStudio.Avalonia/bin/Release/net10.0/win-x64/publish
+          if-no-files-found: error
