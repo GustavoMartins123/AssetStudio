@@ -10,16 +10,52 @@ namespace AssetStudio.Avalonia
     {
         public List<AssetHandle>? LoadIndexCache(string folderPath, string signature)
         {
+            return LoadIndexCacheCore(folderPath, signature, allowMmapSidecar: true);
+        }
+
+        internal List<AssetHandle>? LoadIndexCacheFromSqliteOnly(string folderPath, string signature)
+        {
+            return LoadIndexCacheCore(folderPath, signature, allowMmapSidecar: false);
+        }
+
+        private List<AssetHandle>? LoadIndexCacheCore(string folderPath, string signature, bool allowMmapSidecar)
+        {
             EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
+            var idxPath = MmapProjectIndexSidecar.GetSidecarPath(dbPath);
             try
             {
-                using (var conn = CreateReadConnectionByDbPath(dbPath))
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
                 {
                     var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
                     if (projectId == null)
                     {
                         return null;
+                    }
+
+                    if (fromCache)
+                    {
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId == null)
+                        {
+                            return null;
+                        }
+
+                        projectId = verifiedProjectId;
+                    }
+
+                    var indexingStatus = LoadProjectIndexingStatus(conn, projectId.Value);
+                    if (IsIncompleteIndexCacheStatus(indexingStatus))
+                    {
+                        return null;
+                    }
+
+                    if (allowMmapSidecar
+                        && MmapProjectIndexSidecar.TryLoadHandles(idxPath, signature, SemanticSchemaVersion, out var mmapHandles))
+                    {
+                        return mmapHandles.Count == 0 ? null : mmapHandles;
                     }
 
                     var handles = LoadAssetHandlesForProject(conn, projectId.Value, out var incomplete);
@@ -28,25 +64,12 @@ namespace AssetStudio.Avalonia
                         return null;
                     }
 
-                    if (handles.Count == 0 && fromCache)
-                    {
-                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                        if (verifiedProjectId == null)
-                        {
-                            return null;
-                        }
-
-                        if (verifiedProjectId.Value != projectId.Value)
-                        {
-                            handles = LoadAssetHandlesForProject(conn, verifiedProjectId.Value, out incomplete);
-                            if (incomplete)
-                            {
-                                return null;
-                            }
-                        }
-                    }
-
                     return handles.Count == 0 ? null : handles;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
                 }
             }
             catch (Exception ex)
@@ -175,6 +198,12 @@ namespace AssetStudio.Avalonia
                         }
 
                         CacheProjectId(dbPath, folderPath, signature, committedProjectId);
+                        reporter.Report("Writing mmap .idx sidecar cache", force: true);
+                        MmapProjectIndexSidecar.TryWriteSidecar(
+                            MmapProjectIndexSidecar.GetSidecarPath(dbPath),
+                            signature,
+                            SemanticSchemaVersion,
+                            handleList);
                         reporter.Report("Analyzing SQLite statistics", force: true);
                         TryAnalyzeDatabase(conn, "index cache");
                         reporter.Report("Checkpointing SQLite WAL", force: true);

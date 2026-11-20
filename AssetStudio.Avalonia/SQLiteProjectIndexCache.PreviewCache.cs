@@ -225,22 +225,31 @@ namespace AssetStudio.Avalonia
                 long? hitEntryId = null;
                 PreviewCacheEntry? entry = null;
 
-                using (var conn = CreateReadConnectionByDbPath(dbPath))
+                using (var lease = RentReadConnection(dbPath))
                 {
-                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
-                    if (projectId == null)
+                    var conn = lease.Connection;
+                    try
                     {
-                        return null;
-                    }
-
-                    entry = QueryPreviewCacheEntry(conn, dbPath, projectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
-                    if (entry == null && fromCache)
-                    {
-                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                        if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
+                        var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
+                        if (projectId == null)
                         {
-                            entry = QueryPreviewCacheEntry(conn, dbPath, verifiedProjectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                            return null;
                         }
+
+                        entry = QueryPreviewCacheEntry(conn, dbPath, projectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                        if (entry == null && fromCache)
+                        {
+                            var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                            if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
+                            {
+                                entry = QueryPreviewCacheEntry(conn, dbPath, verifiedProjectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        lease.MarkUnhealthy();
+                        throw;
                     }
                 }
 
@@ -890,32 +899,41 @@ namespace AssetStudio.Avalonia
             EnsureInitializedByDbPath(dbPath);
             try
             {
-                using var conn = CreateReadConnectionByDbPath(dbPath);
-                var hasBlobColumns = HasPreviewCacheBlobColumns(conn);
-                using var cmd = conn.CreateCommand();
-                cmd.CommandText = hasBlobColumns
-                    ? @"
-                    SELECT
-                        COUNT(*),
-                        COALESCE(SUM(CASE WHEN ByteSize > 0 THEN ByteSize ELSE COALESCE(LENGTH(PayloadBlob), 0) END), 0),
-                        MIN(NULLIF(LastAccessedUtc, '')),
-                        MAX(NULLIF(LastAccessedUtc, ''))
-                    FROM PreviewCacheEntries"
-                    : @"
-                    SELECT
-                        COUNT(*),
-                        COALESCE(SUM(ByteSize), 0),
-                        MIN(NULLIF(LastAccessedUtc, '')),
-                        MAX(NULLIF(LastAccessedUtc, ''))
-                    FROM PreviewCacheEntries";
-                using var reader = cmd.ExecuteReader();
-                if (reader.Read())
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
                 {
-                    var count = reader.IsDBNull(0) ? 0 : reader.GetInt32(0);
-                    var bytes = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
-                    var oldest = reader.IsDBNull(2) ? null : reader.GetString(2);
-                    var newest = reader.IsDBNull(3) ? null : reader.GetString(3);
-                    return new PreviewCacheStats(count, bytes, oldest, newest);
+                    var hasBlobColumns = HasPreviewCacheBlobColumns(conn);
+                    using var cmd = conn.CreateCommand();
+                    cmd.CommandText = hasBlobColumns
+                        ? @"
+                        SELECT
+                            COUNT(*),
+                            COALESCE(SUM(CASE WHEN ByteSize > 0 THEN ByteSize ELSE COALESCE(LENGTH(PayloadBlob), 0) END), 0),
+                            MIN(NULLIF(LastAccessedUtc, '')),
+                            MAX(NULLIF(LastAccessedUtc, ''))
+                        FROM PreviewCacheEntries"
+                        : @"
+                        SELECT
+                            COUNT(*),
+                            COALESCE(SUM(ByteSize), 0),
+                            MIN(NULLIF(LastAccessedUtc, '')),
+                            MAX(NULLIF(LastAccessedUtc, ''))
+                        FROM PreviewCacheEntries";
+                    using var reader = cmd.ExecuteReader();
+                    if (reader.Read())
+                    {
+                        var count = reader.IsDBNull(0) ? 0 : reader.GetInt32(0);
+                        var bytes = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
+                        var oldest = reader.IsDBNull(2) ? null : reader.GetString(2);
+                        var newest = reader.IsDBNull(3) ? null : reader.GetString(3);
+                        return new PreviewCacheStats(count, bytes, oldest, newest);
+                    }
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
                 }
             }
             catch (Exception ex)

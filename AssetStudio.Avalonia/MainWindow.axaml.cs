@@ -769,12 +769,23 @@ public partial class MainWindow : Window
             return 0;
         }
 
+        var sessionId = lazyIndexingSessionId;
         var totalVisible = 0;
         var totalHandles = cachedHandles.Count;
-        for (var offset = 0; offset < totalHandles; offset += CachedIndexLoadBatchSize)
+        var coalescedBatchSize = Math.Max(CachedIndexLoadBatchSize * 20, (totalHandles + 7) / 8);
+
+        for (var offset = 0; offset < totalHandles;)
         {
+            if (sessionId != lazyIndexingSessionId)
+            {
+                break;
+            }
+
             var start = offset;
-            var count = Math.Min(CachedIndexLoadBatchSize, totalHandles - start);
+            var targetBatchSize = start == 0 ? CachedIndexLoadBatchSize : coalescedBatchSize;
+            var count = Math.Min(targetBatchSize, totalHandles - start);
+            offset += count;
+
             await Task.Run(() =>
             {
                 for (var i = start; i < start + count; i++)
@@ -785,6 +796,11 @@ public partial class MainWindow : Window
                 }
             });
 
+            if (sessionId != lazyIndexingSessionId)
+            {
+                break;
+            }
+
             totalVisible += AppendNewLazyAssetsFromProjectIndex(count);
             var processed = start + count;
             var percent = totalHandles == 0 ? 100 : Math.Min(100, processed * 100.0 / totalHandles);
@@ -792,8 +808,10 @@ public partial class MainWindow : Window
             ViewModel.LoadingProgress = (int)percent;
             ShowIndexingProgressPanel("running", processed, totalHandles, totalHandles - processed, percent, string.Empty, string.Empty, null);
             StatusStripUpdate($"Loading project index from SQLite cache... {processed:N0}/{totalHandles:N0} handles | Showing {visibleAssets.Count:N0} assets");
-            await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Background);
-            await Task.Delay(1);
+            if (processed < totalHandles)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { }, DispatcherPriority.Background);
+            }
         }
 
         return totalVisible;

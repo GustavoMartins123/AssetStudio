@@ -19,29 +19,38 @@ namespace AssetStudio.Avalonia
             var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnectionByDbPath(dbPath);
-                var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
-                if (projectId == null)
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
                 {
-                    return false;
-                }
-
-                var count = CountMaterialSemanticRelations(conn, null, projectId.Value);
-                if (count == 0 && fromCache)
-                {
-                    var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                    if (verifiedProjectId == null)
+                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
+                    if (projectId == null)
                     {
                         return false;
                     }
 
-                    if (verifiedProjectId.Value != projectId.Value)
+                    var count = CountMaterialSemanticRelations(conn, null, projectId.Value);
+                    if (count == 0 && fromCache)
                     {
-                        count = CountMaterialSemanticRelations(conn, null, verifiedProjectId.Value);
-                    }
-                }
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId == null)
+                        {
+                            return false;
+                        }
 
-                return count > 0;
+                        if (verifiedProjectId.Value != projectId.Value)
+                        {
+                            count = CountMaterialSemanticRelations(conn, null, verifiedProjectId.Value);
+                        }
+                    }
+
+                    return count > 0;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
             {

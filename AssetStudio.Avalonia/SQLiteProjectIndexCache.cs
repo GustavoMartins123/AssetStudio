@@ -60,6 +60,11 @@ namespace AssetStudio.Avalonia
             return Path.Combine(_cacheDir, $"project_index_{folderKey}.db");
         }
 
+        internal string GetIdxPath(string folderPath)
+        {
+            return MmapProjectIndexSidecar.GetSidecarPath(GetDbPath(folderPath));
+        }
+
         public void DeleteIndexCache(string folderPath)
         {
             if (string.IsNullOrWhiteSpace(folderPath))
@@ -78,6 +83,7 @@ namespace AssetStudio.Avalonia
                     InvalidateReadConnectionPool(dbPath);
                     ClearConnectionPoolsForDb(dbPath);
                     InvalidateProjectIdCacheForDb(dbPath);
+                    MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
 
                     if (File.Exists(dbPath))
                     {
@@ -643,15 +649,46 @@ namespace AssetStudio.Avalonia
                         {
                             InvalidateProjectIdCacheForDb(dbPath);
                             InvalidateReadConnectionPool(dbPath);
+                            MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
                         }
 
                         CreateSchema(conn);
+                        TryOptimizeDatabase(conn, "database initialization");
                     }
                 }
             }
             catch (Exception ex)
             {
                 Logger.Error($"Failed to initialize SQLite database cache at {dbPath}: {ex.Message}", ex);
+            }
+        }
+
+        internal static void TryOptimizeDatabase(SqliteConnection conn, string context = "database")
+        {
+            if (conn == null || conn.State != ConnectionState.Open)
+            {
+                return;
+            }
+
+            try
+            {
+                using (var roCmd = conn.CreateCommand())
+                {
+                    roCmd.CommandText = "PRAGMA query_only;";
+                    var queryOnly = Convert.ToInt64(roCmd.ExecuteScalar() ?? 0L);
+                    if (queryOnly != 0)
+                    {
+                        return;
+                    }
+                }
+
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "PRAGMA optimize=0x10002;";
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"SQLite PRAGMA optimize for {context} skipped: {ex.Message}");
             }
         }
 
@@ -679,7 +716,7 @@ namespace AssetStudio.Avalonia
             try
             {
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = "ANALYZE;";
+                cmd.CommandText = "PRAGMA optimize=0x10002; ANALYZE;";
                 cmd.ExecuteNonQuery();
             }
             catch (Exception ex)
