@@ -357,6 +357,7 @@ public partial class MainWindow : Window
         }
         ClearMeshMaterialControls();
         ClearPreviewCandidateControls();
+        ClearPreviewCacheBadge();
         if (asset is not AnimationClip)
         {
             Stop2DAnimation();

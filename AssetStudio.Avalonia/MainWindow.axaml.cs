@@ -21,6 +21,7 @@ using System.Threading.Tasks;
 using FFmpegVideoPlayer.Core;
 using AssetStudio.Avalonia.ViewModels;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.Services.ProjectAnalysis;
 
 namespace AssetStudio.Avalonia;
 
@@ -99,6 +100,7 @@ public partial class MainWindow : Window
     private HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
     private HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
+    private long lazyIndexingSessionId;
     private bool projectAutoIndexStarted;
     private int foregroundLazyLoadCount;
 
@@ -136,6 +138,8 @@ public partial class MainWindow : Window
         displayAll.IsChecked = appSettings.DisplayAll;
         displayInfo.IsChecked = appSettings.DisplayInfo;
         enablePreview.IsChecked = appSettings.EnablePreview;
+        useDiskDecompressionCacheMenu.IsChecked = appSettings.UseDiskDecompressionCache;
+        ProjectAnalysisReportUpdated += OnProjectAnalysisReportUpdated;
         ViewModel.SpecifyUnityVersion = appSettings.SpecifyUnityVersion ?? string.Empty;
         SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
         ApplyUnityVersionOption();
@@ -265,6 +269,7 @@ public partial class MainWindow : Window
                     UpdateAnimationPlaybackFrame(currentFrame, totalFrames);
                 });
             };
+            GLPreviewControl.MeshGeometryLoaded += OnMeshPreviewGeometryLoaded;
         }
 
         ApplyAvatarPreviewControlSettings();
@@ -285,6 +290,7 @@ public partial class MainWindow : Window
             StatusStripUpdate("Loading files...");
             assetsManager.Clear();
             assetsManager.LazyLoading = false;
+            assetsManager.DecompressionCache = null;
             ApplyUnityVersionOption();
             try
             {
@@ -351,10 +357,12 @@ public partial class MainWindow : Window
         StatusStripUpdate("Loading folder (Full / Scene Hierarchy)...");
         assetsManager.Clear();
         assetsManager.LazyLoading = false;
+        assetsManager.DecompressionCache = null;
         assetsManager.ProjectRoot = !string.IsNullOrWhiteSpace(appSettings.ProjectRoot)
             ? appSettings.ProjectRoot
             : folderPath;
         ApplyUnityVersionOption();
+        StartProjectAnalysisAsync(folderPath);
         try
         {
             await Task.Run(() => assetsManager.LoadFolderAsync(folderPath));
@@ -412,6 +420,7 @@ public partial class MainWindow : Window
         ResetForm();
         assetsManager.Clear();
         assetsManager.LazyLoading = false;
+        assetsManager.DecompressionCache = null;
         ApplyUnityVersionOption();
         StatusStripUpdate("Loading dropped files...");
 
@@ -488,9 +497,16 @@ public partial class MainWindow : Window
 
         if (!string.IsNullOrEmpty(cacheTargetFolder))
         {
-            var folderCacheKey = GetFolderCacheKey(cacheTargetFolder);
-            BundleFile.CacheDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "DecompressedCache", folderCacheKey);
-            Directory.CreateDirectory(BundleFile.CacheDirectory);
+            BundleFile.CacheDirectory = string.Empty;
+            assetsManager.DecompressionCache = appSettings.UseDiskDecompressionCache
+                ? new DecompressedBundleCache(gameScopePath: cacheTargetFolder)
+                : null;
+            StartProjectAnalysisAsync(cacheTargetFolder);
+        }
+        else
+        {
+            BundleFile.CacheDirectory = string.Empty;
+            assetsManager.DecompressionCache = null;
         }
 
         try
@@ -625,6 +641,7 @@ public partial class MainWindow : Window
         ViewModel.IsStopEnabled = true;
         ShowIndexingProgressPanel("running", 0, files.Count, files.Count, 0, string.Empty, string.Empty, null);
 
+        var indexingSessionId = lazyIndexingSessionId;
         var activeFilters = filterTypeAll.IsChecked != true
             ? GetFilterTypeItems()
                 .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
@@ -644,9 +661,16 @@ public partial class MainWindow : Window
             {
                 Dispatcher.UIThread.Post(() =>
                 {
+                    if (indexingSessionId != lazyIndexingSessionId)
+                    {
+                        return;
+                    }
+
                     ViewModel.LoadingProgress = progressPercent;
                     var addedAssets = AppendNewLazyAssetsFromProjectIndex();
-                    StatusStripUpdate($"{statusText} | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})");
+                    StatusStripUpdate(addedAssets > 0
+                        ? $"{statusText} | Showing {visibleAssets.Count:N0} assets (+{addedAssets:N0})"
+                        : $"{statusText} | Showing {visibleAssets.Count:N0} assets");
                 });
             },
             (ex) =>
@@ -663,7 +687,10 @@ public partial class MainWindow : Window
             {
                 Dispatcher.UIThread.Post(() =>
                 {
-                    AppendNewLazyAssetsFromProjectIndex();
+                    if (indexingSessionId == lazyIndexingSessionId)
+                    {
+                        AppendNewLazyAssetsFromProjectIndex();
+                    }
                 });
             },
             (folderPath, scanResult) =>
@@ -679,6 +706,11 @@ public partial class MainWindow : Window
             {
                 Dispatcher.UIThread.Post(async () =>
                 {
+                    if (indexingSessionId != lazyIndexingSessionId)
+                    {
+                        return;
+                    }
+
                     try
                     {
                         ViewModel.IsIndexingActive = false;
@@ -706,7 +738,28 @@ public partial class MainWindow : Window
                         StatusStripUpdate("Lazy indexing finalization failed.");
                     }
                 });
-            });
+            },
+            onHandleBatchReady: batch =>
+            {
+                if (batch == null || batch.Count == 0)
+                {
+                    return;
+                }
+
+                foreach (var handle in batch)
+                {
+                    RememberLazyHandleSourcePath(handle);
+                }
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (indexingSessionId == lazyIndexingSessionId)
+                    {
+                        AppendLazyHandles(batch);
+                    }
+                });
+            },
+            handleFlushBatchSize: AssetLoadingService.DefaultHandleFlushBatchSize);
     }
 
     private async Task<int> LoadCachedHandlesIntoProjectIndexSmoothlyAsync(IReadOnlyList<AssetHandle> cachedHandles)
@@ -753,13 +806,23 @@ public partial class MainWindow : Window
             return 0;
         }
 
-        var displayAllChecked = displayAll.IsChecked == true;
-        var filterTypesChanged = false;
-        var newExportableItems = new List<AssetItem>();
-
         var pendingHandles = maxHandlesToDrain.HasValue
             ? assetsManager.ProjectIndex.DrainPendingHandles(maxHandlesToDrain.Value)
             : assetsManager.ProjectIndex.DrainPendingHandles();
+
+        return AppendLazyHandles(pendingHandles);
+    }
+
+    private int AppendLazyHandles(IEnumerable<AssetHandle> pendingHandles)
+    {
+        if (!assetsManager.LazyLoading || pendingHandles == null)
+        {
+            return 0;
+        }
+
+        var displayAllChecked = displayAll.IsChecked == true;
+        var filterTypesChanged = false;
+        var newExportableItems = new List<AssetItem>();
 
         foreach (var handle in pendingHandles)
         {
@@ -1402,8 +1465,63 @@ public partial class MainWindow : Window
         }
     }
 
+    private void OnProjectAnalysisReportUpdated(ProjectAnalysisReport report)
+    {
+        void ApplyBanner()
+        {
+            var text = FormatProjectAnalysisStatusText(report);
+            var isVisible = !string.IsNullOrWhiteSpace(text);
+            if (ProjectAnalysisBannerText != null)
+            {
+                ProjectAnalysisBannerText.Text = text;
+            }
+
+            if (ProjectAnalysisBannerBorder != null)
+            {
+                ProjectAnalysisBannerBorder.IsVisible = isVisible;
+            }
+        }
+
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            ApplyBanner();
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(ApplyBanner, DispatcherPriority.Background);
+        }
+    }
+
+    private void HideProjectAnalysisBanner()
+    {
+        void ClearBanner()
+        {
+            if (ProjectAnalysisBannerText != null)
+            {
+                ProjectAnalysisBannerText.Text = string.Empty;
+            }
+
+            if (ProjectAnalysisBannerBorder != null)
+            {
+                ProjectAnalysisBannerBorder.IsVisible = false;
+            }
+        }
+
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            ClearBanner();
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(ClearBanner);
+        }
+    }
+
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        ProjectAnalysisReportUpdated -= OnProjectAnalysisReportUpdated;
+        CancelProjectAnalysis();
+        assetsManager.DecompressionCache = null;
         AssetsManager.ShouldYieldForUserInteraction = null;
         FlushAvatarPreviewSettingsSave();
         AudioReset(recreateAudioPlayer: false);

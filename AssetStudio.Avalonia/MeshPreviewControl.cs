@@ -122,6 +122,7 @@ namespace AssetStudio.Avalonia
 
         public event Action<string>? GpuErrorOccurred;
         public event Action<int, int>? AnimationFrameChanged;
+        internal event Action<bool>? MeshGeometryLoaded;
 
         internal Func<Mesh, float, MeshPreviewGeometryCache?>? LoadMeshPreviewGeometryCache { get; set; }
         internal Action<Mesh, float, MeshPreviewGeometryCache>? SaveMeshPreviewGeometryCache { get; set; }

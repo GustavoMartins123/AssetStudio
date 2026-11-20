@@ -118,7 +118,8 @@ namespace AssetStudio.Avalonia
                 part.Uvs,
                 part.SubMeshIndexCounts,
                 min,
-                max);
+                max,
+                part.FromCache);
         }
 
         private static Vector3 TransformPoint(float[] matrix, Vector3 point)

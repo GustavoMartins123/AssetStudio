@@ -109,10 +109,12 @@ public partial class MainWindow
         var singleSelected = selectedAssets.Count == 1;
         var hasAnimatorWithClips = selectedAssets.Any(x => x.Type == ClassIDType.Animator)
             && selectedAssets.Any(x => x.Type == ClassIDType.AnimationClip);
+        var hasModelGroupTarget = selectedAssets.Any(x => x.Type is ClassIDType.Mesh or ClassIDType.Animator or ClassIDType.Avatar);
 
         goToSceneHierarchyMenuItem.IsVisible = singleSelected && selectedAssets[0].TreeNode != null;
         showOriginalFileMenuItem.IsVisible = singleSelected;
         exportAnimatorWithSelectedAnimationClipMenuItem.IsVisible = hasAnimatorWithClips;
+        exportModelGroupFbxMenuItem.IsVisible = hasModelGroupTarget;
     }
 
     private async void CopyAssetCellText_Click(object? sender, RoutedEventArgs e)
@@ -146,6 +148,11 @@ public partial class MainWindow
     private async void ExportAnimatorWithSelectedAnimationClip_Click(object? sender, RoutedEventArgs e)
     {
         await ExportAnimatorWithSelectedAnimationClips(GetSelectedAssets());
+    }
+
+    private async void ExportModelGroupFbx_Click(object? sender, RoutedEventArgs e)
+    {
+        await ExportSelectedModelGroupFbxAsync();
     }
 
     private async Task FilterAssetListAsync(CancellationToken token)

@@ -124,6 +124,7 @@ namespace AssetStudio.Avalonia
                     });
                 }
 
+                bool loadedFromCache = cachedGeometry != null;
                 bool hasSubMeshTextures = QueueSubMeshTexturesIfNeeded(resetMaterialOverrides, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
 
                 PostLoadedMeshGeometry(
@@ -137,7 +138,8 @@ namespace AssetStudio.Avalonia
                     localColorData,
                     localUvData,
                     localPreviewSubMeshIndexCounts,
-                    hasSubMeshTextures);
+                    hasSubMeshTextures,
+                    loadedFromCache);
             });
         }
 
@@ -275,6 +277,7 @@ namespace AssetStudio.Avalonia
                     ? combinedSubMeshCounts.ToArray()
                     : null;
                 var localModelMatrixData = CreatePreviewModelMatrix(previewMin, previewMax);
+                bool loadedFromCache = parts.Count > 0 && parts.All(part => part.FromCache);
                 bool hasSubMeshTextures = QueueSubMeshTexturesIfNeeded(resetMaterialOverrides, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
 
                 PostLoadedMeshGeometry(
@@ -288,7 +291,8 @@ namespace AssetStudio.Avalonia
                     localColorData,
                     localUvData,
                     localPreviewSubMeshIndexCounts,
-                    hasSubMeshTextures);
+                    hasSubMeshTextures,
+                    loadedFromCache);
             });
         }
 
@@ -335,7 +339,8 @@ namespace AssetStudio.Avalonia
             Vector4[] localColorData,
             Vector2[]? localUvData,
             int[]? localPreviewSubMeshIndexCounts,
-            bool hasSubMeshTextures)
+            bool hasSubMeshTextures,
+            bool loadedFromCache)
         {
             global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
@@ -362,6 +367,7 @@ namespace AssetStudio.Avalonia
                 }
                 vao = 0;
                 RequestNextFrameRendering();
+                MeshGeometryLoaded?.Invoke(loadedFromCache);
             });
         }
 
@@ -379,7 +385,8 @@ namespace AssetStudio.Avalonia
                     cachedGeometry.Uvs,
                     cachedGeometry.SubMeshIndexCounts,
                     cachedMin,
-                    cachedMax);
+                    cachedMax,
+                    fromCache: true);
             }
 
             var localVertexData = ExtractMeshVertices(mesh.m_Vertices!, mesh.m_VertexCount, out var min, out var max);
@@ -494,7 +501,8 @@ namespace AssetStudio.Avalonia
                 Vector2[]? uvs,
                 int[]? subMeshIndexCounts,
                 Vector3 min,
-                Vector3 max)
+                Vector3 max,
+                bool fromCache = false)
             {
                 Vertices = vertices;
                 Indices = indices;
@@ -504,6 +512,7 @@ namespace AssetStudio.Avalonia
                 SubMeshIndexCounts = subMeshIndexCounts;
                 Min = min;
                 Max = max;
+                FromCache = fromCache;
             }
 
             public Vector3[] Vertices { get; }
@@ -514,6 +523,7 @@ namespace AssetStudio.Avalonia
             public int[]? SubMeshIndexCounts { get; }
             public Vector3 Min { get; }
             public Vector3 Max { get; }
+            public bool FromCache { get; }
         }
     }
 }

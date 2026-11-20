@@ -11,6 +11,25 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private long _activeMeshBadgePreviewId;
+    private string? _activeMeshBadgeSourceKind;
+    private bool _activeMeshGeometryFromCache;
+    private bool _activeMeshMaterialsLoading;
+
+    private void OnMeshPreviewGeometryLoaded(bool fromCache)
+    {
+        if (texturePreviewIdCounter != _activeMeshBadgePreviewId)
+        {
+            return;
+        }
+
+        _activeMeshGeometryFromCache = fromCache;
+        UpdatePreviewCacheBadge(
+            fromCache: fromCache,
+            sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
+            materialsLoading: _activeMeshMaterialsLoading);
+    }
+
     private void PreviewMesh(
         AssetItem assetItem,
         Mesh m_Mesh,
@@ -60,6 +79,11 @@ public partial class MainWindow
                     if (GLPreviewControl != null)
                     {
                         currentPreviewMesh = m_Mesh;
+                        _activeMeshBadgePreviewId = meshPreviewId;
+                        _activeMeshBadgeSourceKind = "mesh-geometry";
+                        _activeMeshGeometryFromCache = false;
+                        _activeMeshMaterialsLoading = true;
+                        UpdatePreviewCacheBadge(fromCache: false, sourceKind: "mesh-geometry", materialsLoading: true);
                         GLPreviewControl.SetMesh(m_Mesh, uvs);
                         GLPreviewControl.IsVisible = true;
                         ShowPreviewGeometryControls(showBoneControls: false);
@@ -127,6 +151,12 @@ public partial class MainWindow
                         PreviewInfoBorder.IsVisible = true;
                     }
 
+                    _activeMeshMaterialsLoading = false;
+                    UpdatePreviewCacheBadge(
+                        fromCache: _activeMeshGeometryFromCache,
+                        sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
+                        materialsLoading: false);
+
                     StatusStripUpdate(hasTextures
                         ? "OpenGL Preview | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal | 'Ctrl S'=Textured/Shaded"
                         : "OpenGL Preview | No texture found for this mesh | 'Ctrl W'=Wireframe | 'Ctrl N'=ReNormal");
@@ -139,6 +169,8 @@ public partial class MainWindow
                 {
                     if (meshPreviewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
                     {
+                        _activeMeshMaterialsLoading = false;
+                        ClearPreviewCacheBadge();
                         StatusStripUpdate($"Mesh preview error: {ex.Message}");
                         if (PreviewInfoOverlay != null)
                         {

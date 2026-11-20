@@ -12,6 +12,11 @@ public partial class MainWindow
 {
     private void ResetForm()
     {
+        lazyIndexingSessionId++;
+        CancelProjectAnalysis();
+        HideProjectAnalysisBanner();
+        ClearPreviewCacheBadge();
+        assetsManager.DecompressionCache = null;
         BundleFile.CacheDirectory = "";
         lock (preloaderLock)
         {
@@ -154,6 +159,7 @@ public partial class MainWindow
         HidePreviewGeometryControls();
         ClearMeshMaterialControls();
         ClearPreviewCandidateControls();
+        ClearPreviewCacheBadge();
         if (AnimationPlaybackPanel != null)
         {
             AnimationPlaybackPanel.IsVisible = false;
@@ -251,6 +257,30 @@ public partial class MainWindow
         {
             PreviewInfoBorder.IsVisible = false;
         }
+    }
+
+    private void UseDiskDecompressionCache_Click(object? sender, RoutedEventArgs e)
+    {
+        var enabled = useDiskDecompressionCacheMenu.IsChecked == true;
+        appSettings.UseDiskDecompressionCache = enabled;
+        SaveAppSettings();
+
+        if (assetsManager.LazyLoading)
+        {
+            var cacheRoot = GetCurrentCacheFolderPath();
+            assetsManager.DecompressionCache = enabled && !string.IsNullOrWhiteSpace(cacheRoot)
+                ? new DecompressedBundleCache(gameScopePath: cacheRoot)
+                : null;
+            BundleFile.CacheDirectory = string.Empty;
+        }
+        else
+        {
+            assetsManager.DecompressionCache = null;
+        }
+
+        StatusStripUpdate(enabled
+            ? "Disk decompression cache (Lazy Mode) enabled."
+            : "Disk decompression cache (Lazy Mode) disabled.");
     }
 
     private void TogglePreviewInfoBtn_Click(object? sender, RoutedEventArgs e)

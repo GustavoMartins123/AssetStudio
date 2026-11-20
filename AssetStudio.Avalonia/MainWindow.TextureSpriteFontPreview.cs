@@ -47,10 +47,12 @@ public partial class MainWindow
             {
                 PreviewInfoBorder.IsVisible = false;
             }
+            ClearPreviewCacheBadge();
             return;
         }
 
         long currentId = ++texturePreviewIdCounter;
+        ClearPreviewCacheBadge();
         StatusStripUpdate("Rendering font preview...");
 
         Task.Run(() =>
@@ -321,6 +323,7 @@ public partial class MainWindow
                                     PreviewInfoBorder.IsVisible = false;
                                 }
 
+                                ClearPreviewCacheBadge();
                                 StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
                             }
                             catch (Exception ex)
@@ -364,15 +367,22 @@ public partial class MainWindow
 
         Task.Run(() =>
         {
+            TexturePreviewImageResult? cachedTextureResult = null;
+            SKBitmap? ownedSpriteImage = null;
             try
             {
                 SKBitmap? image = null;
                 string infoText = string.Empty;
                 bool isTexture = previewTexture != null;
+                bool previewFromCache = false;
+                bool previewDownscaled = false;
 
                 if (previewTexture != null)
                 {
-                    image = previewTexture.ConvertToImage(true);
+                    cachedTextureResult = LoadTexturePreviewThumbnail(previewTexture, MaxInlinePreviewTextureDimension);
+                    image = cachedTextureResult?.Image;
+                    previewFromCache = cachedTextureResult?.FromCache == true;
+                    previewDownscaled = cachedTextureResult?.Downscaled == true;
                     if (image != null)
                     {
                         infoText = $"Width: {previewTexture.m_Width}\nHeight: {previewTexture.m_Height}\nFormat: {previewTexture.m_TextureFormat}";
@@ -388,11 +398,20 @@ public partial class MainWindow
                             case 0: infoText += "\nWrap mode: Repeat"; break;
                             case 1: infoText += "\nWrap mode: Clamp"; break;
                         }
+                        if (previewDownscaled)
+                        {
+                            infoText += $"\nPreview texture downscaled to {image.Width}x{image.Height}";
+                        }
+                        if (previewFromCache)
+                        {
+                            infoText += "\nPreview texture loaded from cache";
+                        }
                     }
                 }
                 else if (previewSprite != null)
                 {
-                    image = previewSprite.GetImage();
+                    ownedSpriteImage = previewSprite.GetImage();
+                    image = ownedSpriteImage;
                     if (image != null)
                     {
                         infoText = $"Width: {image.Width}\nHeight: {image.Height}\n";
@@ -418,6 +437,7 @@ public partial class MainWindow
                     {
                         if (currentId == texturePreviewIdCounter)
                         {
+                            ClearPreviewCacheBadge();
                             StatusStripUpdate(failReason);
                             ImagePreviewBox.IsVisible = false;
                             PreviewInfoBorder.IsVisible = false;
@@ -426,7 +446,6 @@ public partial class MainWindow
                     return;
                 }
 
-                using (image)
                 {
                     int validChannel = 0;
                     for (int i = 0; i < 4; i++)
@@ -467,6 +486,8 @@ public partial class MainWindow
                         infoText += "\nRender mode: CPU (Fallback)";
 
                         string finalInfoText = infoText;
+                        bool finalFromCache = previewFromCache;
+                        string? finalSourceKind = isTexture ? "texture-thumbnail-png" : "sprite";
                         Dispatcher.UIThread.Post(() =>
                         {
                             if (currentId == texturePreviewIdCounter)
@@ -485,6 +506,8 @@ public partial class MainWindow
                                 {
                                     PreviewInfoBorder.IsVisible = false;
                                 }
+
+                                UpdatePreviewCacheBadge(fromCache: finalFromCache, sourceKind: finalSourceKind);
 
                                 if (isTexture)
                                 {
@@ -509,11 +532,17 @@ public partial class MainWindow
                 {
                     if (currentId == texturePreviewIdCounter)
                     {
+                        ClearPreviewCacheBadge();
                         StatusStripUpdate($"Error generating preview: {ex.Message}");
                         ImagePreviewBox.IsVisible = false;
                         PreviewInfoBorder.IsVisible = false;
                     }
                 });
+            }
+            finally
+            {
+                cachedTextureResult?.Dispose();
+                ownedSpriteImage?.Dispose();
             }
         });
     }

@@ -32,6 +32,7 @@ public partial class MainWindow : Window
 
         try
         {
+            _sqliteCache.EvictPreviewCache(folderPath, maxTotalBytes: 0, maxEntryCount: 0);
             _sqliteCache.DeleteIndexCache(folderPath);
             DeleteDecompressedCacheFolder(folderPath);
             DeletePreviewCacheFolder(folderPath);
@@ -78,12 +79,35 @@ public partial class MainWindow : Window
             return;
         }
 
-        var cacheRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AssetStudio",
-            "DecompressedCache");
-        var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(folderPath));
-        DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
+        var cacheRoot = DecompressedBundleCache.GetDefaultCacheBaseDirectory();
+        var legacyDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(folderPath));
+        DeleteDirectoryInsideRoot(cacheRoot, legacyDirectory);
+
+        var scopedDirectory = Path.Combine(cacheRoot, GetDecompressedBundleScopeKey(folderPath));
+        DeleteDirectoryInsideRoot(cacheRoot, scopedDirectory);
+    }
+
+    internal static string GetDecompressedBundleScopeKey(string folderPath)
+    {
+        string normalized;
+        try
+        {
+            normalized = Path.GetFullPath(folderPath)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch
+        {
+            normalized = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            normalized = normalized.ToLowerInvariant();
+        }
+
+        var hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
+        var hex = Convert.ToHexStringLower(hashBytes);
+        return hex.Length > 16 ? hex.Substring(0, 16) : hex;
     }
 
     private static void DeletePreviewCacheFolder(string folderPath)

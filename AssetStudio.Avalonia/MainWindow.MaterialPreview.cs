@@ -64,6 +64,7 @@ public partial class MainWindow
                         ImagePreviewBox.IsVisible = false;
                         PreviewInfoBorder.IsVisible = false;
                         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        ClearPreviewCacheBadge();
                         StatusStripUpdate("Material loaded (no texture).");
                     });
                     return;
@@ -86,6 +87,7 @@ public partial class MainWindow
                         ImagePreviewBox.IsVisible = false;
                         PreviewInfoBorder.IsVisible = false;
                         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        ClearPreviewCacheBadge();
                         StatusStripUpdate("Material loaded (no preview texture support).");
                     });
                     return;
@@ -160,6 +162,7 @@ public partial class MainWindow
                             PreviewInfoBorder.IsVisible = false;
                         }
 
+                        UpdatePreviewCacheBadge(fromCache: materialPreviewFromCache, sourceKind: "material");
                         StatusStripUpdate($"Material preview loaded: {postedPreviewTexture.m_Name}");
                     }
                     catch (Exception ex)
@@ -172,6 +175,7 @@ public partial class MainWindow
                             ImagePreviewBox.IsVisible = false;
                             PreviewInfoBorder.IsVisible = false;
                             if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                            ClearPreviewCacheBadge();
                             StatusStripUpdate("Material preview UI error.");
                         }
                     }
@@ -192,6 +196,7 @@ public partial class MainWindow
                         ImagePreviewBox.IsVisible = false;
                         PreviewInfoBorder.IsVisible = false;
                         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                        ClearPreviewCacheBadge();
                         StatusStripUpdate("Material preview error.");
                     }
                 });

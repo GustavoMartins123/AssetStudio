@@ -367,6 +367,11 @@ public partial class MainWindow
                     if (GLPreviewControl != null)
                     {
                         currentPreviewMesh = candidate.Mesh ?? meshes[0];
+                        _activeMeshBadgePreviewId = meshPreviewId;
+                        _activeMeshBadgeSourceKind = "model-group";
+                        _activeMeshGeometryFromCache = false;
+                        _activeMeshMaterialsLoading = true;
+                        UpdatePreviewCacheBadge(fromCache: false, sourceKind: "model-group", materialsLoading: true);
                         GLPreviewControl.SetMeshGroup(meshes, uvs, transforms);
                         GLPreviewControl.IsVisible = true;
                         ShowPreviewGeometryControls(showBoneControls: false);
@@ -442,6 +447,12 @@ public partial class MainWindow
                         PreviewInfoBorder.IsVisible = true;
                     }
 
+                    _activeMeshMaterialsLoading = false;
+                    UpdatePreviewCacheBadge(
+                        fromCache: _activeMeshGeometryFromCache,
+                        sourceKind: _activeMeshBadgeSourceKind ?? "model-group",
+                        materialsLoading: false);
+
                     StatusStripUpdate(hasTextures
                         ? $"OpenGL Preview | Model group: {candidate.ModelGroupName} | Parts: {meshes.Count:N0} | Textured"
                         : $"OpenGL Preview | Model group: {candidate.ModelGroupName} | Parts: {meshes.Count:N0} | No textures found");
@@ -454,6 +465,8 @@ public partial class MainWindow
                 {
                     if (meshPreviewId == texturePreviewIdCounter)
                     {
+                        _activeMeshMaterialsLoading = false;
+                        ClearPreviewCacheBadge();
                         StatusStripUpdate($"Model group preview error: {ex.Message}");
                     }
                 });

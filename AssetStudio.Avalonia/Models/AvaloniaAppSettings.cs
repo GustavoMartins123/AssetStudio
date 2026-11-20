@@ -20,6 +20,7 @@ public sealed class AvaloniaAppSettings
     public bool DisplayAll { get; set; } = false;
     public bool DisplayInfo { get; set; } = true;
     public bool EnablePreview { get; set; } = true;
+    public bool UseDiskDecompressionCache { get; set; } = true;
     public double AvatarPreviewBoneScale { get; set; } = 1.0;
     public double AvatarPreviewMeshDensityPercent { get; set; } = 15.0;
     public string ModelPreviewViewPreset { get; set; } = nameof(MeshPreviewViewPreset.Auto);

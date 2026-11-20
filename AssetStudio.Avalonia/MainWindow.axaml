@@ -59,6 +59,11 @@
                         <PathIcon Data="{StaticResource icon_info}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem x:Name="useDiskDecompressionCacheMenu" Header="Use disk decompression cache (Lazy Mode)" ToggleType="CheckBox" IsChecked="True" Click="UseDiskDecompressionCache_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <MenuItem Header="Set project root..." Click="SetProjectRoot_Click">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
@@ -135,6 +140,11 @@
                     </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
+                <MenuItem Header="Export Model Group (FBX)..." Click="ExportModelGroupFbx_Click">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <MenuItem Header="Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
@@ -195,6 +205,20 @@
             </MenuItem>
         </Menu>
 
+        <Border x:Name="ProjectAnalysisBannerBorder"
+                DockPanel.Dock="Top"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="0,0,0,1"
+                Padding="10,4"
+                IsVisible="False">
+            <TextBlock x:Name="ProjectAnalysisBannerText"
+                       FontSize="12"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                       TextTrimming="CharacterEllipsis"
+                       VerticalAlignment="Center" />
+        </Border>
+
         <Grid DockPanel.Dock="Bottom" ColumnDefinitions="*, Auto" Height="24" Margin="2,0">
             <ProgressBar x:Name="progressBar" Grid.Column="0" Height="20" Minimum="0" Maximum="100" Value="{Binding LoadingProgress}" />
             <TextBlock x:Name="statusLabel" Grid.Column="1" VerticalAlignment="Center" Margin="6,0,4,0" Text="{Binding StatusText}" />
@@ -235,6 +259,7 @@
                                 <ContextMenu Opened="AssetListContextMenu_Opened">
                                     <MenuItem Header="Copy text" Click="CopyAssetCellText_Click" />
                                     <MenuItem Header="Export selected assets" Click="ExportSelectedAssetsContext_Click" />
+                                    <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group (FBX)..." Click="ExportModelGroupFbx_Click" />
                                     <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Animator + selected AnimationClips" Click="ExportAnimatorWithSelectedAnimationClip_Click" />
                                     <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Click="GoToSceneHierarchy_Click" />
                                     <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Click="ShowOriginalFile_Click" />
@@ -488,6 +513,24 @@
                                     </StackPanel>
                                 </WrapPanel>
                             </Grid>
+                        </Border>
+
+                        <Border x:Name="PreviewCacheBadgeBorder"
+                                Background="#C0111111"
+                                BorderBrush="#44ffffff"
+                                BorderThickness="1"
+                                CornerRadius="12"
+                                Padding="10,4"
+                                Margin="10"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Top"
+                                IsHitTestVisible="False"
+                                IsVisible="False">
+                            <TextBlock x:Name="PreviewCacheBadgeText"
+                                       Foreground="#E6FFFFFF"
+                                       FontSize="11"
+                                       FontWeight="SemiBold"
+                                       Text="" />
                         </Border>
                         </Panel>
                     </Grid>
