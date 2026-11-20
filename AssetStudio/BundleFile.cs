@@ -1,9 +1,12 @@
 #nullable enable
 using K4os.Compression.LZ4;
+using Microsoft.Win32.SafeHandles;
 using System;
 using System.Buffers;
 using System.IO;
 using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 
 namespace AssetStudio
 {
@@ -40,10 +43,10 @@ namespace AssetStudio
         public static string TemporaryDirectory { get; set; } = "";
         public static string CacheDirectory { get; set; } = "";
         public const int MaxUncompressedBlocksInfoSize = 128 * 1024 * 1024; // 128 MiB safety cap
+        public const int MinParallelBlockCount = 4;
         private const int PersistentCacheSampleBytes = 1024 * 1024;
         private const long PersistentCacheFullSignatureThreshold = 8L * 1024 * 1024;
-        private const ulong PersistentCacheFnvOffsetBasis = 14695981039346656037UL;
-        private const ulong PersistentCacheFnvPrime = 1099511628211UL;
+        private const ulong PersistentCacheHashSeed = 0x9E3779B97F4A7C15UL;
 
         public class Header
         {
@@ -75,19 +78,33 @@ namespace AssetStudio
         public Header m_Header = new Header();
         private StorageBlock[] m_BlocksInfo = Array.Empty<StorageBlock>();
         private Node[] m_DirectoryInfo = Array.Empty<Node>();
+        private readonly bool allowParallelDecompression;
+        private readonly long? lowMemoryThresholdOverride;
 
         public StreamFile[] fileList = Array.Empty<StreamFile>();
         public Stream? BlocksStream { get; set; }
         public bool LoadedFromDecompressionCache { get; private set; }
         public string? CachedBlocksPath { get; private set; }
+        public bool UsedParallelDecompression { get; private set; }
 
         public BundleFile(FileReader reader)
-            : this(reader, null)
+            : this(reader, null, allowParallelDecompression: true, lowMemoryThresholdOverride: null)
         {
         }
 
         public BundleFile(FileReader reader, DecompressedBundleCache? decompressionCache)
+            : this(reader, decompressionCache, allowParallelDecompression: true, lowMemoryThresholdOverride: null)
         {
+        }
+
+        public BundleFile(
+            FileReader reader,
+            DecompressedBundleCache? decompressionCache,
+            bool allowParallelDecompression,
+            long? lowMemoryThresholdOverride = null)
+        {
+            this.allowParallelDecompression = allowParallelDecompression;
+            this.lowMemoryThresholdOverride = lowMemoryThresholdOverride;
             m_Header = new Header();
             m_Header.signature = reader.ReadStringToNull();
             m_Header.version = reader.ReadUInt32();
@@ -429,7 +446,7 @@ namespace AssetStudio
                         if (cacheFileInfo.Length == uncompressedSizeSum)
                         {
                             isCached = true;
-                            return new FileStream(cachedFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                            return new FileStream(cachedFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                         }
                         else
                         {
@@ -446,7 +463,7 @@ namespace AssetStudio
 
                     targetCachePath = cachedFilePath;
                     tempCachePath = cachedFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                    return new FileStream(tempCachePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
+                    return new FileStream(tempCachePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
                 }
                 catch (Exception ex)
                 {
@@ -455,7 +472,7 @@ namespace AssetStudio
             }
 
             Stream blocksStream;
-            if (ShouldUseTemporaryStream(uncompressedSizeSum))
+            if (ShouldUseTemporaryStream(uncompressedSizeSum, lowMemoryThresholdOverride))
             {
                 /*var memoryMappedFile = MemoryMappedFile.CreateNew(null, uncompressedSizeSum);
                 assetsDataStream = memoryMappedFile.CreateViewStream();*/
@@ -489,9 +506,10 @@ namespace AssetStudio
             }
         }
 
-        internal static bool ShouldUseTemporaryStream(long size)
+        internal static bool ShouldUseTemporaryStream(long size, long? thresholdOverride = null)
         {
-            return size >= int.MaxValue || (LowMemoryMode && size >= LowMemoryThreshold);
+            long threshold = thresholdOverride ?? LowMemoryThreshold;
+            return size >= int.MaxValue || ((LowMemoryMode || thresholdOverride.HasValue) && size >= threshold);
         }
 
         internal static FileStream CreateTemporaryStream(string sourcePath, string kind)
@@ -556,32 +574,31 @@ namespace AssetStudio
             return $"{SanitizeTempFilePart(Path.GetFileName(path))}_{sourceLength}_{sourceSignature}.blocks";
         }
 
-        private static string ComputeSourceContentSignature(string path, long sourceLength)
+        public static string ComputeSourceContentSignature(string path, long sourceLength)
         {
-            var hash = AddUInt64(PersistentCacheFnvOffsetBasis, (ulong)sourceLength);
+            var hash = FastHash64.Combine(PersistentCacheHashSeed, (ulong)sourceLength);
             var buffer = ArrayPool<byte>.Shared.Rent(PersistentCacheSampleBytes);
             var fileOptions = sourceLength <= PersistentCacheFullSignatureThreshold
                 ? FileOptions.SequentialScan
                 : FileOptions.RandomAccess;
-            using var stream = new FileStream(
+            using var handle = File.OpenHandle(
                 path,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete,
-                1024 * 1024,
                 fileOptions);
             try
             {
                 if (sourceLength <= PersistentCacheFullSignatureThreshold)
                 {
-                    hash = AddSample(hash, stream, buffer, 0, sourceLength);
+                    hash = AddSample(hash, handle, buffer, 0, sourceLength);
                 }
                 else
                 {
-                    hash = AddSample(hash, stream, buffer, 0, PersistentCacheSampleBytes);
+                    hash = AddSample(hash, handle, buffer, 0, PersistentCacheSampleBytes);
                     hash = AddSample(
                         hash,
-                        stream,
+                        handle,
                         buffer,
                         Math.Max(0, sourceLength - PersistentCacheSampleBytes),
                         PersistentCacheSampleBytes);
@@ -595,60 +612,30 @@ namespace AssetStudio
             return "s1_" + hash.ToString("x16");
         }
 
-        private static ulong AddSample(ulong hash, FileStream stream, byte[] buffer, long offset, long bytesToRead)
+        private static ulong AddSample(ulong hash, SafeFileHandle handle, byte[] buffer, long offset, long bytesToRead)
         {
             if (bytesToRead <= 0)
             {
                 return hash;
             }
 
-            stream.Position = offset;
+            var currentOffset = offset;
             var remaining = bytesToRead;
-            hash = AddUInt64(hash, (ulong)offset);
+            hash = FastHash64.Combine(hash, (ulong)offset);
             while (remaining > 0)
             {
                 var readSize = (int)Math.Min(buffer.Length, remaining);
-                var bytesRead = stream.Read(buffer, 0, readSize);
+                var bytesRead = RandomAccess.Read(handle, buffer.AsSpan(0, readSize), currentOffset);
                 if (bytesRead <= 0)
                 {
                     break;
                 }
 
-                hash = AddInt32(hash, bytesRead);
-                hash = AddBytes(hash, buffer, bytesRead);
+                hash = FastHash64.Hash(buffer.AsSpan(0, bytesRead), hash);
+                currentOffset += bytesRead;
                 remaining -= bytesRead;
             }
 
-            return hash;
-        }
-
-        private static ulong AddUInt64(ulong hash, ulong value)
-        {
-            for (int i = 0; i < sizeof(ulong); i++)
-            {
-                hash ^= (byte)(value >> (i * 8));
-                hash *= PersistentCacheFnvPrime;
-            }
-            return hash;
-        }
-
-        private static ulong AddInt32(ulong hash, int value)
-        {
-            for (int i = 0; i < sizeof(int); i++)
-            {
-                hash ^= (byte)(value >> (i * 8));
-                hash *= PersistentCacheFnvPrime;
-            }
-            return hash;
-        }
-
-        private static ulong AddBytes(ulong hash, byte[] buffer, int count)
-        {
-            for (int i = 0; i < count; i++)
-            {
-                hash ^= buffer[i];
-                hash *= PersistentCacheFnvPrime;
-            }
             return hash;
         }
 
@@ -771,6 +758,7 @@ namespace AssetStudio
             else if (blocksStream is FileStream fileStream)
             {
                 var tempFilePath = fileStream.Name;
+                using var sharedHandle = new SharedFileHandle(tempFilePath);
                 for (int i = 0; i < m_DirectoryInfo.Length; i++)
                 {
                     var node = m_DirectoryInfo[i];
@@ -779,9 +767,9 @@ namespace AssetStudio
                     file.path = node.path;
                     file.fileName = Path.GetFileName(node.path.Replace('\\', '/'));
 
-                    // Directly wrap in a SubStream pointing to the single temp file!
-                    // Zero disk copy! Zero extra temp files!
-                    file.stream = new SubStream(tempFilePath, node.offset, node.size);
+                    // Directly wrap in a SubStream sharing one ref-counted SafeFileHandle!
+                    // Zero disk copy! Zero extra temp files! Zero duplicate OS handles!
+                    file.stream = new SubStream(sharedHandle, node.offset, node.size);
                 }
             }
             else
@@ -933,6 +921,440 @@ namespace AssetStudio
 
         private void ReadBlocks(EndianBinaryReader reader, Stream blocksStream)
         {
+            if (allowParallelDecompression && TryReadBlocksParallel(reader, blocksStream))
+            {
+                UsedParallelDecompression = true;
+                return;
+            }
+
+            UsedParallelDecompression = false;
+            ReadBlocksSequential(reader, blocksStream);
+        }
+
+        public static bool TryBuildBlockOffsets(
+            StorageBlock[] blocksInfo,
+            out long[] compressedOffsets,
+            out long[] uncompressedOffsets,
+            out long totalCompressedSize,
+            out long totalUncompressedSize)
+        {
+            compressedOffsets = Array.Empty<long>();
+            uncompressedOffsets = Array.Empty<long>();
+            totalCompressedSize = 0;
+            totalUncompressedSize = 0;
+
+            if (blocksInfo == null || blocksInfo.Length == 0)
+            {
+                return false;
+            }
+
+            var compOffsets = new long[blocksInfo.Length];
+            var uncompOffsets = new long[blocksInfo.Length];
+            long runningCompressed = 0;
+            long runningUncompressed = 0;
+
+            for (int i = 0; i < blocksInfo.Length; i++)
+            {
+                var block = blocksInfo[i];
+                var compressionType = (CompressionType)(block.flags & StorageBlockFlags.CompressionTypeMask);
+                if (compressionType != CompressionType.None
+                    && compressionType != CompressionType.Lz4
+                    && compressionType != CompressionType.Lz4HC)
+                {
+                    return false;
+                }
+
+                if (block.compressedSize > int.MaxValue || block.uncompressedSize > int.MaxValue)
+                {
+                    return false;
+                }
+
+                if (compressionType == CompressionType.None && block.compressedSize != block.uncompressedSize)
+                {
+                    return false;
+                }
+
+                compOffsets[i] = runningCompressed;
+                uncompOffsets[i] = runningUncompressed;
+                runningCompressed = checked(runningCompressed + block.compressedSize);
+                runningUncompressed = checked(runningUncompressed + block.uncompressedSize);
+            }
+
+            compressedOffsets = compOffsets;
+            uncompressedOffsets = uncompOffsets;
+            totalCompressedSize = runningCompressed;
+            totalUncompressedSize = runningUncompressed;
+            return true;
+        }
+
+        private bool TryReadBlocksParallel(EndianBinaryReader reader, Stream blocksStream)
+        {
+            int blockCount = m_BlocksInfo.Length;
+            if (blockCount < MinParallelBlockCount)
+            {
+                return false;
+            }
+
+            if (!TryBuildBlockOffsets(
+                m_BlocksInfo,
+                out var compressedOffsets,
+                out var uncompressedOffsets,
+                out var totalCompressedSize,
+                out var totalUncompressedSize))
+            {
+                return false;
+            }
+
+            if (totalUncompressedSize <= 0)
+            {
+                return false;
+            }
+
+            var sourceStream = reader.BaseStream;
+            if (!sourceStream.CanSeek)
+            {
+                return false;
+            }
+
+            long baseCompressedOffset = reader.Position;
+            if (baseCompressedOffset < 0)
+            {
+                return false;
+            }
+
+            long sourceLength = sourceStream.Length;
+
+            SafeFileHandle? srcHandle = null;
+            long srcFileBaseOffset = 0;
+            byte[]? srcBuffer = null;
+            long srcBufferBaseOffset = 0;
+            long srcBufferAvailable = 0;
+            byte[]? rentedSrcBuffer = null;
+
+            if (sourceStream is FileStream srcFileStream)
+            {
+                srcHandle = srcFileStream.SafeFileHandle;
+                srcFileBaseOffset = baseCompressedOffset;
+            }
+            else if (sourceStream is SubStream srcSubStream && srcSubStream.SafeFileHandle is SafeFileHandle subHandle)
+            {
+                srcHandle = subHandle;
+                srcFileBaseOffset = srcSubStream.Offset + baseCompressedOffset;
+            }
+            else if (sourceStream is MemoryStream srcMemStream)
+            {
+                if (srcMemStream.TryGetBuffer(out ArraySegment<byte> srcSeg) && srcSeg.Array != null)
+                {
+                    srcBuffer = srcSeg.Array;
+                    srcBufferBaseOffset = srcSeg.Offset + baseCompressedOffset;
+                    srcBufferAvailable = Math.Max(0L, srcMemStream.Length - baseCompressedOffset);
+                }
+                else if (totalCompressedSize <= int.MaxValue)
+                {
+                    long available = Math.Max(0L, srcMemStream.Length - baseCompressedOffset);
+                    int toRead = (int)Math.Min(totalCompressedSize, available);
+                    rentedSrcBuffer = BigArrayPool<byte>.Shared.Rent(Math.Max(1, toRead));
+                    srcMemStream.Position = baseCompressedOffset;
+                    int totalRead = 0;
+                    while (totalRead < toRead)
+                    {
+                        int r = srcMemStream.Read(rentedSrcBuffer, totalRead, toRead - totalRead);
+                        if (r <= 0)
+                        {
+                            break;
+                        }
+                        totalRead += r;
+                    }
+                    srcBuffer = rentedSrcBuffer;
+                    srcBufferBaseOffset = 0;
+                    srcBufferAvailable = totalRead;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            try
+            {
+                byte[]? dstBuffer = null;
+                int dstBufferBaseOffset = 0;
+                SafeFileHandle? dstHandle = null;
+
+                if (blocksStream is MemoryStream dstMemStream)
+                {
+                    if (totalUncompressedSize > int.MaxValue || dstMemStream.Position != 0)
+                    {
+                        return false;
+                    }
+
+                    dstMemStream.SetLength(totalUncompressedSize);
+                    if (!dstMemStream.TryGetBuffer(out ArraySegment<byte> dstSeg) || dstSeg.Array == null)
+                    {
+                        return false;
+                    }
+
+                    dstBuffer = dstSeg.Array;
+                    dstBufferBaseOffset = dstSeg.Offset;
+                }
+                else if (blocksStream is FileStream dstFileStream)
+                {
+                    if (dstFileStream.Position != 0)
+                    {
+                        return false;
+                    }
+
+                    dstFileStream.Flush();
+                    if (baseCompressedOffset <= sourceLength - totalCompressedSize)
+                    {
+                        dstFileStream.SetLength(totalUncompressedSize);
+                    }
+                    dstHandle = dstFileStream.SafeFileHandle;
+                }
+                else
+                {
+                    return false;
+                }
+
+                var blocksInfo = m_BlocksInfo;
+                var blockExceptions = new Exception?[blockCount];
+                var parallelOptions = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount, blockCount))
+                };
+
+                Parallel.For<ParallelBlockScratch>(
+                    0,
+                    blockCount,
+                    parallelOptions,
+                    () => new ParallelBlockScratch(),
+                    (i, loopState, scratch) =>
+                    {
+                        try
+                        {
+                            var blockInfo = blocksInfo[i];
+                            var compressionType = (CompressionType)(blockInfo.flags & StorageBlockFlags.CompressionTypeMask);
+                            int compressedSize = (int)blockInfo.compressedSize;
+                            int uncompressedSize = (int)blockInfo.uncompressedSize;
+                            long compOffset = compressedOffsets[i];
+                            long uncompOffset = uncompressedOffsets[i];
+
+                            if (compressionType == CompressionType.None)
+                            {
+                                if (compressedSize == 0)
+                                {
+                                    return scratch;
+                                }
+
+                                if (srcBuffer != null)
+                                {
+                                    if (compOffset > srcBufferAvailable - compressedSize)
+                                    {
+                                        int available = (int)Math.Max(0L, srcBufferAvailable - compOffset);
+                                        throw new EndOfStreamException($"Unexpected end of bundle stream while copying uncompressed block: {compressedSize - available} bytes remaining.");
+                                    }
+
+                                    ReadOnlySpan<byte> srcSpan = srcBuffer.AsSpan((int)(srcBufferBaseOffset + compOffset), compressedSize);
+                                    if (dstBuffer != null)
+                                    {
+                                        srcSpan.CopyTo(dstBuffer.AsSpan(dstBufferBaseOffset + (int)uncompOffset, uncompressedSize));
+                                    }
+                                    else
+                                    {
+                                        RandomAccess.Write(dstHandle!, srcSpan, uncompOffset);
+                                    }
+                                }
+                                else if (dstBuffer != null)
+                                {
+                                    Span<byte> destSpan = dstBuffer.AsSpan(dstBufferBaseOffset + (int)uncompOffset, uncompressedSize);
+                                    ReadExactRandomAccessForCopy(srcHandle!, destSpan, srcFileBaseOffset + compOffset);
+                                }
+                                else
+                                {
+                                    int chunkSize = Math.Min(compressedSize, 1024 * 1024);
+                                    byte[] chunkBuf = scratch.EnsureCompressedBuffer(chunkSize);
+                                    int remaining = compressedSize;
+                                    long readOffset = srcFileBaseOffset + compOffset;
+                                    long writeOffset = uncompOffset;
+                                    while (remaining > 0)
+                                    {
+                                        int toRead = Math.Min(chunkBuf.Length, remaining);
+                                        int read = RandomAccess.Read(srcHandle!, chunkBuf.AsSpan(0, toRead), readOffset);
+                                        if (read <= 0)
+                                        {
+                                            throw new EndOfStreamException($"Unexpected end of bundle stream while copying uncompressed block: {remaining} bytes remaining.");
+                                        }
+                                        RandomAccess.Write(dstHandle!, chunkBuf.AsSpan(0, read), writeOffset);
+                                        readOffset += read;
+                                        writeOffset += read;
+                                        remaining -= read;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                ReadOnlySpan<byte> compressedSpan;
+                                if (srcBuffer != null)
+                                {
+                                    if (compOffset > srcBufferAvailable - compressedSize)
+                                    {
+                                        int actualRead = (int)Math.Max(0L, srcBufferAvailable - compOffset);
+                                        throw new EndOfStreamException($"Unexpected end of bundle stream: expected {compressedSize} bytes, read {actualRead} bytes.");
+                                    }
+                                    compressedSpan = srcBuffer.AsSpan((int)(srcBufferBaseOffset + compOffset), compressedSize);
+                                }
+                                else
+                                {
+                                    byte[] compBuf = scratch.EnsureCompressedBuffer(compressedSize);
+                                    Span<byte> compSpan = compBuf.AsSpan(0, compressedSize);
+                                    ReadExactRandomAccess(srcHandle!, compSpan, srcFileBaseOffset + compOffset);
+                                    compressedSpan = compSpan;
+                                }
+
+                                if (dstBuffer != null)
+                                {
+                                    Span<byte> destSpan = dstBuffer.AsSpan(dstBufferBaseOffset + (int)uncompOffset, uncompressedSize);
+                                    int numWrite = LZ4Codec.Decode(compressedSpan, destSpan);
+                                    if (numWrite != uncompressedSize)
+                                    {
+                                        throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                    }
+                                }
+                                else
+                                {
+                                    byte[] uncompBuf = scratch.EnsureUncompressedBuffer(uncompressedSize);
+                                    Span<byte> destSpan = uncompBuf.AsSpan(0, uncompressedSize);
+                                    int numWrite = LZ4Codec.Decode(compressedSpan, destSpan);
+                                    if (numWrite != uncompressedSize)
+                                    {
+                                        throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                    }
+                                    RandomAccess.Write(dstHandle!, destSpan, uncompOffset);
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            blockExceptions[i] = ex;
+                            loopState.Break();
+                        }
+
+                        return scratch;
+                    },
+                    scratch => scratch.Dispose());
+
+                for (int i = 0; i < blockCount; i++)
+                {
+                    var ex = blockExceptions[i];
+                    if (ex != null)
+                    {
+                        ExceptionDispatchInfo.Capture(ex).Throw();
+                    }
+                }
+
+                reader.Position = baseCompressedOffset + totalCompressedSize;
+                blocksStream.Position = 0;
+                return true;
+            }
+            finally
+            {
+                if (rentedSrcBuffer != null)
+                {
+                    BigArrayPool<byte>.Shared.Return(rentedSrcBuffer);
+                }
+            }
+        }
+
+        private static void ReadExactRandomAccess(SafeFileHandle handle, Span<byte> destination, long fileOffset)
+        {
+            int totalRead = 0;
+            int count = destination.Length;
+            while (totalRead < count)
+            {
+                int read = RandomAccess.Read(handle, destination.Slice(totalRead), fileOffset + totalRead);
+                if (read <= 0)
+                {
+                    throw new EndOfStreamException($"Unexpected end of bundle stream: expected {count} bytes, read {totalRead} bytes.");
+                }
+                totalRead += read;
+            }
+        }
+
+        private static void ReadExactRandomAccessForCopy(SafeFileHandle handle, Span<byte> destination, long fileOffset)
+        {
+            int totalRead = 0;
+            int count = destination.Length;
+            while (totalRead < count)
+            {
+                int read = RandomAccess.Read(handle, destination.Slice(totalRead), fileOffset + totalRead);
+                if (read <= 0)
+                {
+                    throw new EndOfStreamException($"Unexpected end of bundle stream while copying uncompressed block: {count - totalRead} bytes remaining.");
+                }
+                totalRead += read;
+            }
+        }
+
+        private sealed class ParallelBlockScratch : IDisposable
+        {
+            private byte[]? compressedBuffer;
+            private byte[]? uncompressedBuffer;
+
+            public byte[] EnsureCompressedBuffer(int minSize)
+            {
+                int required = Math.Max(1, minSize);
+                if (compressedBuffer == null || compressedBuffer.Length < required)
+                {
+                    if (compressedBuffer != null)
+                    {
+                        var old = compressedBuffer;
+                        compressedBuffer = null;
+                        BigArrayPool<byte>.Shared.Return(old);
+                    }
+                    compressedBuffer = BigArrayPool<byte>.Shared.Rent(required);
+                }
+                return compressedBuffer;
+            }
+
+            public byte[] EnsureUncompressedBuffer(int minSize)
+            {
+                int required = Math.Max(1, minSize);
+                if (uncompressedBuffer == null || uncompressedBuffer.Length < required)
+                {
+                    if (uncompressedBuffer != null)
+                    {
+                        var old = uncompressedBuffer;
+                        uncompressedBuffer = null;
+                        BigArrayPool<byte>.Shared.Return(old);
+                    }
+                    uncompressedBuffer = BigArrayPool<byte>.Shared.Rent(required);
+                }
+                return uncompressedBuffer;
+            }
+
+            public void Dispose()
+            {
+                if (compressedBuffer != null)
+                {
+                    var old = compressedBuffer;
+                    compressedBuffer = null;
+                    BigArrayPool<byte>.Shared.Return(old);
+                }
+                if (uncompressedBuffer != null)
+                {
+                    var old = uncompressedBuffer;
+                    uncompressedBuffer = null;
+                    BigArrayPool<byte>.Shared.Return(old);
+                }
+            }
+        }
+
+        private void ReadBlocksSequential(EndianBinaryReader reader, Stream blocksStream)
+        {
             byte[]? compressedBuffer = null;
             byte[]? uncompressedBuffer = null;
             try
@@ -1044,6 +1466,13 @@ namespace AssetStudio
 
         public void Dispose()
         {
+            if (fileList != null)
+            {
+                for (int i = 0; i < fileList.Length; i++)
+                {
+                    fileList[i]?.stream?.Dispose();
+                }
+            }
             BlocksStream?.Dispose();
             BlocksStream = null;
         }
