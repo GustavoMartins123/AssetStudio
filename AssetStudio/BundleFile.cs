@@ -72,11 +72,11 @@ namespace AssetStudio
             public string path = "";
         }
 
-        public Header m_Header = null!;
-        private StorageBlock[] m_BlocksInfo = null!;
-        private Node[] m_DirectoryInfo = null!;
+        public Header m_Header = new Header();
+        private StorageBlock[] m_BlocksInfo = Array.Empty<StorageBlock>();
+        private Node[] m_DirectoryInfo = Array.Empty<Node>();
 
-        public StreamFile[] fileList = null!;
+        public StreamFile[] fileList = Array.Empty<StreamFile>();
         public Stream? BlocksStream { get; set; }
         public bool LoadedFromDecompressionCache { get; private set; }
         public string? CachedBlocksPath { get; private set; }
@@ -96,7 +96,7 @@ namespace AssetStudio
             switch (m_Header.signature)
             {
                 case "UnityArchive":
-                    break; //TODO
+                    throw new NotSupportedException("UnityArchive format is not supported.");
                 case "UnityWeb":
                 case "UnityRaw":
                     {
@@ -316,6 +316,8 @@ namespace AssetStudio
                         }
                         break;
                     }
+                default:
+                    throw new NotSupportedException($"Unsupported bundle signature '{m_Header.signature}'.");
             }
         }
 
