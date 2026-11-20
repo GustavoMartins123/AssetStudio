@@ -1054,9 +1054,8 @@ public sealed class ProjectManagerStore
 
     private static string GetFolderCacheKey(string folderPath)
     {
-        using var md5 = MD5.Create();
-        var hashBytes = md5.ComputeHash(Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
-        return Convert.ToHexString(hashBytes).ToLowerInvariant();
+        var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
+        return Convert.ToHexStringLower(hashBytes);
     }
 
     private string? FindIconInDirectory(string directory, bool recursive, int maxFiles)
@@ -1321,9 +1320,8 @@ public sealed class ProjectManagerStore
 
     private static string ComputeFileHash(string path)
     {
-        using var sha = SHA256.Create();
         using var stream = File.OpenRead(path);
-        return Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
+        return Convert.ToHexStringLower(SHA256.HashData(stream));
     }
 
     private static string GetNullableString(SqliteDataReader reader, int ordinal)

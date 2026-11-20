@@ -175,44 +175,73 @@ namespace AssetStudio
             else
             {
                 using var rawMs = new MemoryStream(uncompressedSize);
-                using (var rawBw = new BinaryWriter(rawMs))
+                using (var rawBw = new BinaryWriter(rawMs, Encoding.UTF8, leaveOpen: true))
                 {
                     itemWriter(rawBw);
+                    rawBw.Flush();
                 }
-                var rawBytes = rawMs.ToArray();
-                uint checksum = CalcAdler32(rawBytes);
+
+                ReadOnlySpan<byte> rawSpan = rawMs.TryGetBuffer(out var rawSeg)
+                    ? rawSeg.AsSpan()
+                    : rawMs.ToArray();
 
                 using var compMs = new MemoryStream();
-                // Standard RFC 1950 zlib header: CMF = 0x78 (32K window, deflate), FLG = 0x01 (fastest)
-                compMs.WriteByte(0x78);
-                compMs.WriteByte(0x01);
+                CompressZlib(rawSpan, compMs);
 
-                using (var deflate = new DeflateStream(compMs, CompressionLevel.Fastest, leaveOpen: true))
-                {
-                    deflate.Write(rawBytes, 0, rawBytes.Length);
-                }
+                ReadOnlySpan<byte> compSpan = compMs.TryGetBuffer(out var compSeg)
+                    ? compSeg.AsSpan()
+                    : compMs.ToArray();
 
-                // Adler-32 checksum (Big Endian)
-                compMs.WriteByte((byte)((checksum >> 24) & 0xFF));
-                compMs.WriteByte((byte)((checksum >> 16) & 0xFF));
-                compMs.WriteByte((byte)((checksum >> 8) & 0xFF));
-                compMs.WriteByte((byte)(checksum & 0xFF));
-
-                var compBytes = compMs.ToArray();
                 bw.Write(1); // encoding = 1 (compressed)
-                bw.Write(compBytes.Length);
-                bw.Write(compBytes);
+                bw.Write(compSpan.Length);
+                bw.Write(compSpan);
             }
         }
 
-        private static uint CalcAdler32(byte[] data)
+        private static void CompressZlib(ReadOnlySpan<byte> rawData, MemoryStream compMs)
         {
-            uint a = 1, b = 0;
-            for (int i = 0; i < data.Length; i++)
+            uint checksum = CalcAdler32(rawData);
+
+            // Standard RFC 1950 zlib header: CMF = 0x78 (32K window, deflate), FLG = 0x01 (fastest)
+            compMs.WriteByte(0x78);
+            compMs.WriteByte(0x01);
+
+            using (var deflate = new DeflateStream(compMs, CompressionLevel.Fastest, leaveOpen: true))
             {
-                a = (a + data[i]) % 65521;
-                b = (b + a) % 65521;
+                deflate.Write(rawData);
             }
+
+            // Adler-32 checksum (Big Endian)
+            compMs.WriteByte((byte)((checksum >> 24) & 0xFF));
+            compMs.WriteByte((byte)((checksum >> 16) & 0xFF));
+            compMs.WriteByte((byte)((checksum >> 8) & 0xFF));
+            compMs.WriteByte((byte)(checksum & 0xFF));
+        }
+
+        private static uint CalcAdler32(ReadOnlySpan<byte> data)
+        {
+            const uint modAdler = 65521;
+            const int nmax = 5552;
+
+            uint a = 1;
+            uint b = 0;
+            int index = 0;
+            int len = data.Length;
+
+            while (len > 0)
+            {
+                int chunk = len < nmax ? len : nmax;
+                len -= chunk;
+                int end = index + chunk;
+                while (index < end)
+                {
+                    a += data[index++];
+                    b += a;
+                }
+                a %= modAdler;
+                b %= modAdler;
+            }
+
             return (b << 16) | a;
         }
     }

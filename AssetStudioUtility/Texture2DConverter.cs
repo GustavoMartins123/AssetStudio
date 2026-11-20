@@ -1164,9 +1164,14 @@ namespace AssetStudio
                     {
                         var originalHeight = m_Height;
                         m_Height = height;
-                        var res = DecodeDXT3(compressedRow, outputRow);
-                        m_Height = originalHeight;
-                        return res;
+                        try
+                        {
+                            return DecodeDXT3(compressedRow, outputRow);
+                        }
+                        finally
+                        {
+                            m_Height = originalHeight;
+                        }
                     }
                 case TextureFormat.DXT5:
                     return TextureDecoder.DecodeDXT5(compressedRow, width, height, outputRow);
@@ -1241,6 +1246,11 @@ namespace AssetStudio
                 return false;
             }
 
+            const int TargetReadChunkBytes = 256 * 1024;
+            const long MaxDecodedStripBytes = 4L * 1024 * 1024;
+
+            using var readSession = reader.OpenReadSession();
+
             if (param.IsCompressed)
             {
                 int blockWidth = param.BlockWidth;
@@ -1251,169 +1261,175 @@ namespace AssetStudio
                 int blocksY = (m_Height + blockHeight - 1) / blockHeight;
                 int rowBytes = blocksX * bytesPerBlock;
 
-                byte[] compressedRow = BigArrayPool<byte>.Shared.Rent(rowBytes);
+                long decodedRowBytes = (long)m_Width * blockHeight * 4;
+                int maxByDecoded = (int)Math.Max(1L, MaxDecodedStripBytes / Math.Max(1L, decodedRowBytes));
+                int maxByCompressed = Math.Max(1, TargetReadChunkBytes / Math.Max(1, rowBytes));
+                int stripBlocksY = Math.Min(blocksY, Math.Min(maxByDecoded, maxByCompressed));
+
+                int maxStripCompressedBytes = stripBlocksY * rowBytes;
+                int maxStripDecodedHeight = (int)Math.Min((long)stripBlocksY * blockHeight, m_Height);
+                int maxStripDecodedBytes = m_Width * maxStripDecodedHeight * 4;
+
+                bool needsXboxSwap = platform == BuildTarget.XBOX360 &&
+                    (m_TextureFormat == TextureFormat.DXT1 || m_TextureFormat == TextureFormat.DXT3 || m_TextureFormat == TextureFormat.DXT5);
+
+                byte[] compressedStrip = BigArrayPool<byte>.Shared.Rent(maxStripCompressedBytes);
+                byte[] chunkDecoded = BigArrayPool<byte>.Shared.Rent(maxStripDecodedBytes);
                 try
                 {
-                    for (int by = 0; by < blocksY; by++)
+                    int outputRowStride = m_Width * 4;
+                    for (int by = 0; by < blocksY; by += stripBlocksY)
                     {
-                        int chunkHeight = Math.Min(blockHeight, m_Height - by * blockHeight);
+                        int blocksInStrip = Math.Min(stripBlocksY, blocksY - by);
+                        int chunkHeight = Math.Min(blocksInStrip * blockHeight, m_Height - by * blockHeight);
+                        int stripBytes = blocksInStrip * rowBytes;
                         long offset = (long)by * rowBytes;
-                        
-                        // Read row of blocks
-                        reader.ReadSegment(offset, compressedRow, 0, rowBytes);
 
-                        // Xbox 360 swap bytes (only DXT1/DXT3/DXT5 among compressed formats)
-                        if (platform == BuildTarget.XBOX360 &&
-                            (m_TextureFormat == TextureFormat.DXT1 || m_TextureFormat == TextureFormat.DXT3 || m_TextureFormat == TextureFormat.DXT5))
+                        readSession.ReadSegment(offset, compressedStrip, 0, stripBytes);
+
+                        if (needsXboxSwap)
                         {
-                            for (var i = 0; i < rowBytes / 2; i++)
+                            var words = MemoryMarshal.Cast<byte, ushort>(compressedStrip.AsSpan(0, stripBytes & ~1));
+                            for (var i = 0; i < words.Length; i++)
                             {
-                                var b = compressedRow[i * 2];
-                                compressedRow[i * 2] = compressedRow[i * 2 + 1];
-                                compressedRow[i * 2 + 1] = b;
+                                words[i] = BinaryPrimitives.ReverseEndianness(words[i]);
                             }
                         }
 
-                        // Temp decoded buffer for this block row
-                        int chunkOutputSize = m_Width * chunkHeight * 4;
-                        byte[] chunkDecoded = BigArrayPool<byte>.Shared.Rent(chunkOutputSize);
-                        try
+                        if (!DecodeBlockRow(m_TextureFormat, compressedStrip, m_Width, chunkHeight, blockWidth, blockHeight, chunkDecoded))
                         {
-                            if (!DecodeBlockRow(m_TextureFormat, compressedRow, m_Width, chunkHeight, blockWidth, blockHeight, chunkDecoded))
-                            {
-                                return false;
-                            }
+                            return false;
+                        }
 
-                            // Copy back to final buffer
-                            for (int row = 0; row < chunkHeight; row++)
-                            {
-                                int srcOffset = row * m_Width * 4;
-                                int dstOffset = ((by * blockHeight) + row) * m_Width * 4;
-                                Buffer.BlockCopy(chunkDecoded, srcOffset, bytes, dstOffset, m_Width * 4);
-                            }
-                        }
-                        finally
-                        {
-                            BigArrayPool<byte>.Shared.Return(chunkDecoded);
-                        }
+                        int dstOffset = by * blockHeight * outputRowStride;
+                        Buffer.BlockCopy(chunkDecoded, 0, bytes, dstOffset, chunkHeight * outputRowStride);
                     }
                     return true;
                 }
                 finally
                 {
-                    BigArrayPool<byte>.Shared.Return(compressedRow);
+                    BigArrayPool<byte>.Shared.Return(chunkDecoded);
+                    BigArrayPool<byte>.Shared.Return(compressedStrip);
                 }
             }
             else
             {
-                // Uncompressed format decoded row-by-row
+                // Uncompressed format decoded in multi-row chunks via a single open read session
                 int bytesPerPixel = param.BytesPerBlock;
                 int rowBytes = m_Width * bytesPerPixel;
-                byte[] tempRow = BigArrayPool<byte>.Shared.Rent(rowBytes);
+                int rowsPerChunk = Math.Clamp(TargetReadChunkBytes / Math.Max(1, rowBytes), 1, m_Height);
+
+                if (m_TextureFormat == TextureFormat.BGRA32)
+                {
+                    for (int yStart = 0; yStart < m_Height; yStart += rowsPerChunk)
+                    {
+                        int chunkRows = Math.Min(rowsPerChunk, m_Height - yStart);
+                        int chunkBytes = chunkRows * rowBytes;
+                        readSession.ReadSegment((long)yStart * rowBytes, bytes, yStart * rowBytes, chunkBytes);
+                    }
+                    return true;
+                }
+
+                byte[] tempChunk = BigArrayPool<byte>.Shared.Rent(rowsPerChunk * rowBytes);
                 try
                 {
-                    for (int y = 0; y < m_Height; y++)
+                    int outputRowStride = m_Width * 4;
+                    for (int yStart = 0; yStart < m_Height; yStart += rowsPerChunk)
                     {
-                        reader.ReadSegment((long)y * rowBytes, tempRow, 0, rowBytes);
+                        int chunkRows = Math.Min(rowsPerChunk, m_Height - yStart);
+                        int chunkBytes = chunkRows * rowBytes;
+                        readSession.ReadSegment((long)yStart * rowBytes, tempChunk, 0, chunkBytes);
 
-                        switch (m_TextureFormat)
+                        for (int r = 0; r < chunkRows; r++)
                         {
-                            case TextureFormat.Alpha8:
-                                {
+                            int srcRow = r * rowBytes;
+                            int dstRow = (yStart + r) * outputRowStride;
+
+                            switch (m_TextureFormat)
+                            {
+                                case TextureFormat.Alpha8:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
+                                        int outIdx = dstRow + x * 4;
                                         bytes[outIdx] = 0xFF;
                                         bytes[outIdx + 1] = 0xFF;
                                         bytes[outIdx + 2] = 0xFF;
-                                        bytes[outIdx + 3] = tempRow[x];
+                                        bytes[outIdx + 3] = tempChunk[srcRow + x];
                                     }
-                                }
-                                break;
-                            case TextureFormat.RGB24:
-                                {
+                                    break;
+                                case TextureFormat.RGB24:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
-                                        bytes[outIdx] = tempRow[x * 3 + 2];
-                                        bytes[outIdx + 1] = tempRow[x * 3 + 1];
-                                        bytes[outIdx + 2] = tempRow[x * 3 + 0];
+                                        int inIdx = srcRow + x * 3;
+                                        int outIdx = dstRow + x * 4;
+                                        bytes[outIdx] = tempChunk[inIdx + 2];
+                                        bytes[outIdx + 1] = tempChunk[inIdx + 1];
+                                        bytes[outIdx + 2] = tempChunk[inIdx];
                                         bytes[outIdx + 3] = 255;
                                     }
-                                }
-                                break;
-                            case TextureFormat.BGR24:
-                                {
+                                    break;
+                                case TextureFormat.BGR24:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
-                                        bytes[outIdx] = tempRow[x * 3 + 0];
-                                        bytes[outIdx + 1] = tempRow[x * 3 + 1];
-                                        bytes[outIdx + 2] = tempRow[x * 3 + 2];
+                                        int inIdx = srcRow + x * 3;
+                                        int outIdx = dstRow + x * 4;
+                                        bytes[outIdx] = tempChunk[inIdx];
+                                        bytes[outIdx + 1] = tempChunk[inIdx + 1];
+                                        bytes[outIdx + 2] = tempChunk[inIdx + 2];
                                         bytes[outIdx + 3] = 255;
                                     }
-                                }
-                                break;
-                            case TextureFormat.RGBA32:
-                                {
+                                    break;
+                                case TextureFormat.RGBA32:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
-                                        bytes[outIdx] = tempRow[x * 4 + 2];
-                                        bytes[outIdx + 1] = tempRow[x * 4 + 1];
-                                        bytes[outIdx + 2] = tempRow[x * 4 + 0];
-                                        bytes[outIdx + 3] = tempRow[x * 4 + 3];
+                                        int inIdx = srcRow + x * 4;
+                                        int outIdx = dstRow + x * 4;
+                                        bytes[outIdx] = tempChunk[inIdx + 2];
+                                        bytes[outIdx + 1] = tempChunk[inIdx + 1];
+                                        bytes[outIdx + 2] = tempChunk[inIdx];
+                                        bytes[outIdx + 3] = tempChunk[inIdx + 3];
                                     }
-                                }
-                                break;
-                            case TextureFormat.ARGB32:
-                                {
+                                    break;
+                                case TextureFormat.ARGB32:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
-                                        bytes[outIdx] = tempRow[x * 4 + 3];
-                                        bytes[outIdx + 1] = tempRow[x * 4 + 2];
-                                        bytes[outIdx + 2] = tempRow[x * 4 + 1];
-                                        bytes[outIdx + 3] = tempRow[x * 4 + 0];
+                                        int inIdx = srcRow + x * 4;
+                                        int outIdx = dstRow + x * 4;
+                                        bytes[outIdx] = tempChunk[inIdx + 3];
+                                        bytes[outIdx + 1] = tempChunk[inIdx + 2];
+                                        bytes[outIdx + 2] = tempChunk[inIdx + 1];
+                                        bytes[outIdx + 3] = tempChunk[inIdx];
                                     }
-                                }
-                                break;
-                            case TextureFormat.BGRA32:
-                                {
-                                    Buffer.BlockCopy(tempRow, 0, bytes, y * m_Width * 4, rowBytes);
-                                }
-                                break;
-                            case TextureFormat.RG16:
-                                {
+                                    break;
+                                case TextureFormat.RG16:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
+                                        int inIdx = srcRow + x * 2;
+                                        int outIdx = dstRow + x * 4;
                                         bytes[outIdx] = 0;
-                                        bytes[outIdx + 1] = tempRow[x * 2 + 1];
-                                        bytes[outIdx + 2] = tempRow[x * 2];
+                                        bytes[outIdx + 1] = tempChunk[inIdx + 1];
+                                        bytes[outIdx + 2] = tempChunk[inIdx];
                                         bytes[outIdx + 3] = 255;
                                     }
-                                }
-                                break;
-                            case TextureFormat.R8:
-                                {
+                                    break;
+                                case TextureFormat.R8:
                                     for (int x = 0; x < m_Width; x++)
                                     {
-                                        int outIdx = (y * m_Width + x) * 4;
+                                        int outIdx = dstRow + x * 4;
                                         bytes[outIdx] = 0;
                                         bytes[outIdx + 1] = 0;
-                                        bytes[outIdx + 2] = tempRow[x];
+                                        bytes[outIdx + 2] = tempChunk[srcRow + x];
                                         bytes[outIdx + 3] = 255;
                                     }
-                                }
-                                break;
+                                    break;
+                            }
                         }
                     }
                     return true;
                 }
                 finally
                 {
-                    BigArrayPool<byte>.Shared.Return(tempRow);
+                    BigArrayPool<byte>.Shared.Return(tempChunk);
                 }
             }
         }

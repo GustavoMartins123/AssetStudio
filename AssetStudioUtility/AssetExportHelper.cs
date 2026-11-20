@@ -326,21 +326,14 @@ namespace AssetStudio
             var pathID = obj.m_PathID;
 
             var input = $"{fileName}_{name}_{pathID}";
-            using (var md5 = MD5.Create())
-            {
-                var hash = md5.ComputeHash(Encoding.UTF8.GetBytes(input));
-                return string.Concat(hash.Select(x => x.ToString("x2")));
-            }
+            return Convert.ToHexStringLower(MD5.HashData(Encoding.UTF8.GetBytes(input)));
         }
 
         private static string GenerateUnityGuid()
         {
-            var bytes = new byte[16];
-            using (var rng = RandomNumberGenerator.Create())
-            {
-                rng.GetBytes(bytes);
-            }
-            return string.Concat(bytes.Select(x => x.ToString("x2")));
+            Span<byte> bytes = stackalloc byte[16];
+            RandomNumberGenerator.Fill(bytes);
+            return Convert.ToHexStringLower(bytes);
         }
 
         private static string BuildTextureMeta(string guid)

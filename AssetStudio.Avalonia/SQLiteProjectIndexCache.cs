@@ -33,16 +33,14 @@ namespace AssetStudio.Avalonia
             try
             {
                 var normalized = Path.GetFullPath(folderPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                using var md5 = System.Security.Cryptography.MD5.Create();
-                var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(normalized));
-                return Convert.ToHexString(hashBytes).ToLowerInvariant();
+                var hashBytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
+                return Convert.ToHexStringLower(hashBytes);
             }
             catch
             {
                 var normalized = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                using var md5 = System.Security.Cryptography.MD5.Create();
-                var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(normalized));
-                return Convert.ToHexString(hashBytes).ToLowerInvariant();
+                var hashBytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
+                return Convert.ToHexStringLower(hashBytes);
             }
         }
 

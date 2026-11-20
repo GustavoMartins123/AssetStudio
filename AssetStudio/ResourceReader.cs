@@ -504,34 +504,109 @@ namespace AssetStudio
             }
         }
 
-        public void ReadSegment(long segmentOffset, byte[] buffer, int bufferOffset, int count)
+        public ReadSession OpenReadSession()
         {
             if (rawData != null)
             {
-                if (segmentOffset < 0 || count < 0 || segmentOffset > size - count)
-                {
-                    throw new EndOfStreamException($"Unable to read {count} bytes from resource {path} at segment offset {segmentOffset} (size {size}).");
-                }
-                Buffer.BlockCopy(rawData, (int)segmentOffset, buffer, bufferOffset, count);
-                return;
+                return new ReadSession(rawData, size, path);
             }
 
             var binaryReader = GetReader(out var shouldDispose);
-            try
+            return new ReadSession(binaryReader, shouldDispose, offset, size, path);
+        }
+
+        public void ReadSegment(long segmentOffset, byte[] buffer, int bufferOffset, int count)
+        {
+            using (var session = OpenReadSession())
             {
-                binaryReader.BaseStream.Position = this.offset + segmentOffset;
-                var read = ReadExact(binaryReader, buffer, bufferOffset, count);
+                session.ReadSegment(segmentOffset, buffer, bufferOffset, count);
+            }
+        }
+
+        public sealed class ReadSession : IDisposable
+        {
+            private readonly byte[] rawData;
+            private BinaryReader binaryReader;
+            private readonly bool shouldDispose;
+            private readonly long baseOffset;
+            private readonly long size;
+            private readonly string resourcePath;
+            private bool disposed;
+
+            public long Size => size;
+
+            internal ReadSession(byte[] rawData, long size, string resourcePath)
+            {
+                this.rawData = rawData;
+                this.size = size;
+                this.resourcePath = resourcePath;
+            }
+
+            internal ReadSession(BinaryReader binaryReader, bool shouldDispose, long baseOffset, long size, string resourcePath)
+            {
+                this.binaryReader = binaryReader ?? throw new ArgumentNullException(nameof(binaryReader));
+                this.shouldDispose = shouldDispose;
+                this.baseOffset = baseOffset;
+                this.size = size;
+                this.resourcePath = resourcePath;
+            }
+
+            public int ReadSegment(long segmentOffset, byte[] buff, int buffOffset, int count)
+            {
+                if (disposed)
+                {
+                    throw new ObjectDisposedException(nameof(ReadSession));
+                }
+                if (buff == null)
+                {
+                    throw new ArgumentNullException(nameof(buff));
+                }
+                if (buffOffset < 0 || count < 0 || buffOffset > buff.Length - count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(count));
+                }
+                if (segmentOffset < 0 || size < count || segmentOffset > size - count)
+                {
+                    throw new EndOfStreamException($"Unable to read {count} bytes from resource {resourcePath} at segment offset {segmentOffset} (size {size}).");
+                }
+                if (count == 0)
+                {
+                    return 0;
+                }
+
+                if (rawData != null)
+                {
+                    Buffer.BlockCopy(rawData, (int)segmentOffset, buff, buffOffset, count);
+                    return count;
+                }
+
+                var targetPosition = baseOffset + segmentOffset;
+                var stream = binaryReader.BaseStream;
+                if (stream.Position != targetPosition)
+                {
+                    stream.Position = targetPosition;
+                }
+
+                var read = ReadExact(binaryReader, buff, buffOffset, count);
                 if (read != count)
                 {
-                    throw new EndOfStreamException($"Unable to read {count} bytes from resource {path} at segment offset {segmentOffset}. Read {read} bytes.");
+                    throw new EndOfStreamException($"Unable to read {count} bytes from resource {resourcePath} at segment offset {segmentOffset}. Read {read} bytes.");
                 }
+                return read;
             }
-            finally
+
+            public void Dispose()
             {
+                if (disposed)
+                {
+                    return;
+                }
+                disposed = true;
                 if (shouldDispose)
                 {
-                    binaryReader.Dispose();
+                    binaryReader?.Dispose();
                 }
+                binaryReader = null;
             }
         }
 

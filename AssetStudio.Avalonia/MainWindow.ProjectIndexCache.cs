@@ -19,9 +19,8 @@ public partial class MainWindow : Window
 {
     private static string GetFolderCacheKey(string folderPath)
     {
-        using var md5 = System.Security.Cryptography.MD5.Create();
-        var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
-        return Convert.ToHexString(hashBytes).ToLowerInvariant();
+        var hashBytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
+        return Convert.ToHexStringLower(hashBytes);
     }
 
     private void ClearCurrentProjectCache_Click(object? sender, RoutedEventArgs e)
@@ -353,8 +352,7 @@ public partial class MainWindow : Window
 
     private static string ComputeSha256Hex(byte[] bytes)
     {
-        using var sha256 = System.Security.Cryptography.SHA256.Create();
-        return Convert.ToHexString(sha256.ComputeHash(bytes)).ToLowerInvariant();
+        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
     }
 
     private static bool IsPathInsideDirectory(string root, string path)
