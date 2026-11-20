@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 
 namespace AssetStudio
 {
@@ -18,8 +19,9 @@ namespace AssetStudio
                 m_Source = reader.ReadInt32();
                 m_Url = reader.ReadAlignedString();
             }
-            catch
+            catch (Exception ex) when (ex is EndOfStreamException || ex is InvalidDataException || ex is ArgumentOutOfRangeException)
             {
+                Logger.Warning($"VideoPlayer (PathID {m_PathID}): failed to read trailing fields ({ex.GetType().Name}: {ex.Message}).");
                 m_Url ??= string.Empty;
             }
         }

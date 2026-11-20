@@ -801,10 +801,7 @@ namespace AssetStudio
                         {
                             for (var i = 0; i < componentBytes.Length / componentByteSize; i++)
                             {
-                                var buff = new byte[componentByteSize];
-                                Buffer.BlockCopy(componentBytes, i * componentByteSize, buff, 0, componentByteSize);
-                                Array.Reverse(buff);
-                                Buffer.BlockCopy(buff, 0, componentBytes, i * componentByteSize, componentByteSize);
+                                Array.Reverse(componentBytes, i * componentByteSize, componentByteSize);
                             }
                         }
 

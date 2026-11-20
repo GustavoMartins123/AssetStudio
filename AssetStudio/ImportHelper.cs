@@ -1,9 +1,13 @@
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace AssetStudio
 {
@@ -11,29 +15,261 @@ namespace AssetStudio
     {
         public static long MaxDecompressedSize { get; set; } = 4L * 1024 * 1024 * 1024; // 4 GiB safety cap
 
+        private static readonly StringComparer PathKeyComparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        private static readonly StringComparison PathKeyComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        private static readonly ConcurrentDictionary<string, string> MergedSplitFallbackPaths =
+            new ConcurrentDictionary<string, string>(PathKeyComparer);
+
+        public static void ClearMergedSplitFallbackPaths() => MergedSplitFallbackPaths.Clear();
+
+        public static bool TryGetMergedSplitFallbackPath(string destFull, out string fallbackPath)
+        {
+            fallbackPath = null;
+            if (string.IsNullOrWhiteSpace(destFull))
+            {
+                return false;
+            }
+
+            var key = NormalizeSplitPathKey(destFull);
+            if (MergedSplitFallbackPaths.TryGetValue(key, out var mapped) && File.Exists(mapped))
+            {
+                fallbackPath = mapped;
+                return true;
+            }
+
+            return false;
+        }
+
         public static void MergeSplitAssets(string path, bool allDirectories = false)
         {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return;
+            }
+
             var splitFiles = GetFilesSafe(path, "*.split0", allDirectories);
             foreach (var splitFile in splitFiles)
             {
                 var destFile = Path.GetFileNameWithoutExtension(splitFile);
                 var destPath = Path.GetDirectoryName(splitFile);
-                var destFull = Path.Combine(destPath, destFile);
-                if (!File.Exists(destFull))
+                if (string.IsNullOrEmpty(destPath) || string.IsNullOrEmpty(destFile))
                 {
-                    var splitParts = Directory.GetFiles(destPath, destFile + ".split*");
-                    using (var destStream = File.Create(destFull))
+                    continue;
+                }
+
+                var destFull = Path.Combine(destPath, destFile);
+                var destKey = NormalizeSplitPathKey(destFull);
+                if (File.Exists(destFull))
+                {
+                    MergedSplitFallbackPaths.TryRemove(destKey, out _);
+                    continue;
+                }
+
+                if (!TryCollectOrderedSplitParts(destPath, destFile, destFull, out var orderedParts))
+                {
+                    MergedSplitFallbackPaths.TryRemove(destKey, out _);
+                    continue;
+                }
+
+                if (TryMergePartsToTarget(orderedParts, destFull, overwriteTarget: false, out var destinationWriteFailed))
+                {
+                    MergedSplitFallbackPaths.TryRemove(destKey, out _);
+                    continue;
+                }
+
+                if (!destinationWriteFailed)
+                {
+                    MergedSplitFallbackPaths.TryRemove(destKey, out _);
+                    continue;
+                }
+
+                var fallbackDest = GetFallbackMergedPath(destPath, destFile);
+                try
+                {
+                    var fallbackDir = Path.GetDirectoryName(fallbackDest);
+                    if (!string.IsNullOrEmpty(fallbackDir))
                     {
-                        for (int i = 0; i < splitParts.Length; i++)
-                        {
-                            var splitPart = destFull + ".split" + i;
-                            using (var sourceStream = File.OpenRead(splitPart))
-                            {
-                                sourceStream.CopyTo(destStream);
-                            }
-                        }
+                        Directory.CreateDirectory(fallbackDir);
                     }
                 }
+                catch (Exception ex)
+                {
+                    MergedSplitFallbackPaths.TryRemove(destKey, out _);
+                    Logger.Warning($"Failed to create temporary split-merge directory for '{destFull}': {ex.Message}");
+                    continue;
+                }
+
+                if (TryMergePartsToTarget(orderedParts, fallbackDest, overwriteTarget: true, out _))
+                {
+                    MergedSplitFallbackPaths[destKey] = fallbackDest;
+                    Logger.Info($"Source directory '{destPath}' is not writable; merged split asset '{destFile}' to temporary path '{fallbackDest}'.");
+                }
+                else
+                {
+                    MergedSplitFallbackPaths.TryRemove(destKey, out _);
+                }
+            }
+        }
+
+        private static bool TryCollectOrderedSplitParts(string destPath, string destFile, string destFull, out List<string> orderedParts)
+        {
+            orderedParts = null;
+            string[] candidates;
+            try
+            {
+                candidates = Directory.GetFiles(destPath, destFile + ".split*");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to enumerate split parts for '{destFull}': {ex.Message}");
+                return false;
+            }
+
+            var prefix = destFile + ".split";
+            var partsByIndex = new Dictionary<int, string>();
+            int maxIndex = -1;
+
+            foreach (var candidate in candidates)
+            {
+                var candidateName = Path.GetFileName(candidate);
+                if (string.IsNullOrEmpty(candidateName) || !candidateName.StartsWith(prefix, PathKeyComparison))
+                {
+                    continue;
+                }
+
+                var suffix = candidateName.Substring(prefix.Length);
+                if (!int.TryParse(suffix, NumberStyles.None, CultureInfo.InvariantCulture, out var partIndex)
+                    || !string.Equals(suffix, partIndex.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                partsByIndex[partIndex] = candidate;
+                if (partIndex > maxIndex)
+                {
+                    maxIndex = partIndex;
+                }
+            }
+
+            if (maxIndex < 0)
+            {
+                return false;
+            }
+
+            var result = new List<string>(maxIndex + 1);
+            for (int i = 0; i <= maxIndex; i++)
+            {
+                if (!partsByIndex.TryGetValue(i, out var partPath) || !File.Exists(partPath))
+                {
+                    Logger.Warning($"Skipping incomplete split asset '{destFull}': missing part '{destFull}.split{i}'.");
+                    return false;
+                }
+                result.Add(partPath);
+            }
+
+            orderedParts = result;
+            return true;
+        }
+
+        private static bool TryMergePartsToTarget(IReadOnlyList<string> orderedParts, string targetPath, bool overwriteTarget, out bool destinationWriteFailed)
+        {
+            destinationWriteFailed = false;
+            var tmpPath = targetPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            bool moved = false;
+
+            try
+            {
+                FileStream destStream;
+                try
+                {
+                    destStream = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920);
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException)
+                {
+                    destinationWriteFailed = true;
+                    return false;
+                }
+
+                using (destStream)
+                {
+                    for (int i = 0; i < orderedParts.Count; i++)
+                    {
+                        using (var sourceStream = File.OpenRead(orderedParts[i]))
+                        {
+                            sourceStream.CopyTo(destStream);
+                        }
+                    }
+                    destStream.Flush();
+                }
+
+                try
+                {
+                    File.Move(tmpPath, targetPath, overwriteTarget);
+                    moved = true;
+                    return true;
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException)
+                {
+                    if (File.Exists(targetPath))
+                    {
+                        return true;
+                    }
+                    destinationWriteFailed = true;
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to merge split asset '{targetPath}': {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                if (!moved)
+                {
+                    TryDeleteFile(tmpPath);
+                }
+            }
+        }
+
+        private static string GetFallbackMergedPath(string destPath, string destFile)
+        {
+            var normalizedDir = NormalizeSplitPathKey(destPath);
+            var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(normalizedDir));
+            var dirHash = Convert.ToHexStringLower(hashBytes.AsSpan(0, 8));
+            var fallbackDir = Path.Combine(Path.GetTempPath(), "AssetStudio", "SplitMerge", dirHash);
+            return Path.Combine(fallbackDir, destFile);
+        }
+
+        private static string NormalizeSplitPathKey(string path)
+        {
+            try
+            {
+                return Path.GetFullPath(path)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            catch
+            {
+                return path.Trim();
+            }
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup of temporary merge file.
             }
         }
 
@@ -43,9 +279,10 @@ namespace AssetStudio
             var selectFilesList = new List<string>();
             foreach (var x in selectFile)
             {
-                if (x.Contains(".split"))
+                var fileName = Path.GetFileName(x);
+                if (!string.IsNullOrEmpty(fileName) && fileName.Contains(".split"))
                 {
-                    splitFiles.Add(Path.Combine(Path.GetDirectoryName(x), Path.GetFileNameWithoutExtension(x)));
+                    splitFiles.Add(Path.Combine(Path.GetDirectoryName(x) ?? string.Empty, Path.GetFileNameWithoutExtension(x)));
                 }
                 else
                 {
@@ -53,15 +290,19 @@ namespace AssetStudio
                 }
             }
 
-            var distinctSplitFiles = splitFiles.Distinct();
+            var distinctSplitFiles = splitFiles.Distinct(PathKeyComparer);
             foreach (var file in distinctSplitFiles)
             {
                 if (File.Exists(file))
                 {
                     selectFilesList.Add(file);
                 }
+                else if (TryGetMergedSplitFallbackPath(file, out var fallbackPath))
+                {
+                    selectFilesList.Add(fallbackPath);
+                }
             }
-            return selectFilesList.Distinct().ToArray();
+            return selectFilesList.Distinct(PathKeyComparer).ToArray();
         }
 
         public static FileReader DecompressGZip(FileReader reader)

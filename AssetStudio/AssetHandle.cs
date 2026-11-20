@@ -63,6 +63,8 @@ namespace AssetStudio
             return SourceHashCache.GetOrAdd(key, ComputeSourceHash);
         }
 
+        public static void ClearSourceHashCache() => SourceHashCache.Clear();
+
         private static string ComputeSourceHash(string key)
         {
             // First 8 bytes of SHA-256 as 16 lowercase hex chars (persisted in UniqueIDs / SQLite cache).

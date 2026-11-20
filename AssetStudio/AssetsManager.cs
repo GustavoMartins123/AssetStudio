@@ -284,12 +284,24 @@ namespace AssetStudio
         {
             DisableMemoryPressureCheck = false;
             ShouldStopLoading = false;
+            if (files == null || files.Length == 0)
+            {
+                return;
+            }
             var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
             if (string.IsNullOrEmpty(ProjectRoot))
             {
                 ProjectRoot = path;
             }
-            MergeSplitAssets(path);
+            var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            foreach (var dir in files
+                .Where(f => !string.IsNullOrWhiteSpace(f))
+                .Select(f => Path.GetDirectoryName(Path.GetFullPath(f)))
+                .Where(d => !string.IsNullOrEmpty(d))
+                .Distinct(dirComparer))
+            {
+                MergeSplitAssets(dir);
+            }
             var toReadFile = ProcessingSplitFiles(files);
             await LoadAsync(toReadFile, highPriority);
         }
@@ -1176,6 +1188,7 @@ namespace AssetStudio
             assetsFileIndexCache.Clear();
             inferredUnityVersion = "";
             DecryptionHelper.Clear();
+            AssetHandle.ClearSourceHashCache();
         }
 
         public void Dispose()

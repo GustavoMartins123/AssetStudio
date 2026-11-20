@@ -39,6 +39,7 @@ namespace AssetStudio
         public static long LowMemoryThreshold { get; set; } = 200L * 1024 * 1024;
         public static string TemporaryDirectory { get; set; } = "";
         public static string CacheDirectory { get; set; } = "";
+        public const int MaxUncompressedBlocksInfoSize = 128 * 1024 * 1024; // 128 MiB safety cap
         private const int PersistentCacheSampleBytes = 1024 * 1024;
         private const long PersistentCacheFullSignatureThreshold = 8L * 1024 * 1024;
         private const ulong PersistentCacheFnvOffsetBasis = 14695981039346656037UL;
@@ -732,9 +733,9 @@ namespace AssetStudio
             {
                 throw new InvalidDataException($"Invalid compressed blocks info size {m_Header.compressedBlocksInfoSize} (file length {reader.BaseStream.Length}).");
             }
-            if (m_Header.uncompressedBlocksInfoSize > int.MaxValue)
+            if (m_Header.uncompressedBlocksInfoSize > MaxUncompressedBlocksInfoSize)
             {
-                throw new InvalidDataException($"Invalid uncompressed blocks info size {m_Header.uncompressedBlocksInfoSize}.");
+                throw new InvalidDataException($"Invalid uncompressed blocks info size {m_Header.uncompressedBlocksInfoSize} (exceeds safety limit of {MaxUncompressedBlocksInfoSize} bytes).");
             }
             var compressedBlocksInfoSize = (int)m_Header.compressedBlocksInfoSize;
             if ((m_Header.flags & ArchiveFlags.BlocksInfoAtTheEnd) != 0)

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Specialized;
+using System.IO;
 using System.Linq;
 
 namespace AssetStudio
@@ -164,18 +165,29 @@ namespace AssetStudio
                     // Validação genérica: se o path lido do StreamingInfo for um lixo de memória, é certeza que há um desalinhamento.
                     if (!string.IsNullOrEmpty(m_StreamData.path) && (m_StreamData.path.Length > 260 || m_StreamData.path.Any(c => char.IsControl(c))))
                     {
-                        throw new Exception("Invalid stream path - trying with extra u32 padding");
+                        throw new InvalidDataException("Invalid stream path - trying with extra u32 padding");
                     }
                 }
             }
-            catch
+            catch (Exception ex) when (ex is EndOfStreamException || ex is InvalidDataException || ex is ArgumentOutOfRangeException)
             {
                 // Fallback para forks que adicionam um padding u32 antes do tamanho da imagem
-                reader.BaseStream.Position = posBeforeImageData + 4; // Pula 4 bytes
-                image_data_size = reader.ReadInt32();
-                if (image_data_size == 0 && HasStreamData(version))
+                m_StreamData = null;
+                image_data_size = 0;
+                long objectEnd = reader.byteStart + reader.byteSize;
+                if (posBeforeImageData + 8 <= objectEnd && posBeforeImageData + 8 <= reader.BaseStream.Length)
                 {
-                    m_StreamData = new StreamingInfo(reader);
+                    reader.BaseStream.Position = posBeforeImageData + 4; // Pula 4 bytes
+                    image_data_size = reader.ReadInt32();
+                    if (image_data_size == 0 && HasStreamData(version))
+                    {
+                        m_StreamData = new StreamingInfo(reader);
+                    }
+                }
+                else
+                {
+                    Logger.Warning($"Texture2D '{m_Name}' (PathID {m_PathID}): skipped extra u32 padding fallback because offset {posBeforeImageData + 8} exceeds object boundary {objectEnd}.");
+                    reader.BaseStream.Position = Math.Min(posBeforeImageData, reader.BaseStream.Length);
                 }
             }
 

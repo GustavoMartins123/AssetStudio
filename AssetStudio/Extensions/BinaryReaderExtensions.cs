@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -37,19 +38,67 @@ namespace AssetStudio
 
         public static string ReadStringToNull(this BinaryReader reader, int maxLength = 32767)
         {
-            var bytes = new List<byte>();
-            int count = 0;
-            while (reader.BaseStream.Position < reader.BaseStream.Length && count < maxLength)
+            if (maxLength <= 0)
             {
-                var b = reader.ReadByte();
-                if (b == 0)
-                {
-                    break;
-                }
-                bytes.Add(b);
-                count++;
+                return string.Empty;
             }
-            return Encoding.UTF8.GetString(bytes.ToArray());
+
+            const int StackBufferSize = 256;
+            Span<byte> stackBuffer = stackalloc byte[StackBufferSize];
+            byte[] pooled = null;
+            int count = 0;
+
+            try
+            {
+                var stream = reader.BaseStream;
+                while (stream.Position < stream.Length && count < maxLength)
+                {
+                    var b = reader.ReadByte();
+                    if (b == 0)
+                    {
+                        break;
+                    }
+
+                    if (pooled == null)
+                    {
+                        if (count < StackBufferSize)
+                        {
+                            stackBuffer[count++] = b;
+                            continue;
+                        }
+
+                        int initialSize = Math.Min(StackBufferSize * 2, maxLength);
+                        pooled = ArrayPool<byte>.Shared.Rent(initialSize);
+                        stackBuffer.CopyTo(pooled);
+                    }
+                    else if (count == pooled.Length)
+                    {
+                        int nextSize = pooled.Length > maxLength / 2 ? maxLength : pooled.Length * 2;
+                        var nextBuffer = ArrayPool<byte>.Shared.Rent(nextSize);
+                        Buffer.BlockCopy(pooled, 0, nextBuffer, 0, count);
+                        ArrayPool<byte>.Shared.Return(pooled);
+                        pooled = nextBuffer;
+                    }
+
+                    pooled[count++] = b;
+                }
+
+                if (count == 0)
+                {
+                    return string.Empty;
+                }
+
+                return pooled != null
+                    ? Encoding.UTF8.GetString(pooled, 0, count)
+                    : Encoding.UTF8.GetString(stackBuffer.Slice(0, count));
+            }
+            finally
+            {
+                if (pooled != null)
+                {
+                    ArrayPool<byte>.Shared.Return(pooled);
+                }
+            }
         }
 
         public static Quaternion ReadQuaternion(this BinaryReader reader)
