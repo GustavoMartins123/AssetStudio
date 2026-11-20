@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
@@ -6,11 +7,52 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 namespace AssetStudio
 {
     public static class AssetExportHelper
     {
+        private static readonly StringComparer PathComparer =
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
+        private static readonly ConcurrentDictionary<string, Lazy<Dictionary<string, string>>> ShaderGuidCacheByProjectRoot =
+            new(PathComparer);
+
+        private static readonly ConcurrentDictionary<string, string?> UnityProjectRootByDirectoryCache =
+            new(PathComparer);
+
+        private static int shaderGuidDirectoryScanCount;
+
+        public static int ShaderGuidDirectoryScanCount => Volatile.Read(ref shaderGuidDirectoryScanCount);
+
+        public static void ClearShaderGuidCache(string? projectRoot = null)
+        {
+            if (string.IsNullOrWhiteSpace(projectRoot))
+            {
+                ShaderGuidCacheByProjectRoot.Clear();
+                UnityProjectRootByDirectoryCache.Clear();
+                Interlocked.Exchange(ref shaderGuidDirectoryScanCount, 0);
+                return;
+            }
+
+            var resolvedRoot = FindUnityProjectRoot(projectRoot);
+            if (string.IsNullOrEmpty(resolvedRoot))
+            {
+                try
+                {
+                    resolvedRoot = Path.GetFullPath(projectRoot);
+                }
+                catch
+                {
+                    resolvedRoot = projectRoot;
+                }
+            }
+
+            ShaderGuidCacheByProjectRoot.TryRemove(resolvedRoot, out _);
+            UnityProjectRootByDirectoryCache.Clear();
+        }
+
         public static bool ExportMaterial(Material material, string fallbackName, string exportPath, ImageFormat textureFormat)
         {
             var exportName = string.IsNullOrEmpty(material.m_Name) ? fallbackName : material.m_Name;
@@ -18,7 +60,19 @@ namespace AssetStudio
             var filePath = Path.Combine(exportPath, FixFileName(exportName) + ".mat");
             if (File.Exists(filePath)) return false;
 
-            File.WriteAllText(filePath, BuildUnityMaterial(material, exportName, exportPath, textureFormat), Encoding.UTF8);
+            return ExportMaterialToFile(material, fallbackName, exportPath, filePath, textureFormat);
+        }
+
+        public static bool ExportMaterialToFile(
+            Material material,
+            string fallbackName,
+            string exportPath,
+            string targetFilePath,
+            ImageFormat textureFormat)
+        {
+            var exportName = string.IsNullOrEmpty(material.m_Name) ? fallbackName : material.m_Name;
+            EnsureParentDirectory(targetFilePath);
+            WriteTextFileAtomic(targetFilePath, BuildUnityMaterial(material, exportName, exportPath, textureFormat));
             return true;
         }
 
@@ -217,60 +271,109 @@ namespace AssetStudio
             return true;
         }
 
-        private static bool TryGetShaderGuid(string path, string? shaderName, [NotNullWhen(true)] out string? guid)
+        public static bool TryGetShaderGuid(string path, string? shaderName, [NotNullWhen(true)] out string? guid)
         {
             guid = null;
-            if (string.IsNullOrEmpty(shaderName))
+            if (string.IsNullOrEmpty(shaderName) || string.IsNullOrWhiteSpace(path))
             {
                 return false;
             }
 
-            var projectRoot = FindUnityProjectRoot(path);
+            var projectRoot = FindUnityProjectRootCached(path);
             if (projectRoot == null)
             {
                 return false;
             }
 
             var shaderFileName = shaderName.Split('/').Last() + ".shader.meta";
+            var lazyIndex = ShaderGuidCacheByProjectRoot.GetOrAdd(
+                projectRoot,
+                root => new Lazy<Dictionary<string, string>>(
+                    () => BuildShaderGuidIndexForProjectRoot(root),
+                    LazyThreadSafetyMode.ExecutionAndPublication));
+
+            return lazyIndex.Value.TryGetValue(shaderFileName, out guid) && !string.IsNullOrEmpty(guid);
+        }
+
+        private static Dictionary<string, string> BuildShaderGuidIndexForProjectRoot(string projectRoot)
+        {
+            Interlocked.Increment(ref shaderGuidDirectoryScanCount);
+            var index = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var roots = new[]
             {
-            Path.Combine(projectRoot, "Assets"),
-            Path.Combine(projectRoot, "Packages"),
-            Path.Combine(projectRoot, "Library", "PackageCache")
-        };
+                Path.Combine(projectRoot, "Assets"),
+                Path.Combine(projectRoot, "Packages"),
+                Path.Combine(projectRoot, "Library", "PackageCache")
+            };
 
             foreach (var root in roots.Where(Directory.Exists))
             {
-                var matches = ImportHelper.GetFilesSafe(root, shaderFileName, true);
+                var matches = ImportHelper.GetFilesSafe(root, "*.shader.meta", true);
                 foreach (var match in matches)
                 {
-                    if (TryReadGuid(match, out guid))
+                    var fileName = Path.GetFileName(match);
+                    if (string.IsNullOrEmpty(fileName) || index.ContainsKey(fileName))
                     {
-                        return true;
+                        continue;
+                    }
+
+                    if (TryReadGuid(match, out var parsedGuid))
+                    {
+                        index[fileName] = parsedGuid;
                     }
                 }
             }
 
-            return false;
+            return index;
+        }
+
+        private static string? FindUnityProjectRootCached(string path)
+        {
+            string normalized;
+            try
+            {
+                normalized = Path.GetFullPath(path);
+            }
+            catch
+            {
+                normalized = path;
+            }
+
+            return UnityProjectRootByDirectoryCache.GetOrAdd(normalized, FindUnityProjectRoot);
         }
 
         private static bool TryReadGuid(string metaPath, [NotNullWhen(true)] out string? guid)
         {
             guid = null;
-            foreach (var line in File.ReadLines(metaPath))
+            try
             {
-                if (line.StartsWith("guid: ", StringComparison.Ordinal))
+                foreach (var line in File.ReadLines(metaPath))
                 {
-                    guid = line.Substring("guid: ".Length).Trim();
-                    return guid.Length == 32;
+                    if (line.StartsWith("guid: ", StringComparison.Ordinal))
+                    {
+                        guid = line.Substring("guid: ".Length).Trim();
+                        return guid.Length == 32;
+                    }
                 }
+            }
+            catch
+            {
             }
             return false;
         }
 
         private static string? FindUnityProjectRoot(string path)
         {
-            var directory = new DirectoryInfo(path);
+            DirectoryInfo? directory;
+            try
+            {
+                directory = new DirectoryInfo(path);
+            }
+            catch
+            {
+                return null;
+            }
+
             while (directory != null)
             {
                 if (string.Equals(directory.Name, "Assets", StringComparison.OrdinalIgnoreCase))
@@ -611,8 +714,42 @@ TextureImporter:
             var filePath = Path.Combine(exportPath, FixFileName(exportName) + ".anim");
             if (File.Exists(filePath)) return false;
 
-            File.WriteAllText(filePath, BuildUnityAnimationClip(clip, bonePathHash, morphChannelNames), Encoding.UTF8);
+            return ExportAnimationClipToFile(clip, filePath, bonePathHash, morphChannelNames);
+        }
+
+        public static bool ExportAnimationClipToFile(
+            AnimationClip clip,
+            string targetFilePath,
+            Dictionary<uint, string> bonePathHash,
+            Dictionary<uint, string> morphChannelNames)
+        {
+            EnsureParentDirectory(targetFilePath);
+            WriteTextFileAtomic(targetFilePath, BuildUnityAnimationClip(clip, bonePathHash, morphChannelNames));
             return true;
+        }
+
+        private static void WriteTextFileAtomic(string filePath, string content)
+        {
+            try
+            {
+                using var file = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.SequentialScan);
+                using var writer = new StreamWriter(file, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                writer.Write(content);
+            }
+            catch
+            {
+                try
+                {
+                    if (File.Exists(filePath))
+                    {
+                        File.Delete(filePath);
+                    }
+                }
+                catch
+                {
+                }
+                throw;
+            }
         }
 
         private static string BuildUnityAnimationClip(AnimationClip clip, Dictionary<uint, string> bonePathHash, Dictionary<uint, string> morphChannelNames)

@@ -3,6 +3,7 @@ using Avalonia.Interactivity;
 using AssetStudio;
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -10,6 +11,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
 
@@ -17,6 +19,21 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    internal const int DefaultCurrentExportWriteIntervalMs = 250;
+    internal const int DefaultExportUiProgressIntervalMs = 50;
+
+    internal static int GetExportThreadCount(int requestedDegreeOfParallelism = 0)
+    {
+        if (requestedDegreeOfParallelism > 0)
+        {
+            return requestedDegreeOfParallelism;
+        }
+
+        return Math.Clamp(
+            AssetsManager.GetConfiguredThreadCount("ASSETSTUDIO_EXPORT_THREADS", 1.0),
+            1,
+            16);
+    }
     private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets.ToList(), ExportMode.Convert);
     private async void ExportSelectedAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
     private async void ExportFilteredAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Convert);
@@ -139,13 +156,14 @@ public partial class MainWindow
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
+        string? assemblyFolderToLoad = null;
         if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump) && toExport.Any(x => x.Type == ClassIDType.MonoBehaviour))
         {
             var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
             if (folders != null && folders.Count > 0)
             {
-                SaveLoadFolder(folders[0].Path.LocalPath);
-                assemblyLoader.Load(folders[0].Path.LocalPath);
+                assemblyFolderToLoad = folders[0].Path.LocalPath;
+                SaveLoadFolder(assemblyFolderToLoad);
             }
             else
             {
@@ -174,81 +192,27 @@ public partial class MainWindow
 
         await Task.Run(() =>
         {
-            EnsureLazyAssetsLoadedForExport(toExport);
-            var conversionContext = new ExportConversionContext(assetsManager.assetsFileList);
-            var currentExportPath = Path.Combine(savePath, "export-current.txt");
-            for (int j = 0; j < total; j++)
+            if (!string.IsNullOrEmpty(assemblyFolderToLoad) && !assemblyLoader.Loaded)
             {
-                var asset = toExport[j];
-                try
+                lock (assemblyLoader)
                 {
-                    var exportedBefore = exported;
-                    WriteCurrentExport(currentExportPath, asset, j + 1, total);
-                    var exportPath = GetExportPath(savePath, asset);
-                    Directory.CreateDirectory(exportPath);
-                    var fileName = FixFileName(asset.Name);
-
-                    switch (mode)
+                    if (!assemblyLoader.Loaded)
                     {
-                        case ExportMode.Raw:
-                            if (conversionContext.TryGetAssetFilePath(exportPath, fileName, GetRawExtension(asset), asset, out var rawFilePath))
-                            {
-                                var assetObj = asset.Asset;
-                                if (assetObj != null)
-                                {
-                                    WriteRawAssetData(assetObj, rawFilePath);
-                                    exported++;
-                                }
-                            }
-                            break;
-                        case ExportMode.Dump:
-                            if (conversionContext.TryGetAssetFilePath(exportPath, fileName, ".txt", asset, out var dumpFilePath))
-                            {
-                                string? dump = null;
-                                var assetObj = asset.Asset;
-                                if (assetObj is MonoBehaviour m_MonoBehaviour)
-                                {
-                                    dump = m_MonoBehaviour.Dump();
-                                    if (dump == null && assemblyLoader.Loaded)
-                                    {
-                                        var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
-                                        if (typeTree != null)
-                                        {
-                                            dump = m_MonoBehaviour.Dump(typeTree);
-                                        }
-                                    }
-                                }
-                                else if (assetObj != null)
-                                {
-                                    dump = assetObj.Dump();
-                                }
-                                WriteTextExport(dumpFilePath, dump ?? "");
-                                exported++;
-                            }
-                            break;
-                        case ExportMode.Convert:
-                            if (ExportConvertFile(asset, exportPath, conversionContext))
-                                exported++;
-                            break;
-                    }
-
-                    if (exported == exportedBefore)
-                    {
-                        skipped++;
+                        assemblyLoader.Load(assemblyFolderToLoad);
                     }
                 }
-                catch (Exception ex)
-                {
-                    failed++;
-                    var error = $"Failed to export {asset.TypeString}: {asset.Name} (PathID: {asset.PathID})";
-                    exportErrors.Add($"{error}{Environment.NewLine}{ex}");
-                    StatusStripUpdate($"Error exporting {asset.Name}: {ex.Message}");
-                }
-
-                var progress = (int)((j + 1.0) / total * 100);
-                global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress);
             }
-            ClearCurrentExport(savePath);
+
+            var summary = ExportAssetsBatchCore(
+                toExport,
+                mode,
+                savePath,
+                progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress));
+
+            exported = summary.Exported;
+            skipped = summary.Skipped;
+            failed = summary.Failed;
+            exportErrors.AddRange(summary.Errors);
         });
 
         var errorReportPath = WriteErrorReport(savePath, exportErrors, logger);
@@ -263,6 +227,258 @@ public partial class MainWindow
         {
             OpenFolder(savePath);
         }
+    }
+
+    internal readonly record struct BulkExportSummary(
+        int Exported,
+        int Skipped,
+        int Failed,
+        int BatchCount,
+        IReadOnlyList<string> Errors);
+
+    internal BulkExportSummary ExportAssetsBatchCore(
+        IReadOnlyList<AssetItem> toExport,
+        ExportMode mode,
+        string savePath,
+        Action<int>? uiProgressCallback = null,
+        int maxDegreeOfParallelism = 0,
+        int maxSourceFilesPerBatch = DefaultLazyExportBatchSourceFileLimit,
+        long maxAssetBytesPerBatch = DefaultLazyExportBatchByteLimit,
+        Action<LazyExportSourceBatch, int>? onBatchLoaded = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(toExport);
+        Directory.CreateDirectory(savePath);
+
+        int total = toExport.Count;
+        if (total == 0)
+        {
+            return new BulkExportSummary(0, 0, 0, 0, Array.Empty<string>());
+        }
+
+        int exported = 0;
+        int skipped = 0;
+        int failed = 0;
+        int completed = 0;
+        var exportErrors = new ConcurrentQueue<string>();
+
+        var currentExportPath = Path.Combine(savePath, "export-current.txt");
+        var progressTracker = new ExportProgressTracker(
+            currentExportPath,
+            total,
+            uiProgressCallback,
+            DefaultCurrentExportWriteIntervalMs,
+            DefaultExportUiProgressIntervalMs);
+
+        var conversionContext = new ExportConversionContext(assetsManager.assetsFileList, assetsManager.loadLock);
+
+        List<LazyExportSourceBatch> batches;
+        HashSet<string>? initiallyLoadedFileNames = null;
+        if (assetsManager.LazyLoading)
+        {
+            lock (assetsManager.loadLock)
+            {
+                initiallyLoadedFileNames = assetsManager.assetsFileList
+                    .Select(f => f.fileName)
+                    .Where(n => !string.IsNullOrEmpty(n))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+
+            batches = BuildLazyExportBatches(toExport, maxSourceFilesPerBatch, maxAssetBytesPerBatch);
+        }
+        else
+        {
+            batches = new List<LazyExportSourceBatch>(1)
+            {
+                new LazyExportSourceBatch(Array.Empty<string>(), toExport, 0L)
+            };
+        }
+
+        int workerCount = GetExportThreadCount(maxDegreeOfParallelism);
+
+        try
+        {
+            for (int batchIndex = 0; batchIndex < batches.Count; batchIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var batch = batches[batchIndex];
+                if (batch.Items.Count == 0)
+                {
+                    continue;
+                }
+
+                if (assetsManager.LazyLoading)
+                {
+                    EnsureLazyBatchLoadedForExport(batch, cancellationToken);
+                    conversionContext.InvalidateDynamicCaches();
+                }
+
+                onBatchLoaded?.Invoke(batch, batchIndex);
+
+                using var lruSuspension = assetsManager.LazyLoading
+                    ? assetsManager.LruCache.SuspendEviction()
+                    : null;
+
+                var phases = BuildBatchExecutionPhases(batch.Items, mode);
+                for (int phaseIndex = 0; phaseIndex < phases.Count; phaseIndex++)
+                {
+                    var phaseItems = phases[phaseIndex];
+                    if (phaseItems.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var parallelOptions = new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = Math.Min(workerCount, phaseItems.Count),
+                        CancellationToken = cancellationToken
+                    };
+
+                    Parallel.ForEach(phaseItems, parallelOptions, asset =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        bool forceFlushCurrent = false;
+                        try
+                        {
+                            var exportPath = GetExportPath(savePath, asset);
+                            Directory.CreateDirectory(exportPath);
+                            var fileName = FixFileName(asset.Name);
+                            bool itemExported = false;
+
+                            switch (mode)
+                            {
+                                case ExportMode.Raw:
+                                    if (conversionContext.TryGetAssetFilePath(exportPath, fileName, GetRawExtension(asset), asset, out var rawFilePath))
+                                    {
+                                        var assetObj = asset.Asset;
+                                        if (assetObj != null)
+                                        {
+                                            WriteRawAssetData(assetObj, rawFilePath);
+                                            itemExported = true;
+                                        }
+                                    }
+                                    break;
+                                case ExportMode.Dump:
+                                    if (conversionContext.TryGetAssetFilePath(exportPath, fileName, ".txt", asset, out var dumpFilePath))
+                                    {
+                                        string? dump = null;
+                                        var assetObj = asset.Asset;
+                                        if (assetObj is MonoBehaviour m_MonoBehaviour)
+                                        {
+                                            dump = m_MonoBehaviour.Dump();
+                                            if (dump == null && assemblyLoader.Loaded)
+                                            {
+                                                TypeTree? typeTree;
+                                                lock (assemblyLoader)
+                                                {
+                                                    typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                                                }
+                                                if (typeTree != null)
+                                                {
+                                                    dump = m_MonoBehaviour.Dump(typeTree);
+                                                }
+                                            }
+                                        }
+                                        else if (assetObj != null)
+                                        {
+                                            dump = assetObj.Dump();
+                                        }
+                                        WriteTextExport(dumpFilePath, dump ?? "");
+                                        itemExported = true;
+                                    }
+                                    break;
+                                case ExportMode.Convert:
+                                    if (ExportConvertFile(asset, exportPath, conversionContext))
+                                    {
+                                        itemExported = true;
+                                    }
+                                    break;
+                            }
+
+                            if (itemExported)
+                            {
+                                Interlocked.Increment(ref exported);
+                            }
+                            else
+                            {
+                                Interlocked.Increment(ref skipped);
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            forceFlushCurrent = true;
+                            Interlocked.Increment(ref failed);
+                            var error = $"Failed to export {asset.TypeString}: {asset.Name} (PathID: {asset.PathID})";
+                            exportErrors.Enqueue($"{error}{Environment.NewLine}{ex}");
+                            StatusStripUpdate($"Error exporting {asset.Name}: {ex.Message}");
+                        }
+
+                        var currentCompleted = Interlocked.Increment(ref completed);
+                        progressTracker.ReportAssetProgress(
+                            asset,
+                            currentCompleted,
+                            forceFlush: forceFlushCurrent || currentCompleted == 1 || currentCompleted == total);
+                    });
+                }
+
+                if (assetsManager.LazyLoading && batches.Count > 1)
+                {
+                    ReleaseLazyExportBatch(batch, initiallyLoadedFileNames);
+                }
+            }
+        }
+        finally
+        {
+            ClearCurrentExport(savePath);
+        }
+
+        return new BulkExportSummary(
+            exported,
+            skipped,
+            failed,
+            batches.Count,
+            exportErrors.ToArray());
+    }
+
+    private static List<IReadOnlyList<AssetItem>> BuildBatchExecutionPhases(
+        IReadOnlyList<AssetItem> batchItems,
+        ExportMode mode)
+    {
+        if (mode != ExportMode.Convert || batchItems.Count <= 1)
+        {
+            return new List<IReadOnlyList<AssetItem>>(1) { batchItems };
+        }
+
+        var textures = new List<AssetItem>();
+        var materials = new List<AssetItem>();
+        var others = new List<AssetItem>();
+
+        for (int i = 0; i < batchItems.Count; i++)
+        {
+            var item = batchItems[i];
+            if (item.Type == ClassIDType.Texture2D)
+            {
+                textures.Add(item);
+            }
+            else if (item.Type == ClassIDType.Material)
+            {
+                materials.Add(item);
+            }
+            else
+            {
+                others.Add(item);
+            }
+        }
+
+        var phases = new List<IReadOnlyList<AssetItem>>(3);
+        if (textures.Count > 0) phases.Add(textures);
+        if (materials.Count > 0) phases.Add(materials);
+        if (others.Count > 0) phases.Add(others);
+        return phases;
     }
 
     private static List<AssetItem> OrderConvertedAssetsForExport(List<AssetItem> assets)
@@ -513,47 +729,71 @@ public partial class MainWindow
 
         await Task.Run(() =>
         {
-            for (var i = 0; i < exportNodes.Count; i++)
+            var totalNodes = exportNodes.Count;
+            var completedNodes = 0;
+            var errorQueue = new ConcurrentQueue<string>();
+            var reservedPaths = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            var progressTracker = new ExportProgressTracker(
+                currentExportPath,
+                totalNodes,
+                progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress),
+                DefaultCurrentExportWriteIntervalMs,
+                DefaultExportUiProgressIntervalMs);
+
+            var parallelOptions = new ParallelOptions
             {
-                var node = exportNodes[i];
-                var gameObject = node.GameObject!;
-                var targetFolder = createObjectFolders
-                    ? GetUniqueDirectoryPath(Path.Combine(exportRoot, FixFileName(gameObject.m_Name)))
-                    : exportRoot;
-                Directory.CreateDirectory(targetFolder);
+                MaxDegreeOfParallelism = Math.Min(GetExportThreadCount(), totalNodes)
+            };
 
-                var exportFile = GetUniqueFilePath(Path.Combine(targetFolder, FixFileName(gameObject.m_Name) + ".fbx"));
-                StatusStripUpdate($"Exporting {Path.GetFileName(exportFile)}");
-
-                try
+            try
+            {
+                Parallel.For(0, totalNodes, parallelOptions, i =>
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(currentExportPath)!);
-                    File.WriteAllText(currentExportPath,
-                        $"Exporting {i + 1}/{exportNodes.Count}{Environment.NewLine}" +
-                        $"Type: GameObject{Environment.NewLine}" +
-                        $"Name: {gameObject.m_Name}{Environment.NewLine}" +
-                        $"PathID: {gameObject.m_PathID}{Environment.NewLine}" +
-                        $"Source: {gameObject.assetsFile?.originalPath ?? gameObject.assetsFile?.fullName ?? gameObject.assetsFile?.fileName}{Environment.NewLine}",
-                        Encoding.UTF8);
+                    var node = exportNodes[i];
+                    var gameObject = node.GameObject!;
+                    var targetFolder = createObjectFolders
+                        ? ReserveUniqueDirectoryPath(Path.Combine(exportRoot, FixFileName(gameObject.m_Name)), reservedPaths)
+                        : exportRoot;
+                    Directory.CreateDirectory(targetFolder);
 
-                    var convert = CreateModelConverter(gameObject, clips);
-                    ExportFbx(convert, exportFile);
-                    exported++;
-                }
-                catch (Exception ex)
-                {
-                    failed++;
-                    var error = $"Export GameObject:{gameObject.m_Name} error";
-                    exportErrors.Add($"{error}{Environment.NewLine}{ex}");
-                    Logger.Error(error, ex);
-                    StatusStripUpdate($"Error exporting {gameObject.m_Name}: {ex.Message}");
-                }
+                    var exportFile = ReserveUniqueFilePath(
+                        Path.Combine(targetFolder, FixFileName(gameObject.m_Name) + ".fbx"),
+                        reservedPaths);
+                    StatusStripUpdate($"Exporting {Path.GetFileName(exportFile)}");
 
-                var progress = (int)((i + 1.0) / exportNodes.Count * 100);
-                global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress);
+                    bool forceFlushCurrent = false;
+                    try
+                    {
+                        var convert = CreateModelConverter(gameObject, clips);
+                        ExportFbx(convert, exportFile, reservedPaths);
+                        Interlocked.Increment(ref exported);
+                    }
+                    catch (Exception ex)
+                    {
+                        forceFlushCurrent = true;
+                        Interlocked.Increment(ref failed);
+                        var error = $"Export GameObject:{gameObject.m_Name} error";
+                        errorQueue.Enqueue($"{error}{Environment.NewLine}{ex}");
+                        Logger.Error(error, ex);
+                        StatusStripUpdate($"Error exporting {gameObject.m_Name}: {ex.Message}");
+                    }
+
+                    var currentCompleted = Interlocked.Increment(ref completedNodes);
+                    var source = gameObject.assetsFile?.originalPath ?? gameObject.assetsFile?.fullName ?? gameObject.assetsFile?.fileName;
+                    progressTracker.ReportCustomProgress(
+                        typeString: "GameObject",
+                        name: gameObject.m_Name,
+                        pathId: gameObject.m_PathID,
+                        source: source,
+                        completedCount: currentCompleted,
+                        forceFlush: forceFlushCurrent || currentCompleted == 1 || currentCompleted == totalNodes);
+                });
             }
-
-            ClearCurrentExport(exportRoot);
+            finally
+            {
+                ClearCurrentExport(exportRoot);
+                exportErrors.AddRange(errorQueue);
+            }
         });
 
         var errorReportPath = WriteErrorReport(exportRoot, exportErrors, logger);
@@ -646,6 +886,23 @@ public partial class MainWindow
         return candidate;
     }
 
+    internal static string ReserveUniqueDirectoryPath(
+        string directoryPath,
+        ConcurrentDictionary<string, byte> reservedPaths)
+    {
+        ArgumentNullException.ThrowIfNull(reservedPaths);
+        var fullBasePath = Path.GetFullPath(directoryPath);
+        var candidate = fullBasePath;
+        for (var i = 1; ; i++)
+        {
+            if (reservedPaths.TryAdd(candidate, 0) && !Directory.Exists(candidate))
+            {
+                return candidate;
+            }
+            candidate = $"{fullBasePath} ({i})";
+        }
+    }
+
     private static string GetUniqueFilePath(string filePath)
     {
         if (!File.Exists(filePath)) return filePath;
@@ -660,6 +917,27 @@ public partial class MainWindow
             {
                 return candidate;
             }
+        }
+    }
+
+    internal static string ReserveUniqueFilePath(
+        string filePath,
+        ConcurrentDictionary<string, byte> reservedPaths)
+    {
+        ArgumentNullException.ThrowIfNull(reservedPaths);
+        var fullFilePath = Path.GetFullPath(filePath);
+        var directory = Path.GetDirectoryName(fullFilePath) ?? string.Empty;
+        var name = Path.GetFileNameWithoutExtension(fullFilePath);
+        var extension = Path.GetExtension(fullFilePath);
+
+        var candidate = fullFilePath;
+        for (var i = 1; ; i++)
+        {
+            if (reservedPaths.TryAdd(candidate, 0) && !File.Exists(candidate))
+            {
+                return candidate;
+            }
+            candidate = Path.Combine(directory, $"{name} ({i}){extension}");
         }
     }
 
@@ -930,17 +1208,218 @@ public partial class MainWindow
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var directory = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
             File.WriteAllText(path,
-                $"Exporting {index}/{count}{Environment.NewLine}" +
-                $"Type: {asset.TypeString}{Environment.NewLine}" +
-                $"Name: {asset.Name}{Environment.NewLine}" +
-                $"PathID: {asset.PathID}{Environment.NewLine}" +
-                $"Source: {asset.SourceFile?.originalPath ?? asset.SourceFile?.fullName ?? asset.SourceFile?.fileName}{Environment.NewLine}",
+                FormatCurrentExportContent(
+                    asset.TypeString,
+                    asset.Name,
+                    asset.PathID,
+                    asset.SourceFile?.originalPath ?? asset.SourceFile?.fullName ?? asset.SourceFile?.fileName,
+                    index,
+                    count),
                 Encoding.UTF8);
         }
         catch
         {
+        }
+    }
+
+    internal static string FormatCurrentExportContent(
+        string? typeString,
+        string? name,
+        long pathId,
+        string? source,
+        int index,
+        int count)
+    {
+        return $"Exporting {index}/{count}{Environment.NewLine}" +
+               $"Type: {typeString}{Environment.NewLine}" +
+               $"Name: {name}{Environment.NewLine}" +
+               $"PathID: {pathId}{Environment.NewLine}" +
+               $"Source: {source}{Environment.NewLine}";
+    }
+
+    internal sealed class ExportProgressTracker
+    {
+        private readonly string currentExportPath;
+        private readonly int totalCount;
+        private readonly Action<int>? uiProgressCallback;
+        private readonly int fileWriteIntervalMs;
+        private readonly int uiProgressIntervalMs;
+        private readonly object fileWriteLock = new();
+
+        private long lastFileWriteTicks;
+        private long lastUiPostTicks;
+        private int lastReportedPercent = -1;
+        private int fileWriteCount;
+        private int uiPostCount;
+
+        public int FileWriteCount => Volatile.Read(ref fileWriteCount);
+        public int UiPostCount => Volatile.Read(ref uiPostCount);
+        public int LastReportedPercent => Volatile.Read(ref lastReportedPercent);
+
+        public ExportProgressTracker(
+            string currentExportPath,
+            int totalCount,
+            Action<int>? uiProgressCallback = null,
+            int fileWriteIntervalMs = DefaultCurrentExportWriteIntervalMs,
+            int uiProgressIntervalMs = DefaultExportUiProgressIntervalMs)
+        {
+            this.currentExportPath = currentExportPath ?? string.Empty;
+            this.totalCount = Math.Max(1, totalCount);
+            this.uiProgressCallback = uiProgressCallback;
+            this.fileWriteIntervalMs = Math.Max(0, fileWriteIntervalMs);
+            this.uiProgressIntervalMs = Math.Max(0, uiProgressIntervalMs);
+
+            var initialTicks = Environment.TickCount64 - Math.Max(this.fileWriteIntervalMs, this.uiProgressIntervalMs) - 1;
+            lastFileWriteTicks = initialTicks;
+            lastUiPostTicks = initialTicks;
+
+            if (!string.IsNullOrWhiteSpace(this.currentExportPath))
+            {
+                try
+                {
+                    var dir = Path.GetDirectoryName(this.currentExportPath);
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        public void ReportAssetProgress(AssetItem asset, int completedCount, bool forceFlush = false)
+        {
+            var source = asset.SourceFile?.originalPath
+                ?? asset.SourceFile?.fullName
+                ?? asset.SourceFile?.fileName
+                ?? asset.Handle?.OriginalPath;
+            ReportCustomProgress(
+                asset.TypeString,
+                asset.Name,
+                asset.PathID,
+                source,
+                completedCount,
+                forceFlush);
+        }
+
+        public void ReportCustomProgress(
+            string? typeString,
+            string? name,
+            long pathId,
+            string? source,
+            int completedCount,
+            bool forceFlush = false)
+        {
+            bool isFinal = completedCount >= totalCount;
+            bool shouldForceWrite = forceFlush || isFinal || completedCount <= 1;
+
+            TryWriteCurrentExportThrottled(typeString, name, pathId, source, completedCount, shouldForceWrite);
+            TryPostUiProgressThrottled(completedCount, isFinal);
+        }
+
+        private void TryWriteCurrentExportThrottled(
+            string? typeString,
+            string? name,
+            long pathId,
+            string? source,
+            int completedCount,
+            bool forceFlush)
+        {
+            if (string.IsNullOrWhiteSpace(currentExportPath))
+            {
+                return;
+            }
+
+            long nowTicks = Environment.TickCount64;
+            if (!forceFlush)
+            {
+                long prevTicks = Interlocked.Read(ref lastFileWriteTicks);
+                if (nowTicks - prevTicks < fileWriteIntervalMs)
+                {
+                    return;
+                }
+                if (Interlocked.CompareExchange(ref lastFileWriteTicks, nowTicks, prevTicks) != prevTicks)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                Interlocked.Exchange(ref lastFileWriteTicks, nowTicks);
+            }
+
+            lock (fileWriteLock)
+            {
+                try
+                {
+                    File.WriteAllText(
+                        currentExportPath,
+                        FormatCurrentExportContent(typeString, name, pathId, source, completedCount, totalCount),
+                        Encoding.UTF8);
+                    Interlocked.Increment(ref fileWriteCount);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void TryPostUiProgressThrottled(int completedCount, bool isFinal)
+        {
+            if (uiProgressCallback == null)
+            {
+                return;
+            }
+
+            int percent = Math.Clamp((int)((double)completedCount / totalCount * 100), 0, 100);
+            int prevPercent = Volatile.Read(ref lastReportedPercent);
+            long nowTicks = Environment.TickCount64;
+            long prevTicks = Interlocked.Read(ref lastUiPostTicks);
+
+            bool percentChanged = percent > prevPercent;
+            bool timeElapsed = nowTicks - prevTicks >= uiProgressIntervalMs;
+
+            if (!isFinal && !percentChanged && !timeElapsed)
+            {
+                return;
+            }
+
+            if (percentChanged)
+            {
+                int currentPrev = prevPercent;
+                while (percent > currentPrev)
+                {
+                    int exchanged = Interlocked.CompareExchange(ref lastReportedPercent, percent, currentPrev);
+                    if (exchanged == currentPrev)
+                    {
+                        Interlocked.Exchange(ref lastUiPostTicks, nowTicks);
+                        Interlocked.Increment(ref uiPostCount);
+                        uiProgressCallback(percent);
+                        return;
+                    }
+                    currentPrev = exchanged;
+                }
+                return;
+            }
+
+            if (isFinal || (timeElapsed && Interlocked.CompareExchange(ref lastUiPostTicks, nowTicks, prevTicks) == prevTicks))
+            {
+                if (isFinal && prevPercent == percent)
+                {
+                    return;
+                }
+                Interlocked.Exchange(ref lastReportedPercent, percent);
+                Interlocked.Increment(ref uiPostCount);
+                uiProgressCallback(percent);
+            }
         }
     }
 
@@ -1229,12 +1708,13 @@ public partial class MainWindow
             }
             case AnimationClip m_AnimationClip:
             {
-                return AssetExportHelper.ExportAnimationClip(
-                    m_AnimationClip,
-                    fileName,
-                    exportPath,
-                    conversionContext.BonePathHash,
-                    conversionContext.MorphChannelNames);
+                var clipExportName = string.IsNullOrEmpty(m_AnimationClip.m_Name) ? fileName : m_AnimationClip.m_Name;
+                return conversionContext.TryGetAssetFilePath(exportPath, clipExportName, ".anim", item, out var clipFullPath)
+                    && AssetExportHelper.ExportAnimationClipToFile(
+                        m_AnimationClip,
+                        clipFullPath,
+                        conversionContext.BonePathHash,
+                        conversionContext.MorphChannelNames);
             }
             case Mesh m_Mesh:
             {
@@ -1288,7 +1768,9 @@ public partial class MainWindow
             }
             case Material m_Material:
             {
-                return AssetExportHelper.ExportMaterial(m_Material, item.Name, exportPath, exportOptions.ConvertTextureFormat);
+                var matExportName = string.IsNullOrEmpty(m_Material.m_Name) ? item.Name : m_Material.m_Name;
+                return conversionContext.TryGetAssetFilePath(exportPath, matExportName, ".mat", item, out var matFullPath)
+                    && AssetExportHelper.ExportMaterialToFile(m_Material, item.Name, exportPath, matFullPath, exportOptions.ConvertTextureFormat);
             }
             case TextAsset m_TextAsset:
             {
@@ -1398,10 +1880,25 @@ public partial class MainWindow
             }
             case MonoBehaviour m_MonoBehaviour:
             {
+                TypeTree? convertedTypeTree = null;
+                bool typeTreeConverted = false;
+                TypeTree? GetOrConvertTypeTree()
+                {
+                    if (!typeTreeConverted && assemblyLoader.Loaded)
+                    {
+                        typeTreeConverted = true;
+                        lock (assemblyLoader)
+                        {
+                            convertedTypeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                        }
+                    }
+                    return convertedTypeTree;
+                }
+
                 object? obj = m_MonoBehaviour.ToType();
                 if (obj == null && assemblyLoader.Loaded)
                 {
-                    var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                    var typeTree = GetOrConvertTypeTree();
                     if (typeTree != null)
                     {
                         obj = m_MonoBehaviour.ToType(typeTree);
@@ -1420,7 +1917,7 @@ public partial class MainWindow
                 var dumpStr = m_MonoBehaviour.Dump();
                 if (dumpStr == null && assemblyLoader.Loaded)
                 {
-                    var typeTree = m_MonoBehaviour.ConvertToTypeTree(assemblyLoader);
+                    var typeTree = GetOrConvertTypeTree();
                     if (typeTree != null)
                     {
                         dumpStr = m_MonoBehaviour.Dump(typeTree);
@@ -1971,7 +2468,7 @@ public partial class MainWindow
             && group != null
             && groupMeshes.Count > 0)
         {
-            if (conversionContext.IsModelGroupExported(group.GroupId))
+            if (!conversionContext.TryMarkModelGroupExported(group.GroupId))
             {
                 alreadyExportedGroup = true;
                 return false;
@@ -1981,19 +2478,20 @@ public partial class MainWindow
             if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var fbxPath)
                 && ExportModelGroupFbx(group, groupMeshes, fbxPath))
             {
-                conversionContext.TryMarkModelGroupExported(group.GroupId);
                 return true;
             }
+
+            conversionContext.UnmarkModelGroupExported(group.GroupId);
         }
 
         // 2. Eager mode scene-hierarchy ModelGroup discovery (multi-part characters/props & orphaned meshes with renderers)
         if (!assetsManager.LazyLoading
-            && TryBuildEagerModelGroupForMesh(mesh, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar))
+            && TryBuildEagerModelGroupForMesh(mesh, conversionContext, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar))
         {
             var eagerGroupKey = eagerRoot != null
                 ? $"eager:{GetPreviewObjectKey(eagerRoot)}"
                 : null;
-            if (!string.IsNullOrEmpty(eagerGroupKey) && conversionContext.IsModelGroupExported(eagerGroupKey))
+            if (!string.IsNullOrEmpty(eagerGroupKey) && !conversionContext.TryMarkModelGroupExported(eagerGroupKey))
             {
                 alreadyExportedGroup = true;
                 return false;
@@ -2003,9 +2501,10 @@ public partial class MainWindow
             if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var fbxPath)
                 && ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar, null, fbxPath))
             {
-                conversionContext.TryMarkModelGroupExported(eagerGroupKey);
                 return true;
             }
+
+            conversionContext.UnmarkModelGroupExported(eagerGroupKey);
         }
 
         return false;
@@ -2121,8 +2620,36 @@ public partial class MainWindow
         return false;
     }
 
+    internal sealed class EagerModelGroupEntry
+    {
+        public required string GroupName { get; init; }
+        public GameObject? RootGameObject { get; init; }
+        public required List<Mesh> Meshes { get; init; }
+        public required List<Renderer> Renderers { get; init; }
+        public Avatar? Avatar { get; init; }
+    }
+
     private bool TryBuildEagerModelGroupForMesh(
         Mesh mesh,
+        out string groupName,
+        out GameObject? rootGameObject,
+        out List<Mesh> meshes,
+        out List<Renderer> renderers,
+        out Avatar? avatar)
+    {
+        return TryBuildEagerModelGroupForMesh(
+            mesh,
+            conversionContext: null,
+            out groupName,
+            out rootGameObject,
+            out meshes,
+            out renderers,
+            out avatar);
+    }
+
+    private bool TryBuildEagerModelGroupForMesh(
+        Mesh mesh,
+        ExportConversionContext? conversionContext,
         out string groupName,
         out GameObject? rootGameObject,
         out List<Mesh> meshes,
@@ -2135,16 +2662,45 @@ public partial class MainWindow
         renderers = new List<Renderer>();
         avatar = null;
 
-        Renderer? ownerRenderer = null;
-        GameObject? ownerGo = null;
-
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
+        Dictionary<Mesh, EagerModelGroupEntry> lookup;
+        if (conversionContext != null)
         {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
+            lookup = conversionContext.EagerModelGroupsByMesh;
+        }
+        else
+        {
+            List<SerializedFile> filesSnapshot;
+            lock (assetsManager.loadLock)
+            {
+                filesSnapshot = assetsManager.assetsFileList.ToList();
+            }
+            lookup = BuildEagerModelGroupLookup(filesSnapshot);
         }
 
-        for (int f = 0; f < filesSnapshot.Count && ownerRenderer == null; f++)
+        if (!lookup.TryGetValue(mesh, out var entry) || entry.Meshes.Count == 0)
+        {
+            return false;
+        }
+
+        groupName = entry.GroupName;
+        rootGameObject = entry.RootGameObject;
+        meshes = entry.Meshes;
+        renderers = entry.Renderers;
+        avatar = entry.Avatar;
+        return true;
+    }
+
+    internal static Dictionary<Mesh, EagerModelGroupEntry> BuildEagerModelGroupLookup(
+        IReadOnlyList<SerializedFile> filesSnapshot)
+    {
+        var result = new Dictionary<Mesh, EagerModelGroupEntry>(ReferenceEqualityComparer.Instance);
+        if (filesSnapshot == null || filesSnapshot.Count == 0)
+        {
+            return result;
+        }
+
+        var ownerByMesh = new Dictionary<Mesh, (Renderer OwnerRenderer, GameObject OwnerGo)>(ReferenceEqualityComparer.Instance);
+        for (int f = 0; f < filesSnapshot.Count; f++)
         {
             var objects = filesSnapshot[f].Objects;
             for (int i = 0; i < objects.Count; i++)
@@ -2153,74 +2709,113 @@ public partial class MainWindow
                 if (obj is SkinnedMeshRenderer smr
                     && smr.m_Mesh != null
                     && smr.m_Mesh.TryGet(out var smrMesh)
-                    && ReferenceEquals(smrMesh, mesh))
+                    && smrMesh != null
+                    && !ownerByMesh.ContainsKey(smrMesh))
                 {
-                    ownerRenderer = smr;
+                    GameObject? ownerGo = null;
                     smr.m_GameObject?.TryGet(out ownerGo);
-                    break;
+                    if (ownerGo != null)
+                    {
+                        ownerByMesh[smrMesh] = (smr, ownerGo);
+                    }
                 }
                 else if (obj is MeshFilter mf
                     && mf.m_Mesh != null
                     && mf.m_Mesh.TryGet(out var mfMesh)
-                    && ReferenceEquals(mfMesh, mesh)
+                    && mfMesh != null
+                    && !ownerByMesh.ContainsKey(mfMesh)
                     && mf.m_GameObject != null
                     && mf.m_GameObject.TryGet(out var mfGo)
                     && mfGo?.m_MeshRenderer != null)
                 {
-                    ownerRenderer = mfGo.m_MeshRenderer;
-                    ownerGo = mfGo;
+                    ownerByMesh[mfMesh] = (mfGo.m_MeshRenderer, mfGo);
+                }
+            }
+        }
+
+        if (ownerByMesh.Count == 0)
+        {
+            return result;
+        }
+
+        var subtreeCacheByRoot = new Dictionary<GameObject, (List<Mesh> Meshes, List<Renderer> Renderers)>(ReferenceEqualityComparer.Instance);
+        var visited = new HashSet<GameObject>(ReferenceEqualityComparer.Instance);
+
+        foreach (var kvp in ownerByMesh)
+        {
+            var mesh = kvp.Key;
+            var ownerRenderer = kvp.Value.OwnerRenderer;
+            var ownerGo = kvp.Value.OwnerGo;
+
+            GameObject? animatorRoot = null;
+            GameObject? multiRendererRoot = null;
+            Avatar? avatar = null;
+            var current = ownerGo;
+            visited.Clear();
+
+            while (current != null && visited.Add(current))
+            {
+                if (current.m_Animator != null)
+                {
+                    animatorRoot = current;
+                    if (current.m_Animator.m_Avatar != null)
+                    {
+                        current.m_Animator.m_Avatar.TryGet(out avatar);
+                    }
                     break;
                 }
-            }
-        }
 
-        if (ownerGo == null)
-        {
-            return false;
-        }
-
-        // Walk up the parent transform hierarchy to find an enclosing Animator or multi-part group root
-        GameObject? animatorRoot = null;
-        GameObject? multiRendererRoot = null;
-        var current = ownerGo;
-        var visited = new HashSet<GameObject>();
-        while (current != null && visited.Add(current))
-        {
-            if (current.m_Animator != null)
-            {
-                animatorRoot = current;
-                if (current.m_Animator.m_Avatar != null)
+                if (multiRendererRoot == null && CountRenderersInSubtree(current, maxCount: 2) >= 2)
                 {
-                    current.m_Animator.m_Avatar.TryGet(out avatar);
+                    multiRendererRoot = current;
                 }
-                break;
+
+                var parentTransform = current.m_Transform?.m_Father != null && current.m_Transform.m_Father.TryGet(out var father)
+                    ? father
+                    : null;
+                if (parentTransform == null || parentTransform.m_GameObject == null || !parentTransform.m_GameObject.TryGet(out var parentGo))
+                {
+                    break;
+                }
+                current = parentGo;
             }
 
-            if (multiRendererRoot == null && CountRenderersInSubtree(current, maxCount: 2) >= 2)
+            var rootGameObject = animatorRoot ?? multiRendererRoot ?? ownerGo;
+            var groupName = !string.IsNullOrWhiteSpace(rootGameObject.m_Name)
+                ? rootGameObject.m_Name
+                : (mesh.m_Name ?? "Model");
+
+            if (!subtreeCacheByRoot.TryGetValue(rootGameObject, out var subtree))
             {
-                multiRendererRoot = current;
+                var collectedMeshes = new List<Mesh>();
+                var collectedRenderers = new List<Renderer>();
+                CollectSubtreeMeshesAndRenderers(rootGameObject, collectedMeshes, collectedRenderers);
+                subtree = (collectedMeshes, collectedRenderers);
+                subtreeCacheByRoot[rootGameObject] = subtree;
             }
 
-            var parentTransform = current.m_Transform?.m_Father != null && current.m_Transform.m_Father.TryGet(out var father)
-                ? father
-                : null;
-            if (parentTransform == null || parentTransform.m_GameObject == null || !parentTransform.m_GameObject.TryGet(out var parentGo))
+            List<Mesh> groupMeshes = subtree.Meshes;
+            List<Renderer> groupRenderers = subtree.Renderers;
+            if (groupMeshes.Count == 0 && ownerRenderer != null)
             {
-                break;
+                groupMeshes = new List<Mesh>(1) { mesh };
+                groupRenderers = new List<Renderer>(1) { ownerRenderer };
             }
-            current = parentGo;
+
+            if (groupMeshes.Count > 0)
+            {
+                result[mesh] = new EagerModelGroupEntry
+                {
+                    GroupName = groupName,
+                    RootGameObject = rootGameObject,
+                    Meshes = groupMeshes,
+                    Renderers = groupRenderers,
+                    Avatar = avatar
+                };
+            }
         }
 
-        rootGameObject = animatorRoot ?? multiRendererRoot ?? ownerGo;
-        groupName = !string.IsNullOrWhiteSpace(rootGameObject.m_Name) ? rootGameObject.m_Name : groupName;
-        CollectSubtreeMeshesAndRenderers(rootGameObject, meshes, renderers);
-        if (meshes.Count == 0 && ownerRenderer != null)
-        {
-            meshes.Add(mesh);
-            renderers.Add(ownerRenderer);
-        }
-
-        return meshes.Count > 0;
+        return result;
     }
 
     private bool TryBuildEagerModelGroupForAvatar(
@@ -2413,7 +3008,10 @@ public partial class MainWindow
         }
     }
 
-    private void ExportFbx(IImported convert, string exportFile)
+    private void ExportFbx(
+        IImported convert,
+        string exportFile,
+        ConcurrentDictionary<string, byte>? reservedPaths = null)
     {
         if (exportOptions.ExportAnimations && exportOptions.ExportAnimationsSplit && convert.AnimationList?.Count > 0)
         {
@@ -2453,9 +3051,12 @@ public partial class MainWindow
             // 2. Export each animation clip separately
             foreach (var anim in effectiveConvert.AnimationList)
             {
-                var animFile = GetUniqueFilePath(Path.Combine(
+                var candidateAnimFile = Path.Combine(
                     Path.GetDirectoryName(exportFile)!,
-                    $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.fbx"));
+                    $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.fbx");
+                var animFile = reservedPaths != null
+                    ? ReserveUniqueFilePath(candidateAnimFile, reservedPaths)
+                    : GetUniqueFilePath(candidateAnimFile);
                 var animConvert = new ImportedWrapper(effectiveConvert)
                 {
                     AnimationList = new List<ImportedKeyframedAnimation> { anim }
@@ -2521,35 +3122,113 @@ public partial class MainWindow
         }
     }
 
-    private sealed class ExportConversionContext
+    internal sealed class ExportConversionContext
     {
         private readonly List<SerializedFile> assetsFiles;
-        private readonly HashSet<string> reservedOutputPaths = new(
-            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
-        private readonly HashSet<string> exportedModelGroupIds = new(StringComparer.Ordinal);
+        private readonly object? filesLock;
+        private readonly object cacheLock = new();
+        private readonly ConcurrentDictionary<string, byte> reservedOutputPaths = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, int> collisionCountersByStem = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, byte> exportedModelGroupIds = new(StringComparer.Ordinal);
         private Dictionary<uint, string>? bonePathHash;
         private Dictionary<uint, string>? morphChannelNames;
+        private Dictionary<Mesh, EagerModelGroupEntry>? eagerModelGroupsByMesh;
 
-        public ExportConversionContext(List<SerializedFile> assetsFiles)
+        public ExportConversionContext(List<SerializedFile> assetsFiles, object? filesLock = null)
         {
-            this.assetsFiles = assetsFiles;
+            this.assetsFiles = assetsFiles ?? new List<SerializedFile>();
+            this.filesLock = filesLock;
+        }
+
+        public int ReservedPathCount => reservedOutputPaths.Count;
+
+        public void InvalidateDynamicCaches()
+        {
+            lock (cacheLock)
+            {
+                bonePathHash = null;
+                morphChannelNames = null;
+                eagerModelGroupsByMesh = null;
+            }
+        }
+
+        private List<SerializedFile> SnapshotAssetsFiles()
+        {
+            if (filesLock != null)
+            {
+                lock (filesLock)
+                {
+                    return assetsFiles.ToList();
+                }
+            }
+            return assetsFiles.ToList();
         }
 
         public bool IsModelGroupExported(string? groupId)
         {
-            return !string.IsNullOrWhiteSpace(groupId) && exportedModelGroupIds.Contains(groupId);
+            return !string.IsNullOrWhiteSpace(groupId) && exportedModelGroupIds.ContainsKey(groupId);
         }
 
         public bool TryMarkModelGroupExported(string? groupId)
         {
-            return string.IsNullOrWhiteSpace(groupId) || exportedModelGroupIds.Add(groupId);
+            return string.IsNullOrWhiteSpace(groupId) || exportedModelGroupIds.TryAdd(groupId, 0);
         }
 
-        public Dictionary<uint, string> BonePathHash =>
-            bonePathHash ??= AssetExportHelper.BuildBonePathHash(assetsFiles);
+        public void UnmarkModelGroupExported(string? groupId)
+        {
+            if (!string.IsNullOrWhiteSpace(groupId))
+            {
+                exportedModelGroupIds.TryRemove(groupId, out _);
+            }
+        }
 
-        public Dictionary<uint, string> MorphChannelNames =>
-            morphChannelNames ??= AssetExportHelper.BuildMorphChannelNames(assetsFiles);
+        public Dictionary<uint, string> BonePathHash
+        {
+            get
+            {
+                var cached = Volatile.Read(ref bonePathHash);
+                if (cached != null)
+                {
+                    return cached;
+                }
+                lock (cacheLock)
+                {
+                    return bonePathHash ??= AssetExportHelper.BuildBonePathHash(SnapshotAssetsFiles());
+                }
+            }
+        }
+
+        public Dictionary<uint, string> MorphChannelNames
+        {
+            get
+            {
+                var cached = Volatile.Read(ref morphChannelNames);
+                if (cached != null)
+                {
+                    return cached;
+                }
+                lock (cacheLock)
+                {
+                    return morphChannelNames ??= AssetExportHelper.BuildMorphChannelNames(SnapshotAssetsFiles());
+                }
+            }
+        }
+
+        public Dictionary<Mesh, EagerModelGroupEntry> EagerModelGroupsByMesh
+        {
+            get
+            {
+                var cached = Volatile.Read(ref eagerModelGroupsByMesh);
+                if (cached != null)
+                {
+                    return cached;
+                }
+                lock (cacheLock)
+                {
+                    return eagerModelGroupsByMesh ??= BuildEagerModelGroupLookup(SnapshotAssetsFiles());
+                }
+            }
+        }
 
         public bool TryGetAssetFilePath(
             string directory,
@@ -2561,7 +3240,7 @@ public partial class MainWindow
             fileName = FixFileName(fileName);
             filePath = Path.Combine(directory, fileName + extension);
             var normalizedPath = Path.GetFullPath(filePath);
-            if (reservedOutputPaths.Add(normalizedPath))
+            if (reservedOutputPaths.TryAdd(normalizedPath, 0))
             {
                 return !File.Exists(filePath);
             }
@@ -2581,14 +3260,33 @@ public partial class MainWindow
                 .ToLowerInvariant();
             var suffix = $"_{asset.PathID.ToString(CultureInfo.InvariantCulture)}_{hash}";
             var maxBaseLength = Math.Max(1, 120 - suffix.Length);
-            if (fileName.Length > maxBaseLength)
+            var truncatedBase = fileName.Length > maxBaseLength
+                ? fileName.Substring(0, maxBaseLength)
+                : fileName;
+
+            var fullDirectory = Path.GetFullPath(directory);
+            filePath = Path.Combine(fullDirectory, truncatedBase + suffix + extension);
+            if (reservedOutputPaths.TryAdd(filePath, 0))
             {
-                fileName = fileName.Substring(0, maxBaseLength);
+                return !File.Exists(filePath);
             }
 
-            filePath = Path.Combine(directory, fileName + suffix + extension);
-            normalizedPath = Path.GetFullPath(filePath);
-            return reservedOutputPaths.Add(normalizedPath) && !File.Exists(filePath);
+            var stemKey = Path.Combine(fullDirectory, fileName + suffix + extension);
+            while (true)
+            {
+                var collisionIndex = collisionCountersByStem.AddOrUpdate(stemKey, 1, static (_, prev) => prev + 1);
+                var indexSuffix = $"{suffix}_{collisionIndex.ToString(CultureInfo.InvariantCulture)}";
+                var indexedMaxBase = Math.Max(1, 120 - indexSuffix.Length);
+                var indexedBase = fileName.Length > indexedMaxBase
+                    ? fileName.Substring(0, indexedMaxBase)
+                    : fileName;
+                var candidatePath = Path.Combine(fullDirectory, indexedBase + indexSuffix + extension);
+                if (reservedOutputPaths.TryAdd(candidatePath, 0) && !File.Exists(candidatePath))
+                {
+                    filePath = candidatePath;
+                    return true;
+                }
+            }
         }
     }
 

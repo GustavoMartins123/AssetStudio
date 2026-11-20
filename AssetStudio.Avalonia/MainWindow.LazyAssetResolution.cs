@@ -390,14 +390,187 @@ public partial class MainWindow
         }
     }
 
-    private void EnsureLazyAssetsLoadedForExport(List<AssetItem> items)
+    internal const int DefaultLazyExportBatchSourceFileLimit = 16;
+    internal const long DefaultLazyExportBatchByteLimit = 256L * 1024L * 1024L; // 256 MiB
+
+    internal sealed class LazyExportSourceBatch
     {
-        if (!assetsManager.LazyLoading)
+        public IReadOnlyList<string> SourcePaths { get; }
+        public IReadOnlyList<AssetItem> Items { get; }
+        public long EstimatedAssetBytes { get; }
+
+        public LazyExportSourceBatch(
+            IReadOnlyList<string> sourcePaths,
+            IReadOnlyList<AssetItem> items,
+            long estimatedAssetBytes)
+        {
+            SourcePaths = sourcePaths;
+            Items = items;
+            EstimatedAssetBytes = estimatedAssetBytes;
+        }
+    }
+
+    internal string ResolveLazyExportSourceKey(AssetItem item)
+    {
+        if (item == null)
+        {
+            return string.Empty;
+        }
+
+        if (item.Handle != null)
+        {
+            var resolved = ResolveLazyHandleSourcePath(item.Handle);
+            if (!string.IsNullOrWhiteSpace(resolved))
+            {
+                return resolved;
+            }
+
+            if (!string.IsNullOrWhiteSpace(item.Handle.OriginalPath))
+            {
+                return item.Handle.OriginalPath;
+            }
+
+            if (!string.IsNullOrWhiteSpace(item.Handle.SerializedFileName))
+            {
+                return item.Handle.SerializedFileName;
+            }
+        }
+
+        return GetAssetSourcePath(item);
+    }
+
+    internal List<LazyExportSourceBatch> BuildLazyExportBatches(
+        IReadOnlyList<AssetItem> items,
+        int maxSourceFilesPerBatch = DefaultLazyExportBatchSourceFileLimit,
+        long maxAssetBytesPerBatch = DefaultLazyExportBatchByteLimit)
+    {
+        return BuildLazyExportBatchesForItems(
+            items,
+            ResolveLazyExportSourceKey,
+            maxSourceFilesPerBatch,
+            maxAssetBytesPerBatch);
+    }
+
+    internal static List<LazyExportSourceBatch> BuildLazyExportBatchesForItems(
+        IReadOnlyList<AssetItem> items,
+        Func<AssetItem, string?> sourcePathResolver,
+        int maxSourceFilesPerBatch = DefaultLazyExportBatchSourceFileLimit,
+        long maxAssetBytesPerBatch = DefaultLazyExportBatchByteLimit)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(sourcePathResolver);
+
+        maxSourceFilesPerBatch = Math.Max(1, maxSourceFilesPerBatch);
+        maxAssetBytesPerBatch = Math.Max(1L, maxAssetBytesPerBatch);
+
+        var batches = new List<LazyExportSourceBatch>();
+        if (items.Count == 0)
+        {
+            return batches;
+        }
+
+        var comparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+
+        var sourceGroupOrder = new List<string>();
+        var itemsBySource = new Dictionary<string, List<AssetItem>>(comparer);
+        var bytesBySource = new Dictionary<string, long>(comparer);
+
+        for (int i = 0; i < items.Count; i++)
+        {
+            var item = items[i];
+            if (item == null)
+            {
+                continue;
+            }
+
+            var rawSource = sourcePathResolver(item) ?? string.Empty;
+            var groupKey = rawSource.Trim();
+            if (!itemsBySource.TryGetValue(groupKey, out var groupItems))
+            {
+                groupItems = new List<AssetItem>();
+                itemsBySource[groupKey] = groupItems;
+                bytesBySource[groupKey] = 0L;
+                sourceGroupOrder.Add(groupKey);
+            }
+
+            groupItems.Add(item);
+            var itemBytes = Math.Max(0L, item.FullSize > 0 ? item.FullSize : item.Size);
+            bytesBySource[groupKey] += itemBytes;
+        }
+
+        var currentSourcePaths = new List<string>(maxSourceFilesPerBatch);
+        var currentItems = new List<AssetItem>();
+        long currentBytes = 0L;
+
+        void FlushBatch()
+        {
+            if (currentItems.Count == 0)
+            {
+                return;
+            }
+
+            batches.Add(new LazyExportSourceBatch(
+                currentSourcePaths.ToArray(),
+                currentItems.ToArray(),
+                currentBytes));
+            currentSourcePaths.Clear();
+            currentItems.Clear();
+            currentBytes = 0L;
+        }
+
+        for (int g = 0; g < sourceGroupOrder.Count; g++)
+        {
+            var sourceKey = sourceGroupOrder[g];
+            var groupItems = itemsBySource[sourceKey];
+            var groupBytes = bytesBySource[sourceKey];
+            var hasSourcePath = !string.IsNullOrEmpty(sourceKey);
+
+            var exceedsFileLimit = hasSourcePath && currentSourcePaths.Count >= maxSourceFilesPerBatch;
+            var exceedsByteLimit = currentItems.Count > 0 && currentBytes + groupBytes > maxAssetBytesPerBatch;
+            if (exceedsFileLimit || exceedsByteLimit)
+            {
+                FlushBatch();
+            }
+
+            if (hasSourcePath)
+            {
+                currentSourcePaths.Add(sourceKey);
+            }
+            currentItems.AddRange(groupItems);
+            currentBytes += groupBytes;
+        }
+
+        FlushBatch();
+        return batches;
+    }
+
+    internal void EnsureLazyBatchLoadedForExport(
+        LazyExportSourceBatch batch,
+        System.Threading.CancellationToken cancellationToken = default)
+    {
+        if (!assetsManager.LazyLoading || batch == null || batch.Items.Count == 0)
         {
             return;
         }
 
-        var unloadedItems = items
+        cancellationToken.ThrowIfCancellationRequested();
+
+        for (int i = 0; i < batch.Items.Count; i++)
+        {
+            var handle = batch.Items[i].Handle;
+            if (handle != null && handle.SourceFile?.reader == null)
+            {
+                TryAttachLoadedSourceFile(handle);
+                if (handle.SourceFile?.reader != null)
+                {
+                    UpdateLazyAssetItemHandle(batch.Items[i], handle);
+                }
+            }
+        }
+
+        var unloadedItems = batch.Items
             .Where(x => x.Handle != null && x.Handle.SourceFile?.reader == null)
             .ToList();
 
@@ -408,34 +581,146 @@ public partial class MainWindow
 
         var uniqueSourcePaths = unloadedItems
             .Select(x => ResolveLazyHandleSourcePath(x.Handle!))
-            .Where(path => !string.IsNullOrEmpty(path))
+            .Where(path => !string.IsNullOrEmpty(path) && File.Exists(path))
+            .Select(path => path!)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        if (uniqueSourcePaths.Count > 0)
+        if (uniqueSourcePaths.Count == 0)
         {
-            global::Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusStripUpdate($"Loading {uniqueSourcePaths.Count} source file(s) for export..."));
-            foreach (var path in uniqueSourcePaths)
-            {
-                try
-                {
-                    assetsManager.LoadFilesForPreview(path);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to load source file {path} for export: {ex.Message}");
-                }
-            }
+            return;
+        }
 
-            foreach (var item in unloadedItems)
+        for (int i = 0; i < uniqueSourcePaths.Count; i++)
+        {
+            RemovePendingFileFromProgressiveQueue(uniqueSourcePaths[i]);
+        }
+
+        global::Avalonia.Threading.Dispatcher.UIThread.Post(
+            () => StatusStripUpdate($"Loading {uniqueSourcePaths.Count} source file(s) for export batch..."));
+
+        foreach (var path in uniqueSourcePaths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
             {
-                if (item.Handle != null)
+                assetsManager.LoadFilesForPreview(path);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load source file {path} for export: {ex.Message}");
+            }
+        }
+
+        foreach (var item in unloadedItems)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (item.Handle != null)
+            {
+                TryAttachLoadedSourceFile(item.Handle);
+                if (item.Handle.SourceFile?.reader == null)
                 {
                     assetsManager.WaitForAssetsFileLoaded(item.Handle.SerializedFileName, 5000);
                     TryAttachLoadedSourceFile(item.Handle);
-                    UpdateLazyAssetItemHandle(item, item.Handle);
+                }
+                UpdateLazyAssetItemHandle(item, item.Handle);
+            }
+        }
+    }
+
+    internal void ReleaseLazyExportBatch(
+        LazyExportSourceBatch batch,
+        HashSet<string>? protectedFileNames = null)
+    {
+        if (!assetsManager.LazyLoading || batch == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < batch.Items.Count; i++)
+        {
+            var item = batch.Items[i];
+            item.ClearAsset();
+            var handle = item.Handle;
+            if (handle != null)
+            {
+                lock (handle)
+                {
+                    var obj = handle.RealObject;
+                    handle.RealObject = null;
+                    if (obj != null && handle.SourceFile != null)
+                    {
+                        handle.SourceFile.RemoveObject(obj);
+                    }
                 }
             }
+        }
+
+        var originalKeepCallback = assetsManager.ShouldKeepFileCallback;
+        bool ShouldKeepFile(string fileName)
+        {
+            if (protectedFileNames != null && protectedFileNames.Contains(fileName))
+            {
+                return true;
+            }
+            return originalKeepCallback != null && originalKeepCallback(fileName);
+        }
+
+        List<string> fileNamesToEvict;
+        lock (assetsManager.loadLock)
+        {
+            fileNamesToEvict = assetsManager.assetsFileList
+                .Where(f => !ShouldKeepFile(f.fileName))
+                .Select(f => f.fileName)
+                .ToList();
+        }
+
+        for (int f = 0; f < fileNamesToEvict.Count; f++)
+        {
+            foreach (var handle in assetsManager.ProjectIndex.GetHandlesForFile(fileNamesToEvict[f]))
+            {
+                lock (handle)
+                {
+                    handle.RealObject = null;
+                    if (handle.Tag is AssetItem taggedItem)
+                    {
+                        taggedItem.ClearAsset();
+                        taggedItem.SourceFile = null;
+                    }
+                    else if (handle.Tag is IAssetHandleTag tag)
+                    {
+                        tag.ClearAsset();
+                    }
+                }
+            }
+        }
+
+        try
+        {
+            assetsManager.ShouldKeepFileCallback = ShouldKeepFile;
+            assetsManager.ClearLoadedFilesKeepIndex();
+            assetsManager.LruCache.Clear();
+        }
+        finally
+        {
+            assetsManager.ShouldKeepFileCallback = originalKeepCallback;
+        }
+    }
+
+    private void EnsureLazyAssetsLoadedForExport(List<AssetItem> items)
+    {
+        if (!assetsManager.LazyLoading || items == null || items.Count == 0)
+        {
+            return;
+        }
+
+        var batches = BuildLazyExportBatches(
+            items,
+            maxSourceFilesPerBatch: Math.Max(DefaultLazyExportBatchSourceFileLimit, items.Count),
+            maxAssetBytesPerBatch: long.MaxValue);
+        for (int i = 0; i < batches.Count; i++)
+        {
+            EnsureLazyBatchLoadedForExport(batches[i]);
         }
     }
 }
