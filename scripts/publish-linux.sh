@@ -368,13 +368,23 @@ if [[ -f "$ICON_SRC" ]]; then
     echo "Copied as.png icon to $PUBLISH_DIR"
 fi
 
+LAUNCHER_SCRIPT="$PUBLISH_DIR/launch-assetstudio.sh"
+cat > "$LAUNCHER_SCRIPT" <<'LAUNCHER_EOF'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "${0}")")"
+export LD_LIBRARY_PATH="${HERE}:${HERE}/x64:${HERE}/x64/ffmpeg:${LD_LIBRARY_PATH:-}"
+exec "${HERE}/AssetStudio.Avalonia" "$@"
+LAUNCHER_EOF
+chmod +x "$LAUNCHER_SCRIPT"
+echo "Generated $LAUNCHER_SCRIPT"
+
 DESKTOP_FILE="$PUBLISH_DIR/AssetStudio.desktop"
 cat > "$DESKTOP_FILE" <<DESKTOP_EOF
 [Desktop Entry]
 Type=Application
 Name=AssetStudio
 Comment=Unity asset viewer and extractor
-Exec="$PUBLISH_DIR/AssetStudio.Avalonia" %F
+Exec="$LAUNCHER_SCRIPT" %F
 Icon=$PUBLISH_DIR/as.png
 Terminal=false
 Categories=Development;Utility;
@@ -396,6 +406,7 @@ DESKTOP_DIR="\$HOME/.local/share/applications"
 ICON_DIR="\$HOME/.local/share/icons/hicolor/256x256/apps"
 mkdir -p "\$DESKTOP_DIR" "\$ICON_DIR"
 
+chmod +x "\$SCRIPT_DIR/launch-assetstudio.sh" 2>/dev/null || true
 cp "\$SCRIPT_DIR/as.png" "\$ICON_DIR/assetstudio.png"
 gtk-update-icon-cache -f -t "\$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
@@ -404,7 +415,7 @@ cat > "\$DESKTOP_DIR/assetstudio.desktop" <<EOF
 Type=Application
 Name=AssetStudio
 Comment=Unity asset viewer and extractor
-Exec="\$SCRIPT_DIR/AssetStudio.Avalonia" %F
+Exec="\$SCRIPT_DIR/launch-assetstudio.sh" %F
 Icon=assetstudio
 Terminal=false
 Categories=Development;Utility;
@@ -423,7 +434,7 @@ echo "Generated $INSTALL_SCRIPT"
 
 echo ""
 echo "Done: $PUBLISH_DIR"
-echo "You can run the app with: $PUBLISH_DIR/AssetStudio.Avalonia"
+echo "You can run the app with: $LAUNCHER_SCRIPT"
 echo ""
 echo "To add AssetStudio to your application launcher, run:"
 echo "  bash \"$INSTALL_SCRIPT\""
