@@ -1,60 +1,180 @@
 using AssetStudio;
+using Avalonia.Threading;
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private async void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader, string? dumpStr)
+    private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader)
+    {
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        TextPreviewBox.Text = "Loading MonoBehaviour preview...";
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate($"Loading MonoBehaviour preview: {assetItem.Name}...");
+
+        _ = PreviewMonoBehaviourAsync(assetItem, m_MonoBehaviour, fbxHeader, requestId, previewVersion, token);
+    }
+
+    private async Task PreviewMonoBehaviourAsync(
+        AssetItem assetItem,
+        MonoBehaviour m_MonoBehaviour,
+        string fbxHeader,
+        long requestId,
+        long previewVersion,
+        CancellationToken token)
     {
         try
         {
-            object? obj = m_MonoBehaviour.ToType();
-            if (obj == null)
+            // Fast path: attempt direct ToType() + JSON serialization off the UI thread without wasting a Dump().
+            var directJsonResult = await Task.Run<(bool Succeeded, string? Text)>(() =>
             {
-                var typeTree = await MonoBehaviourToTypeTree(m_MonoBehaviour);
-                if (typeTree != null)
+                token.ThrowIfCancellationRequested();
+                try
                 {
-                    obj = m_MonoBehaviour.ToType(typeTree);
+                    var obj = m_MonoBehaviour.ToType();
+                    if (obj != null)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        var json = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
+                        token.ThrowIfCancellationRequested();
+                        return (true, TruncatePreviewText(fbxHeader + json));
+                    }
                 }
-            }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                    // Fall through to TypeTree / Dump fallback.
+                }
 
-            if (obj != null)
+                return (false, null);
+            }, token);
+
+            if (directJsonResult.Succeeded && directJsonResult.Text != null)
             {
-                var str = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
-                SetTextWithTruncation(TextPreviewBox, fbxHeader + str);
-                TextPreviewBox.IsVisible = true;
-                PreviewLabel.IsVisible = false;
-                StatusStripUpdate("MonoBehaviour preview loaded (JSON format).");
+                ApplyMonoBehaviourPreviewText(requestId, previewVersion, token, directJsonResult.Text, "MonoBehaviour preview loaded (JSON format).");
                 return;
             }
-        }
-        catch
-        {
-            // Fallback
-        }
 
-        if (dumpStr == null)
-        {
-            var typeTree = await MonoBehaviourToTypeTree(m_MonoBehaviour);
-            if (typeTree != null)
+            if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
             {
-                dumpStr = m_MonoBehaviour.Dump(typeTree);
+                return;
             }
-        }
 
-        if (dumpStr != null)
-        {
-            SetTextWithTruncation(TextPreviewBox, fbxHeader + dumpStr);
-            TextPreviewBox.IsVisible = true;
-            PreviewLabel.IsVisible = false;
-            StatusStripUpdate("MonoBehaviour loaded (text dump).");
+            // TypeTree path: assembly folder prompt (if needed) on UI thread, assembly load + ConvertToTypeTree off UI thread.
+            TypeTree? typeTree = null;
+            try
+            {
+                typeTree = await MonoBehaviourToTypeTree(m_MonoBehaviour, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch
+            {
+                typeTree = null;
+            }
+
+            if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+            {
+                return;
+            }
+
+            var resolved = await Task.Run<(string? Text, string Status)>(() =>
+            {
+                token.ThrowIfCancellationRequested();
+
+                if (typeTree != null)
+                {
+                    try
+                    {
+                        var obj = m_MonoBehaviour.ToType(typeTree);
+                        if (obj != null)
+                        {
+                            token.ThrowIfCancellationRequested();
+                            var json = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
+                            token.ThrowIfCancellationRequested();
+                            return (TruncatePreviewText(fbxHeader + json), "MonoBehaviour preview loaded (JSON format).");
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        // Fall through to text dump fallback.
+                    }
+                }
+
+                string? dumpStr = null;
+                try
+                {
+                    dumpStr = m_MonoBehaviour.Dump();
+                    if (dumpStr == null && typeTree != null)
+                    {
+                        dumpStr = m_MonoBehaviour.Dump(typeTree);
+                    }
+                }
+                catch (Exception dumpEx)
+                {
+                    dumpStr = $"Failed to dump MonoBehaviour: {dumpEx.Message}";
+                }
+
+                token.ThrowIfCancellationRequested();
+                return dumpStr != null
+                    ? (TruncatePreviewText(fbxHeader + dumpStr), "MonoBehaviour loaded (text dump).")
+                    : (null, "MonoBehaviour loaded (no dump/types available).");
+            }, token);
+
+            ApplyMonoBehaviourPreviewText(requestId, previewVersion, token, resolved.Text, resolved.Status);
         }
-        else
+        catch (OperationCanceledException)
         {
-            StatusStripUpdate("MonoBehaviour loaded (no dump/types available).");
+        }
+        catch (Exception ex)
+        {
+            logger.Log(LoggerEvent.Error, $"MonoBehaviour preview failed for {assetItem.Name}: {ex}");
+            var errorText = TruncatePreviewText($"Failed to preview MonoBehaviour {assetItem.Name}:{Environment.NewLine}{ex.Message}");
+            ApplyMonoBehaviourPreviewText(requestId, previewVersion, token, errorText, $"MonoBehaviour preview error: {ex.Message}");
         }
     }
 
+    private void ApplyMonoBehaviourPreviewText(
+        long requestId,
+        long previewVersion,
+        CancellationToken token,
+        string? truncatedText,
+        string statusMessage)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+            {
+                return;
+            }
+
+            if (truncatedText != null)
+            {
+                TextPreviewBox.Text = truncatedText;
+                TextPreviewBox.IsVisible = true;
+                PreviewLabel.IsVisible = false;
+            }
+            else
+            {
+                TextPreviewBox.Text = string.Empty;
+                TextPreviewBox.IsVisible = false;
+                PreviewLabel.IsVisible = displayInfo.IsChecked == true;
+            }
+
+            StatusStripUpdate(statusMessage);
+        });
+    }
 }

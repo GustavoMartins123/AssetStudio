@@ -15,6 +15,7 @@ public partial class MainWindow
     private string? _currentTempVideoPath;
     private string? _currentTempVideoAssetId;
     private CancellationTokenSource? _videoPreviewLoadCts;
+    private long _videoSessionCounter;
     private bool _isUpdatingVideoProgress = false;
     private bool _isVideoDragging = false;
     private long _videoLengthMs = 0;
@@ -39,6 +40,43 @@ public partial class MainWindow
     {
         var source = asset.assetsFile?.fullName ?? asset.assetsFile?.fileName ?? string.Empty;
         return string.Concat(source, "\u001f", asset.m_PathID.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    private static void DeleteTempVideoFileBackground(string? filePath)
+    {
+        if (string.IsNullOrEmpty(filePath))
+        {
+            return;
+        }
+
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                try
+                {
+                    if (!File.Exists(filePath))
+                    {
+                        return;
+                    }
+
+                    File.Delete(filePath);
+                    return;
+                }
+                catch (IOException)
+                {
+                    Thread.Sleep(50);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    Thread.Sleep(50);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+        });
     }
 
     private void SetInitialVideoAudioLabel(VideoClip videoClip)
@@ -80,23 +118,17 @@ public partial class MainWindow
         try
         {
             _ffmpegVideoTimer?.Stop();
-            FfmpegVideoPlayer.Stop();
+            FfmpegVideoPlayer?.Stop();
         }
         catch {}
 
         SetVideoStoppedUi();
     }
 
-    private async Task VideoStopAsync()
+    private Task VideoStopAsync()
     {
-        try
-        {
-            _ffmpegVideoTimer?.Stop();
-            await Task.Run(() => FfmpegVideoPlayer.Stop());
-        }
-        catch {}
-
-        SetVideoStoppedUi();
+        VideoStop();
+        return Task.CompletedTask;
     }
 
     private void CancelVideoPreviewLoad()
@@ -111,85 +143,69 @@ public partial class MainWindow
     private void VideoReset()
     {
         CancelVideoPreviewLoad();
+        Interlocked.Increment(ref _videoSessionCounter);
+
         try
         {
             _ffmpegVideoTimer?.Stop();
-            FfmpegVideoPlayer.Stop();
         }
         catch {}
 
-        if (!string.IsNullOrEmpty(_currentTempVideoPath) && File.Exists(_currentTempVideoPath))
+        var pathToDelete = _currentTempVideoPath;
+        _currentTempVideoPath = null;
+        _currentTempVideoAssetId = null;
+        SetVideoStoppedUi();
+
+        // Detach/stop player non-blockingly (VideoPlayerControl.Stop dispatches stop to ThreadPool)
+        // and delete the temp video file asynchronously in background so switching assets never stutters.
+        var player = FfmpegVideoPlayer;
+        if (player != null)
         {
             try
             {
-                File.Delete(_currentTempVideoPath);
+                player.Stop();
             }
             catch {}
-            _currentTempVideoPath = null;
         }
 
-        _currentTempVideoAssetId = null;
-        SetVideoStoppedUi();
+        DeleteTempVideoFileBackground(pathToDelete);
     }
 
-    private async Task VideoResetAsync()
+    private Task VideoResetAsync()
     {
-        CancelVideoPreviewLoad();
-        try
-        {
-            _ffmpegVideoTimer?.Stop();
-            await Task.Run(() => FfmpegVideoPlayer.Stop());
-        }
-        catch {}
-
-        if (!string.IsNullOrEmpty(_currentTempVideoPath))
-        {
-            var pathToDelete = _currentTempVideoPath;
-            _currentTempVideoPath = null;
-            await Task.Run(() =>
-            {
-                try
-                {
-                    if (File.Exists(pathToDelete))
-                    {
-                        File.Delete(pathToDelete);
-                    }
-                }
-                catch {}
-            });
-        }
-
-        _currentTempVideoAssetId = null;
-        SetVideoStoppedUi();
+        VideoReset();
+        return Task.CompletedTask;
     }
 
     private void SetVideoStoppedUi()
     {
-        VideoStatusLabel.Text = "Stopped";
-        VideoPlayButton.Content = "Play";
-        VideoProgressBar.Value = 0;
-        VideoTimerLabel.Text = "0:00.0 / 0:00.0";
+        if (VideoStatusLabel != null) VideoStatusLabel.Text = "Stopped";
+        if (VideoPlayButton != null) VideoPlayButton.Content = "Play";
+        if (VideoProgressBar != null) VideoProgressBar.Value = 0;
+        if (VideoTimerLabel != null) VideoTimerLabel.Text = "0:00.0 / 0:00.0";
     }
 
-    private async void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
+    private void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
     {
         var videoAssetId = GetPreviewAssetId(m_VideoClip);
         if (_currentTempVideoAssetId == videoAssetId)
         {
-            await VideoStopAsync();
+            VideoStop();
+            Interlocked.Increment(ref _videoSessionCounter);
         }
         else
         {
-            await VideoResetAsync();
+            VideoReset();
         }
 
+        var sessionId = Volatile.Read(ref _videoSessionCounter);
         currentPreviewVideoClip = m_VideoClip;
 
         VideoTitleLabel.Text = m_VideoClip.m_Name;
         VideoStatusLabel.Text = "Ready";
         VideoResolutionLabel.Text = $"Resolution: {m_VideoClip.m_Width}x{m_VideoClip.m_Height} (Proxy: {m_VideoClip.m_ProxyWidth}x{m_VideoClip.m_ProxyHeight})";
         VideoFrameRateLabel.Text = $"Frame Rate: {m_VideoClip.m_FrameRate:F2} FPS | Frames: {m_VideoClip.m_FrameCount}";
-        
+
         var ext = SanitizeExtension(Path.GetExtension(m_VideoClip.m_OriginalPath), ".mp4");
         VideoFormatLabel.Text = $"Format: {ext.ToUpperInvariant().TrimStart('.')}";
 
@@ -203,7 +219,7 @@ public partial class MainWindow
 
         VideoClipPanel.IsVisible = true;
         PreviewLabel.IsVisible = false;
-        StartVideoThumbnailPreview(m_VideoClip);
+        StartVideoThumbnailPreview(m_VideoClip, sessionId);
         StatusStripUpdate($"Loaded video clip: {m_VideoClip.m_Name}");
     }
 
@@ -213,27 +229,83 @@ public partial class MainWindow
         {
             StatusStripUpdate($"VideoPlayer references VideoClip: {m_VideoClip.m_Name}");
             PreviewVideoClip(assetItem, m_VideoClip);
+            var sessionId = Volatile.Read(ref _videoSessionCounter);
             string vpName = m_VideoPlayer.m_GameObject.TryGet(out var go) ? go.m_Name : "VideoPlayer";
             VideoTitleLabel.Text = $"{vpName} (VideoPlayer)";
-            
-            var sb = new StringBuilder();
-            sb.AppendLine(m_VideoPlayer.Dump());
-            sb.AppendLine("Ready. Press Play to load embedded native preview.");
-            VideoInfoLabel.Text = sb.ToString();
-        }
-        else if (m_VideoPlayer.m_Source == 1 && !string.IsNullOrEmpty(m_VideoPlayer.m_Url))
-        {
-            StatusStripUpdate($"VideoPlayer references URL: {m_VideoPlayer.m_Url}");
-            SetTextWithTruncation(TextPreviewBox, m_VideoPlayer.Dump());
-            TextPreviewBox.IsVisible = true;
-            PreviewLabel.IsVisible = false;
+
+            var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    token.ThrowIfCancellationRequested();
+                    var sb = new StringBuilder();
+                    sb.AppendLine(m_VideoPlayer.Dump());
+                    sb.AppendLine("Ready. Press Play to load embedded native preview.");
+                    var infoText = sb.ToString();
+
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (IsPreviewRequestCurrent(requestId, previewVersion, token)
+                            && sessionId == Volatile.Read(ref _videoSessionCounter))
+                        {
+                            VideoInfoLabel.Text = infoText;
+                        }
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch
+                {
+                }
+            }, token);
         }
         else
         {
-            StatusStripUpdate("VideoPlayer has no loaded VideoClip or URL.");
-            SetTextWithTruncation(TextPreviewBox, m_VideoPlayer.Dump());
+            var statusMessage = m_VideoPlayer.m_Source == 1 && !string.IsNullOrEmpty(m_VideoPlayer.m_Url)
+                ? $"VideoPlayer references URL: {m_VideoPlayer.m_Url}"
+                : "VideoPlayer has no loaded VideoClip or URL.";
+            StatusStripUpdate(statusMessage);
+
+            var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+            TextPreviewBox.Text = "Loading VideoPlayer preview...";
             TextPreviewBox.IsVisible = true;
             PreviewLabel.IsVisible = false;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    token.ThrowIfCancellationRequested();
+                    var truncated = TruncatePreviewText(m_VideoPlayer.Dump());
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (IsPreviewRequestCurrent(requestId, previewVersion, token))
+                        {
+                            TextPreviewBox.Text = truncated;
+                            TextPreviewBox.IsVisible = true;
+                            PreviewLabel.IsVisible = false;
+                        }
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    var errText = TruncatePreviewText($"Failed to dump VideoPlayer:{Environment.NewLine}{ex.Message}");
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (IsPreviewRequestCurrent(requestId, previewVersion, token))
+                        {
+                            TextPreviewBox.Text = errText;
+                            TextPreviewBox.IsVisible = true;
+                            PreviewLabel.IsVisible = false;
+                        }
+                    });
+                }
+            }, token);
         }
     }
 
@@ -241,6 +313,8 @@ public partial class MainWindow
     {
         var videoClip = currentPreviewVideoClip;
         if (videoClip == null) return;
+
+        var sessionId = Volatile.Read(ref _videoSessionCounter);
 
         try
         {
@@ -261,17 +335,23 @@ public partial class MainWindow
 
                 if (!hasLoadedFile)
                 {
-                    if (!await EnsureVideoPreviewFileAsync(videoClip))
+                    if (!await EnsureVideoPreviewFileAsync(videoClip, sessionId))
                     {
                         return;
                     }
 
-                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                        || sessionId != Volatile.Read(ref _videoSessionCounter))
                     {
                         return;
                     }
 
-                    var path = _currentTempVideoPath!;
+                    var path = _currentTempVideoPath;
+                    if (string.IsNullOrEmpty(path))
+                    {
+                        return;
+                    }
+
                     bool opened = await Task.Run(() =>
                     {
                         try
@@ -285,7 +365,8 @@ public partial class MainWindow
                         }
                     });
 
-                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                        || sessionId != Volatile.Read(ref _videoSessionCounter))
                     {
                         return;
                     }
@@ -317,7 +398,7 @@ public partial class MainWindow
         }
     }
 
-    private async Task<bool> EnsureVideoPreviewFileAsync(VideoClip videoClip)
+    private async Task<bool> EnsureVideoPreviewFileAsync(VideoClip videoClip, long sessionId)
     {
         var assetId = GetPreviewAssetId(videoClip);
         if (_currentTempVideoAssetId == assetId
@@ -332,6 +413,7 @@ public partial class MainWindow
         _videoPreviewLoadCts = loadCts;
         var token = loadCts.Token;
 
+        string? createdTempPath = null;
         try
         {
             VideoStatusLabel.Text = "Loading";
@@ -341,10 +423,13 @@ public partial class MainWindow
             StatusStripUpdate($"Preparing video preview: {videoClip.m_Name}");
 
             var tempPath = await Task.Run(() => PrepareVideoPreviewFile(videoClip, token), token);
+            createdTempPath = tempPath;
             token.ThrowIfCancellationRequested();
 
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                || sessionId != Volatile.Read(ref _videoSessionCounter))
             {
+                DeleteTempVideoFileBackground(createdTempPath);
                 return false;
             }
 
@@ -357,8 +442,15 @@ public partial class MainWindow
                 return false;
             }
 
+            var oldPath = _currentTempVideoPath;
             _currentTempVideoPath = tempPath;
             _currentTempVideoAssetId = assetId;
+            createdTempPath = null; // Ownership transferred
+            if (!string.IsNullOrEmpty(oldPath) && !string.Equals(oldPath, tempPath, StringComparison.OrdinalIgnoreCase))
+            {
+                DeleteTempVideoFileBackground(oldPath);
+            }
+
             _videoLengthMs = 0;
             VideoInfoLabel.Text = "Embedded FFmpeg preview loaded.";
             StatusStripUpdate($"Loaded video clip with FFmpeg backend: {videoClip.m_Name}");
@@ -366,13 +458,19 @@ public partial class MainWindow
         }
         catch (OperationCanceledException)
         {
+            DeleteTempVideoFileBackground(createdTempPath);
             return false;
         }
         catch (Exception ex)
         {
-            VideoInfoLabel.Text = $"Failed to prepare preview: {ex.Message}";
-            VideoStatusLabel.Text = "Error";
-            StatusStripUpdate($"Failed to prepare video preview: {ex.Message}");
+            DeleteTempVideoFileBackground(createdTempPath);
+            if (ReferenceEquals(currentPreviewVideoClip, videoClip)
+                && sessionId == Volatile.Read(ref _videoSessionCounter))
+            {
+                VideoInfoLabel.Text = $"Failed to prepare preview: {ex.Message}";
+                VideoStatusLabel.Text = "Error";
+                StatusStripUpdate($"Failed to prepare video preview: {ex.Message}");
+            }
             return false;
         }
         finally
@@ -382,7 +480,8 @@ public partial class MainWindow
                 _videoPreviewLoadCts = null;
             }
             loadCts.Dispose();
-            if (ReferenceEquals(currentPreviewVideoClip, videoClip))
+            if (ReferenceEquals(currentPreviewVideoClip, videoClip)
+                && sessionId == Volatile.Read(ref _videoSessionCounter))
             {
                 VideoPlayButton.IsEnabled = true;
                 VideoStopButton.IsEnabled = true;
@@ -412,7 +511,7 @@ public partial class MainWindow
         Directory.CreateDirectory(tempDir);
 
         token.ThrowIfCancellationRequested();
-        var tempPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}{ext}");
+        var tempPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}_{Guid.NewGuid():N}{ext}");
         try
         {
             videoClip.m_VideoData.WriteData(tempPath);
@@ -423,26 +522,33 @@ public partial class MainWindow
             throw;
         }
 
-        token.ThrowIfCancellationRequested();
+        if (token.IsCancellationRequested)
+        {
+            TryDeletePartialExport(tempPath);
+            token.ThrowIfCancellationRequested();
+        }
+
         return File.Exists(tempPath) && new FileInfo(tempPath).Length > 0 ? tempPath : null;
     }
 
-    private async void StartVideoThumbnailPreview(VideoClip videoClip)
+    private async void StartVideoThumbnailPreview(VideoClip videoClip, long sessionId)
     {
         try
         {
             await Task.Delay(120);
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                || sessionId != Volatile.Read(ref _videoSessionCounter))
             {
                 return;
             }
 
-            if (!await EnsureVideoPreviewFileAsync(videoClip))
+            if (!await EnsureVideoPreviewFileAsync(videoClip, sessionId))
             {
                 return;
             }
 
             if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                || sessionId != Volatile.Read(ref _videoSessionCounter)
                 || string.IsNullOrEmpty(_currentTempVideoPath)
                 || !File.Exists(_currentTempVideoPath))
             {
@@ -463,7 +569,8 @@ public partial class MainWindow
                 }
             });
 
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip))
+            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
+                || sessionId != Volatile.Read(ref _videoSessionCounter))
             {
                 return;
             }
@@ -484,7 +591,8 @@ public partial class MainWindow
         }
         catch (Exception ex)
         {
-            if (ReferenceEquals(currentPreviewVideoClip, videoClip))
+            if (ReferenceEquals(currentPreviewVideoClip, videoClip)
+                && sessionId == Volatile.Read(ref _videoSessionCounter))
             {
                 VideoStatusLabel.Text = "Error";
                 VideoInfoLabel.Text = $"Failed to load thumbnail: {ex.Message}";
@@ -539,26 +647,46 @@ public partial class MainWindow
 
     private void FfmpegVideoPlayer_MediaEnded(object? sender, EventArgs e)
     {
-        global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        global::Avalonia.Threading.Dispatcher.UIThread.Post(async () =>
         {
             try
             {
                 _ffmpegVideoTimer?.Stop();
 
+                var loopPath = _currentTempVideoPath;
+                var sessionId = Volatile.Read(ref _videoSessionCounter);
                 if (VideoLoopButton.IsChecked == true
-                    && !string.IsNullOrEmpty(_currentTempVideoPath)
-                    && File.Exists(_currentTempVideoPath))
+                    && !string.IsNullOrEmpty(loopPath)
+                    && File.Exists(loopPath))
                 {
-                    FfmpegVideoPlayer.Open(_currentTempVideoPath);
-                    FfmpegVideoPlayer.Volume = _targetVolume;
-                    FfmpegVideoPlayer.Play();
-                    _ffmpegVideoTimer?.Start();
-                    VideoStatusLabel.Text = "Playing";
-                    VideoPlayButton.Content = "Pause";
-                    return;
+                    bool reopened = await Task.Run(() =>
+                    {
+                        try
+                        {
+                            FfmpegVideoPlayer.Open(loopPath);
+                            return FfmpegVideoPlayer.HasMediaLoaded;
+                        }
+                        catch
+                        {
+                            return false;
+                        }
+                    });
+
+                    if (reopened && sessionId == Volatile.Read(ref _videoSessionCounter))
+                    {
+                        FfmpegVideoPlayer.Volume = _targetVolume;
+                        FfmpegVideoPlayer.Play();
+                        _ffmpegVideoTimer?.Start();
+                        VideoStatusLabel.Text = "Playing";
+                        VideoPlayButton.Content = "Pause";
+                        return;
+                    }
                 }
 
-                SetVideoStoppedUi();
+                if (sessionId == Volatile.Read(ref _videoSessionCounter))
+                {
+                    SetVideoStoppedUi();
+                }
             }
             catch
             {

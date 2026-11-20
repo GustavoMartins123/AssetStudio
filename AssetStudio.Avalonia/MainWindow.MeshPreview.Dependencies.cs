@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
@@ -105,24 +106,26 @@ public partial class MainWindow
         }
     }
 
-    private void EnsureSpritePreviewDependenciesLoaded(Sprite sprite)
+    private void EnsureSpritePreviewDependenciesLoaded(Sprite sprite, CancellationToken cancellationToken = default)
     {
         if (!assetsManager.LazyLoading || sprite.assetsFile == null)
         {
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
-        EnsureIndexedExternalSourcesLoaded(sprite.assetsFile);
-        MaterializeReferenceObjects(sprite.assetsFile, SpritePreviewReferenceTypes);
+        EnsureIndexedExternalSourcesLoaded(sprite.assetsFile, cancellationToken);
+        MaterializeReferenceObjects(sprite.assetsFile, SpritePreviewReferenceTypes, diagnostics: null, cancellationToken);
 
         var filesSnapshot = GetLoadedFilesSnapshot();
         foreach (var file in filesSnapshot)
         {
-            MaterializeReferenceObjects(file, SpritePreviewReferenceTypes);
+            cancellationToken.ThrowIfCancellationRequested();
+            MaterializeReferenceObjects(file, SpritePreviewReferenceTypes, diagnostics: null, cancellationToken);
         }
 
-        PrepareLoadedSpriteAtlasReferencesForPreview(filesSnapshot);
+        PrepareLoadedSpriteAtlasReferencesForPreview(filesSnapshot, cancellationToken);
     }
 
     private void EnsureAnimationClip2DPreviewDependenciesLoaded(AnimationClip clip)
@@ -145,7 +148,7 @@ public partial class MainWindow
         PrepareLoadedSpriteAtlasReferencesForPreview(filesSnapshot);
     }
 
-    private void EnsureIndexedExternalSourcesLoaded(SerializedFile sourceFile)
+    private void EnsureIndexedExternalSourcesLoaded(SerializedFile sourceFile, CancellationToken cancellationToken = default)
     {
         if (sourceFile == null)
         {
@@ -159,6 +162,7 @@ public partial class MainWindow
 
         while (pending.Count > 0)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var currentFile = pending.Dequeue();
             if (currentFile == null || !processedFiles.Add(GetSerializedFileDependencyKey(currentFile)))
             {
@@ -172,6 +176,7 @@ public partial class MainWindow
 
             foreach (var external in currentFile.m_Externals)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (external == null || (string.IsNullOrWhiteSpace(external.fileName) && string.IsNullOrWhiteSpace(external.pathName)))
                 {
                     continue;
@@ -320,7 +325,7 @@ public partial class MainWindow
         return file.fileName ?? string.Empty;
     }
 
-    private static void PrepareLoadedSpriteAtlasReferencesForPreview(List<SerializedFile> filesSnapshot)
+    private static void PrepareLoadedSpriteAtlasReferencesForPreview(List<SerializedFile> filesSnapshot, CancellationToken cancellationToken = default)
     {
         if (filesSnapshot.Count == 0)
         {
@@ -331,6 +336,7 @@ public partial class MainWindow
         var atlases = new List<SpriteAtlas>();
         foreach (var file in filesSnapshot)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             AssetStudio.Object[] objects;
             lock (file)
             {
@@ -444,8 +450,10 @@ public partial class MainWindow
     private void MaterializeReferenceObjects(
         SerializedFile sourceFile,
         HashSet<ClassIDType> referenceTypes,
-        LazyConnectionBuildDiagnostics? diagnostics = null)
+        LazyConnectionBuildDiagnostics? diagnostics = null,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var handles = assetsManager.ProjectIndex
             .GetHandlesForFile(sourceFile.fileName)
             .Where(handle => referenceTypes.Contains(handle.Type)
@@ -457,6 +465,7 @@ public partial class MainWindow
         diagnostics?.RecordMaterializationCandidateCount(handles.Count);
         foreach (var handle in handles)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (handle.SourceFile?.reader == null)
             {
                 handle.SourceFile = sourceFile;

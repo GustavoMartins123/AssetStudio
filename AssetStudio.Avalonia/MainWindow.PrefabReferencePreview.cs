@@ -1,17 +1,18 @@
 using AssetStudio;
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Collections.Specialized;
 using System.Text;
+using System.Threading;
 using Object = AssetStudio.Object;
 
 namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private Object? ResolvePPtr(object? pptrObj, SerializedFile file)
+    private static Object? ResolvePPtr(object? pptrObj, SerializedFile file)
     {
-        if (pptrObj is System.Collections.Specialized.OrderedDictionary dict)
+        if (pptrObj is OrderedDictionary dict)
         {
             if (dict.Contains("m_FileID") && dict.Contains("m_PathID"))
             {
@@ -35,10 +36,12 @@ public partial class MainWindow
         return null;
     }
 
-    private void FindAllPPtrs(object? obj, List<System.Collections.Specialized.OrderedDictionary> pptrs)
+    private static void FindAllPPtrs(object? obj, List<OrderedDictionary> pptrs, CancellationToken cancellationToken)
     {
         if (obj == null) return;
-        if (obj is System.Collections.Specialized.OrderedDictionary dict)
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (obj is OrderedDictionary dict)
         {
             if (dict.Contains("m_FileID") && dict.Contains("m_PathID"))
             {
@@ -48,54 +51,140 @@ public partial class MainWindow
             {
                 foreach (System.Collections.DictionaryEntry entry in dict)
                 {
-                    FindAllPPtrs(entry.Value, pptrs);
+                    FindAllPPtrs(entry.Value, pptrs, cancellationToken);
                 }
             }
         }
-        else if (obj is System.Collections.IEnumerable list && !(obj is string))
+        else if (obj is System.Collections.IEnumerable list && obj is not string)
         {
             foreach (var item in list)
             {
-                FindAllPPtrs(item, pptrs);
+                FindAllPPtrs(item, pptrs, cancellationToken);
             }
         }
     }
 
-    private void TraverseGameObject(GameObject go, List<GameObject> gameObjects, List<Component> components)
+    internal static void TraverseGameObjectHierarchy(
+        GameObject? root,
+        List<GameObject> gameObjects,
+        HashSet<GameObject> visitedGameObjects,
+        List<Component> components,
+        HashSet<Object> hierarchyObjects,
+        CancellationToken cancellationToken = default)
     {
-        if (go == null || gameObjects.Contains(go)) return;
-        gameObjects.Add(go);
-
-        if (go.m_Components != null)
+        if (root == null)
         {
+            return;
+        }
+
+        var stack = new Stack<GameObject>();
+        stack.Push(root);
+
+        while (stack.Count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var go = stack.Pop();
+            if (go == null || !visitedGameObjects.Add(go))
+            {
+                continue;
+            }
+
+            gameObjects.Add(go);
+            hierarchyObjects.Add(go);
+
+            if (go.m_Components == null)
+            {
+                continue;
+            }
+
+            var childGameObjects = new List<GameObject>();
             foreach (var pptrComp in go.m_Components)
             {
-                if (pptrComp.TryGet(out var comp))
+                if (pptrComp.TryGet(out var comp) && comp != null)
                 {
                     components.Add(comp);
-                    if (comp is Transform t)
+                    hierarchyObjects.Add(comp);
+
+                    if (comp is Transform t && t.m_Children != null)
                     {
-                        if (t.m_Children != null)
+                        foreach (var childPtr in t.m_Children)
                         {
-                            foreach (var childPtr in t.m_Children)
+                            if (childPtr.TryGet(out var childTransform)
+                                && childTransform.m_GameObject.TryGet(out var childGo)
+                                && childGo != null)
                             {
-                                if (childPtr.TryGet(out var childTransform))
-                                {
-                                    if (childTransform.m_GameObject.TryGet(out var childGo))
-                                    {
-                                        TraverseGameObject(childGo, gameObjects, components);
-                                    }
-                                }
+                                childGameObjects.Add(childGo);
                             }
                         }
                     }
                 }
             }
+
+            // Push children in reverse so iterative traversal visits in the exact same preorder as recursion.
+            for (int i = childGameObjects.Count - 1; i >= 0; i--)
+            {
+                stack.Push(childGameObjects[i]);
+            }
         }
+    }
+
+    internal static (List<Object> UniqueResolvedObjects, int TotalResolvedCount, List<string> UniqueUnresolvedPPtrs, int TotalUnresolvedCount)
+        DeduplicatePrefabReferences(
+            IEnumerable<Object?> resolvedCandidates,
+            IEnumerable<string> unresolvedCandidates,
+            IReadOnlySet<Object> excludedObjects,
+            CancellationToken cancellationToken = default)
+    {
+        var uniqueResolved = new List<Object>();
+        var seenResolved = new HashSet<Object>();
+        int totalResolved = 0;
+
+        foreach (var resolved in resolvedCandidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (resolved == null || excludedObjects.Contains(resolved))
+            {
+                continue;
+            }
+
+            totalResolved++;
+            if (seenResolved.Add(resolved))
+            {
+                uniqueResolved.Add(resolved);
+            }
+        }
+
+        var uniqueUnresolved = new List<string>();
+        var seenUnresolved = new HashSet<string>(StringComparer.Ordinal);
+        int totalUnresolved = 0;
+
+        foreach (var unresolved in unresolvedCandidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrEmpty(unresolved))
+            {
+                continue;
+            }
+
+            totalUnresolved++;
+            if (seenUnresolved.Add(unresolved))
+            {
+                uniqueUnresolved.Add(unresolved);
+            }
+        }
+
+        return (uniqueResolved, totalResolved, uniqueUnresolved, totalUnresolved);
     }
 
     private string FormatPrefab(Object prefab)
     {
+        return FormatPrefabCore(prefab, CancellationToken.None);
+    }
+
+    internal static string FormatPrefabCore(Object prefab, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
         var sb = new StringBuilder();
         sb.AppendLine($"Prefab Instance Asset: {prefab.assetsFile.fileName} (PathID: {prefab.m_PathID})");
         sb.AppendLine("NOTE: This is a Composite/Referential Asset (Prefab).");
@@ -119,9 +208,13 @@ public partial class MainWindow
             }
         }
 
-        if (rootGameObject != null)
+        if (rootGameObject is GameObject rootGoHeader)
         {
-            sb.AppendLine($"Root GameObject: {((GameObject)rootGameObject).m_Name} (PathID: {rootGameObject.m_PathID})");
+            sb.AppendLine($"Root GameObject: {rootGoHeader.m_Name} (PathID: {rootGameObject.m_PathID})");
+        }
+        else if (rootGameObject != null)
+        {
+            sb.AppendLine($"Root GameObject: {rootGameObject.type} (PathID: {rootGameObject.m_PathID})");
         }
         else
         {
@@ -136,11 +229,13 @@ public partial class MainWindow
         sb.AppendLine();
 
         var gameObjects = new List<GameObject>();
+        var visitedGameObjects = new HashSet<GameObject>();
         var components = new List<Component>();
+        var hierarchyObjects = new HashSet<Object> { prefab };
 
         if (rootGameObject is GameObject rootGo)
         {
-            TraverseGameObject(rootGo, gameObjects, components);
+            TraverseGameObjectHierarchy(rootGo, gameObjects, visitedGameObjects, components, hierarchyObjects, cancellationToken);
         }
 
         sb.AppendLine($"GameObjects in Hierarchy ({gameObjects.Count}):");
@@ -162,46 +257,62 @@ public partial class MainWindow
         }
         sb.AppendLine();
 
-        var allPPtrDicts = new List<System.Collections.Specialized.OrderedDictionary>();
-        FindAllPPtrs(dict, allPPtrDicts);
+        var allPPtrDicts = new List<OrderedDictionary>();
+        FindAllPPtrs(dict, allPPtrDicts, cancellationToken);
 
-        var resolvedObjects = new List<Object>();
-        var unresolvedPPtrs = new List<string>();
+        var uniqueResolvedObjects = new List<Object>();
+        var seenResolvedObjects = new HashSet<Object>();
+        int totalResolvedCount = 0;
+
+        var uniqueUnresolvedPPtrs = new List<string>();
+        var seenUnresolvedPPtrs = new HashSet<string>(StringComparer.Ordinal);
+        int totalUnresolvedCount = 0;
+
         foreach (var pptrDict in allPPtrDicts)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var resolved = ResolvePPtr(pptrDict, prefab.assetsFile);
             if (resolved != null)
             {
-                if (!gameObjects.Contains(resolved) && !components.Contains(resolved) && resolved != prefab)
+                if (!hierarchyObjects.Contains(resolved))
                 {
-                    resolvedObjects.Add(resolved);
+                    totalResolvedCount++;
+                    if (seenResolvedObjects.Add(resolved))
+                    {
+                        uniqueResolvedObjects.Add(resolved);
+                    }
                 }
             }
             else
             {
                 var fileID = pptrDict["m_FileID"];
                 var pathID = pptrDict["m_PathID"];
-                if (Convert.ToInt64(pathID) != 0)
+                if (pathID != null && Convert.ToInt64(pathID) != 0)
                 {
-                    unresolvedPPtrs.Add($"FileID: {fileID}, PathID: {pathID}");
+                    var key = $"FileID: {fileID}, PathID: {pathID}";
+                    totalUnresolvedCount++;
+                    if (seenUnresolvedPPtrs.Add(key))
+                    {
+                        uniqueUnresolvedPPtrs.Add(key);
+                    }
                 }
             }
         }
 
-        if (resolvedObjects.Count > 0)
+        if (totalResolvedCount > 0)
         {
-            sb.AppendLine($"Other Resolved Referenced Assets ({resolvedObjects.Count}):");
-            foreach (var resObj in resolvedObjects.Distinct())
+            sb.AppendLine($"Other Resolved Referenced Assets ({totalResolvedCount}):");
+            foreach (var resObj in uniqueResolvedObjects)
             {
                 sb.AppendLine($"  - Type: {resObj.type} (PathID: {resObj.m_PathID})");
             }
             sb.AppendLine();
         }
 
-        if (unresolvedPPtrs.Count > 0)
+        if (totalUnresolvedCount > 0)
         {
-            sb.AppendLine($"Unresolved PPtr References ({unresolvedPPtrs.Count}):");
-            foreach (var unres in unresolvedPPtrs.Distinct())
+            sb.AppendLine($"Unresolved PPtr References ({totalUnresolvedCount}):");
+            foreach (var unres in uniqueUnresolvedPPtrs)
             {
                 sb.AppendLine($"  - {unres}");
             }
@@ -210,5 +321,4 @@ public partial class MainWindow
 
         return sb.ToString();
     }
-
 }

@@ -22,6 +22,7 @@ public partial class MainWindow
     private string? _currentTempAudioPath;
     private string? _currentTempAudioAssetId;
     private CancellationTokenSource? _audioPreviewLoadCts;
+    private long _audioSessionCounter;
     private bool _usingPcmWavePreview;
     private long _audioLengthMs;
     private DispatcherTimer? _audioTimer;
@@ -263,8 +264,46 @@ public partial class MainWindow
         }
     }
 
+    private static void DeleteTempAudioFileBackground(string? filePath)
+    {
+        if (string.IsNullOrEmpty(filePath))
+        {
+            return;
+        }
+
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                try
+                {
+                    if (!File.Exists(filePath))
+                    {
+                        return;
+                    }
+
+                    File.Delete(filePath);
+                    return;
+                }
+                catch (IOException)
+                {
+                    Thread.Sleep(40);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    Thread.Sleep(40);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+        });
+    }
+
     private void AudioReset(bool recreateAudioPlayer = true)
     {
+        Interlocked.Increment(ref _audioSessionCounter);
         try
         {
             _audioTimer?.Stop();
@@ -294,15 +333,9 @@ public partial class MainWindow
             _audioPreviewLoadCts = null;
         }
 
-        if (!string.IsNullOrEmpty(_currentTempAudioPath) && File.Exists(_currentTempAudioPath))
-        {
-            try
-            {
-                File.Delete(_currentTempAudioPath);
-            }
-            catch {}
-            _currentTempAudioPath = null;
-        }
+        var tempAudioPathToDelete = _currentTempAudioPath;
+        _currentTempAudioPath = null;
+        DeleteTempAudioFileBackground(tempAudioPathToDelete);
 
         _currentTempAudioAssetId = null;
         _usingPcmWavePreview = false;
@@ -358,33 +391,71 @@ public partial class MainWindow
             else if (_audioMediaPlayer != null)
             {
                 var previewPath = _currentTempAudioPath;
+                if (string.IsNullOrEmpty(previewPath))
+                {
+                    AudioStatusLabel.Text = "Unsupported";
+                    StatusStripUpdate("Audio preview could not reopen this AudioClip.");
+                    return;
+                }
+
                 ResetAudioMediaPlayer(recreate: true);
-                if (_audioMediaPlayer == null)
+                var mediaPlayer = _audioMediaPlayer;
+                if (mediaPlayer == null)
                 {
                     AudioStatusLabel.Text = "Unsupported";
                     StatusStripUpdate("Audio preview player is unavailable.");
                     return;
                 }
 
+                var sessionId = Volatile.Read(ref _audioSessionCounter);
+                if (AudioPlayButton != null) AudioPlayButton.IsEnabled = false;
+                if (AudioPauseButton != null) AudioPauseButton.IsEnabled = false;
+                if (AudioStatusLabel != null) AudioStatusLabel.Text = "Loading";
+
+                bool opened;
                 try
                 {
-                    _audioMediaPlayer.Volume = _targetAudioVolume;
+                    opened = await Task.Run(() =>
+                    {
+                        try
+                        {
+                            mediaPlayer.Volume = _targetAudioVolume;
+                        }
+                        catch {}
+
+                        return mediaPlayer.Open(previewPath) && mediaPlayer.AudioPlayer != null;
+                    });
                 }
-                catch {}
-                if (string.IsNullOrEmpty(previewPath)
-                    || !_audioMediaPlayer.Open(previewPath)
-                    || _audioMediaPlayer.AudioPlayer == null)
+                finally
                 {
-                    AudioStatusLabel.Text = "Unsupported";
+                    if (ReferenceEquals(currentPreviewAudioClip, audioClip)
+                        && sessionId == Volatile.Read(ref _audioSessionCounter))
+                    {
+                        if (AudioPlayButton != null) AudioPlayButton.IsEnabled = true;
+                        if (AudioPauseButton != null) AudioPauseButton.IsEnabled = true;
+                    }
+                }
+
+                if (!ReferenceEquals(currentPreviewAudioClip, audioClip)
+                    || sessionId != Volatile.Read(ref _audioSessionCounter)
+                    || !ReferenceEquals(_audioMediaPlayer, mediaPlayer))
+                {
+                    return;
+                }
+
+                if (!opened)
+                {
+                    if (AudioStatusLabel != null) AudioStatusLabel.Text = "Unsupported";
                     StatusStripUpdate("Audio preview could not reopen this AudioClip.");
                     return;
                 }
+
                 StartAudioClock(0);
-                _audioMediaPlayer.Play();
+                mediaPlayer.Play();
             }
 
-            AudioStatusLabel.Text = "Playing";
-            AudioPauseButton.Content = "Pause";
+            if (AudioStatusLabel != null) AudioStatusLabel.Text = "Playing";
+            if (AudioPauseButton != null) AudioPauseButton.Content = "Pause";
             _audioTimer?.Start();
         }
         catch (Exception ex)
@@ -570,151 +641,190 @@ public partial class MainWindow
             return true;
         }
 
+        var preservedInfoText = AudioInfoLabel?.Text ?? string.Empty;
         AudioReset();
         currentPreviewAudioClip = audioClip;
         _currentTempAudioAssetId = assetId;
+        if (AudioInfoLabel != null && !string.IsNullOrEmpty(preservedInfoText))
+        {
+            AudioInfoLabel.Text = preservedInfoText;
+        }
 
         if (AudioPlayButton != null) AudioPlayButton.IsEnabled = false;
         if (AudioPauseButton != null) AudioPauseButton.IsEnabled = false;
         if (AudioStatusLabel != null) AudioStatusLabel.Text = "Loading";
 
-        _audioPreviewLoadCts = new CancellationTokenSource();
-        var token = _audioPreviewLoadCts.Token;
+        var loadCts = new CancellationTokenSource();
+        _audioPreviewLoadCts = loadCts;
+        var token = loadCts.Token;
+        var sessionId = Volatile.Read(ref _audioSessionCounter);
+        var linuxFallback = useLinuxAudioFallback;
+        var preferTranscode = linuxFallback || Environment.GetEnvironmentVariable("ASSETSTUDIO_PREFER_TRANSCODE_PREVIEW") == "1";
 
+        string? createdTempPath = null;
         try
         {
-            var audioData = audioClip.m_AudioData.GetData();
-            if (audioData == null || audioData.Length == 0)
+            var prepared = await Task.Run(() =>
+            {
+                token.ThrowIfCancellationRequested();
+
+                var audioData = audioClip.m_AudioData.GetData();
+                token.ThrowIfCancellationRequested();
+                if (audioData == null || audioData.Length == 0)
+                {
+                    return (HasData: false, TempPath: (string?)null, FormatExtension: ".wav", DurationMs: 0L, SourceDescription: string.Empty);
+                }
+
+                var converter = new AudioClipConverter(audioClip);
+                var extension = NormalizeAudioExtension(converter.GetExtensionName());
+                if (string.IsNullOrEmpty(extension))
+                {
+                    extension = ".wav";
+                }
+
+                var analysis = AnalyzeAudioPreviewData(audioClip, audioData, extension);
+                token.ThrowIfCancellationRequested();
+
+                var sampleData = analysis.RebuiltData ?? audioData;
+                var formatExtension = analysis.RebuiltExtension;
+                var durationMs = analysis.DurationMs > 0
+                    ? analysis.DurationMs
+                    : (long)(audioClip.m_Length * 1000.0);
+                var sourceDescription = formatExtension.ToUpperInvariant().TrimStart('.');
+
+                var shouldTranscode = ShouldTranscodeAudioForPreview(formatExtension, preferTranscode);
+                if (shouldTranscode)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var tempDir = Path.GetTempPath();
+                    var audioInputPath = Path.Combine(tempDir, $"assetstudio_audio_in_{Guid.NewGuid():N}{formatExtension}");
+                    var audioOutputPath = Path.Combine(tempDir, $"assetstudio_audio_out_{Guid.NewGuid():N}.wav");
+                    try
+                    {
+                        File.WriteAllBytes(audioInputPath, sampleData);
+                        var transcodeResult = FFmpegAudioTranscoder.TryTranscodeToPcmWav(audioInputPath, audioOutputPath, token);
+                        token.ThrowIfCancellationRequested();
+                        if (transcodeResult.Success && File.Exists(audioOutputPath))
+                        {
+                            sampleData = File.ReadAllBytes(audioOutputPath);
+                            formatExtension = ".wav";
+                            sourceDescription += " -> WAV (Transcoded)";
+                        }
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(audioInputPath)) File.Delete(audioInputPath); } catch {}
+                        try { if (File.Exists(audioOutputPath)) File.Delete(audioOutputPath); } catch {}
+                    }
+                }
+
+                token.ThrowIfCancellationRequested();
+
+                if (formatExtension.Equals(".wav", StringComparison.OrdinalIgnoreCase) && !linuxFallback)
+                {
+                    var waveDurationMs = TryGetWaveDurationMs(sampleData);
+                    if (waveDurationMs > 0)
+                    {
+                        durationMs = waveDurationMs;
+                    }
+                }
+
+                var finalTempPath = Path.Combine(Path.GetTempPath(), $"assetstudio_audio_{Guid.NewGuid():N}{formatExtension}");
+                try
+                {
+                    File.WriteAllBytes(finalTempPath, sampleData);
+                }
+                catch
+                {
+                    try { if (File.Exists(finalTempPath)) File.Delete(finalTempPath); } catch {}
+                    throw;
+                }
+
+                return (HasData: true, TempPath: (string?)finalTempPath, FormatExtension: formatExtension, DurationMs: durationMs, SourceDescription: sourceDescription);
+            }, token);
+
+            createdTempPath = prepared.TempPath;
+
+            if (token.IsCancellationRequested
+                || sessionId != Volatile.Read(ref _audioSessionCounter)
+                || !ReferenceEquals(currentPreviewAudioClip, audioClip))
+            {
+                DeleteTempAudioFileBackground(createdTempPath);
+                return false;
+            }
+
+            if (!prepared.HasData || string.IsNullOrEmpty(createdTempPath))
             {
                 if (AudioStatusLabel != null) AudioStatusLabel.Text = "Missing";
                 StatusStripUpdate("AudioClip has no binary data.");
                 return false;
             }
 
-            var converter = new AudioClipConverter(audioClip);
-            var extension = NormalizeAudioExtension(converter.GetExtensionName());
-            if (string.IsNullOrEmpty(extension))
-            {
-                extension = ".wav";
-            }
-
-            var analysis = await Task.Run(() => AnalyzeAudioPreviewData(audioClip, audioData, extension), token);
-            if (token.IsCancellationRequested)
-            {
-                return false;
-            }
-
-            var sampleData = analysis.RebuiltData ?? audioData;
-            var formatExtension = analysis.RebuiltExtension;
-
-            _audioLengthMs = analysis.DurationMs > 0
-                ? analysis.DurationMs
-                : (long)(audioClip.m_Length * 1000.0);
-
+            _audioLengthMs = prepared.DurationMs;
             _usingPcmWavePreview = false;
-            _audioPreviewSourceDescription = formatExtension.ToUpperInvariant().TrimStart('.');
+            _audioPreviewSourceDescription = prepared.SourceDescription;
+            _currentTempAudioPath = createdTempPath;
+            createdTempPath = null; // Ownership transferred to _currentTempAudioPath
 
-            var preferTranscode = useLinuxAudioFallback || Environment.GetEnvironmentVariable("ASSETSTUDIO_PREFER_TRANSCODE_PREVIEW") == "1";
-            var shouldTranscode = ShouldTranscodeAudioForPreview(formatExtension, preferTranscode);
-
-            if (shouldTranscode)
+            if (prepared.FormatExtension.Equals(".wav", StringComparison.OrdinalIgnoreCase) && !linuxFallback)
             {
-                if (token.IsCancellationRequested) return false;
+                var pcmPlayer = _pcmWavePreviewPlayer ??= new WinMmAudioPlayer();
+                var wavPath = _currentTempAudioPath;
+                bool loaded = await Task.Run(() => pcmPlayer.Load(wavPath), token);
 
-                var tempInputFile = Path.GetTempFileName();
-                var audioInputPath = Path.ChangeExtension(tempInputFile, formatExtension);
-                if (File.Exists(tempInputFile))
+                if (token.IsCancellationRequested
+                    || sessionId != Volatile.Read(ref _audioSessionCounter)
+                    || !ReferenceEquals(currentPreviewAudioClip, audioClip))
                 {
-                    try { File.Delete(tempInputFile); } catch {}
-                }
-                await File.WriteAllBytesAsync(audioInputPath, sampleData, token);
-
-                var tempOutputFile = Path.GetTempFileName();
-                var audioOutputPath = Path.ChangeExtension(tempOutputFile, ".wav");
-                if (File.Exists(tempOutputFile))
-                {
-                    try { File.Delete(tempOutputFile); } catch {}
+                    return false;
                 }
 
-                try
-                {
-                    var transcodeResult = await Task.Run(() => FFmpegAudioTranscoder.TryTranscodeToPcmWav(audioInputPath, audioOutputPath, token), token);
-                    if (transcodeResult.Success && File.Exists(audioOutputPath))
-                    {
-                        sampleData = await File.ReadAllBytesAsync(audioOutputPath, token);
-                        formatExtension = ".wav";
-                        _audioPreviewSourceDescription += " -> WAV (Transcoded)";
-                    }
-                }
-                finally
-                {
-                    try { File.Delete(audioInputPath); } catch {}
-                    try { File.Delete(audioOutputPath); } catch {}
-                }
-            }
-
-            if (token.IsCancellationRequested) return false;
-
-            if (formatExtension.Equals(".wav", StringComparison.OrdinalIgnoreCase) && !useLinuxAudioFallback)
-            {
-                var waveDurationMs = TryGetWaveDurationMs(sampleData);
-                if (waveDurationMs > 0)
-                {
-                    _audioLengthMs = waveDurationMs;
-                }
-
-                var tempFile = Path.GetTempFileName();
-                var audioTempPath = Path.ChangeExtension(tempFile, ".wav");
-                if (File.Exists(tempFile))
-                {
-                    try { File.Delete(tempFile); } catch {}
-                }
-
-                await File.WriteAllBytesAsync(audioTempPath, sampleData, token);
-                _currentTempAudioPath = audioTempPath;
-
-                _usingPcmWavePreview = true;
-                _pcmWavePreviewPlayer ??= new WinMmAudioPlayer();
-                if (!_pcmWavePreviewPlayer.Load(audioTempPath))
+                if (!loaded)
                 {
                     _usingPcmWavePreview = false;
                     if (AudioStatusLabel != null) AudioStatusLabel.Text = "Unsupported";
                     StatusStripUpdate("Failed to initialize PCM wave audio preview player.");
                     return false;
                 }
-                _pcmWavePreviewPlayer.SetVolume(_targetAudioVolume);
+
+                _usingPcmWavePreview = true;
+                pcmPlayer.SetVolume(_targetAudioVolume);
             }
-            else
+            else if (!linuxFallback)
             {
-                var tempFile = Path.GetTempFileName();
-                var audioTempPath = Path.ChangeExtension(tempFile, formatExtension);
-                if (File.Exists(tempFile))
+                var mediaPlayer = _audioMediaPlayer;
+                if (mediaPlayer == null)
                 {
-                    try { File.Delete(tempFile); } catch {}
+                    if (AudioStatusLabel != null) AudioStatusLabel.Text = "Unsupported";
+                    StatusStripUpdate("FFmpeg audio media player was not initialized.");
+                    return false;
                 }
 
-                await File.WriteAllBytesAsync(audioTempPath, sampleData, token);
-                _currentTempAudioPath = audioTempPath;
+                var mediaPath = _currentTempAudioPath;
+                bool opened = await Task.Run(() => mediaPlayer.Open(mediaPath) && mediaPlayer.AudioPlayer != null, token);
 
-                if (!useLinuxAudioFallback)
+                if (token.IsCancellationRequested
+                    || sessionId != Volatile.Read(ref _audioSessionCounter)
+                    || !ReferenceEquals(currentPreviewAudioClip, audioClip)
+                    || !ReferenceEquals(_audioMediaPlayer, mediaPlayer))
                 {
-                    if (_audioMediaPlayer == null)
-                    {
-                        if (AudioStatusLabel != null) AudioStatusLabel.Text = "Unsupported";
-                        StatusStripUpdate("FFmpeg audio media player was not initialized.");
-                        return false;
-                    }
+                    return false;
+                }
 
-                    if (!_audioMediaPlayer.Open(audioTempPath) || _audioMediaPlayer.AudioPlayer == null)
-                    {
-                        if (AudioStatusLabel != null) AudioStatusLabel.Text = "Unsupported";
-                        StatusStripUpdate("FFmpeg media player could not open the audio format.");
-                        return false;
-                    }
+                if (!opened)
+                {
+                    if (AudioStatusLabel != null) AudioStatusLabel.Text = "Unsupported";
+                    StatusStripUpdate("FFmpeg media player could not open the audio format.");
+                    return false;
                 }
             }
 
-            if (token.IsCancellationRequested) return false;
+            if (token.IsCancellationRequested
+                || sessionId != Volatile.Read(ref _audioSessionCounter)
+                || !ReferenceEquals(currentPreviewAudioClip, audioClip))
+            {
+                return false;
+            }
 
             UpdateAudioInfoText();
 
@@ -728,17 +838,28 @@ public partial class MainWindow
         }
         catch (OperationCanceledException)
         {
+            DeleteTempAudioFileBackground(createdTempPath);
             return false;
         }
         catch (Exception ex)
         {
-            if (AudioStatusLabel != null) AudioStatusLabel.Text = "Error";
-            StatusStripUpdate($"Failed to prepare audio preview: {ex.Message}");
+            DeleteTempAudioFileBackground(createdTempPath);
+            if (sessionId == Volatile.Read(ref _audioSessionCounter) && ReferenceEquals(currentPreviewAudioClip, audioClip))
+            {
+                if (AudioStatusLabel != null) AudioStatusLabel.Text = "Error";
+                StatusStripUpdate($"Failed to prepare audio preview: {ex.Message}");
+            }
             return false;
         }
         finally
         {
-            if (ReferenceEquals(currentPreviewAudioClip, audioClip))
+            if (ReferenceEquals(_audioPreviewLoadCts, loadCts))
+            {
+                _audioPreviewLoadCts = null;
+            }
+            loadCts.Dispose();
+
+            if (sessionId == Volatile.Read(ref _audioSessionCounter) && ReferenceEquals(currentPreviewAudioClip, audioClip))
             {
                 if (AudioPlayButton != null) AudioPlayButton.IsEnabled = true;
                 if (AudioPauseButton != null) AudioPauseButton.IsEnabled = true;
@@ -913,7 +1034,7 @@ public partial class MainWindow
         AudioInfoLabel.Text = $"{baseText} | Preview: {_audioPreviewSourceDescription}";
     }
 
-    private async void AudioPauseButton_Click(object? sender, RoutedEventArgs e)
+    private void AudioPauseButton_Click(object? sender, RoutedEventArgs e)
     {
         var audioClip = currentPreviewAudioClip;
         if (audioClip == null)

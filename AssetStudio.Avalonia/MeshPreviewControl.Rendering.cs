@@ -256,6 +256,7 @@ namespace AssetStudio.Avalonia
                 GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
             }
 
+            EnsureWireframeVAO();
             if (vaoWireframe != 0)
             {
                 GL.UseProgram(pgmGreenID);
@@ -385,6 +386,12 @@ namespace AssetStudio.Avalonia
 
         private void RenderWireframeOverlay(int[] indices)
         {
+            EnsureWireframeVAO();
+            if (vaoWireframe == 0)
+            {
+                return;
+            }
+
             if (!isGles)
             {
                 GL.Enable(EnableCap.PolygonOffsetLine);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -14,6 +15,31 @@ using SkiaSharp;
 
 namespace AssetStudio.Avalonia
 {
+    public enum PreparedGpuTextureUploadKind
+    {
+        Compressed,
+        Rgba32,
+        Bgra32,
+        Rgb24
+    }
+
+    public sealed class PreparedGpuTexturePayload
+    {
+        public required byte[] Data { get; init; }
+        public required int DataLength { get; init; }
+        public required int Width { get; init; }
+        public required int Height { get; init; }
+        public required TextureFormat SourceFormat { get; init; }
+        public required TextureFormat UploadFormat { get; init; }
+        public required PreparedGpuTextureUploadKind UploadKind { get; init; }
+        public required int GlInternalFormat { get; init; }
+        public required bool NeedsYFlip { get; init; }
+        public required bool WasCrunchUnpacked { get; init; }
+        public required bool WasCpuDecoded { get; init; }
+        public required TextureGLPreviewControl.GlCapabilities TargetCapabilities { get; init; }
+        internal Texture2D? SourceTextureForFallback { get; init; }
+    }
+
     public class TextureGLPreviewControl : OpenGlControlBase
     {
         private const string vsSource = @"
@@ -141,8 +167,23 @@ void main()
             }
         }
 
+        // Conservative capability set used only before OnOpenGlInit has queried the real GPU context.
+        public static GlCapabilities ConservativeUninitializedCapabilities { get; } = new(
+            IsOpenGles: false,
+            MajorVersion: 3,
+            MinorVersion: 3,
+            SupportsBgraUpload: true,
+            SupportsS3tc: false,
+            SupportsRgtc: false,
+            SupportsBptc: false,
+            SupportsEtc1: false,
+            SupportsEtc2: false,
+            SupportsAstcLdr: false,
+            SupportsAstcHdr: false);
+
         // Pending texture upload data
         private readonly object textureLock = new object();
+        private PreparedGpuTexturePayload? pendingPreparedPayload;
         private byte[]? pendingTextureData;
         private int pendingWidth;
         private int pendingHeight;
@@ -157,6 +198,28 @@ void main()
 
         public event Action<string>? GpuErrorOccurred;
 
+        public bool HasGlCapabilities
+        {
+            get
+            {
+                lock (textureLock)
+                {
+                    return hasGlCapabilities;
+                }
+            }
+        }
+
+        public GlCapabilities CurrentGlCapabilities
+        {
+            get
+            {
+                lock (textureLock)
+                {
+                    return hasGlCapabilities ? glCapabilities : ConservativeUninitializedCapabilities;
+                }
+            }
+        }
+
         public TextureGLPreviewControl()
         {
             ClipToBounds = true;
@@ -169,12 +232,331 @@ void main()
             context.DrawRectangle(Brushes.Transparent, null, new Rect(Bounds.Size));
         }
 
+        public static PreparedGpuTexturePayload PrepareGpuTexturePayload(
+            Texture2D texture,
+            GlCapabilities capabilities,
+            CancellationToken cancellationToken = default)
+        {
+            return PrepareGpuTexturePayload(texture, capabilities, crunchUnpacker: null, cancellationToken);
+        }
+
+        internal static PreparedGpuTexturePayload PrepareGpuTexturePayload(
+            Texture2D texture,
+            GlCapabilities capabilities,
+            Func<byte[], TextureFormat, int[]?, byte[]?>? crunchUnpacker,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(texture);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            int width = texture.m_Width;
+            int height = texture.m_Height;
+            if (width <= 0 || height <= 0)
+            {
+                throw new InvalidOperationException($"Invalid texture dimensions: {width}x{height}.");
+            }
+
+            TextureFormat sourceFormat = texture.m_TextureFormat;
+            byte[] rawBytes = texture.image_data.GetData();
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (rawBytes == null || rawBytes.Length == 0)
+            {
+                throw new InvalidOperationException($"Texture {texture.m_Name} has no image data.");
+            }
+
+            byte[] dataToUpload = rawBytes;
+            TextureFormat uploadFormat = sourceFormat;
+            bool wasCrunchUnpacked = false;
+
+            if (sourceFormat == TextureFormat.DXT1Crunched || sourceFormat == TextureFormat.DXT5Crunched ||
+                sourceFormat == TextureFormat.ETC_RGB4Crunched || sourceFormat == TextureFormat.ETC2_RGBA8Crunched)
+            {
+                byte[]? unpacked = crunchUnpacker != null
+                    ? crunchUnpacker(rawBytes, sourceFormat, texture.version)
+                    : UnpackCrunchedTextureBytes(rawBytes, sourceFormat, texture.version);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (unpacked != null && unpacked.Length > 0)
+                {
+                    dataToUpload = unpacked;
+                    wasCrunchUnpacked = true;
+                    uploadFormat = sourceFormat switch
+                    {
+                        TextureFormat.DXT1Crunched => TextureFormat.DXT1,
+                        TextureFormat.DXT5Crunched => TextureFormat.DXT5,
+                        TextureFormat.ETC_RGB4Crunched => TextureFormat.ETC_RGB4,
+                        TextureFormat.ETC2_RGBA8Crunched => TextureFormat.ETC2_RGBA8,
+                        _ => sourceFormat
+                    };
+                }
+            }
+
+            int mip0Size = GetMip0Size(uploadFormat, width, height);
+            bool hasFullMip0 = mip0Size > 0 && dataToUpload.Length >= mip0Size;
+
+            if (hasFullMip0 && TryResolveCompressedInternalFormat(uploadFormat, capabilities, out int glInternalFormat))
+            {
+                return new PreparedGpuTexturePayload
+                {
+                    Data = dataToUpload,
+                    DataLength = mip0Size,
+                    Width = width,
+                    Height = height,
+                    SourceFormat = sourceFormat,
+                    UploadFormat = uploadFormat,
+                    UploadKind = PreparedGpuTextureUploadKind.Compressed,
+                    GlInternalFormat = glInternalFormat,
+                    NeedsYFlip = false,
+                    WasCrunchUnpacked = wasCrunchUnpacked,
+                    WasCpuDecoded = false,
+                    TargetCapabilities = capabilities,
+                    SourceTextureForFallback = texture
+                };
+            }
+
+            if (hasFullMip0 && uploadFormat == TextureFormat.RGBA32)
+            {
+                return new PreparedGpuTexturePayload
+                {
+                    Data = dataToUpload,
+                    DataLength = mip0Size,
+                    Width = width,
+                    Height = height,
+                    SourceFormat = sourceFormat,
+                    UploadFormat = TextureFormat.RGBA32,
+                    UploadKind = PreparedGpuTextureUploadKind.Rgba32,
+                    GlInternalFormat = 0,
+                    NeedsYFlip = false,
+                    WasCrunchUnpacked = wasCrunchUnpacked,
+                    WasCpuDecoded = false,
+                    TargetCapabilities = capabilities
+                };
+            }
+
+            if (hasFullMip0 && uploadFormat == TextureFormat.BGRA32)
+            {
+                if (capabilities.SupportsBgraUpload)
+                {
+                    return new PreparedGpuTexturePayload
+                    {
+                        Data = dataToUpload,
+                        DataLength = mip0Size,
+                        Width = width,
+                        Height = height,
+                        SourceFormat = sourceFormat,
+                        UploadFormat = TextureFormat.BGRA32,
+                        UploadKind = PreparedGpuTextureUploadKind.Bgra32,
+                        GlInternalFormat = 0,
+                        NeedsYFlip = false,
+                        WasCrunchUnpacked = wasCrunchUnpacked,
+                        WasCpuDecoded = false,
+                        TargetCapabilities = capabilities
+                    };
+                }
+
+                byte[] rgbaBytes = new byte[mip0Size];
+                Texture2DConverter.SwizzleRgbaBgra(dataToUpload.AsSpan(0, mip0Size), rgbaBytes.AsSpan(0, mip0Size));
+                cancellationToken.ThrowIfCancellationRequested();
+                return new PreparedGpuTexturePayload
+                {
+                    Data = rgbaBytes,
+                    DataLength = mip0Size,
+                    Width = width,
+                    Height = height,
+                    SourceFormat = sourceFormat,
+                    UploadFormat = TextureFormat.RGBA32,
+                    UploadKind = PreparedGpuTextureUploadKind.Rgba32,
+                    GlInternalFormat = 0,
+                    NeedsYFlip = false,
+                    WasCrunchUnpacked = wasCrunchUnpacked,
+                    WasCpuDecoded = false,
+                    TargetCapabilities = capabilities
+                };
+            }
+
+            if (hasFullMip0 && uploadFormat == TextureFormat.RGB24)
+            {
+                return new PreparedGpuTexturePayload
+                {
+                    Data = dataToUpload,
+                    DataLength = mip0Size,
+                    Width = width,
+                    Height = height,
+                    SourceFormat = sourceFormat,
+                    UploadFormat = TextureFormat.RGB24,
+                    UploadKind = PreparedGpuTextureUploadKind.Rgb24,
+                    GlInternalFormat = 0,
+                    NeedsYFlip = false,
+                    WasCrunchUnpacked = wasCrunchUnpacked,
+                    WasCpuDecoded = false,
+                    TargetCapabilities = capabilities
+                };
+            }
+
+            // Off-UI CPU fallback decode for formats the active GL context does not natively support (e.g. ASTC on Desktop GL).
+            cancellationToken.ThrowIfCancellationRequested();
+            long requiredBytes = checked((long)width * height * 4L);
+            if (requiredBytes > Array.MaxLength)
+            {
+                throw new OverflowException($"Decoded texture buffer size exceeds supported limits ({width}x{height}).");
+            }
+
+            int byteCount = checked((int)requiredBytes);
+            byte[] decodedBytes = new byte[byteCount];
+            var converter = new Texture2DConverter(texture);
+            if (!converter.DecodeTexture2D(decodedBytes.AsSpan(0, byteCount)))
+            {
+                throw new InvalidOperationException($"Unable to decode texture format {sourceFormat} on CPU.");
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (capabilities.SupportsBgraUpload)
+            {
+                return new PreparedGpuTexturePayload
+                {
+                    Data = decodedBytes,
+                    DataLength = byteCount,
+                    Width = width,
+                    Height = height,
+                    SourceFormat = sourceFormat,
+                    UploadFormat = TextureFormat.BGRA32,
+                    UploadKind = PreparedGpuTextureUploadKind.Bgra32,
+                    GlInternalFormat = 0,
+                    NeedsYFlip = false,
+                    WasCrunchUnpacked = wasCrunchUnpacked,
+                    WasCpuDecoded = true,
+                    TargetCapabilities = capabilities
+                };
+            }
+
+            Texture2DConverter.SwizzleRgbaBgra(decodedBytes.AsSpan(0, byteCount), decodedBytes.AsSpan(0, byteCount));
+            cancellationToken.ThrowIfCancellationRequested();
+            return new PreparedGpuTexturePayload
+            {
+                Data = decodedBytes,
+                DataLength = byteCount,
+                Width = width,
+                Height = height,
+                SourceFormat = sourceFormat,
+                UploadFormat = TextureFormat.RGBA32,
+                UploadKind = PreparedGpuTextureUploadKind.Rgba32,
+                GlInternalFormat = 0,
+                NeedsYFlip = false,
+                WasCrunchUnpacked = wasCrunchUnpacked,
+                WasCpuDecoded = true,
+                TargetCapabilities = capabilities
+            };
+        }
+
+        public static PreparedGpuTexturePayload PrepareGpuImagePayload(
+            SKBitmap image,
+            GlCapabilities capabilities,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(image);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            int width = image.Width;
+            int height = image.Height;
+            if (width <= 0 || height <= 0)
+            {
+                throw new InvalidOperationException($"Invalid image dimensions: {width}x{height}.");
+            }
+
+            int byteCount = checked(width * height * 4);
+            byte[] pixels = new byte[byteCount];
+            image.CopyBgraPixelsTo(pixels);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (capabilities.SupportsBgraUpload)
+            {
+                return new PreparedGpuTexturePayload
+                {
+                    Data = pixels,
+                    DataLength = byteCount,
+                    Width = width,
+                    Height = height,
+                    SourceFormat = TextureFormat.BGRA32,
+                    UploadFormat = TextureFormat.BGRA32,
+                    UploadKind = PreparedGpuTextureUploadKind.Bgra32,
+                    GlInternalFormat = 0,
+                    NeedsYFlip = true,
+                    WasCrunchUnpacked = false,
+                    WasCpuDecoded = false,
+                    TargetCapabilities = capabilities
+                };
+            }
+
+            Texture2DConverter.SwizzleRgbaBgra(pixels.AsSpan(0, byteCount), pixels.AsSpan(0, byteCount));
+            cancellationToken.ThrowIfCancellationRequested();
+            return new PreparedGpuTexturePayload
+            {
+                Data = pixels,
+                DataLength = byteCount,
+                Width = width,
+                Height = height,
+                SourceFormat = TextureFormat.BGRA32,
+                UploadFormat = TextureFormat.RGBA32,
+                UploadKind = PreparedGpuTextureUploadKind.Rgba32,
+                GlInternalFormat = 0,
+                NeedsYFlip = true,
+                WasCrunchUnpacked = false,
+                WasCpuDecoded = false,
+                TargetCapabilities = capabilities
+            };
+        }
+
+        private static byte[]? UnpackCrunchedTextureBytes(byte[] rawBytes, TextureFormat format, int[]? version)
+        {
+            try
+            {
+                if (version != null && version.Length >= 2 && (version[0] > 2017 || (version[0] == 2017 && version[1] >= 3))
+                    || format == TextureFormat.ETC_RGB4Crunched
+                    || format == TextureFormat.ETC2_RGBA8Crunched)
+                {
+                    return TextureDecoder.UnpackUnityCrunch(rawBytes);
+                }
+
+                return TextureDecoder.UnpackCrunch(rawBytes);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Crunch unpack failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        public void SetPreparedTexture(PreparedGpuTexturePayload payload)
+        {
+            ArgumentNullException.ThrowIfNull(payload);
+            ResetPanAndZoom();
+
+            lock (textureLock)
+            {
+                pendingPreparedPayload = payload;
+                currentTexture = payload.SourceTextureForFallback;
+                pendingTextureData = null;
+                pendingWidth = payload.Width;
+                pendingHeight = payload.Height;
+                pendingFormat = payload.UploadFormat;
+                pendingVersion = null;
+                pendingPlatform = BuildTarget.NoTarget;
+                pendingNeedsYFlip = payload.NeedsYFlip;
+                hasPendingTexture = true;
+            }
+
+            hasTexture = true;
+            RequestNextFrameRendering();
+        }
+
         public void SetTexture(Texture2D texture)
         {
             ResetPanAndZoom();
 
             lock (textureLock)
             {
+                pendingPreparedPayload = null;
                 currentTexture = texture;
                 pendingWidth = texture.m_Width;
                 pendingHeight = texture.m_Height;
@@ -201,25 +583,8 @@ void main()
 
         public void SetImage(SKBitmap image)
         {
-            ResetPanAndZoom();
-
-            lock (textureLock)
-            {
-                currentTexture = null;
-                pendingWidth = image.Width;
-                pendingHeight = image.Height;
-                pendingFormat = TextureFormat.BGRA32;
-                pendingVersion = null;
-                pendingPlatform = BuildTarget.NoTarget;
-                pendingNeedsYFlip = true;
-                hasPendingTexture = true;
-
-                pendingTextureData = new byte[checked(image.Width * image.Height * 4)];
-                image.CopyBgraPixelsTo(pendingTextureData);
-            }
-
-            hasTexture = true;
-            RequestNextFrameRendering();
+            var payload = PrepareGpuImagePayload(image, CurrentGlCapabilities);
+            SetPreparedTexture(payload);
         }
 
         public void SetChannels(bool[] channels)
@@ -243,10 +608,14 @@ void main()
             try
             {
                 GL.LoadBindings(new AvaloniaBindingsContext(gl));
-                glCapabilities = QueryGlCapabilities(gl);
-                hasGlCapabilities = true;
+                var queriedCapabilities = QueryGlCapabilities(gl);
+                lock (textureLock)
+                {
+                    glCapabilities = queriedCapabilities;
+                    hasGlCapabilities = true;
+                }
 
-                bool isGles = glCapabilities.IsOpenGles;
+                bool isGles = queriedCapabilities.IsOpenGles;
                 string glslVersion = isGles ? "#version 300 es" : "#version 330 core";
                 string precision = isGles ? "precision mediump float;" : "";
 
@@ -289,6 +658,7 @@ void main()
             {
                 // Check if there is a pending texture to upload
                 bool uploadNew = false;
+                PreparedGpuTexturePayload? prepared = null;
                 byte[]? texBytes = null;
                 int texW = 0, texH = 0;
                 TextureFormat texFormat = TextureFormat.RGBA32;
@@ -300,6 +670,7 @@ void main()
                     if (hasPendingTexture)
                     {
                         uploadNew = true;
+                        prepared = pendingPreparedPayload;
                         texBytes = pendingTextureData;
                         texW = pendingWidth;
                         texH = pendingHeight;
@@ -308,11 +679,12 @@ void main()
                         texPlatform = pendingPlatform;
                         currentNeedsYFlip = pendingNeedsYFlip;
                         hasPendingTexture = false;
+                        pendingPreparedPayload = null;
                         pendingTextureData = null;
                     }
                 }
 
-                if (uploadNew && texBytes != null)
+                if (uploadNew)
                 {
                     if (glTextureId != 0)
                     {
@@ -320,7 +692,14 @@ void main()
                         glTextureId = 0;
                     }
 
-                    UploadTexture(texBytes, texW, texH, texFormat, texVersion, texPlatform);
+                    if (prepared != null)
+                    {
+                        UploadPreparedTexture(prepared);
+                    }
+                    else if (texBytes != null)
+                    {
+                        UploadTexture(texBytes, texW, texH, texFormat, texVersion, texPlatform);
+                    }
                 }
 
                 GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
@@ -415,9 +794,7 @@ void main()
 
                 // Channel masking
                 GL.Uniform4(uniformChannelMask, channelMask[0] ? 1.0f : 0.0f, channelMask[1] ? 1.0f : 0.0f, channelMask[2] ? 1.0f : 0.0f, channelMask[3] ? 1.0f : 0.0f);
-                
-                int activeColorCount = 0;
-                for (int i = 0; i < 3; i++) if (channelMask[i]) activeColorCount++;
+
                 bool alphaOnly = !channelMask[0] && !channelMask[1] && !channelMask[2] && channelMask[3];
                 GL.Uniform1(uniformIsAlphaOnly, alphaOnly ? 1 : 0);
 
@@ -432,6 +809,93 @@ void main()
             {
                 GpuErrorOccurred?.Invoke($"OpenGL rendering failed: {ex.Message}");
             }
+        }
+
+        private void UploadPreparedTexture(PreparedGpuTexturePayload payload)
+        {
+            textureWidth = payload.Width;
+            textureHeight = payload.Height;
+
+            var capabilities = CurrentGlCapabilities;
+            while (GL.GetError() != ErrorCode.NoError) { }
+
+            glTextureId = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture2D, glTextureId);
+
+            if (payload.UploadKind == PreparedGpuTextureUploadKind.Compressed)
+            {
+                GL.CompressedTexImage2D(
+                    TextureTarget.Texture2D,
+                    0,
+                    (InternalFormat)payload.GlInternalFormat,
+                    payload.Width,
+                    payload.Height,
+                    0,
+                    payload.DataLength,
+                    payload.Data);
+
+                ErrorCode err = GL.GetError();
+                if (err == ErrorCode.NoError)
+                {
+                    SetupTextureParameters();
+                    return;
+                }
+
+                // Driver rejected compressed upload unexpectedly; delete texture and report error to trigger async CPU fallback.
+                GL.DeleteTexture(glTextureId);
+                glTextureId = 0;
+                while (GL.GetError() != ErrorCode.NoError) { }
+                throw new Exception($"CompressedTexImage2D failed with OpenGL error: {err}");
+            }
+
+            switch (payload.UploadKind)
+            {
+                case PreparedGpuTextureUploadKind.Rgba32:
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, payload.Width, payload.Height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, payload.Data);
+                    break;
+
+                case PreparedGpuTextureUploadKind.Bgra32:
+                    if (capabilities.SupportsBgraUpload)
+                    {
+                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, payload.Width, payload.Height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, payload.Data);
+                    }
+                    else
+                    {
+                        byte[] rgbaBytes = BigArrayPool<byte>.Shared.Rent(payload.DataLength);
+                        try
+                        {
+                            Texture2DConverter.SwizzleRgbaBgra(payload.Data.AsSpan(0, payload.DataLength), rgbaBytes.AsSpan(0, payload.DataLength));
+                            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, payload.Width, payload.Height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, rgbaBytes);
+                        }
+                        finally
+                        {
+                            BigArrayPool<byte>.Shared.Return(rgbaBytes);
+                        }
+                    }
+                    break;
+
+                case PreparedGpuTextureUploadKind.Rgb24:
+                    GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+                    try
+                    {
+                        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb, payload.Width, payload.Height, 0, PixelFormat.Rgb, PixelType.UnsignedByte, payload.Data);
+                    }
+                    finally
+                    {
+                        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+                    }
+                    break;
+            }
+
+            ErrorCode finalErr = GL.GetError();
+            if (finalErr != ErrorCode.NoError)
+            {
+                GL.DeleteTexture(glTextureId);
+                glTextureId = 0;
+                throw new Exception($"TexImage2D failed with OpenGL error: {finalErr}");
+            }
+
+            SetupTextureParameters();
         }
 
         private static GlCapabilities QueryGlCapabilities(GlInterface gl)
@@ -735,43 +1199,21 @@ void main()
             textureWidth = width;
             textureHeight = height;
 
-            var capabilities = hasGlCapabilities
-                ? glCapabilities
-                : GlCapabilities.FromVersionAndExtensions(isOpenGles: false, majorVersion: 3, minorVersion: 3, extensions: null);
-
+            var capabilities = CurrentGlCapabilities;
             byte[] dataToUpload = rawBytes;
             TextureFormat uploadFormat = format;
 
-            // Unpack crunch compression on CPU if needed (which is fast and yields DXT/ETC blocks)
             if (format == TextureFormat.DXT1Crunched || format == TextureFormat.DXT5Crunched ||
                 format == TextureFormat.ETC_RGB4Crunched || format == TextureFormat.ETC2_RGBA8Crunched)
             {
-                try
+                byte[]? unpacked = UnpackCrunchedTextureBytes(rawBytes, format, version);
+                if (unpacked != null)
                 {
-                    byte[]? unpacked;
-                    if (version != null && (version[0] > 2017 || (version[0] == 2017 && version[1] >= 3))
-                        || format == TextureFormat.ETC_RGB4Crunched
-                        || format == TextureFormat.ETC2_RGBA8Crunched)
-                    {
-                        unpacked = TextureDecoder.UnpackUnityCrunch(rawBytes);
-                    }
-                    else
-                    {
-                        unpacked = TextureDecoder.UnpackCrunch(rawBytes);
-                    }
-
-                    if (unpacked != null)
-                    {
-                        dataToUpload = unpacked;
-                        if (format == TextureFormat.DXT1Crunched) uploadFormat = TextureFormat.DXT1;
-                        else if (format == TextureFormat.DXT5Crunched) uploadFormat = TextureFormat.DXT5;
-                        else if (format == TextureFormat.ETC_RGB4Crunched) uploadFormat = TextureFormat.ETC_RGB4;
-                        else if (format == TextureFormat.ETC2_RGBA8Crunched) uploadFormat = TextureFormat.ETC2_RGBA8;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Crunch unpack failed: {ex.Message}");
+                    dataToUpload = unpacked;
+                    if (format == TextureFormat.DXT1Crunched) uploadFormat = TextureFormat.DXT1;
+                    else if (format == TextureFormat.DXT5Crunched) uploadFormat = TextureFormat.DXT5;
+                    else if (format == TextureFormat.ETC_RGB4Crunched) uploadFormat = TextureFormat.ETC_RGB4;
+                    else if (format == TextureFormat.ETC2_RGBA8Crunched) uploadFormat = TextureFormat.ETC2_RGBA8;
                 }
             }
 
@@ -780,7 +1222,6 @@ void main()
             int glInternalFormat = 0;
             bool isCompressed = hasFullMip0 && TryResolveCompressedInternalFormat(uploadFormat, capabilities, out glInternalFormat);
 
-            // Clear any previous GL errors
             while (GL.GetError() != ErrorCode.NoError) { }
 
             glTextureId = GL.GenTexture();
@@ -791,7 +1232,7 @@ void main()
                 try
                 {
                     GL.CompressedTexImage2D(TextureTarget.Texture2D, 0, (InternalFormat)glInternalFormat, width, height, 0, mip0Size, dataToUpload);
-                    
+
                     ErrorCode err = GL.GetError();
                     if (err != ErrorCode.NoError)
                     {
@@ -805,16 +1246,12 @@ void main()
                 {
                     System.Diagnostics.Debug.WriteLine($"GPU Compressed texture upload failed, falling back to CPU decode: {ex.Message}");
                     GL.DeleteTexture(glTextureId);
-                    
-                    // Clear errors
                     while (GL.GetError() != ErrorCode.NoError) { }
-
                     glTextureId = GL.GenTexture();
                     GL.BindTexture(TextureTarget.Texture2D, glTextureId);
                 }
             }
 
-            // Uncompressed direct upload or fallback CPU decode
             if (hasFullMip0 && uploadFormat == TextureFormat.RGBA32)
             {
                 GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, dataToUpload);
@@ -853,7 +1290,6 @@ void main()
             }
             else
             {
-                // Fallback: Use CPU decoder to decode to BGRA32, then upload
                 if (currentTexture != null)
                 {
                     if (width <= 0 || height <= 0)

@@ -330,9 +330,70 @@
                                     </Grid>
                                 </Border>
                                 <Grid Grid.Row="1">
-                                    <ScrollViewer x:Name="TextAssetDialogueScrollViewer" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
-                                        <StackPanel x:Name="TextAssetDialogueCardsHost" Margin="16" Spacing="10" />
-                                    </ScrollViewer>
+                                    <ListBox x:Name="TextAssetDialogueCardsList"
+                                             Background="Transparent"
+                                             BorderThickness="0"
+                                             Padding="16"
+                                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                             ScrollViewer.VerticalScrollBarVisibility="Auto">
+                                        <ListBox.Styles>
+                                            <Style Selector="ListBoxItem">
+                                                <Setter Property="Padding" Value="0,0,0,10" />
+                                                <Setter Property="Background" Value="Transparent" />
+                                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                            </Style>
+                                            <Style Selector="ListBoxItem:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                                                <Setter Property="Background" Value="Transparent" />
+                                            </Style>
+                                            <Style Selector="ListBoxItem:selected /template/ ContentPresenter#PART_ContentPresenter">
+                                                <Setter Property="Background" Value="Transparent" />
+                                            </Style>
+                                        </ListBox.Styles>
+                                        <ListBox.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <VirtualizingStackPanel />
+                                            </ItemsPanelTemplate>
+                                        </ListBox.ItemsPanel>
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate x:DataType="local:TextAssetDialogueCardViewModel" x:CompileBindings="True">
+                                                <Border Background="{Binding CardBackground, Mode=OneTime}"
+                                                        BorderBrush="{Binding CardBorderBrush, Mode=OneTime}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="6"
+                                                        Padding="12"
+                                                        MaxWidth="820"
+                                                        HorizontalAlignment="Stretch">
+                                                    <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="8">
+                                                        <Grid ColumnDefinitions="*,Auto">
+                                                            <TextBlock Text="{Binding Title, Mode=OneTime}"
+                                                                       Foreground="{Binding TitleForeground, Mode=OneTime}"
+                                                                       FontSize="13"
+                                                                       FontWeight="SemiBold"
+                                                                       TextWrapping="Wrap" />
+                                                            <TextBlock Grid.Column="1"
+                                                                       Text="{Binding OffsetText, Mode=OneTime}"
+                                                                       Foreground="{Binding MetadataForeground, Mode=OneTime}"
+                                                                       FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                                       FontSize="11"
+                                                                       Margin="12,0,0,0"
+                                                                       VerticalAlignment="Center" />
+                                                        </Grid>
+                                                        <TextBlock Grid.Row="1"
+                                                                   Text="{Binding BodyText, Mode=OneTime}"
+                                                                   Foreground="{Binding BodyForeground, Mode=OneTime}"
+                                                                   FontSize="16"
+                                                                   LineHeight="23"
+                                                                   TextWrapping="Wrap" />
+                                                        <TextBlock Grid.Row="2"
+                                                                   Text="{Binding FooterText, Mode=OneTime}"
+                                                                   Foreground="{Binding FooterForeground, Mode=OneTime}"
+                                                                   FontSize="11"
+                                                                   TextWrapping="Wrap" />
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
                                     <TextBox x:Name="TextAssetDetailsTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" IsVisible="False" />
                                 </Grid>
                             </Grid>

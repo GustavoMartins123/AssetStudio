@@ -9,8 +9,128 @@ using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
+internal sealed class AsyncPreviewRequestCoordinator : IDisposable
+{
+    private readonly object _gate = new();
+    private CancellationTokenSource? _activeCts;
+    private long _currentRequestId;
+    private long _cancelledRequestCount;
+
+    public long CurrentRequestId => Interlocked.Read(ref _currentRequestId);
+    public long CancelledRequestCount => Interlocked.Read(ref _cancelledRequestCount);
+
+    public CancellationToken BeginNewRequest(out long requestId)
+    {
+        lock (_gate)
+        {
+            CancelAndDisposeActiveLocked();
+            _activeCts = new CancellationTokenSource();
+            requestId = Interlocked.Increment(ref _currentRequestId);
+            return _activeCts.Token;
+        }
+    }
+
+    public void CancelCurrent()
+    {
+        lock (_gate)
+        {
+            Interlocked.Increment(ref _currentRequestId);
+            CancelAndDisposeActiveLocked();
+        }
+    }
+
+    public bool IsCurrent(long requestId)
+    {
+        return Interlocked.Read(ref _currentRequestId) == requestId;
+    }
+
+    public async Task<(bool Applied, long RequestId, T? Result)> RunLatestAsync<T>(
+        Func<long, CancellationToken, Task<T>> backgroundWork,
+        Action<long, T>? onCompleted = null)
+    {
+        var token = BeginNewRequest(out var requestId);
+        try
+        {
+            var result = await Task.Run(() => backgroundWork(requestId, token), token).ConfigureAwait(false);
+            if (token.IsCancellationRequested || !IsCurrent(requestId))
+            {
+                return (false, requestId, default);
+            }
+
+            onCompleted?.Invoke(requestId, result);
+            return (true, requestId, result);
+        }
+        catch (OperationCanceledException)
+        {
+            return (false, requestId, default);
+        }
+    }
+
+    private void CancelAndDisposeActiveLocked()
+    {
+        if (_activeCts == null)
+        {
+            return;
+        }
+
+        if (!_activeCts.IsCancellationRequested)
+        {
+            Interlocked.Increment(ref _cancelledRequestCount);
+            try
+            {
+                _activeCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        _activeCts.Dispose();
+        _activeCts = null;
+    }
+
+    public void Dispose()
+    {
+        CancelCurrent();
+    }
+}
+
 public partial class MainWindow : Window
 {
+    private const int MaxPreviewTextChars = 100000;
+    private readonly AsyncPreviewRequestCoordinator _previewRequestCoordinator = new();
+    private readonly AsyncPreviewRequestCoordinator _dumpRequestCoordinator = new();
+    private readonly SemaphoreSlim _assemblyLoaderGate = new(1, 1);
+
+    private CancellationToken BeginAsyncPreviewRequest(out long requestId, out long previewVersion)
+    {
+        previewVersion = Volatile.Read(ref texturePreviewIdCounter);
+        return _previewRequestCoordinator.BeginNewRequest(out requestId);
+    }
+
+    private bool IsPreviewRequestCurrent(long requestId, long previewVersion, CancellationToken token)
+    {
+        return !token.IsCancellationRequested
+            && _previewRequestCoordinator.IsCurrent(requestId)
+            && Volatile.Read(ref texturePreviewIdCounter) == previewVersion;
+    }
+
+    internal static string TruncatePreviewText(string? text, string fallbackText = "")
+    {
+        if (text == null)
+        {
+            return fallbackText;
+        }
+
+        if (text.Length > MaxPreviewTextChars)
+        {
+            return text.Substring(0, MaxPreviewTextChars) +
+                $"{Environment.NewLine}...{Environment.NewLine}[Preview truncated: content is too large ({text.Length:N0} characters). Please export the asset to view full content]";
+        }
+
+        return text;
+    }
+
     private async void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         if (isRefreshingFilterList) return;
@@ -32,8 +152,9 @@ public partial class MainWindow : Window
         else
         {
             _currentlySelectedUniqueID = null;
+            _dumpRequestCoordinator.CancelCurrent();
             DumpTextBox.Text = string.Empty;
-            previewDebounce?.Cancel();
+            CancelPendingPreview();
             ClearPreview("Preview Panel");
             lock (preloaderLock)
             {
@@ -54,6 +175,7 @@ public partial class MainWindow : Window
             }
             else if (RightTabControl.SelectedIndex == 0)
             {
+                _dumpRequestCoordinator.CancelCurrent();
                 PreviewSelectedAssetImmediately();
             }
         }
@@ -62,7 +184,9 @@ public partial class MainWindow : Window
     private void CancelPendingPreview()
     {
         previewDebounce?.Cancel();
+        _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
+        Interlocked.Increment(ref texturePreviewIdCounter);
     }
 
     private void PreviewSelectedAssetImmediately()
@@ -89,7 +213,9 @@ public partial class MainWindow : Window
         previewDebounce?.Dispose();
         previewDebounce = new CancellationTokenSource();
         var token = previewDebounce.Token;
-        var previewId = ++texturePreviewIdCounter;
+        _previewRequestCoordinator.CancelCurrent();
+        _animationPreviewCoordinator.CancelCurrent();
+        var previewId = Interlocked.Increment(ref texturePreviewIdCounter);
 
         if (PreviewLabel != null)
         {
@@ -112,7 +238,7 @@ public partial class MainWindow : Window
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     if (!token.IsCancellationRequested
-                        && previewId == texturePreviewIdCounter
+                        && previewId == Volatile.Read(ref texturePreviewIdCounter)
                         && RightTabControl.SelectedIndex == 0
                         && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
                     {
@@ -128,7 +254,8 @@ public partial class MainWindow : Window
                 logger.Log(LoggerEvent.Error, $"Preview queue failed for {assetItem.Name}: {ex}");
                 Dispatcher.UIThread.Post(() =>
                 {
-                    if (previewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                    if (previewId == Volatile.Read(ref texturePreviewIdCounter)
+                        && ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
                     {
                         StatusStripUpdate($"Preview error: {ex.Message}");
                     }
@@ -139,32 +266,19 @@ public partial class MainWindow : Window
 
     private void SetTextWithTruncation(TextBox textBox, string? text, string fallbackText = "")
     {
-        if (text == null)
-        {
-            textBox.Text = fallbackText;
-            return;
-        }
-
-        const int maxChars = 100000;
-        if (text.Length > maxChars)
-        {
-            textBox.Text = text.Substring(0, maxChars) + 
-                $"{Environment.NewLine}...{Environment.NewLine}[Preview truncated: content is too large ({text.Length:N0} characters). Please export the asset to view full content]";
-        }
-        else
-        {
-            textBox.Text = text;
-        }
+        textBox.Text = TruncatePreviewText(text, fallbackText);
     }
 
     private async Task UpdateDumpForSelectedAsset()
     {
         if (AssetListDataGrid.SelectedItem is not AssetItem assetItem)
         {
+            _dumpRequestCoordinator.CancelCurrent();
             DumpTextBox.Text = string.Empty;
             return;
         }
 
+        var token = _dumpRequestCoordinator.BeginNewRequest(out var requestId);
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
         DumpTextBox.Text = "Loading dump...";
         var shouldPauseIndexing = assetsManager.LazyLoading && assetItem.Handle != null;
@@ -176,14 +290,19 @@ public partial class MainWindow : Window
         {
             var asset = await Task.Run(() =>
             {
+                token.ThrowIfCancellationRequested();
                 if (assetsManager.LazyLoading && assetItem.Handle != null)
                 {
                     EnsureLazyAssetReadyForPreview(assetItem);
                 }
 
+                token.ThrowIfCancellationRequested();
                 return assetItem.Asset;
-            });
-            if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+            }, token);
+
+            if (token.IsCancellationRequested
+                || !_dumpRequestCoordinator.IsCurrent(requestId)
+                || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
             {
                 return;
             }
@@ -194,16 +313,23 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var dump = await DumpAsset(asset);
-            if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+            var dump = await DumpAsset(asset, token);
+            var truncatedDump = await Task.Run(() => TruncatePreviewText(dump, "No Dump Available"), token);
+            if (token.IsCancellationRequested
+                || !_dumpRequestCoordinator.IsCurrent(requestId)
+                || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
             {
                 return;
             }
-            SetTextWithTruncation(DumpTextBox, dump, "No Dump Available");
+            DumpTextBox.Text = truncatedDump;
+        }
+        catch (OperationCanceledException)
+        {
         }
         catch (Exception ex)
         {
-            if (!ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+            if (!_dumpRequestCoordinator.IsCurrent(requestId)
+                || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
             {
                 return;
             }
@@ -218,50 +344,105 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task<string?> DumpAsset(Object asset)
+    private async Task<string?> DumpAsset(Object asset, CancellationToken cancellationToken = default)
     {
         if (asset is MonoBehaviour monoBehaviour)
         {
-            var dump = await Task.Run(() => monoBehaviour.Dump());
+            var dump = await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return monoBehaviour.Dump();
+            }, cancellationToken);
+
             if (dump == null)
             {
-                var typeTree = await MonoBehaviourToTypeTree(monoBehaviour);
-                dump = await Task.Run(() => monoBehaviour.Dump(typeTree));
+                var typeTree = await MonoBehaviourToTypeTree(monoBehaviour, cancellationToken);
+                dump = await Task.Run(() =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return monoBehaviour.Dump(typeTree);
+                }, cancellationToken);
             }
             return dump;
         }
         else
         {
-            return await Task.Run(() => asset.Dump());
+            return await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return asset.Dump();
+            }, cancellationToken);
         }
     }
 
-    private async Task<TypeTree> MonoBehaviourToTypeTree(MonoBehaviour monoBehaviour)
+    private async Task EnsureAssemblyLoaderReadyAsync(CancellationToken cancellationToken = default)
     {
-        if (!assemblyLoader.Loaded)
+        if (assemblyLoader.Loaded)
         {
-            var topLevel = TopLevel.GetTopLevel(this);
-            if (topLevel != null)
-            {
-                var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
+            return;
+        }
 
-                if (folders != null && folders.Count > 0)
-                {
-                    SaveLoadFolder(folders[0].Path.LocalPath);
-                    assemblyLoader.Load(folders[0].Path.LocalPath);
-                }
-                else
-                {
-                    assemblyLoader.Loaded = true;
-                }
+        await _assemblyLoaderGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (assemblyLoader.Loaded)
+            {
+                return;
+            }
+
+            string? selectedFolder = null;
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                selectedFolder = await PickAssemblyFolderOnUiThreadAsync();
+            }
+            else
+            {
+                selectedFolder = await Dispatcher.UIThread.InvokeAsync(PickAssemblyFolderOnUiThreadAsync);
+            }
+
+            if (!string.IsNullOrEmpty(selectedFolder))
+            {
+                await Task.Run(() => assemblyLoader.Load(selectedFolder), cancellationToken);
             }
             else
             {
                 assemblyLoader.Loaded = true;
             }
         }
+        finally
+        {
+            _assemblyLoaderGate.Release();
+        }
+    }
 
-        return monoBehaviour.ConvertToTypeTree(assemblyLoader);
+    private async Task<string?> PickAssemblyFolderOnUiThreadAsync()
+    {
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null)
+        {
+            return null;
+        }
+
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
+        if (folders != null && folders.Count > 0)
+        {
+            var localPath = folders[0].Path.LocalPath;
+            SaveLoadFolder(localPath);
+            return localPath;
+        }
+
+        return null;
+    }
+
+    private async Task<TypeTree> MonoBehaviourToTypeTree(MonoBehaviour monoBehaviour, CancellationToken cancellationToken = default)
+    {
+        await EnsureAssemblyLoaderReadyAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        return await Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return monoBehaviour.ConvertToTypeTree(assemblyLoader);
+        }, cancellationToken);
     }
 
     private AssetStudio.Object? ResolveAssetForPreview(AssetItem assetItem)
@@ -295,9 +476,186 @@ public partial class MainWindow : Window
         }
     }
 
+    private void PreviewShaderAsync(AssetItem assetItem, Shader m_Shader, string fbxHeader)
+    {
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        TextPreviewBox.Text = "Loading shader preview...";
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate($"Loading shader preview: {assetItem.Name}...");
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                var converted = m_Shader.Convert() ?? "Serialized Shader can't be read";
+                token.ThrowIfCancellationRequested();
+                var truncated = TruncatePreviewText(fbxHeader + converted);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        return;
+                    }
+
+                    TextPreviewBox.Text = truncated;
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                    StatusStripUpdate($"Shader preview loaded: {assetItem.Name}");
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Shader preview failed for {assetItem.Name}: {ex}");
+                var errorText = TruncatePreviewText($"Failed to preview shader {assetItem.Name}:{Environment.NewLine}{ex.Message}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        return;
+                    }
+
+                    TextPreviewBox.Text = errorText;
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                    StatusStripUpdate($"Shader preview error: {ex.Message}");
+                });
+            }
+        }, token);
+    }
+
+    private void PreviewPrefabInstanceAsync(AssetItem assetItem, Object prefab, string fbxHeader)
+    {
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        TextPreviewBox.Text = "Loading prefab preview...";
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+        StatusStripUpdate($"Loading prefab preview: {assetItem.Name}...");
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                var formatted = FormatPrefabCore(prefab, token);
+                token.ThrowIfCancellationRequested();
+                var truncated = TruncatePreviewText(fbxHeader + formatted);
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        return;
+                    }
+
+                    TextPreviewBox.Text = truncated;
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                    StatusStripUpdate($"Prefab preview loaded: {assetItem.Name}");
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Prefab preview failed for {assetItem.Name}: {ex}");
+                var errorText = TruncatePreviewText($"Failed to preview prefab {assetItem.Name}:{Environment.NewLine}{ex.Message}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        return;
+                    }
+
+                    TextPreviewBox.Text = errorText;
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                    StatusStripUpdate($"Prefab preview error: {ex.Message}");
+                });
+            }
+        }, token);
+    }
+
+    private void PreviewDefaultDumpAsync(AssetItem assetItem, Object asset, string fbxHeader)
+    {
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        TextPreviewBox.Text = "Loading asset preview...";
+        TextPreviewBox.IsVisible = true;
+        PreviewLabel.IsVisible = false;
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                string? rawDump;
+                try
+                {
+                    rawDump = asset.Dump();
+                }
+                catch (Exception dumpEx)
+                {
+                    rawDump = $"Failed to dump asset: {dumpEx.Message}";
+                }
+
+                token.ThrowIfCancellationRequested();
+                string? truncated = rawDump != null ? TruncatePreviewText(fbxHeader + rawDump) : null;
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        return;
+                    }
+
+                    if (truncated != null)
+                    {
+                        TextPreviewBox.Text = truncated;
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
+                    }
+                    else
+                    {
+                        TextPreviewBox.Text = string.Empty;
+                        TextPreviewBox.IsVisible = false;
+                        PreviewLabel.IsVisible = displayInfo.IsChecked == true;
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"Asset dump preview failed for {assetItem.Name}: {ex}");
+                var errorText = TruncatePreviewText($"Failed to dump asset {assetItem.Name}:{Environment.NewLine}{ex.Message}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        return;
+                    }
+
+                    TextPreviewBox.Text = errorText;
+                    TextPreviewBox.IsVisible = true;
+                    PreviewLabel.IsVisible = false;
+                    StatusStripUpdate($"Preview error: {ex.Message}");
+                });
+            }
+        }, token);
+    }
+
     private void PreviewAsset(AssetItem assetItem, AssetStudio.Object? resolvedAsset = null, bool assetResolutionAttempted = false)
     {
-        ++texturePreviewIdCounter;
+        _previewRequestCoordinator.CancelCurrent();
+        _animationPreviewCoordinator.CancelCurrent();
+        Interlocked.Increment(ref texturePreviewIdCounter);
         if (enablePreview.IsChecked != true)
         {
             ClearPreview("Preview disabled");
@@ -408,21 +766,10 @@ public partial class MainWindow : Window
                     PreviewTextAsset(assetItem, m_TextAsset, fbxHeader);
                     break;
                 case Shader m_Shader:
-                    SetTextWithTruncation(TextPreviewBox, fbxHeader + (m_Shader.Convert() ?? "Serialized Shader can't be read"));
-                    TextPreviewBox.IsVisible = true;
-                    PreviewLabel.IsVisible = false;
+                    PreviewShaderAsync(assetItem, m_Shader, fbxHeader);
                     break;
                 case MonoBehaviour m_MonoBehaviour:
-                    string? dumpStr = null;
-                    try
-                    {
-                        dumpStr = m_MonoBehaviour.Dump();
-                    }
-                    catch (Exception dumpEx)
-                    {
-                        dumpStr = $"Failed to dump MonoBehaviour: {dumpEx.Message}";
-                    }
-                    PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader, dumpStr);
+                    PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader);
                     break;
                 case MonoScript m_MonoScript:
                     {
@@ -439,9 +786,7 @@ public partial class MainWindow : Window
                     PreviewMesh(assetItem, m_Mesh);
                     break;
                 case Object obj when obj.type == ClassIDType.PrefabInstance:
-                    SetTextWithTruncation(TextPreviewBox, fbxHeader + FormatPrefab(obj));
-                    TextPreviewBox.IsVisible = true;
-                    PreviewLabel.IsVisible = false;
+                    PreviewPrefabInstanceAsync(assetItem, obj, fbxHeader);
                     break;
                 case VideoClip m_VideoClip:
                     PreviewVideoClip(assetItem, m_VideoClip);
@@ -468,21 +813,7 @@ public partial class MainWindow : Window
                     PreviewAnimationClip(m_AnimationClip);
                     break;
                 default:
-                    string? rawDump = null;
-                    try
-                    {
-                        rawDump = asset.Dump();
-                    }
-                    catch (Exception dumpEx)
-                    {
-                        rawDump = $"Failed to dump asset: {dumpEx.Message}";
-                    }
-                    if (rawDump != null)
-                    {
-                        SetTextWithTruncation(TextPreviewBox, fbxHeader + rawDump);
-                        TextPreviewBox.IsVisible = true;
-                        PreviewLabel.IsVisible = false;
-                    }
+                    PreviewDefaultDumpAsync(assetItem, asset, fbxHeader);
                     break;
             }
         }

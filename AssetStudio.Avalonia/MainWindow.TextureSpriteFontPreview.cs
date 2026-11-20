@@ -4,12 +4,15 @@ using SkiaSharp;
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private Sprite? _spriteDependenciesLoadedFor;
+
     private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
     {
         currentPreviewTexture = m_Texture2D;
@@ -18,7 +21,6 @@ public partial class MainWindow
 
     private void PreviewSprite(AssetItem assetItem, Sprite m_Sprite)
     {
-        EnsureSpritePreviewDependenciesLoaded(m_Sprite);
         currentPreviewSprite = m_Sprite;
         UpdateImagePreview();
     }
@@ -50,19 +52,30 @@ public partial class MainWindow
             return;
         }
 
-        long currentId = ++texturePreviewIdCounter;
+        Interlocked.Increment(ref texturePreviewIdCounter);
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
         ClearPreviewCacheBadge();
         StatusStripUpdate("Rendering font preview...");
 
-        Task.Run(() =>
+        _ = Task.Run(() =>
         {
             try
             {
-                var fontPreview = FontAssetPreviewRenderer.Render(m_Font.m_Name, m_Font.m_FontData, () => currentId != texturePreviewIdCounter);
+                token.ThrowIfCancellationRequested();
+                var fontPreview = FontAssetPreviewRenderer.Render(
+                    m_Font.m_Name,
+                    m_Font.m_FontData,
+                    () => !IsPreviewRequestCurrent(requestId, previewVersion, token));
+
+                if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                {
+                    fontPreview.Bitmap?.Dispose();
+                    return;
+                }
 
                 Dispatcher.UIThread.Post(() =>
                 {
-                    if (currentId == texturePreviewIdCounter)
+                    if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                     {
                         ImagePreviewBox.Source = fontPreview.Bitmap;
                         ImagePreviewBox.IsVisible = true;
@@ -79,15 +92,23 @@ public partial class MainWindow
                         }
                         StatusStripUpdate($"Font loaded: {m_Font.m_Name}");
                     }
+                    else
+                    {
+                        fontPreview.Bitmap?.Dispose();
+                    }
                 });
+            }
+            catch (OperationCanceledException)
+            {
             }
             catch (Exception ex)
             {
+                var fallbackText = TruncatePreviewText(FontAssetPreviewRenderer.BuildFallbackText(m_Font, ex.Message));
                 Dispatcher.UIThread.Post(() =>
                 {
-                    if (currentId == texturePreviewIdCounter)
+                    if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                     {
-                        SetTextWithTruncation(TextPreviewBox, FontAssetPreviewRenderer.BuildFallbackText(m_Font, ex.Message));
+                        TextPreviewBox.Text = fallbackText;
                         ImagePreviewBox.IsVisible = false;
                         TextPreviewBox.IsVisible = true;
                         PreviewLabel.IsVisible = false;
@@ -96,7 +117,7 @@ public partial class MainWindow
                     }
                 });
             }
-        });
+        }, token);
     }
 
     private static void ApplyPreviewChannelMask(SKBitmap image, bool[] channels, int validChannel)
@@ -211,6 +232,17 @@ public partial class MainWindow
         return true;
     }
 
+    private void EnsureSpriteDependenciesInBackground(Sprite sprite, CancellationToken cancellationToken)
+    {
+        if (ReferenceEquals(Volatile.Read(ref _spriteDependenciesLoadedFor), sprite))
+        {
+            return;
+        }
+
+        EnsureSpritePreviewDependenciesLoaded(sprite, cancellationToken);
+        Volatile.Write(ref _spriteDependenciesLoadedFor, sprite);
+    }
+
     private void UpdateImagePreview(bool forceCpu = false)
     {
         var previewTexture = currentPreviewTexture;
@@ -218,26 +250,28 @@ public partial class MainWindow
         if (previewTexture == null && previewSprite == null)
             return;
 
-        long currentId = ++texturePreviewIdCounter;
+        Interlocked.Increment(ref texturePreviewIdCounter);
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        var channelsSnapshot = (bool[])textureChannels.Clone();
 
         if (useGpuTexturePreview && TextureGLPreview != null && !forceCpu)
         {
+            var glControl = TextureGLPreview;
+            var glCapabilities = glControl.CurrentGlCapabilities;
             StatusStripUpdate("Loading preview (GPU)...");
 
-            Task.Run(() =>
+            _ = Task.Run(() =>
             {
                 try
                 {
-                    SKBitmap? decodedImage = null;
-                    int width = 0;
-                    int height = 0;
+                    token.ThrowIfCancellationRequested();
+                    PreparedGpuTexturePayload preparedPayload;
                     string infoText = string.Empty;
-                    bool isSprite = previewSprite != null;
 
                     if (previewTexture != null)
                     {
-                        width = previewTexture.m_Width;
-                        height = previewTexture.m_Height;
+                        int width = previewTexture.m_Width;
+                        int height = previewTexture.m_Height;
 
                         infoText = $"Width: {width}\nHeight: {height}\nFormat: {previewTexture.m_TextureFormat}";
                         switch (previewTexture.m_TextureSettings.m_FilterMode)
@@ -252,23 +286,32 @@ public partial class MainWindow
                             case 0: infoText += "\nWrap mode: Repeat"; break;
                             case 1: infoText += "\nWrap mode: Clamp"; break;
                         }
+
+                        // Perform .resS I/O, Crunch unpack, and CPU fallback decode (e.g., ASTC) strictly off the UI/GL thread.
+                        preparedPayload = TextureGLPreviewControl.PrepareGpuTexturePayload(previewTexture, glCapabilities, token);
                     }
-                    else if (previewSprite != null)
+                    else
                     {
-                        decodedImage = previewSprite.GetImage();
+                        var sprite = previewSprite!;
+                        EnsureSpriteDependenciesInBackground(sprite, token);
+                        token.ThrowIfCancellationRequested();
+
+                        using var decodedImage = sprite.GetImage();
                         if (decodedImage == null)
                         {
-                            throw new Exception("Failed to decode sprite image on CPU.");
+                            throw new InvalidOperationException("Failed to decode sprite image on CPU.");
                         }
-                        width = decodedImage.Width;
-                        height = decodedImage.Height;
-                        infoText = $"Width: {width}\nHeight: {height}\n";
+
+                        infoText = $"Width: {decodedImage.Width}\nHeight: {decodedImage.Height}\n";
+                        preparedPayload = TextureGLPreviewControl.PrepareGpuImagePayload(decodedImage, glCapabilities, token);
                     }
+
+                    token.ThrowIfCancellationRequested();
 
                     int validChannel = 0;
                     for (int i = 0; i < 4; i++)
                     {
-                        if (textureChannels[i]) validChannel++;
+                        if (channelsSnapshot[i]) validChannel++;
                     }
 
                     infoText += "\nChannels: ";
@@ -279,80 +322,71 @@ public partial class MainWindow
                     else
                     {
                         var channelNames = new string[4] { "R", "G", "B", "A" };
-                        var activeList = new List<string>();
+                        var activeList = new List<string>(4);
                         for (int i = 0; i < 4; i++)
                         {
-                            if (textureChannels[i])
+                            if (channelsSnapshot[i])
                                 activeList.Add(channelNames[i]);
                         }
                         infoText += string.Join(" ", activeList);
                     }
                     infoText += "\nRender mode: GPU (OpenGL)";
 
+                    string finalInfoText = infoText;
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (currentId == texturePreviewIdCounter)
+                        if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
                         {
-                            try
-                            {
-                                ImagePreviewBox.IsVisible = false;
-                                GLPreviewControl.IsVisible = false;
-                                TextPreviewBox.IsVisible = false;
-                                PreviewLabel.IsVisible = false;
-                                TextureGLPreview.IsVisible = true;
-                                TextureGLPreview.Focus();
-
-                                if (isSprite && decodedImage != null)
-                                {
-                                    TextureGLPreview.SetImage(decodedImage);
-                                }
-                                else if (previewTexture != null)
-                                {
-                                    TextureGLPreview.SetTexture(previewTexture);
-                                }
-                                TextureGLPreview.SetChannels(textureChannels);
-
-                                if (displayInfo.IsChecked == true)
-                                {
-                                    PreviewInfoOverlay.Text = infoText;
-                                    PreviewInfoBorder.IsVisible = true;
-                                }
-                                else
-                                {
-                                    PreviewInfoBorder.IsVisible = false;
-                                }
-
-                                ClearPreviewCacheBadge();
-                                StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
-                            }
-                            catch (Exception ex)
-                            {
-                                logger.Log(LoggerEvent.Warning, $"GPU texture preview failed setup: {ex.Message}. Falling back to CPU.");
-                                UpdateImagePreview(forceCpu: true);
-                            }
-                            finally
-                            {
-                                decodedImage?.Dispose();
-                            }
+                            return;
                         }
-                        else
+
+                        try
                         {
-                            decodedImage?.Dispose();
+                            ImagePreviewBox.IsVisible = false;
+                            GLPreviewControl.IsVisible = false;
+                            TextPreviewBox.IsVisible = false;
+                            PreviewLabel.IsVisible = false;
+                            glControl.IsVisible = true;
+                            glControl.Focus();
+
+                            glControl.SetPreparedTexture(preparedPayload);
+                            glControl.SetChannels(textureChannels);
+
+                            if (displayInfo.IsChecked == true)
+                            {
+                                PreviewInfoOverlay.Text = finalInfoText;
+                                PreviewInfoBorder.IsVisible = true;
+                            }
+                            else
+                            {
+                                PreviewInfoBorder.IsVisible = false;
+                            }
+
+                            ClearPreviewCacheBadge();
+                            StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle | Drag to Pan, Scroll to Zoom");
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.Log(LoggerEvent.Warning, $"GPU texture preview failed setup: {ex.Message}. Falling back to CPU.");
+                            UpdateImagePreview(forceCpu: true);
                         }
                     });
+                }
+                catch (OperationCanceledException)
+                {
                 }
                 catch (Exception ex)
                 {
                     logger.Log(LoggerEvent.Warning, $"GPU texture preview failed preparation: {ex.Message}. Falling back to CPU.");
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (currentId == texturePreviewIdCounter)
+                        if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                         {
                             UpdateImagePreview(forceCpu: true);
                         }
                     });
                 }
-            });
+            }, token);
             return;
         }
 
@@ -364,12 +398,13 @@ public partial class MainWindow
 
         StatusStripUpdate("Loading preview (CPU)...");
 
-        Task.Run(() =>
+        _ = Task.Run(() =>
         {
             TexturePreviewImageResult? cachedTextureResult = null;
             SKBitmap? ownedSpriteImage = null;
             try
             {
+                token.ThrowIfCancellationRequested();
                 SKBitmap? image = null;
                 string infoText = string.Empty;
                 bool isTexture = previewTexture != null;
@@ -409,6 +444,8 @@ public partial class MainWindow
                 }
                 else if (previewSprite != null)
                 {
+                    EnsureSpriteDependenciesInBackground(previewSprite, token);
+                    token.ThrowIfCancellationRequested();
                     ownedSpriteImage = previewSprite.GetImage();
                     image = ownedSpriteImage;
                     if (image != null)
@@ -416,6 +453,8 @@ public partial class MainWindow
                         infoText = $"Width: {image.Width}\nHeight: {image.Height}\n";
                     }
                 }
+
+                token.ThrowIfCancellationRequested();
 
                 if (image == null)
                 {
@@ -434,7 +473,7 @@ public partial class MainWindow
 
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (currentId == texturePreviewIdCounter)
+                        if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                         {
                             ClearPreviewCacheBadge();
                             StatusStripUpdate(failReason);
@@ -449,7 +488,7 @@ public partial class MainWindow
                     int validChannel = 0;
                     for (int i = 0; i < 4; i++)
                     {
-                        if (textureChannels[i])
+                        if (channelsSnapshot[i])
                         {
                             validChannel++;
                         }
@@ -457,10 +496,17 @@ public partial class MainWindow
 
                     if (validChannel != 4)
                     {
-                        ApplyPreviewChannelMask(image, textureChannels, validChannel);
+                        ApplyPreviewChannelMask(image, channelsSnapshot, validChannel);
                     }
 
+                    token.ThrowIfCancellationRequested();
                     var bitmap = CreateWriteableBitmapFromSKBitmap(image);
+
+                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        bitmap.Dispose();
+                        return;
+                    }
 
                     infoText += "\nChannels: ";
                     if (validChannel == 0)
@@ -470,10 +516,10 @@ public partial class MainWindow
                     else
                     {
                         var channelNames = new string[4] { "R", "G", "B", "A" };
-                        var activeList = new List<string>();
+                        var activeList = new List<string>(4);
                         for (int i = 0; i < 4; i++)
                         {
-                            if (textureChannels[i])
+                            if (channelsSnapshot[i])
                                 activeList.Add(channelNames[i]);
                         }
                         infoText += string.Join(" ", activeList);
@@ -485,7 +531,7 @@ public partial class MainWindow
                     string? finalSourceKind = isTexture ? "texture-thumbnail-png" : "sprite";
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (currentId == texturePreviewIdCounter)
+                        if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                         {
                             ImagePreviewBox.Source = bitmap;
                             ImagePreviewBox.IsVisible = true;
@@ -520,11 +566,14 @@ public partial class MainWindow
                     });
                 }
             }
+            catch (OperationCanceledException)
+            {
+            }
             catch (Exception ex)
             {
                 Dispatcher.UIThread.Post(() =>
                 {
-                    if (currentId == texturePreviewIdCounter)
+                    if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                     {
                         ClearPreviewCacheBadge();
                         StatusStripUpdate($"Error generating preview: {ex.Message}");
@@ -538,7 +587,7 @@ public partial class MainWindow
                 cachedTextureResult?.Dispose();
                 ownedSpriteImage?.Dispose();
             }
-        });
+        }, token);
     }
 
     public static global::Avalonia.Media.Imaging.WriteableBitmap CreateWriteableBitmapFromSKBitmap(SKBitmap image)

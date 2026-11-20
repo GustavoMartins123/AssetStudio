@@ -376,7 +376,40 @@ void main()
             GL.BufferData(BufferTarget.ElementArrayBuffer, (IntPtr)(data.Length * sizeof(int)), data, BufferUsageHint.StaticDraw);
         }
 
-        private void BindAttribsAndEBO(bool isWireframe)
+        internal static bool ShouldCreateWireframeVao(bool avatarMode, int currentWireframeMode)
+        {
+            return avatarMode || currentWireframeMode == 1 || currentWireframeMode == 2;
+        }
+
+        internal static int[] BuildWireframeLineIndices(ReadOnlySpan<int> triangleIndices)
+        {
+            int triangleCount = triangleIndices.Length / 3;
+            if (triangleCount <= 0)
+            {
+                return Array.Empty<int>();
+            }
+
+            int[] lineIndices = new int[triangleCount * 6];
+            int dst = 0;
+            int limit = triangleCount * 3;
+            for (int i = 0; i < limit; i += 3)
+            {
+                int i0 = triangleIndices[i];
+                int i1 = triangleIndices[i + 1];
+                int i2 = triangleIndices[i + 2];
+                lineIndices[dst] = i0;
+                lineIndices[dst + 1] = i1;
+                lineIndices[dst + 2] = i1;
+                lineIndices[dst + 3] = i2;
+                lineIndices[dst + 4] = i2;
+                lineIndices[dst + 5] = i0;
+                dst += 6;
+            }
+
+            return lineIndices;
+        }
+
+        private void BindSolidAttribsAndEBO()
         {
             if (vboPosition == 0)
             {
@@ -407,36 +440,31 @@ void main()
                 CreateVBO(out _, colorData, LocationColor);
             }
 
-            if (isWireframe)
-            {
-                if (indiceData != null)
-                {
-                    var lineIndices = new List<int>();
-                    for (int i = 0; i < indiceData.Length; i += 3)
-                    {
-                        if (i + 2 < indiceData.Length)
-                        {
-                            int i0 = indiceData[i];
-                            int i1 = indiceData[i + 1];
-                            int i2 = indiceData[i + 2];
-                            lineIndices.Add(i0);
-                            lineIndices.Add(i1);
-                            lineIndices.Add(i1);
-                            lineIndices.Add(i2);
-                            lineIndices.Add(i2);
-                            lineIndices.Add(i0);
-                        }
-                    }
-
-                    CreateEBO(out _, lineIndices.ToArray());
-                }
-            }
-            else
-            {
-                CreateEBO(out _, indiceData);
-            }
-
+            CreateEBO(out _, indiceData);
             GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+        }
+
+        private void EnsureWireframeVAO()
+        {
+            if (vaoWireframe != 0 || indiceData == null || vboPosition == 0)
+            {
+                return;
+            }
+
+            var lineIndices = BuildWireframeLineIndices(indiceData);
+            if (lineIndices.Length == 0)
+            {
+                return;
+            }
+
+            GL.GenVertexArrays(1, out vaoWireframe);
+            GL.BindVertexArray(vaoWireframe);
+            GL.BindBuffer(BufferTarget.ArrayBuffer, vboPosition);
+            GL.VertexAttribPointer(LocationPosition, 3, VertexAttribPointerType.Float, false, 0, 0);
+            GL.EnableVertexAttribArray(LocationPosition);
+            CreateEBO(out _, lineIndices);
+            GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+            GL.BindVertexArray(0);
         }
 
         private void CreateVAO()
@@ -445,13 +473,14 @@ void main()
 
             GL.GenVertexArrays(1, out vao);
             GL.BindVertexArray(vao);
-            BindAttribsAndEBO(false);
+            BindSolidAttribsAndEBO();
             GL.BindVertexArray(0);
 
-            GL.GenVertexArrays(1, out vaoWireframe);
-            GL.BindVertexArray(vaoWireframe);
-            BindAttribsAndEBO(true);
-            GL.BindVertexArray(0);
+            // Wireframe VAO is built lazily only when wireframe/avatar mode actually renders it.
+            if (ShouldCreateWireframeVao(isAvatarMode, wireFrameMode))
+            {
+                EnsureWireframeVAO();
+            }
 
             Vector3[]? localSkeletonVerts = null;
             lock (skeletonLock)
