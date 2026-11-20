@@ -1,6 +1,8 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
@@ -12,20 +14,8 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
-    private const int ExtractionProgressThrottleMilliseconds = 50;
-
     internal static int GetExtractionThreadCount(int requestedDegreeOfParallelism = 0)
-    {
-        if (requestedDegreeOfParallelism > 0)
-        {
-            return requestedDegreeOfParallelism;
-        }
-
-        return Math.Clamp(
-            AssetsManager.GetConfiguredThreadCount("ASSETSTUDIO_EXTRACT_THREADS", 1.0),
-            1,
-            16);
-    }
+        => AssetExportService.GetExtractionThreadCount(requestedDegreeOfParallelism);
 
     private async void ExtractFile_Click(object? sender, RoutedEventArgs e)
     {
@@ -42,16 +32,31 @@ public partial class MainWindow
         SaveLoadFolder(filePaths.FirstOrDefault() ?? string.Empty);
         var savePath = folders[0].Path.LocalPath;
         SaveExportFolder(savePath);
+
+        var cancellationToken = ExportState.BeginExport(
+            ExportOperationMode.ExtractBundle,
+            filePaths.Length,
+            savePath,
+            "Extracting files...");
         StatusStripUpdate("Extracting files...");
         try
         {
-            var extractedCount = await Task.Run(() => ExtractFiles(filePaths, savePath));
-            StatusStripUpdate($"Finished extracting {extractedCount} files.");
+            var extractedCount = await Task.Run(() => ExtractFiles(filePaths, savePath, cancellationToken));
+            var status = $"Finished extracting {extractedCount} files.";
+            ExportState.Complete(extractedCount, statusText: status);
+            StatusStripUpdate(status);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            ExportState.Complete(0, statusText: "Extraction cancelled.", wasCancelled: true);
+            StatusStripUpdate("Extraction cancelled.");
         }
         catch (Exception ex)
         {
             Logger.Error("Error extracting files", ex);
-            StatusStripUpdate($"Error extracting files: {ex.Message}");
+            var errorStatus = $"Error extracting files: {ex.Message}";
+            ExportState.Fail(errorStatus);
+            StatusStripUpdate(errorStatus);
         }
     }
 
@@ -70,26 +75,43 @@ public partial class MainWindow
         SaveLoadFolder(sourcePath);
         var savePath = saveFolders[0].Path.LocalPath;
         SaveExportFolder(savePath);
+
+        var cancellationToken = ExportState.BeginExport(
+            ExportOperationMode.ExtractBundle,
+            totalCount: 0,
+            targetFolder: savePath,
+            initialStatusText: "Extracting folder...");
         StatusStripUpdate("Extracting folder...");
         try
         {
-            var extractedCount = await Task.Run(() => ExtractFolder(sourcePath, savePath));
-            StatusStripUpdate($"Finished extracting {extractedCount} files.");
+            var extractedCount = await Task.Run(() => ExtractFolder(sourcePath, savePath, cancellationToken));
+            var status = $"Finished extracting {extractedCount} files.";
+            ExportState.Complete(extractedCount, statusText: status);
+            StatusStripUpdate(status);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            ExportState.Complete(0, statusText: "Folder extraction cancelled.", wasCancelled: true);
+            StatusStripUpdate("Folder extraction cancelled.");
         }
         catch (Exception ex)
         {
             Logger.Error("Error extracting folder", ex);
-            StatusStripUpdate($"Error extracting folder: {ex.Message}");
+            var errorStatus = $"Error extracting folder: {ex.Message}";
+            ExportState.Fail(errorStatus);
+            StatusStripUpdate(errorStatus);
         }
     }
 
     internal int ExtractFolder(string path, string savePath, CancellationToken cancellationToken = default)
     {
-        return ExtractFolderCore(
+        Progress.Reset();
+        return AssetExportService.ExtractFolder(
             path,
             savePath,
             StatusStripUpdate,
             Progress.Report,
+            viewModel: ExportState,
             maxDegreeOfParallelism: 0,
             cancellationToken: cancellationToken);
     }
@@ -102,86 +124,26 @@ public partial class MainWindow
         int maxDegreeOfParallelism = 0,
         CancellationToken cancellationToken = default)
     {
-        var sourceRoot = Path.GetFullPath(path);
-        var saveRoot = Path.GetFullPath(savePath);
-        var saveRootWithSeparator = saveRoot
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            + Path.DirectorySeparatorChar;
-        var comparison = OperatingSystem.IsWindows()
-            ? StringComparison.OrdinalIgnoreCase
-            : StringComparison.Ordinal;
-        var pathComparer = OperatingSystem.IsWindows()
-            ? StringComparer.OrdinalIgnoreCase
-            : StringComparer.Ordinal;
-
-        var files = ImportHelper.GetFilesSafe(sourceRoot, "*.*", true);
-        var total = files.Length;
         Progress.Reset();
-        if (total == 0)
-        {
-            return 0;
-        }
-
-        var extractedCount = 0;
-        var completedCount = 0;
-        var lastReportedPercent = -1;
-        var lastProgressTicks = 0L;
-        var reservedOutputPaths = new ConcurrentDictionary<string, byte>(pathComparer);
-        var parallelOptions = new ParallelOptions
-        {
-            MaxDegreeOfParallelism = Math.Min(GetExtractionThreadCount(maxDegreeOfParallelism), total),
-            CancellationToken = cancellationToken
-        };
-
-        Parallel.For(0, total, parallelOptions, i =>
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var file = files[i];
-            var fileDirectory = Path.GetDirectoryName(file) ?? sourceRoot;
-            var relativeDirectory = Path.GetRelativePath(sourceRoot, fileDirectory);
-            var fileSavePath = string.IsNullOrEmpty(relativeDirectory) || relativeDirectory == "."
-                ? saveRoot
-                : Path.GetFullPath(Path.Combine(saveRoot, relativeDirectory));
-
-            if (!string.Equals(fileSavePath, saveRoot, comparison)
-                && !fileSavePath.StartsWith(saveRootWithSeparator, comparison))
-            {
-                Logger.Warning($"Blocked folder extraction target outside destination root: '{file}'");
-                var blockedCompleted = Interlocked.Increment(ref completedCount);
-                ReportThrottledExtractionProgress(
-                    blockedCompleted,
-                    total,
-                    ref lastReportedPercent,
-                    ref lastProgressTicks,
-                    progressReport);
-                return;
-            }
-
-            var count = ExtractFileCore(file, fileSavePath, statusUpdate, reservedOutputPaths);
-            if (count > 0)
-            {
-                Interlocked.Add(ref extractedCount, count);
-            }
-
-            var completed = Interlocked.Increment(ref completedCount);
-            ReportThrottledExtractionProgress(
-                completed,
-                total,
-                ref lastReportedPercent,
-                ref lastProgressTicks,
-                progressReport);
-        });
-
-        return extractedCount;
+        return AssetExportService.ExtractFolder(
+            path,
+            savePath,
+            statusUpdate,
+            progressReport,
+            viewModel: null,
+            maxDegreeOfParallelism: maxDegreeOfParallelism,
+            cancellationToken: cancellationToken);
     }
 
     internal int ExtractFiles(string[] fileNames, string savePath, CancellationToken cancellationToken = default)
     {
-        return ExtractFilesCore(
+        Progress.Reset();
+        return AssetExportService.ExtractFiles(
             fileNames,
             savePath,
             StatusStripUpdate,
             Progress.Report,
+            viewModel: ExportState,
             maxDegreeOfParallelism: 0,
             cancellationToken: cancellationToken);
     }
@@ -194,237 +156,23 @@ public partial class MainWindow
         int maxDegreeOfParallelism = 0,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(fileNames);
-        var total = fileNames.Length;
         Progress.Reset();
-        if (total == 0)
-        {
-            return 0;
-        }
-
-        var pathComparer = OperatingSystem.IsWindows()
-            ? StringComparer.OrdinalIgnoreCase
-            : StringComparer.Ordinal;
-        var reservedOutputPaths = new ConcurrentDictionary<string, byte>(pathComparer);
-        var extractedCount = 0;
-        var completedCount = 0;
-        var lastReportedPercent = -1;
-        var lastProgressTicks = 0L;
-        var parallelOptions = new ParallelOptions
-        {
-            MaxDegreeOfParallelism = Math.Min(GetExtractionThreadCount(maxDegreeOfParallelism), total),
-            CancellationToken = cancellationToken
-        };
-
-        Parallel.For(0, total, parallelOptions, i =>
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var count = ExtractFileCore(fileNames[i], savePath, statusUpdate, reservedOutputPaths);
-            if (count > 0)
-            {
-                Interlocked.Add(ref extractedCount, count);
-            }
-
-            var completed = Interlocked.Increment(ref completedCount);
-            ReportThrottledExtractionProgress(
-                completed,
-                total,
-                ref lastReportedPercent,
-                ref lastProgressTicks,
-                progressReport);
-        });
-
-        return extractedCount;
-    }
-
-    private static void ReportThrottledExtractionProgress(
-        int completed,
-        int total,
-        ref int lastReportedPercent,
-        ref long lastProgressTicks,
-        Action<int, int>? progressReport)
-    {
-        if (progressReport == null || total <= 0)
-        {
-            return;
-        }
-
-        var percent = Math.Clamp((int)((double)completed / total * 100), 0, 100);
-        var nowTicks = Environment.TickCount64;
-        var prevPercent = Volatile.Read(ref lastReportedPercent);
-        var prevTicks = Interlocked.Read(ref lastProgressTicks);
-
-        var isFinal = completed >= total;
-        var percentChanged = percent > prevPercent;
-        var timeElapsed = nowTicks - prevTicks >= ExtractionProgressThrottleMilliseconds;
-
-        if (!isFinal && !percentChanged && !timeElapsed)
-        {
-            return;
-        }
-
-        if (percentChanged)
-        {
-            Interlocked.CompareExchange(ref lastReportedPercent, percent, prevPercent);
-        }
-
-        if (isFinal || timeElapsed || percentChanged)
-        {
-            if (isFinal || Interlocked.CompareExchange(ref lastProgressTicks, nowTicks, prevTicks) == prevTicks)
-            {
-                progressReport(completed, total);
-            }
-        }
+        return AssetExportService.ExtractFiles(
+            fileNames,
+            savePath,
+            statusUpdate,
+            progressReport,
+            viewModel: null,
+            maxDegreeOfParallelism: maxDegreeOfParallelism,
+            cancellationToken: cancellationToken);
     }
 
     private int ExtractFile(string fileName, string savePath)
-    {
-        return ExtractFileCore(fileName, savePath, StatusStripUpdate, reservedOutputPaths: null);
-    }
-
-    private static int ExtractFileCore(
-        string fileName,
-        string savePath,
-        Action<string>? statusUpdate,
-        ConcurrentDictionary<string, byte>? reservedOutputPaths)
-    {
-        using var reader = new FileReader(fileName);
-        return reader.FileType switch
-        {
-            FileType.BundleFile => ExtractBundleFileCore(reader, savePath, statusUpdate, reservedOutputPaths),
-            FileType.WebFile => ExtractWebDataFileCore(reader, savePath, statusUpdate, reservedOutputPaths),
-            _ => 0
-        };
-    }
-
-    private static int ExtractBundleFileCore(
-        FileReader reader,
-        string savePath,
-        Action<string>? statusUpdate,
-        ConcurrentDictionary<string, byte>? reservedOutputPaths)
-    {
-        statusUpdate?.Invoke($"Decompressing {reader.FileName} ...");
-        var fileName = FixFileName(reader.FileName);
-        using var bundleFile = new BundleFile(reader);
-        if (bundleFile.fileList.Length == 0) return 0;
-
-        var extractPath = Path.Combine(savePath, fileName + "_unpacked");
-        return ExtractStreamFiles(extractPath, bundleFile.fileList, reservedOutputPaths);
-    }
-
-    private static int ExtractWebDataFileCore(
-        FileReader reader,
-        string savePath,
-        Action<string>? statusUpdate,
-        ConcurrentDictionary<string, byte>? reservedOutputPaths)
-    {
-        statusUpdate?.Invoke($"Decompressing {reader.FileName} ...");
-        var fileName = FixFileName(reader.FileName);
-        var webFile = new WebFile(reader);
-        if (webFile.fileList.Length == 0) return 0;
-
-        var extractPath = Path.Combine(savePath, fileName + "_unpacked");
-        return ExtractStreamFiles(extractPath, webFile.fileList, reservedOutputPaths);
-    }
+        => AssetExportService.ExtractSingleFile(fileName, savePath, StatusStripUpdate, reservedOutputPaths: null);
 
     internal static int ExtractStreamFiles(
         string extractPath,
         StreamFile[] fileList,
         ConcurrentDictionary<string, byte>? reservedOutputPaths = null)
-    {
-        var extractedCount = 0;
-        var rootFullPath = Path.GetFullPath(extractPath)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            + Path.DirectorySeparatorChar;
-        var comparison = OperatingSystem.IsWindows()
-            ? StringComparison.OrdinalIgnoreCase
-            : StringComparison.Ordinal;
-
-        foreach (var file in fileList)
-        {
-            try
-            {
-                var rawPath = file.path ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(rawPath) || file.stream == null)
-                {
-                    continue;
-                }
-
-                if (Path.IsPathRooted(rawPath))
-                {
-                    Logger.Warning($"Blocked rooted path in bundle entry: '{rawPath}'");
-                    continue;
-                }
-
-                var rawSegments = rawPath.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-                if (rawSegments.Length == 0 || rawSegments.Any(part => part.Trim() is "." or ".."))
-                {
-                    Logger.Warning($"Blocked path traversal attempt in bundle entry: '{rawPath}'");
-                    continue;
-                }
-
-                var safeSegments = rawSegments
-                    .Select(FixFileName)
-                    .Where(part => !string.IsNullOrWhiteSpace(part))
-                    .ToArray();
-                if (safeSegments.Length == 0)
-                {
-                    continue;
-                }
-
-                var filePath = Path.GetFullPath(Path.Combine(rootFullPath, Path.Combine(safeSegments)));
-                if (!filePath.StartsWith(rootFullPath, comparison))
-                {
-                    Logger.Warning($"Blocked path traversal attempt in bundle entry: '{rawPath}'");
-                    continue;
-                }
-
-                if (reservedOutputPaths != null && !reservedOutputPaths.TryAdd(filePath, 0))
-                {
-                    continue;
-                }
-
-                var fileDirectory = Path.GetDirectoryName(filePath);
-                if (!string.IsNullOrEmpty(fileDirectory))
-                {
-                    Directory.CreateDirectory(fileDirectory);
-                }
-
-                if (!File.Exists(filePath))
-                {
-                    var createdFile = false;
-                    try
-                    {
-                        using var fileStream = new FileStream(
-                            filePath,
-                            FileMode.CreateNew,
-                            FileAccess.Write,
-                            FileShare.None,
-                            64 * 1024,
-                            FileOptions.SequentialScan);
-                        createdFile = true;
-                        file.stream.CopyTo(fileStream);
-                        extractedCount++;
-                    }
-                    catch (IOException) when (!createdFile && File.Exists(filePath))
-                    {
-                        // Another worker created the destination file concurrently; preserve existing file.
-                    }
-                    catch
-                    {
-                        if (createdFile)
-                        {
-                            TryDeletePartialExport(filePath);
-                        }
-                        throw;
-                    }
-                }
-            }
-            finally
-            {
-                file.stream?.Dispose();
-            }
-        }
-        return extractedCount;
-    }
+        => AssetExportService.ExtractStreamFiles(extractPath, fileList, reservedOutputPaths);
 }

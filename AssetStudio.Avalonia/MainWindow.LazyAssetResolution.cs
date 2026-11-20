@@ -1,4 +1,5 @@
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -390,25 +391,8 @@ public partial class MainWindow
         }
     }
 
-    internal const int DefaultLazyExportBatchSourceFileLimit = 16;
-    internal const long DefaultLazyExportBatchByteLimit = 256L * 1024L * 1024L; // 256 MiB
-
-    internal sealed class LazyExportSourceBatch
-    {
-        public IReadOnlyList<string> SourcePaths { get; }
-        public IReadOnlyList<AssetItem> Items { get; }
-        public long EstimatedAssetBytes { get; }
-
-        public LazyExportSourceBatch(
-            IReadOnlyList<string> sourcePaths,
-            IReadOnlyList<AssetItem> items,
-            long estimatedAssetBytes)
-        {
-            SourcePaths = sourcePaths;
-            Items = items;
-            EstimatedAssetBytes = estimatedAssetBytes;
-        }
-    }
+    internal const int DefaultLazyExportBatchSourceFileLimit = AssetExportService.DefaultLazyExportBatchSourceFileLimit;
+    internal const long DefaultLazyExportBatchByteLimit = AssetExportService.DefaultLazyExportBatchByteLimit;
 
     internal string ResolveLazyExportSourceKey(AssetItem item)
     {
@@ -456,95 +440,11 @@ public partial class MainWindow
         Func<AssetItem, string?> sourcePathResolver,
         int maxSourceFilesPerBatch = DefaultLazyExportBatchSourceFileLimit,
         long maxAssetBytesPerBatch = DefaultLazyExportBatchByteLimit)
-    {
-        ArgumentNullException.ThrowIfNull(items);
-        ArgumentNullException.ThrowIfNull(sourcePathResolver);
-
-        maxSourceFilesPerBatch = Math.Max(1, maxSourceFilesPerBatch);
-        maxAssetBytesPerBatch = Math.Max(1L, maxAssetBytesPerBatch);
-
-        var batches = new List<LazyExportSourceBatch>();
-        if (items.Count == 0)
-        {
-            return batches;
-        }
-
-        var comparer = OperatingSystem.IsWindows()
-            ? StringComparer.OrdinalIgnoreCase
-            : StringComparer.Ordinal;
-
-        var sourceGroupOrder = new List<string>();
-        var itemsBySource = new Dictionary<string, List<AssetItem>>(comparer);
-        var bytesBySource = new Dictionary<string, long>(comparer);
-
-        for (int i = 0; i < items.Count; i++)
-        {
-            var item = items[i];
-            if (item == null)
-            {
-                continue;
-            }
-
-            var rawSource = sourcePathResolver(item) ?? string.Empty;
-            var groupKey = rawSource.Trim();
-            if (!itemsBySource.TryGetValue(groupKey, out var groupItems))
-            {
-                groupItems = new List<AssetItem>();
-                itemsBySource[groupKey] = groupItems;
-                bytesBySource[groupKey] = 0L;
-                sourceGroupOrder.Add(groupKey);
-            }
-
-            groupItems.Add(item);
-            var itemBytes = Math.Max(0L, item.FullSize > 0 ? item.FullSize : item.Size);
-            bytesBySource[groupKey] += itemBytes;
-        }
-
-        var currentSourcePaths = new List<string>(maxSourceFilesPerBatch);
-        var currentItems = new List<AssetItem>();
-        long currentBytes = 0L;
-
-        void FlushBatch()
-        {
-            if (currentItems.Count == 0)
-            {
-                return;
-            }
-
-            batches.Add(new LazyExportSourceBatch(
-                currentSourcePaths.ToArray(),
-                currentItems.ToArray(),
-                currentBytes));
-            currentSourcePaths.Clear();
-            currentItems.Clear();
-            currentBytes = 0L;
-        }
-
-        for (int g = 0; g < sourceGroupOrder.Count; g++)
-        {
-            var sourceKey = sourceGroupOrder[g];
-            var groupItems = itemsBySource[sourceKey];
-            var groupBytes = bytesBySource[sourceKey];
-            var hasSourcePath = !string.IsNullOrEmpty(sourceKey);
-
-            var exceedsFileLimit = hasSourcePath && currentSourcePaths.Count >= maxSourceFilesPerBatch;
-            var exceedsByteLimit = currentItems.Count > 0 && currentBytes + groupBytes > maxAssetBytesPerBatch;
-            if (exceedsFileLimit || exceedsByteLimit)
-            {
-                FlushBatch();
-            }
-
-            if (hasSourcePath)
-            {
-                currentSourcePaths.Add(sourceKey);
-            }
-            currentItems.AddRange(groupItems);
-            currentBytes += groupBytes;
-        }
-
-        FlushBatch();
-        return batches;
-    }
+        => AssetExportService.BuildLazyExportBatches(
+            items,
+            sourcePathResolver,
+            maxSourceFilesPerBatch,
+            maxAssetBytesPerBatch);
 
     internal void EnsureLazyBatchLoadedForExport(
         LazyExportSourceBatch batch,
