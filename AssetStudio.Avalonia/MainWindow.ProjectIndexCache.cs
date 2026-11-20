@@ -30,7 +30,10 @@ public partial class MainWindow : Window
             + relations.ModelGroupMeshes.Count
             + relations.MeshRenderers.Count
             + relations.MeshMaterials.Count
-            + relations.MaterialTextures.Count;
+            + relations.MaterialTextures.Count
+            + relations.AnimationClipTargets.Count
+            + relations.RigBoneHashes.Count
+            + relations.ClipBoneHashes.Count;
     }
 
     private static string GetFolderCacheKey(string folderPath)
@@ -64,6 +67,7 @@ public partial class MainWindow : Window
                 materialPreviewMaterialCache = null;
                 materialTextureSlotsCache = null;
             }
+            _animationRigPreviewCache.Clear();
             SpriteHelper.ClearAtlasCache();
 
             StatusStripUpdate($"Cleared project cache for: {folderPath}");

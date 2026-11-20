@@ -103,4 +103,51 @@ namespace AssetStudio.Avalonia
         public ModelGroupInfo Group { get; }
         public List<ModelGroupMeshInfo> Meshes { get; } = new();
     }
+
+    internal sealed class AnimationClipTargetInfo
+    {
+        public AnimationClipTargetInfo(
+            string clipAssetId,
+            string animatorAssetId,
+            string avatarAssetId,
+            string meshAssetId,
+            string modelGroupId,
+            string relationKind,
+            int matchScore,
+            int matchedBoneCount = 0,
+            int totalClipBoneCount = 0,
+            string avatarName = "",
+            string meshName = "",
+            string modelGroupName = "",
+            int modelGroupConfidence = 0)
+        {
+            ClipAssetId = clipAssetId ?? string.Empty;
+            AnimatorAssetId = animatorAssetId ?? string.Empty;
+            AvatarAssetId = avatarAssetId ?? string.Empty;
+            MeshAssetId = meshAssetId ?? string.Empty;
+            ModelGroupId = modelGroupId ?? string.Empty;
+            RelationKind = relationKind ?? string.Empty;
+            MatchScore = matchScore;
+            MatchedBoneCount = matchedBoneCount;
+            TotalClipBoneCount = totalClipBoneCount;
+            AvatarName = avatarName ?? string.Empty;
+            MeshName = meshName ?? string.Empty;
+            ModelGroupName = modelGroupName ?? string.Empty;
+            ModelGroupConfidence = modelGroupConfidence;
+        }
+
+        public string ClipAssetId { get; }
+        public string AnimatorAssetId { get; }
+        public string AvatarAssetId { get; }
+        public string MeshAssetId { get; }
+        public string ModelGroupId { get; }
+        public string RelationKind { get; }
+        public int MatchScore { get; }
+        public int MatchedBoneCount { get; }
+        public int TotalClipBoneCount { get; }
+        public string AvatarName { get; }
+        public string MeshName { get; }
+        public string ModelGroupName { get; }
+        public int ModelGroupConfidence { get; }
+    }
 }

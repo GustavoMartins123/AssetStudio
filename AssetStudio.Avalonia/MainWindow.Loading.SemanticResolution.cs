@@ -153,6 +153,15 @@ namespace AssetStudio.Avalonia
                 }
             }
 
+            if (sourceFile.assetsManager?.LazyLoading == true && sourceFile.assetsManager.ProjectIndex != null)
+            {
+                var handle = sourceFile.assetsManager.ProjectIndex.GetHandle(sourceFile, pathID);
+                if (handle != null)
+                {
+                    return sourceFile.assetsManager.ResolveHandle(handle);
+                }
+            }
+
             return null;
         }
 

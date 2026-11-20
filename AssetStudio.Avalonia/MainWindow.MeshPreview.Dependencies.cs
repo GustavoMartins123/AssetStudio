@@ -52,6 +52,8 @@ public partial class MainWindow
         ClassIDType.Material,
         ClassIDType.Avatar,
         ClassIDType.Animator,
+        ClassIDType.Animation,
+        ClassIDType.AnimationClip,
         ClassIDType.AnimatorController,
         ClassIDType.AnimatorOverrideController,
         ClassIDType.RuntimeAnimatorController

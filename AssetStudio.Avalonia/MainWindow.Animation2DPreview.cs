@@ -6,6 +6,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
@@ -30,115 +32,203 @@ public partial class MainWindow
 
     private void Preview2DAnimationClip(AnimationClip clip)
     {
+        var token = _animationPreviewCoordinator.BeginNewRequest(out var requestId);
+        Preview2DAnimationClipAsync(clip, requestId, texturePreviewIdCounter, token);
+    }
+
+    private void Preview2DAnimationClipAsync(
+        AnimationClip clip,
+        long requestId,
+        long previewId,
+        CancellationToken cancellationToken)
+    {
         Stop2DAnimation();
-        EnsureAnimationClip2DPreviewDependenciesLoaded(clip);
+        StatusStripUpdate($"Loading 2D animation '{clip.m_Name}'...");
 
-        var pptrCurve = clip.m_PPtrCurves?.FirstOrDefault(c => c.curve != null && c.curve.Length > 0);
-        if (pptrCurve == null)
+        _ = Task.Run(() =>
         {
-            StatusStripUpdate("AnimationClip: No keyframes found in 2D animation curves.");
-            return;
-        }
-
-        var frames = new List<(float time, AssetStudio.Object asset)>();
-        foreach (var kf in pptrCurve.curve)
-        {
-            if (kf.value != null && !kf.value.IsNull)
+            Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap>? decodedBitmaps = null;
+            try
             {
-                if (kf.value.TryGet<Sprite>(out var sprite))
+                cancellationToken.ThrowIfCancellationRequested();
+                EnsureAnimationClip2DPreviewDependenciesLoaded(clip);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var pptrCurve = clip.m_PPtrCurves?.FirstOrDefault(c => c.curve != null && c.curve.Length > 0);
+                if (pptrCurve == null)
                 {
-                    frames.Add((kf.time, sprite));
-                }
-                else if (kf.value.TryGet<Texture2D>(out var texture))
-                {
-                    frames.Add((kf.time, texture));
-                }
-            }
-        }
-
-        if (frames.Count == 0)
-        {
-            StatusStripUpdate("AnimationClip: No Sprites or Textures could be loaded for 2D animation.");
-            return;
-        }
-
-        _2dAnimFrames = frames.OrderBy(f => f.time).ToList();
-        _2dAnimDuration = _2dAnimFrames.Last().time;
-        if (_2dAnimDuration <= 0)
-        {
-            _2dAnimDuration = 1.0f;
-        }
-
-        _2dAnimBitmaps.Clear();
-        foreach (var f in _2dAnimFrames)
-        {
-            if (!_2dAnimBitmaps.ContainsKey(f.asset))
-            {
-                try
-                {
-                    SKBitmap? img = null;
-                    if (f.asset is Sprite sprite)
+                    Dispatcher.UIThread.Post(() =>
                     {
-                        img = sprite.GetImage();
-                    }
-                    else if (f.asset is Texture2D texture)
-                    {
-                        img = texture.ConvertToImage(true);
-                    }
-
-                    if (img != null)
-                    {
-                        using (img)
-                        using (var ms = new MemoryStream())
+                        if (!cancellationToken.IsCancellationRequested
+                            && _animationPreviewCoordinator.IsCurrent(requestId)
+                            && previewId == texturePreviewIdCounter)
                         {
-                            img.WriteToStream(ms, ImageFormat.Png);
-                            ms.Position = 0;
-                            var bmp = new global::Avalonia.Media.Imaging.Bitmap(ms);
-                            _2dAnimBitmaps[f.asset] = bmp;
+                            StatusStripUpdate("AnimationClip: No keyframes found in 2D animation curves.");
+                        }
+                    });
+                    return;
+                }
+
+                var frames = new List<(float time, AssetStudio.Object asset)>();
+                foreach (var kf in pptrCurve.curve)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (kf.value != null && !kf.value.IsNull)
+                    {
+                        if (kf.value.TryGet<Sprite>(out var sprite))
+                        {
+                            frames.Add((kf.time, sprite));
+                        }
+                        else if (kf.value.TryGet<Texture2D>(out var texture))
+                        {
+                            frames.Add((kf.time, texture));
                         }
                     }
                 }
-                catch (Exception ex)
+
+                if (frames.Count == 0)
                 {
-                    logger.Log(LoggerEvent.Warning, $"Failed to decode 2D animation frame: {ex.Message}");
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (!cancellationToken.IsCancellationRequested
+                            && _animationPreviewCoordinator.IsCurrent(requestId)
+                            && previewId == texturePreviewIdCounter)
+                        {
+                            StatusStripUpdate("AnimationClip: No Sprites or Textures could be loaded for 2D animation.");
+                        }
+                    });
+                    return;
+                }
+
+                var orderedFrames = frames.OrderBy(f => f.time).ToList();
+                var duration = orderedFrames.Last().time;
+                if (duration <= 0)
+                {
+                    duration = 1.0f;
+                }
+
+                decodedBitmaps = new Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap>();
+                foreach (var f in orderedFrames)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!decodedBitmaps.ContainsKey(f.asset))
+                    {
+                        try
+                        {
+                            SKBitmap? img = null;
+                            if (f.asset is Sprite sprite)
+                            {
+                                img = sprite.GetImage();
+                            }
+                            else if (f.asset is Texture2D texture)
+                            {
+                                img = texture.ConvertToImage(true);
+                            }
+
+                            if (img != null)
+                            {
+                                using (img)
+                                using (var ms = new MemoryStream())
+                                {
+                                    img.WriteToStream(ms, ImageFormat.Png);
+                                    ms.Position = 0;
+                                    var bmp = new global::Avalonia.Media.Imaging.Bitmap(ms);
+                                    decodedBitmaps[f.asset] = bmp;
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.Log(LoggerEvent.Warning, $"Failed to decode 2D animation frame: {ex.Message}");
+                        }
+                    }
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var finalBitmaps = decodedBitmaps;
+                decodedBitmaps = null;
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (cancellationToken.IsCancellationRequested
+                        || !_animationPreviewCoordinator.IsCurrent(requestId)
+                        || previewId != texturePreviewIdCounter)
+                    {
+                        foreach (var bmp in finalBitmaps.Values.Distinct())
+                        {
+                            bmp.Dispose();
+                        }
+                        return;
+                    }
+
+                    if (finalBitmaps.Count == 0)
+                    {
+                        StatusStripUpdate("AnimationClip: Failed to decode any sprite/texture frames for preview.");
+                        return;
+                    }
+
+                    Stop2DAnimation();
+                    _2dAnimFrames = orderedFrames;
+                    _2dAnimDuration = duration;
+                    _2dAnimBitmaps = finalBitmaps;
+
+                    if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
+                    if (TextureGLPreview != null) TextureGLPreview.IsVisible = false;
+                    if (TextPreviewBox != null) TextPreviewBox.IsVisible = false;
+                    if (PreviewLabel != null) PreviewLabel.IsVisible = false;
+                    if (ImagePreviewBox != null)
+                    {
+                        ImagePreviewBox.IsVisible = true;
+                        ImagePreviewBox.Stretch = global::Avalonia.Media.Stretch.Fill;
+                        ImagePreviewBox.StretchDirection = global::Avalonia.Media.StretchDirection.Both;
+                    }
+
+                    _is2dAnimationPreviewActive = true;
+                    _2dAnimPaused = false;
+                    _2dAnimPausedElapsedSeconds = 0;
+                    _2dAnimCurrentFrameIndex = 0;
+                    _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
+                    _2dAnimStartTime = DateTime.UtcNow;
+                    ShowAnimationPlayback(_2dAnimFrames.Count);
+                    Render2DAnimationFrame(0);
+
+                    _2dAnimTimer = new DispatcherTimer
+                    {
+                        Interval = TimeSpan.FromMilliseconds(30)
+                    };
+                    _2dAnimTimer.Tick += On2DAnimTimerTick;
+                    _2dAnimTimer.Start();
+
+                    StatusStripUpdate($"AnimationClip: Playing 2D animation '{clip.m_Name}' ({_2dAnimFrames.Count} frames)...");
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Error, $"2D animation preview failed for {clip.m_Name}: {ex}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!cancellationToken.IsCancellationRequested
+                        && _animationPreviewCoordinator.IsCurrent(requestId)
+                        && previewId == texturePreviewIdCounter)
+                    {
+                        StatusStripUpdate($"AnimationClip preview error: {ex.Message}");
+                    }
+                });
+            }
+            finally
+            {
+                if (decodedBitmaps != null)
+                {
+                    foreach (var bmp in decodedBitmaps.Values.Distinct())
+                    {
+                        bmp.Dispose();
+                    }
                 }
             }
-        }
-
-        if (_2dAnimBitmaps.Count == 0)
-        {
-            StatusStripUpdate("AnimationClip: Failed to decode any sprite/texture frames for preview.");
-            return;
-        }
-
-        if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
-        if (TextureGLPreview != null) TextureGLPreview.IsVisible = false;
-        if (TextPreviewBox != null) TextPreviewBox.IsVisible = false;
-        if (PreviewLabel != null) PreviewLabel.IsVisible = false;
-        if (ImagePreviewBox != null)
-        {
-            ImagePreviewBox.IsVisible = true;
-            ImagePreviewBox.Stretch = global::Avalonia.Media.Stretch.Fill;
-            ImagePreviewBox.StretchDirection = global::Avalonia.Media.StretchDirection.Both;
-        }
-
-        _is2dAnimationPreviewActive = true;
-        _2dAnimPaused = false;
-        _2dAnimPausedElapsedSeconds = 0;
-        _2dAnimCurrentFrameIndex = 0;
-        _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
-        _2dAnimStartTime = DateTime.UtcNow;
-        ShowAnimationPlayback(_2dAnimFrames.Count);
-        Render2DAnimationFrame(0);
-
-        _2dAnimTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(30)
-        };
-        _2dAnimTimer.Tick += On2DAnimTimerTick;
-        _2dAnimTimer.Start();
-
-        StatusStripUpdate($"AnimationClip: Playing 2D animation '{clip.m_Name}' ({_2dAnimFrames.Count} frames)...");
+        }, cancellationToken);
     }
 
     private void On2DAnimTimerTick(object? sender, EventArgs e)

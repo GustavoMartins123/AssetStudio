@@ -263,7 +263,8 @@ namespace AssetStudio.Avalonia
                     (SELECT COUNT(1) FROM ModelGroups WHERE ProjectId = @projectId) +
                     (SELECT COUNT(1) FROM ModelGroupMeshes WHERE ProjectId = @projectId) +
                     (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
-                    (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
+                    (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM AnimationClipTargets WHERE ProjectId = @projectId)";
             cmd.Parameters.AddWithValue("@projectId", projectId);
             return Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
         }

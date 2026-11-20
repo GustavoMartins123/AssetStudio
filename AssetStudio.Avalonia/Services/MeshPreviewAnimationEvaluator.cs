@@ -204,7 +204,7 @@ internal static class MeshPreviewAnimationEvaluator
         AnimationTrackSet tracks,
         bool updateMaxTimeBeforeBoundsCheck = false)
     {
-        if (bindings.genericBindings == null)
+        if (bindings.genericBindings == null || bindings.genericBindings.Length == 0)
         {
             return;
         }
@@ -226,61 +226,136 @@ internal static class MeshPreviewAnimationEvaluator
             };
         }
 
-        bool TryFindBindingInfo(int index, out GenericBinding binding, out int startIndex, out int width)
-        {
-            var curves = 0;
-            foreach (var candidate in bindings.genericBindings)
-            {
-                var candidateWidth = GetBindingCurveWidth(candidate);
-                if (index >= curves && index < curves + candidateWidth)
-                {
-                    binding = candidate;
-                    startIndex = curves;
-                    width = candidateWidth;
-                    return true;
-                }
+        // Pre-resolve every GenericBinding ONCE per clip instead of scanning genericBindings and avatar.m_TOS on every frame.
+        var bindingCount = bindings.genericBindings.Length;
+        var bindingStartIndices = new int[bindingCount];
+        var bindingWidths = new int[bindingCount];
+        var bindingMeshBones = new int[bindingCount];
+        var bindingAttributes = new uint[bindingCount];
+        var bindingIsValidTransform = new bool[bindingCount];
+        var bindingIsTransform = new bool[bindingCount];
 
-                curves += candidateWidth;
+        var totalCurveSlots = 0;
+        var hasAnyValidTransformBinding = false;
+        for (var i = 0; i < bindingCount; i++)
+        {
+            var candidate = bindings.genericBindings[i];
+            var width = GetBindingCurveWidth(candidate);
+            bindingStartIndices[i] = totalCurveSlots;
+            bindingWidths[i] = width;
+            bindingAttributes[i] = candidate.attribute;
+            bindingIsTransform[i] = candidate.typeID == ClassIDType.Transform;
+
+            if (candidate.typeID == ClassIDType.Transform
+                && tryResolveBone(candidate, out var meshBoneIdx)
+                && shouldUseBone(meshBoneIdx))
+            {
+                bindingMeshBones[i] = meshBoneIdx;
+                bindingIsValidTransform[i] = candidate.attribute is 1 or 2 or 3 or 4;
+                if (bindingIsValidTransform[i])
+                {
+                    hasAnyValidTransformBinding = true;
+                }
+            }
+            else
+            {
+                bindingMeshBones[i] = -1;
+                bindingIsValidTransform[i] = false;
             }
 
-            binding = default!;
-            startIndex = -1;
-            width = 1;
+            totalCurveSlots += width;
+        }
+
+        if (!hasAnyValidTransformBinding || totalCurveSlots <= 0)
+        {
+            return;
+        }
+
+        int[]? curveToBindingIndex = null;
+        if (totalCurveSlots <= 131_072)
+        {
+            curveToBindingIndex = new int[totalCurveSlots];
+            for (var b = 0; b < bindingCount; b++)
+            {
+                var start = bindingStartIndices[b];
+                var width = bindingWidths[b];
+                for (var c = 0; c < width; c++)
+                {
+                    curveToBindingIndex[start + c] = b;
+                }
+            }
+        }
+
+        bool TryFindBindingIndex(int curveIndex, out int bindingIdx)
+        {
+            if ((uint)curveIndex >= (uint)totalCurveSlots)
+            {
+                bindingIdx = -1;
+                return false;
+            }
+
+            if (curveToBindingIndex != null)
+            {
+                bindingIdx = curveToBindingIndex[curveIndex];
+                return true;
+            }
+
+            int lo = 0;
+            int hi = bindingCount - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                int start = bindingStartIndices[mid];
+                int width = bindingWidths[mid];
+                if (curveIndex < start)
+                {
+                    hi = mid - 1;
+                }
+                else if (curveIndex >= start + width)
+                {
+                    lo = mid + 1;
+                }
+                else
+                {
+                    bindingIdx = mid;
+                    return true;
+                }
+            }
+
+            bindingIdx = -1;
             return false;
         }
 
         void ProcessCurveData(int curveIndexInStream, float time, float[] data, int dataOffset, ref int currentIdxOut)
         {
-            if (!TryFindBindingInfo(curveIndexInStream, out var binding, out var bindingStart, out var bindingWidth)
-                || curveIndexInStream != bindingStart)
+            if (!TryFindBindingIndex(curveIndexInStream, out var bIdx)
+                || curveIndexInStream != bindingStartIndices[bIdx])
             {
                 currentIdxOut++;
                 return;
             }
 
-            if (binding.typeID == ClassIDType.Transform)
+            if (bindingIsTransform[bIdx])
             {
-                if (tryResolveBone(binding, out var meshBoneIdx) && shouldUseBone(meshBoneIdx))
+                var width = bindingWidths[bIdx];
+                if (bindingIsValidTransform[bIdx])
                 {
-                    if (binding.attribute is 1 or 2 or 3 or 4)
-                    {
-                        tracks.AddGenericKeyframe(
-                            meshBoneIdx,
-                            binding.attribute,
-                            time,
-                            data,
-                            currentIdxOut + dataOffset,
-                            updateMaxTimeBeforeBoundsCheck);
-                        currentIdxOut += bindingWidth;
-                    }
-                    else
-                    {
-                        currentIdxOut++;
-                    }
+                    tracks.AddGenericKeyframe(
+                        bindingMeshBones[bIdx],
+                        bindingAttributes[bIdx],
+                        time,
+                        data,
+                        currentIdxOut + dataOffset,
+                        updateMaxTimeBeforeBoundsCheck);
+                    currentIdxOut += width;
+                }
+                else if (bindingMeshBones[bIdx] >= 0)
+                {
+                    currentIdxOut++;
                 }
                 else
                 {
-                    currentIdxOut += bindingWidth;
+                    currentIdxOut += width;
                 }
             }
             else
@@ -289,57 +364,79 @@ internal static class MeshPreviewAnimationEvaluator
             }
         }
 
-        void ProcessStreamedFrame(float time, StreamedClip.StreamedCurveKey[] keyList)
+        if (innerClip.m_StreamedClip != null)
         {
-            var valuesByIndex = keyList.ToDictionary(x => x.index, x => x.value);
-            var processedStarts = new HashSet<int>();
+            var streamedFrames = innerClip.m_StreamedClip.ReadData();
+            var frameValues = new float[totalCurveSlots];
+            var frameValueStamp = new int[totalCurveSlots];
+            var touchedBindings = new int[bindingCount];
+            var touchedBindingStamp = new int[bindingCount];
+            var currentStamp = 0;
 
-            foreach (var key in keyList.OrderBy(x => x.index))
+            for (var frameIndex = 1; frameIndex < streamedFrames.Count - 1; frameIndex++)
             {
-                if (!TryFindBindingInfo(key.index, out var binding, out var bindingStart, out var bindingWidth)
-                    || !processedStarts.Add(bindingStart)
-                    || binding.typeID != ClassIDType.Transform
-                    || !tryResolveBone(binding, out var meshBoneIdx)
-                    || !shouldUseBone(meshBoneIdx))
+                var frame = streamedFrames[frameIndex];
+                var keyList = frame.keyList;
+                if (keyList == null || keyList.Length == 0)
                 {
                     continue;
                 }
 
-                var values = new float[bindingWidth];
-                var hasAllComponents = true;
-                for (var i = 0; i < bindingWidth; i++)
+                currentStamp++;
+                var touchedCount = 0;
+                for (var k = 0; k < keyList.Length; k++)
                 {
-                    if (valuesByIndex.TryGetValue(bindingStart + i, out var value))
+                    var key = keyList[k];
+                    if (!TryFindBindingIndex(key.index, out var bIdx))
                     {
-                        values[i] = value;
+                        continue;
                     }
-                    else
+
+                    // Keep first occurrence per index to match ToDictionary behavior without throwing or allocating
+                    if (frameValueStamp[key.index] != currentStamp)
                     {
-                        hasAllComponents = false;
-                        break;
+                        frameValueStamp[key.index] = currentStamp;
+                        frameValues[key.index] = key.value;
+                    }
+
+                    if (bindingIsValidTransform[bIdx] && touchedBindingStamp[bIdx] != currentStamp)
+                    {
+                        touchedBindingStamp[bIdx] = currentStamp;
+                        touchedBindings[touchedCount++] = bIdx;
                     }
                 }
 
-                if (hasAllComponents)
+                if (touchedCount > 1)
                 {
-                    tracks.AddGenericKeyframe(
-                        meshBoneIdx,
-                        binding.attribute,
-                        time,
-                        values,
-                        0,
-                        updateMaxTimeBeforeBoundsCheck);
+                    Array.Sort(touchedBindings, 0, touchedCount);
                 }
-            }
-        }
 
-        if (innerClip.m_StreamedClip != null)
-        {
-            var streamedFrames = innerClip.m_StreamedClip.ReadData();
-            for (var frameIndex = 1; frameIndex < streamedFrames.Count - 1; frameIndex++)
-            {
-                var frame = streamedFrames[frameIndex];
-                ProcessStreamedFrame(frame.time, frame.keyList);
+                for (var t = 0; t < touchedCount; t++)
+                {
+                    var bIdx = touchedBindings[t];
+                    var start = bindingStartIndices[bIdx];
+                    var width = bindingWidths[bIdx];
+                    var hasAllComponents = true;
+                    for (var c = 0; c < width; c++)
+                    {
+                        if (frameValueStamp[start + c] != currentStamp)
+                        {
+                            hasAllComponents = false;
+                            break;
+                        }
+                    }
+
+                    if (hasAllComponents)
+                    {
+                        tracks.AddGenericKeyframe(
+                            bindingMeshBones[bIdx],
+                            bindingAttributes[bIdx],
+                            frame.time,
+                            frameValues,
+                            start,
+                            updateMaxTimeBeforeBoundsCheck);
+                    }
+                }
             }
         }
 
@@ -412,6 +509,30 @@ internal static class MeshPreviewAnimationEvaluator
             return false;
         }
 
+        static int FindKeyframeSegmentIndex<T>(List<(float time, T value)> track, float t)
+        {
+            int lo = 0;
+            int hi = track.Count - 2;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                if (track[mid + 1].time < t)
+                {
+                    lo = mid + 1;
+                }
+                else if (track[mid].time > t)
+                {
+                    hi = mid - 1;
+                }
+                else
+                {
+                    return mid;
+                }
+            }
+
+            return Math.Clamp(lo, 0, track.Count - 2);
+        }
+
         global::OpenTK.Mathematics.Vector3 EvaluatePos(int meshBoneIdx, float t)
         {
             if (!posTracks.TryGetValue(meshBoneIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Vector3.Zero;
@@ -419,16 +540,10 @@ internal static class MeshPreviewAnimationEvaluator
             if (t <= track[0].time) return track[0].value;
             if (t >= track[^1].time) return track[^1].value;
 
-            for (var i = 0; i < track.Count - 1; i++)
-            {
-                if (t >= track[i].time && t <= track[i + 1].time)
-                {
-                    var factor = (t - track[i].time) / (track[i + 1].time - track[i].time);
-                    return global::OpenTK.Mathematics.Vector3.Lerp(track[i].value, track[i + 1].value, factor);
-                }
-            }
-
-            return track[^1].value;
+            var idx = FindKeyframeSegmentIndex(track, t);
+            var span = track[idx + 1].time - track[idx].time;
+            var factor = span > 1e-6f ? (t - track[idx].time) / span : 0f;
+            return global::OpenTK.Mathematics.Vector3.Lerp(track[idx].value, track[idx + 1].value, factor);
         }
 
         global::OpenTK.Mathematics.Quaternion EvaluateRot(int meshBoneIdx, float t)
@@ -438,16 +553,10 @@ internal static class MeshPreviewAnimationEvaluator
             if (t <= track[0].time) return track[0].value;
             if (t >= track[^1].time) return track[^1].value;
 
-            for (var i = 0; i < track.Count - 1; i++)
-            {
-                if (t >= track[i].time && t <= track[i + 1].time)
-                {
-                    var factor = (t - track[i].time) / (track[i + 1].time - track[i].time);
-                    return global::OpenTK.Mathematics.Quaternion.Slerp(track[i].value, track[i + 1].value, factor);
-                }
-            }
-
-            return track[^1].value;
+            var idx = FindKeyframeSegmentIndex(track, t);
+            var span = track[idx + 1].time - track[idx].time;
+            var factor = span > 1e-6f ? (t - track[idx].time) / span : 0f;
+            return global::OpenTK.Mathematics.Quaternion.Slerp(track[idx].value, track[idx + 1].value, factor);
         }
 
         global::OpenTK.Mathematics.Vector3 EvaluateScale(int meshBoneIdx, float t)
@@ -457,16 +566,10 @@ internal static class MeshPreviewAnimationEvaluator
             if (t <= track[0].time) return track[0].value;
             if (t >= track[^1].time) return track[^1].value;
 
-            for (var i = 0; i < track.Count - 1; i++)
-            {
-                if (t >= track[i].time && t <= track[i + 1].time)
-                {
-                    var factor = (t - track[i].time) / (track[i + 1].time - track[i].time);
-                    return global::OpenTK.Mathematics.Vector3.Lerp(track[i].value, track[i + 1].value, factor);
-                }
-            }
-
-            return track[^1].value;
+            var idx = FindKeyframeSegmentIndex(track, t);
+            var span = track[idx + 1].time - track[idx].time;
+            var factor = span > 1e-6f ? (t - track[idx].time) / span : 0f;
+            return global::OpenTK.Mathematics.Vector3.Lerp(track[idx].value, track[idx + 1].value, factor);
         }
 
         var bindPoses = new global::OpenTK.Mathematics.Matrix4[meshBoneCount];

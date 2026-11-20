@@ -64,17 +64,17 @@ public partial class MainWindow
                     materialMainTextureCache = null;
                     materialPreviewMaterialCache = null;
                     materialTextureSlotsCache = null;
+                    animationClipAvatarCache = null;
+                    avatarMeshCache = null;
+                    avatarMeshesCache = null;
+                    meshAvatarCache = null;
+                    meshSkinnedRenderersCache = null;
+                    animationClipTransformBindingsCache = null;
                 }
 
                 meshAssociatedRenderersCache = null;
                 meshSourceTypesCache = null;
                 objectToAssetItemCache = null;
-                animationClipAvatarCache = null;
-                avatarMeshCache = null;
-                avatarMeshesCache = null;
-                meshAvatarCache = null;
-                meshSkinnedRenderersCache = null;
-                animationClipTransformBindingsCache = null;
             }
 
             global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>

@@ -207,6 +207,38 @@ namespace AssetStudio.Avalonia
                         animatorCount,
                         result.SemanticRelations);
                 }
+                else if (obj is RuntimeAnimatorController controller)
+                {
+                    IndexRuntimeAnimatorControllerRelations(
+                        file,
+                        controller,
+                        result.SemanticRelations);
+                }
+                else if (obj is Animation legacyAnimation)
+                {
+                    AddLegacyAnimationRelations(
+                        file,
+                        legacyAnimation,
+                        skinnedMeshBindings,
+                        animatorCount,
+                        result.SemanticRelations);
+                }
+                else if (obj is Avatar avatar)
+                {
+                    AddAvatarRigRelations(
+                        file,
+                        avatar,
+                        skinnedMeshBindings,
+                        objectsSnapshot,
+                        result.SemanticRelations);
+                }
+                else if (obj is AnimationClip animationClip)
+                {
+                    AddAnimationClipFingerprintRelations(
+                        file,
+                        animationClip,
+                        result.SemanticRelations);
+                }
                 else if (obj is MeshRenderer mr)
                 {
                     IndexMeshRendererComponentRelations(
@@ -223,7 +255,9 @@ namespace AssetStudio.Avalonia
                 result.SemanticRelations,
                 skinnedMeshBindings.Select(binding => RendererMeshSemanticBinding.FromSkinned(binding))
                     .Concat(meshRendererBindings));
+            AddSkinnedMeshFallbackBoneHashes(file, skinnedMeshBindings, result.SemanticRelations);
             AddContainerMaterialRelations(result.SemanticRelations, file, containerReferences);
+            AddContainerAnimationRelations(result.SemanticRelations, file, containerReferences);
             return result;
         }
 

@@ -85,6 +85,9 @@ namespace AssetStudio.Avalonia
             public int StagedMeshRenderersCount { get; private set; }
             public int StagedMeshMaterialsCount { get; private set; }
             public int StagedMaterialTexturesCount { get; private set; }
+            public int StagedAnimationClipTargetsCount { get; private set; }
+            public int StagedRigBoneHashesCount { get; private set; }
+            public int StagedClipBoneHashesCount { get; private set; }
 
             public int TotalStagedRows =>
                 StagedSourceFilesCount
@@ -93,7 +96,10 @@ namespace AssetStudio.Avalonia
                 + StagedModelGroupMeshesCount
                 + StagedMeshRenderersCount
                 + StagedMeshMaterialsCount
-                + StagedMaterialTexturesCount;
+                + StagedMaterialTexturesCount
+                + StagedAnimationClipTargetsCount
+                + StagedRigBoneHashesCount
+                + StagedClipBoneHashesCount;
 
             public bool HasStagedRelations =>
                 StagedAssetEdgesCount > 0
@@ -101,12 +107,18 @@ namespace AssetStudio.Avalonia
                 || StagedModelGroupMeshesCount > 0
                 || StagedMeshRenderersCount > 0
                 || StagedMeshMaterialsCount > 0
-                || StagedMaterialTexturesCount > 0;
+                || StagedMaterialTexturesCount > 0
+                || StagedAnimationClipTargetsCount > 0
+                || StagedRigBoneHashesCount > 0
+                || StagedClipBoneHashesCount > 0;
 
             public bool HasStagedMaterialRelations =>
                 StagedAssetEdgesCount > 0
                 || StagedMeshMaterialsCount > 0
-                || StagedMaterialTexturesCount > 0;
+                || StagedMaterialTexturesCount > 0
+                || StagedAnimationClipTargetsCount > 0
+                || StagedRigBoneHashesCount > 0
+                || StagedClipBoneHashesCount > 0;
 
             public bool IsCommitted => _isCommitted;
             public bool IsAborted => _isAborted;
@@ -126,7 +138,10 @@ namespace AssetStudio.Avalonia
                     batch.ModelGroups,
                     batch.ModelGroupMeshes,
                     batch.SourceFiles,
-                    clearLists: clearBatch);
+                    clearLists: clearBatch,
+                    animationClipTargets: batch.AnimationClipTargets,
+                    rigBoneHashes: batch.RigBoneHashes,
+                    clipBoneHashes: batch.ClipBoneHashes);
             }
 
             public void FlushBatch(
@@ -137,7 +152,10 @@ namespace AssetStudio.Avalonia
                 IReadOnlyList<SemanticModelGroupRelation>? modelGroups,
                 IReadOnlyList<SemanticModelGroupMeshRelation>? modelGroupMeshes,
                 IReadOnlyCollection<SemanticSourceFileEntry>? sourceFiles = null,
-                bool clearLists = true)
+                bool clearLists = true,
+                IReadOnlyList<SemanticAnimationClipTargetRelation>? animationClipTargets = null,
+                IReadOnlyList<SemanticRigBoneHashEntry>? rigBoneHashes = null,
+                IReadOnlyList<SemanticClipBoneHashEntry>? clipBoneHashes = null)
             {
                 EnsureActive();
 
@@ -148,7 +166,10 @@ namespace AssetStudio.Avalonia
                 var rendererCount = meshRenderers?.Count ?? 0;
                 var materialCount = meshMaterials?.Count ?? 0;
                 var textureCount = materialTextures?.Count ?? 0;
-                var batchTotal = sourceFileCount + edgeCount + groupCount + groupMeshCount + rendererCount + materialCount + textureCount;
+                var animTargetCount = animationClipTargets?.Count ?? 0;
+                var rigHashCount = rigBoneHashes?.Count ?? 0;
+                var clipHashCount = clipBoneHashes?.Count ?? 0;
+                var batchTotal = sourceFileCount + edgeCount + groupCount + groupMeshCount + rendererCount + materialCount + textureCount + animTargetCount + rigHashCount + clipHashCount;
                 if (batchTotal == 0)
                 {
                     return;
@@ -186,6 +207,18 @@ namespace AssetStudio.Avalonia
                     {
                         InsertStagedMaterialTextures(conn, transaction, _projectId, materialTextures);
                     }
+                    if (animationClipTargets != null && animTargetCount > 0)
+                    {
+                        InsertStagedAnimationClipTargets(conn, transaction, _projectId, animationClipTargets);
+                    }
+                    if (rigBoneHashes != null && rigHashCount > 0)
+                    {
+                        InsertStagedRigBoneHashes(conn, transaction, _projectId, rigBoneHashes);
+                    }
+                    if (clipBoneHashes != null && clipHashCount > 0)
+                    {
+                        InsertStagedClipBoneHashes(conn, transaction, _projectId, clipBoneHashes);
+                    }
                     transaction.Commit();
                 }
 
@@ -197,6 +230,9 @@ namespace AssetStudio.Avalonia
                 StagedMeshRenderersCount += rendererCount;
                 StagedMeshMaterialsCount += materialCount;
                 StagedMaterialTexturesCount += textureCount;
+                StagedAnimationClipTargetsCount += animTargetCount;
+                StagedRigBoneHashesCount += rigHashCount;
+                StagedClipBoneHashesCount += clipHashCount;
 
                 if (clearLists)
                 {
@@ -207,6 +243,9 @@ namespace AssetStudio.Avalonia
                     ClearIfMutableList(meshRenderers);
                     ClearIfMutableList(meshMaterials);
                     ClearIfMutableList(materialTextures);
+                    ClearIfMutableList(animationClipTargets);
+                    ClearIfMutableList(rigBoneHashes);
+                    ClearIfMutableList(clipBoneHashes);
                 }
             }
 
@@ -413,7 +452,7 @@ namespace AssetStudio.Avalonia
             var dbPath = GetDbPath(folderPath);
             try
             {
-                var clearWork = replaceExisting ? 6 : 0;
+                var clearWork = replaceExisting ? 7 : 0;
                 var totalWork = Math.Max(1,
                     relations.SourceFiles.Count
                     + relations.AssetEdges.Count
@@ -422,8 +461,11 @@ namespace AssetStudio.Avalonia
                     + relations.MeshRenderers.Count
                     + relations.MeshMaterials.Count
                     + relations.MaterialTextures.Count
+                    + relations.AnimationClipTargets.Count
+                    + relations.RigBoneHashes.Count
+                    + relations.ClipBoneHashes.Count
                     + clearWork
-                    + 3);
+                    + 4);
                 var reporter = new ThrottledProgressReporter(totalWork, progress);
 
                 reporter.Report("Waiting for SQLite writer", force: true);
@@ -499,6 +541,7 @@ namespace AssetStudio.Avalonia
                 InsertMeshRenderers(conn, transaction, projectId, relations.MeshRenderers, 0, relations.MeshRenderers.Count, reporter.Advance);
                 InsertMeshMaterials(conn, transaction, projectId, relations.MeshMaterials, 0, relations.MeshMaterials.Count, reporter.Advance);
                 InsertMaterialTextures(conn, transaction, projectId, relations.MaterialTextures, 0, relations.MaterialTextures.Count, reporter.Advance);
+                StageAndPromoteAnimationRelations(conn, transaction, projectId, relations, reporter.Advance);
 
                 reporter.Report("Rebuilding semantic relation indexes", force: true);
                 CreateSemanticBulkSecondaryIndexes(conn, transaction);
@@ -590,6 +633,13 @@ namespace AssetStudio.Avalonia
                 (c, tx, offset, count) => InsertMaterialTextures(c, tx, projectId, relations.MaterialTextures, offset, count, reporter.Advance),
                 SaveProgressCheckpoint);
 
+            using (var transaction = conn.BeginTransaction())
+            {
+                StageAndPromoteAnimationRelations(conn, transaction, projectId, relations, reporter.Advance);
+                SaveProgressCheckpoint(conn, transaction);
+                transaction.Commit();
+            }
+
             reporter.Report("Committing semantic relations", force: true);
             using (var transaction = conn.BeginTransaction())
             {
@@ -660,6 +710,7 @@ namespace AssetStudio.Avalonia
         {
             var tables = new[]
             {
+                "AnimationClipTargets",
                 "MaterialTextures",
                 "MeshMaterials",
                 "MeshRenderers",
@@ -1586,6 +1637,702 @@ namespace AssetStudio.Avalonia
                 cmd.ExecuteNonQuery();
                 advanceProgress?.Invoke(step.StageMessage);
             }
+
+            PromoteStagedAnimationRelationsToLive(conn, transaction, projectId, advanceProgress);
+        }
+
+        private static void InsertStagedAnimationClipTargets(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticAnimationClipTargetRelation> targets)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO Stage_AnimationClipTargets (
+                    ProjectId, ClipAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID,
+                    MeshAssetUniqueID, ModelGroupId, RelationKind, MatchScore, MatchedBoneCount, TotalClipBoneCount)
+                VALUES (
+                    @projectId, @clipId, @animatorId, @avatarId,
+                    @meshId, @groupId, @relationKind, @matchScore, @matchedBones, @totalClipBones);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pClipId = cmd.Parameters.Add("@clipId", SqliteType.Text);
+            var pAnimatorId = cmd.Parameters.Add("@animatorId", SqliteType.Text);
+            var pAvatarId = cmd.Parameters.Add("@avatarId", SqliteType.Text);
+            var pMeshId = cmd.Parameters.Add("@meshId", SqliteType.Text);
+            var pGroupId = cmd.Parameters.Add("@groupId", SqliteType.Text);
+            var pRelationKind = cmd.Parameters.Add("@relationKind", SqliteType.Text);
+            var pMatchScore = cmd.Parameters.Add("@matchScore", SqliteType.Integer);
+            var pMatchedBones = cmd.Parameters.Add("@matchedBones", SqliteType.Integer);
+            var pTotalClipBones = cmd.Parameters.Add("@totalClipBones", SqliteType.Integer);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < targets.Count; i++)
+            {
+                var target = targets[i];
+                pClipId.Value = target.ClipAssetId;
+                pAnimatorId.Value = target.AnimatorAssetId;
+                pAvatarId.Value = target.AvatarAssetId;
+                pMeshId.Value = target.MeshAssetId;
+                pGroupId.Value = target.ModelGroupId;
+                pRelationKind.Value = target.RelationKind;
+                pMatchScore.Value = target.MatchScore;
+                pMatchedBones.Value = target.MatchedBoneCount;
+                pTotalClipBones.Value = target.TotalClipBoneCount;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void InsertStagedRigBoneHashes(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticRigBoneHashEntry> rigHashes)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO Stage_RigBoneHashes (
+                    ProjectId, AvatarAssetUniqueID, AnimatorAssetUniqueID, MeshAssetUniqueID, ModelGroupId, BoneHash)
+                VALUES (
+                    @projectId, @avatarId, @animatorId, @meshId, @groupId, @boneHash);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pAvatarId = cmd.Parameters.Add("@avatarId", SqliteType.Text);
+            var pAnimatorId = cmd.Parameters.Add("@animatorId", SqliteType.Text);
+            var pMeshId = cmd.Parameters.Add("@meshId", SqliteType.Text);
+            var pGroupId = cmd.Parameters.Add("@groupId", SqliteType.Text);
+            var pBoneHash = cmd.Parameters.Add("@boneHash", SqliteType.Integer);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < rigHashes.Count; i++)
+            {
+                var entry = rigHashes[i];
+                if (entry.BoneHash == 0)
+                {
+                    continue;
+                }
+
+                pAvatarId.Value = entry.AvatarAssetId;
+                pAnimatorId.Value = entry.AnimatorAssetId;
+                pMeshId.Value = entry.MeshAssetId;
+                pGroupId.Value = entry.ModelGroupId;
+                pBoneHash.Value = (long)entry.BoneHash;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void InsertStagedClipBoneHashes(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticClipBoneHashEntry> clipHashes)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO Stage_ClipBoneHashes (
+                    ProjectId, ClipAssetUniqueID, BoneHash, TotalClipBoneCount)
+                VALUES (
+                    @projectId, @clipId, @boneHash, @totalClipBones);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pClipId = cmd.Parameters.Add("@clipId", SqliteType.Text);
+            var pBoneHash = cmd.Parameters.Add("@boneHash", SqliteType.Integer);
+            var pTotalClipBones = cmd.Parameters.Add("@totalClipBones", SqliteType.Integer);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < clipHashes.Count; i++)
+            {
+                var entry = clipHashes[i];
+                if (entry.BoneHash == 0 || string.IsNullOrEmpty(entry.ClipAssetId))
+                {
+                    continue;
+                }
+
+                pClipId.Value = entry.ClipAssetId;
+                pBoneHash.Value = (long)entry.BoneHash;
+                pTotalClipBones.Value = entry.TotalClipBoneCount;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void StageAndPromoteAnimationRelations(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            SemanticAssetRelations relations,
+            Action<string>? advanceProgress = null)
+        {
+            using (var createCmd = conn.CreateCommand())
+            {
+                createCmd.Transaction = transaction;
+                createCmd.CommandText = @"
+                    DROP TABLE IF EXISTS Stage_AnimationClipTargets;
+                    DROP TABLE IF EXISTS Stage_RigBoneHashes;
+                    DROP TABLE IF EXISTS Stage_ClipBoneHashes;
+
+                    CREATE TABLE Stage_AnimationClipTargets (
+                        ProjectId INTEGER NOT NULL,
+                        ClipAssetUniqueID TEXT NOT NULL,
+                        AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        MeshAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        ModelGroupId TEXT NOT NULL DEFAULT '',
+                        RelationKind TEXT NOT NULL DEFAULT '',
+                        MatchScore INTEGER NOT NULL DEFAULT 0,
+                        MatchedBoneCount INTEGER NOT NULL DEFAULT 0,
+                        TotalClipBoneCount INTEGER NOT NULL DEFAULT 0
+                    );
+
+                    CREATE TABLE Stage_RigBoneHashes (
+                        ProjectId INTEGER NOT NULL,
+                        AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        MeshAssetUniqueID TEXT NOT NULL DEFAULT '',
+                        ModelGroupId TEXT NOT NULL DEFAULT '',
+                        BoneHash INTEGER NOT NULL
+                    );
+
+                    CREATE TABLE Stage_ClipBoneHashes (
+                        ProjectId INTEGER NOT NULL,
+                        ClipAssetUniqueID TEXT NOT NULL,
+                        BoneHash INTEGER NOT NULL,
+                        TotalClipBoneCount INTEGER NOT NULL DEFAULT 0
+                    );";
+                createCmd.ExecuteNonQuery();
+            }
+
+            if (relations.AnimationClipTargets.Count > 0)
+            {
+                InsertStagedAnimationClipTargets(conn, transaction, projectId, relations.AnimationClipTargets);
+            }
+
+            if (relations.RigBoneHashes.Count > 0)
+            {
+                InsertStagedRigBoneHashes(conn, transaction, projectId, relations.RigBoneHashes);
+            }
+
+            if (relations.ClipBoneHashes.Count > 0)
+            {
+                InsertStagedClipBoneHashes(conn, transaction, projectId, relations.ClipBoneHashes);
+            }
+
+            PromoteStagedAnimationRelationsToLive(conn, transaction, projectId, advanceProgress);
+
+            using (var dropCmd = conn.CreateCommand())
+            {
+                dropCmd.Transaction = transaction;
+                dropCmd.CommandText = @"
+                    DROP TABLE IF EXISTS Stage_AnimationClipTargets;
+                    DROP TABLE IF EXISTS Stage_RigBoneHashes;
+                    DROP TABLE IF EXISTS Stage_ClipBoneHashes;";
+                dropCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void PromoteStagedAnimationRelationsToLive(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            Action<string>? advanceProgress = null)
+        {
+            // 1. Direct staged AnimationClipTargets
+            using (var directCmd = conn.CreateCommand())
+            {
+                directCmd.Transaction = transaction;
+                directCmd.CommandText = @"
+                    INSERT INTO AnimationClipTargets (
+                        ProjectId, ClipAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID,
+                        MeshAssetUniqueID, ModelGroupId, RelationKind, MatchScore, MatchedBoneCount, TotalClipBoneCount)
+                    SELECT
+                        @projectId,
+                        s.ClipAssetUniqueID,
+                        s.AnimatorAssetUniqueID,
+                        s.AvatarAssetUniqueID,
+                        s.MeshAssetUniqueID,
+                        s.ModelGroupId,
+                        s.RelationKind,
+                        s.MatchScore,
+                        s.MatchedBoneCount,
+                        s.TotalClipBoneCount
+                    FROM Stage_AnimationClipTargets s
+                    WHERE s.ClipAssetUniqueID <> ''
+                      AND (s.AvatarAssetUniqueID <> '' OR s.MeshAssetUniqueID <> '' OR s.ModelGroupId <> '' OR s.AnimatorAssetUniqueID <> '')
+                    ORDER BY s.rowid ASC
+                    ON CONFLICT(ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
+                    DO UPDATE SET
+                        MatchScore = MAX(AnimationClipTargets.MatchScore, excluded.MatchScore),
+                        MatchedBoneCount = MAX(AnimationClipTargets.MatchedBoneCount, excluded.MatchedBoneCount),
+                        TotalClipBoneCount = MAX(AnimationClipTargets.TotalClipBoneCount, excluded.TotalClipBoneCount);";
+                directCmd.Parameters.AddWithValue("@projectId", projectId);
+                directCmd.ExecuteNonQuery();
+            }
+
+            // 2. Cross-bundle direct relations synthesized from AssetEdges + ModelGroups + ModelGroupMeshes
+            using (var edgeSynthCmd = conn.CreateCommand())
+            {
+                edgeSynthCmd.Transaction = transaction;
+                edgeSynthCmd.CommandText = @"
+                    WITH GroupRepresentativeMesh AS (
+                        SELECT
+                            mgm.GroupAssetUniqueID,
+                            mgm.MeshAssetUniqueID,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY mgm.GroupAssetUniqueID
+                                ORDER BY mgm.Confidence DESC, COALESCE(meshAsset.ByteSize, 0) DESC, mgm.SlotIndex ASC, mgm.MeshAssetUniqueID ASC
+                            ) AS RepRank
+                        FROM ModelGroupMeshes mgm
+                        LEFT JOIN Assets meshAsset
+                          ON meshAsset.ProjectId = mgm.ProjectId
+                         AND meshAsset.UniqueID = mgm.MeshAssetUniqueID
+                        WHERE mgm.ProjectId = @projectId
+                          AND mgm.MeshAssetUniqueID <> ''
+                    ),
+                    ControllerHierarchy AS (
+                        SELECT
+                            ae.SourceAssetUniqueID AS DerivedControllerId,
+                            ae.TargetAssetUniqueID AS BaseControllerId
+                        FROM AssetEdges ae
+                        WHERE ae.ProjectId = @projectId
+                          AND ae.EdgeKind = 'AnimatorController'
+                          AND ae.SlotName = 'm_Controller'
+                          AND ae.SourceAssetUniqueID <> ''
+                          AND ae.TargetAssetUniqueID <> ''
+                    ),
+                    ControllerClips AS (
+                        SELECT
+                            clipEdge.SourceAssetUniqueID AS ControllerId,
+                            clipEdge.TargetAssetUniqueID AS ClipId,
+                            clipEdge.SlotIndex AS SlotIndex,
+                            'AnimatorController' AS Kind,
+                            10000 AS BaseScore
+                        FROM AssetEdges clipEdge
+                        WHERE clipEdge.ProjectId = @projectId
+                          AND clipEdge.EdgeKind = 'AnimationClip'
+                          AND clipEdge.TargetAssetUniqueID <> ''
+                        UNION ALL
+                        SELECT
+                            ch.DerivedControllerId AS ControllerId,
+                            clipEdge.TargetAssetUniqueID AS ClipId,
+                            clipEdge.SlotIndex AS SlotIndex,
+                            'AnimatorOverrideController' AS Kind,
+                            9800 AS BaseScore
+                        FROM ControllerHierarchy ch
+                        INNER JOIN AssetEdges clipEdge
+                          ON clipEdge.ProjectId = @projectId
+                         AND clipEdge.SourceAssetUniqueID = ch.BaseControllerId
+                         AND clipEdge.EdgeKind = 'AnimationClip'
+                         AND clipEdge.TargetAssetUniqueID <> ''
+                    ),
+                    DirectEdges AS (
+                        -- (a) Clip -> Avatar edge (AnimatorAvatar / CompatibleAvatar) joined with ModelGroups or Avatar->Mesh edges
+                        SELECT
+                            ca.SourceAssetUniqueID AS ClipId,
+                            COALESCE(mg.AnimatorAssetUniqueID, '') AS AnimatorId,
+                            ca.TargetAssetUniqueID AS AvatarId,
+                            COALESCE(rep.MeshAssetUniqueID, meshEdge.TargetAssetUniqueID, '') AS MeshId,
+                            COALESCE(mg.GroupAssetUniqueID, '') AS GroupId,
+                            CASE WHEN ca.SlotName = 'CompatibleAvatar' THEN 'CompatibleAvatar' ELSE 'AnimatorAvatar' END AS RelationKind,
+                            (CASE WHEN ca.SlotName = 'CompatibleAvatar' THEN 8500 ELSE 9500 END)
+                                + COALESCE(mg.Confidence, 0)
+                                + (CASE WHEN COALESCE(mg.GroupAssetUniqueID, '') <> '' THEN 100 ELSE 0 END)
+                                - MIN(MAX(ca.SlotIndex, 0), 100) AS Score
+                        FROM AssetEdges ca
+                        LEFT JOIN ModelGroups mg
+                          ON mg.ProjectId = ca.ProjectId
+                         AND mg.AvatarAssetUniqueID = ca.TargetAssetUniqueID
+                        LEFT JOIN GroupRepresentativeMesh rep
+                          ON rep.GroupAssetUniqueID = mg.GroupAssetUniqueID
+                         AND rep.RepRank = 1
+                        LEFT JOIN AssetEdges meshEdge
+                          ON meshEdge.ProjectId = ca.ProjectId
+                         AND meshEdge.SourceAssetUniqueID = ca.TargetAssetUniqueID
+                         AND meshEdge.EdgeKind = 'Mesh'
+                         AND meshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                         AND meshEdge.TargetAssetUniqueID <> ''
+                        WHERE ca.ProjectId = @projectId
+                          AND ca.EdgeKind = 'Avatar'
+                          AND ca.SlotName IN ('AnimatorAvatar', 'CompatibleAvatar')
+                          AND ca.SourceAssetUniqueID <> ''
+                          AND ca.TargetAssetUniqueID <> ''
+
+                        UNION ALL
+
+                        -- (b) ModelGroups linked via ControllerAssetUniqueID -> ControllerClips
+                        SELECT
+                            cc.ClipId AS ClipId,
+                            mg.AnimatorAssetUniqueID AS AnimatorId,
+                            mg.AvatarAssetUniqueID AS AvatarId,
+                            COALESCE(rep.MeshAssetUniqueID, '') AS MeshId,
+                            mg.GroupAssetUniqueID AS GroupId,
+                            cc.Kind AS RelationKind,
+                            cc.BaseScore + COALESCE(mg.Confidence, 0) + 150 - MIN(MAX(cc.SlotIndex, 0), 100) AS Score
+                        FROM ModelGroups mg
+                        INNER JOIN ControllerClips cc
+                          ON cc.ControllerId = mg.ControllerAssetUniqueID
+                        LEFT JOIN GroupRepresentativeMesh rep
+                          ON rep.GroupAssetUniqueID = mg.GroupAssetUniqueID
+                         AND rep.RepRank = 1
+                        WHERE mg.ProjectId = @projectId
+                          AND mg.ControllerAssetUniqueID <> ''
+
+                        UNION ALL
+
+                        -- (c) Animator / Avatar / Controller source directly holding AnimationClip edge + Avatar/Mesh edges
+                        SELECT
+                            clipEdge.TargetAssetUniqueID AS ClipId,
+                            CASE WHEN srcAsset.Type IN (@animatorType, @animationType) THEN clipEdge.SourceAssetUniqueID ELSE '' END AS AnimatorId,
+                            COALESCE(
+                                avatarEdge.TargetAssetUniqueID,
+                                CASE WHEN srcAsset.Type = @avatarType THEN clipEdge.SourceAssetUniqueID ELSE '' END,
+                                ''
+                            ) AS AvatarId,
+                            COALESCE(meshEdge.TargetAssetUniqueID, avatarMeshEdge.TargetAssetUniqueID, '') AS MeshId,
+                            COALESCE(mg.GroupAssetUniqueID, '') AS GroupId,
+                            CASE
+                                WHEN clipEdge.SlotName = 'LegacyAnimationClip' THEN 'LegacyAnimation'
+                                ELSE 'AnimatorController'
+                            END AS RelationKind,
+                            9600 + COALESCE(mg.Confidence, 0) - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
+                        FROM AssetEdges clipEdge
+                        LEFT JOIN Assets srcAsset
+                          ON srcAsset.ProjectId = clipEdge.ProjectId
+                         AND srcAsset.UniqueID = clipEdge.SourceAssetUniqueID
+                        LEFT JOIN AssetEdges avatarEdge
+                          ON avatarEdge.ProjectId = clipEdge.ProjectId
+                         AND avatarEdge.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
+                         AND avatarEdge.EdgeKind = 'Avatar'
+                         AND avatarEdge.TargetAssetUniqueID <> ''
+                        LEFT JOIN AssetEdges meshEdge
+                          ON meshEdge.ProjectId = clipEdge.ProjectId
+                         AND meshEdge.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
+                         AND meshEdge.EdgeKind = 'Mesh'
+                         AND meshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                         AND meshEdge.TargetAssetUniqueID <> ''
+                        LEFT JOIN AssetEdges avatarMeshEdge
+                          ON avatarMeshEdge.ProjectId = clipEdge.ProjectId
+                         AND avatarMeshEdge.SourceAssetUniqueID = COALESCE(
+                                avatarEdge.TargetAssetUniqueID,
+                                CASE WHEN srcAsset.Type = @avatarType THEN clipEdge.SourceAssetUniqueID ELSE '' END)
+                         AND avatarMeshEdge.EdgeKind = 'Mesh'
+                         AND avatarMeshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                         AND avatarMeshEdge.TargetAssetUniqueID <> ''
+                        LEFT JOIN ModelGroups mg
+                          ON mg.ProjectId = clipEdge.ProjectId
+                         AND (
+                             (mg.AnimatorAssetUniqueID <> '' AND mg.AnimatorAssetUniqueID = clipEdge.SourceAssetUniqueID)
+                             OR (mg.AvatarAssetUniqueID <> '' AND mg.AvatarAssetUniqueID = COALESCE(
+                                    avatarEdge.TargetAssetUniqueID,
+                                    CASE WHEN srcAsset.Type = @avatarType THEN clipEdge.SourceAssetUniqueID ELSE '' END))
+                         )
+                        WHERE clipEdge.ProjectId = @projectId
+                          AND clipEdge.EdgeKind = 'AnimationClip'
+                          AND clipEdge.TargetAssetUniqueID <> ''
+                          AND (
+                              COALESCE(avatarEdge.TargetAssetUniqueID, '') <> ''
+                              OR COALESCE(meshEdge.TargetAssetUniqueID, '') <> ''
+                              OR COALESCE(avatarMeshEdge.TargetAssetUniqueID, '') <> ''
+                              OR COALESCE(mg.GroupAssetUniqueID, '') <> ''
+                              OR srcAsset.Type IN (@animatorType, @avatarType, @animationType)
+                          )
+                    )
+                    INSERT INTO AnimationClipTargets (
+                        ProjectId, ClipAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID,
+                        MeshAssetUniqueID, ModelGroupId, RelationKind, MatchScore, MatchedBoneCount, TotalClipBoneCount)
+                    SELECT
+                        @projectId,
+                        d.ClipId,
+                        d.AnimatorId,
+                        d.AvatarId,
+                        d.MeshId,
+                        d.GroupId,
+                        d.RelationKind,
+                        MAX(d.Score),
+                        0,
+                        0
+                    FROM DirectEdges d
+                    WHERE d.ClipId <> ''
+                      AND (d.AvatarId <> '' OR d.MeshId <> '' OR d.GroupId <> '' OR d.AnimatorId <> '')
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM AnimationClipTargets existing
+                          WHERE existing.ProjectId = @projectId
+                            AND existing.ClipAssetUniqueID = d.ClipId
+                            AND existing.RelationKind = d.RelationKind
+                            AND (existing.MeshAssetUniqueID = d.MeshId OR d.MeshId = '')
+                            AND existing.MatchScore >= d.Score - 1000
+                      )
+                    GROUP BY d.ClipId, d.AvatarId, d.MeshId, d.GroupId, d.AnimatorId, d.RelationKind
+                    ON CONFLICT(ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
+                    DO UPDATE SET
+                        MatchScore = MAX(AnimationClipTargets.MatchScore, excluded.MatchScore);";
+                edgeSynthCmd.Parameters.AddWithValue("@projectId", projectId);
+                edgeSynthCmd.Parameters.AddWithValue("@animatorType", (int)ClassIDType.Animator);
+                edgeSynthCmd.Parameters.AddWithValue("@avatarType", (int)ClassIDType.Avatar);
+                edgeSynthCmd.Parameters.AddWithValue("@animationType", (int)ClassIDType.Animation);
+                edgeSynthCmd.ExecuteNonQuery();
+            }
+
+            // 3. Cross-bundle structural bone-hash matching (Stage_ClipBoneHashes ⋈ Stage_RigBoneHashes)
+            long clipBoneRowCount;
+            long rigBoneRowCount;
+            using (var countCmd = conn.CreateCommand())
+            {
+                countCmd.Transaction = transaction;
+                countCmd.CommandText = @"
+                    SELECT
+                        (SELECT COUNT(1) FROM Stage_ClipBoneHashes WHERE ProjectId = @projectId),
+                        (SELECT COUNT(1) FROM Stage_RigBoneHashes WHERE ProjectId = @projectId);";
+                countCmd.Parameters.AddWithValue("@projectId", projectId);
+                using var reader = countCmd.ExecuteReader();
+                reader.Read();
+                clipBoneRowCount = reader.GetInt64(0);
+                rigBoneRowCount = reader.GetInt64(1);
+            }
+
+            if (clipBoneRowCount > 0 && rigBoneRowCount > 0)
+            {
+                using (var idxCmd = conn.CreateCommand())
+                {
+                    idxCmd.Transaction = transaction;
+                    idxCmd.CommandText = @"
+                        CREATE INDEX IF NOT EXISTS idx_stage_rig_bone_hash
+                        ON Stage_RigBoneHashes(ProjectId, BoneHash, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID);
+                        CREATE INDEX IF NOT EXISTS idx_stage_clip_bone_hash
+                        ON Stage_ClipBoneHashes(ProjectId, ClipAssetUniqueID, BoneHash);";
+                    idxCmd.ExecuteNonQuery();
+                }
+
+                using (var matchCmd = conn.CreateCommand())
+                {
+                    matchCmd.Transaction = transaction;
+                    matchCmd.CommandText = @"
+                        WITH GroupRepresentativeMesh AS (
+                            SELECT
+                                mgm.GroupAssetUniqueID,
+                                mgm.MeshAssetUniqueID,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY mgm.GroupAssetUniqueID
+                                    ORDER BY mgm.Confidence DESC, COALESCE(meshAsset.ByteSize, 0) DESC, mgm.SlotIndex ASC, mgm.MeshAssetUniqueID ASC
+                                ) AS RepRank
+                            FROM ModelGroupMeshes mgm
+                            LEFT JOIN Assets meshAsset
+                              ON meshAsset.ProjectId = mgm.ProjectId
+                             AND meshAsset.UniqueID = mgm.MeshAssetUniqueID
+                            WHERE mgm.ProjectId = @projectId
+                              AND mgm.MeshAssetUniqueID <> ''
+                        ),
+                        AvatarFirstMesh AS (
+                            SELECT
+                                ae.SourceAssetUniqueID AS AvatarId,
+                                ae.TargetAssetUniqueID AS MeshId,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY ae.SourceAssetUniqueID
+                                    ORDER BY ae.SlotIndex ASC, ae.TargetAssetUniqueID ASC
+                                ) AS MeshRank
+                            FROM AssetEdges ae
+                            WHERE ae.ProjectId = @projectId
+                              AND ae.EdgeKind = 'Mesh'
+                              AND ae.SlotName IN ('AnimatorMesh', 'AvatarMesh')
+                              AND ae.SourceAssetUniqueID <> ''
+                              AND ae.TargetAssetUniqueID <> ''
+                        ),
+                        AvatarFirstGroup AS (
+                            SELECT
+                                mg.AvatarAssetUniqueID AS AvatarId,
+                                mg.GroupAssetUniqueID AS GroupId,
+                                mg.AnimatorAssetUniqueID AS AnimatorId,
+                                mg.Confidence AS GroupConfidence,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY mg.AvatarAssetUniqueID
+                                    ORDER BY mg.Confidence DESC, mg.GroupAssetUniqueID ASC
+                                ) AS GroupRank
+                            FROM ModelGroups mg
+                            WHERE mg.ProjectId = @projectId
+                              AND mg.AvatarAssetUniqueID <> ''
+                        ),
+                        ClipProbeCounts AS (
+                            SELECT
+                                c.ClipAssetUniqueID,
+                                COUNT(DISTINCT c.BoneHash) AS ProbeCount,
+                                MAX(c.TotalClipBoneCount) AS TotalClipBones
+                            FROM Stage_ClipBoneHashes c
+                            WHERE c.ProjectId = @projectId
+                            GROUP BY c.ClipAssetUniqueID
+                        ),
+                        RawRigMatches AS (
+                            SELECT
+                                c.ClipAssetUniqueID AS ClipId,
+                                r.AvatarAssetUniqueID AS RawAvatarId,
+                                r.AnimatorAssetUniqueID AS RawAnimatorId,
+                                r.MeshAssetUniqueID AS RawMeshId,
+                                r.ModelGroupId AS RawGroupId,
+                                COUNT(DISTINCT c.BoneHash) AS MatchedProbes,
+                                cp.ProbeCount AS ProbeCount,
+                                CASE WHEN cp.TotalClipBones > 0 THEN cp.TotalClipBones ELSE cp.ProbeCount END AS TotalClipBones
+                            FROM Stage_ClipBoneHashes c
+                            INNER JOIN ClipProbeCounts cp
+                              ON cp.ClipAssetUniqueID = c.ClipAssetUniqueID
+                            INNER JOIN Stage_RigBoneHashes r
+                              ON r.ProjectId = c.ProjectId
+                             AND r.BoneHash = c.BoneHash
+                            WHERE c.ProjectId = @projectId
+                            GROUP BY
+                                c.ClipAssetUniqueID,
+                                r.AvatarAssetUniqueID,
+                                r.AnimatorAssetUniqueID,
+                                r.MeshAssetUniqueID,
+                                r.ModelGroupId
+                            HAVING MatchedProbes >= (
+                                CASE
+                                    WHEN cp.ProbeCount <= 2 THEN cp.ProbeCount
+                                    WHEN cp.ProbeCount <= 5 THEN cp.ProbeCount - 1
+                                    ELSE MAX(3, cp.ProbeCount / 4)
+                                END
+                            )
+                        ),
+                        EnrichedMatches AS (
+                            SELECT
+                                m.ClipId,
+                                COALESCE(NULLIF(m.RawAnimatorId, ''), afg.AnimatorId, '') AS AnimatorId,
+                                m.RawAvatarId AS AvatarId,
+                                COALESCE(NULLIF(m.RawMeshId, ''), rep.MeshAssetUniqueID, afm.MeshId, '') AS MeshId,
+                                COALESCE(NULLIF(m.RawGroupId, ''), afg.GroupId, '') AS GroupId,
+                                m.MatchedProbes,
+                                m.ProbeCount,
+                                m.TotalClipBones,
+                                ((m.MatchedProbes * 1000) / MAX(1, m.ProbeCount))
+                                    + (m.MatchedProbes * 100)
+                                    + (CASE WHEN COALESCE(NULLIF(m.RawGroupId, ''), afg.GroupId, '') <> '' THEN 60 ELSE 0 END)
+                                    + (CASE WHEN COALESCE(NULLIF(m.RawMeshId, ''), rep.MeshAssetUniqueID, afm.MeshId, '') <> '' THEN 40 ELSE 0 END)
+                                    + (CASE WHEN clipAsset.SourceFileId IS NOT NULL
+                                             AND (clipAsset.SourceFileId = avatarAsset.SourceFileId
+                                                  OR clipAsset.SourceFileId = meshAsset.SourceFileId)
+                                            THEN 50 ELSE 0 END) AS Score
+                            FROM RawRigMatches m
+                            LEFT JOIN AvatarFirstGroup afg
+                              ON m.RawAvatarId <> ''
+                             AND afg.AvatarId = m.RawAvatarId
+                             AND afg.GroupRank = 1
+                            LEFT JOIN GroupRepresentativeMesh rep
+                              ON rep.GroupAssetUniqueID = COALESCE(NULLIF(m.RawGroupId, ''), afg.GroupId, '')
+                             AND rep.RepRank = 1
+                            LEFT JOIN AvatarFirstMesh afm
+                              ON m.RawAvatarId <> ''
+                             AND afm.AvatarId = m.RawAvatarId
+                             AND afm.MeshRank = 1
+                            LEFT JOIN Assets clipAsset
+                              ON clipAsset.ProjectId = @projectId
+                             AND clipAsset.UniqueID = m.ClipId
+                            LEFT JOIN Assets avatarAsset
+                              ON avatarAsset.ProjectId = @projectId
+                             AND m.RawAvatarId <> ''
+                             AND avatarAsset.UniqueID = m.RawAvatarId
+                            LEFT JOIN Assets meshAsset
+                              ON meshAsset.ProjectId = @projectId
+                             AND COALESCE(NULLIF(m.RawMeshId, ''), rep.MeshAssetUniqueID, afm.MeshId, '') <> ''
+                             AND meshAsset.UniqueID = COALESCE(NULLIF(m.RawMeshId, ''), rep.MeshAssetUniqueID, afm.MeshId, '')
+                        ),
+                        RankedMatches AS (
+                            SELECT
+                                e.ClipId,
+                                e.AnimatorId,
+                                e.AvatarId,
+                                e.MeshId,
+                                e.GroupId,
+                                MAX(e.Score) AS BestScore,
+                                MAX(e.MatchedProbes) AS BestMatchedProbes,
+                                MAX(e.TotalClipBones) AS TotalClipBones,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY e.ClipId
+                                    ORDER BY MAX(e.Score) DESC, MAX(e.MatchedProbes) DESC, e.AvatarId ASC, e.MeshId ASC, e.GroupId ASC
+                                ) AS RankNum
+                            FROM EnrichedMatches e
+                            WHERE e.AvatarId <> '' OR e.MeshId <> '' OR e.GroupId <> ''
+                            GROUP BY e.ClipId, e.AvatarId, e.MeshId, e.GroupId, e.AnimatorId
+                        )
+                        INSERT INTO AnimationClipTargets (
+                            ProjectId, ClipAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID,
+                            MeshAssetUniqueID, ModelGroupId, RelationKind, MatchScore, MatchedBoneCount, TotalClipBoneCount)
+                        SELECT
+                            @projectId,
+                            r.ClipId,
+                            r.AnimatorId,
+                            r.AvatarId,
+                            r.MeshId,
+                            r.GroupId,
+                            'BoneHashMatch',
+                            r.BestScore,
+                            r.BestMatchedProbes,
+                            r.TotalClipBones
+                        FROM RankedMatches r
+                        WHERE r.RankNum <= 16
+                        ON CONFLICT(ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
+                        DO UPDATE SET
+                            MatchScore = MAX(AnimationClipTargets.MatchScore, excluded.MatchScore),
+                            MatchedBoneCount = MAX(AnimationClipTargets.MatchedBoneCount, excluded.MatchedBoneCount),
+                            TotalClipBoneCount = MAX(AnimationClipTargets.TotalClipBoneCount, excluded.TotalClipBoneCount);";
+                    matchCmd.Parameters.AddWithValue("@projectId", projectId);
+                    matchCmd.ExecuteNonQuery();
+                }
+
+                // Also synthesize CompatibleAvatar edges into AssetEdges for top bone-hash matches
+                // so legacy LoadAnimationClipAvatarAssetIds / LoadAnimationClipMeshAssetIds queries
+                // see decoupled bone-hash-matched rigs immediately.
+                using (var compatEdgeCmd = conn.CreateCommand())
+                {
+                    compatEdgeCmd.Transaction = transaction;
+                    compatEdgeCmd.CommandText = @"
+                        WITH RankedAvatarTargets AS (
+                            SELECT
+                                t.ClipAssetUniqueID AS ClipId,
+                                t.AvatarAssetUniqueID AS AvatarId,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY t.ClipAssetUniqueID
+                                    ORDER BY MAX(t.MatchScore) DESC, MAX(t.MatchedBoneCount) DESC, t.AvatarAssetUniqueID ASC
+                                ) - 1 AS SlotIdx
+                            FROM AnimationClipTargets t
+                            WHERE t.ProjectId = @projectId
+                              AND t.RelationKind = 'BoneHashMatch'
+                              AND t.AvatarAssetUniqueID <> ''
+                            GROUP BY t.ClipAssetUniqueID, t.AvatarAssetUniqueID
+                        )
+                        INSERT INTO AssetEdges (
+                            ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetAssetUniqueID,
+                            SourceFileId, SourcePathID, TargetFileId, TargetPathID, IsResolved)
+                        SELECT
+                            @projectId,
+                            rat.ClipId,
+                            'Avatar',
+                            'CompatibleAvatar',
+                            rat.SlotIdx,
+                            rat.AvatarId,
+                            COALESCE(srcAsset.SourceFileId, 0),
+                            COALESCE(srcAsset.PathID, 0),
+                            COALESCE(tgtAsset.SourceFileId, 0),
+                            COALESCE(tgtAsset.PathID, 0),
+                            1
+                        FROM RankedAvatarTargets rat
+                        LEFT JOIN Assets srcAsset
+                          ON srcAsset.ProjectId = @projectId
+                         AND srcAsset.UniqueID = rat.ClipId
+                        LEFT JOIN Assets tgtAsset
+                          ON tgtAsset.ProjectId = @projectId
+                         AND tgtAsset.UniqueID = rat.AvatarId
+                        WHERE rat.SlotIdx < 8
+                        ON CONFLICT(ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetFileId, TargetPathID)
+                        DO UPDATE SET
+                            TargetAssetUniqueID = excluded.TargetAssetUniqueID,
+                            IsResolved = excluded.IsResolved;";
+                    compatEdgeCmd.Parameters.AddWithValue("@projectId", projectId);
+                    compatEdgeCmd.ExecuteNonQuery();
+                }
+            }
+
+            advanceProgress?.Invoke("Promoted animation clip targets");
         }
     }
 }

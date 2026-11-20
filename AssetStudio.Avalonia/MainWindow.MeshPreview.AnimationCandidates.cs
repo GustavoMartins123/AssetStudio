@@ -10,6 +10,24 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private List<AnimationClipTargetInfo> LoadAnimationClipTargetsForPreview(AnimationClip clip)
+    {
+        if (!assetsManager.LazyLoading || clip.assetsFile == null || currentScanResult == null)
+        {
+            return new List<AnimationClipTargetInfo>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return new List<AnimationClipTargetInfo>();
+        }
+
+        var clipAssetId = AssetHandle.BuildUniqueID(clip.assetsFile, clip.m_PathID);
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadAnimationClipTargets(folderPath, signature, clipAssetId);
+    }
+
     private List<string> LoadAnimationClipAvatarAssetIdsForPreview(AnimationClip clip)
     {
         if (!assetsManager.LazyLoading || clip.assetsFile == null || currentScanResult == null)
@@ -51,10 +69,14 @@ public partial class MainWindow
         Avatar? preferredAvatar,
         Mesh? preferredMesh,
         string? preferredAvatarId = null,
-        string? preferredMeshId = null)
+        string? preferredMeshId = null,
+        Avatar? currentAvatarSnapshot = null,
+        Mesh? currentMeshSnapshot = null)
     {
         var candidates = new List<PreviewCandidateItem>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var activePreviewAvatar = currentAvatarSnapshot ?? currentPreviewAvatar;
+        var activePreviewMesh = currentMeshSnapshot ?? currentPreviewMesh;
 
         void AddCandidate(
             Avatar? avatar,
@@ -161,47 +183,142 @@ public partial class MainWindow
             AddCandidate(preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId, "Selected");
         }
 
-        if (currentPreviewMesh != null)
+        if (activePreviewMesh != null)
         {
-            AddCandidate(currentPreviewAvatar, currentPreviewMesh, null, null, currentPreviewAvatar != null ? "Current" : "Current mesh");
+            AddCandidate(activePreviewAvatar, activePreviewMesh, null, null, activePreviewAvatar != null ? "Current" : "Current mesh");
         }
 
-        if (currentPreviewAvatar != null)
+        if (activePreviewAvatar != null)
         {
             var addedCurrentMesh = false;
-            if (avatarMeshesCache != null && avatarMeshesCache.TryGetValue(currentPreviewAvatar, out var currentMeshes))
+            List<Mesh>? currentMeshes = null;
+            Mesh? cachedMesh = null;
+            lock (previewCacheLock)
+            {
+                if (avatarMeshesCache != null && avatarMeshesCache.TryGetValue(activePreviewAvatar, out var foundMeshes))
+                {
+                    currentMeshes = new List<Mesh>(foundMeshes);
+                }
+
+                if (avatarMeshCache != null)
+                {
+                    avatarMeshCache.TryGetValue(activePreviewAvatar, out cachedMesh);
+                }
+            }
+
+            if (currentMeshes != null)
             {
                 foreach (var mesh in currentMeshes)
                 {
-                    AddCandidate(currentPreviewAvatar, mesh, null, null, "Current avatar");
+                    AddCandidate(activePreviewAvatar, mesh, null, null, "Current avatar");
                     addedCurrentMesh = true;
                 }
             }
 
-            if (!addedCurrentMesh
-                && avatarMeshCache != null
-                && avatarMeshCache.TryGetValue(currentPreviewAvatar, out var cachedMesh)
-                && cachedMesh != null)
+            if (!addedCurrentMesh && cachedMesh != null)
             {
-                AddCandidate(currentPreviewAvatar, cachedMesh, null, null, "Current avatar");
+                AddCandidate(activePreviewAvatar, cachedMesh, null, null, "Current avatar");
                 addedCurrentMesh = true;
             }
 
             if (!addedCurrentMesh)
             {
-                AddCandidate(currentPreviewAvatar, null, null, null, "Current avatar");
+                AddCandidate(activePreviewAvatar, null, null, null, "Current avatar");
             }
         }
 
         if (assetsManager.LazyLoading)
         {
-            var avatarIds = LoadAnimationClipAvatarAssetIdsForPreview(clip);
-            var avatarMeshIdsByAvatarId = LoadAvatarMeshAssetIdsByAvatarIdsForPreview(avatarIds);
-            var modelGroupsByAvatarId = LoadModelGroupsByAvatarIdsForPreview(avatarIds);
             var avatarIdsCoveredByMesh = new HashSet<string>(StringComparer.Ordinal);
             var avatarIdsCoveredByModelGroup = new HashSet<string>(StringComparer.Ordinal);
             var meshIdsCoveredByAvatar = new HashSet<string>(StringComparer.Ordinal);
             var meshIdsCoveredByModelGroup = new HashSet<string>(StringComparer.Ordinal);
+
+            // Fast v14 pre-indexed single-query lookup from AnimationClipTargets
+            var preIndexedTargets = LoadAnimationClipTargetsForPreview(clip);
+            foreach (var target in preIndexedTargets)
+            {
+                if (!string.IsNullOrWhiteSpace(target.ModelGroupId))
+                {
+                    var groupMeshes = LoadModelGroupMeshesForPreview(target.ModelGroupId);
+                    var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+                    var repMeshId = representative?.MeshAssetId ?? target.MeshAssetId;
+                    if (!string.IsNullOrWhiteSpace(repMeshId))
+                    {
+                        var meshIds = groupMeshes
+                            .Select(mesh => mesh.MeshAssetId)
+                            .Where(id => !string.IsNullOrWhiteSpace(id))
+                            .ToArray();
+                        foreach (var meshId in meshIds)
+                        {
+                            meshIdsCoveredByModelGroup.Add(meshId);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(target.AvatarAssetId))
+                        {
+                            avatarIdsCoveredByModelGroup.Add(target.AvatarAssetId);
+                            avatarIdsCoveredByMesh.Add(target.AvatarAssetId);
+                            meshIdsCoveredByAvatar.Add(repMeshId);
+                        }
+
+                        var groupName = !string.IsNullOrWhiteSpace(target.ModelGroupName)
+                            ? target.ModelGroupName
+                            : GetPreviewHandleName(repMeshId, "Model");
+                        var meshName = !string.IsNullOrWhiteSpace(representative?.MeshName)
+                            ? representative!.MeshName
+                            : !string.IsNullOrWhiteSpace(target.MeshName)
+                                ? target.MeshName
+                                : GetPreviewHandleName(repMeshId, "Mesh");
+                        var avatarName = !string.IsNullOrWhiteSpace(target.AvatarName)
+                            ? target.AvatarName
+                            : !string.IsNullOrWhiteSpace(target.AvatarAssetId)
+                                ? GetPreviewHandleName(target.AvatarAssetId, "Avatar")
+                                : string.Empty;
+
+                        AddCandidate(
+                            null,
+                            null,
+                            target.AvatarAssetId,
+                            repMeshId,
+                            "Model group",
+                            avatarName,
+                            meshName,
+                            target.ModelGroupId,
+                            groupName,
+                            meshIds,
+                            groupMeshes,
+                            target.ModelGroupConfidence);
+                        continue;
+                    }
+                }
+
+                var relationSource = target.RelationKind switch
+                {
+                    "BoneHashMatch" => "Bone match",
+                    "Container" => "Container",
+                    "LegacyAnimation" => "Legacy animation",
+                    _ => !string.IsNullOrWhiteSpace(target.AvatarAssetId) ? "Avatar relation" : "Animator mesh"
+                };
+
+                if (!string.IsNullOrWhiteSpace(target.AvatarAssetId) && !string.IsNullOrWhiteSpace(target.MeshAssetId))
+                {
+                    avatarIdsCoveredByMesh.Add(target.AvatarAssetId);
+                    meshIdsCoveredByAvatar.Add(target.MeshAssetId);
+                }
+
+                AddCandidate(
+                    null,
+                    null,
+                    target.AvatarAssetId,
+                    target.MeshAssetId,
+                    relationSource,
+                    !string.IsNullOrWhiteSpace(target.AvatarName) ? target.AvatarName : null,
+                    !string.IsNullOrWhiteSpace(target.MeshName) ? target.MeshName : null);
+            }
+
+            var avatarIds = LoadAnimationClipAvatarAssetIdsForPreview(clip);
+            var avatarMeshIdsByAvatarId = LoadAvatarMeshAssetIdsByAvatarIdsForPreview(avatarIds);
+            var modelGroupsByAvatarId = LoadModelGroupsByAvatarIdsForPreview(avatarIds);
 
             foreach (var avatarId in avatarIds)
             {
@@ -459,69 +576,14 @@ public partial class MainWindow
         string? preferredMeshId,
         PreviewCandidateItem? selectedCandidate)
     {
-        var previewId = texturePreviewIdCounter;
-        var selectedAsset = AssetListDataGrid.SelectedItem;
-        StatusStripUpdate("Loading animation relations...");
-
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                var candidates = BuildAnimationClipPreviewCandidates(
-                    clip,
-                    preferredAvatar,
-                    preferredMesh,
-                    preferredAvatarId,
-                    preferredMeshId);
-                var activeCandidate = selectedCandidate
-                    ?? SelectAnimationClipPreviewCandidate(
-                        clip,
-                        candidates,
-                        preferredAvatar,
-                        preferredMesh,
-                        preferredAvatarId,
-                        preferredMeshId);
-
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (previewId != texturePreviewIdCounter
-                        || !ReferenceEquals(AssetListDataGrid.SelectedItem, selectedAsset))
-                    {
-                        return;
-                    }
-
-                    BuildPreviewCandidateControls(candidates, activeCandidate, "Animation Target");
-                    PreviewAnimationClip(
-                        clip,
-                        preferredAvatar,
-                        preferredMesh,
-                        preferredAvatarId,
-                        preferredMeshId,
-                        rebuildCandidateControls: false,
-                        selectedCandidate: activeCandidate);
-                });
-            }
-            catch (Exception ex)
-            {
-                logger.Log(LoggerEvent.Error, $"Animation relation query failed for {clip.m_Name}: {ex}");
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (previewId == texturePreviewIdCounter
-                        && ReferenceEquals(AssetListDataGrid.SelectedItem, selectedAsset))
-                    {
-                        ClearPreviewCandidateControls();
-                        PreviewAnimationClip(
-                            clip,
-                            preferredAvatar,
-                            preferredMesh,
-                            preferredAvatarId,
-                            preferredMeshId,
-                            rebuildCandidateControls: false,
-                            selectedCandidate: selectedCandidate);
-                    }
-                });
-            }
-        });
+        QueueAnimationClipPreviewAsync(
+            clip,
+            preferredAvatar,
+            preferredMesh,
+            preferredAvatarId,
+            preferredMeshId,
+            rebuildCandidateControls: true,
+            selectedCandidate: selectedCandidate);
     }
 
     private List<Avatar> FindCandidateAvatarsForAnimationClip(AnimationClip clip)
@@ -550,10 +612,15 @@ public partial class MainWindow
             AddCandidate(avatar);
         }
 
-        if (animationClipAvatarCache != null && animationClipAvatarCache.TryGetValue(clip, out var cachedAvatar))
+        Avatar? cachedAvatar = null;
+        lock (previewCacheLock)
         {
-            AddCandidate(cachedAvatar);
+            if (animationClipAvatarCache != null)
+            {
+                animationClipAvatarCache.TryGetValue(clip, out cachedAvatar);
+            }
         }
+        AddCandidate(cachedAvatar);
 
         return avatars;
     }
@@ -597,8 +664,11 @@ public partial class MainWindow
 
         if (avatars.Count > 0)
         {
-            animationClipAvatarCache ??= new Dictionary<AnimationClip, Avatar?>();
-            animationClipAvatarCache[clip] = avatars[0];
+            lock (previewCacheLock)
+            {
+                animationClipAvatarCache ??= new Dictionary<AnimationClip, Avatar?>();
+                animationClipAvatarCache[clip] = avatars[0];
+            }
         }
 
         return avatars;
@@ -646,19 +716,28 @@ public partial class MainWindow
 
     private bool IsAnimationClipCompatibleWithAvatar(AnimationClip clip, Avatar avatar)
     {
-        if (animationClipAvatarCache != null && animationClipAvatarCache.TryGetValue(clip, out var cachedAvatar))
+        HashSet<uint>? bindingPaths;
+        lock (previewCacheLock)
         {
-            if (ReferenceEquals(cachedAvatar, avatar))
+            if (animationClipAvatarCache != null
+                && animationClipAvatarCache.TryGetValue(clip, out var cachedAvatar)
+                && ReferenceEquals(cachedAvatar, avatar))
             {
                 return true;
             }
+
+            animationClipTransformBindingsCache ??= new Dictionary<AnimationClip, HashSet<uint>>();
+            animationClipTransformBindingsCache.TryGetValue(clip, out bindingPaths);
         }
 
-        animationClipTransformBindingsCache ??= new Dictionary<AnimationClip, HashSet<uint>>();
-        if (!animationClipTransformBindingsCache.TryGetValue(clip, out var bindingPaths))
+        if (bindingPaths == null)
         {
             bindingPaths = GetTransformBindingPathsBackground(clip);
-            animationClipTransformBindingsCache[clip] = bindingPaths;
+            lock (previewCacheLock)
+            {
+                animationClipTransformBindingsCache ??= new Dictionary<AnimationClip, HashSet<uint>>();
+                animationClipTransformBindingsCache[clip] = bindingPaths;
+            }
         }
 
         if (bindingPaths.Count == 0 || avatar.m_TOS == null)

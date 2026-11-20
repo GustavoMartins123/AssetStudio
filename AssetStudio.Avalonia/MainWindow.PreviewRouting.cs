@@ -62,6 +62,7 @@ public partial class MainWindow : Window
     private void CancelPendingPreview()
     {
         previewDebounce?.Cancel();
+        _animationPreviewCoordinator.CancelCurrent();
     }
 
     private void PreviewSelectedAssetImmediately()

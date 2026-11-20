@@ -11,6 +11,9 @@ internal sealed class SemanticAssetRelations
     public List<SemanticMeshRendererRelation> MeshRenderers { get; } = new();
     public List<SemanticMeshMaterialRelation> MeshMaterials { get; } = new();
     public List<SemanticMaterialTextureRelation> MaterialTextures { get; } = new();
+    public List<SemanticAnimationClipTargetRelation> AnimationClipTargets { get; } = new();
+    public List<SemanticRigBoneHashEntry> RigBoneHashes { get; } = new();
+    public List<SemanticClipBoneHashEntry> ClipBoneHashes { get; } = new();
 
     public bool HasRelations =>
         AssetEdges.Count > 0 ||
@@ -18,12 +21,18 @@ internal sealed class SemanticAssetRelations
         ModelGroupMeshes.Count > 0 ||
         MeshRenderers.Count > 0 ||
         MeshMaterials.Count > 0 ||
-        MaterialTextures.Count > 0;
+        MaterialTextures.Count > 0 ||
+        AnimationClipTargets.Count > 0 ||
+        RigBoneHashes.Count > 0 ||
+        ClipBoneHashes.Count > 0;
 
     public bool HasMaterialRelations =>
         AssetEdges.Count > 0 ||
         MeshMaterials.Count > 0 ||
-        MaterialTextures.Count > 0;
+        MaterialTextures.Count > 0 ||
+        AnimationClipTargets.Count > 0 ||
+        RigBoneHashes.Count > 0 ||
+        ClipBoneHashes.Count > 0;
 
     public void Merge(SemanticAssetRelations other)
     {
@@ -39,7 +48,85 @@ internal sealed class SemanticAssetRelations
         MeshRenderers.AddRange(other.MeshRenderers);
         MeshMaterials.AddRange(other.MeshMaterials);
         MaterialTextures.AddRange(other.MaterialTextures);
+        AnimationClipTargets.AddRange(other.AnimationClipTargets);
+        RigBoneHashes.AddRange(other.RigBoneHashes);
+        ClipBoneHashes.AddRange(other.ClipBoneHashes);
     }
+}
+
+internal sealed class SemanticAnimationClipTargetRelation
+{
+    public SemanticAnimationClipTargetRelation(
+        string clipAssetId,
+        string animatorAssetId,
+        string avatarAssetId,
+        string meshAssetId,
+        string modelGroupId,
+        string relationKind,
+        int matchScore,
+        int matchedBoneCount = 0,
+        int totalClipBoneCount = 0)
+    {
+        ClipAssetId = clipAssetId ?? string.Empty;
+        AnimatorAssetId = animatorAssetId ?? string.Empty;
+        AvatarAssetId = avatarAssetId ?? string.Empty;
+        MeshAssetId = meshAssetId ?? string.Empty;
+        ModelGroupId = modelGroupId ?? string.Empty;
+        RelationKind = relationKind ?? string.Empty;
+        MatchScore = matchScore;
+        MatchedBoneCount = matchedBoneCount;
+        TotalClipBoneCount = totalClipBoneCount;
+    }
+
+    public string ClipAssetId { get; }
+    public string AnimatorAssetId { get; }
+    public string AvatarAssetId { get; }
+    public string MeshAssetId { get; }
+    public string ModelGroupId { get; }
+    public string RelationKind { get; }
+    public int MatchScore { get; }
+    public int MatchedBoneCount { get; }
+    public int TotalClipBoneCount { get; }
+}
+
+internal sealed class SemanticRigBoneHashEntry
+{
+    public SemanticRigBoneHashEntry(
+        string avatarAssetId,
+        string animatorAssetId,
+        string meshAssetId,
+        string modelGroupId,
+        uint boneHash)
+    {
+        AvatarAssetId = avatarAssetId ?? string.Empty;
+        AnimatorAssetId = animatorAssetId ?? string.Empty;
+        MeshAssetId = meshAssetId ?? string.Empty;
+        ModelGroupId = modelGroupId ?? string.Empty;
+        BoneHash = boneHash;
+    }
+
+    public string AvatarAssetId { get; }
+    public string AnimatorAssetId { get; }
+    public string MeshAssetId { get; }
+    public string ModelGroupId { get; }
+    public uint BoneHash { get; }
+}
+
+internal sealed class SemanticClipBoneHashEntry
+{
+    public SemanticClipBoneHashEntry(
+        string clipAssetId,
+        uint boneHash,
+        int totalClipBoneCount)
+    {
+        ClipAssetId = clipAssetId ?? string.Empty;
+        BoneHash = boneHash;
+        TotalClipBoneCount = totalClipBoneCount;
+    }
+
+    public string ClipAssetId { get; }
+    public uint BoneHash { get; }
+    public int TotalClipBoneCount { get; }
 }
 
 internal sealed class SemanticAssetEdgeRelation

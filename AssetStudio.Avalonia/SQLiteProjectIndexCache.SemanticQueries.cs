@@ -430,6 +430,91 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        internal List<AnimationClipTargetInfo> LoadAnimationClipTargets(
+            string folderPath,
+            string signature,
+            string clipAssetId,
+            int maxResults = 32)
+        {
+            var result = new List<AnimationClipTargetInfo>();
+            if (string.IsNullOrWhiteSpace(clipAssetId) || maxResults <= 0)
+            {
+                return result;
+            }
+
+            ExecuteProjectReadQuery(folderPath, signature, "animation clip target relations", (conn, transaction, projectId) =>
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        t.ClipAssetUniqueID,
+                        t.AnimatorAssetUniqueID,
+                        t.AvatarAssetUniqueID,
+                        t.MeshAssetUniqueID,
+                        t.ModelGroupId,
+                        t.RelationKind,
+                        t.MatchScore,
+                        t.MatchedBoneCount,
+                        t.TotalClipBoneCount,
+                        COALESCE(avatarAsset.Name, ''),
+                        COALESCE(meshAsset.Name, ''),
+                        COALESCE(
+                            NULLIF(mg.GroupName, ''),
+                            NULLIF(mg.RootGameObjectName, ''),
+                            ''
+                        ),
+                        COALESCE(mg.Confidence, 0)
+                    FROM AnimationClipTargets t
+                    LEFT JOIN Assets avatarAsset
+                      ON avatarAsset.ProjectId = t.ProjectId
+                     AND t.AvatarAssetUniqueID <> ''
+                     AND avatarAsset.UniqueID = t.AvatarAssetUniqueID
+                    LEFT JOIN Assets meshAsset
+                      ON meshAsset.ProjectId = t.ProjectId
+                     AND t.MeshAssetUniqueID <> ''
+                     AND meshAsset.UniqueID = t.MeshAssetUniqueID
+                    LEFT JOIN ModelGroups mg
+                      ON mg.ProjectId = t.ProjectId
+                     AND t.ModelGroupId <> ''
+                     AND mg.GroupAssetUniqueID = t.ModelGroupId
+                    WHERE t.ProjectId = @projectId
+                      AND t.ClipAssetUniqueID = @clipAssetId
+                    ORDER BY
+                        t.MatchScore DESC,
+                        t.MatchedBoneCount DESC,
+                        CASE WHEN t.ModelGroupId <> '' THEN 0 ELSE 1 END,
+                        CASE WHEN t.AvatarAssetUniqueID <> '' AND t.MeshAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                        t.AvatarAssetUniqueID,
+                        t.MeshAssetUniqueID,
+                        t.ModelGroupId
+                    LIMIT @maxResults";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                cmd.Parameters.AddWithValue("@clipAssetId", clipAssetId);
+                cmd.Parameters.AddWithValue("@maxResults", maxResults);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(new AnimationClipTargetInfo(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetString(3),
+                        reader.GetString(4),
+                        reader.GetString(5),
+                        reader.GetInt32(6),
+                        reader.GetInt32(7),
+                        reader.GetInt32(8),
+                        reader.GetString(9),
+                        reader.GetString(10),
+                        reader.GetString(11),
+                        reader.GetInt32(12)));
+                }
+            });
+
+            return result;
+        }
+
         internal List<string> LoadAnimationClipAvatarAssetIds(string folderPath, string signature, string clipAssetId)
         {
             var result = new List<string>();
@@ -444,6 +529,14 @@ namespace AssetStudio.Avalonia
                 cmd.Transaction = transaction;
                 cmd.CommandText = @"
                     WITH AvatarCandidates AS (
+                        SELECT
+                            t.AvatarAssetUniqueID AS AvatarAssetId,
+                            -t.MatchScore AS SortIndex
+                        FROM AnimationClipTargets t
+                        WHERE t.ProjectId = @projectId
+                          AND t.ClipAssetUniqueID = @clipAssetId
+                          AND t.AvatarAssetUniqueID <> ''
+                        UNION ALL
                         SELECT
                             ae.TargetAssetUniqueID AS AvatarAssetId,
                             ae.SlotIndex AS SortIndex
@@ -502,6 +595,14 @@ namespace AssetStudio.Avalonia
                 cmd.Transaction = transaction;
                 cmd.CommandText = @"
                     WITH MeshCandidates AS (
+                        SELECT
+                            t.MeshAssetUniqueID AS MeshAssetId,
+                            -t.MatchScore AS SortIndex
+                        FROM AnimationClipTargets t
+                        WHERE t.ProjectId = @projectId
+                          AND t.ClipAssetUniqueID = @clipAssetId
+                          AND t.MeshAssetUniqueID <> ''
+                        UNION ALL
                         SELECT
                             meshEdge.TargetAssetUniqueID AS MeshAssetId,
                             meshEdge.SlotIndex AS SortIndex

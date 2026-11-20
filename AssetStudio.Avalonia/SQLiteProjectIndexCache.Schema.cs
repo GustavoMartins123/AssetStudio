@@ -8,12 +8,11 @@ namespace AssetStudio.Avalonia
     public partial class SQLiteProjectIndexCache
     {
         /// <summary>
-        /// v13: the physical <c>AssetHandles</c> table was folded into the clustered <c>Assets</c>
-        /// table (WITHOUT ROWID, PRIMARY KEY (ProjectId, UniqueID)). Every handle is written exactly
-        /// once; <c>OriginalPath</c>/<c>SerializedFileName</c> are normalized through <c>SourceFiles</c>
-        /// and a read-only <c>AssetHandles</c> compatibility view keeps legacy queries working.
+        /// v14: adds pre-indexed <c>AnimationClipTargets</c> (WITHOUT ROWID) and bone-hash staging tables
+        /// (<c>Stage_AnimationClipTargets</c>, <c>Stage_RigBoneHashes</c>, <c>Stage_ClipBoneHashes</c>)
+        /// for O(1) &lt; 1 ms <c>AnimationClip</c> ↔ <c>Animator</c>/<c>Avatar</c>/<c>Mesh</c>/<c>ModelGroup</c> resolution.
         /// </summary>
-        internal const int SemanticSchemaVersion = 13;
+        internal const int SemanticSchemaVersion = 14;
 
         private const string AssetHandlesCompatibilityViewSql = @"
             CREATE VIEW IF NOT EXISTS AssetHandles AS
@@ -42,13 +41,13 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            if ((existingVersion == 11 || existingVersion == 12) && CanPreserveV11ProjectsAndPreviewCache(conn))
+            if ((existingVersion == 11 || existingVersion == 12 || existingVersion == 13) && CanPreserveV11ProjectsAndPreviewCache(conn))
             {
-                if (existingVersion == 12 && CanPreserveV12UnifiedAssets(conn))
+                if ((existingVersion == 12 || existingVersion == 13) && CanPreserveV12UnifiedAssets(conn))
                 {
-                    // v12 Assets already holds every handle column (paths via SourceFiles): keep the
-                    // whole index cache and just drop the duplicated physical AssetHandles table.
-                    UpgradeV12ToV13InPlace(conn);
+                    // v12/v13 Assets already holds every handle column (paths via SourceFiles): keep the
+                    // whole index cache and preview cache in place and add v14 animation relation tables.
+                    UpgradeV12OrV13ToV14InPlace(conn);
                 }
                 else
                 {
@@ -179,7 +178,7 @@ namespace AssetStudio.Avalonia
             return Convert.ToInt64(orphanCmd.ExecuteScalar()) == 0;
         }
 
-        private static void UpgradeV12ToV13InPlace(SqliteConnection conn)
+        private static void UpgradeV12OrV13ToV14InPlace(SqliteConnection conn)
         {
             DropAssetHandlesSchemaObject(conn);
             using var cmd = conn.CreateCommand();
@@ -187,6 +186,17 @@ namespace AssetStudio.Avalonia
                 DROP INDEX IF EXISTS idx_handles_lookup;
                 DROP INDEX IF EXISTS idx_projects_path;";
             cmd.ExecuteNonQuery();
+
+            if (GetTableColumnNames(conn, "ProjectIndexingState").Contains("Status"))
+            {
+                using var statusCmd = conn.CreateCommand();
+                statusCmd.CommandText = @"
+                    UPDATE ProjectIndexingState
+                    SET Status = 'completed',
+                        CurrentFile = 'Schema upgraded to v14; connections ready to rebuild'
+                    WHERE Status IN ('connections_completed', 'structure_completed', 'building_structure');";
+                statusCmd.ExecuteNonQuery();
+            }
         }
 
         private static void DropLegacyIndexTables(SqliteConnection conn)
@@ -197,6 +207,7 @@ namespace AssetStudio.Avalonia
                 PRAGMA foreign_keys = OFF;
                 DROP TABLE IF EXISTS IndexingReadFiles;
                 DROP TABLE IF EXISTS ProjectIndexingState;
+                DROP TABLE IF EXISTS AnimationClipTargets;
                 DROP TABLE IF EXISTS MaterialTextures;
                 DROP TABLE IF EXISTS MeshMaterials;
                 DROP TABLE IF EXISTS MeshRenderers;
@@ -220,6 +231,7 @@ namespace AssetStudio.Avalonia
                     DROP TABLE IF EXISTS IndexingReadFiles;
                     DROP TABLE IF EXISTS ProjectIndexingState;
                     DROP TABLE IF EXISTS PreviewCacheEntries;
+                    DROP TABLE IF EXISTS AnimationClipTargets;
                     DROP TABLE IF EXISTS MaterialTextures;
                     DROP TABLE IF EXISTS MeshMaterials;
                     DROP TABLE IF EXISTS MeshRenderers;
@@ -388,6 +400,20 @@ namespace AssetStudio.Avalonia
                                 PRIMARY KEY (ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID)
                             ) WITHOUT ROWID;
 
+                            CREATE TABLE IF NOT EXISTS AnimationClipTargets (
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                ClipAssetUniqueID TEXT NOT NULL,
+                                AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                MeshAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                ModelGroupId TEXT NOT NULL DEFAULT '',
+                                RelationKind TEXT NOT NULL DEFAULT '',
+                                MatchScore INTEGER NOT NULL DEFAULT 0,
+                                MatchedBoneCount INTEGER NOT NULL DEFAULT 0,
+                                TotalClipBoneCount INTEGER NOT NULL DEFAULT 0,
+                                PRIMARY KEY (ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
+                            ) WITHOUT ROWID;
+
                             CREATE TABLE IF NOT EXISTS PreviewCacheEntries (
                                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
@@ -447,6 +473,9 @@ namespace AssetStudio.Avalonia
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_clip_score ON AnimationClipTargets(ProjectId, ClipAssetUniqueID, MatchScore DESC, MatchedBoneCount DESC);
+                            CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_mesh ON AnimationClipTargets(ProjectId, MeshAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_avatar ON AnimationClipTargets(ProjectId, AvatarAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
                             CREATE INDEX IF NOT EXISTS idx_indexing_read_files_project ON IndexingReadFiles(ProjectId, ReadOrder);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_indexing_read_files_unique ON IndexingReadFiles(ProjectId, FilePath);
@@ -472,7 +501,10 @@ namespace AssetStudio.Avalonia
                 DROP INDEX IF EXISTS idx_model_groups_avatar;
                 DROP INDEX IF EXISTS idx_model_group_meshes_group;
                 DROP INDEX IF EXISTS idx_model_group_meshes_candidate;
-                DROP INDEX IF EXISTS idx_material_textures_preview_lookup;";
+                DROP INDEX IF EXISTS idx_material_textures_preview_lookup;
+                DROP INDEX IF EXISTS idx_anim_clip_targets_clip_score;
+                DROP INDEX IF EXISTS idx_anim_clip_targets_mesh;
+                DROP INDEX IF EXISTS idx_anim_clip_targets_avatar;";
             cmd.ExecuteNonQuery();
         }
 
@@ -485,7 +517,10 @@ namespace AssetStudio.Avalonia
                 CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
-                CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);";
+                CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_clip_score ON AnimationClipTargets(ProjectId, ClipAssetUniqueID, MatchScore DESC, MatchedBoneCount DESC);
+                CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_mesh ON AnimationClipTargets(ProjectId, MeshAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_avatar ON AnimationClipTargets(ProjectId, AvatarAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);";
             cmd.ExecuteNonQuery();
         }
 
@@ -497,7 +532,10 @@ namespace AssetStudio.Avalonia
             "Stage_ModelGroupMeshes",
             "Stage_MeshRenderers",
             "Stage_MeshMaterials",
-            "Stage_MaterialTextures"
+            "Stage_MaterialTextures",
+            "Stage_AnimationClipTargets",
+            "Stage_RigBoneHashes",
+            "Stage_ClipBoneHashes"
         };
 
         internal static void DropSemanticStagingTables(SqliteConnection conn, SqliteTransaction? transaction = null)
@@ -627,6 +665,35 @@ namespace AssetStudio.Avalonia
                     PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
                     IsResolved INTEGER NOT NULL DEFAULT 0,
                     IsMainTexture INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE Stage_AnimationClipTargets (
+                    ProjectId INTEGER NOT NULL,
+                    ClipAssetUniqueID TEXT NOT NULL,
+                    AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MeshAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    ModelGroupId TEXT NOT NULL DEFAULT '',
+                    RelationKind TEXT NOT NULL DEFAULT '',
+                    MatchScore INTEGER NOT NULL DEFAULT 0,
+                    MatchedBoneCount INTEGER NOT NULL DEFAULT 0,
+                    TotalClipBoneCount INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE Stage_RigBoneHashes (
+                    ProjectId INTEGER NOT NULL,
+                    AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MeshAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    ModelGroupId TEXT NOT NULL DEFAULT '',
+                    BoneHash INTEGER NOT NULL
+                );
+
+                CREATE TABLE Stage_ClipBoneHashes (
+                    ProjectId INTEGER NOT NULL,
+                    ClipAssetUniqueID TEXT NOT NULL,
+                    BoneHash INTEGER NOT NULL,
+                    TotalClipBoneCount INTEGER NOT NULL DEFAULT 0
                 );";
             cmd.ExecuteNonQuery();
         }

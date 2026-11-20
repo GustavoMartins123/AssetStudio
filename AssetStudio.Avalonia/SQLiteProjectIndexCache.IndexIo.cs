@@ -319,6 +319,7 @@ namespace AssetStudio.Avalonia
                 }
                 : new[]
                 {
+                    "AnimationClipTargets",
                     "MaterialTextures",
                     "MeshMaterials",
                     "MeshRenderers",

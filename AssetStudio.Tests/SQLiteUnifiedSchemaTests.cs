@@ -16,13 +16,13 @@ namespace AssetStudio.Tests
             var tempRoot = CreateTempDirectory("sqlite_unified_schema");
             try
             {
-                Assert.Equal(13, SQLiteProjectIndexCache.SemanticSchemaVersion);
+                Assert.Equal(14, SQLiteProjectIndexCache.SemanticSchemaVersion);
 
                 var (cache, projectDir, _, _, _) = CreateSampleProject(tempRoot);
                 cache.EnsureInitialized(projectDir);
 
                 using var conn = cache.CreateReadConnection(projectDir);
-                Assert.Equal("13", ReadSchemaVersion(conn));
+                Assert.Equal("14", ReadSchemaVersion(conn));
                 Assert.Null(GetSchemaObjectType(conn, "AssetHandles", "table"));
                 Assert.Equal("view", GetSchemaObjectType(conn, "AssetHandles", "view"));
                 Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Assets"), StringComparison.OrdinalIgnoreCase);
@@ -348,7 +348,7 @@ namespace AssetStudio.Tests
             Assert.Equal("hash123", preservedPreview!.PayloadHash);
 
             using var conn = cache.CreateReadConnection(projectDir);
-            Assert.Equal("13", ReadSchemaVersion(conn));
+            Assert.Equal("14", ReadSchemaVersion(conn));
             Assert.Null(GetSchemaObjectType(conn, "AssetHandles", "table"));
             Assert.Equal("view", GetSchemaObjectType(conn, "AssetHandles", "view"));
             Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Assets"), StringComparison.OrdinalIgnoreCase);

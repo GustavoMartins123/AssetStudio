@@ -28,39 +28,45 @@ public partial class MainWindow
 
     private void CacheAvatarMeshRelation(Avatar avatar, Mesh mesh)
     {
-        avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
-        avatarMeshCache[avatar] = mesh;
-
-        avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
-        if (!avatarMeshesCache.TryGetValue(avatar, out var meshes))
+        lock (previewCacheLock)
         {
-            meshes = new List<Mesh>();
-            avatarMeshesCache[avatar] = meshes;
-        }
+            avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
+            avatarMeshCache[avatar] = mesh;
 
-        if (!meshes.Any(existing => AreSamePreviewObject(existing, mesh)))
-        {
-            meshes.Add(mesh);
-        }
+            avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
+            if (!avatarMeshesCache.TryGetValue(avatar, out var meshes))
+            {
+                meshes = new List<Mesh>();
+                avatarMeshesCache[avatar] = meshes;
+            }
 
-        meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
-        meshAvatarCache[mesh] = avatar;
+            if (!meshes.Any(existing => AreSamePreviewObject(existing, mesh)))
+            {
+                meshes.Add(mesh);
+            }
+
+            meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
+            meshAvatarCache[mesh] = avatar;
+        }
     }
 
     private Mesh? ResolveFirstMeshForAvatar(Avatar avatar)
     {
-        if (avatarMeshesCache != null
-            && avatarMeshesCache.TryGetValue(avatar, out var cachedMeshes)
-            && cachedMeshes.Count > 0)
+        lock (previewCacheLock)
         {
-            return cachedMeshes[0];
-        }
+            if (avatarMeshesCache != null
+                && avatarMeshesCache.TryGetValue(avatar, out var cachedMeshes)
+                && cachedMeshes.Count > 0)
+            {
+                return cachedMeshes[0];
+            }
 
-        if (avatarMeshCache != null
-            && avatarMeshCache.TryGetValue(avatar, out var cachedMesh)
-            && cachedMesh != null)
-        {
-            return cachedMesh;
+            if (avatarMeshCache != null
+                && avatarMeshCache.TryGetValue(avatar, out var cachedMesh)
+                && cachedMesh != null)
+            {
+                return cachedMesh;
+            }
         }
 
         foreach (var meshId in LoadAvatarMeshAssetIdsForPreview(avatar))
@@ -132,10 +138,13 @@ public partial class MainWindow
             return new List<SkinnedMeshRenderer>();
         }
 
-        meshSkinnedRenderersCache ??= new Dictionary<string, List<SkinnedMeshRenderer>>(StringComparer.Ordinal);
-        if (meshSkinnedRenderersCache.TryGetValue(meshAssetId, out var cachedRenderers))
+        lock (previewCacheLock)
         {
-            return new List<SkinnedMeshRenderer>(cachedRenderers);
+            meshSkinnedRenderersCache ??= new Dictionary<string, List<SkinnedMeshRenderer>>(StringComparer.Ordinal);
+            if (meshSkinnedRenderersCache.TryGetValue(meshAssetId, out var cachedRenderers))
+            {
+                return new List<SkinnedMeshRenderer>(cachedRenderers);
+            }
         }
 
         var signature = _sqliteCache.GetFolderSignature(currentScanResult);
@@ -161,7 +170,11 @@ public partial class MainWindow
             }
         }
 
-        meshSkinnedRenderersCache[meshAssetId] = renderers;
+        lock (previewCacheLock)
+        {
+            meshSkinnedRenderersCache ??= new Dictionary<string, List<SkinnedMeshRenderer>>(StringComparer.Ordinal);
+            meshSkinnedRenderersCache[meshAssetId] = renderers;
+        }
         return new List<SkinnedMeshRenderer>(renderers);
     }
 
@@ -307,9 +320,12 @@ public partial class MainWindow
 
     private Avatar? FindBestAvatarForMesh(Mesh mesh)
     {
-        if (meshAvatarCache != null && meshAvatarCache.TryGetValue(mesh, out var avatar) && avatar != null)
+        lock (previewCacheLock)
         {
-            return avatar;
+            if (meshAvatarCache != null && meshAvatarCache.TryGetValue(mesh, out var avatar) && avatar != null)
+            {
+                return avatar;
+            }
         }
 
         return TryLoadAvatarsForMeshFromSemanticCache(mesh).FirstOrDefault();
@@ -340,19 +356,22 @@ public partial class MainWindow
 
     private List<Mesh> FindMeshesForAvatar(Avatar avatar)
     {
-        if (avatarMeshesCache != null
-            && avatarMeshesCache.TryGetValue(avatar, out var cachedMeshes)
-            && cachedMeshes.Count > 0)
-        {
-            return new List<Mesh>(cachedMeshes);
-        }
-
         var meshes = new List<Mesh>();
-        if (avatarMeshCache != null
-            && avatarMeshCache.TryGetValue(avatar, out var cachedMesh)
-            && cachedMesh != null)
+        lock (previewCacheLock)
         {
-            meshes.Add(cachedMesh);
+            if (avatarMeshesCache != null
+                && avatarMeshesCache.TryGetValue(avatar, out var cachedMeshes)
+                && cachedMeshes.Count > 0)
+            {
+                return new List<Mesh>(cachedMeshes);
+            }
+
+            if (avatarMeshCache != null
+                && avatarMeshCache.TryGetValue(avatar, out var cachedMesh)
+                && cachedMesh != null)
+            {
+                meshes.Add(cachedMesh);
+            }
         }
 
         foreach (var mesh in TryLoadMeshesForAvatarFromSemanticCache(avatar))
@@ -365,16 +384,19 @@ public partial class MainWindow
 
         if (meshes.Count > 0)
         {
-            avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
-            avatarMeshesCache[avatar] = meshes;
-
-            avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
-            avatarMeshCache[avatar] = meshes[0];
-
-            meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
-            foreach (var mesh in meshes)
+            lock (previewCacheLock)
             {
-                meshAvatarCache[mesh] = avatar;
+                avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
+                avatarMeshesCache[avatar] = meshes;
+
+                avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
+                avatarMeshCache[avatar] = meshes[0];
+
+                meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
+                foreach (var mesh in meshes)
+                {
+                    meshAvatarCache[mesh] = avatar;
+                }
             }
         }
 
@@ -460,23 +482,26 @@ public partial class MainWindow
 
         if (avatars.Count > 0)
         {
-            meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
-            meshAvatarCache[mesh] = avatars[0];
-
-            avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
-            avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
-            foreach (var avatar in avatars)
+            lock (previewCacheLock)
             {
-                avatarMeshCache.TryAdd(avatar, mesh);
-                if (!avatarMeshesCache.TryGetValue(avatar, out var meshes))
-                {
-                    meshes = new List<Mesh>();
-                    avatarMeshesCache[avatar] = meshes;
-                }
+                meshAvatarCache ??= new Dictionary<Mesh, Avatar?>();
+                meshAvatarCache[mesh] = avatars[0];
 
-                if (!meshes.Any(existing => ReferenceEquals(existing, mesh)))
+                avatarMeshCache ??= new Dictionary<Avatar, Mesh?>();
+                avatarMeshesCache ??= new Dictionary<Avatar, List<Mesh>>();
+                foreach (var avatar in avatars)
                 {
-                    meshes.Add(mesh);
+                    avatarMeshCache.TryAdd(avatar, mesh);
+                    if (!avatarMeshesCache.TryGetValue(avatar, out var meshes))
+                    {
+                        meshes = new List<Mesh>();
+                        avatarMeshesCache[avatar] = meshes;
+                    }
+
+                    if (!meshes.Any(existing => ReferenceEquals(existing, mesh)))
+                    {
+                        meshes.Add(mesh);
+                    }
                 }
             }
         }

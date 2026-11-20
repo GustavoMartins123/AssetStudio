@@ -116,7 +116,7 @@ namespace AssetStudio.Tests
                 using (var versionCmd = conn.CreateCommand())
                 {
                     versionCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("13", versionCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("14", versionCmd.ExecuteScalar()?.ToString());
                 }
 
                 var tableDdl = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -775,7 +775,7 @@ namespace AssetStudio.Tests
                 {
                     using var versionCmd = conn.CreateCommand();
                     versionCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("13", versionCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("14", versionCmd.ExecuteScalar()?.ToString());
 
                     foreach (var table in ClusteredWithoutRowIdTables)
                     {
