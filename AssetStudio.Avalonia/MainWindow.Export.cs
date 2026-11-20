@@ -1643,15 +1643,11 @@ public partial class MainWindow
             try
             {
                 ModelExporter.ExportFbx(exportFile, mainConvert,
-                    exportOptions.EulerFilter,
-                    (float)exportOptions.FilterPrecision,
-                    exportOptions.ExportAllNodes,
                     exportOptions.ExportSkins,
                     false, // Disable animation for main export
                     exportOptions.ExportBlendShape,
                     exportOptions.CastToBone,
                     (float)exportOptions.BoneSize,
-                    exportOptions.ExportAllUvsAsDiffuseMaps,
                     (float)exportOptions.ScaleFactor,
                     exportOptions.FbxVersion,
                     exportOptions.FbxFormat == 1);
@@ -1680,15 +1676,11 @@ public partial class MainWindow
                 try
                 {
                     ModelExporter.ExportFbx(animFile, animConvert,
-                        exportOptions.EulerFilter,
-                        (float)exportOptions.FilterPrecision,
-                        exportOptions.ExportAllNodes,
                         exportOptions.ExportSkins,
                         true,
                         exportOptions.ExportBlendShape,
                         exportOptions.CastToBone,
                         (float)exportOptions.BoneSize,
-                        exportOptions.ExportAllUvsAsDiffuseMaps,
                         (float)exportOptions.ScaleFactor,
                         exportOptions.FbxVersion,
                         exportOptions.FbxFormat == 1);
@@ -1718,15 +1710,11 @@ public partial class MainWindow
             try
             {
                 ModelExporter.ExportFbx(exportFile, convert,
-                    exportOptions.EulerFilter,
-                    (float)exportOptions.FilterPrecision,
-                    exportOptions.ExportAllNodes,
                     exportOptions.ExportSkins,
                     exportOptions.ExportAnimations,
                     exportOptions.ExportBlendShape,
                     exportOptions.CastToBone,
                     (float)exportOptions.BoneSize,
-                    exportOptions.ExportAllUvsAsDiffuseMaps,
                     (float)exportOptions.ScaleFactor,
                     exportOptions.FbxVersion,
                     exportOptions.FbxFormat == 1);
