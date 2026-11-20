@@ -29,10 +29,14 @@ static const int CemTableA[] = {0, 3, 5, 0, 3, 5, 0, 3, 5, 0, 3, 5, 0, 3, 5, 0, 
 static const int CemTableB[] = {8, 6, 5, 7, 5, 4, 6, 4, 3, 5, 3, 2, 4, 2, 1, 3, 1, 2, 1};
 
 static inline uint_fast8_t bit_reverse_u8(const uint_fast8_t c, const int bits) {
-    return BitReverseTable[c] >> (8 - bits);
+    if (bits <= 0 || bits > 8)
+        return 0;
+    return BitReverseTable[c & 0xff] >> (8 - bits);
 }
 
 static inline uint_fast64_t bit_reverse_u64(const uint_fast64_t d, const int bits) {
+    if (bits <= 0 || bits > 64)
+        return 0;
     uint_fast64_t ret = (uint_fast64_t)BitReverseTable[d & 0xff] << 56 |
       (uint_fast64_t)BitReverseTable[d >> 8 & 0xff] << 48 | (uint_fast64_t)BitReverseTable[d >> 16 & 0xff] << 40 |
       (uint_fast64_t)BitReverseTable[d >> 24 & 0xff] << 32 | (uint_fast32_t)BitReverseTable[d >> 32 & 0xff] << 24 |
@@ -41,26 +45,45 @@ static inline uint_fast64_t bit_reverse_u64(const uint_fast64_t d, const int bit
     return ret >> (64 - bits);
 }
 
+static inline uint64_t load_u64_le(const uint8_t *p) {
+    return static_cast<uint64_t>(p[0]) |
+           (static_cast<uint64_t>(p[1]) << 8) |
+           (static_cast<uint64_t>(p[2]) << 16) |
+           (static_cast<uint64_t>(p[3]) << 24) |
+           (static_cast<uint64_t>(p[4]) << 32) |
+           (static_cast<uint64_t>(p[5]) << 40) |
+           (static_cast<uint64_t>(p[6]) << 48) |
+           (static_cast<uint64_t>(p[7]) << 56);
+}
+
 static inline int getbits(const uint8_t *buf, const int bit, const int len) {
-    return (*(int *)(buf + bit / 8) >> (bit % 8)) & ((1 << len) - 1);
+    if (len <= 0 || len > 32 || bit < 0 || bit > 128 - len)
+        return 0;
+    uint64_t val = 0;
+    const int byte_idx = bit / 8;
+    const int bit_off = bit % 8;
+    const int bytes_needed = (bit_off + len + 7) / 8;
+    for (int i = 0; i < bytes_needed && (byte_idx + i) < 16; i++) {
+        val |= static_cast<uint64_t>(buf[byte_idx + i]) << (i * 8);
+    }
+    return static_cast<int>((val >> bit_off) & ((1ULL << len) - 1ULL));
 }
 
 static inline uint_fast64_t getbits64(const uint8_t *buf, const int bit, const int len) {
-    uint_fast64_t mask = len == 64 ? 0xffffffffffffffff : (1ull << len) - 1;
-    if (len < 1)
+    if (len <= 0 || len > 64 || bit < 0 || bit >= 128)
         return 0;
-    else if (bit >= 64)
-        return (*(uint_fast64_t *)(buf + 8)) >> (bit - 64) & mask;
-    else if (bit <= 0)
-        return (*(uint_fast64_t *)buf) << -bit & mask;
-    else if (bit + len <= 64)
-        return (*(uint_fast64_t *)buf) >> bit & mask;
-    else
-        return ((*(uint_fast64_t *)buf) >> bit | *(uint_fast64_t *)(buf + 8) << (64 - bit)) & mask;
+    const uint_fast64_t mask = (len == 64) ? 0xffffffffffffffffULL : ((1ULL << len) - 1ULL);
+    if (bit >= 64)
+        return (load_u64_le(buf + 8) >> (bit - 64)) & mask;
+    if (bit == 0)
+        return load_u64_le(buf) & mask;
+    if (bit + len <= 64)
+        return (load_u64_le(buf) >> bit) & mask;
+    return ((load_u64_le(buf) >> bit) | (load_u64_le(buf + 8) << (64 - bit))) & mask;
 }
 
 static inline uint16_t u8ptr_to_u16(const uint8_t *ptr) {
-    return lton16(*(uint16_t *)ptr);
+    return static_cast<uint16_t>(ptr[0]) | (static_cast<uint16_t>(ptr[1]) << 8);
 }
 
 static inline uint_fast8_t clamp(const int n) {
@@ -176,7 +199,7 @@ static inline uint8_t f32_to_u8(const float f) {
 }
 
 static inline uint8_t f16ptr_to_u8(const uint8_t *ptr) {
-    return f32_to_u8(fp16_ieee_to_fp32_value(lton16(*(uint16_t *)ptr)));
+    return f32_to_u8(fp16_ieee_to_fp32_value(u8ptr_to_u16(ptr)));
 }
 
 typedef struct {
@@ -319,7 +342,7 @@ void decode_intseq(const uint8_t *buf, int offset, const int a, const int b, con
     }
 }
 
-void decode_block_params(const uint8_t *buf, BlockData *block_data) {
+bool decode_block_params(const uint8_t *buf, BlockData *block_data) {
     block_data->dual_plane = !!(buf[1] & 4);
     block_data->weight_range = (buf[0] >> 4 & 1) | (buf[1] << 2 & 8);
 
@@ -374,9 +397,21 @@ void decode_block_params(const uint8_t *buf, BlockData *block_data) {
 
     block_data->part_num = (buf[1] >> 3 & 3) + 1;
 
+    if (block_data->part_num == 4 && block_data->dual_plane)
+        return false;
+
+    if (block_data->width < 2 || block_data->height < 2 ||
+        block_data->width > block_data->bw || block_data->height > block_data->bh ||
+        block_data->weight_range < 0 || block_data->weight_range >= 16 ||
+        (WeightPrecTableA[block_data->weight_range] == 0 && WeightPrecTableB[block_data->weight_range] == 0))
+        return false;
+
     block_data->weight_num = block_data->width * block_data->height;
     if (block_data->dual_plane)
         block_data->weight_num *= 2;
+
+    if (block_data->weight_num <= 0 || block_data->weight_num > 64)
+        return false;
 
     int weight_bits, config_bits, cem_base = 0;
 
@@ -392,6 +427,9 @@ void decode_block_params(const uint8_t *buf, BlockData *block_data) {
     default:
         weight_bits = block_data->weight_num * WeightPrecTableB[block_data->weight_range];
     }
+
+    if (weight_bits < 24 || weight_bits > 96)
+        return false;
 
     if (block_data->part_num == 1) {
         block_data->cem[0] = u8ptr_to_u16(buf + 1) >> 5 & 0xf;
@@ -438,6 +476,11 @@ void decode_block_params(const uint8_t *buf, BlockData *block_data) {
     for (int i = 0; i < block_data->part_num; i++)
         block_data->endpoint_value_num += (block_data->cem[i] >> 1 & 6) + 2;
 
+    if (block_data->endpoint_value_num <= 0 || block_data->endpoint_value_num > 32 ||
+        remain_bits < block_data->endpoint_value_num)
+        return false;
+
+    block_data->cem_range = -1;
     for (int i = 0, endpoint_bits; i < (int)(sizeof(CemTableA) / sizeof(int)); i++) {
         switch (CemTableA[i]) {
         case 3:
@@ -457,6 +500,8 @@ void decode_block_params(const uint8_t *buf, BlockData *block_data) {
             break;
         }
     }
+
+    return block_data->cem_range >= 0;
 }
 
 void decode_endpoints_hdr7(int *endpoints, int *v) {
@@ -671,14 +716,14 @@ void decode_endpoints_hdr11(int *endpoints, int *v, int alpha1, int alpha2) {
 void decode_endpoints(const uint8_t *buf, BlockData *data) {
     static const int TritsTable[] = {0, 204, 93, 44, 22, 11, 5};
     static const int QuintsTable[] = {0, 113, 54, 26, 13, 6};
-    IntSeqData seq[32];
-    int ev[32];
+    IntSeqData seq[32] = {};
+    int ev[32] = {};
     decode_intseq(buf, data->part_num == 1 ? 17 : 29, CemTableA[data->cem_range], CemTableB[data->cem_range],
                   data->endpoint_value_num, 0, seq);
 
     switch (CemTableA[data->cem_range]) {
     case 3:
-        for (int i = 0, b, c = TritsTable[CemTableB[data->cem_range]]; i < data->endpoint_value_num; i++) {
+        for (int i = 0, b = 0, c = TritsTable[CemTableB[data->cem_range]]; i < data->endpoint_value_num; i++) {
             int a = (seq[i].bits & 1) * 0x1ff;
             int x = seq[i].bits >> 1;
             switch (CemTableB[data->cem_range]) {
@@ -705,7 +750,7 @@ void decode_endpoints(const uint8_t *buf, BlockData *data) {
         }
         break;
     case 5:
-        for (int i = 0, b, c = QuintsTable[CemTableB[data->cem_range]]; i < data->endpoint_value_num; i++) {
+        for (int i = 0, b = 0, c = QuintsTable[CemTableB[data->cem_range]]; i < data->endpoint_value_num; i++) {
             int a = (seq[i].bits & 1) * 0x1ff;
             int x = seq[i].bits >> 1;
             switch (CemTableB[data->cem_range]) {
@@ -881,8 +926,8 @@ void decode_endpoints(const uint8_t *buf, BlockData *data) {
 }
 
 void decode_weights(const uint8_t *buf, BlockData *data) {
-    IntSeqData seq[128];
-    int wv[128] = {};
+    IntSeqData seq[160] = {};
+    int wv[160] = {};
     decode_intseq(buf, 128, WeightPrecTableA[data->weight_range], WeightPrecTableB[data->weight_range],
                   data->weight_num, 1, seq);
 
@@ -975,10 +1020,14 @@ void decode_weights(const uint8_t *buf, BlockData *data) {
             int w00 = 16 - fs - ft + w11;
 
             for (int p = 0; p < pn; p++) {
-                int p00 = wv[v * pn + p];
-                int p01 = wv[(v + 1) * pn + p];
-                int p10 = wv[(v + data->width) * pn + p];
-                int p11 = wv[(v + data->width + 1) * pn + p];
+                int i00 = v * pn + p;
+                int i01 = (v + 1) * pn + p;
+                int i10 = (v + data->width) * pn + p;
+                int i11 = (v + data->width + 1) * pn + p;
+                int p00 = (i00 >= 0 && i00 < data->weight_num) ? wv[i00] : 0;
+                int p01 = (fs > 0 && i01 >= 0 && i01 < data->weight_num) ? wv[i01] : 0;
+                int p10 = (ft > 0 && i10 >= 0 && i10 < data->weight_num) ? wv[i10] : 0;
+                int p11 = (fs > 0 && ft > 0 && i11 >= 0 && i11 < data->weight_num) ? wv[i11] : 0;
                 data->weights[i][p] = (p00 * w00 + p01 * w01 + p10 * w10 + p11 * w11 + 8) >> 4;
             }
         }
@@ -987,7 +1036,7 @@ void decode_weights(const uint8_t *buf, BlockData *data) {
 
 void select_partition(const uint8_t *buf, BlockData *data) {
     int small_block = data->bw * data->bh < 31;
-    int seed = (*(int *)buf >> 13 & 0x3ff) | (data->part_num - 1) << 10;
+    int seed = getbits(buf, 13, 10) | ((data->part_num - 1) << 10);
 
     uint32_t rnum = seed;
     rnum ^= rnum >> 15;
@@ -1108,6 +1157,9 @@ void applicate_color(const BlockData *data, uint32_t *outbuf) {
 }
 
 void decode_block(const uint8_t *buf, const int bw, const int bh, uint32_t *outbuf) {
+    if (bw < 2 || bh < 2 || bw * bh > 144)
+        return;
+
     if (buf[0] == 0xfc && (buf[1] & 1) == 1) {
         uint_fast32_t c;
         if (buf[1] & 2)
@@ -1121,10 +1173,15 @@ void decode_block(const uint8_t *buf, const int bw, const int bh, uint32_t *outb
         for (int i = 0; i < bw * bh; i++)
             outbuf[i] = c;
     } else {
-        BlockData block_data;
+        BlockData block_data = {};
         block_data.bw = bw;
         block_data.bh = bh;
-        decode_block_params(buf, &block_data);
+        if (!decode_block_params(buf, &block_data)) {
+            uint_fast32_t c = color(255, 0, 255, 255);
+            for (int i = 0; i < bw * bh; i++)
+                outbuf[i] = c;
+            return;
+        }
         decode_endpoints(buf, &block_data);
         decode_weights(buf, &block_data);
         if (block_data.part_num > 1)
@@ -1134,6 +1191,8 @@ void decode_block(const uint8_t *buf, const int bw, const int bh, uint32_t *outb
 }
 
 int decode_astc(const uint8_t *data, const long w, const long h, const int bw, const int bh, uint32_t *image) {
+    if (data == nullptr || image == nullptr || w <= 0 || h <= 0 || bw < 2 || bh < 2 || bw > 12 || bh > 12 || bw * bh > 144)
+        return 0;
     const long num_blocks_x = (w + bw - 1) / bw;
     const long num_blocks_y = (h + bh - 1) / bh;
     uint32_t buffer[144];
