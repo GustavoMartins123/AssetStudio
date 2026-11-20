@@ -29,6 +29,7 @@ public sealed class ExportOptionsState
     public bool ExportAnimationsSplit { get; set; } = false;
     public bool ExportBlendShape { get; set; } = true;
     public bool CastToBone { get; set; }
+    public bool CombineMeshes { get; set; } = false;
     public decimal BoneSize { get; set; } = 10m;
     public decimal ScaleFactor { get; set; } = 1m;
     public int FbxVersion { get; set; } = 3;
@@ -51,6 +52,7 @@ public sealed class ExportOptionsState
         ExportAnimationsSplit = other.ExportAnimationsSplit;
         ExportBlendShape = other.ExportBlendShape;
         CastToBone = other.CastToBone;
+        CombineMeshes = other.CombineMeshes;
         BoneSize = other.BoneSize;
         ScaleFactor = other.ScaleFactor;
         FbxVersion = other.FbxVersion;
@@ -74,6 +76,7 @@ public sealed class ExportOptionsWindow : Window
     private readonly CheckBox exportAnimationsSplit = new() { Content = "Export animations as separate FBX files" };
     private readonly CheckBox exportBlendShape = new() { Content = "Export blend shapes" };
     private readonly CheckBox castToBone = new() { Content = "Cast to bone" };
+    private readonly CheckBox combineMeshes = new() { Content = "Combine meshes into single mesh" };
     private readonly TextBox boneSize = new() { Width = 90 };
     private readonly TextBox scaleFactor = new() { Width = 90 };
     private readonly ComboBox fbxVersion = new();
@@ -86,7 +89,7 @@ public sealed class ExportOptionsWindow : Window
         this.state = state;
         Title = "Export options";
         Width = 420;
-        Height = 620;
+        Height = 650;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         CanResize = false;
 
@@ -112,6 +115,7 @@ public sealed class ExportOptionsWindow : Window
         panel.Children.Add(exportAnimationsSplit);
         panel.Children.Add(exportBlendShape);
         panel.Children.Add(castToBone);
+        panel.Children.Add(combineMeshes);
         panel.Children.Add(Labeled("Bone size", boneSize));
         panel.Children.Add(Labeled("Scale factor", scaleFactor));
         panel.Children.Add(Labeled("FBX version", fbxVersion));
@@ -151,6 +155,7 @@ public sealed class ExportOptionsWindow : Window
         exportAnimationsSplit.IsChecked = state.ExportAnimationsSplit;
         exportBlendShape.IsChecked = state.ExportBlendShape;
         castToBone.IsChecked = state.CastToBone;
+        combineMeshes.IsChecked = state.CombineMeshes;
         boneSize.Text = state.BoneSize.ToString(CultureInfo.InvariantCulture);
         scaleFactor.Text = state.ScaleFactor.ToString(CultureInfo.InvariantCulture);
         fbxVersion.SelectedIndex = state.FbxVersion;
@@ -172,6 +177,7 @@ public sealed class ExportOptionsWindow : Window
         state.ExportAnimationsSplit = exportAnimationsSplit.IsChecked == true;
         state.ExportBlendShape = exportBlendShape.IsChecked == true;
         state.CastToBone = castToBone.IsChecked == true;
+        state.CombineMeshes = combineMeshes.IsChecked == true;
         state.BoneSize = ParseDecimal(boneSize.Text, state.BoneSize);
         state.ScaleFactor = ParseDecimal(scaleFactor.Text, state.ScaleFactor);
         state.FbxVersion = Math.Max(0, fbxVersion.SelectedIndex);

@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AssetStudio.Avalonia;
 
@@ -23,6 +24,12 @@ public sealed class AvaloniaAppSettings
     public double AvatarPreviewMeshDensityPercent { get; set; } = 15.0;
     public string ModelPreviewViewPreset { get; set; } = nameof(MeshPreviewViewPreset.Auto);
     public ExportOptionsState ExportOptions { get; set; } = new();
+    [JsonIgnore]
+    public bool CombineMeshes
+    {
+        get => (ExportOptions ??= new ExportOptionsState()).CombineMeshes;
+        set => (ExportOptions ??= new ExportOptionsState()).CombineMeshes = value;
+    }
     public string SelectedTheme { get; set; } = "Default";
 
     public static AvaloniaAppSettings Load()

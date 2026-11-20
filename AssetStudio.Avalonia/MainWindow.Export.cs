@@ -1162,14 +1162,31 @@ public partial class MainWindow
         {
             case Animator m_Animator:
             {
-                var convert = new ModelConverter(m_Animator, exportOptions.ConvertTextureFormat);
                 bool exported = false;
-                if (convert.MeshList.Count > 0
-                    && conversionContext.TryGetAssetFilePath(exportPath, fileName, ".fbx", item, out var exportFullPath))
+                if (TryFindModelGroupForAnimator(m_Animator, out var animatorGroup, out var animatorGroupMeshes)
+                    && animatorGroup != null
+                    && animatorGroupMeshes.Count > 0)
                 {
-                    ExportFbx(convert, exportFullPath);
-                    exported = true;
+                    var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(animatorGroup.GroupName) ? animatorGroup.GroupName : fileName);
+                    if (conversionContext.TryMarkModelGroupExported(animatorGroup.GroupId)
+                        && conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var groupFbxPath)
+                        && ExportModelGroupFbx(animatorGroup, animatorGroupMeshes, groupFbxPath))
+                    {
+                        exported = true;
+                    }
                 }
+
+                if (!exported)
+                {
+                    var convert = new ModelConverter(m_Animator, exportOptions.ConvertTextureFormat);
+                    if (convert.MeshList.Count > 0
+                        && conversionContext.TryGetAssetFilePath(exportPath, fileName, ".fbx", item, out var exportFullPath))
+                    {
+                        ExportFbx(convert, exportFullPath);
+                        exported = true;
+                    }
+                }
+
                 if (m_Animator.m_Avatar.TryGet(out var avatar))
                 {
                     var avatarFileName = FixFileName(avatar.m_Name);
@@ -1183,8 +1200,22 @@ public partial class MainWindow
             }
             case Avatar m_Avatar:
             {
-                return conversionContext.TryGetAssetFilePath(exportPath, fileName, ".asset", item, out var avatarFullPath)
+                bool exported = conversionContext.TryGetAssetFilePath(exportPath, fileName, ".asset", item, out var avatarFullPath)
                     && AssetExportHelper.ExportAvatar(m_Avatar, avatarFullPath);
+
+                if (TryFindModelGroupForAvatar(m_Avatar, out var avatarGroup, out var avatarGroupMeshes)
+                    && avatarGroup != null
+                    && avatarGroupMeshes.Count > 0)
+                {
+                    var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(avatarGroup.GroupName) ? avatarGroup.GroupName : fileName);
+                    if (conversionContext.TryMarkModelGroupExported(avatarGroup.GroupId)
+                        && conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var groupFbxPath)
+                        && ExportModelGroupFbx(avatarGroup, avatarGroupMeshes, groupFbxPath))
+                    {
+                        exported = true;
+                    }
+                }
+                return exported;
             }
             case AnimatorController m_AnimatorController:
             {
@@ -1433,6 +1464,15 @@ public partial class MainWindow
         string fileName,
         ExportConversionContext conversionContext)
     {
+        if (TryExportMeshModelGroupFbx(item, mesh, exportPath, fileName, conversionContext, out var alreadyExportedGroup))
+        {
+            return true;
+        }
+        if (alreadyExportedGroup)
+        {
+            return false;
+        }
+
         if (item.TreeNode?.GameObject != null)
         {
             var animator = FindAnimatorForModelExport(item);
@@ -1636,12 +1676,753 @@ public partial class MainWindow
         return null;
     }
 
+    internal async Task ExportSelectedModelGroupFbxAsync()
+    {
+        var selectedAssets = GetSelectedAssets();
+        var primaryAsset = selectedAssets.FirstOrDefault(x => x.Type is ClassIDType.Mesh or ClassIDType.Animator or ClassIDType.Avatar);
+        if (primaryAsset == null)
+        {
+            StatusStripUpdate("Select a Mesh, Animator, or Avatar to export its Model Group as FBX.");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+
+        var suggestedName = FixFileName(GetExportFileName(primaryAsset)) + ".fbx";
+        var file = await topLevel.StorageProvider.SaveFilePickerAsync(await CreateFbxSaveOptions("Export Model Group (FBX)", suggestedName));
+        if (file == null) return;
+
+        var exportFile = file.Path.LocalPath;
+        var exportFolder = Path.GetDirectoryName(exportFile);
+        if (!string.IsNullOrEmpty(exportFolder))
+        {
+            SaveExportFolder(exportFolder);
+        }
+
+        var clips = selectedAssets
+            .Where(x => x.Type == ClassIDType.AnimationClip)
+            .ToList();
+        StatusStripUpdate($"Exporting Model Group FBX: {Path.GetFileName(exportFile)}...");
+
+        bool success = false;
+        string? errorMessage = null;
+        await Task.Run(() =>
+        {
+            try
+            {
+                EnsureLazyAssetsLoadedForExport(selectedAssets);
+                var resolvedClips = clips
+                    .Select(x => x.Asset as AnimationClip)
+                    .Where(x => x != null)
+                    .Cast<AnimationClip>()
+                    .ToArray();
+                var clipArg = resolvedClips.Length > 0 ? resolvedClips : null;
+
+                switch (primaryAsset.Asset)
+                {
+                    case Mesh mesh:
+                        if (TryFindModelGroupForMesh(mesh, out var meshGroup, out var meshGroupParts)
+                            && meshGroup != null
+                            && meshGroupParts.Count > 0)
+                        {
+                            success = ExportModelGroupFbx(meshGroup, meshGroupParts, exportFile, clipArg);
+                        }
+                        else if (TryBuildEagerModelGroupForMesh(mesh, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar))
+                        {
+                            success = ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar, clipArg, exportFile);
+                        }
+                        else if (primaryAsset.TreeNode?.GameObject != null)
+                        {
+                            var animator = FindAnimatorForModelExport(primaryAsset);
+                            var convert = animator != null
+                                ? new ModelConverter(animator, exportOptions.ConvertTextureFormat, clipArg)
+                                : new ModelConverter(primaryAsset.TreeNode.GameObject, exportOptions.ConvertTextureFormat, clipArg);
+                            if (convert.MeshList.Count > 0)
+                            {
+                                ExportFbx(convert, exportFile);
+                                success = true;
+                            }
+                        }
+                        break;
+                    case Avatar avatar:
+                        if (TryFindModelGroupForAvatar(avatar, out var avatarGroup, out var avatarGroupParts)
+                            && avatarGroup != null
+                            && avatarGroupParts.Count > 0)
+                        {
+                            success = ExportModelGroupFbx(avatarGroup, avatarGroupParts, exportFile, clipArg);
+                        }
+                        else if (TryBuildEagerModelGroupForAvatar(avatar, out var eagerAvatarName, out var eagerAvatarRoot, out var eagerAvatarMeshes, out var eagerAvatarRenderers))
+                        {
+                            success = ExportModelGroupFbx(eagerAvatarName, eagerAvatarRoot, eagerAvatarMeshes, eagerAvatarRenderers, avatar, clipArg, exportFile);
+                        }
+                        break;
+                    case Animator animator:
+                        if (TryFindModelGroupForAnimator(animator, out var animGroup, out var animGroupParts)
+                            && animGroup != null
+                            && animGroupParts.Count > 0)
+                        {
+                            success = ExportModelGroupFbx(animGroup, animGroupParts, exportFile, clipArg);
+                        }
+                        else
+                        {
+                            var convert = new ModelConverter(animator, exportOptions.ConvertTextureFormat, clipArg);
+                            if (convert.MeshList.Count > 0)
+                            {
+                                ExportFbx(convert, exportFile);
+                                success = true;
+                            }
+                        }
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                Logger.Error($"Export Model Group FBX failed for {primaryAsset.Name}", ex);
+            }
+        });
+
+        if (success)
+        {
+            StatusStripUpdate($"Finished exporting Model Group FBX: {Path.GetFileName(exportFile)}");
+            if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+            {
+                OpenFolder(exportFolder);
+            }
+        }
+        else
+        {
+            StatusStripUpdate(errorMessage != null
+                ? $"Error exporting Model Group FBX: {errorMessage}"
+                : $"No Model Group found for {primaryAsset.Name}.");
+        }
+    }
+
+    internal bool ExportModelGroupFbx(
+        ModelGroupInfo group,
+        IReadOnlyList<ModelGroupMeshInfo> groupMeshes,
+        string exportFile,
+        AnimationClip[]? animationClips = null)
+    {
+        if (group == null || groupMeshes == null || groupMeshes.Count == 0 || string.IsNullOrWhiteSpace(exportFile))
+        {
+            return false;
+        }
+
+        var rootGameObject = !string.IsNullOrWhiteSpace(group.RootGameObjectAssetId)
+            ? ResolvePreviewCandidateAsset(group.RootGameObjectAssetId) as GameObject
+            : null;
+        var animator = !string.IsNullOrWhiteSpace(group.AnimatorAssetId)
+            ? ResolvePreviewCandidateAsset(group.AnimatorAssetId) as Animator
+            : null;
+        if (rootGameObject == null && animator?.m_GameObject != null)
+        {
+            animator.m_GameObject.TryGet(out rootGameObject);
+        }
+
+        var avatar = !string.IsNullOrWhiteSpace(group.AvatarAssetId)
+            ? ResolveAvatarPreviewCandidate(group.AvatarAssetId)
+            : null;
+        if (avatar == null && animator?.m_Avatar != null)
+        {
+            animator.m_Avatar.TryGet(out avatar);
+        }
+
+        var resolvedMeshes = new List<Mesh>(groupMeshes.Count);
+        var resolvedRenderers = new List<Renderer>(groupMeshes.Count);
+        var partTransforms = new List<float[]?>(groupMeshes.Count);
+        var partMaterials = new List<IReadOnlyList<Material>>(groupMeshes.Count);
+        var partNames = new List<string>(groupMeshes.Count);
+
+        for (int i = 0; i < groupMeshes.Count; i++)
+        {
+            var part = groupMeshes[i];
+            if (string.IsNullOrWhiteSpace(part.MeshAssetId))
+            {
+                continue;
+            }
+
+            var mesh = ResolveMeshPreviewCandidate(part.MeshAssetId);
+            if (mesh == null)
+            {
+                continue;
+            }
+
+            var renderer = !string.IsNullOrWhiteSpace(part.RendererAssetId)
+                ? ResolvePreviewCandidateAsset(part.RendererAssetId) as Renderer
+                : null;
+
+            var materials = FindMaterialsForMesh(mesh);
+            if (assetsManager.LazyLoading)
+            {
+                EnsureMaterialTexturesLoadedForExport(materials);
+                if (renderer != null)
+                {
+                    EnsureRendererMaterialsLoadedForExport(renderer);
+                }
+            }
+
+            var nonNullMaterials = new List<Material>(materials.Count);
+            for (int m = 0; m < materials.Count; m++)
+            {
+                nonNullMaterials.Add(materials[m]!);
+            }
+
+            resolvedMeshes.Add(mesh);
+            resolvedRenderers.Add(renderer!);
+            partTransforms.Add(part.TransformMatrix);
+            partMaterials.Add(nonNullMaterials);
+            partNames.Add(!string.IsNullOrWhiteSpace(part.GameObjectName) ? part.GameObjectName : mesh.m_Name ?? $"Part_{i}");
+        }
+
+        if (resolvedMeshes.Count == 0 && rootGameObject == null)
+        {
+            return false;
+        }
+
+        var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+            ? group.GroupName
+            : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                ? group.RootGameObjectName
+                : Path.GetFileNameWithoutExtension(exportFile);
+
+        var convert = ModelConverter.CreateFromModelGroup(
+            groupName,
+            rootGameObject,
+            resolvedMeshes,
+            resolvedRenderers,
+            avatar,
+            animationClips,
+            exportOptions.ConvertTextureFormat,
+            combineMeshes: false,
+            partTransforms: partTransforms!,
+            partMaterials: partMaterials,
+            partNames: partNames);
+
+        if (convert.MeshList.Count == 0)
+        {
+            return false;
+        }
+
+        ExportFbx(convert, exportFile);
+        return true;
+    }
+
+    internal bool ExportModelGroupFbx(
+        string groupName,
+        GameObject? rootGameObject,
+        IReadOnlyList<Mesh> meshes,
+        IReadOnlyList<Renderer>? renderers,
+        Avatar? avatar,
+        AnimationClip[]? animationClips,
+        string exportFile,
+        IReadOnlyList<float[]?>? partTransforms = null,
+        IReadOnlyList<IReadOnlyList<Material>>? partMaterials = null,
+        IReadOnlyList<string>? partNames = null)
+    {
+        if (string.IsNullOrWhiteSpace(exportFile) || ((meshes == null || meshes.Count == 0) && rootGameObject == null))
+        {
+            return false;
+        }
+
+        if (assetsManager.LazyLoading && partMaterials != null)
+        {
+            for (int i = 0; i < partMaterials.Count; i++)
+            {
+                EnsureMaterialTexturesLoadedForExport(partMaterials[i]);
+            }
+        }
+
+        var convert = ModelConverter.CreateFromModelGroup(
+            groupName,
+            rootGameObject,
+            meshes ?? Array.Empty<Mesh>(),
+            renderers,
+            avatar,
+            animationClips,
+            exportOptions.ConvertTextureFormat,
+            combineMeshes: false,
+            partTransforms: partTransforms!,
+            partMaterials: partMaterials,
+            partNames: partNames);
+
+        if (convert.MeshList.Count == 0)
+        {
+            return false;
+        }
+
+        ExportFbx(convert, exportFile);
+        return true;
+    }
+
+    private bool TryExportMeshModelGroupFbx(
+        AssetItem item,
+        Mesh mesh,
+        string exportPath,
+        string fileName,
+        ExportConversionContext conversionContext,
+        out bool alreadyExportedGroup)
+    {
+        alreadyExportedGroup = false;
+
+        // 1. SQLite semantic relation ModelGroup (Lazy mode & cached projects)
+        if (TryFindModelGroupForMesh(mesh, out var group, out var groupMeshes)
+            && group != null
+            && groupMeshes.Count > 0)
+        {
+            if (conversionContext.IsModelGroupExported(group.GroupId))
+            {
+                alreadyExportedGroup = true;
+                return false;
+            }
+
+            var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(group.GroupName) ? group.GroupName : fileName);
+            if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var fbxPath)
+                && ExportModelGroupFbx(group, groupMeshes, fbxPath))
+            {
+                conversionContext.TryMarkModelGroupExported(group.GroupId);
+                return true;
+            }
+        }
+
+        // 2. Eager mode scene-hierarchy ModelGroup discovery (multi-part characters/props & orphaned meshes with renderers)
+        if (!assetsManager.LazyLoading
+            && TryBuildEagerModelGroupForMesh(mesh, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar))
+        {
+            var eagerGroupKey = eagerRoot != null
+                ? $"eager:{GetPreviewObjectKey(eagerRoot)}"
+                : null;
+            if (!string.IsNullOrEmpty(eagerGroupKey) && conversionContext.IsModelGroupExported(eagerGroupKey))
+            {
+                alreadyExportedGroup = true;
+                return false;
+            }
+
+            var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(eagerName) ? eagerName : fileName);
+            if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var fbxPath)
+                && ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar, null, fbxPath))
+            {
+                conversionContext.TryMarkModelGroupExported(eagerGroupKey);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindModelGroupForMesh(Mesh mesh, out ModelGroupInfo? group, out List<ModelGroupMeshInfo> groupMeshes)
+    {
+        group = null;
+        groupMeshes = new List<ModelGroupMeshInfo>();
+        var meshId = GetPreviewObjectKey(mesh);
+        if (string.IsNullOrWhiteSpace(meshId))
+        {
+            return false;
+        }
+
+        var candidates = LoadModelGroupCandidatesForMeshAssetIdForPreview(meshId);
+        if (candidates.Count == 0)
+        {
+            return false;
+        }
+
+        ModelGroupCandidateInfo? best = null;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            var candidate = candidates[i];
+            if (candidate.Meshes.Count == 0)
+            {
+                continue;
+            }
+
+            if (best == null)
+            {
+                best = candidate;
+                continue;
+            }
+
+            // Prefer multi-part groups over single-part groups, then higher confidence, then tighter group
+            bool bestIsMulti = best.Meshes.Count > 1;
+            bool candIsMulti = candidate.Meshes.Count > 1;
+            if (candIsMulti && !bestIsMulti)
+            {
+                best = candidate;
+            }
+            else if (candIsMulti == bestIsMulti && candidate.Group.Confidence > best.Group.Confidence)
+            {
+                best = candidate;
+            }
+        }
+
+        if (best == null)
+        {
+            return false;
+        }
+
+        group = best.Group;
+        groupMeshes = best.Meshes;
+        return true;
+    }
+
+    private bool TryFindModelGroupForAvatar(Avatar avatar, out ModelGroupInfo? group, out List<ModelGroupMeshInfo> groupMeshes)
+    {
+        group = null;
+        groupMeshes = new List<ModelGroupMeshInfo>();
+        var avatarId = GetPreviewObjectKey(avatar);
+        if (string.IsNullOrWhiteSpace(avatarId))
+        {
+            return false;
+        }
+
+        var groupsByAvatar = LoadModelGroupsByAvatarIdsForPreview(new[] { avatarId });
+        if (!groupsByAvatar.TryGetValue(avatarId, out var groups) || groups.Count == 0)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < groups.Count; i++)
+        {
+            var candidate = groups[i];
+            var meshes = LoadModelGroupMeshesForPreview(candidate.GroupId);
+            if (meshes.Count > 0)
+            {
+                group = candidate;
+                groupMeshes = meshes;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindModelGroupForAnimator(Animator animator, out ModelGroupInfo? group, out List<ModelGroupMeshInfo> groupMeshes)
+    {
+        group = null;
+        groupMeshes = new List<ModelGroupMeshInfo>();
+
+        if (animator.m_Avatar != null && animator.m_Avatar.TryGet(out var avatar) && avatar != null)
+        {
+            if (TryFindModelGroupForAvatar(avatar, out group, out groupMeshes))
+            {
+                return true;
+            }
+        }
+
+        if (animator.m_GameObject != null && animator.m_GameObject.TryGet(out var go) && go != null)
+        {
+            var firstMesh = FindFirstMeshUnderGameObject(go);
+            if (firstMesh != null && TryFindModelGroupForMesh(firstMesh, out group, out groupMeshes))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryBuildEagerModelGroupForMesh(
+        Mesh mesh,
+        out string groupName,
+        out GameObject? rootGameObject,
+        out List<Mesh> meshes,
+        out List<Renderer> renderers,
+        out Avatar? avatar)
+    {
+        groupName = mesh.m_Name ?? "Model";
+        rootGameObject = null;
+        meshes = new List<Mesh>();
+        renderers = new List<Renderer>();
+        avatar = null;
+
+        Renderer? ownerRenderer = null;
+        GameObject? ownerGo = null;
+
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        for (int f = 0; f < filesSnapshot.Count && ownerRenderer == null; f++)
+        {
+            var objects = filesSnapshot[f].Objects;
+            for (int i = 0; i < objects.Count; i++)
+            {
+                var obj = objects[i];
+                if (obj is SkinnedMeshRenderer smr
+                    && smr.m_Mesh != null
+                    && smr.m_Mesh.TryGet(out var smrMesh)
+                    && ReferenceEquals(smrMesh, mesh))
+                {
+                    ownerRenderer = smr;
+                    smr.m_GameObject?.TryGet(out ownerGo);
+                    break;
+                }
+                else if (obj is MeshFilter mf
+                    && mf.m_Mesh != null
+                    && mf.m_Mesh.TryGet(out var mfMesh)
+                    && ReferenceEquals(mfMesh, mesh)
+                    && mf.m_GameObject != null
+                    && mf.m_GameObject.TryGet(out var mfGo)
+                    && mfGo?.m_MeshRenderer != null)
+                {
+                    ownerRenderer = mfGo.m_MeshRenderer;
+                    ownerGo = mfGo;
+                    break;
+                }
+            }
+        }
+
+        if (ownerGo == null)
+        {
+            return false;
+        }
+
+        // Walk up the parent transform hierarchy to find an enclosing Animator or multi-part group root
+        GameObject? animatorRoot = null;
+        GameObject? multiRendererRoot = null;
+        var current = ownerGo;
+        var visited = new HashSet<GameObject>();
+        while (current != null && visited.Add(current))
+        {
+            if (current.m_Animator != null)
+            {
+                animatorRoot = current;
+                if (current.m_Animator.m_Avatar != null)
+                {
+                    current.m_Animator.m_Avatar.TryGet(out avatar);
+                }
+                break;
+            }
+
+            if (multiRendererRoot == null && CountRenderersInSubtree(current, maxCount: 2) >= 2)
+            {
+                multiRendererRoot = current;
+            }
+
+            var parentTransform = current.m_Transform?.m_Father != null && current.m_Transform.m_Father.TryGet(out var father)
+                ? father
+                : null;
+            if (parentTransform == null || parentTransform.m_GameObject == null || !parentTransform.m_GameObject.TryGet(out var parentGo))
+            {
+                break;
+            }
+            current = parentGo;
+        }
+
+        rootGameObject = animatorRoot ?? multiRendererRoot ?? ownerGo;
+        groupName = !string.IsNullOrWhiteSpace(rootGameObject.m_Name) ? rootGameObject.m_Name : groupName;
+        CollectSubtreeMeshesAndRenderers(rootGameObject, meshes, renderers);
+        if (meshes.Count == 0 && ownerRenderer != null)
+        {
+            meshes.Add(mesh);
+            renderers.Add(ownerRenderer);
+        }
+
+        return meshes.Count > 0;
+    }
+
+    private bool TryBuildEagerModelGroupForAvatar(
+        Avatar avatar,
+        out string groupName,
+        out GameObject? rootGameObject,
+        out List<Mesh> meshes,
+        out List<Renderer> renderers)
+    {
+        groupName = avatar.m_Name ?? "Avatar";
+        rootGameObject = null;
+        meshes = new List<Mesh>();
+        renderers = new List<Renderer>();
+
+        List<SerializedFile> filesSnapshot;
+        lock (assetsManager.loadLock)
+        {
+            filesSnapshot = assetsManager.assetsFileList.ToList();
+        }
+
+        for (int f = 0; f < filesSnapshot.Count && rootGameObject == null; f++)
+        {
+            var objects = filesSnapshot[f].Objects;
+            for (int i = 0; i < objects.Count; i++)
+            {
+                if (objects[i] is Animator anim
+                    && anim.m_Avatar != null
+                    && anim.m_Avatar.TryGet(out var animAvatar)
+                    && ReferenceEquals(animAvatar, avatar)
+                    && anim.m_GameObject != null
+                    && anim.m_GameObject.TryGet(out var animGo)
+                    && animGo != null)
+                {
+                    rootGameObject = animGo;
+                    break;
+                }
+            }
+        }
+
+        if (rootGameObject == null)
+        {
+            return false;
+        }
+
+        groupName = !string.IsNullOrWhiteSpace(rootGameObject.m_Name) ? rootGameObject.m_Name : groupName;
+        CollectSubtreeMeshesAndRenderers(rootGameObject, meshes, renderers);
+        return meshes.Count > 0;
+    }
+
+    private static int CountRenderersInSubtree(GameObject root, int maxCount)
+    {
+        int count = 0;
+        var visited = new HashSet<Transform>();
+        var stack = new Stack<Transform>();
+        if (root.m_Transform != null)
+        {
+            stack.Push(root.m_Transform);
+        }
+        else if (root.m_MeshRenderer != null || root.m_SkinnedMeshRenderer != null)
+        {
+            return 1;
+        }
+
+        while (stack.Count > 0 && count < maxCount)
+        {
+            var tr = stack.Pop();
+            if (tr == null || !visited.Add(tr)) continue;
+            if (tr.m_GameObject != null && tr.m_GameObject.TryGet(out var go) && go != null)
+            {
+                if (go.m_SkinnedMeshRenderer != null || (go.m_MeshRenderer != null && go.m_MeshFilter != null))
+                {
+                    count++;
+                }
+            }
+
+            if (tr.m_Children != null)
+            {
+                for (int i = 0; i < tr.m_Children.Length; i++)
+                {
+                    if (tr.m_Children[i] != null && tr.m_Children[i].TryGet(out var child) && child != null)
+                    {
+                        stack.Push(child);
+                    }
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private static void CollectSubtreeMeshesAndRenderers(GameObject root, List<Mesh> meshes, List<Renderer> renderers)
+    {
+        var visited = new HashSet<Transform>();
+        var stack = new Stack<Transform>();
+        if (root.m_Transform != null)
+        {
+            stack.Push(root.m_Transform);
+        }
+
+        while (stack.Count > 0)
+        {
+            var tr = stack.Pop();
+            if (tr == null || !visited.Add(tr)) continue;
+            if (tr.m_GameObject != null && tr.m_GameObject.TryGet(out var go) && go != null)
+            {
+                if (go.m_SkinnedMeshRenderer != null
+                    && go.m_SkinnedMeshRenderer.m_Mesh != null
+                    && go.m_SkinnedMeshRenderer.m_Mesh.TryGet(out var smrMesh)
+                    && smrMesh != null)
+                {
+                    meshes.Add(smrMesh);
+                    renderers.Add(go.m_SkinnedMeshRenderer);
+                }
+                if (go.m_MeshRenderer != null
+                    && go.m_MeshFilter != null
+                    && go.m_MeshFilter.m_Mesh != null
+                    && go.m_MeshFilter.m_Mesh.TryGet(out var mfMesh)
+                    && mfMesh != null)
+                {
+                    meshes.Add(mfMesh);
+                    renderers.Add(go.m_MeshRenderer);
+                }
+            }
+
+            if (tr.m_Children != null)
+            {
+                for (int i = tr.m_Children.Length - 1; i >= 0; i--)
+                {
+                    if (tr.m_Children[i] != null && tr.m_Children[i].TryGet(out var child) && child != null)
+                    {
+                        stack.Push(child);
+                    }
+                }
+            }
+        }
+    }
+
+    private static Mesh? FindFirstMeshUnderGameObject(GameObject root)
+    {
+        var meshes = new List<Mesh>();
+        var renderers = new List<Renderer>();
+        CollectSubtreeMeshesAndRenderers(root, meshes, renderers);
+        return meshes.Count > 0 ? meshes[0] : null;
+    }
+
+    private void EnsureRendererMaterialsLoadedForExport(Renderer renderer)
+    {
+        if (renderer.m_Materials == null)
+        {
+            return;
+        }
+
+        var loadedMaterials = new List<Material?>(renderer.m_Materials.Length);
+        for (int i = 0; i < renderer.m_Materials.Length; i++)
+        {
+            var matPtr = renderer.m_Materials[i];
+            if (matPtr == null || matPtr.IsNull) continue;
+            if (matPtr.TryGet(out var mat) && mat != null)
+            {
+                loadedMaterials.Add(mat);
+            }
+        }
+        EnsureMaterialTexturesLoadedForExport(loadedMaterials);
+    }
+
+    private void EnsureMaterialTexturesLoadedForExport(IReadOnlyList<Material?> materials)
+    {
+        if (materials == null || materials.Count == 0)
+        {
+            return;
+        }
+
+        for (int i = 0; i < materials.Count; i++)
+        {
+            var mat = materials[i];
+            var texEnvs = mat?.m_SavedProperties?.m_TexEnvs;
+            if (mat == null || texEnvs == null)
+            {
+                continue;
+            }
+
+            foreach (var texEnv in texEnvs)
+            {
+                var texRef = texEnv.Value?.m_Texture;
+                if (texRef != null && !texRef.IsNull)
+                {
+                    _ = ResolveTexturePPtrForPreview(mat, texRef);
+                }
+            }
+        }
+    }
+
     private void ExportFbx(IImported convert, string exportFile)
     {
         if (exportOptions.ExportAnimations && exportOptions.ExportAnimationsSplit && convert.AnimationList?.Count > 0)
         {
+            var effectiveConvert = exportOptions.CombineMeshes && convert.MeshList?.Count > 1
+                ? ModelConverter.CreateCombinedView(convert)
+                : convert;
+
             // 1. Export main model without animations
-            var mainConvert = new ImportedWrapper(convert)
+            var mainConvert = new ImportedWrapper(effectiveConvert)
             {
                 AnimationList = new List<ImportedKeyframedAnimation>()
             };
@@ -1655,7 +2436,8 @@ public partial class MainWindow
                     (float)exportOptions.BoneSize,
                     (float)exportOptions.ScaleFactor,
                     exportOptions.FbxVersion,
-                    exportOptions.FbxFormat == 1);
+                    exportOptions.FbxFormat == 1,
+                    exportOptions.CombineMeshes);
             }
             catch
             {
@@ -1669,12 +2451,12 @@ public partial class MainWindow
             }
 
             // 2. Export each animation clip separately
-            foreach (var anim in convert.AnimationList)
+            foreach (var anim in effectiveConvert.AnimationList)
             {
                 var animFile = GetUniqueFilePath(Path.Combine(
                     Path.GetDirectoryName(exportFile)!,
                     $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.fbx"));
-                var animConvert = new ImportedWrapper(convert)
+                var animConvert = new ImportedWrapper(effectiveConvert)
                 {
                     AnimationList = new List<ImportedKeyframedAnimation> { anim }
                 };
@@ -1688,7 +2470,8 @@ public partial class MainWindow
                         (float)exportOptions.BoneSize,
                         (float)exportOptions.ScaleFactor,
                         exportOptions.FbxVersion,
-                        exportOptions.FbxFormat == 1);
+                        exportOptions.FbxFormat == 1,
+                        exportOptions.CombineMeshes);
                 }
                 catch
                 {
@@ -1722,7 +2505,8 @@ public partial class MainWindow
                     (float)exportOptions.BoneSize,
                     (float)exportOptions.ScaleFactor,
                     exportOptions.FbxVersion,
-                    exportOptions.FbxFormat == 1);
+                    exportOptions.FbxFormat == 1,
+                    exportOptions.CombineMeshes);
             }
             catch
             {
@@ -1742,12 +2526,23 @@ public partial class MainWindow
         private readonly List<SerializedFile> assetsFiles;
         private readonly HashSet<string> reservedOutputPaths = new(
             OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        private readonly HashSet<string> exportedModelGroupIds = new(StringComparer.Ordinal);
         private Dictionary<uint, string>? bonePathHash;
         private Dictionary<uint, string>? morphChannelNames;
 
         public ExportConversionContext(List<SerializedFile> assetsFiles)
         {
             this.assetsFiles = assetsFiles;
+        }
+
+        public bool IsModelGroupExported(string? groupId)
+        {
+            return !string.IsNullOrWhiteSpace(groupId) && exportedModelGroupIds.Contains(groupId);
+        }
+
+        public bool TryMarkModelGroupExported(string? groupId)
+        {
+            return string.IsNullOrWhiteSpace(groupId) || exportedModelGroupIds.Add(groupId);
         }
 
         public Dictionary<uint, string> BonePathHash =>
