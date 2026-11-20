@@ -1,0 +1,350 @@
+using System;
+using System.IO;
+using AssetStudio.Avalonia.Services;
+using Microsoft.Data.Sqlite;
+
+namespace AssetStudio.Avalonia
+{
+    public partial class SQLiteProjectIndexCache
+    {
+        internal void SaveIndexingProgress(
+            string folderPath,
+            string signature,
+            ProjectScanResult scanResult,
+            IndexingProgressUpdate update)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath) || scanResult == null || update == null)
+            {
+                return;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                lock (WriteGate)
+                {
+                    using var conn = CreateConnection(folderPath);
+                    using var transaction = conn.BeginTransaction();
+                    var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
+
+                    if (update.ProcessedFiles == 0
+                        && update.NewlyReadFiles.Count == 0
+                        && string.Equals(update.Status, "running", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var clearCmd = conn.CreateCommand();
+                        clearCmd.Transaction = transaction;
+                        clearCmd.CommandText = "DELETE FROM IndexingReadFiles WHERE ProjectId = @projectId";
+                        clearCmd.Parameters.AddWithValue("@projectId", projectId);
+                        clearCmd.ExecuteNonQuery();
+                    }
+
+                    UpsertProjectIndexingStateRow(
+                        conn,
+                        transaction,
+                        projectId,
+                        update.Status ?? string.Empty,
+                        update.TotalFiles,
+                        update.ProcessedFiles,
+                        update.PendingFiles,
+                        update.PercentComplete,
+                        update.CurrentFile ?? string.Empty,
+                        update.LastReadFile ?? string.Empty,
+                        IsTerminalIndexingStatus(update.Status));
+
+                    if (update.NewlyReadFiles.Count > 0)
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.Transaction = transaction;
+                        cmd.CommandText = @"
+                            INSERT INTO IndexingReadFiles (ProjectId, FilePath, FileName, ReadOrder, Status)
+                            VALUES (@projectId, @filePath, @fileName, @readOrder, 'read')
+                            ON CONFLICT(ProjectId, FilePath)
+                            DO UPDATE SET
+                                FileName = excluded.FileName,
+                                ReadOrder = excluded.ReadOrder,
+                                ReadAt = CURRENT_TIMESTAMP,
+                                Status = excluded.Status";
+
+                        var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+                        var pFilePath = cmd.Parameters.Add("@filePath", SqliteType.Text);
+                        var pFileName = cmd.Parameters.Add("@fileName", SqliteType.Text);
+                        var pReadOrder = cmd.Parameters.Add("@readOrder", SqliteType.Integer);
+                        pProjectId.Value = projectId;
+
+                        var firstReadOrder = Math.Max(1, update.ProcessedFiles - update.NewlyReadFiles.Count + 1);
+                        for (var i = 0; i < update.NewlyReadFiles.Count; i++)
+                        {
+                            var filePath = update.NewlyReadFiles[i] ?? string.Empty;
+                            pFilePath.Value = filePath;
+                            pFileName.Value = Path.GetFileName(filePath);
+                            pReadOrder.Value = firstReadOrder + i;
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    transaction.Commit();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to save indexing progress: {ex.Message}");
+            }
+        }
+
+        internal ProjectIndexingState? LoadIndexingState(string folderPath, string signature)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return null;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateReadConnection(folderPath);
+                var projectId = FindProjectId(conn, null, folderPath, signature);
+                if (projectId == null)
+                {
+                    return null;
+                }
+
+                return LoadIndexingState(conn, null, projectId.Value);
+            }
+            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+            {
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load indexing progress: {ex.Message}");
+                return null;
+            }
+        }
+
+        internal ProjectIndexingState? LoadLatestIndexingState(string folderPath)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return null;
+            }
+
+            EnsureInitialized(folderPath);
+            try
+            {
+                using var conn = CreateReadConnection(folderPath);
+                var projectId = FindLatestProjectId(conn, null, folderPath);
+                if (projectId == null)
+                {
+                    return null;
+                }
+
+                return LoadIndexingState(conn, null, projectId.Value);
+            }
+            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+            {
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load latest indexing progress: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static ProjectIndexingState? LoadIndexingState(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
+        {
+            ProjectIndexingState? state = null;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                           CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt
+                    FROM ProjectIndexingState
+                    WHERE ProjectId = @projectId
+                    LIMIT 1";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                using var reader = cmd.ExecuteReader();
+                if (reader.Read())
+                {
+                    state = new ProjectIndexingState
+                    {
+                        Status = reader.GetString(0),
+                        TotalFiles = reader.GetInt32(1),
+                        ProcessedFiles = reader.GetInt32(2),
+                        PendingFiles = reader.GetInt32(3),
+                        PercentComplete = reader.GetDouble(4),
+                        CurrentFile = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                        LastReadFile = reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+                        StartedAt = ReadNullableDateTime(reader, 7),
+                        UpdatedAt = ReadNullableDateTime(reader, 8),
+                        CompletedAt = ReadNullableDateTime(reader, 9)
+                    };
+                }
+            }
+
+            if (state == null)
+            {
+                return null;
+            }
+
+            if (IsSemanticReadyStatus(state.Status)
+                && CountMaterialSemanticRelations(conn, transaction, projectId) == 0)
+            {
+                state = new ProjectIndexingState
+                {
+                    Status = "connections_failed",
+                    TotalFiles = state.TotalFiles,
+                    ProcessedFiles = state.ProcessedFiles,
+                    PendingFiles = state.PendingFiles,
+                    PercentComplete = state.PercentComplete,
+                    CurrentFile = "Saved connections missing",
+                    LastReadFile = string.Empty,
+                    StartedAt = state.StartedAt,
+                    UpdatedAt = state.UpdatedAt,
+                    CompletedAt = null
+                };
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT FilePath
+                    FROM IndexingReadFiles
+                    WHERE ProjectId = @projectId
+                    ORDER BY ReadOrder, Id";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    state.ReadFiles.Add(reader.IsDBNull(0) ? string.Empty : reader.GetString(0));
+                }
+            }
+
+            return state;
+        }
+
+        private static bool IsSemanticReadyStatus(string? status)
+        {
+            return string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static long CountMaterialSemanticRelations(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT
+                    (SELECT COUNT(1) FROM AssetEdges WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM ModelGroups WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM ModelGroupMeshes WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
+                    (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
+        }
+
+        private static bool IsSemanticSaveInProgress(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT Status
+                FROM ProjectIndexingState
+                WHERE ProjectId = @projectId
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            var status = cmd.ExecuteScalar()?.ToString();
+            return string.Equals(status, "saving_connections", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void SaveProjectIndexingState(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            string status,
+            int processed,
+            int total,
+            string stage,
+            bool completed)
+        {
+            var safeTotal = Math.Max(1, total);
+            var safeProcessed = Math.Clamp(processed, 0, safeTotal);
+            var percent = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal));
+            var safeStage = stage ?? string.Empty;
+
+            UpsertProjectIndexingStateRow(
+                conn,
+                transaction,
+                projectId,
+                status ?? string.Empty,
+                safeTotal,
+                safeProcessed,
+                Math.Max(0, safeTotal - safeProcessed),
+                percent,
+                safeStage,
+                safeStage,
+                completed);
+        }
+
+        private static void UpsertProjectIndexingStateRow(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            string status,
+            int totalFiles,
+            int processedFiles,
+            int pendingFiles,
+            double percentComplete,
+            string currentFile,
+            string lastReadFile,
+            bool completed)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO ProjectIndexingState (
+                    ProjectId, Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete,
+                    CurrentFile, LastReadFile, StartedAt, UpdatedAt, CompletedAt)
+                VALUES (
+                    @projectId, @status, @totalFiles, @processedFiles, @pendingFiles, @percentComplete,
+                    @currentFile, @lastReadFile, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, @completedAt)
+                ON CONFLICT(ProjectId)
+                DO UPDATE SET
+                    Status = excluded.Status,
+                    TotalFiles = excluded.TotalFiles,
+                    ProcessedFiles = excluded.ProcessedFiles,
+                    PendingFiles = excluded.PendingFiles,
+                    PercentComplete = excluded.PercentComplete,
+                    CurrentFile = excluded.CurrentFile,
+                    LastReadFile = excluded.LastReadFile,
+                    UpdatedAt = CURRENT_TIMESTAMP,
+                    CompletedAt = excluded.CompletedAt";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            cmd.Parameters.AddWithValue("@status", status);
+            cmd.Parameters.AddWithValue("@totalFiles", totalFiles);
+            cmd.Parameters.AddWithValue("@processedFiles", processedFiles);
+            cmd.Parameters.AddWithValue("@pendingFiles", pendingFiles);
+            cmd.Parameters.AddWithValue("@percentComplete", percentComplete);
+            cmd.Parameters.AddWithValue("@currentFile", currentFile);
+            cmd.Parameters.AddWithValue("@lastReadFile", lastReadFile);
+            cmd.Parameters.AddWithValue("@completedAt", completed ? DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss") : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+
+        private static bool IsTerminalIndexingStatus(string? status)
+        {
+            return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+}
