@@ -38,7 +38,8 @@ mkdir -p "$DIST_DIR"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-VERSION=$(grep -oP '(?<=<Version>)[^<]+' "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" || echo "0.17.1")
+VERSION=$(grep -h -oP '(?<=<Version>)[^<]+' "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" "$REPO_ROOT/Directory.Build.props" 2>/dev/null | head -n 1 || true)
+VERSION="${VERSION:-0.17.1}"
 echo "--> Detected version: $VERSION"
 
 build_appimage() {

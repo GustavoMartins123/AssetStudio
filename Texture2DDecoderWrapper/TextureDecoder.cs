@@ -11,7 +11,7 @@ namespace Texture2DDecoder
             DllLoader.PreloadDll(T2DDll.DllName);
         }
 
-        private static bool ValidateBuffers(byte[] data, int width, int height, byte[] image, long minDataSize)
+        private static bool ValidateBuffers(byte[]? data, int width, int height, byte[]? image, long minDataSize)
         {
             if (data == null || image == null || width <= 0 || height <= 0 || minDataSize <= 0)
             {
@@ -295,7 +295,7 @@ namespace Texture2DDecoder
             }
         }
 
-        public static byte[] UnpackCrunch(byte[] data)
+        public static byte[]? UnpackCrunch(byte[]? data)
         {
             if (data == null || data.Length == 0)
             {
@@ -332,7 +332,7 @@ namespace Texture2DDecoder
             }
         }
 
-        public static byte[] UnpackUnityCrunch(byte[] data)
+        public static byte[]? UnpackUnityCrunch(byte[]? data)
         {
             if (data == null || data.Length == 0)
             {

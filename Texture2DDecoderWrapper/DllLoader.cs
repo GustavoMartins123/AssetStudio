@@ -52,7 +52,7 @@ namespace Texture2DDecoder
             }
         }
 
-        private static void RegisterResolver(Assembly assembly)
+        private static void RegisterResolver(Assembly? assembly)
         {
             if (assembly == null || !RegisteredAssemblies.TryAdd(assembly, 0))
             {
