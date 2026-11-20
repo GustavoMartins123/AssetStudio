@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
@@ -10,11 +12,16 @@ namespace AssetStudio.Avalonia
 {
     public partial class SQLiteProjectIndexCache
     {
+        private const int WriteBusyTimeoutSeconds = 60;
         private const int ReadBusyTimeoutSeconds = 5;
+        private const int DefaultPageSizeBytes = 8192;
+        private const int ConnectionCacheSizeKiB = -65536;
+        private const long ConnectionMmapSizeBytes = 268435456;
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
-        private readonly HashSet<string> _initializedDbs = new();
+        private readonly HashSet<string> _initializedDbs = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _initLock = new object();
+        private readonly ConcurrentDictionary<string, long> _projectIdCache = new(StringComparer.Ordinal);
 
         public SQLiteProjectIndexCache()
             : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache"))
@@ -58,15 +65,8 @@ namespace AssetStudio.Avalonia
             {
                 lock (WriteGate)
                 {
-                    // Force close any pooled connections to this database first
-                    using (var conn = new SqliteConnection($"Data Source={dbPath}"))
-                    {
-                        SqliteConnection.ClearPool(conn);
-                    }
-                    using (var readConn = new SqliteConnection(BuildReadConnectionString(dbPath)))
-                    {
-                        SqliteConnection.ClearPool(readConn);
-                    }
+                    ClearConnectionPoolsForDb(dbPath);
+                    InvalidateProjectIdCacheForDb(dbPath);
 
                     if (File.Exists(dbPath))
                     {
@@ -90,6 +90,22 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to delete SQLite index cache files for {folderPath}: {ex.Message}");
+            }
+        }
+
+        private static void ClearConnectionPoolsForDb(string dbPath)
+        {
+            using (var writeConn = new SqliteConnection(BuildWriteConnectionString(dbPath)))
+            {
+                SqliteConnection.ClearPool(writeConn);
+            }
+            using (var defaultConn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                SqliteConnection.ClearPool(defaultConn);
+            }
+            using (var readConn = new SqliteConnection(BuildReadConnectionString(dbPath)))
+            {
+                SqliteConnection.ClearPool(readConn);
             }
         }
 
@@ -118,7 +134,93 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private void EnsureInitialized(string folderPath)
+        private static string NormalizeProjectPathForCache(string folderPath)
+        {
+            return (folderPath ?? string.Empty)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                .ToUpperInvariant();
+        }
+
+        private static string BuildProjectIdCacheKey(string dbPath, string folderPath, string signature)
+        {
+            return $"{dbPath}\u001f{NormalizeProjectPathForCache(folderPath)}\u001f{signature}";
+        }
+
+        internal bool TryGetCachedProjectId(string folderPath, string signature, out long projectId)
+        {
+            var dbPath = GetDbPath(folderPath);
+            return _projectIdCache.TryGetValue(BuildProjectIdCacheKey(dbPath, folderPath, signature), out projectId);
+        }
+
+        private void CacheProjectId(string dbPath, string folderPath, string signature, long projectId)
+        {
+            _projectIdCache[BuildProjectIdCacheKey(dbPath, folderPath, signature)] = projectId;
+        }
+
+        private void EvictProjectIdCacheEntry(string dbPath, string folderPath, string signature)
+        {
+            _projectIdCache.TryRemove(BuildProjectIdCacheKey(dbPath, folderPath, signature), out _);
+        }
+
+        private void InvalidateProjectIdCacheForDb(string dbPath)
+        {
+            var prefix = dbPath + "\u001f";
+            foreach (var key in _projectIdCache.Keys)
+            {
+                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    _projectIdCache.TryRemove(key, out _);
+                }
+            }
+        }
+
+        private long? TryGetOrResolveProjectId(
+            SqliteConnection conn,
+            SqliteTransaction? transaction,
+            string dbPath,
+            string folderPath,
+            string signature,
+            out bool fromCache)
+        {
+            var cacheKey = BuildProjectIdCacheKey(dbPath, folderPath, signature);
+            if (_projectIdCache.TryGetValue(cacheKey, out var cachedId))
+            {
+                fromCache = true;
+                return cachedId;
+            }
+
+            fromCache = false;
+            var projectId = FindProjectId(conn, transaction, folderPath, signature);
+            if (projectId.HasValue)
+            {
+                _projectIdCache[cacheKey] = projectId.Value;
+            }
+
+            return projectId;
+        }
+
+        private long? ReverifyProjectId(
+            SqliteConnection conn,
+            SqliteTransaction? transaction,
+            string dbPath,
+            string folderPath,
+            string signature)
+        {
+            var cacheKey = BuildProjectIdCacheKey(dbPath, folderPath, signature);
+            var projectId = FindProjectId(conn, transaction, folderPath, signature);
+            if (projectId.HasValue)
+            {
+                _projectIdCache[cacheKey] = projectId.Value;
+            }
+            else
+            {
+                _projectIdCache.TryRemove(cacheKey, out _);
+            }
+
+            return projectId;
+        }
+
+        internal void EnsureInitialized(string folderPath)
         {
             EnsureInitializedByDbPath(GetDbPath(folderPath));
         }
@@ -127,7 +229,7 @@ namespace AssetStudio.Avalonia
         {
             lock (_initLock)
             {
-                if (_initializedDbs.Contains(dbPath))
+                if (_initializedDbs.Contains(dbPath) && File.Exists(dbPath))
                 {
                     return;
                 }
@@ -154,6 +256,17 @@ namespace AssetStudio.Avalonia
             }
         }
 
+        private static string BuildWriteConnectionString(string dbPath)
+        {
+            return new SqliteConnectionStringBuilder
+            {
+                DataSource = dbPath,
+                Mode = SqliteOpenMode.ReadWriteCreate,
+                Pooling = true,
+                DefaultTimeout = WriteBusyTimeoutSeconds
+            }.ToString();
+        }
+
         private static string BuildReadConnectionString(string dbPath)
         {
             return new SqliteConnectionStringBuilder
@@ -165,28 +278,48 @@ namespace AssetStudio.Avalonia
             }.ToString();
         }
 
-        private SqliteConnection CreateConnection(string folderPath)
+        internal SqliteConnection CreateConnection(string folderPath)
         {
             return CreateConnectionByDbPath(GetDbPath(folderPath));
         }
 
-        private static SqliteConnection CreateConnectionByDbPath(string dbPath)
+        internal static SqliteConnection CreateConnectionByDbPath(string dbPath)
         {
-            var conn = new SqliteConnection($"Data Source={dbPath}");
-            conn.DefaultTimeout = 60;
+            return CreateConnectionByDbPath(dbPath, initializePageSize: false);
+        }
+
+        private static SqliteConnection CreateConnectionByDbPath(string dbPath, bool initializePageSize)
+        {
+            var conn = new SqliteConnection(BuildWriteConnectionString(dbPath));
+            conn.DefaultTimeout = WriteBusyTimeoutSeconds;
             conn.Open();
             using var pragma = conn.CreateCommand();
-            pragma.CommandText = "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 60000;";
+            pragma.CommandText = initializePageSize
+                ? $@"
+                    PRAGMA page_size = {DefaultPageSizeBytes};
+                    PRAGMA foreign_keys = ON;
+                    PRAGMA busy_timeout = {WriteBusyTimeoutSeconds * 1000};
+                    PRAGMA synchronous = NORMAL;
+                    PRAGMA temp_store = MEMORY;
+                    PRAGMA cache_size = {ConnectionCacheSizeKiB};
+                    PRAGMA mmap_size = {ConnectionMmapSizeBytes};"
+                : $@"
+                    PRAGMA foreign_keys = ON;
+                    PRAGMA busy_timeout = {WriteBusyTimeoutSeconds * 1000};
+                    PRAGMA synchronous = NORMAL;
+                    PRAGMA temp_store = MEMORY;
+                    PRAGMA cache_size = {ConnectionCacheSizeKiB};
+                    PRAGMA mmap_size = {ConnectionMmapSizeBytes};";
             pragma.ExecuteNonQuery();
             return conn;
         }
 
-        private SqliteConnection CreateReadConnection(string folderPath)
+        internal SqliteConnection CreateReadConnection(string folderPath)
         {
             return CreateReadConnectionByDbPath(GetDbPath(folderPath));
         }
 
-        private static SqliteConnection CreateReadConnectionByDbPath(string dbPath)
+        internal static SqliteConnection CreateReadConnectionByDbPath(string dbPath)
         {
             var connectionString = BuildReadConnectionString(dbPath);
             var conn = new SqliteConnection(connectionString);
@@ -195,23 +328,21 @@ namespace AssetStudio.Avalonia
             pragma.CommandText = $@"
                 PRAGMA query_only = ON;
                 PRAGMA busy_timeout = {ReadBusyTimeoutSeconds * 1000};
-                PRAGMA temp_store = MEMORY;";
+                PRAGMA temp_store = MEMORY;
+                PRAGMA cache_size = {ConnectionCacheSizeKiB};
+                PRAGMA mmap_size = {ConnectionMmapSizeBytes};";
             pragma.ExecuteNonQuery();
             return conn;
         }
 
-        private void InitializeDatabase(string folderPath)
-        {
-            InitializeDatabaseByPath(GetDbPath(folderPath));
-        }
-
-        private static void InitializeDatabaseByPath(string dbPath)
+        private void InitializeDatabaseByPath(string dbPath)
         {
             try
             {
                 lock (WriteGate)
                 {
-                    using (var conn = CreateConnectionByDbPath(dbPath))
+                    var isNewOrEmptyDb = !File.Exists(dbPath) || new FileInfo(dbPath).Length == 0;
+                    using (var conn = CreateConnectionByDbPath(dbPath, initializePageSize: isNewOrEmptyDb))
                     {
                         using (var pragma = conn.CreateCommand())
                         {
@@ -222,9 +353,9 @@ namespace AssetStudio.Avalonia
                             pragma.ExecuteNonQuery();
                         }
 
-                        if (ShouldRebuildSchema(conn))
+                        if (TryUpgradeOrRebuildSchema(conn))
                         {
-                            RebuildSchema(conn);
+                            InvalidateProjectIdCacheForDb(dbPath);
                         }
 
                         CreateSchema(conn);
@@ -234,6 +365,39 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 Logger.Error($"Failed to initialize SQLite database cache at {dbPath}: {ex.Message}", ex);
+            }
+        }
+
+        private static void SetSynchronousMode(SqliteConnection conn, string mode)
+        {
+            if (conn.State != ConnectionState.Open)
+            {
+                return;
+            }
+
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = $"PRAGMA synchronous = {mode};";
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to set SQLite PRAGMA synchronous = {mode}: {ex.Message}");
+            }
+        }
+
+        private static void TryAnalyzeDatabase(SqliteConnection conn, string context)
+        {
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "ANALYZE;";
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"SQLite ANALYZE for {context} failed: {ex.Message}");
             }
         }
 
@@ -310,11 +474,12 @@ namespace AssetStudio.Avalonia
             Action<SqliteConnection, SqliteTransaction, long> query)
         {
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnection(folderPath);
+                using var conn = CreateReadConnectionByDbPath(dbPath);
                 using var transaction = conn.BeginTransaction(deferred: true);
-                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                var projectId = TryGetOrResolveProjectId(conn, transaction, dbPath, folderPath, signature, out _);
                 if (projectId == null)
                 {
                     return;
@@ -324,6 +489,7 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                 Logger.Warning($"Failed to load {errorContext} from SQLite: {ex.Message}");
             }
         }

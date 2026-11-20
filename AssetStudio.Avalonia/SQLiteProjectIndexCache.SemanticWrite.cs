@@ -21,9 +21,10 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
-                var clearWork = replaceExisting ? 4 : 0;
+                var clearWork = replaceExisting ? 6 : 0;
                 var totalWork = Math.Max(1,
                     relations.SourceFiles.Count
                     + relations.AssetEdges.Count
@@ -40,149 +41,193 @@ namespace AssetStudio.Avalonia
                 lock (WriteGate)
                 {
                     reporter.Report("Opening SQLite connection", force: true);
-                    using var conn = CreateConnection(folderPath);
+                    using var conn = CreateConnectionByDbPath(dbPath);
 
-                    long projectId;
-                    bool resumePartialSave;
-                    using (var transaction = conn.BeginTransaction())
+                    reporter.Report("Resolving project row", force: true);
+                    var foundProjectId = FindProjectId(conn, null, folderPath, signature);
+                    if (foundProjectId == null)
                     {
-                        reporter.Report("Resolving project row", force: true);
-                        var foundProjectId = FindProjectId(conn, transaction, folderPath, signature);
-                        if (foundProjectId == null)
-                        {
-                            return false;
-                        }
-
-                        projectId = foundProjectId.Value;
-                        resumePartialSave = replaceExisting
-                            && IsSemanticSaveInProgress(conn, transaction, projectId)
-                            && CountMaterialSemanticRelations(conn, transaction, projectId) > 0;
-
-                        SaveProjectIndexingState(
-                            conn,
-                            transaction,
-                            projectId,
-                            "saving_connections",
-                            reporter.ProcessedWork,
-                            reporter.TotalWork,
-                            resumePartialSave
-                                ? "Resuming partial semantic relation save"
-                                : "Preparing semantic relation save",
-                            completed: false);
-                        transaction.Commit();
+                        EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                        return false;
                     }
 
-                    if (replaceExisting && !resumePartialSave)
+                    var projectId = foundProjectId.Value;
+                    CacheProjectId(dbPath, folderPath, signature, projectId);
+
+                    if (replaceExisting)
                     {
-                        using var transaction = conn.BeginTransaction();
-                        ClearSemanticRelationTablesForProject(conn, transaction, projectId, reporter.Advance);
-                        SaveProjectIndexingState(
-                            conn,
-                            transaction,
-                            projectId,
-                            "saving_connections",
-                            reporter.ProcessedWork,
-                            reporter.TotalWork,
-                            reporter.CurrentStage,
-                            completed: false);
-                        transaction.Commit();
+                        SaveSemanticRelationsBulkReplace(conn, projectId, relations, reporter);
+                        reporter.Report("Analyzing SQLite statistics", force: true);
+                        TryAnalyzeDatabase(conn, "semantic relations");
                     }
-                    else if (replaceExisting && resumePartialSave)
+                    else
                     {
-                        reporter.Skip(clearWork, "Resuming partial semantic relation save");
+                        SaveSemanticRelationsIncremental(conn, projectId, relations, reporter);
                     }
 
-                    using (var transaction = conn.BeginTransaction())
-                    {
-                        InsertSemanticSourceFiles(conn, transaction, projectId, relations.SourceFiles, reporter.Advance);
-                        SaveProjectIndexingState(
-                            conn,
-                            transaction,
-                            projectId,
-                            "saving_connections",
-                            reporter.ProcessedWork,
-                            reporter.TotalWork,
-                            string.IsNullOrWhiteSpace(reporter.CurrentStage) ? "Saving semantic source files" : reporter.CurrentStage,
-                            completed: false);
-                        transaction.Commit();
-                    }
-
-                    Dictionary<string, long> assetSourceFileIds;
-                    using (var transaction = conn.BeginTransaction())
-                    {
-                        assetSourceFileIds = LoadAssetSourceFileIdMap(conn, transaction, projectId);
-                        transaction.Commit();
-                    }
-
-                    ExecuteInCommitChunks(
-                        conn,
-                        relations.AssetEdges.Count,
-                        (c, tx, offset, count) => InsertAssetEdges(c, tx, projectId, relations.AssetEdges, offset, count, assetSourceFileIds, reporter.Advance),
-                        SaveProgressCheckpoint);
-                    ExecuteInCommitChunks(
-                        conn,
-                        relations.ModelGroups.Count,
-                        (c, tx, offset, count) => InsertModelGroups(c, tx, projectId, relations.ModelGroups, offset, count, reporter.Advance),
-                        SaveProgressCheckpoint);
-                    ExecuteInCommitChunks(
-                        conn,
-                        relations.ModelGroupMeshes.Count,
-                        (c, tx, offset, count) => InsertModelGroupMeshes(c, tx, projectId, relations.ModelGroupMeshes, offset, count, reporter.Advance),
-                        SaveProgressCheckpoint);
-                    ExecuteInCommitChunks(
-                        conn,
-                        relations.MeshRenderers.Count,
-                        (c, tx, offset, count) => InsertMeshRenderers(c, tx, projectId, relations.MeshRenderers, offset, count, reporter.Advance),
-                        SaveProgressCheckpoint);
-                    ExecuteInCommitChunks(
-                        conn,
-                        relations.MeshMaterials.Count,
-                        (c, tx, offset, count) => InsertMeshMaterials(c, tx, projectId, relations.MeshMaterials, offset, count, reporter.Advance),
-                        SaveProgressCheckpoint);
-                    ExecuteInCommitChunks(
-                        conn,
-                        relations.MaterialTextures.Count,
-                        (c, tx, offset, count) => InsertMaterialTextures(c, tx, projectId, relations.MaterialTextures, offset, count, reporter.Advance),
-                        SaveProgressCheckpoint);
-
-                    reporter.Report("Committing semantic relations", force: true);
-                    using (var transaction = conn.BeginTransaction())
-                    {
-                        reporter.MarkCompleted("Semantic relations saved");
-                        SaveProjectIndexingState(
-                            conn,
-                            transaction,
-                            projectId,
-                            "connections_completed",
-                            reporter.ProcessedWork,
-                            reporter.TotalWork,
-                            reporter.CurrentStage,
-                            completed: true);
-                        transaction.Commit();
-                    }
                     reporter.Report("Checkpointing SQLite WAL", force: true);
                     TryCheckpointWal(conn, "semantic relations");
                     reporter.Report("Semantic relations saved", force: true);
                     return true;
-
-                    void SaveProgressCheckpoint(SqliteConnection checkpointConn, SqliteTransaction checkpointTransaction)
-                    {
-                        SaveProjectIndexingState(
-                            checkpointConn,
-                            checkpointTransaction,
-                            projectId,
-                            "saving_connections",
-                            reporter.ProcessedWork,
-                            reporter.TotalWork,
-                            string.IsNullOrWhiteSpace(reporter.CurrentStage) ? "Saving semantic relations" : reporter.CurrentStage,
-                            completed: false);
-                    }
                 }
             }
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to save semantic asset relations: {ex.Message}");
                 return false;
+            }
+        }
+
+        private static void SaveSemanticRelationsBulkReplace(
+            SqliteConnection conn,
+            long projectId,
+            SemanticAssetRelations relations,
+            ThrottledProgressReporter reporter)
+        {
+            SetSynchronousMode(conn, "OFF");
+            try
+            {
+                using var transaction = conn.BeginTransaction();
+                SaveProjectIndexingState(
+                    conn,
+                    transaction,
+                    projectId,
+                    "saving_connections",
+                    reporter.ProcessedWork,
+                    reporter.TotalWork,
+                    "Preparing semantic relation save",
+                    completed: false);
+
+                ClearSemanticRelationTablesForProject(conn, transaction, projectId, reporter.Advance);
+                DropSemanticBulkSecondaryIndexes(conn, transaction);
+
+                InsertSemanticSourceFiles(conn, transaction, projectId, relations.SourceFiles, reporter.Advance);
+                var assetSourceFileIds = LoadAssetSourceFileIdMap(conn, transaction, projectId);
+
+                InsertAssetEdges(conn, transaction, projectId, relations.AssetEdges, 0, relations.AssetEdges.Count, assetSourceFileIds, reporter.Advance);
+                InsertModelGroups(conn, transaction, projectId, relations.ModelGroups, 0, relations.ModelGroups.Count, reporter.Advance);
+                InsertModelGroupMeshes(conn, transaction, projectId, relations.ModelGroupMeshes, 0, relations.ModelGroupMeshes.Count, reporter.Advance);
+                InsertMeshRenderers(conn, transaction, projectId, relations.MeshRenderers, 0, relations.MeshRenderers.Count, reporter.Advance);
+                InsertMeshMaterials(conn, transaction, projectId, relations.MeshMaterials, 0, relations.MeshMaterials.Count, reporter.Advance);
+                InsertMaterialTextures(conn, transaction, projectId, relations.MaterialTextures, 0, relations.MaterialTextures.Count, reporter.Advance);
+
+                reporter.Report("Rebuilding semantic relation indexes", force: true);
+                CreateSemanticBulkSecondaryIndexes(conn, transaction);
+
+                reporter.Report("Committing semantic relations", force: true);
+                reporter.MarkCompleted("Semantic relations saved");
+                SaveProjectIndexingState(
+                    conn,
+                    transaction,
+                    projectId,
+                    "connections_completed",
+                    reporter.ProcessedWork,
+                    reporter.TotalWork,
+                    reporter.CurrentStage,
+                    completed: true);
+                transaction.Commit();
+            }
+            finally
+            {
+                SetSynchronousMode(conn, "NORMAL");
+            }
+        }
+
+        private static void SaveSemanticRelationsIncremental(
+            SqliteConnection conn,
+            long projectId,
+            SemanticAssetRelations relations,
+            ThrottledProgressReporter reporter)
+        {
+            using (var transaction = conn.BeginTransaction())
+            {
+                SaveProjectIndexingState(
+                    conn,
+                    transaction,
+                    projectId,
+                    "saving_connections",
+                    reporter.ProcessedWork,
+                    reporter.TotalWork,
+                    "Preparing semantic relation save",
+                    completed: false);
+                InsertSemanticSourceFiles(conn, transaction, projectId, relations.SourceFiles, reporter.Advance);
+                SaveProjectIndexingState(
+                    conn,
+                    transaction,
+                    projectId,
+                    "saving_connections",
+                    reporter.ProcessedWork,
+                    reporter.TotalWork,
+                    string.IsNullOrWhiteSpace(reporter.CurrentStage) ? "Saving semantic source files" : reporter.CurrentStage,
+                    completed: false);
+                transaction.Commit();
+            }
+
+            Dictionary<string, long> assetSourceFileIds;
+            using (var transaction = conn.BeginTransaction())
+            {
+                assetSourceFileIds = LoadAssetSourceFileIdMap(conn, transaction, projectId);
+                transaction.Commit();
+            }
+
+            ExecuteInCommitChunks(
+                conn,
+                relations.AssetEdges.Count,
+                (c, tx, offset, count) => InsertAssetEdges(c, tx, projectId, relations.AssetEdges, offset, count, assetSourceFileIds, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.ModelGroups.Count,
+                (c, tx, offset, count) => InsertModelGroups(c, tx, projectId, relations.ModelGroups, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.ModelGroupMeshes.Count,
+                (c, tx, offset, count) => InsertModelGroupMeshes(c, tx, projectId, relations.ModelGroupMeshes, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.MeshRenderers.Count,
+                (c, tx, offset, count) => InsertMeshRenderers(c, tx, projectId, relations.MeshRenderers, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.MeshMaterials.Count,
+                (c, tx, offset, count) => InsertMeshMaterials(c, tx, projectId, relations.MeshMaterials, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.MaterialTextures.Count,
+                (c, tx, offset, count) => InsertMaterialTextures(c, tx, projectId, relations.MaterialTextures, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+
+            reporter.Report("Committing semantic relations", force: true);
+            using (var transaction = conn.BeginTransaction())
+            {
+                reporter.MarkCompleted("Semantic relations saved");
+                SaveProjectIndexingState(
+                    conn,
+                    transaction,
+                    projectId,
+                    "connections_completed",
+                    reporter.ProcessedWork,
+                    reporter.TotalWork,
+                    reporter.CurrentStage,
+                    completed: true);
+                transaction.Commit();
+            }
+
+            void SaveProgressCheckpoint(SqliteConnection checkpointConn, SqliteTransaction checkpointTransaction)
+            {
+                SaveProjectIndexingState(
+                    checkpointConn,
+                    checkpointTransaction,
+                    projectId,
+                    "saving_connections",
+                    reporter.ProcessedWork,
+                    reporter.TotalWork,
+                    string.IsNullOrWhiteSpace(reporter.CurrentStage) ? "Saving semantic relations" : reporter.CurrentStage,
+                    completed: false);
             }
         }
 
@@ -194,15 +239,17 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection(folderPath);
+                    using var conn = CreateConnectionByDbPath(dbPath);
                     using var transaction = conn.BeginTransaction();
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
                     if (projectId == null)
                     {
+                        EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                         return;
                     }
 

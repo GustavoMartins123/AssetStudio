@@ -7,9 +7,27 @@ namespace AssetStudio.Avalonia
 {
     public partial class SQLiteProjectIndexCache
     {
-        private const int SemanticSchemaVersion = 11;
+        internal const int SemanticSchemaVersion = 12;
 
-        private static bool ShouldRebuildSchema(SqliteConnection conn)
+        private static bool TryUpgradeOrRebuildSchema(SqliteConnection conn)
+        {
+            var existingVersion = GetExistingSchemaVersion(conn);
+            if (existingVersion == null || existingVersion == SemanticSchemaVersion)
+            {
+                return false;
+            }
+
+            if (existingVersion == 11 && CanPreserveV11ProjectsAndPreviewCache(conn))
+            {
+                UpgradeV11ToV12(conn);
+                return true;
+            }
+
+            RebuildSchema(conn);
+            return true;
+        }
+
+        private static int? GetExistingSchemaVersion(SqliteConnection conn)
         {
             using (var cmd = conn.CreateCommand())
             {
@@ -17,7 +35,7 @@ namespace AssetStudio.Avalonia
                 var tableCount = Convert.ToInt32(cmd.ExecuteScalar());
                 if (tableCount == 0)
                 {
-                    return false;
+                    return null;
                 }
             }
 
@@ -27,7 +45,7 @@ namespace AssetStudio.Avalonia
                 var hasSchemaTable = Convert.ToInt32(cmd.ExecuteScalar()) > 0;
                 if (!hasSchemaTable)
                 {
-                    return true;
+                    return -1;
                 }
             }
 
@@ -35,8 +53,70 @@ namespace AssetStudio.Avalonia
             {
                 cmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1";
                 var versionText = cmd.ExecuteScalar()?.ToString();
-                return !int.TryParse(versionText, out var version) || version != SemanticSchemaVersion;
+                return int.TryParse(versionText, out var version) ? version : -1;
             }
+        }
+
+        private static bool CanPreserveV11ProjectsAndPreviewCache(SqliteConnection conn)
+        {
+            var projectColumns = GetTableColumnNames(conn, "Projects");
+            var previewColumns = GetTableColumnNames(conn, "PreviewCacheEntries");
+
+            return projectColumns.Contains("Id")
+                && projectColumns.Contains("FolderPath")
+                && projectColumns.Contains("SignatureHash")
+                && projectColumns.Contains("TotalFiles")
+                && projectColumns.Contains("TotalBytes")
+                && projectColumns.Contains("UnityBundleCount")
+                && projectColumns.Contains("LastIndexed")
+                && projectColumns.Contains("UnityVersion")
+                && previewColumns.Contains("Id")
+                && previewColumns.Contains("ProjectId")
+                && previewColumns.Contains("AssetUniqueID")
+                && previewColumns.Contains("PreviewKind")
+                && previewColumns.Contains("AlgorithmVersion")
+                && previewColumns.Contains("Parameters")
+                && previewColumns.Contains("PayloadHash")
+                && previewColumns.Contains("PayloadPath")
+                && previewColumns.Contains("ByteSize");
+        }
+
+        private static HashSet<string> GetTableColumnNames(SqliteConnection conn, string tableName)
+        {
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using var infoCmd = conn.CreateCommand();
+            infoCmd.CommandText = $"PRAGMA table_info({tableName});";
+            using var reader = infoCmd.ExecuteReader();
+            while (reader.Read())
+            {
+                if (!reader.IsDBNull(1))
+                {
+                    columns.Add(reader.GetString(1));
+                }
+            }
+
+            return columns;
+        }
+
+        private static void UpgradeV11ToV12(SqliteConnection conn)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                PRAGMA foreign_keys = OFF;
+                DROP TABLE IF EXISTS IndexingReadFiles;
+                DROP TABLE IF EXISTS ProjectIndexingState;
+                DROP TABLE IF EXISTS MaterialTextures;
+                DROP TABLE IF EXISTS MeshMaterials;
+                DROP TABLE IF EXISTS MeshRenderers;
+                DROP TABLE IF EXISTS ModelGroupMeshes;
+                DROP TABLE IF EXISTS ModelGroups;
+                DROP TABLE IF EXISTS AssetEdges;
+                DROP TABLE IF EXISTS Assets;
+                DROP TABLE IF EXISTS SourceFiles;
+                DROP TABLE IF EXISTS AssetHandles;
+                DROP INDEX IF EXISTS idx_projects_path;
+                PRAGMA foreign_keys = ON;";
+            cmd.ExecuteNonQuery();
         }
 
         private static void RebuildSchema(SqliteConnection conn)
@@ -94,9 +174,9 @@ namespace AssetStudio.Avalonia
                                 ByteSize INTEGER NOT NULL
                             );
 
-                            CREATE INDEX IF NOT EXISTS idx_projects_path ON Projects(FolderPath);
                             CREATE INDEX IF NOT EXISTS idx_projects_lookup ON Projects(FolderPath COLLATE NOCASE, SignatureHash, LastIndexed DESC);
-                            CREATE INDEX IF NOT EXISTS idx_handles_project ON AssetHandles(ProjectId);
+                            DROP INDEX IF EXISTS idx_projects_path;
+                            DROP INDEX IF EXISTS idx_handles_project;
                             DROP INDEX IF EXISTS idx_handles_unique;
 
                             CREATE TABLE IF NOT EXISTS SourceFiles (
@@ -110,20 +190,19 @@ namespace AssetStudio.Avalonia
                             );
 
                             CREATE TABLE IF NOT EXISTS Assets (
-                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
-                                SourceFileId INTEGER REFERENCES SourceFiles(Id) ON DELETE SET NULL,
                                 UniqueID TEXT NOT NULL,
+                                SourceFileId INTEGER REFERENCES SourceFiles(Id) ON DELETE SET NULL,
                                 Name TEXT NOT NULL,
                                 Type INTEGER NOT NULL,
                                 Container TEXT NOT NULL DEFAULT '',
                                 PathID INTEGER NOT NULL,
                                 ByteStart INTEGER NOT NULL,
-                                ByteSize INTEGER NOT NULL
-                            );
+                                ByteSize INTEGER NOT NULL,
+                                PRIMARY KEY (ProjectId, UniqueID)
+                            ) WITHOUT ROWID;
 
                             CREATE TABLE IF NOT EXISTS AssetEdges (
-                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
                                 SourceAssetUniqueID TEXT NOT NULL,
                                 EdgeKind TEXT NOT NULL,
@@ -134,8 +213,9 @@ namespace AssetStudio.Avalonia
                                 SourcePathID INTEGER NOT NULL DEFAULT 0,
                                 TargetFileId INTEGER NOT NULL DEFAULT 0,
                                 TargetPathID INTEGER NOT NULL DEFAULT 0,
-                                IsResolved INTEGER NOT NULL DEFAULT 0
-                            );
+                                IsResolved INTEGER NOT NULL DEFAULT 0,
+                                PRIMARY KEY (ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetFileId, TargetPathID)
+                            ) WITHOUT ROWID;
 
                             CREATE TABLE IF NOT EXISTS ModelGroups (
                                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,41 +249,41 @@ namespace AssetStudio.Avalonia
                             );
 
                             CREATE TABLE IF NOT EXISTS MeshRenderers (
-                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
                                 MeshAssetUniqueID TEXT NOT NULL,
                                 RendererAssetUniqueID TEXT NOT NULL,
                                 RendererType TEXT NOT NULL,
                                 GameObjectAssetUniqueID TEXT,
                                 GameObjectName TEXT,
-                                Description TEXT
-                            );
+                                Description TEXT,
+                                PRIMARY KEY (ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, RendererType)
+                            ) WITHOUT ROWID;
 
                             CREATE TABLE IF NOT EXISTS MeshMaterials (
-                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
                                 MeshAssetUniqueID TEXT NOT NULL,
-                                MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
-                                RendererType TEXT NOT NULL DEFAULT '',
                                 SubMeshIndex INTEGER NOT NULL,
                                 MaterialSlotIndex INTEGER NOT NULL DEFAULT -1,
-                                MaterialScore INTEGER NOT NULL DEFAULT 0
-                            );
+                                MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                RendererType TEXT NOT NULL DEFAULT '',
+                                MaterialScore INTEGER NOT NULL DEFAULT 0,
+                                PRIMARY KEY (ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID)
+                            ) WITHOUT ROWID;
 
                             CREATE TABLE IF NOT EXISTS MaterialTextures (
-                                Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
                                 MaterialAssetUniqueID TEXT NOT NULL,
-                                PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 SlotName TEXT NOT NULL,
                                 SlotIndex INTEGER NOT NULL,
-                                TextureAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 TextureFileId INTEGER NOT NULL DEFAULT 0,
                                 TexturePathID INTEGER NOT NULL DEFAULT 0,
+                                TextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 IsResolved INTEGER NOT NULL DEFAULT 0,
-                                IsMainTexture INTEGER NOT NULL DEFAULT 0
-                            );
+                                IsMainTexture INTEGER NOT NULL DEFAULT 0,
+                                PRIMARY KEY (ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID)
+                            ) WITHOUT ROWID;
 
                             CREATE TABLE IF NOT EXISTS PreviewCacheEntries (
                                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,38 +333,15 @@ namespace AssetStudio.Avalonia
                             INSERT OR REPLACE INTO CacheSchema (Key, Value)
                             VALUES ('SemanticSchemaVersion', '{SemanticSchemaVersion.ToString(CultureInfo.InvariantCulture)}');
 
-                            CREATE INDEX IF NOT EXISTS idx_source_files_project ON SourceFiles(ProjectId);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_source_files_unique ON SourceFiles(ProjectId, SerializedFileName, OriginalPath);
-                            CREATE INDEX IF NOT EXISTS idx_assets_project ON Assets(ProjectId);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_unique ON Assets(ProjectId, UniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_assets_type_source ON Assets(ProjectId, Type, SourceFileId, UniqueID);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_edges_unique ON AssetEdges(ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetFileId, TargetPathID);
-                            CREATE INDEX IF NOT EXISTS idx_asset_edges_source ON AssetEdges(ProjectId, SourceAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_asset_edges_target ON AssetEdges(ProjectId, TargetAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_asset_edges_source_kind ON AssetEdges(ProjectId, SourceAssetUniqueID, EdgeKind, SlotName, SlotIndex, TargetAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SourceAssetUniqueID, SlotIndex);
+                            CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SlotName, SourceAssetUniqueID, SlotIndex);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_groups_unique ON ModelGroups(ProjectId, GroupAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_group_meshes_unique ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex);
-                            CREATE INDEX IF NOT EXISTS idx_model_group_meshes_mesh ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_renderers_unique ON MeshRenderers(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, RendererType);
-                            CREATE INDEX IF NOT EXISTS idx_mesh_renderers_mesh ON MeshRenderers(ProjectId, MeshAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_mesh_renderers_lookup ON MeshRenderers(ProjectId, MeshAssetUniqueID, RendererType, RendererAssetUniqueID);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_materials_unique ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh ON MeshMaterials(ProjectId, MeshAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_mesh_submesh ON MeshMaterials(ProjectId, MeshAssetUniqueID, SubMeshIndex);
-                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_renderer ON MeshMaterials(ProjectId, MeshAssetUniqueID, RendererAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_mesh_materials_rank ON MeshMaterials(ProjectId, MeshAssetUniqueID, SubMeshIndex, MaterialSlotIndex, MaterialScore DESC, RendererAssetUniqueID, MaterialAssetUniqueID);
-                            CREATE UNIQUE INDEX IF NOT EXISTS idx_material_textures_unique ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_material_textures_material ON MaterialTextures(ProjectId, MaterialAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_material_textures_preview_material ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_material_textures_material_lookup ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, TextureAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, TextureAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_material_textures_rank ON MaterialTextures(ProjectId, MaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
-                            CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
                             CREATE INDEX IF NOT EXISTS idx_indexing_read_files_project ON IndexingReadFiles(ProjectId, ReadOrder);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_indexing_read_files_unique ON IndexingReadFiles(ProjectId, FilePath);
@@ -295,21 +352,51 @@ namespace AssetStudio.Avalonia
             EnsurePreviewCacheSchemaUpgrades(conn);
         }
 
+        private static void DropIndexBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = "DROP INDEX IF EXISTS idx_handles_lookup;";
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void CreateIndexBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_handles_lookup ON AssetHandles(ProjectId, UniqueID);";
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void DropSemanticBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                DROP INDEX IF EXISTS idx_asset_edges_target_kind;
+                DROP INDEX IF EXISTS idx_model_groups_avatar;
+                DROP INDEX IF EXISTS idx_model_group_meshes_group;
+                DROP INDEX IF EXISTS idx_model_group_meshes_candidate;
+                DROP INDEX IF EXISTS idx_material_textures_preview_lookup;";
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void CreateSemanticBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SlotName, SourceAssetUniqueID, SlotIndex);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);";
+            cmd.ExecuteNonQuery();
+        }
+
         private static void EnsurePreviewCacheSchemaUpgrades(SqliteConnection conn)
         {
-            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            using (var infoCmd = conn.CreateCommand())
-            {
-                infoCmd.CommandText = "PRAGMA table_info(PreviewCacheEntries);";
-                using var reader = infoCmd.ExecuteReader();
-                while (reader.Read())
-                {
-                    if (!reader.IsDBNull(1))
-                    {
-                        columns.Add(reader.GetString(1));
-                    }
-                }
-            }
+            var columns = GetTableColumnNames(conn, "PreviewCacheEntries");
 
             if (!columns.Contains("UpdatedUtc"))
             {

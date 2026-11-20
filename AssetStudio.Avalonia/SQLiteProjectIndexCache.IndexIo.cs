@@ -11,71 +11,91 @@ namespace AssetStudio.Avalonia
         public List<AssetHandle>? LoadIndexCache(string folderPath, string signature)
         {
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
-                using (var conn = CreateReadConnection(folderPath))
+                using (var conn = CreateReadConnectionByDbPath(dbPath))
                 {
-                    long? projectId = null;
-                    using (var cmd = conn.CreateCommand())
-                    {
-                        cmd.CommandText = "SELECT Id FROM Projects WHERE FolderPath = @path AND SignatureHash = @signature LIMIT 1";
-                        cmd.Parameters.AddWithValue("@path", folderPath);
-                        cmd.Parameters.AddWithValue("@signature", signature);
-                        using (var reader = cmd.ExecuteReader())
-                        {
-                            if (reader.Read())
-                            {
-                                projectId = reader.GetInt64(0);
-                            }
-                        }
-                    }
-
+                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
                     if (projectId == null)
                     {
                         return null;
                     }
 
-                    var indexingStatus = LoadProjectIndexingStatus(conn, projectId.Value);
-                    if (IsIncompleteIndexCacheStatus(indexingStatus))
+                    var handles = LoadAssetHandlesForProject(conn, projectId.Value, out var incomplete);
+                    if (incomplete)
                     {
                         return null;
                     }
 
-                    var handles = new List<AssetHandle>();
-                    using (var cmd = conn.CreateCommand())
+                    if (handles.Count == 0 && fromCache)
                     {
-                        cmd.CommandText = @"
-                            SELECT UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize
-                            FROM AssetHandles
-                            WHERE ProjectId = @projectId";
-                        cmd.Parameters.AddWithValue("@projectId", projectId.Value);
-                        using (var reader = cmd.ExecuteReader())
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId == null)
                         {
-                            while (reader.Read())
+                            return null;
+                        }
+
+                        if (verifiedProjectId.Value != projectId.Value)
+                        {
+                            handles = LoadAssetHandlesForProject(conn, verifiedProjectId.Value, out incomplete);
+                            if (incomplete)
                             {
-                                handles.Add(new AssetHandle
-                                {
-                                    UniqueID = reader.GetString(0),
-                                    Name = reader.GetString(1),
-                                    Type = (ClassIDType)reader.GetInt32(2),
-                                    Container = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
-                                    OriginalPath = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
-                                    SerializedFileName = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
-                                    PathID = reader.GetInt64(6),
-                                    ByteStart = reader.GetInt64(7),
-                                    ByteSize = reader.GetInt64(8)
-                                });
+                                return null;
                             }
                         }
                     }
+
                     return handles.Count == 0 ? null : handles;
                 }
             }
             catch (Exception ex)
             {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                 Logger.Warning($"Failed to load SQLite index cache: {ex.Message}");
                 return null;
             }
+        }
+
+        private static List<AssetHandle> LoadAssetHandlesForProject(SqliteConnection conn, long projectId, out bool incomplete)
+        {
+            var indexingStatus = LoadProjectIndexingStatus(conn, projectId);
+            if (IsIncompleteIndexCacheStatus(indexingStatus))
+            {
+                incomplete = true;
+                return new List<AssetHandle>();
+            }
+
+            incomplete = false;
+            var handles = new List<AssetHandle>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+                    SELECT UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize
+                    FROM AssetHandles
+                    WHERE ProjectId = @projectId";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        handles.Add(new AssetHandle
+                        {
+                            UniqueID = reader.GetString(0),
+                            Name = reader.GetString(1),
+                            Type = (ClassIDType)reader.GetInt32(2),
+                            Container = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                            OriginalPath = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                            SerializedFileName = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                            PathID = reader.GetInt64(6),
+                            ByteStart = reader.GetInt64(7),
+                            ByteSize = reader.GetInt64(8)
+                        });
+                    }
+                }
+            }
+
+            return handles;
         }
 
         public bool SaveIndexCache(
@@ -88,6 +108,7 @@ namespace AssetStudio.Avalonia
             Action<int, int, string>? progress = null)
         {
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
                 var handleList = handles?.ToList() ?? new List<AssetHandle>();
@@ -98,66 +119,86 @@ namespace AssetStudio.Avalonia
                 lock (WriteGate)
                 {
                     reporter.Report("Opening SQLite connection", force: true);
-                    using (var conn = CreateConnection(folderPath))
+                    using (var conn = CreateConnectionByDbPath(dbPath))
                     {
-                        using (var transaction = conn.BeginTransaction())
+                        InvalidateProjectIdCacheForDb(dbPath);
+                        long committedProjectId;
+
+                        SetSynchronousMode(conn, "OFF");
+                        try
                         {
-                            reporter.Report("Preparing SQLite project row", force: true);
-                            var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
-                            reporter.Report("Clearing previous index rows", force: true);
-                            ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
-
-                            // Insert handles in batch using parameterized query
-                            using (var cmd = conn.CreateCommand())
+                            using (var transaction = conn.BeginTransaction())
                             {
-                                cmd.CommandText = @"
-                                    INSERT INTO AssetHandles (ProjectId, UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize)
-                                    VALUES (@projectId, @uniqueId, @name, @type, @container, @originalPath, @serializedFile, @pathId, @byteStart, @byteSize)";
-                                cmd.Transaction = transaction;
+                                reporter.Report("Preparing SQLite project row", force: true);
+                                var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
+                                reporter.Report("Clearing previous index rows", force: true);
+                                ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+                                DropIndexBulkSecondaryIndexes(conn, transaction);
 
-                                var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
-                                var pUniqueId = cmd.Parameters.Add("@uniqueId", SqliteType.Text);
-                                var pName = cmd.Parameters.Add("@name", SqliteType.Text);
-                                var pType = cmd.Parameters.Add("@type", SqliteType.Integer);
-                                var pContainer = cmd.Parameters.Add("@container", SqliteType.Text);
-                                var pOriginalPath = cmd.Parameters.Add("@originalPath", SqliteType.Text);
-                                var pSerializedFile = cmd.Parameters.Add("@serializedFile", SqliteType.Text);
-                                var pPathId = cmd.Parameters.Add("@pathId", SqliteType.Integer);
-                                var pByteStart = cmd.Parameters.Add("@byteStart", SqliteType.Integer);
-                                var pByteSize = cmd.Parameters.Add("@byteSize", SqliteType.Integer);
-
-                                pProjectId.Value = projectId;
-
-                                var savedHandleRows = 0;
-                                foreach (var h in handleList)
+                                // Insert handles in batch using parameterized query
+                                using (var cmd = conn.CreateCommand())
                                 {
-                                    pUniqueId.Value = h.UniqueID ?? string.Empty;
-                                    pName.Value = h.Name ?? string.Empty;
-                                    pType.Value = (int)h.Type;
-                                    pContainer.Value = h.Container ?? (object)DBNull.Value;
-                                    pOriginalPath.Value = h.OriginalPath ?? (object)DBNull.Value;
-                                    pSerializedFile.Value = h.SerializedFileName ?? (object)DBNull.Value;
-                                    pPathId.Value = h.PathID;
-                                    pByteStart.Value = h.ByteStart;
-                                    pByteSize.Value = h.ByteSize;
+                                    cmd.CommandText = @"
+                                        INSERT INTO AssetHandles (ProjectId, UniqueID, Name, Type, Container, OriginalPath, SerializedFileName, PathID, ByteStart, ByteSize)
+                                        VALUES (@projectId, @uniqueId, @name, @type, @container, @originalPath, @serializedFile, @pathId, @byteStart, @byteSize)";
+                                    cmd.Transaction = transaction;
 
-                                    cmd.ExecuteNonQuery();
-                                    savedHandleRows++;
-                                    reporter.Advance($"Saving handles: {savedHandleRows:N0}/{handleList.Count:N0}");
+                                    var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+                                    var pUniqueId = cmd.Parameters.Add("@uniqueId", SqliteType.Text);
+                                    var pName = cmd.Parameters.Add("@name", SqliteType.Text);
+                                    var pType = cmd.Parameters.Add("@type", SqliteType.Integer);
+                                    var pContainer = cmd.Parameters.Add("@container", SqliteType.Text);
+                                    var pOriginalPath = cmd.Parameters.Add("@originalPath", SqliteType.Text);
+                                    var pSerializedFile = cmd.Parameters.Add("@serializedFile", SqliteType.Text);
+                                    var pPathId = cmd.Parameters.Add("@pathId", SqliteType.Integer);
+                                    var pByteStart = cmd.Parameters.Add("@byteStart", SqliteType.Integer);
+                                    var pByteSize = cmd.Parameters.Add("@byteSize", SqliteType.Integer);
+
+                                    pProjectId.Value = projectId;
+
+                                    var savedHandleRows = 0;
+                                    foreach (var h in handleList)
+                                    {
+                                        pUniqueId.Value = h.UniqueID ?? string.Empty;
+                                        pName.Value = h.Name ?? string.Empty;
+                                        pType.Value = (int)h.Type;
+                                        pContainer.Value = h.Container ?? (object)DBNull.Value;
+                                        pOriginalPath.Value = h.OriginalPath ?? (object)DBNull.Value;
+                                        pSerializedFile.Value = h.SerializedFileName ?? (object)DBNull.Value;
+                                        pPathId.Value = h.PathID;
+                                        pByteStart.Value = h.ByteStart;
+                                        pByteSize.Value = h.ByteSize;
+
+                                        cmd.ExecuteNonQuery();
+                                        savedHandleRows++;
+                                        reporter.Advance($"Saving handles: {savedHandleRows:N0}/{handleList.Count:N0}");
+                                    }
                                 }
+
+                                InsertSourceFilesAndAssets(conn, transaction, projectId, handleList, reporter.Advance);
+
+                                reporter.Report("Rebuilding index cache indexes", force: true);
+                                CreateIndexBulkSecondaryIndexes(conn, transaction);
+
+                                reporter.Report("Committing SQLite transaction", force: true);
+                                transaction.Commit();
+                                committedProjectId = projectId;
                             }
-
-                            InsertSourceFilesAndAssets(conn, transaction, projectId, handleList, reporter.Advance);
-
-                            reporter.Report("Committing SQLite transaction", force: true);
-                            transaction.Commit();
-                            reporter.Report("Checkpointing SQLite WAL", force: true);
-                            TryCheckpointWal(conn, "index cache");
-                            reporter.MarkCompleted("SQLite index cache saved");
-                            reporter.Report("SQLite index cache saved", force: true);
-                            Logger.Info($"Saved index cache in SQLite for: {folderPath}");
-                            return true;
                         }
+                        finally
+                        {
+                            SetSynchronousMode(conn, "NORMAL");
+                        }
+
+                        CacheProjectId(dbPath, folderPath, signature, committedProjectId);
+                        reporter.Report("Analyzing SQLite statistics", force: true);
+                        TryAnalyzeDatabase(conn, "index cache");
+                        reporter.Report("Checkpointing SQLite WAL", force: true);
+                        TryCheckpointWal(conn, "index cache");
+                        reporter.MarkCompleted("SQLite index cache saved");
+                        reporter.Report("SQLite index cache saved", force: true);
+                        Logger.Info($"Saved index cache in SQLite for: {folderPath}");
+                        return true;
                     }
                 }
             }
@@ -312,44 +353,35 @@ namespace AssetStudio.Avalonia
                 .ToList();
 
             var sourceGroupIndex = 0;
-            foreach (var group in sourceGroups)
+            using (var upsertSourceCmd = conn.CreateCommand())
             {
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        INSERT INTO SourceFiles (ProjectId, SerializedFileName, OriginalPath, UnityVersion, ObjectCount)
-                        VALUES (@projectId, @serializedFileName, @originalPath, '', @objectCount)
-                        ON CONFLICT(ProjectId, SerializedFileName, OriginalPath)
-                        DO UPDATE SET ObjectCount = excluded.ObjectCount, LastSeen = CURRENT_TIMESTAMP";
-                    cmd.Parameters.AddWithValue("@projectId", projectId);
-                    cmd.Parameters.AddWithValue("@serializedFileName", group.Key.SerializedFileName);
-                    cmd.Parameters.AddWithValue("@originalPath", group.Key.OriginalPath);
-                    cmd.Parameters.AddWithValue("@objectCount", group.Count());
-                    cmd.ExecuteNonQuery();
-                }
+                upsertSourceCmd.Transaction = transaction;
+                upsertSourceCmd.CommandText = @"
+                    INSERT INTO SourceFiles (ProjectId, SerializedFileName, OriginalPath, UnityVersion, ObjectCount)
+                    VALUES (@projectId, @serializedFileName, @originalPath, '', @objectCount)
+                    ON CONFLICT(ProjectId, SerializedFileName, OriginalPath)
+                    DO UPDATE SET ObjectCount = excluded.ObjectCount, LastSeen = CURRENT_TIMESTAMP
+                    RETURNING Id";
+                var pSrcProjectId = upsertSourceCmd.Parameters.Add("@projectId", SqliteType.Integer);
+                var pSerializedFileName = upsertSourceCmd.Parameters.Add("@serializedFileName", SqliteType.Text);
+                var pOriginalPath = upsertSourceCmd.Parameters.Add("@originalPath", SqliteType.Text);
+                var pObjectCount = upsertSourceCmd.Parameters.Add("@objectCount", SqliteType.Integer);
+                pSrcProjectId.Value = projectId;
 
-                using (var cmd = conn.CreateCommand())
+                foreach (var group in sourceGroups)
                 {
-                    cmd.Transaction = transaction;
-                    cmd.CommandText = @"
-                        SELECT Id FROM SourceFiles
-                        WHERE ProjectId = @projectId
-                          AND SerializedFileName = @serializedFileName
-                          AND OriginalPath = @originalPath
-                        LIMIT 1";
-                    cmd.Parameters.AddWithValue("@projectId", projectId);
-                    cmd.Parameters.AddWithValue("@serializedFileName", group.Key.SerializedFileName);
-                    cmd.Parameters.AddWithValue("@originalPath", group.Key.OriginalPath);
-                    var id = cmd.ExecuteScalar();
-                    if (id != null)
+                    pSerializedFileName.Value = group.Key.SerializedFileName;
+                    pOriginalPath.Value = group.Key.OriginalPath;
+                    pObjectCount.Value = group.Count();
+                    var id = upsertSourceCmd.ExecuteScalar();
+                    if (id != null && id != DBNull.Value)
                     {
                         sourceFileIds[GetSourceFileKey(group.Key.SerializedFileName, group.Key.OriginalPath)] = Convert.ToInt64(id);
                     }
-                }
 
-                sourceGroupIndex++;
-                advanceProgress?.Invoke($"Saving source files: {sourceGroupIndex:N0}/{sourceGroups.Count:N0}");
+                    sourceGroupIndex++;
+                    advanceProgress?.Invoke($"Saving source files: {sourceGroupIndex:N0}/{sourceGroups.Count:N0}");
+                }
             }
 
             using (var cmd = conn.CreateCommand())

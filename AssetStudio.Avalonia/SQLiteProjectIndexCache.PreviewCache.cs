@@ -96,43 +96,28 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
                 long? hitEntryId = null;
                 PreviewCacheEntry? entry = null;
 
-                using (var conn = CreateReadConnection(folderPath))
+                using (var conn = CreateReadConnectionByDbPath(dbPath))
                 {
-                    var projectId = FindProjectId(conn, null, folderPath, signature);
+                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
                     if (projectId == null)
                     {
                         return null;
                     }
 
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"
-                        SELECT Id, PayloadHash, PayloadPath, ByteSize
-                        FROM PreviewCacheEntries
-                        WHERE ProjectId = @projectId
-                          AND AssetUniqueID = @assetUniqueId
-                          AND PreviewKind = @previewKind
-                          AND AlgorithmVersion = @algorithmVersion
-                          AND Parameters = @parameters
-                        LIMIT 1";
-                    cmd.Parameters.AddWithValue("@projectId", projectId.Value);
-                    cmd.Parameters.AddWithValue("@assetUniqueId", assetUniqueId);
-                    cmd.Parameters.AddWithValue("@previewKind", previewKind);
-                    cmd.Parameters.AddWithValue("@algorithmVersion", algorithmVersion);
-                    cmd.Parameters.AddWithValue("@parameters", parameters ?? string.Empty);
-
-                    using var reader = cmd.ExecuteReader();
-                    if (reader.Read())
+                    entry = QueryPreviewCacheEntry(conn, projectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                    if (entry == null && fromCache)
                     {
-                        hitEntryId = reader.GetInt64(0);
-                        entry = new PreviewCacheEntry(
-                            reader.GetString(1),
-                            reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
-                            reader.GetInt64(3));
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
+                        {
+                            entry = QueryPreviewCacheEntry(conn, verifiedProjectId.Value, assetUniqueId, previewKind, algorithmVersion, parameters, out hitEntryId);
+                        }
                     }
                 }
 
@@ -145,9 +130,49 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                 Logger.Warning($"Failed to load preview cache entry from SQLite: {ex.Message}");
                 return null;
             }
+        }
+
+        private static PreviewCacheEntry? QueryPreviewCacheEntry(
+            SqliteConnection conn,
+            long projectId,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            out long? hitEntryId)
+        {
+            hitEntryId = null;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT Id, PayloadHash, PayloadPath, ByteSize
+                FROM PreviewCacheEntries
+                WHERE ProjectId = @projectId
+                  AND AssetUniqueID = @assetUniqueId
+                  AND PreviewKind = @previewKind
+                  AND AlgorithmVersion = @algorithmVersion
+                  AND Parameters = @parameters
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            cmd.Parameters.AddWithValue("@assetUniqueId", assetUniqueId);
+            cmd.Parameters.AddWithValue("@previewKind", previewKind);
+            cmd.Parameters.AddWithValue("@algorithmVersion", algorithmVersion);
+            cmd.Parameters.AddWithValue("@parameters", parameters ?? string.Empty);
+
+            using var reader = cmd.ExecuteReader();
+            if (reader.Read())
+            {
+                hitEntryId = reader.GetInt64(0);
+                return new PreviewCacheEntry(
+                    reader.GetString(1),
+                    reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+                    reader.GetInt64(3));
+            }
+
+            return null;
         }
 
         internal void SavePreviewCacheEntry(
@@ -170,6 +195,7 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             var effectiveByteSize = ResolvePayloadByteSize(payloadPath, byteSize);
             var nowUtc = NextMonotonicUtcTimestamp();
             List<string>? filesToDelete = null;
@@ -178,13 +204,16 @@ namespace AssetStudio.Avalonia
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection(folderPath);
+                    using var conn = CreateConnectionByDbPath(dbPath);
                     using var transaction = conn.BeginTransaction();
                     var projectId = FindProjectId(conn, transaction, folderPath, signature);
                     if (projectId == null)
                     {
+                        EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                         return;
                     }
+
+                    CacheProjectId(dbPath, folderPath, signature, projectId.Value);
 
                     using (var cmd = conn.CreateCommand())
                     {

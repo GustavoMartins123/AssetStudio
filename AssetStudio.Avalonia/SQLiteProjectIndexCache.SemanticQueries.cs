@@ -16,16 +16,31 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnection(folderPath);
-                var projectId = FindProjectId(conn, null, folderPath, signature);
+                using var conn = CreateReadConnectionByDbPath(dbPath);
+                var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
                 if (projectId == null)
                 {
                     return false;
                 }
 
                 var count = CountMaterialSemanticRelations(conn, null, projectId.Value);
+                if (count == 0 && fromCache)
+                {
+                    var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                    if (verifiedProjectId == null)
+                    {
+                        return false;
+                    }
+
+                    if (verifiedProjectId.Value != projectId.Value)
+                    {
+                        count = CountMaterialSemanticRelations(conn, null, verifiedProjectId.Value);
+                    }
+                }
+
                 return count > 0;
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
@@ -34,6 +49,7 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                 Logger.Warning($"Failed to inspect semantic asset relations: {ex.Message}");
                 return false;
             }

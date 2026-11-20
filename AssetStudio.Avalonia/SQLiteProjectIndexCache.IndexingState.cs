@@ -19,11 +19,13 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
                 lock (WriteGate)
                 {
-                    using var conn = CreateConnection(folderPath);
+                    using var conn = CreateConnectionByDbPath(dbPath);
+                    InvalidateProjectIdCacheForDb(dbPath);
                     using var transaction = conn.BeginTransaction();
                     var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
 
@@ -83,6 +85,7 @@ namespace AssetStudio.Avalonia
                     }
 
                     transaction.Commit();
+                    CacheProjectId(dbPath, folderPath, signature, projectId);
                 }
             }
             catch (Exception ex)
@@ -99,16 +102,32 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnection(folderPath);
-                var projectId = FindProjectId(conn, null, folderPath, signature);
+                using var conn = CreateReadConnectionByDbPath(dbPath);
+                var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
                 if (projectId == null)
                 {
                     return null;
                 }
 
-                return LoadIndexingState(conn, null, projectId.Value);
+                var state = LoadIndexingState(conn, null, projectId.Value);
+                if (state == null && fromCache)
+                {
+                    var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                    if (verifiedProjectId == null)
+                    {
+                        return null;
+                    }
+
+                    if (verifiedProjectId.Value != projectId.Value)
+                    {
+                        state = LoadIndexingState(conn, null, verifiedProjectId.Value);
+                    }
+                }
+
+                return state;
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
             {
@@ -116,6 +135,7 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
                 Logger.Warning($"Failed to load indexing progress: {ex.Message}");
                 return null;
             }
@@ -246,20 +266,6 @@ namespace AssetStudio.Avalonia
                     (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId)";
             cmd.Parameters.AddWithValue("@projectId", projectId);
             return Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
-        }
-
-        private static bool IsSemanticSaveInProgress(SqliteConnection conn, SqliteTransaction transaction, long projectId)
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = transaction;
-            cmd.CommandText = @"
-                SELECT Status
-                FROM ProjectIndexingState
-                WHERE ProjectId = @projectId
-                LIMIT 1";
-            cmd.Parameters.AddWithValue("@projectId", projectId);
-            var status = cmd.ExecuteScalar()?.ToString();
-            return string.Equals(status, "saving_connections", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void SaveProjectIndexingState(
