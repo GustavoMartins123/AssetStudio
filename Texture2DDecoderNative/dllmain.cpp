@@ -14,6 +14,11 @@ T2D_API(bool32_t) DecodeDXT1(const void* data, int32_t width, int32_t height, vo
 	return decode_bc1(static_cast<const uint8_t*>(data), width, height, static_cast<uint32_t*>(image));
 }
 
+T2D_API(bool32_t) DecodeDXT3(const void* data, int32_t width, int32_t height, void* image)
+{
+	return decode_bc2(static_cast<const uint8_t*>(data), width, height, static_cast<uint32_t*>(image));
+}
+
 T2D_API(bool32_t) DecodeDXT5(const void* data, int32_t width, int32_t height, void* image)
 {
 	return decode_bc3(static_cast<const uint8_t*>(data), width, height, static_cast<uint32_t*>(image));

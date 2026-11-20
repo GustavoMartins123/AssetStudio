@@ -35,6 +35,7 @@
     <ClInclude Include="fp16\fp16.h" />
     <ClInclude Include="pvrtc.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="simd_dispatch.h" />
     <ClInclude Include="unitycrunch.h" />
     <ClInclude Include="unitycrunch\crnlib.h" />
     <ClInclude Include="unitycrunch\crn_decomp.h" />
@@ -48,6 +49,7 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="etc.cpp" />
     <ClCompile Include="pvrtc.cpp" />
+    <ClCompile Include="simd_dispatch.cpp" />
     <ClCompile Include="unitycrunch.cpp" />
   </ItemGroup>
   <ItemGroup>

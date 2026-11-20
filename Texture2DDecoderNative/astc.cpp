@@ -5,8 +5,9 @@
 #include <string.h>
 #include "color.h"
 #include "fp16.h"
+#include "simd_dispatch.h"
 
-static const int BitReverseTable[] = {
+static const uint8_t BitReverseTable[] = {
   0x00, 0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10, 0x90, 0x50, 0xD0, 0x30, 0xB0, 0x70, 0xF0, 0x08, 0x88, 0x48,
   0xC8, 0x28, 0xA8, 0x68, 0xE8, 0x18, 0x98, 0x58, 0xD8, 0x38, 0xB8, 0x78, 0xF8, 0x04, 0x84, 0x44, 0xC4, 0x24, 0xA4,
   0x64, 0xE4, 0x14, 0x94, 0x54, 0xD4, 0x34, 0xB4, 0x74, 0xF4, 0x0C, 0x8C, 0x4C, 0xCC, 0x2C, 0xAC, 0x6C, 0xEC, 0x1C,
@@ -46,27 +47,7 @@ static inline uint_fast64_t bit_reverse_u64(const uint_fast64_t d, const int bit
 }
 
 static inline uint64_t load_u64_le(const uint8_t *p) {
-    return static_cast<uint64_t>(p[0]) |
-           (static_cast<uint64_t>(p[1]) << 8) |
-           (static_cast<uint64_t>(p[2]) << 16) |
-           (static_cast<uint64_t>(p[3]) << 24) |
-           (static_cast<uint64_t>(p[4]) << 32) |
-           (static_cast<uint64_t>(p[5]) << 40) |
-           (static_cast<uint64_t>(p[6]) << 48) |
-           (static_cast<uint64_t>(p[7]) << 56);
-}
-
-static inline int getbits(const uint8_t *buf, const int bit, const int len) {
-    if (len <= 0 || len > 32 || bit < 0 || bit > 128 - len)
-        return 0;
-    uint64_t val = 0;
-    const int byte_idx = bit / 8;
-    const int bit_off = bit % 8;
-    const int bytes_needed = (bit_off + len + 7) / 8;
-    for (int i = 0; i < bytes_needed && (byte_idx + i) < 16; i++) {
-        val |= static_cast<uint64_t>(buf[byte_idx + i]) << (i * 8);
-    }
-    return static_cast<int>((val >> bit_off) & ((1ULL << len) - 1ULL));
+    return t2d_load_u64_le(p);
 }
 
 static inline uint_fast64_t getbits64(const uint8_t *buf, const int bit, const int len) {
@@ -80,6 +61,12 @@ static inline uint_fast64_t getbits64(const uint8_t *buf, const int bit, const i
     if (bit + len <= 64)
         return (load_u64_le(buf) >> bit) & mask;
     return ((load_u64_le(buf) >> bit) | (load_u64_le(buf + 8) << (64 - bit))) & mask;
+}
+
+static inline int getbits(const uint8_t *buf, const int bit, const int len) {
+    if (len <= 0 || len > 32 || bit < 0 || bit > 128 - len)
+        return 0;
+    return static_cast<int>(getbits64(buf, bit, len));
 }
 
 static inline uint16_t u8ptr_to_u16(const uint8_t *ptr) {
@@ -216,7 +203,7 @@ typedef struct {
     int cem_range;
     int endpoint_value_num;
     int endpoints[4][8];
-    int weights[144][2];
+    int weights[2][144];
     int partition[144];
 } BlockData;
 
@@ -227,9 +214,9 @@ typedef struct {
 
 void decode_intseq(const uint8_t *buf, int offset, const int a, const int b, const int count, const int reverse,
                    IntSeqData *out) {
-    static int mt[] = {0, 2, 4, 5, 7};
-    static int mq[] = {0, 3, 5};
-    static int TritsTable[5][256] = {
+    static const uint8_t mt[] = {0, 2, 4, 5, 7};
+    static const uint8_t mq[] = {0, 3, 5};
+    static const uint8_t TritsTable[5][256] = {
       {0, 1, 2, 0, 0, 1, 2, 1, 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 0, 0, 1, 2, 1, 0, 1, 2, 2, 0, 1, 2, 0, 0, 1, 2, 0, 0,
        1, 2, 1, 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 0, 0, 1, 2, 1, 0, 1, 2, 2, 0, 1, 2, 1, 0, 1, 2, 0, 0, 1, 2, 1, 0, 1,
        2, 2, 0, 1, 2, 2, 0, 1, 2, 0, 0, 1, 2, 1, 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 0, 0, 1, 2, 1, 0, 1, 2, 2, 0, 1, 2,
@@ -265,7 +252,7 @@ void decode_intseq(const uint8_t *buf, int offset, const int a, const int b, con
        1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
        1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2,
        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2}};
-    static int QuintsTable[3][128] = {
+    static const uint8_t QuintsTable[3][128] = {
       {0, 1, 2, 3, 4, 0, 4, 4, 0, 1, 2, 3, 4, 1, 4, 4, 0, 1, 2, 3, 4, 2, 4, 4, 0, 1, 2, 3, 4, 3, 4, 4,
        0, 1, 2, 3, 4, 0, 4, 0, 0, 1, 2, 3, 4, 1, 4, 1, 0, 1, 2, 3, 4, 2, 4, 2, 0, 1, 2, 3, 4, 3, 4, 3,
        0, 1, 2, 3, 4, 0, 2, 3, 0, 1, 2, 3, 4, 1, 2, 3, 0, 1, 2, 3, 4, 2, 2, 3, 0, 1, 2, 3, 4, 3, 2, 3,
@@ -282,6 +269,14 @@ void decode_intseq(const uint8_t *buf, int offset, const int a, const int b, con
     if (count <= 0)
         return;
 
+    uint8_t rev_buf[16];
+    if (reverse) {
+        for (int i = 0; i < 16; i++)
+            rev_buf[i] = BitReverseTable[buf[15 - i]];
+        buf = rev_buf;
+        offset = 128 - offset;
+    }
+
     int n = 0;
 
     if (a == 3) {
@@ -291,23 +286,12 @@ void decode_intseq(const uint8_t *buf, int offset, const int a, const int b, con
         int block_size = 8 + 5 * b;
         int last_block_size = (block_size * last_block_count + 4) / 5;
 
-        if (reverse) {
-            for (int i = 0, p = offset; i < block_count; i++, p -= block_size) {
-                int now_size = (i < block_count - 1) ? block_size : last_block_size;
-                uint_fast64_t d = bit_reverse_u64(getbits64(buf, p - now_size, now_size), now_size);
-                int x =
-                  (d >> b & 3) | (d >> b * 2 & 0xc) | (d >> b * 3 & 0x10) | (d >> b * 4 & 0x60) | (d >> b * 5 & 0x80);
-                for (int j = 0; j < 5 && n < count; j++, n++)
-                    out[n] = { static_cast<int>(d >> (mt[j] + b * j) & mask), TritsTable[j][x]};
-            }
-        } else {
-            for (int i = 0, p = offset; i < block_count; i++, p += block_size) {
-                uint_fast64_t d = getbits64(buf, p, (i < block_count - 1) ? block_size : last_block_size);
-                int x =
-                  (d >> b & 3) | (d >> b * 2 & 0xc) | (d >> b * 3 & 0x10) | (d >> b * 4 & 0x60) | (d >> b * 5 & 0x80);
-                for (int j = 0; j < 5 && n < count; j++, n++)
-                    out[n] = { static_cast<int>(d >> (mt[j] + b * j) & mask), TritsTable[j][x]};
-            }
+        for (int i = 0, p = offset; i < block_count; i++, p += block_size) {
+            uint_fast64_t d = getbits64(buf, p, (i < block_count - 1) ? block_size : last_block_size);
+            int x =
+              (d >> b & 3) | (d >> b * 2 & 0xc) | (d >> b * 3 & 0x10) | (d >> b * 4 & 0x60) | (d >> b * 5 & 0x80);
+            for (int j = 0; j < 5 && n < count; j++, n++)
+                out[n] = { static_cast<int>(d >> (mt[j] + b * j) & mask), TritsTable[j][x]};
         }
     } else if (a == 5) {
         int mask = (1 << b) - 1;
@@ -316,29 +300,15 @@ void decode_intseq(const uint8_t *buf, int offset, const int a, const int b, con
         int block_size = 7 + 3 * b;
         int last_block_size = (block_size * last_block_count + 2) / 3;
 
-        if (reverse) {
-            for (int i = 0, p = offset; i < block_count; i++, p -= block_size) {
-                int now_size = (i < block_count - 1) ? block_size : last_block_size;
-                uint_fast64_t d = bit_reverse_u64(getbits64(buf, p - now_size, now_size), now_size);
-                int x = (d >> b & 7) | (d >> b * 2 & 0x18) | (d >> b * 3 & 0x60);
-                for (int j = 0; j < 3 && n < count; j++, n++)
-                    out[n] = { static_cast<int>(d >> (mq[j] + b * j) & mask), QuintsTable[j][x]};
-            }
-        } else {
-            for (int i = 0, p = offset; i < block_count; i++, p += block_size) {
-                uint_fast64_t d = getbits64(buf, p, (i < block_count - 1) ? block_size : last_block_size);
-                int x = (d >> b & 7) | (d >> b * 2 & 0x18) | (d >> b * 3 & 0x60);
-                for (int j = 0; j < 3 && n < count; j++, n++)
-                    out[n] = { static_cast<int>(d >> (mq[j] + b * j) & mask), QuintsTable[j][x]};
-            }
+        for (int i = 0, p = offset; i < block_count; i++, p += block_size) {
+            uint_fast64_t d = getbits64(buf, p, (i < block_count - 1) ? block_size : last_block_size);
+            int x = (d >> b & 7) | (d >> b * 2 & 0x18) | (d >> b * 3 & 0x60);
+            for (int j = 0; j < 3 && n < count; j++, n++)
+                out[n] = { static_cast<int>(d >> (mq[j] + b * j) & mask), QuintsTable[j][x]};
         }
     } else {
-        if (reverse)
-            for (int p = offset - b; n < count; n++, p -= b)
-                out[n] = {bit_reverse_u8(getbits(buf, p, b), b), 0};
-        else
-            for (int p = offset; n < count; n++, p += b)
-                out[n] = {getbits(buf, p, b), 0};
+        for (int p = offset; n < count; n++, p += b)
+            out[n] = {getbits(buf, p, b), 0};
     }
 }
 
@@ -1003,32 +973,57 @@ void decode_weights(const uint8_t *buf, BlockData *data) {
         }
     }
 
-    int ds = (1024 + data->bw / 2) / (data->bw - 1);
-    int dt = (1024 + data->bh / 2) / (data->bh - 1);
     int pn = data->dual_plane ? 2 : 1;
 
+    if (data->width == data->bw && data->height == data->bh && data->bw <= 10 && data->bh <= 10) {
+        const int num_pixels = data->bw * data->bh;
+        if (pn == 1) {
+            for (int i = 0; i < num_pixels; i++) {
+                data->weights[0][i] = (i < data->weight_num) ? wv[i] : 0;
+            }
+        } else {
+            for (int i = 0; i < num_pixels; i++) {
+                const int i0 = i * 2;
+                const int i1 = i0 + 1;
+                data->weights[0][i] = (i0 < data->weight_num) ? wv[i0] : 0;
+                data->weights[1][i] = (i1 < data->weight_num) ? wv[i1] : 0;
+            }
+        }
+        return;
+    }
+
+    int ds = (1024 + data->bw / 2) / (data->bw - 1);
+    int dt = (1024 + data->bh / 2) / (data->bh - 1);
+
+    int fs_arr[12], vs_arr[12];
+    for (int s = 0; s < data->bw; s++) {
+        const int gs = (ds * s * (data->width - 1) + 32) >> 6;
+        fs_arr[s] = gs & 0xf;
+        vs_arr[s] = gs >> 4;
+    }
+
     for (int t = 0, i = 0; t < data->bh; t++) {
+        const int gt = (dt * t * (data->height - 1) + 32) >> 6;
+        const int ft = gt & 0xf;
+        const int vt_row = (gt >> 4) * data->width;
         for (int s = 0; s < data->bw; s++, i++) {
-            int gs = (ds * s * (data->width - 1) + 32) >> 6;
-            int gt = (dt * t * (data->height - 1) + 32) >> 6;
-            int fs = gs & 0xf;
-            int ft = gt & 0xf;
-            int v = (gs >> 4) + (gt >> 4) * data->width;
-            int w11 = (fs * ft + 8) >> 4;
-            int w10 = ft - w11;
-            int w01 = fs - w11;
-            int w00 = 16 - fs - ft + w11;
+            const int fs = fs_arr[s];
+            const int v = vs_arr[s] + vt_row;
+            const int w11 = (fs * ft + 8) >> 4;
+            const int w10 = ft - w11;
+            const int w01 = fs - w11;
+            const int w00 = 16 - fs - ft + w11;
 
             for (int p = 0; p < pn; p++) {
-                int i00 = v * pn + p;
-                int i01 = (v + 1) * pn + p;
-                int i10 = (v + data->width) * pn + p;
-                int i11 = (v + data->width + 1) * pn + p;
-                int p00 = (i00 >= 0 && i00 < data->weight_num) ? wv[i00] : 0;
-                int p01 = (fs > 0 && i01 >= 0 && i01 < data->weight_num) ? wv[i01] : 0;
-                int p10 = (ft > 0 && i10 >= 0 && i10 < data->weight_num) ? wv[i10] : 0;
-                int p11 = (fs > 0 && ft > 0 && i11 >= 0 && i11 < data->weight_num) ? wv[i11] : 0;
-                data->weights[i][p] = (p00 * w00 + p01 * w01 + p10 * w10 + p11 * w11 + 8) >> 4;
+                const int i00 = v * pn + p;
+                const int i01 = (v + 1) * pn + p;
+                const int i10 = (v + data->width) * pn + p;
+                const int i11 = (v + data->width + 1) * pn + p;
+                const int p00 = (i00 >= 0 && i00 < data->weight_num) ? wv[i00] : 0;
+                const int p01 = (fs > 0 && i01 >= 0 && i01 < data->weight_num) ? wv[i01] : 0;
+                const int p10 = (ft > 0 && i10 >= 0 && i10 < data->weight_num) ? wv[i10] : 0;
+                const int p11 = (fs > 0 && ft > 0 && i11 >= 0 && i11 < data->weight_num) ? wv[i11] : 0;
+                data->weights[p][i] = (p00 * w00 + p01 * w01 + p10 * w10 + p11 * w11 + 8) >> 4;
             }
         }
     }
@@ -1090,6 +1085,91 @@ void select_partition(const uint8_t *buf, BlockData *data) {
     }
 }
 
+static inline bool cem_is_ldr(int cem) noexcept {
+    // CEMs {2, 3, 7, 11, 14, 15} use HDR RGB interpolation; all others are purely LDR.
+    return cem != 2 && cem != 3 && cem != 7 && cem != 11 && cem != 14 && cem != 15;
+}
+
+#if T2D_SIMD_X86
+
+T2D_TARGET_SSE41
+static int applicate_color_ldr_1part_1plane_sse41(const int ep[8], const int* w0, int start, int count, uint32_t* outbuf) noexcept {
+    const int eB0 = (ep[2] << 8) | ep[2], eB1 = (ep[6] << 8) | ep[6];
+    const int eG0 = (ep[1] << 8) | ep[1], eG1 = (ep[5] << 8) | ep[5];
+    const int eR0 = (ep[0] << 8) | ep[0], eR1 = (ep[4] << 8) | ep[4];
+    const int eA0 = (ep[3] << 8) | ep[3], eA1 = (ep[7] << 8) | ep[7];
+
+    const __m128i baseB = _mm_set1_epi32(eB0 * 64 + 32), diffB = _mm_set1_epi32(eB1 - eB0);
+    const __m128i baseG = _mm_set1_epi32(eG0 * 64 + 32), diffG = _mm_set1_epi32(eG1 - eG0);
+    const __m128i baseR = _mm_set1_epi32(eR0 * 64 + 32), diffR = _mm_set1_epi32(eR1 - eR0);
+    const __m128i baseA = _mm_set1_epi32(eA0 * 64 + 32), diffA = _mm_set1_epi32(eA1 - eA0);
+    const __m128i c32768 = _mm_set1_epi32(32768);
+    const __m128i maskG = _mm_set1_epi32(0x0000FF00);
+    const __m128i maskR = _mm_set1_epi32(0x00FF0000);
+    const __m128i maskA = _mm_set1_epi32(static_cast<int>(0xFF000000u));
+    const bool opaque = (ep[3] == 255 && ep[7] == 255);
+
+    int i = start;
+    for (; i + 4 <= count; i += 4) {
+        const __m128i vw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w0 + i));
+        const __m128i cB = _mm_srli_epi32(_mm_add_epi32(baseB, _mm_mullo_epi32(diffB, vw)), 6);
+        const __m128i cG = _mm_srli_epi32(_mm_add_epi32(baseG, _mm_mullo_epi32(diffG, vw)), 6);
+        const __m128i cR = _mm_srli_epi32(_mm_add_epi32(baseR, _mm_mullo_epi32(diffR, vw)), 6);
+
+        const __m128i b = _mm_srli_epi32(_mm_add_epi32(_mm_sub_epi32(_mm_slli_epi32(cB, 8), cB), c32768), 16);
+        const __m128i g = _mm_and_si128(_mm_srli_epi32(_mm_add_epi32(_mm_sub_epi32(_mm_slli_epi32(cG, 8), cG), c32768), 8), maskG);
+        const __m128i r = _mm_and_si128(_mm_add_epi32(_mm_sub_epi32(_mm_slli_epi32(cR, 8), cR), c32768), maskR);
+        __m128i a = maskA;
+        if (!opaque) {
+            const __m128i cA = _mm_srli_epi32(_mm_add_epi32(baseA, _mm_mullo_epi32(diffA, vw)), 6);
+            a = _mm_and_si128(_mm_slli_epi32(_mm_add_epi32(_mm_sub_epi32(_mm_slli_epi32(cA, 8), cA), c32768), 8), maskA);
+        }
+        const __m128i bgra = _mm_or_si128(_mm_or_si128(b, g), _mm_or_si128(r, a));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(outbuf + i), bgra);
+    }
+    return i;
+}
+
+T2D_TARGET_AVX2
+static int applicate_color_ldr_1part_1plane_avx2(const int ep[8], const int* w0, int count, uint32_t* outbuf) noexcept {
+    const int eB0 = (ep[2] << 8) | ep[2], eB1 = (ep[6] << 8) | ep[6];
+    const int eG0 = (ep[1] << 8) | ep[1], eG1 = (ep[5] << 8) | ep[5];
+    const int eR0 = (ep[0] << 8) | ep[0], eR1 = (ep[4] << 8) | ep[4];
+    const int eA0 = (ep[3] << 8) | ep[3], eA1 = (ep[7] << 8) | ep[7];
+
+    const __m256i baseB = _mm256_set1_epi32(eB0 * 64 + 32), diffB = _mm256_set1_epi32(eB1 - eB0);
+    const __m256i baseG = _mm256_set1_epi32(eG0 * 64 + 32), diffG = _mm256_set1_epi32(eG1 - eG0);
+    const __m256i baseR = _mm256_set1_epi32(eR0 * 64 + 32), diffR = _mm256_set1_epi32(eR1 - eR0);
+    const __m256i baseA = _mm256_set1_epi32(eA0 * 64 + 32), diffA = _mm256_set1_epi32(eA1 - eA0);
+    const __m256i c32768 = _mm256_set1_epi32(32768);
+    const __m256i maskG = _mm256_set1_epi32(0x0000FF00);
+    const __m256i maskR = _mm256_set1_epi32(0x00FF0000);
+    const __m256i maskA = _mm256_set1_epi32(static_cast<int>(0xFF000000u));
+    const bool opaque = (ep[3] == 255 && ep[7] == 255);
+
+    int i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const __m256i vw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i));
+        const __m256i cB = _mm256_srli_epi32(_mm256_add_epi32(baseB, _mm256_mullo_epi32(diffB, vw)), 6);
+        const __m256i cG = _mm256_srli_epi32(_mm256_add_epi32(baseG, _mm256_mullo_epi32(diffG, vw)), 6);
+        const __m256i cR = _mm256_srli_epi32(_mm256_add_epi32(baseR, _mm256_mullo_epi32(diffR, vw)), 6);
+
+        const __m256i b = _mm256_srli_epi32(_mm256_add_epi32(_mm256_sub_epi32(_mm256_slli_epi32(cB, 8), cB), c32768), 16);
+        const __m256i g = _mm256_and_si256(_mm256_srli_epi32(_mm256_add_epi32(_mm256_sub_epi32(_mm256_slli_epi32(cG, 8), cG), c32768), 8), maskG);
+        const __m256i r = _mm256_and_si256(_mm256_add_epi32(_mm256_sub_epi32(_mm256_slli_epi32(cR, 8), cR), c32768), maskR);
+        __m256i a = maskA;
+        if (!opaque) {
+            const __m256i cA = _mm256_srli_epi32(_mm256_add_epi32(baseA, _mm256_mullo_epi32(diffA, vw)), 6);
+            a = _mm256_and_si256(_mm256_slli_epi32(_mm256_add_epi32(_mm256_sub_epi32(_mm256_slli_epi32(cA, 8), cA), c32768), 8), maskA);
+        }
+        const __m256i bgra = _mm256_or_si256(_mm256_or_si256(b, g), _mm256_or_si256(r, a));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(outbuf + i), bgra);
+    }
+    return i;
+}
+
+#endif
+
 void applicate_color(const BlockData *data, uint32_t *outbuf) {
     static const t_select_folor_func_ptr FuncTableC[] = {
       select_color, select_color,     select_color_hdr, select_color_hdr, select_color, select_color,
@@ -1099,59 +1179,136 @@ void applicate_color(const BlockData *data, uint32_t *outbuf) {
       select_color, select_color,     select_color_hdr, select_color_hdr, select_color, select_color,
       select_color, select_color_hdr, select_color,     select_color,     select_color, select_color_hdr,
       select_color, select_color,     select_color,     select_color_hdr};
-    if (data->dual_plane) {
-        int ps[] = {0, 0, 0, 0};
-        ps[data->plane_selector] = 1;
-        if (data->part_num > 1) {
-            for (int i = 0; i < data->bw * data->bh; i++) {
-                int p = data->partition[i];
-                uint_fast8_t r =
-                  FuncTableC[data->cem[p]](data->endpoints[p][0], data->endpoints[p][4], data->weights[i][ps[0]]);
-                uint_fast8_t g =
-                  FuncTableC[data->cem[p]](data->endpoints[p][1], data->endpoints[p][5], data->weights[i][ps[1]]);
-                uint_fast8_t b =
-                  FuncTableC[data->cem[p]](data->endpoints[p][2], data->endpoints[p][6], data->weights[i][ps[2]]);
-                uint_fast8_t a =
-                  FuncTableA[data->cem[p]](data->endpoints[p][3], data->endpoints[p][7], data->weights[i][ps[3]]);
-                outbuf[i] = color(r, g, b, a);
+
+    const int num_pixels = data->bw * data->bh;
+    bool all_ldr = true;
+    for (int p = 0; p < data->part_num; p++) {
+        if (!cem_is_ldr(data->cem[p])) {
+            all_ldr = false;
+            break;
+        }
+    }
+
+    if (all_ldr) {
+        if (!data->dual_plane && data->part_num == 1) {
+            int i = 0;
+#if T2D_SIMD_X86
+            const SimdLevel simd = t2d_get_simd_level();
+            if (simd >= SimdLevel::AVX2) {
+                i = applicate_color_ldr_1part_1plane_avx2(data->endpoints[0], data->weights[0], num_pixels, outbuf);
+            }
+            if (simd >= SimdLevel::SSE41 && i + 4 <= num_pixels) {
+                i = applicate_color_ldr_1part_1plane_sse41(data->endpoints[0], data->weights[0], i, num_pixels, outbuf);
+            }
+#endif
+            const int* ep = data->endpoints[0];
+            for (; i < num_pixels; i++) {
+                const int w = data->weights[0][i];
+                uint_fast8_t r = select_color(ep[0], ep[4], w);
+                uint_fast8_t g = select_color(ep[1], ep[5], w);
+                uint_fast8_t b = select_color(ep[2], ep[6], w);
+                uint_fast8_t a = select_color(ep[3], ep[7], w);
+                outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
+            }
+            return;
+        }
+
+        if (!data->dual_plane) {
+            for (int i = 0; i < num_pixels; i++) {
+                const int p = data->partition[i];
+                const int* ep = data->endpoints[p];
+                const int w = data->weights[0][i];
+                uint_fast8_t r = select_color(ep[0], ep[4], w);
+                uint_fast8_t g = select_color(ep[1], ep[5], w);
+                uint_fast8_t b = select_color(ep[2], ep[6], w);
+                uint_fast8_t a = select_color(ep[3], ep[7], w);
+                outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
+            }
+            return;
+        }
+
+        int ps[4] = {0, 0, 0, 0};
+        ps[data->plane_selector & 3] = 1;
+        const int* wR = data->weights[ps[0]];
+        const int* wG = data->weights[ps[1]];
+        const int* wB = data->weights[ps[2]];
+        const int* wA = data->weights[ps[3]];
+        if (data->part_num == 1) {
+            const int* ep = data->endpoints[0];
+            for (int i = 0; i < num_pixels; i++) {
+                uint_fast8_t r = select_color(ep[0], ep[4], wR[i]);
+                uint_fast8_t g = select_color(ep[1], ep[5], wG[i]);
+                uint_fast8_t b = select_color(ep[2], ep[6], wB[i]);
+                uint_fast8_t a = select_color(ep[3], ep[7], wA[i]);
+                outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
             }
         } else {
-            for (int i = 0; i < data->bw * data->bh; i++) {
+            for (int i = 0; i < num_pixels; i++) {
+                const int p = data->partition[i];
+                const int* ep = data->endpoints[p];
+                uint_fast8_t r = select_color(ep[0], ep[4], wR[i]);
+                uint_fast8_t g = select_color(ep[1], ep[5], wG[i]);
+                uint_fast8_t b = select_color(ep[2], ep[6], wB[i]);
+                uint_fast8_t a = select_color(ep[3], ep[7], wA[i]);
+                outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
+            }
+        }
+        return;
+    }
+
+    if (data->dual_plane) {
+        int ps[] = {0, 0, 0, 0};
+        ps[data->plane_selector & 3] = 1;
+        if (data->part_num > 1) {
+            for (int i = 0; i < num_pixels; i++) {
+                int p = data->partition[i];
                 uint_fast8_t r =
-                  FuncTableC[data->cem[0]](data->endpoints[0][0], data->endpoints[0][4], data->weights[i][ps[0]]);
+                  FuncTableC[data->cem[p]](data->endpoints[p][0], data->endpoints[p][4], data->weights[ps[0]][i]);
                 uint_fast8_t g =
-                  FuncTableC[data->cem[0]](data->endpoints[0][1], data->endpoints[0][5], data->weights[i][ps[1]]);
+                  FuncTableC[data->cem[p]](data->endpoints[p][1], data->endpoints[p][5], data->weights[ps[1]][i]);
                 uint_fast8_t b =
-                  FuncTableC[data->cem[0]](data->endpoints[0][2], data->endpoints[0][6], data->weights[i][ps[2]]);
+                  FuncTableC[data->cem[p]](data->endpoints[p][2], data->endpoints[p][6], data->weights[ps[2]][i]);
                 uint_fast8_t a =
-                  FuncTableA[data->cem[0]](data->endpoints[0][3], data->endpoints[0][7], data->weights[i][ps[3]]);
-                outbuf[i] = color(r, g, b, a);
+                  FuncTableA[data->cem[p]](data->endpoints[p][3], data->endpoints[p][7], data->weights[ps[3]][i]);
+                outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
+            }
+        } else {
+            for (int i = 0; i < num_pixels; i++) {
+                uint_fast8_t r =
+                  FuncTableC[data->cem[0]](data->endpoints[0][0], data->endpoints[0][4], data->weights[ps[0]][i]);
+                uint_fast8_t g =
+                  FuncTableC[data->cem[0]](data->endpoints[0][1], data->endpoints[0][5], data->weights[ps[1]][i]);
+                uint_fast8_t b =
+                  FuncTableC[data->cem[0]](data->endpoints[0][2], data->endpoints[0][6], data->weights[ps[2]][i]);
+                uint_fast8_t a =
+                  FuncTableA[data->cem[0]](data->endpoints[0][3], data->endpoints[0][7], data->weights[ps[3]][i]);
+                outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
             }
         }
     } else if (data->part_num > 1) {
-        for (int i = 0; i < data->bw * data->bh; i++) {
+        for (int i = 0; i < num_pixels; i++) {
             int p = data->partition[i];
             uint_fast8_t r =
-              FuncTableC[data->cem[p]](data->endpoints[p][0], data->endpoints[p][4], data->weights[i][0]);
+              FuncTableC[data->cem[p]](data->endpoints[p][0], data->endpoints[p][4], data->weights[0][i]);
             uint_fast8_t g =
-              FuncTableC[data->cem[p]](data->endpoints[p][1], data->endpoints[p][5], data->weights[i][0]);
+              FuncTableC[data->cem[p]](data->endpoints[p][1], data->endpoints[p][5], data->weights[0][i]);
             uint_fast8_t b =
-              FuncTableC[data->cem[p]](data->endpoints[p][2], data->endpoints[p][6], data->weights[i][0]);
+              FuncTableC[data->cem[p]](data->endpoints[p][2], data->endpoints[p][6], data->weights[0][i]);
             uint_fast8_t a =
-              FuncTableA[data->cem[p]](data->endpoints[p][3], data->endpoints[p][7], data->weights[i][0]);
-            outbuf[i] = color(r, g, b, a);
+              FuncTableA[data->cem[p]](data->endpoints[p][3], data->endpoints[p][7], data->weights[0][i]);
+            outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
         }
     } else {
-        for (int i = 0; i < data->bw * data->bh; i++) {
+        for (int i = 0; i < num_pixels; i++) {
             uint_fast8_t r =
-              FuncTableC[data->cem[0]](data->endpoints[0][0], data->endpoints[0][4], data->weights[i][0]);
+              FuncTableC[data->cem[0]](data->endpoints[0][0], data->endpoints[0][4], data->weights[0][i]);
             uint_fast8_t g =
-              FuncTableC[data->cem[0]](data->endpoints[0][1], data->endpoints[0][5], data->weights[i][0]);
+              FuncTableC[data->cem[0]](data->endpoints[0][1], data->endpoints[0][5], data->weights[0][i]);
             uint_fast8_t b =
-              FuncTableC[data->cem[0]](data->endpoints[0][2], data->endpoints[0][6], data->weights[i][0]);
+              FuncTableC[data->cem[0]](data->endpoints[0][2], data->endpoints[0][6], data->weights[0][i]);
             uint_fast8_t a =
-              FuncTableA[data->cem[0]](data->endpoints[0][3], data->endpoints[0][7], data->weights[i][0]);
-            outbuf[i] = color(r, g, b, a);
+              FuncTableA[data->cem[0]](data->endpoints[0][3], data->endpoints[0][7], data->weights[0][i]);
+            outbuf[i] = static_cast<uint32_t>(color(r, g, b, a));
         }
     }
 }

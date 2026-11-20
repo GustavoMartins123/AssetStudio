@@ -75,8 +75,14 @@
     <ClInclude Include="resource.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="simd_dispatch.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="simd_dispatch.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="unitycrunch.cpp">
       <Filter>源文件</Filter>
     </ClCompile>

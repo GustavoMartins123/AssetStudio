@@ -11,6 +11,10 @@ namespace Texture2DDecoder
 
         [DllImport(T2DDll.DllName, CallingConvention = CallingConvention.Winapi)]
         [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DecodeDXT3(void* data, int width, int height, void* image);
+
+        [DllImport(T2DDll.DllName, CallingConvention = CallingConvention.Winapi)]
+        [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool DecodeDXT5(void* data, int width, int height, void* image);
 
         [DllImport(T2DDll.DllName, CallingConvention = CallingConvention.Winapi)]

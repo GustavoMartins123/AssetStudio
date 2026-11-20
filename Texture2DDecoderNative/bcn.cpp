@@ -1,126 +1,558 @@
 #include "bcn.h"
 #include <stdint.h>
 #include <assert.h>
+#include <math.h>
+#include <string.h>
 #include <algorithm>
 #include "color.h"
 #include "fp16.h"
+#include "simd_dispatch.h"
 
-static inline void decode_bc1_block(const uint8_t* data, uint32_t* outbuf) {
+static inline void decode_bc1_colors(const uint8_t* data, uint32_t c[4], uint8_t alpha) noexcept {
 	uint8_t r0, g0, b0, r1, g1, b1;
-	int q0 = *(uint16_t*)(data);
-	int q1 = *(uint16_t*)(data + 2);
+	const uint16_t q0 = t2d_load_u16_le(data);
+	const uint16_t q1 = t2d_load_u16_le(data + 2);
 	rgb565_le(q0, &r0, &g0, &b0);
 	rgb565_le(q1, &r1, &g1, &b1);
-	uint_fast32_t c[4] = { color(r0, g0, b0, 255), color(r1, g1, b1, 255) };
+	c[0] = static_cast<uint32_t>(color(r0, g0, b0, alpha));
+	c[1] = static_cast<uint32_t>(color(r1, g1, b1, alpha));
 	if (q0 > q1) {
-		c[2] = color((r0 * 2 + r1) / 3, (g0 * 2 + g1) / 3, (b0 * 2 + b1) / 3, 255);
-		c[3] = color((r0 + r1 * 2) / 3, (g0 + g1 * 2) / 3, (b0 + b1 * 2) / 3, 255);
+		c[2] = static_cast<uint32_t>(color(((r0 * 2 + r1) * 21846) >> 16, ((g0 * 2 + g1) * 21846) >> 16, ((b0 * 2 + b1) * 21846) >> 16, alpha));
+		c[3] = static_cast<uint32_t>(color(((r0 + r1 * 2) * 21846) >> 16, ((g0 + g1 * 2) * 21846) >> 16, ((b0 + b1 * 2) * 21846) >> 16, alpha));
 	}
 	else {
-		c[2] = color((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2, 255);
-		c[3] = color(0, 0, 0, 255);
+		c[2] = static_cast<uint32_t>(color((r0 + r1) >> 1, (g0 + g1) >> 1, (b0 + b1) >> 1, alpha));
+		c[3] = static_cast<uint32_t>(color(0, 0, 0, alpha));
 	}
-	uint_fast32_t d = lton32(*(uint32_t*)(data + 4));
+}
+
+static inline void decode_bc2_colors(const uint8_t* data, uint32_t c[4]) noexcept {
+	uint8_t r0, g0, b0, r1, g1, b1;
+	const uint16_t q0 = t2d_load_u16_le(data);
+	const uint16_t q1 = t2d_load_u16_le(data + 2);
+	rgb565_le(q0, &r0, &g0, &b0);
+	rgb565_le(q1, &r1, &g1, &b1);
+	c[0] = static_cast<uint32_t>(color(r0, g0, b0, 0));
+	c[1] = static_cast<uint32_t>(color(r1, g1, b1, 0));
+	c[2] = static_cast<uint32_t>(color(((r0 * 2 + r1) * 21846) >> 16, ((g0 * 2 + g1) * 21846) >> 16, ((b0 * 2 + b1) * 21846) >> 16, 0));
+	c[3] = static_cast<uint32_t>(color(((r0 + r1 * 2) * 21846) >> 16, ((g0 + g1 * 2) * 21846) >> 16, ((b0 + b1 * 2) * 21846) >> 16, 0));
+}
+
+static inline void build_bc3_alpha_lut(const uint8_t* data, uint8_t a[16]) noexcept {
+	const uint32_t a0 = data[0];
+	const uint32_t a1 = data[1];
+	a[0] = static_cast<uint8_t>(a0);
+	a[1] = static_cast<uint8_t>(a1);
+	if (a0 > a1) {
+		a[2] = static_cast<uint8_t>(((a0 * 6 + a1) * 9363) >> 16);
+		a[3] = static_cast<uint8_t>(((a0 * 5 + a1 * 2) * 9363) >> 16);
+		a[4] = static_cast<uint8_t>(((a0 * 4 + a1 * 3) * 9363) >> 16);
+		a[5] = static_cast<uint8_t>(((a0 * 3 + a1 * 4) * 9363) >> 16);
+		a[6] = static_cast<uint8_t>(((a0 * 2 + a1 * 5) * 9363) >> 16);
+		a[7] = static_cast<uint8_t>(((a0 + a1 * 6) * 9363) >> 16);
+	}
+	else {
+		a[2] = static_cast<uint8_t>(((a0 * 4 + a1) * 13108) >> 16);
+		a[3] = static_cast<uint8_t>(((a0 * 3 + a1 * 2) * 13108) >> 16);
+		a[4] = static_cast<uint8_t>(((a0 * 2 + a1 * 3) * 13108) >> 16);
+		a[5] = static_cast<uint8_t>(((a0 + a1 * 4) * 13108) >> 16);
+		a[6] = 0;
+		a[7] = 255;
+	}
+	memset(a + 8, 0, 8);
+}
+
+static inline void decode_bc1_block(const uint8_t* data, uint32_t* outbuf) noexcept {
+	uint32_t c[4];
+	decode_bc1_colors(data, c, 255);
+	uint32_t d = t2d_load_u32_le(data + 4);
 	for (int i = 0; i < 16; i++, d >>= 2)
 		outbuf[i] = c[d & 3];
 }
 
+static inline void decode_bc2_block(const uint8_t* data, uint32_t* outbuf) noexcept {
+	uint32_t c[4];
+	decode_bc2_colors(data + 8, c);
+	uint64_t alpha_data = t2d_load_u64_le(data);
+	uint32_t d = t2d_load_u32_le(data + 12);
+	for (int i = 0; i < 16; i++, d >>= 2, alpha_data >>= 4) {
+		const uint32_t a4 = static_cast<uint32_t>(alpha_data & 0x0Fu);
+		const uint32_t a8 = (a4 << 4) | a4;
+		outbuf[i] = c[d & 3] | (a8 << 24);
+	}
+}
+
+void decode_bc3_alpha(const uint8_t* data, uint32_t* outbuf, int channel) {
+	uint8_t a[16];
+	build_bc3_alpha_lut(data, a);
+	uint8_t* dst = reinterpret_cast<uint8_t*>(outbuf);
+	uint64_t d = t2d_load_u64_le(data) >> 16;
+	for (int i = 0; i < 16; i++, d >>= 3)
+		dst[i * 4 + channel] = a[d & 7];
+}
+
+static inline void decode_bc3_block(const uint8_t* data, uint32_t* outbuf) noexcept {
+	decode_bc1_block(data + 8, outbuf);
+	decode_bc3_alpha(data, outbuf, 3);
+}
+
+static inline void decode_bc4_block(const uint8_t* data, uint32_t* outbuf) noexcept {
+	decode_bc3_alpha(data, outbuf, 2);
+}
+
+static inline void decode_bc5_block(const uint8_t* data, uint32_t* outbuf) noexcept {
+	decode_bc3_alpha(data, outbuf, 2);
+	decode_bc3_alpha(data + 8, outbuf, 1);
+}
+
+#if T2D_SIMD_X86
+
+T2D_TARGET_SSE41
+static void decode_bc1_sse41(const uint8_t* data, const long w, const long h, uint32_t* image) noexcept {
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	alignas(16) uint32_t buffer[16];
+	alignas(16) uint32_t c[4];
+	const __m128i mult = _mm_setr_epi32(1 << 6, 1 << 4, 1 << 2, 1);
+	const __m128i mask_c = _mm_set1_epi32(0x0C);
+	const __m128i rep_byte = _mm_set1_epi32(0x01010101);
+	const __m128i byte_offs = _mm_set1_epi32(0x03020100);
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 8) {
+			decode_bc1_colors(d, c, 255);
+			const __m128i pal = _mm_load_si128(reinterpret_cast<const __m128i*>(c));
+			for (int r = 0; r < 4; r++) {
+				const __m128i vb = _mm_set1_epi32(d[4 + r]);
+				const __m128i idx4 = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(vb, mult), 4), mask_c);
+				const __m128i shuf = _mm_add_epi8(_mm_mullo_epi32(idx4, rep_byte), byte_offs);
+				_mm_store_si128(reinterpret_cast<__m128i*>(buffer + r * 4), _mm_shuffle_epi8(pal, shuf));
+			}
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_AVX2
+static void decode_bc1_avx2(const uint8_t* data, const long w, const long h, uint32_t* image) noexcept {
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	alignas(32) uint32_t buffer[16];
+	alignas(16) uint32_t c[4];
+	const __m256i shifts01 = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+	const __m256i shifts23 = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
+	const __m256i mask3 = _mm256_set1_epi32(3);
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 8) {
+			decode_bc1_colors(d, c, 255);
+			const __m256i pal256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(c)));
+			const __m256i vd = _mm256_set1_epi32(static_cast<int>(t2d_load_u32_le(d + 4)));
+			const __m256i out01 = _mm256_permutevar8x32_epi32(pal256, _mm256_and_si256(_mm256_srlv_epi32(vd, shifts01), mask3));
+			const __m256i out23 = _mm256_permutevar8x32_epi32(pal256, _mm256_and_si256(_mm256_srlv_epi32(vd, shifts23), mask3));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 0), out01);
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 8), out23);
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_SSE41
+static void decode_bc2_sse41(const uint8_t* data, const long w, const long h, uint32_t* image) noexcept {
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	alignas(16) uint32_t buffer[16];
+	alignas(16) uint32_t c[4];
+	const __m128i mult_c = _mm_setr_epi32(1 << 6, 1 << 4, 1 << 2, 1);
+	const __m128i mask_c = _mm_set1_epi32(0x0C);
+	const __m128i rep_byte = _mm_set1_epi32(0x01010101);
+	const __m128i byte_offs = _mm_set1_epi32(0x03020100);
+	const __m128i mult_a = _mm_setr_epi32(1 << 12, 1 << 8, 1 << 4, 1);
+	const __m128i mask_a = _mm_set1_epi32(0x0F);
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 16) {
+			decode_bc2_colors(d + 8, c);
+			const __m128i pal = _mm_load_si128(reinterpret_cast<const __m128i*>(c));
+			for (int r = 0; r < 4; r++) {
+				const __m128i vb = _mm_set1_epi32(d[12 + r]);
+				const __m128i idx4 = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(vb, mult_c), 4), mask_c);
+				const __m128i shuf = _mm_add_epi8(_mm_mullo_epi32(idx4, rep_byte), byte_offs);
+				const __m128i col = _mm_shuffle_epi8(pal, shuf);
+
+				const uint16_t a16 = t2d_load_u16_le(d + r * 2);
+				const __m128i va = _mm_set1_epi32(a16);
+				const __m128i nib = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(va, mult_a), 12), mask_a);
+				const __m128i alpha = _mm_or_si128(_mm_slli_epi32(nib, 28), _mm_slli_epi32(nib, 24));
+				_mm_store_si128(reinterpret_cast<__m128i*>(buffer + r * 4), _mm_or_si128(col, alpha));
+			}
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_AVX2
+static void decode_bc2_avx2(const uint8_t* data, const long w, const long h, uint32_t* image) noexcept {
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	alignas(32) uint32_t buffer[16];
+	alignas(16) uint32_t c[4];
+	const __m256i shifts01 = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+	const __m256i shifts23 = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
+	const __m256i mask3 = _mm256_set1_epi32(3);
+	const __m256i ashifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+	const __m256i mask15 = _mm256_set1_epi32(0x0F);
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 16) {
+			decode_bc2_colors(d + 8, c);
+			const __m256i pal256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(c)));
+			const __m256i vd = _mm256_set1_epi32(static_cast<int>(t2d_load_u32_le(d + 12)));
+			const __m256i col01 = _mm256_permutevar8x32_epi32(pal256, _mm256_and_si256(_mm256_srlv_epi32(vd, shifts01), mask3));
+			const __m256i col23 = _mm256_permutevar8x32_epi32(pal256, _mm256_and_si256(_mm256_srlv_epi32(vd, shifts23), mask3));
+
+			const __m256i nib01 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(t2d_load_u32_le(d))), ashifts), mask15);
+			const __m256i nib23 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(t2d_load_u32_le(d + 4))), ashifts), mask15);
+			const __m256i alpha01 = _mm256_or_si256(_mm256_slli_epi32(nib01, 28), _mm256_slli_epi32(nib01, 24));
+			const __m256i alpha23 = _mm256_or_si256(_mm256_slli_epi32(nib23, 28), _mm256_slli_epi32(nib23, 24));
+
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 0), _mm256_or_si256(col01, alpha01));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 8), _mm256_or_si256(col23, alpha23));
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_SSE41
+static void decode_bc3_sse41(const uint8_t* data, const long w, const long h, uint32_t* image) noexcept {
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	alignas(16) uint32_t buffer[16];
+	alignas(16) uint32_t c[4];
+	alignas(16) uint8_t a[16];
+	const __m128i mult_c = _mm_setr_epi32(1 << 6, 1 << 4, 1 << 2, 1);
+	const __m128i mask_c = _mm_set1_epi32(0x0C);
+	const __m128i rep_byte = _mm_set1_epi32(0x01010101);
+	const __m128i byte_offs = _mm_set1_epi32(0x03020100);
+	const __m128i mult_a = _mm_setr_epi32(1 << 9, 1 << 6, 1 << 3, 1);
+	const __m128i mask7 = _mm_set1_epi32(7);
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 16) {
+			decode_bc1_colors(d + 8, c, 0);
+			build_bc3_alpha_lut(d, a);
+			const __m128i pal = _mm_load_si128(reinterpret_cast<const __m128i*>(c));
+			const __m128i alut = _mm_load_si128(reinterpret_cast<const __m128i*>(a));
+			const uint64_t idx48 = t2d_load_u64_le(d) >> 16;
+			for (int r = 0; r < 4; r++) {
+				const __m128i vb = _mm_set1_epi32(d[12 + r]);
+				const __m128i idx4 = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(vb, mult_c), 4), mask_c);
+				const __m128i shuf = _mm_add_epi8(_mm_mullo_epi32(idx4, rep_byte), byte_offs);
+				const __m128i col = _mm_shuffle_epi8(pal, shuf);
+
+				const int a12 = static_cast<int>((idx48 >> (r * 12)) & 0xFFFu);
+				const __m128i aidx = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(_mm_set1_epi32(a12), mult_a), 9), mask7);
+				const __m128i alpha = _mm_slli_epi32(_mm_shuffle_epi8(alut, aidx), 24);
+				_mm_store_si128(reinterpret_cast<__m128i*>(buffer + r * 4), _mm_or_si128(col, alpha));
+			}
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_AVX2
+static void decode_bc3_avx2(const uint8_t* data, const long w, const long h, uint32_t* image) noexcept {
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	alignas(32) uint32_t buffer[16];
+	alignas(16) uint32_t c[4];
+	alignas(16) uint8_t a[16];
+	const __m256i shifts01 = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+	const __m256i shifts23 = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
+	const __m256i mask3 = _mm256_set1_epi32(3);
+	const __m256i shifts3 = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21);
+	const __m256i mask7 = _mm256_set1_epi32(7);
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 16) {
+			decode_bc1_colors(d + 8, c, 0);
+			build_bc3_alpha_lut(d, a);
+			const __m256i pal256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(c)));
+			const __m256i alut256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(a)));
+
+			const __m256i vd = _mm256_set1_epi32(static_cast<int>(t2d_load_u32_le(d + 12)));
+			const __m256i col01 = _mm256_permutevar8x32_epi32(pal256, _mm256_and_si256(_mm256_srlv_epi32(vd, shifts01), mask3));
+			const __m256i col23 = _mm256_permutevar8x32_epi32(pal256, _mm256_and_si256(_mm256_srlv_epi32(vd, shifts23), mask3));
+
+			const uint64_t idx48 = t2d_load_u64_le(d) >> 16;
+			const __m256i ai01 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(idx48 & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i ai23 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>((idx48 >> 24) & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i alpha01 = _mm256_slli_epi32(_mm256_shuffle_epi8(alut256, ai01), 24);
+			const __m256i alpha23 = _mm256_slli_epi32(_mm256_shuffle_epi8(alut256, ai23), 24);
+
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 0), _mm256_or_si256(col01, alpha01));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 8), _mm256_or_si256(col23, alpha23));
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_SSE41
+static void decode_bc4_sse41(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) noexcept {
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
+	alignas(16) uint32_t buffer[16];
+	alignas(16) uint8_t a[16];
+	const __m128i mult_a = _mm_setr_epi32(1 << 9, 1 << 6, 1 << 3, 1);
+	const __m128i mask7 = _mm_set1_epi32(7);
+	const __m128i mask_ff = _mm_set1_epi32(0xFF);
+	const __m128i alpha_mask_v = _mm_set1_epi32(static_cast<int>(0xFF000000u));
+	for (uint32_t by = 0; by < m_blocks_y; by++) {
+		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 8) {
+			build_bc3_alpha_lut(data, a);
+			const __m128i alut = _mm_load_si128(reinterpret_cast<const __m128i*>(a));
+			const uint64_t idx48 = t2d_load_u64_le(data) >> 16;
+			for (int r = 0; r < 4; r++) {
+				const int a12 = static_cast<int>((idx48 >> (r * 12)) & 0xFFFu);
+				const __m128i aidx = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(_mm_set1_epi32(a12), mult_a), 9), mask7);
+				const __m128i red = _mm_slli_epi32(_mm_and_si128(_mm_shuffle_epi8(alut, aidx), mask_ff), 16);
+				_mm_store_si128(reinterpret_cast<__m128i*>(buffer + r * 4), _mm_or_si128(red, alpha_mask_v));
+			}
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_AVX2
+static void decode_bc4_avx2(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) noexcept {
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
+	alignas(32) uint32_t buffer[16];
+	alignas(16) uint8_t a[16];
+	const __m256i shifts3 = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21);
+	const __m256i mask7 = _mm256_set1_epi32(7);
+	const __m256i mask_ff = _mm256_set1_epi32(0xFF);
+	const __m256i alpha_mask_v = _mm256_set1_epi32(static_cast<int>(0xFF000000u));
+	for (uint32_t by = 0; by < m_blocks_y; by++) {
+		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 8) {
+			build_bc3_alpha_lut(data, a);
+			const __m256i alut256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(a)));
+			const uint64_t idx48 = t2d_load_u64_le(data) >> 16;
+			const __m256i ai01 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(idx48 & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i ai23 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>((idx48 >> 24) & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i red01 = _mm256_slli_epi32(_mm256_and_si256(_mm256_shuffle_epi8(alut256, ai01), mask_ff), 16);
+			const __m256i red23 = _mm256_slli_epi32(_mm256_and_si256(_mm256_shuffle_epi8(alut256, ai23), mask_ff), 16);
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 0), _mm256_or_si256(red01, alpha_mask_v));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 8), _mm256_or_si256(red23, alpha_mask_v));
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_SSE41
+static void decode_bc5_sse41(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) noexcept {
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
+	alignas(16) uint32_t buffer[16];
+	alignas(16) uint8_t ar[16];
+	alignas(16) uint8_t ag[16];
+	const __m128i mult_a = _mm_setr_epi32(1 << 9, 1 << 6, 1 << 3, 1);
+	const __m128i mask7 = _mm_set1_epi32(7);
+	const __m128i mask_ff = _mm_set1_epi32(0xFF);
+	const __m128i alpha_mask_v = _mm_set1_epi32(static_cast<int>(0xFF000000u));
+	for (uint32_t by = 0; by < m_blocks_y; by++) {
+		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 16) {
+			build_bc3_alpha_lut(data, ar);
+			build_bc3_alpha_lut(data + 8, ag);
+			const __m128i rlut = _mm_load_si128(reinterpret_cast<const __m128i*>(ar));
+			const __m128i glut = _mm_load_si128(reinterpret_cast<const __m128i*>(ag));
+			const uint64_t idxR48 = t2d_load_u64_le(data) >> 16;
+			const uint64_t idxG48 = t2d_load_u64_le(data + 8) >> 16;
+			for (int r = 0; r < 4; r++) {
+				const int r12 = static_cast<int>((idxR48 >> (r * 12)) & 0xFFFu);
+				const int g12 = static_cast<int>((idxG48 >> (r * 12)) & 0xFFFu);
+				const __m128i ridx = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(_mm_set1_epi32(r12), mult_a), 9), mask7);
+				const __m128i gidx = _mm_and_si128(_mm_srli_epi32(_mm_mullo_epi32(_mm_set1_epi32(g12), mult_a), 9), mask7);
+				const __m128i red = _mm_slli_epi32(_mm_and_si128(_mm_shuffle_epi8(rlut, ridx), mask_ff), 16);
+				const __m128i grn = _mm_slli_epi32(_mm_and_si128(_mm_shuffle_epi8(glut, gidx), mask_ff), 8);
+				_mm_store_si128(reinterpret_cast<__m128i*>(buffer + r * 4), _mm_or_si128(_mm_or_si128(red, grn), alpha_mask_v));
+			}
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
+		}
+	}
+}
+
+T2D_TARGET_AVX2
+static void decode_bc5_avx2(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) noexcept {
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
+	alignas(32) uint32_t buffer[16];
+	alignas(16) uint8_t ar[16];
+	alignas(16) uint8_t ag[16];
+	const __m256i shifts3 = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21);
+	const __m256i mask7 = _mm256_set1_epi32(7);
+	const __m256i mask_ff = _mm256_set1_epi32(0xFF);
+	const __m256i alpha_mask_v = _mm256_set1_epi32(static_cast<int>(0xFF000000u));
+	for (uint32_t by = 0; by < m_blocks_y; by++) {
+		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 16) {
+			build_bc3_alpha_lut(data, ar);
+			build_bc3_alpha_lut(data + 8, ag);
+			const __m256i rlut256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(ar)));
+			const __m256i glut256 = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(ag)));
+			const uint64_t idxR48 = t2d_load_u64_le(data) >> 16;
+			const uint64_t idxG48 = t2d_load_u64_le(data + 8) >> 16;
+
+			const __m256i ri01 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(idxR48 & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i ri23 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>((idxR48 >> 24) & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i gi01 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(idxG48 & 0xFFFFFFu)), shifts3), mask7);
+			const __m256i gi23 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>((idxG48 >> 24) & 0xFFFFFFu)), shifts3), mask7);
+
+			const __m256i red01 = _mm256_slli_epi32(_mm256_and_si256(_mm256_shuffle_epi8(rlut256, ri01), mask_ff), 16);
+			const __m256i red23 = _mm256_slli_epi32(_mm256_and_si256(_mm256_shuffle_epi8(rlut256, ri23), mask_ff), 16);
+			const __m256i grn01 = _mm256_slli_epi32(_mm256_and_si256(_mm256_shuffle_epi8(glut256, gi01), mask_ff), 8);
+			const __m256i grn23 = _mm256_slli_epi32(_mm256_and_si256(_mm256_shuffle_epi8(glut256, gi23), mask_ff), 8);
+
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 0), _mm256_or_si256(_mm256_or_si256(red01, grn01), alpha_mask_v));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(buffer + 8), _mm256_or_si256(_mm256_or_si256(red23, grn23), alpha_mask_v));
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
+		}
+	}
+}
+
+#endif
+
 int decode_bc1(const uint8_t* data, const long w, const long h, uint32_t* image) {
-	long num_blocks_x = (w + 3) / 4;
-	long num_blocks_y = (h + 3) / 4;
+	if (data == nullptr || image == nullptr || w <= 0 || h <= 0)
+		return 0;
+#if T2D_SIMD_X86
+	const SimdLevel simd = t2d_get_simd_level();
+	if (simd >= SimdLevel::AVX2) {
+		decode_bc1_avx2(data, w, h, image);
+		return 1;
+	}
+	if (simd >= SimdLevel::SSE41) {
+		decode_bc1_sse41(data, w, h, image);
+		return 1;
+	}
+#endif
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
 	uint32_t buffer[16];
 	const uint8_t* d = data;
 	for (long by = 0; by < num_blocks_y; by++) {
 		for (long bx = 0; bx < num_blocks_x; bx++, d += 8) {
 			decode_bc1_block(d, buffer);
-			copy_block_buffer(bx, by, w, h, 4, 4, buffer, image);
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
 		}
 	}
 	return 1;
 }
 
-void decode_bc3_alpha(const uint8_t* data, uint32_t* outbuf, int channel) {
-	uint_fast8_t a[8] = { data[0], data[1] };
-	if (a[0] > a[1]) {
-		a[2] = (a[0] * 6 + a[1]) / 7;
-		a[3] = (a[0] * 5 + a[1] * 2) / 7;
-		a[4] = (a[0] * 4 + a[1] * 3) / 7;
-		a[5] = (a[0] * 3 + a[1] * 4) / 7;
-		a[6] = (a[0] * 2 + a[1] * 5) / 7;
-		a[7] = (a[0] + a[1] * 6) / 7;
+int decode_bc2(const uint8_t* data, const long w, const long h, uint32_t* image) {
+	if (data == nullptr || image == nullptr || w <= 0 || h <= 0)
+		return 0;
+#if T2D_SIMD_X86
+	const SimdLevel simd = t2d_get_simd_level();
+	if (simd >= SimdLevel::AVX2) {
+		decode_bc2_avx2(data, w, h, image);
+		return 1;
 	}
-	else {
-		a[2] = (a[0] * 4 + a[1]) / 5;
-		a[3] = (a[0] * 3 + a[1] * 2) / 5;
-		a[4] = (a[0] * 2 + a[1] * 3) / 5;
-		a[5] = (a[0] + a[1] * 4) / 5;
-		a[6] = 0;
-		a[7] = 255;
+	if (simd >= SimdLevel::SSE41) {
+		decode_bc2_sse41(data, w, h, image);
+		return 1;
 	}
-
-	uint8_t* dst = (uint8_t*)outbuf;
-	uint_fast64_t d = lton64(*(uint64_t*)data) >> 16;
-	for (int i = 0; i < 16; i++, d >>= 3)
-		dst[i * 4 + channel] = a[d & 7];
-}
-
-static inline void decode_bc3_block(const uint8_t* data, uint32_t* outbuf) {
-	decode_bc1_block(data + 8, outbuf);
-	decode_bc3_alpha(data, outbuf, 3);
+#endif
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
+	uint32_t buffer[16];
+	const uint8_t* d = data;
+	for (long by = 0; by < num_blocks_y; by++) {
+		for (long bx = 0; bx < num_blocks_x; bx++, d += 16) {
+			decode_bc2_block(d, buffer);
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
+		}
+	}
+	return 1;
 }
 
 int decode_bc3(const uint8_t* data, const long w, const long h, uint32_t* image) {
-	long num_blocks_x = (w + 3) / 4;
-	long num_blocks_y = (h + 3) / 4;
+	if (data == nullptr || image == nullptr || w <= 0 || h <= 0)
+		return 0;
+#if T2D_SIMD_X86
+	const SimdLevel simd = t2d_get_simd_level();
+	if (simd >= SimdLevel::AVX2) {
+		decode_bc3_avx2(data, w, h, image);
+		return 1;
+	}
+	if (simd >= SimdLevel::SSE41) {
+		decode_bc3_sse41(data, w, h, image);
+		return 1;
+	}
+#endif
+	const long num_blocks_x = (w + 3) / 4;
+	const long num_blocks_y = (h + 3) / 4;
 	uint32_t buffer[16];
 	const uint8_t* d = data;
 	for (long by = 0; by < num_blocks_y; by++) {
 		for (long bx = 0; bx < num_blocks_x; bx++, d += 16) {
 			decode_bc3_block(d, buffer);
-			copy_block_buffer(bx, by, w, h, 4, 4, buffer, image);
+			t2d_copy_block_4x4(bx, by, w, h, buffer, image);
 		}
 	}
 	return 1;
 }
 
-static inline void decode_bc4_block(const uint8_t* data, uint32_t* outbuf) {
-	decode_bc3_alpha(data, outbuf, 2);
-}
-
 int decode_bc4(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) {
-	uint32_t m_block_width = 4;
-	uint32_t m_block_height = 4;
-	uint32_t m_blocks_x = (m_width + m_block_width - 1) / m_block_width;
-	uint32_t m_blocks_y = (m_height + m_block_height - 1) / m_block_height;
+	if (data == nullptr || image == nullptr || m_width == 0 || m_height == 0)
+		return 0;
+#if T2D_SIMD_X86
+	const SimdLevel simd = t2d_get_simd_level();
+	if (simd >= SimdLevel::AVX2) {
+		decode_bc4_avx2(data, m_width, m_height, image);
+		return 1;
+	}
+	if (simd >= SimdLevel::SSE41) {
+		decode_bc4_sse41(data, m_width, m_height, image);
+		return 1;
+	}
+#endif
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
 	uint32_t buffer[16];
 	for (uint32_t i = 0; i < 16; i++)
 		buffer[i] = 0xff000000;
 	for (uint32_t by = 0; by < m_blocks_y; by++) {
 		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 8) {
 			decode_bc4_block(data, buffer);
-			copy_block_buffer(bx, by, m_width, m_height, m_block_width, m_block_height, buffer, image);
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
 		}
 	}
 	return 1;
 }
 
-static inline void decode_bc5_block(const uint8_t* data, uint32_t* outbuf) {
-	decode_bc3_alpha(data, outbuf, 2);
-	decode_bc3_alpha(data + 8, outbuf, 1);
-}
-
 int decode_bc5(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) {
-	uint32_t m_block_width = 4;
-	uint32_t m_block_height = 4;
-	uint32_t m_blocks_x = (m_width + m_block_width - 1) / m_block_width;
-	uint32_t m_blocks_y = (m_height + m_block_height - 1) / m_block_height;
+	if (data == nullptr || image == nullptr || m_width == 0 || m_height == 0)
+		return 0;
+#if T2D_SIMD_X86
+	const SimdLevel simd = t2d_get_simd_level();
+	if (simd >= SimdLevel::AVX2) {
+		decode_bc5_avx2(data, m_width, m_height, image);
+		return 1;
+	}
+	if (simd >= SimdLevel::SSE41) {
+		decode_bc5_sse41(data, m_width, m_height, image);
+		return 1;
+	}
+#endif
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
 	uint32_t buffer[16];
 	for (uint32_t i = 0; i < 16; i++)
 		buffer[i] = 0xff000000;
 	for (uint32_t by = 0; by < m_blocks_y; by++) {
 		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 16) {
 			decode_bc5_block(data, buffer);
-			copy_block_buffer(bx, by, m_width, m_height, m_block_width, m_block_height, buffer, image);
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
 		}
 	}
 	return 1;
@@ -128,33 +560,39 @@ int decode_bc5(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_
 
 struct BitReader
 {
-	BitReader(const uint8_t* _data, uint16_t _bitPos = 0)
-		: m_data(_data)
+	BitReader(const uint8_t* _data, uint16_t _bitPos = 0) noexcept
+		: m_lo(t2d_load_u64_le(_data))
+		, m_hi(t2d_load_u64_le(_data + 8))
 		, m_bitPos(_bitPos)
 	{
 	}
 
-	uint16_t read(uint8_t _numBits)
+	uint16_t extract(uint16_t bitPos, uint8_t numBits) const noexcept
 	{
-		const uint16_t pos = m_bitPos / 8;
-		const uint16_t shift = m_bitPos & 7;
-		uint32_t data = 0;
-		memcpy(&data, &m_data[pos], std::min(4, 16 - pos));
+		if (numBits == 0 || bitPos >= 128)
+			return 0;
+		const uint64_t mask = (1ULL << numBits) - 1ULL;
+		if (bitPos >= 64)
+			return uint16_t((m_hi >> (bitPos - 64)) & mask);
+		if (bitPos + numBits <= 64)
+			return uint16_t((m_lo >> bitPos) & mask);
+		return uint16_t(((m_lo >> bitPos) | (m_hi << (64 - bitPos))) & mask);
+	}
+
+	uint16_t read(uint8_t _numBits) noexcept
+	{
+		const uint16_t res = extract(m_bitPos, _numBits);
 		m_bitPos += _numBits;
-		return uint16_t((data >> shift) & ((1 << _numBits) - 1));
+		return res;
 	}
 
-	uint16_t peek(uint16_t _offset, uint8_t _numBits)
+	uint16_t peek(uint16_t _offset, uint8_t _numBits) const noexcept
 	{
-		const uint16_t bitPos = m_bitPos + _offset;
-		const uint16_t shift = bitPos & 7;
-		uint16_t pos = bitPos / 8;
-		uint32_t data = 0;
-		memcpy(&data, &m_data[pos], std::min(4, 16 - pos));
-		return uint8_t((data >> shift) & ((1 << _numBits) - 1));
+		return static_cast<uint8_t>(extract(m_bitPos + _offset, _numBits));
 	}
 
-	const uint8_t* m_data;
+	uint64_t m_lo;
+	uint64_t m_hi;
 	uint16_t m_bitPos;
 };
 
@@ -178,7 +616,7 @@ static const uint16_t s_bptcP2[] =
 	0xf000, // 0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  1, 1, 1, 1
 	0xf710, // 0, 0, 0, 0,  1, 0, 0, 0,  1, 1, 1, 0,  1, 1, 1, 1
 	0x008e, // 0, 1, 1, 1,  0, 0, 0, 1,  0, 0, 0, 0,  0, 0, 0, 0
-	0x7100, // 0, 0, 0, 0,  0, 0, 0, 0,  1, 0, 0, 0,  1, 1, 1, 0
+	0x7100, // 0, 0, 0, 0,  0, 0, 0,  0, 1, 0, 0, 0,  1, 1, 1, 0
 	0x08ce, // 0, 1, 1, 1,  0, 0, 1, 1,  0, 0, 0, 1,  0, 0, 0, 0
 	0x008c, // 0, 0, 1, 1,  0, 0, 0, 1,  0, 0, 0, 0,  0, 0, 0, 0
 	0x7310, // 0, 0, 0, 0,  1, 0, 0, 0,  1, 1, 0, 0,  1, 1, 1, 0
@@ -254,45 +692,42 @@ struct Bc6hModeInfo
 };
 
 static const Bc6hModeInfo s_bc6hModeInfo[] =
-{ //  +--------------------------- transformed
-  //  |  +------------------------ partition bits
-  //  |  |  +--------------------- endpoint bits
-  //  |  |  |      +-------------- delta bits
-	{ 1, 5, 10, {  5,  5,  5 } }, // 00    2-bits
-	{ 1, 5,  7, {  6,  6,  6 } }, // 01
-	{ 1, 5, 11, {  5,  4,  4 } }, // 00010 5-bits
-	{ 0, 0, 10, { 10, 10, 10 } }, // 00011
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 1, 5, 11, {  4,  5,  4 } }, // 00110
-	{ 1, 0, 11, {  9,  9,  9 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 1, 5, 11, {  4,  4,  5 } }, // 00010
-	{ 1, 0, 12, {  8,  8,  8 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 1, 5,  9, {  5,  5,  5 } }, // 00010
-	{ 1, 0, 16, {  4,  4,  4 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 1, 5,  8, {  6,  5,  5 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 1, 5,  8, {  5,  6,  5 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 1, 5,  8, {  5,  5,  6 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
-	{ 0, 5,  6, {  6,  6,  6 } }, // 00010
-	{ 0, 0,  0, {  0,  0,  0 } }, // -
+{
+	{ 1, 5, 10, {  5,  5,  5 } },
+	{ 1, 5,  7, {  6,  6,  6 } },
+	{ 1, 5, 11, {  5,  4,  4 } },
+	{ 0, 0, 10, { 10, 10, 10 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 1, 5, 11, {  4,  5,  4 } },
+	{ 1, 0, 11, {  9,  9,  9 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 1, 5, 11, {  4,  4,  5 } },
+	{ 1, 0, 12, {  8,  8,  8 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 1, 5,  9, {  5,  5,  5 } },
+	{ 1, 0, 16, {  4,  4,  4 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 1, 5,  8, {  6,  5,  5 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 1, 5,  8, {  5,  6,  5 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 1, 5,  8, {  5,  5,  6 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
+	{ 0, 5,  6, {  6,  6,  6 } },
+	{ 0, 0,  0, {  0,  0,  0 } },
 };
 
-static uint16_t unquantize(uint16_t _value, bool _signed, uint8_t _endpointBits)
+static uint16_t unquantize(uint16_t _value, bool _signed, uint8_t _endpointBits) noexcept
 {
 	const uint16_t maxValue = 1 << (_endpointBits - 1);
 
@@ -342,7 +777,7 @@ static uint16_t unquantize(uint16_t _value, bool _signed, uint8_t _endpointBits)
 	return ((_value << 15) + 0x4000) >> (_endpointBits - 1);
 }
 
-static uint16_t finish_unquantize(uint16_t _value, bool _signed)
+static uint16_t finish_unquantize(uint16_t _value, bool _signed) noexcept
 {
 	if (_signed)
 	{
@@ -355,7 +790,7 @@ static uint16_t finish_unquantize(uint16_t _value, bool _signed)
 	return (_value * 31) >> 6;
 }
 
-static uint16_t sign_extend(uint16_t _value, uint8_t _numBits)
+static uint16_t sign_extend(uint16_t _value, uint8_t _numBits) noexcept
 {
 	const uint16_t mask = 1 << (_numBits - 1);
 	const uint16_t result = (_value ^ mask) - mask;
@@ -363,7 +798,7 @@ static uint16_t sign_extend(uint16_t _value, uint8_t _numBits)
 	return result;
 }
 
-static inline uint8_t f32_to_u8(const float f) {
+static inline uint8_t f32_to_u8(const float f) noexcept {
 	float c = roundf(f * 255);
 	if (c < 0)
 		return 0;
@@ -373,23 +808,40 @@ static inline uint8_t f32_to_u8(const float f) {
 		return static_cast<uint8_t>(c);
 }
 
-static uint8_t half_to_u8(uint16_t h) {
+struct HalfToU8Lut {
+	uint8_t table[0x2800];
+	HalfToU8Lut() noexcept {
+		for (uint16_t h = 0x1400; h < 0x3C00; ++h) {
+			table[h - 0x1400] = f32_to_u8(fp16_ieee_to_fp32_value(h));
+		}
+	}
+};
+
+static inline uint8_t half_to_u8(uint16_t h) noexcept {
+	static const HalfToU8Lut s_lut;
+	if (h < 0x1400)
+		return 0;
+	if (h < 0x3C00)
+		return s_lut.table[h - 0x1400];
+	if (h <= 0x7C00)
+		return 255;
+	if (h >= 0x8000 && h <= 0xFC00)
+		return 0;
 	return f32_to_u8(fp16_ieee_to_fp32_value(h));
 }
 
-static void decode_bc6_block(const uint8_t* _src, uint32_t* _dst, bool _signed)
+static void decode_bc6_block(const uint8_t* _src, uint32_t* _dst, bool _signed) noexcept
 {
 	BitReader bit(_src);
 
 	uint8_t mode = uint8_t(bit.read(2));
 
-	uint16_t epR[4] = { /* rw, rx, ry, rz */ };
-	uint16_t epG[4] = { /* gw, gx, gy, gz */ };
-	uint16_t epB[4] = { /* bw, bx, by, bz */ };
+	uint16_t epR[4] = {};
+	uint16_t epG[4] = {};
+	uint16_t epB[4] = {};
 
 	if (mode & 2)
 	{
-		// 5-bit mode
 		mode |= bit.read(3) << 2;
 
 		if (0 == s_bc6hModeInfo[mode].endpointBits)
@@ -722,8 +1174,7 @@ static void decode_bc6_block(const uint8_t* _src, uint32_t* _dst, bool _signed)
 
 	for (uint8_t ii = 1, num = numSubsets * 2; ii < num; ++ii)
 	{
-		if (_signed
-			|| mi.transformed)
+		if (_signed || mi.transformed)
 		{
 			epR[ii] = sign_extend(epR[ii], mi.deltaBits[0]);
 			epG[ii] = sign_extend(epG[ii], mi.deltaBits[1]);
@@ -758,120 +1209,81 @@ static void decode_bc6_block(const uint8_t* _src, uint32_t* _dst, bool _signed)
 	const uint8_t indexBits = mi.partitionBits ? 3 : 4;
 	const uint8_t* factors = s_bptcFactors[indexBits - 2];
 
-	for (uint8_t yy = 0; yy < 4; ++yy)
+	if (0 == mi.partitionBits && !_signed)
 	{
-		for (uint8_t xx = 0; xx < 4; ++xx)
+		const uint32_t r0 = epR[0], r1 = epR[1];
+		const uint32_t g0 = epG[0], g1 = epG[1];
+		const uint32_t b0 = epB[0], b1 = epB[1];
+		for (uint8_t idx = 0; idx < 16; ++idx)
 		{
-			const uint8_t idx = yy * 4 + xx;
-
-			uint8_t subsetIndex = 0;
-			uint8_t indexAnchor = 0;
-
-			if (0 != mi.partitionBits)
-			{
-				subsetIndex = (s_bptcP2[partitionSetIdx] >> idx) & 1;
-				indexAnchor = subsetIndex ? s_bptcA2[partitionSetIdx] : 0;
-			}
-
-			const uint8_t anchor = idx == indexAnchor;
-			const uint8_t num = indexBits - anchor;
-			const uint8_t index = (uint8_t)bit.read(num);
-
-			const uint8_t fc = factors[index];
-			const uint8_t fca = 64 - fc;
-			const uint8_t fcb = fc;
-
-			subsetIndex *= 2;
-			uint16_t rr = finish_unquantize((epR[subsetIndex] * fca + epR[subsetIndex + 1] * fcb + 32) >> 6, _signed);
-			uint16_t gg = finish_unquantize((epG[subsetIndex] * fca + epG[subsetIndex + 1] * fcb + 32) >> 6, _signed);
-			uint16_t bb = finish_unquantize((epB[subsetIndex] * fca + epB[subsetIndex + 1] * fcb + 32) >> 6, _signed);
-
-			_dst[idx] = color(half_to_u8(rr), half_to_u8(gg), half_to_u8(bb), 255);
+			const uint8_t num = indexBits - (idx == 0);
+			const uint8_t index = static_cast<uint8_t>(bit.read(num));
+			const uint32_t fcb = factors[index];
+			const uint32_t fca = 64 - fcb;
+			const uint16_t rr = static_cast<uint16_t>((((r0 * fca + r1 * fcb + 32) >> 6) * 31) >> 6);
+			const uint16_t gg = static_cast<uint16_t>((((g0 * fca + g1 * fcb + 32) >> 6) * 31) >> 6);
+			const uint16_t bb = static_cast<uint16_t>((((b0 * fca + b1 * fcb + 32) >> 6) * 31) >> 6);
+			_dst[idx] = static_cast<uint32_t>(color(half_to_u8(rr), half_to_u8(gg), half_to_u8(bb), 255));
 		}
+		return;
+	}
+
+	const uint16_t p2Mask = s_bptcP2[partitionSetIdx];
+	const uint8_t a2Idx = s_bptcA2[partitionSetIdx];
+
+	for (uint8_t idx = 0; idx < 16; ++idx)
+	{
+		uint8_t subsetIndex = 0;
+		uint8_t indexAnchor = 0;
+
+		if (0 != mi.partitionBits)
+		{
+			subsetIndex = (p2Mask >> idx) & 1;
+			indexAnchor = subsetIndex ? a2Idx : 0;
+		}
+
+		const uint8_t anchor = idx == indexAnchor;
+		const uint8_t num = indexBits - anchor;
+		const uint8_t index = static_cast<uint8_t>(bit.read(num));
+
+		const uint8_t fc = factors[index];
+		const uint8_t fca = 64 - fc;
+		const uint8_t fcb = fc;
+
+		subsetIndex *= 2;
+		uint16_t rr = finish_unquantize((epR[subsetIndex] * fca + epR[subsetIndex + 1] * fcb + 32) >> 6, _signed);
+		uint16_t gg = finish_unquantize((epG[subsetIndex] * fca + epG[subsetIndex + 1] * fcb + 32) >> 6, _signed);
+		uint16_t bb = finish_unquantize((epB[subsetIndex] * fca + epB[subsetIndex + 1] * fcb + 32) >> 6, _signed);
+
+		_dst[idx] = static_cast<uint32_t>(color(half_to_u8(rr), half_to_u8(gg), half_to_u8(bb), 255));
 	}
 }
 
 int decode_bc6(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) {
-	uint32_t m_block_width = 4;
-	uint32_t m_block_height = 4;
-	uint32_t m_blocks_x = (m_width + m_block_width - 1) / m_block_width;
-	uint32_t m_blocks_y = (m_height + m_block_height - 1) / m_block_height;
+	if (data == nullptr || image == nullptr || m_width == 0 || m_height == 0)
+		return 0;
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
 	uint32_t buffer[16];
 	for (uint32_t by = 0; by < m_blocks_y; by++) {
 		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 16) {
 			decode_bc6_block(data, buffer, false);
-			copy_block_buffer(bx, by, m_width, m_height, m_block_width, m_block_height, buffer, image);
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
 		}
 	}
 	return 1;
 }
 
 static const uint32_t s_bptcP3[] =
-{ //  76543210     0000   1111   2222   3333   4444   5555   6666   7777
-	0xaa685050, // 0, 0,  1, 1,  0, 0,  1, 1,  0, 2,  2, 1,  2, 2,  2, 2
-	0x6a5a5040, // 0, 0,  0, 1,  0, 0,  1, 1,  2, 2,  1, 1,  2, 2,  2, 1
-	0x5a5a4200, // 0, 0,  0, 0,  2, 0,  0, 1,  2, 2,  1, 1,  2, 2,  1, 1
-	0x5450a0a8, // 0, 2,  2, 2,  0, 0,  2, 2,  0, 0,  1, 1,  0, 1,  1, 1
-	0xa5a50000, // 0, 0,  0, 0,  0, 0,  0, 0,  1, 1,  2, 2,  1, 1,  2, 2
-	0xa0a05050, // 0, 0,  1, 1,  0, 0,  1, 1,  0, 0,  2, 2,  0, 0,  2, 2
-	0x5555a0a0, // 0, 0,  2, 2,  0, 0,  2, 2,  1, 1,  1, 1,  1, 1,  1, 1
-	0x5a5a5050, // 0, 0,  1, 1,  0, 0,  1, 1,  2, 2,  1, 1,  2, 2,  1, 1
-	0xaa550000, // 0, 0,  0, 0,  0, 0,  0, 0,  1, 1,  1, 1,  2, 2,  2, 2
-	0xaa555500, // 0, 0,  0, 0,  1, 1,  1, 1,  1, 1,  1, 1,  2, 2,  2, 2
-	0xaaaa5500, // 0, 0,  0, 0,  1, 1,  1, 1,  2, 2,  2, 2,  2, 2,  2, 2
-	0x90909090, // 0, 0,  1, 2,  0, 0,  1, 2,  0, 0,  1, 2,  0, 0,  1, 2
-	0x94949494, // 0, 1,  1, 2,  0, 1,  1, 2,  0, 1,  1, 2,  0, 1,  1, 2
-	0xa4a4a4a4, // 0, 1,  2, 2,  0, 1,  2, 2,  0, 1,  2, 2,  0, 1,  2, 2
-	0xa9a59450, // 0, 0,  1, 1,  0, 1,  1, 2,  1, 1,  2, 2,  1, 2,  2, 2
-	0x2a0a4250, // 0, 0,  1, 1,  2, 0,  0, 1,  2, 2,  0, 0,  2, 2,  2, 0
-	0xa5945040, // 0, 0,  0, 1,  0, 0,  1, 1,  0, 1,  1, 2,  1, 1,  2, 2
-	0x0a425054, // 0, 1,  1, 1,  0, 0,  1, 1,  2, 0,  0, 1,  2, 2,  0, 0
-	0xa5a5a500, // 0, 0,  0, 0,  1, 1,  2, 2,  1, 1,  2, 2,  1, 1,  2, 2
-	0x55a0a0a0, // 0, 0,  2, 2,  0, 0,  2, 2,  0, 0,  2, 2,  1, 1,  1, 1
-	0xa8a85454, // 0, 1,  1, 1,  0, 1,  1, 1,  0, 2,  2, 2,  0, 2,  2, 2
-	0x6a6a4040, // 0, 0,  0, 1,  0, 0,  0, 1,  2, 2,  2, 1,  2, 2,  2, 1
-	0xa4a45000, // 0, 0,  0, 0,  0, 0,  1, 1,  0, 1,  2, 2,  0, 1,  2, 2
-	0x1a1a0500, // 0, 0,  0, 0,  1, 1,  0, 0,  2, 2,  1, 0,  2, 2,  1, 0
-	0x0050a4a4, // 0, 1,  2, 2,  0, 1,  2, 2,  0, 0,  1, 1,  0, 0,  0, 0
-	0xaaa59090, // 0, 0,  1, 2,  0, 0,  1, 2,  1, 1,  2, 2,  2, 2,  2, 2
-	0x14696914, // 0, 1,  1, 0,  1, 2,  2, 1,  1, 2,  2, 1,  0, 1,  1, 0
-	0x69691400, // 0, 0,  0, 0,  0, 1,  1, 0,  1, 2,  2, 1,  1, 2,  2, 1
-	0xa08585a0, // 0, 0,  2, 2,  1, 1,  0, 2,  1, 1,  0, 2,  0, 0,  2, 2
-	0xaa821414, // 0, 1,  1, 0,  0, 1,  1, 0,  2, 0,  0, 2,  2, 2,  2, 2
-	0x50a4a450, // 0, 0,  1, 1,  0, 1,  2, 2,  0, 1,  2, 2,  0, 0,  1, 1
-	0x6a5a0200, // 0, 0,  0, 0,  2, 0,  0, 0,  2, 2,  1, 1,  2, 2,  2, 1
-	0xa9a58000, // 0, 0,  0, 0,  0, 0,  0, 2,  1, 1,  2, 2,  1, 2,  2, 2
-	0x5090a0a8, // 0, 2,  2, 2,  0, 0,  2, 2,  0, 0,  1, 2,  0, 0,  1, 1
-	0xa8a09050, // 0, 0,  1, 1,  0, 0,  1, 2,  0, 0,  2, 2,  0, 2,  2, 2
-	0x24242424, // 0, 1,  2, 0,  0, 1,  2, 0,  0, 1,  2, 0,  0, 1,  2, 0
-	0x00aa5500, // 0, 0,  0, 0,  1, 1,  1, 1,  2, 2,  2, 2,  0, 0,  0, 0
-	0x24924924, // 0, 1,  2, 0,  1, 2,  0, 1,  2, 0,  1, 2,  0, 1,  2, 0
-	0x24499224, // 0, 1,  2, 0,  2, 0,  1, 2,  1, 2,  0, 1,  0, 1,  2, 0
-	0x50a50a50, // 0, 0,  1, 1,  2, 2,  0, 0,  1, 1,  2, 2,  0, 0,  1, 1
-	0x500aa550, // 0, 0,  1, 1,  1, 1,  2, 2,  2, 2,  0, 0,  0, 0,  1, 1
-	0xaaaa4444, // 0, 1,  0, 1,  0, 1,  0, 1,  2, 2,  2, 2,  2, 2,  2, 2
-	0x66660000, // 0, 0,  0, 0,  0, 0,  0, 0,  2, 1,  2, 1,  2, 1,  2, 1
-	0xa5a0a5a0, // 0, 0,  2, 2,  1, 1,  2, 2,  0, 0,  2, 2,  1, 1,  2, 2
-	0x50a050a0, // 0, 0,  2, 2,  0, 0,  1, 1,  0, 0,  2, 2,  0, 0,  1, 1
-	0x69286928, // 0, 2,  2, 0,  1, 2,  2, 1,  0, 2,  2, 0,  1, 2,  2, 1
-	0x44aaaa44, // 0, 1,  0, 1,  2, 2,  2, 2,  2, 2,  2, 2,  0, 1,  0, 1
-	0x66666600, // 0, 0,  0, 0,  2, 1,  2, 1,  2, 1,  2, 1,  2, 1,  2, 1
-	0xaa444444, // 0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  2, 2,  2, 2
-	0x54a854a8, // 0, 2,  2, 2,  0, 1,  1, 1,  0, 2,  2, 2,  0, 1,  1, 1
-	0x95809580, // 0, 0,  0, 2,  1, 1,  1, 2,  0, 0,  0, 2,  1, 1,  1, 2
-	0x96969600, // 0, 0,  0, 0,  2, 1,  1, 2,  2, 1,  1, 2,  2, 1,  1, 2
-	0xa85454a8, // 0, 2,  2, 2,  0, 1,  1, 1,  0, 1,  1, 1,  0, 2,  2, 2
-	0x80959580, // 0, 0,  0, 2,  1, 1,  1, 2,  1, 1,  1, 2,  0, 0,  0, 2
-	0xaa141414, // 0, 1,  1, 0,  0, 1,  1, 0,  0, 1,  1, 0,  2, 2,  2, 2
-	0x96960000, // 0, 0,  0, 0,  0, 0,  0, 0,  2, 1,  1, 2,  2, 1,  1, 2
-	0xaaaa1414, // 0, 1,  1, 0,  0, 1,  1, 0,  2, 2,  2, 2,  2, 2,  2, 2
-	0xa05050a0, // 0, 0,  2, 2,  0, 0,  1, 1,  0, 0,  1, 1,  0, 0,  2, 2
-	0xa0a5a5a0, // 0, 0,  2, 2,  1, 1,  2, 2,  1, 1,  2, 2,  0, 0,  2, 2
-	0x96000000, // 0, 0,  0, 0,  0, 0,  0, 0,  0, 0,  0, 0,  2, 1,  1, 2
-	0x40804080, // 0, 0,  0, 2,  0, 0,  0, 1,  0, 0,  0, 2,  0, 0,  0, 1
-	0xa9a8a9a8, // 0, 2,  2, 2,  1, 2,  2, 2,  0, 2,  2, 2,  1, 2,  2, 2
-	0xaaaaaa44, // 0, 1,  0, 1,  2, 2,  2, 2,  2, 2,  2, 2,  2, 2,  2, 2
-	0x2a4a5254, // 0, 1,  1, 1,  2, 0,  1, 1,  2, 2,  0, 1,  2, 2,  2, 0
+{
+	0xaa685050, 0x6a5a5040, 0x5a5a4200, 0x5450a0a8, 0xa5a50000, 0xa0a05050, 0x5555a0a0, 0x5a5a5050,
+	0xaa550000, 0xaa555500, 0xaaaa5500, 0x90909090, 0x94949494, 0xa4a4a4a4, 0xa9a59450, 0x2a0a4250,
+	0xa5945040, 0x0a425054, 0xa5a5a500, 0x55a0a0a0, 0xa8a85454, 0x6a6a4040, 0xa4a45000, 0x1a1a0500,
+	0x0050a4a4, 0xaaa59090, 0x14696914, 0x69691400, 0xa08585a0, 0xaa821414, 0x50a4a450, 0x6a5a0200,
+	0xa9a58000, 0x5090a0a8, 0xa8a09050, 0x24242424, 0x00aa5500, 0x24924924, 0x24499224, 0x50a50a50,
+	0x500aa550, 0xaaaa4444, 0x66660000, 0xa5a0a5a0, 0x50a050a0, 0x69286928, 0x44aaaa44, 0x66666600,
+	0xaa444444, 0x54a854a8, 0x95809580, 0x96969600, 0xa85454a8, 0x80959580, 0xaa141414, 0x96960000,
+	0xaaaa1414, 0xa05050a0, 0xa0a5a5a0, 0x96000000, 0x40804080, 0xa9a8a9a8, 0xaaaaaa44, 0x2a4a5254,
 };
 
 static const uint8_t s_bptcA3[2][64] =
@@ -912,15 +1324,7 @@ struct Bc7ModeInfo
 };
 
 static const Bc7ModeInfo s_bp7ModeInfo[] =
-{ //  +---------------------------- num subsets
-  //  |  +------------------------- partition bits
-  //  |  |  +---------------------- rotation bits
-  //  |  |  |  +------------------- index selection bits
-  //  |  |  |  |  +---------------- color bits
-  //  |  |  |  |  |  +------------- alpha bits
-  //  |  |  |  |  |  |  +---------- endpoint P-bits
-  //  |  |  |  |  |  |  |  +------- shared P-bits
-  //  |  |  |  |  |  |  |  |    +-- 2x index bits
+{
 	{ 3, 4, 0, 0, 4, 0, 1, 0, { 3, 0 } }, // 0
 	{ 2, 6, 0, 0, 6, 0, 0, 1, { 3, 0 } }, // 1
 	{ 3, 6, 0, 0, 5, 0, 0, 0, { 2, 0 } }, // 2
@@ -931,12 +1335,12 @@ static const Bc7ModeInfo s_bp7ModeInfo[] =
 	{ 2, 6, 0, 0, 5, 5, 1, 0, { 2, 0 } }, // 7
 };
 
-static uint8_t expand_quantized(uint8_t v, int bits) {
-	v = v << (8 - bits);
-	return v | (v >> bits);
+static inline uint8_t expand_quantized(uint8_t v, int bits) noexcept {
+	v = static_cast<uint8_t>(v << (8 - bits));
+	return v | static_cast<uint8_t>(v >> bits);
 }
 
-static void decode_bc7_block(const uint8_t* _src, uint32_t* _dst)
+static void decode_bc7_block(const uint8_t* _src, uint32_t* _dst) noexcept
 {
 	BitReader bit(_src);
 
@@ -1040,10 +1444,10 @@ static void decode_bc7_block(const uint8_t* _src, uint32_t* _dst)
 
 	const bool hasIndexBits1 = 0 != mi.indexBits[1];
 
-	const uint8_t* factors[] =
+	const uint8_t* factors[2] =
 	{
-						s_bptcFactors[mi.indexBits[0] - 2],
-		hasIndexBits1 ? s_bptcFactors[mi.indexBits[1] - 2] : factors[0],
+		s_bptcFactors[mi.indexBits[0] - 2],
+		hasIndexBits1 ? s_bptcFactors[mi.indexBits[1] - 2] : s_bptcFactors[mi.indexBits[0] - 2],
 	};
 
 	uint16_t offset[2] =
@@ -1052,83 +1456,101 @@ static void decode_bc7_block(const uint8_t* _src, uint32_t* _dst)
 		uint16_t(mi.numSubsets * (16 * mi.indexBits[0] - 1)),
 	};
 
-	for (uint8_t yy = 0; yy < 4; ++yy)
+	// Fast path for Mode 6 (1 subset, no rotation, no secondary index bits, 4-bit indices)
+	if (mi.numSubsets == 1 && !hasIndexBits1 && rotationMode == 0)
 	{
-		for (uint8_t xx = 0; xx < 4; ++xx)
+		const uint16_t r0 = epR[0], r1 = epR[1];
+		const uint16_t g0 = epG[0], g1 = epG[1];
+		const uint16_t b0 = epB[0], b1 = epB[1];
+		const uint16_t a0 = epA[0], a1 = epA[1];
+		const uint8_t ib0 = mi.indexBits[0];
+		for (uint8_t idx = 0; idx < 16; ++idx)
 		{
-			const uint8_t idx = yy * 4 + xx;
-
-			uint8_t subsetIndex = 0;
-			uint8_t indexAnchor = 0;
-			switch (mi.numSubsets)
-			{
-			case 2:
-				subsetIndex = (s_bptcP2[partitionSetIdx] >> idx) & 1;
-				indexAnchor = 0 != subsetIndex ? s_bptcA2[partitionSetIdx] : 0;
-				break;
-
-			case 3:
-				subsetIndex = (s_bptcP3[partitionSetIdx] >> (2 * idx)) & 3;
-				indexAnchor = 0 != subsetIndex ? s_bptcA3[subsetIndex - 1][partitionSetIdx] : 0;
-				break;
-
-			default:
-				break;
-			}
-
-			const uint8_t anchor = idx == indexAnchor;
-			const uint8_t num[2] =
-			{
-				uint8_t(mi.indexBits[0] - anchor),
-				uint8_t(hasIndexBits1 ? mi.indexBits[1] - anchor : 0),
-			};
-
-			const uint8_t index[2] =
-			{
-								(uint8_t)bit.peek(offset[0], num[0]),
-				hasIndexBits1 ? (uint8_t)bit.peek(offset[1], num[1]) : index[0],
-			};
-
-			offset[0] += num[0];
-			offset[1] += num[1];
-
-			const uint8_t fc = factors[indexSelectionMode][index[indexSelectionMode]];
-			const uint8_t fa = factors[!indexSelectionMode][index[!indexSelectionMode]];
-
-			const uint8_t fca = 64 - fc;
-			const uint8_t fcb = fc;
-			const uint8_t faa = 64 - fa;
-			const uint8_t fab = fa;
-
-			subsetIndex *= 2;
-			uint8_t rr = uint8_t(uint16_t(epR[subsetIndex] * fca + epR[subsetIndex + 1] * fcb + 32) >> 6);
-			uint8_t gg = uint8_t(uint16_t(epG[subsetIndex] * fca + epG[subsetIndex + 1] * fcb + 32) >> 6);
-			uint8_t bb = uint8_t(uint16_t(epB[subsetIndex] * fca + epB[subsetIndex + 1] * fcb + 32) >> 6);
-			uint8_t aa = uint8_t(uint16_t(epA[subsetIndex] * faa + epA[subsetIndex + 1] * fab + 32) >> 6);
-
-			switch (rotationMode)
-			{
-			case 1: std::swap(aa, rr); break;
-			case 2: std::swap(aa, gg); break;
-			case 3: std::swap(aa, bb); break;
-			default:                  break;
-			};
-
-			_dst[idx] = color(rr, gg, bb, aa);
+			const uint8_t num0 = ib0 - (idx == 0);
+			const uint8_t index0 = static_cast<uint8_t>(bit.peek(offset[0], num0));
+			offset[0] += num0;
+			const uint16_t fcb = factors[0][index0];
+			const uint16_t fca = 64 - fcb;
+			const uint8_t rr = uint8_t((r0 * fca + r1 * fcb + 32) >> 6);
+			const uint8_t gg = uint8_t((g0 * fca + g1 * fcb + 32) >> 6);
+			const uint8_t bb = uint8_t((b0 * fca + b1 * fcb + 32) >> 6);
+			const uint8_t aa = uint8_t((a0 * fca + a1 * fcb + 32) >> 6);
+			_dst[idx] = static_cast<uint32_t>(color(rr, gg, bb, aa));
 		}
+		return;
+	}
+
+	const uint16_t p2Mask = s_bptcP2[partitionSetIdx];
+	const uint8_t a2Idx = s_bptcA2[partitionSetIdx];
+	const uint32_t p3Mask = s_bptcP3[partitionSetIdx];
+
+	for (uint8_t idx = 0; idx < 16; ++idx)
+	{
+		uint8_t subsetIndex = 0;
+		uint8_t indexAnchor = 0;
+		switch (mi.numSubsets)
+		{
+		case 2:
+			subsetIndex = (p2Mask >> idx) & 1;
+			indexAnchor = 0 != subsetIndex ? a2Idx : 0;
+			break;
+
+		case 3:
+			subsetIndex = (p3Mask >> (2 * idx)) & 3;
+			indexAnchor = 0 != subsetIndex ? s_bptcA3[subsetIndex - 1][partitionSetIdx] : 0;
+			break;
+
+		default:
+			break;
+		}
+
+		const uint8_t anchor = idx == indexAnchor;
+		const uint8_t num0 = uint8_t(mi.indexBits[0] - anchor);
+		const uint8_t num1 = uint8_t(hasIndexBits1 ? mi.indexBits[1] - anchor : 0);
+
+		const uint8_t idx0 = static_cast<uint8_t>(bit.peek(offset[0], num0));
+		const uint8_t idx1 = hasIndexBits1 ? static_cast<uint8_t>(bit.peek(offset[1], num1)) : idx0;
+		const uint8_t index[2] = { idx0, idx1 };
+
+		offset[0] += num0;
+		offset[1] += num1;
+
+		const uint8_t fc = factors[indexSelectionMode][index[indexSelectionMode]];
+		const uint8_t fa = factors[!indexSelectionMode][index[!indexSelectionMode]];
+
+		const uint8_t fca = 64 - fc;
+		const uint8_t fcb = fc;
+		const uint8_t faa = 64 - fa;
+		const uint8_t fab = fa;
+
+		subsetIndex *= 2;
+		uint8_t rr = uint8_t(uint16_t(epR[subsetIndex] * fca + epR[subsetIndex + 1] * fcb + 32) >> 6);
+		uint8_t gg = uint8_t(uint16_t(epG[subsetIndex] * fca + epG[subsetIndex + 1] * fcb + 32) >> 6);
+		uint8_t bb = uint8_t(uint16_t(epB[subsetIndex] * fca + epB[subsetIndex + 1] * fcb + 32) >> 6);
+		uint8_t aa = uint8_t(uint16_t(epA[subsetIndex] * faa + epA[subsetIndex + 1] * fab + 32) >> 6);
+
+		switch (rotationMode)
+		{
+		case 1: std::swap(aa, rr); break;
+		case 2: std::swap(aa, gg); break;
+		case 3: std::swap(aa, bb); break;
+		default:                  break;
+		}
+
+		_dst[idx] = static_cast<uint32_t>(color(rr, gg, bb, aa));
 	}
 }
 
 int decode_bc7(const uint8_t* data, uint32_t m_width, uint32_t m_height, uint32_t* image) {
-	uint32_t m_block_width = 4;
-	uint32_t m_block_height = 4;
-	uint32_t m_blocks_x = (m_width + m_block_width - 1) / m_block_width;
-	uint32_t m_blocks_y = (m_height + m_block_height - 1) / m_block_height;
+	if (data == nullptr || image == nullptr || m_width == 0 || m_height == 0)
+		return 0;
+	const uint32_t m_blocks_x = (m_width + 3) / 4;
+	const uint32_t m_blocks_y = (m_height + 3) / 4;
 	uint32_t buffer[16];
 	for (uint32_t by = 0; by < m_blocks_y; by++) {
 		for (uint32_t bx = 0; bx < m_blocks_x; bx++, data += 16) {
 			decode_bc7_block(data, buffer);
-			copy_block_buffer(bx, by, m_width, m_height, m_block_width, m_block_height, buffer, image);
+			t2d_copy_block_4x4(static_cast<long>(bx), static_cast<long>(by), static_cast<long>(m_width), static_cast<long>(m_height), buffer, image);
 		}
 	}
 	return 1;

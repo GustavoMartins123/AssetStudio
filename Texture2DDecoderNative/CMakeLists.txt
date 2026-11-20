@@ -16,6 +16,7 @@ set(SOURCES
     dllmain.cpp
     etc.cpp
     pvrtc.cpp
+    simd_dispatch.cpp
     unitycrunch.cpp
 )
 
