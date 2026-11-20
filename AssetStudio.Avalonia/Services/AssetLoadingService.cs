@@ -12,14 +12,22 @@ namespace AssetStudio.Avalonia.Services
     public class AssetLoadingService
     {
         public const int DefaultHandleFlushBatchSize = 5000;
+        public const int DefaultProgressCheckpointBatchSize = 40;
 
         private CancellationTokenSource? _indexingCts;
         private Task? _indexingTask;
-        private bool _isIndexingPaused;
-        private List<string> _pendingFilesToIndex = new();
+        private volatile bool _isIndexingPaused;
+        private readonly object _pendingQueueLock = new();
+        private string[] _pendingFiles = Array.Empty<string>();
+        private bool[] _consumedPendingFlags = Array.Empty<bool>();
+        private int _priorityPendingCursor;
+        private int _regularPendingCursor;
+        private int _remainingPendingCount;
+        private Dictionary<string, List<int>> _pendingIndicesByPath = new(StringComparer.OrdinalIgnoreCase);
         private System.Diagnostics.Stopwatch? _uiThrottleStopwatch;
         private Action<IndexingProgressUpdate>? _indexingProgressCallback;
         private readonly object _indexingStateLock = new();
+        private readonly object _checkpointLock = new();
         private int _indexingTotalFiles;
         private int _indexingProcessedFiles;
         private string _currentIndexingFile = string.Empty;
@@ -27,29 +35,175 @@ namespace AssetStudio.Avalonia.Services
 
         public bool IsIndexingActive => _indexingTask != null && !_indexingTask.IsCompleted;
         public bool IsIndexingPaused => _isIndexingPaused;
+        public Task? ActiveIndexingTask => _indexingTask;
+
+        public int PendingCount
+        {
+            get
+            {
+                lock (_pendingQueueLock)
+                {
+                    return _remainingPendingCount;
+                }
+            }
+        }
 
         public List<string> PendingFilesToIndex
         {
             get
             {
-                lock (_pendingFilesToIndex)
+                lock (_pendingQueueLock)
                 {
-                    return _pendingFilesToIndex.ToList();
+                    if (_remainingPendingCount <= 0)
+                    {
+                        return new List<string>();
+                    }
+
+                    var result = new List<string>(_remainingPendingCount);
+                    for (int i = _regularPendingCursor; i < _pendingFiles.Length; i++)
+                    {
+                        if (!_consumedPendingFlags[i])
+                        {
+                            result.Add(_pendingFiles[i]);
+                        }
+                    }
+
+                    return result;
                 }
+            }
+        }
+
+        internal void InitializePendingQueue(IReadOnlyList<string> files)
+        {
+            lock (_pendingQueueLock)
+            {
+                if (files == null || files.Count == 0)
+                {
+                    _pendingFiles = Array.Empty<string>();
+                    _consumedPendingFlags = Array.Empty<bool>();
+                    _priorityPendingCursor = 0;
+                    _regularPendingCursor = 0;
+                    _remainingPendingCount = 0;
+                    _pendingIndicesByPath = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+                    return;
+                }
+
+                var count = files.Count;
+                var array = new string[count];
+                var consumed = new bool[count];
+                var map = new Dictionary<string, List<int>>(count, StringComparer.OrdinalIgnoreCase);
+
+                for (int i = 0; i < count; i++)
+                {
+                    var file = files[i] ?? string.Empty;
+                    array[i] = file;
+                    var normalizedKey = NormalizePendingPathKey(file);
+                    if (!map.TryGetValue(normalizedKey, out var list))
+                    {
+                        list = new List<int>(1);
+                        map[normalizedKey] = list;
+                    }
+                    list.Add(i);
+                }
+
+                _pendingFiles = array;
+                _consumedPendingFlags = consumed;
+                _priorityPendingCursor = 0;
+                _regularPendingCursor = 0;
+                _remainingPendingCount = count;
+                _pendingIndicesByPath = map;
+            }
+        }
+
+        internal bool TryDequeueNextPendingFile(SearchValues<string>? keywordSearch, out string file)
+        {
+            lock (_pendingQueueLock)
+            {
+                if (_remainingPendingCount <= 0)
+                {
+                    file = string.Empty;
+                    return false;
+                }
+
+                if (keywordSearch != null)
+                {
+                    while (_priorityPendingCursor < _pendingFiles.Length)
+                    {
+                        var idx = _priorityPendingCursor++;
+                        if (_consumedPendingFlags[idx])
+                        {
+                            continue;
+                        }
+
+                        var candidate = _pendingFiles[idx];
+                        if (Path.GetFileName(candidate.AsSpan()).ContainsAny(keywordSearch))
+                        {
+                            _consumedPendingFlags[idx] = true;
+                            _remainingPendingCount--;
+                            file = candidate;
+                            return true;
+                        }
+                    }
+                }
+
+                while (_regularPendingCursor < _pendingFiles.Length)
+                {
+                    var idx = _regularPendingCursor++;
+                    if (_consumedPendingFlags[idx])
+                    {
+                        continue;
+                    }
+
+                    _consumedPendingFlags[idx] = true;
+                    _remainingPendingCount--;
+                    file = _pendingFiles[idx];
+                    return true;
+                }
+
+                file = string.Empty;
+                return false;
+            }
+        }
+
+        private static string NormalizePendingPathKey(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return path.Trim();
             }
         }
 
         public void RemovePendingFile(string sourcePath)
         {
-            var removed = false;
-            lock (_pendingFilesToIndex)
+            if (string.IsNullOrWhiteSpace(sourcePath))
             {
-                for (int i = _pendingFilesToIndex.Count - 1; i >= 0; i--)
+                return;
+            }
+
+            var removed = false;
+            var key = NormalizePendingPathKey(sourcePath);
+            lock (_pendingQueueLock)
+            {
+                if (_pendingIndicesByPath.TryGetValue(key, out var indices))
                 {
-                    if (string.Equals(Path.GetFullPath(_pendingFilesToIndex[i]), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
+                    for (int i = 0; i < indices.Count; i++)
                     {
-                        _pendingFilesToIndex.RemoveAt(i);
-                        removed = true;
+                        var idx = indices[i];
+                        if (!_consumedPendingFlags[idx])
+                        {
+                            _consumedPendingFlags[idx] = true;
+                            _remainingPendingCount--;
+                            removed = true;
+                        }
                     }
                 }
             }
@@ -160,13 +314,13 @@ namespace AssetStudio.Avalonia.Services
             _indexingCts = new CancellationTokenSource();
             var token = _indexingCts.Token;
             _isIndexingPaused = false;
-            _pendingFilesToIndex = files.ToList();
+            InitializePendingQueue(files);
             _uiThrottleStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             var effectiveHandleFlushBatchSize = handleFlushBatchSize > 0
                 ? handleFlushBatchSize
                 : DefaultHandleFlushBatchSize;
-            var originalTotal = _pendingFilesToIndex.Count;
+            var originalTotal = PendingCount;
             lock (_indexingStateLock)
             {
                 _indexingProgressCallback = onIndexingProgressChanged;
@@ -179,138 +333,240 @@ namespace AssetStudio.Avalonia.Services
 
             _indexingTask = Task.Run(async () =>
             {
-                int batchSize = 40;
+                int checkpointBatchSize = DefaultProgressCheckpointBatchSize;
                 int loadedCount = 0;
                 var pendingHandleFlushBuffer = onHandleBatchReady != null
                     ? new List<AssetHandle>(Math.Min(effectiveHandleFlushBatchSize, DefaultHandleFlushBatchSize))
                     : null;
+                var newlyReadCheckpointBuffer = new List<string>(checkpointBatchSize);
+                var memoryPressurePauseGate = new object();
+                var memoryPressureNotifiedForCurrentPause = false;
 
-                while (_pendingFilesToIndex.Count > 0)
+                // Pre-merge split assets per distinct directory once upfront so continuous workers never scan directories per file.
+                try
                 {
-                    if (token.IsCancellationRequested)
+                    var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+                    var distinctDirs = new HashSet<string>(dirComparer);
+                    for (int i = 0; i < files.Count; i++)
                     {
-                        break;
-                    }
-
-                    while (_isIndexingPaused && !token.IsCancellationRequested)
-                    {
-                        await Task.Delay(200);
-                    }
-
-                    if (token.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
-                    await waitPriorityAsync(token);
-                    if (token.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
-                    try
-                    {
-                        AssetsManager.ThrowIfMemoryPressureTooHigh("progressive indexing");
-                    }
-                    catch (MemoryPressureException ex)
-                    {
-                        onMemoryPressureError(ex);
-                        _isIndexingPaused = true;
-                        EmitIndexingProgress("paused");
-
-                        while (_isIndexingPaused && !token.IsCancellationRequested)
+                        var f = files[i];
+                        if (string.IsNullOrWhiteSpace(f))
                         {
-                            await Task.Delay(500);
+                            continue;
                         }
 
-                        if (!token.IsCancellationRequested)
+                        try
                         {
-                            EmitIndexingProgress("running");
-                        }
-                        continue;
-                    }
-
-                    var batch = new List<string>();
-                    lock (_pendingFilesToIndex)
-                    {
-                        var keywordSearch = GetPriorityKeywordSearch(activeFilters);
-                        if (keywordSearch != null)
-                        {
-                            for (int i = 0; i < _pendingFilesToIndex.Count && batch.Count < batchSize; i++)
+                            var dir = Path.GetDirectoryName(Path.GetFullPath(f));
+                            if (!string.IsNullOrEmpty(dir) && distinctDirs.Add(dir))
                             {
-                                var file = _pendingFilesToIndex[i];
-                                if (Path.GetFileName(file.AsSpan()).ContainsAny(keywordSearch))
+                                ImportHelper.MergeSplitAssets(dir);
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore invalid synthetic paths during pre-merge.
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore pre-merge errors.
+                }
+
+                var configuredWorkers = AssetsManager.GetConfiguredThreadCount(
+                    "ASSETSTUDIO_LAZY_LOAD_THREADS",
+                    AssetsManager.DefaultLazyLoadThreadRatio);
+                var workerCount = Math.Clamp(configuredWorkers, 1, Math.Max(1, originalTotal));
+
+                void FlushCheckpointProgress(bool forceFlushProgress, string? latestCompletedFile)
+                {
+                    List<string>? newlyReadSnapshot = null;
+                    var currentProcessed = Volatile.Read(ref loadedCount);
+
+                    lock (_checkpointLock)
+                    {
+                        if (onHandleBatchReady != null && pendingHandleFlushBuffer != null)
+                        {
+                            FlushHandleBatches(
+                                assetsManager.ProjectIndex,
+                                pendingHandleFlushBuffer,
+                                effectiveHandleFlushBatchSize,
+                                onHandleBatchReady,
+                                flushRemainder: false);
+                        }
+
+                        if (!string.IsNullOrEmpty(latestCompletedFile))
+                        {
+                            newlyReadCheckpointBuffer.Add(latestCompletedFile);
+                        }
+
+                        if (forceFlushProgress || newlyReadCheckpointBuffer.Count >= checkpointBatchSize)
+                        {
+                            if (newlyReadCheckpointBuffer.Count > 0)
+                            {
+                                newlyReadSnapshot = new List<string>(newlyReadCheckpointBuffer);
+                                newlyReadCheckpointBuffer.Clear();
+                            }
+
+                            lock (_indexingStateLock)
+                            {
+                                _indexingProcessedFiles = currentProcessed;
+                                if (!string.IsNullOrEmpty(latestCompletedFile))
                                 {
-                                    batch.Add(file);
-                                    _pendingFilesToIndex.RemoveAt(i);
-                                    i--;
+                                    _lastReadIndexingFile = latestCompletedFile;
+                                }
+                                else if (newlyReadSnapshot != null && newlyReadSnapshot.Count > 0)
+                                {
+                                    _lastReadIndexingFile = newlyReadSnapshot[newlyReadSnapshot.Count - 1];
+                                }
+
+                                if (PendingCount == 0)
+                                {
+                                    _currentIndexingFile = string.Empty;
                                 }
                             }
                         }
-                        while (_pendingFilesToIndex.Count > 0 && batch.Count < batchSize)
+                    }
+
+                    if (newlyReadSnapshot != null)
+                    {
+                        EmitIndexingProgress("running", newlyReadSnapshot);
+
+                        var progressPercent = originalTotal <= 0
+                            ? 100
+                            : (int)((double)currentProcessed / originalTotal * 100);
+
+                        if (currentProcessed < originalTotal && ShouldUpdateUi(shouldPauseBackgroundWork))
                         {
-                            batch.Add(_pendingFilesToIndex[0]);
-                            _pendingFilesToIndex.RemoveAt(0);
+                            updateProgress(progressPercent, $"Indexed: {currentProcessed:N0} / {originalTotal:N0} files ({progressPercent}%)");
+                            onBatchLoaded();
                         }
                     }
+                }
 
-                    if (batch.Count == 0)
-                    {
-                        break;
-                    }
-
-                    lock (_indexingStateLock)
-                    {
-                        _currentIndexingFile = batch[0];
-                    }
-                    EmitIndexingProgress("running");
-
-                    await waitPriorityAsync(token);
-                    if (token.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
+                async Task RunContinuousWorkerAsync()
+                {
                     try
                     {
-                        assetsManager.LoadFiles(batch.ToArray());
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Error($"Error loading batch of {batch.Count} files", ex);
-                    }
+                        while (!token.IsCancellationRequested)
+                        {
+                            while (_isIndexingPaused && !token.IsCancellationRequested)
+                            {
+                                await Task.Delay(50, token);
+                            }
 
-                    if (assetsManager.LazyLoading)
-                    {
-                        assetsManager.ClearLoadedFilesKeepIndex();
-                    }
+                            if (token.IsCancellationRequested)
+                            {
+                                break;
+                            }
 
-                    if (onHandleBatchReady != null && pendingHandleFlushBuffer != null)
-                    {
-                        FlushHandleBatches(
-                            assetsManager.ProjectIndex,
-                            pendingHandleFlushBuffer,
-                            effectiveHandleFlushBatchSize,
-                            onHandleBatchReady,
-                            flushRemainder: false);
-                    }
+                            await waitPriorityAsync(token);
+                            if (token.IsCancellationRequested)
+                            {
+                                break;
+                            }
 
-                    loadedCount += batch.Count;
-                    lock (_indexingStateLock)
-                    {
-                        _indexingProcessedFiles = loadedCount;
-                        _lastReadIndexingFile = batch[batch.Count - 1];
-                        _currentIndexingFile = string.Empty;
-                    }
-                    EmitIndexingProgress("running", batch);
+                            try
+                            {
+                                AssetsManager.ThrowIfMemoryPressureTooHigh("progressive indexing");
+                                lock (memoryPressurePauseGate)
+                                {
+                                    memoryPressureNotifiedForCurrentPause = false;
+                                }
+                            }
+                            catch (MemoryPressureException ex)
+                            {
+                                var shouldNotify = false;
+                                lock (memoryPressurePauseGate)
+                                {
+                                    if (!memoryPressureNotifiedForCurrentPause)
+                                    {
+                                        memoryPressureNotifiedForCurrentPause = true;
+                                        _isIndexingPaused = true;
+                                        shouldNotify = true;
+                                    }
+                                }
 
-                    var progressPercent = (int)((double)loadedCount / originalTotal * 100);
+                                if (shouldNotify)
+                                {
+                                    onMemoryPressureError(ex);
+                                    EmitIndexingProgress("paused");
+                                }
 
-                    if (loadedCount < originalTotal && ShouldUpdateUi(shouldPauseBackgroundWork))
-                    {
-                        updateProgress(progressPercent, $"Indexed: {loadedCount:N0} / {originalTotal:N0} files ({progressPercent}%)");
-                        onBatchLoaded();
+                                while (_isIndexingPaused && !token.IsCancellationRequested)
+                                {
+                                    await Task.Delay(100, token);
+                                }
+
+                                if (shouldNotify && !token.IsCancellationRequested)
+                                {
+                                    EmitIndexingProgress("running");
+                                }
+                                continue;
+                            }
+
+                            var keywordSearch = GetPriorityKeywordSearch(activeFilters);
+                            if (!TryDequeueNextPendingFile(keywordSearch, out var file))
+                            {
+                                break;
+                            }
+
+                            var shouldEmitInitialRunningFile = false;
+                            lock (_indexingStateLock)
+                            {
+                                if (string.IsNullOrEmpty(_currentIndexingFile))
+                                {
+                                    shouldEmitInitialRunningFile = _indexingProcessedFiles == 0;
+                                }
+                                _currentIndexingFile = file;
+                            }
+
+                            if (shouldEmitInitialRunningFile)
+                            {
+                                EmitIndexingProgress("running");
+                            }
+
+                            await waitPriorityAsync(token);
+                            if (token.IsCancellationRequested)
+                            {
+                                break;
+                            }
+
+                            try
+                            {
+                                await assetsManager.IndexSingleFileInWorkerAsync(file);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error($"Error indexing file {file}", ex);
+                            }
+
+                            var completedNow = Interlocked.Increment(ref loadedCount);
+                            var isCheckpoint = (completedNow % checkpointBatchSize) == 0 || completedNow == originalTotal || PendingCount == 0;
+                            FlushCheckpointProgress(forceFlushProgress: isCheckpoint, latestCompletedFile: file);
+                        }
                     }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        // Worker exited cleanly on cancellation.
+                    }
+                }
+
+                var workerTasks = new Task[workerCount];
+                for (int w = 0; w < workerCount; w++)
+                {
+                    workerTasks[w] = Task.Run(RunContinuousWorkerAsync);
+                }
+
+                await Task.WhenAll(workerTasks);
+
+                // Finalize any remaining buffered progress items and handles.
+                FlushCheckpointProgress(forceFlushProgress: true, latestCompletedFile: null);
+
+                if (assetsManager.LazyLoading)
+                {
+                    assetsManager.ClearLoadedFilesKeepIndex();
                 }
 
                 if (onHandleBatchReady != null && pendingHandleFlushBuffer != null)
@@ -321,6 +577,12 @@ namespace AssetStudio.Avalonia.Services
                         effectiveHandleFlushBatchSize,
                         onHandleBatchReady,
                         flushRemainder: true);
+                }
+
+                lock (_indexingStateLock)
+                {
+                    _indexingProcessedFiles = loadedCount;
+                    _currentIndexingFile = string.Empty;
                 }
 
                 var wasCancelled = token.IsCancellationRequested;
@@ -342,7 +604,7 @@ namespace AssetStudio.Avalonia.Services
                 _uiThrottleStopwatch = null;
 
                 onFinished(wasCancelled, loadedCount, originalTotal);
-            }, token);
+            });
         }
 
         public static int FlushHandleBatches(
@@ -445,11 +707,7 @@ namespace AssetStudio.Avalonia.Services
             lock (_indexingStateLock)
             {
                 callback = _indexingProgressCallback;
-                var pendingCount = 0;
-                lock (_pendingFilesToIndex)
-                {
-                    pendingCount = _pendingFilesToIndex.Count;
-                }
+                var pendingCount = PendingCount;
 
                 update = new IndexingProgressUpdate
                 {

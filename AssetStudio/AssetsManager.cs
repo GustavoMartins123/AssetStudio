@@ -54,10 +54,11 @@ namespace AssetStudio
         {
             RegisterManager();
         }
-        private const double DefaultLoadThreadRatio = 0.4;
-        private const double DefaultReadThreadRatio = 0.4;
-        private const double DefaultLazyLoadThreadRatio = 0.4;
-        private const double DefaultLazyReadThreadRatio = 0.4;
+        public const double DefaultLoadThreadRatio = 0.75;
+        public const double DefaultReadThreadRatio = 0.75;
+        public const double DefaultLazyLoadThreadRatio = 0.75;
+        public const double DefaultLazyReadThreadRatio = 0.75;
+        public const int MaxDefaultThreadCount = 16;
         private const int DefaultMemoryLimitPercent = 90;
         private static readonly ConcurrentDictionary<string, int> ConfiguredThreadCountCache = new ConcurrentDictionary<string, int>();
         private static readonly ConcurrentDictionary<string, int> ConfiguredThreadCountOrDefaultCache = new ConcurrentDictionary<string, int>();
@@ -104,11 +105,15 @@ namespace AssetStudio
             public readonly ConcurrentBag<SerializedFile> LoadedAssetsFiles = new ConcurrentBag<SerializedFile>();
             public readonly ConcurrentDictionary<string, byte> ImportFilesHash = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
             public readonly ConcurrentDictionary<string, byte> NoExistFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            public readonly ConcurrentBag<Stream> BundleStreams = new ConcurrentBag<Stream>();
+            public readonly ConcurrentBag<BinaryReader> IsolatedResourceReaders = new ConcurrentBag<BinaryReader>();
+            public readonly bool IsolateStreams;
             public int TotalCount;
 
-            public LoadContext(int totalCount)
+            public LoadContext(int totalCount, bool isolateStreams = false)
             {
                 TotalCount = totalCount;
+                IsolateStreams = isolateStreams;
             }
         }
 
@@ -158,8 +163,19 @@ namespace AssetStudio
 
         internal void RegisterResourceFileReader(BinaryReader? reader, params string?[] keys)
         {
+            RegisterResourceFileReader(reader, context: null, keys);
+        }
+
+        private void RegisterResourceFileReader(BinaryReader? reader, LoadContext? context, params string?[] keys)
+        {
             if (reader == null)
             {
+                return;
+            }
+
+            if (context != null && context.IsolateStreams)
+            {
+                context.IsolatedResourceReaders.Add(reader);
                 return;
             }
 
@@ -638,7 +654,14 @@ namespace AssetStudio
                 bundleFile = new BundleFile(reader, DecompressionCache);
                 if (bundleFile.BlocksStream != null)
                 {
-                    bundleStreams.Add(bundleFile.BlocksStream);
+                    if (context.IsolateStreams)
+                    {
+                        context.BundleStreams.Add(bundleFile.BlocksStream);
+                    }
+                    else
+                    {
+                        bundleStreams.Add(bundleFile.BlocksStream);
+                    }
                 }
                 var baseDir = Path.GetDirectoryName(reader.FullPath);
                 for (int i = 0; i < bundleFile.fileList.Length; i++)
@@ -663,7 +686,7 @@ namespace AssetStudio
                     }
                     else
                     {
-                        RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
+                        RegisterResourceFileReader(subReader, context, file.fileName, file.path, subReader.FullPath); //TODO
                     }
                 }
             }
@@ -726,7 +749,7 @@ namespace AssetStudio
                             LoadWebFile(subReader, context);
                             break;
                         case FileType.ResourceFile:
-                            RegisterResourceFileReader(subReader, file.fileName, file.path, subReader.FullPath); //TODO
+                            RegisterResourceFileReader(subReader, context, file.fileName, file.path, subReader.FullPath); //TODO
                             break;
                         default:
                             subReader.Dispose();
@@ -897,7 +920,7 @@ namespace AssetStudio
                             if (entryReader.FileType == FileType.ResourceFile)
                             {
                                 entryReader.Position = 0;
-                                RegisterResourceFileReader(entryReader, entry.Name, entry.FullName, entryReader.FullPath);
+                                RegisterResourceFileReader(entryReader, context, entry.Name, entry.FullName, entryReader.FullPath);
                             }
                             else
                             {
@@ -1257,6 +1280,291 @@ namespace AssetStudio
             }
         }
 
+        public async System.Threading.Tasks.Task IndexSingleFileInWorkerAsync(string filePath, bool highPriority = false)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                return;
+            }
+
+            if (!LazyLoading)
+            {
+                await LoadFilesAsync(highPriority, filePath);
+                return;
+            }
+
+            if (string.IsNullOrEmpty(ProjectRoot))
+            {
+                try
+                {
+                    var dir = Path.GetDirectoryName(Path.GetFullPath(filePath));
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        lock (loadLock)
+                        {
+                            if (string.IsNullOrEmpty(ProjectRoot))
+                            {
+                                ProjectRoot = dir;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore path normalization failures on invalid synthetic paths.
+                }
+            }
+
+            var toReadFiles = ProcessingSplitFiles(new[] { filePath });
+            if (toReadFiles.Length == 0)
+            {
+                return;
+            }
+
+            var context = new LoadContext(toReadFiles.Length, isolateStreams: true);
+            foreach (var file in toReadFiles)
+            {
+                context.ImportFiles.Add(file);
+                context.ImportFilesHash.TryAdd(Path.GetFileName(file), 0);
+                context.Queue.Enqueue(file);
+            }
+
+            try
+            {
+                while (context.Queue.TryDequeue(out var nextFile))
+                {
+                    await YieldForUserInteractionIfNeededAsync(highPriority);
+                    if (ShouldStopLoading)
+                    {
+                        break;
+                    }
+
+                    ThrowIfMemoryPressureTooHigh("loading files");
+                    if (ShouldStopLoading)
+                    {
+                        break;
+                    }
+
+                    try
+                    {
+                        LoadFile(nextFile, context);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"Error loading file {nextFile}: {ex.Message}", ex);
+                    }
+                }
+
+                var unprocessedFiles = ClaimUnprocessedFiles(context.LoadedAssetsFiles.ToArray());
+                foreach (var assetsFile in unprocessedFiles)
+                {
+                    await IndexSingleSerializedFileLazyAsync(assetsFile, highPriority);
+                }
+            }
+            finally
+            {
+                ReleaseIsolatedContextKeepIndex(context);
+            }
+        }
+
+        private async System.Threading.Tasks.Task IndexSingleSerializedFileLazyAsync(SerializedFile assetsFile, bool highPriority)
+        {
+            await YieldForUserInteractionIfNeededAsync(highPriority);
+
+            bool hasCachedHandles = false;
+            foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
+            {
+                if (!string.IsNullOrEmpty(handle.OriginalPath)
+                    && !IsSameAssetSource(handle.OriginalPath, assetsFile.originalPath))
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
+                {
+                    handle.OriginalPath = assetsFile.originalPath;
+                }
+
+                if (string.IsNullOrEmpty(handle.SerializedFileName))
+                {
+                    handle.SerializedFileName = assetsFile.fileName;
+                }
+
+                handle.SourceFile = assetsFile;
+                hasCachedHandles = true;
+            }
+
+            if (hasCachedHandles)
+            {
+                return;
+            }
+
+            var localObjects = new Object?[assetsFile.m_Objects.Count];
+            var fileOrigin = AssetHandleOrigin.Intern(assetsFile);
+            using var localReader = assetsFile.reader.Clone();
+
+            for (int objectIndex = 0; objectIndex < assetsFile.m_Objects.Count; objectIndex++)
+            {
+                var objectInfo = assetsFile.m_Objects[objectIndex];
+                if ((objectIndex & 0x3f) == 0)
+                {
+                    await YieldForUserInteractionIfNeededAsync(highPriority);
+                }
+
+                if (ShouldStopLoading)
+                {
+                    break;
+                }
+
+                if ((objectIndex & 0xff) == 0)
+                {
+                    ThrowIfMemoryPressureTooHigh("reading assets (lazy)");
+                }
+
+                if (ShouldStopLoading)
+                {
+                    break;
+                }
+
+                var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
+                var type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
+
+                var handle = AssetHandle.CreateCanonical(
+                    fileOrigin,
+                    objectInfo.m_PathID,
+                    type: type,
+                    byteStart: objectInfo.byteStart,
+                    byteSize: objectInfo.byteSize,
+                    sourceFile: assetsFile);
+
+                string? name = null;
+                if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
+                {
+                    try
+                    {
+                        var obj = CreateObjectFromReader(objectReader);
+                        handle.RealObject = obj;
+                        localObjects[objectIndex] = obj;
+                        if (obj is AssetBundle bundle)
+                            name = bundle.m_Name;
+                        else if (obj is ResourceManager)
+                            name = "ResourceManager";
+                    }
+                    catch
+                    {
+                        // Fallback if container loading fails
+                    }
+                }
+                else
+                {
+                    name = AssetHandle.TryReadObjectName(objectReader);
+                }
+
+                handle.Name = name ?? $"Unnamed_{type}_{objectInfo.m_PathID}";
+                ProjectIndex.AddHandle(handle);
+            }
+
+            foreach (var obj in localObjects)
+            {
+                if (obj != null)
+                {
+                    assetsFile.AddObject(obj);
+                }
+            }
+        }
+
+        private void ReleaseIsolatedContextKeepIndex(LoadContext context)
+        {
+            var keptAnyFile = false;
+            var readersToClose = new List<FileReader>();
+
+            lock (loadLock)
+            {
+                foreach (var assetsFile in context.LoadedAssetsFiles)
+                {
+                    if (assetsFile == null)
+                    {
+                        continue;
+                    }
+
+                    if (ShouldKeepFileCallback != null && ShouldKeepFileCallback(assetsFile.fileName))
+                    {
+                        keptAnyFile = true;
+                        continue;
+                    }
+
+                    foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
+                    {
+                        if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
+                        {
+                            handle.OriginalPath = assetsFile.originalPath;
+                        }
+
+                        if (ReferenceEquals(handle.SourceFile, assetsFile))
+                        {
+                            handle.SourceFile = null;
+                        }
+                    }
+
+                    assetsFile.Objects.Clear();
+                    if (assetsFile.reader != null)
+                    {
+                        readersToClose.Add(assetsFile.reader);
+                    }
+
+                    assetsFileList.Remove(assetsFile);
+                    assetsFileListHash.TryRemove(assetsFile.fileName, out _);
+                    if (assetsFileLoadEvents.TryRemove(assetsFile.fileName, out var eventHandle))
+                    {
+                        eventHandle.Dispose();
+                    }
+                }
+            }
+
+            foreach (var reader in readersToClose)
+            {
+                try
+                {
+                    reader.Close();
+                }
+                catch
+                {
+                    // Ignore reader close failure
+                }
+            }
+
+            while (context.IsolatedResourceReaders.TryTake(out var resourceReader))
+            {
+                try
+                {
+                    resourceReader?.Close();
+                }
+                catch
+                {
+                    // Ignore reader close failure
+                }
+            }
+
+            while (context.BundleStreams.TryTake(out var stream))
+            {
+                if (keptAnyFile)
+                {
+                    bundleStreams.Add(stream);
+                }
+                else
+                {
+                    try
+                    {
+                        stream?.Dispose();
+                    }
+                    catch
+                    {
+                        // Ignore stream dispose failure
+                    }
+                }
+            }
+        }
+
         public static Object CreateObjectFromReader(ObjectReader objectReader)
         {
             switch (objectReader.type)
@@ -1574,14 +1882,14 @@ namespace AssetStudio
                 return;
             }
 
+            var parallelOptions = new System.Threading.Tasks.ParallelOptions
+            {
+                MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
+            };
+
             foreach (var assetsFile in ClaimUnprocessedFiles(filesForRead))
             {
                 var localObjects = new Object?[assetsFile.m_Objects.Count];
-
-                var parallelOptions = new System.Threading.Tasks.ParallelOptions
-                {
-                    MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_READ_THREADS", DefaultReadThreadRatio)
-                };
 
                 System.Threading.Tasks.Parallel.For(
                     0,
@@ -1683,25 +1991,43 @@ namespace AssetStudio
 
         public static int GetConfiguredThreadCount(string environmentVariable, double defaultRatio)
         {
-            var cacheKey = environmentVariable + "\u001f" + defaultRatio.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            return ConfiguredThreadCountCache.GetOrAdd(cacheKey, _ => ComputeConfiguredThreadCount(environmentVariable, defaultRatio));
+            var envValue = string.IsNullOrEmpty(environmentVariable)
+                ? string.Empty
+                : (Environment.GetEnvironmentVariable(environmentVariable) ?? string.Empty);
+            var cacheKey = string.Concat(
+                environmentVariable,
+                "\u001f",
+                defaultRatio.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+                "\u001f",
+                envValue);
+            return ConfiguredThreadCountCache.GetOrAdd(
+                cacheKey,
+                _ => ComputeConfiguredThreadCount(environmentVariable, defaultRatio, Environment.ProcessorCount, envValue));
         }
 
-        private static int ComputeConfiguredThreadCount(string environmentVariable, double defaultRatio)
+        public static int ComputeConfiguredThreadCount(
+            string environmentVariable,
+            double defaultRatio,
+            int? processorCountOverride = null,
+            string? environmentValueOverride = null)
         {
-            var value = Environment.GetEnvironmentVariable(environmentVariable);
+            var value = environmentValueOverride ?? (string.IsNullOrEmpty(environmentVariable)
+                ? null
+                : Environment.GetEnvironmentVariable(environmentVariable));
             if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
             {
                 return configuredValue;
             }
 
-            var processorCount = Environment.ProcessorCount;
-            if (processorCount < 1)
+            var processorCount = processorCountOverride ?? Environment.ProcessorCount;
+            if (processorCount <= 1 || defaultRatio <= 0)
             {
                 return 1;
             }
 
-            return Math.Max(1, (int)Math.Floor(processorCount * defaultRatio));
+            var scaled = (int)Math.Floor(processorCount * defaultRatio);
+            var minThreads = processorCount >= 2 ? 2 : 1;
+            return Math.Min(MaxDefaultThreadCount, Math.Max(minThreads, scaled));
         }
 
         private System.Threading.SemaphoreSlim GetLazyLoadGate(int limit)
@@ -1731,13 +2057,25 @@ namespace AssetStudio
 
         private static int GetConfiguredThreadCountOrDefault(string environmentVariable, int defaultValue)
         {
-            var cacheKey = environmentVariable + "\u001f" + defaultValue.ToString(System.Globalization.CultureInfo.InvariantCulture);
-            return ConfiguredThreadCountOrDefaultCache.GetOrAdd(cacheKey, _ => ComputeConfiguredThreadCountOrDefault(environmentVariable, defaultValue));
+            var envValue = string.IsNullOrEmpty(environmentVariable)
+                ? string.Empty
+                : (Environment.GetEnvironmentVariable(environmentVariable) ?? string.Empty);
+            var cacheKey = string.Concat(
+                environmentVariable,
+                "\u001f",
+                defaultValue.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                "\u001f",
+                envValue);
+            return ConfiguredThreadCountOrDefaultCache.GetOrAdd(
+                cacheKey,
+                _ => ComputeConfiguredThreadCountOrDefault(environmentVariable, defaultValue, envValue));
         }
 
-        private static int ComputeConfiguredThreadCountOrDefault(string environmentVariable, int defaultValue)
+        private static int ComputeConfiguredThreadCountOrDefault(string environmentVariable, int defaultValue, string? environmentValueOverride = null)
         {
-            var value = Environment.GetEnvironmentVariable(environmentVariable);
+            var value = environmentValueOverride ?? (string.IsNullOrEmpty(environmentVariable)
+                ? null
+                : Environment.GetEnvironmentVariable(environmentVariable));
             if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
             {
                 return configuredValue;

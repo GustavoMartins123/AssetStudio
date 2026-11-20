@@ -39,7 +39,7 @@ namespace AssetStudio.Avalonia
             var localSemanticRelations = new SemanticAssetRelations();
 
             var fileResults = new AssetReferenceIndexBuildResult?[assetsFileList.Count];
-            Parallel.For(0, assetsFileList.Count, CreateStructureBuildParallelOptions(), index =>
+            Parallel.For(0, assetsFileList.Count, CreateSemanticGraphParallelOptions(), index =>
             {
                 fileResults[index] = BuildAssetReferenceIndexForFile(assetsFileList[index]);
             });
@@ -108,28 +108,69 @@ namespace AssetStudio.Avalonia
             semanticRelationsOut = localSemanticRelations;
         }
 
+        internal static int GetSemanticGraphMaxDegreeOfParallelism(int? processorCountOverride = null, string? environmentValueOverride = null)
+        {
+            var value = environmentValueOverride ?? Environment.GetEnvironmentVariable("ASSETSTUDIO_STRUCTURE_THREADS");
+            if (int.TryParse(value, out var configuredValue) && configuredValue > 0)
+            {
+                return configuredValue;
+            }
+
+            var processorCount = processorCountOverride ?? Environment.ProcessorCount;
+            if (processorCount <= 1)
+            {
+                return 1;
+            }
+
+            return Math.Min(
+                AssetsManager.MaxDefaultThreadCount,
+                Math.Max(2, (int)Math.Ceiling(processorCount * 0.75)));
+        }
+
+        internal static ParallelOptions CreateSemanticGraphParallelOptions(int maxDegreeOfParallelism = 0)
+        {
+            return new ParallelOptions
+            {
+                MaxDegreeOfParallelism = maxDegreeOfParallelism > 0
+                    ? maxDegreeOfParallelism
+                    : GetSemanticGraphMaxDegreeOfParallelism()
+            };
+        }
+
         internal static void BuildSemanticRelationsForFilesBackground(
             IReadOnlyList<SerializedFile> assetsFileList,
             SemanticAssetRelations targetRelations)
+        {
+            BuildSemanticRelationsForFilesBackground(assetsFileList, targetRelations, maxDegreeOfParallelism: 0);
+        }
+
+        internal static void BuildSemanticRelationsForFilesBackground(
+            IReadOnlyList<SerializedFile> assetsFileList,
+            SemanticAssetRelations targetRelations,
+            int maxDegreeOfParallelism)
         {
             if (assetsFileList == null || assetsFileList.Count == 0 || targetRelations == null)
             {
                 return;
             }
 
-            if (assetsFileList.Count == 1)
+            if (assetsFileList.Count == 1 || maxDegreeOfParallelism == 1)
             {
-                var singleFile = assetsFileList[0];
-                if (singleFile != null)
+                for (int i = 0; i < assetsFileList.Count; i++)
                 {
-                    var singleResult = BuildAssetReferenceIndexForFile(singleFile);
-                    targetRelations.Merge(singleResult.SemanticRelations);
+                    var singleFile = assetsFileList[i];
+                    if (singleFile != null)
+                    {
+                        var singleResult = BuildAssetReferenceIndexForFile(singleFile);
+                        targetRelations.Merge(singleResult.SemanticRelations);
+                    }
                 }
                 return;
             }
 
             var fileResults = new SemanticAssetRelations?[assetsFileList.Count];
-            Parallel.For(0, assetsFileList.Count, CreateStructureBuildParallelOptions(), index =>
+            var parallelOptions = CreateSemanticGraphParallelOptions(maxDegreeOfParallelism);
+            Parallel.For(0, assetsFileList.Count, parallelOptions, index =>
             {
                 var file = assetsFileList[index];
                 if (file != null)

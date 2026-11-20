@@ -1075,7 +1075,16 @@ public partial class MainWindow : Window
             : fullDetailed;
     }
 
-    private async Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
+    private sealed class SourceConnectionMaterializationResult
+    {
+        public int ObjectsBefore;
+        public int ObjectsAfter;
+        public int CandidateHandles;
+        public int FailedObjects;
+        public readonly Dictionary<ClassIDType, int> ResolvedByType = new();
+    }
+
+    internal async Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
         IReadOnlyList<string> sourcePaths,
         Action<int, string> reportProgress,
         SQLiteProjectIndexCache.SemanticStagingSession? stagingSession = null,
@@ -1087,6 +1096,7 @@ public partial class MainWindow : Window
         var failedSources = new List<string>();
         var effectiveFlushThreshold = Math.Max(1, stagingFlushRowThreshold);
         const int batchSize = 32;
+        var parallelOptions = CreateSemanticGraphParallelOptions();
 
         for (var i = 0; i < sourcePaths.Count; i += batchSize)
         {
@@ -1098,42 +1108,155 @@ public partial class MainWindow : Window
                 AssetsManager.ThrowIfMemoryPressureTooHigh("building lazy connections");
                 await assetsManager.LoadFilesAsync(batch.ToArray());
 
+                var filesBySource = ResolveLoadedFilesForConnectionBatch(batch);
+                var materializationResults = new SourceConnectionMaterializationResult?[batch.Count];
+                var sourceRelations = new SemanticAssetRelations?[batch.Count];
+                var sourceExceptions = new Exception?[batch.Count];
+
+                using (assetsManager.LruCache.SuspendEviction())
+                {
+                    // Phase 1: Materialize reference objects across all loaded sources in the batch in parallel.
+                    Parallel.For(0, batch.Count, parallelOptions, j =>
+                    {
+                        var filesForSource = filesBySource[j];
+                        if (filesForSource.Count == 0)
+                        {
+                            return;
+                        }
+
+                        try
+                        {
+                            materializationResults[j] = MaterializeReferenceObjectsForConnectionFiles(filesForSource);
+                        }
+                        catch (Exception ex)
+                        {
+                            sourceExceptions[j] = ex;
+                        }
+                    });
+
+                    // Phase 2: Collect all loaded SerializedFiles across the entire batch and extract semantic relations in parallel across CPU cores.
+                    var flattenedFiles = new List<(int SourceIndex, SerializedFile File)>(batch.Count);
+                    for (var j = 0; j < batch.Count; j++)
+                    {
+                        if (sourceExceptions[j] != null)
+                        {
+                            continue;
+                        }
+
+                        var filesForSource = filesBySource[j];
+                        for (var f = 0; f < filesForSource.Count; f++)
+                        {
+                            var file = filesForSource[f];
+                            if (file != null)
+                            {
+                                flattenedFiles.Add((j, file));
+                            }
+                        }
+                    }
+
+                    var perFileRelations = new SemanticAssetRelations?[flattenedFiles.Count];
+                    Parallel.For(0, flattenedFiles.Count, parallelOptions, flatIndex =>
+                    {
+                        var entry = flattenedFiles[flatIndex];
+                        try
+                        {
+                            var fileRel = new SemanticAssetRelations();
+                            BuildSemanticRelationsForFilesBackground(new[] { entry.File }, fileRel, maxDegreeOfParallelism: 1);
+                            perFileRelations[flatIndex] = fileRel;
+                        }
+                        catch (Exception ex)
+                        {
+                            sourceExceptions[entry.SourceIndex] ??= ex;
+                        }
+                    });
+
+                    for (var flatIndex = 0; flatIndex < flattenedFiles.Count; flatIndex++)
+                    {
+                        var entry = flattenedFiles[flatIndex];
+                        if (sourceExceptions[entry.SourceIndex] != null)
+                        {
+                            continue;
+                        }
+
+                        var rel = perFileRelations[flatIndex];
+                        if (rel != null)
+                        {
+                            var target = sourceRelations[entry.SourceIndex];
+                            if (target == null)
+                            {
+                                target = new SemanticAssetRelations();
+                                sourceRelations[entry.SourceIndex] = target;
+                            }
+                            target.Merge(rel);
+                        }
+                    }
+                }
+
+                // Phase 3: Unload materialized reference objects across the batch in parallel.
+                Parallel.For(0, batch.Count, parallelOptions, j =>
+                {
+                    var filesForSource = filesBySource[j];
+                    if (filesForSource.Count > 0)
+                    {
+                        try
+                        {
+                            UnloadConnectionBuildObjects(filesForSource);
+                        }
+                        catch
+                        {
+                            // Ignore best-effort unload errors.
+                        }
+                    }
+                });
+
+                // Phase 4: Deterministically merge batch relations, update diagnostics, flush to SQLite staging session, and report progress.
                 for (var j = 0; j < batch.Count; j++)
                 {
                     var sourcePath = batch[j];
                     var overallIndex = i + j;
                     try
                     {
-                        var filesForSource = GetLoadedFilesForConnectionSource(sourcePath);
+                        if (sourceExceptions[j] != null)
+                        {
+                            throw sourceExceptions[j]!;
+                        }
+
+                        var filesForSource = filesBySource[j];
                         diagnostics.RecordLoadedFiles(sourcePath, filesForSource.Count);
                         if (filesForSource.Count == 0)
                         {
                             continue;
                         }
 
-                        using (assetsManager.LruCache.SuspendEviction())
+                        var mat = materializationResults[j];
+                        if (mat != null)
                         {
-                            var objectsBefore = filesForSource.Sum(file => file.Objects.Count);
-                            foreach (var file in filesForSource)
+                            diagnostics.RecordMaterializationCandidateCount(mat.CandidateHandles);
+                            for (var f = 0; f < mat.FailedObjects; f++)
                             {
-                                MaterializeReferenceObjects(file, LazyConnectionReferenceTypes, diagnostics);
+                                diagnostics.RecordFailedObject();
                             }
-                            var objectsAfter = filesForSource.Sum(file => file.Objects.Count);
-                            diagnostics.RecordMaterializedSource(sourcePath, objectsBefore, objectsAfter);
 
-                            var semanticRelations = new SemanticAssetRelations();
-                            BuildSemanticRelationsForFilesBackground(filesForSource, semanticRelations);
-
-                            mergedRelations.Merge(semanticRelations);
-                            diagnostics.RecordRelationsPass(semanticRelations);
-
-                            if (stagingSession != null
-                                && CountBufferedSemanticRelationRows(mergedRelations) >= effectiveFlushThreshold)
+                            foreach (var kvp in mat.ResolvedByType)
                             {
-                                stagingSession.FlushBatch(mergedRelations, clearBatch: true);
+                                for (var c = 0; c < kvp.Value; c++)
+                                {
+                                    diagnostics.RecordResolvedObject(kvp.Key);
+                                }
                             }
+
+                            diagnostics.RecordMaterializedSource(sourcePath, mat.ObjectsBefore, mat.ObjectsAfter);
                         }
-                        UnloadConnectionBuildObjects(filesForSource);
+
+                        var semanticRelations = sourceRelations[j] ?? new SemanticAssetRelations();
+                        mergedRelations.Merge(semanticRelations);
+                        diagnostics.RecordRelationsPass(semanticRelations);
+
+                        if (stagingSession != null
+                            && CountBufferedSemanticRelationRows(mergedRelations) >= effectiveFlushThreshold)
+                        {
+                            stagingSession.FlushBatch(mergedRelations, clearBatch: true);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -1184,6 +1307,62 @@ public partial class MainWindow : Window
         }
 
         return new LazyConnectionBuildResult(mergedRelations, diagnostics);
+    }
+
+    private SourceConnectionMaterializationResult MaterializeReferenceObjectsForConnectionFiles(IReadOnlyList<SerializedFile> filesForSource)
+    {
+        var stats = new SourceConnectionMaterializationResult
+        {
+            ObjectsBefore = filesForSource.Sum(file => file.Objects.Count)
+        };
+
+        foreach (var sourceFile in filesForSource)
+        {
+            var handles = assetsManager.ProjectIndex
+                .GetHandlesForFile(sourceFile.fileName)
+                .Where(handle => LazyConnectionReferenceTypes.Contains(handle.Type)
+                    && (ReferenceEquals(handle.SourceFile, sourceFile)
+                        || IsSameLazySource(handle.OriginalPath, sourceFile.originalPath)
+                        || string.IsNullOrEmpty(handle.OriginalPath)))
+                .ToList();
+
+            stats.CandidateHandles += handles.Count;
+            foreach (var handle in handles)
+            {
+                if (handle.SourceFile?.reader == null)
+                {
+                    handle.SourceFile = sourceFile;
+                }
+
+                var obj = assetsManager.ResolveHandle(handle);
+                if (obj == null)
+                {
+                    stats.FailedObjects++;
+                    continue;
+                }
+
+                stats.ResolvedByType.TryGetValue(handle.Type, out var count);
+                stats.ResolvedByType[handle.Type] = count + 1;
+                if (handle.Tag is AssetItem item)
+                {
+                    UpdateLazyAssetItemHandle(item, handle);
+                }
+            }
+        }
+
+        stats.ObjectsAfter = filesForSource.Sum(file => file.Objects.Count);
+        return stats;
+    }
+
+    private List<SerializedFile>[] ResolveLoadedFilesForConnectionBatch(IReadOnlyList<string> batch)
+    {
+        var results = new List<SerializedFile>[batch.Count];
+        for (var j = 0; j < batch.Count; j++)
+        {
+            results[j] = GetLoadedFilesForConnectionSource(batch[j]);
+        }
+
+        return results;
     }
 
     private List<SerializedFile> GetLoadedFilesForConnectionSource(string sourcePath)
