@@ -86,14 +86,26 @@ public partial class MainWindow
         ResetFilterTypeMenu();
         StatusStripUpdate("Ready");
 
-        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
-        Title = projectContext == null
-            ? $"AssetStudio v{version}"
-            : $"AssetStudio v{version} - {projectContext.Project.DisplayName}";
+        Title = FormatWindowTitle();
 
         _currentlySelectedUniqueID = null;
         isRefreshingFilterList = false;
         isRefreshingClassesList = false;
+    }
+
+    private string FormatWindowTitle()
+    {
+        var version = AppVersionInfo.PrefixedDisplayVersion;
+        return projectContext == null
+            ? $"AssetStudio {version}"
+            : $"AssetStudio {version} - {projectContext.Project.DisplayName}";
+    }
+
+    private static string FormatLoadedWindowTitle(string? productName, SerializedFile firstFile)
+    {
+        var version = AppVersionInfo.PrefixedDisplayVersion;
+        var label = !string.IsNullOrEmpty(productName) ? productName : "no productName";
+        return $"AssetStudio {version} - {label} - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
     }
 
     private static T? FindVisualChild<T>(global::Avalonia.Visual? visual) where T : class

@@ -99,7 +99,8 @@ jobs:
       - name: Publish AssetStudio.Avalonia (win-x64)
         env:
           RestoreLockedMode: 'true'
-        run: pwsh -File scripts/publish-windows.ps1 -Configuration Release -Platform x64 -SkipNative
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: pwsh -File scripts/publish-windows.ps1 -Configuration Release -Platform x64 -SkipNative -Version "${{ steps.version.outputs.version }}"
 
       - name: Verify and archive Windows release output
         shell: pwsh

@@ -7,6 +7,7 @@ FRAMEWORK="net10.0"
 RUNTIME="linux-x64"
 SELF_CONTAINED="true"
 OUTPUT_DIR=""
+VERSION="${RELEASE_VERSION:-}"
 SKIP_NATIVE="false"
 SKIP_FFMPEG="false"
 SKIP_FFMPEG_DOWNLOAD="${SKIP_FFMPEG_DOWNLOAD:-0}"
@@ -48,7 +49,7 @@ is_truthy() {
 
 print_usage() {
     cat <<EOF
-Usage: $0 [-c Release|Debug] [-f net10.0] [-r linux-x64] [--self-contained true|false] [-o output-dir] [--skip-native] [--skip-ffmpeg] [--skip-ffmpeg-download] [--ffmpeg-dir DIR]
+Usage: $0 [-c Release|Debug] [-f net10.0] [-r linux-x64] [--self-contained true|false] [-o output-dir] [--version VER] [--skip-native] [--skip-ffmpeg] [--skip-ffmpeg-download] [--ffmpeg-dir DIR]
 
 Options:
   -c, --configuration CFG   Build configuration (default: Release)
@@ -56,6 +57,7 @@ Options:
   -r, --runtime RID         Target runtime identifier (default: linux-x64)
   --self-contained BOOL     Publish self-contained (default: true)
   -o, --output DIR          Custom publish output directory
+  --version VER             Release version to stamp into the binary (fallback: RELEASE_VERSION)
   --skip-native             Skip building/copying Texture2DDecoderNative
   --skip-ffmpeg             Do not bundle FFmpeg shared libraries (rely on system FFmpeg)
   --skip-ffmpeg-download    Skip automatic FFmpeg download (use pre-staged libs or system FFmpeg)
@@ -91,6 +93,22 @@ while [[ $# -gt 0 ]]; do
         -o|--output)
             OUTPUT_DIR="$2"
             shift 2
+            ;;
+        --version)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "Error: --version requires a value." >&2
+                exit 1
+            fi
+            VERSION="$2"
+            shift 2
+            ;;
+        --version=*)
+            VERSION="${1#--version=}"
+            if [[ -z "$VERSION" ]]; then
+                echo "Error: --version requires a non-empty value." >&2
+                exit 1
+            fi
+            shift
             ;;
         --skip-native)
             SKIP_NATIVE="true"
@@ -128,7 +146,18 @@ NATIVE_BUILD_DIR="$REPO_ROOT/Texture2DDecoderNative/build"
 FFMPEG_TARGET_DIR="$NATIVE_TARGET_DIR/ffmpeg"
 FFMPEG_SOURCE_DIR="$REPO_ROOT/AssetStudio.Avalonia/Libraries/x64/ffmpeg"
 
-echo "Publishing AssetStudio.Avalonia ($CONFIGURATION, $FRAMEWORK, $RUNTIME, self-contained=$SELF_CONTAINED)"
+RESOLVED_VERSION="${VERSION:-${RELEASE_VERSION:-}}"
+RESOLVED_VERSION="${RESOLVED_VERSION#"${RESOLVED_VERSION%%[![:space:]]*}"}"
+RESOLVED_VERSION="${RESOLVED_VERSION%"${RESOLVED_VERSION##*[![:space:]]}"}"
+while [[ "$RESOLVED_VERSION" =~ ^[vV][0-9] ]]; do
+    RESOLVED_VERSION="${RESOLVED_VERSION#[vV]}"
+done
+
+if [[ -n "$RESOLVED_VERSION" ]]; then
+    echo "Publishing AssetStudio.Avalonia ($CONFIGURATION, $FRAMEWORK, $RUNTIME, self-contained=$SELF_CONTAINED, version=$RESOLVED_VERSION)"
+else
+    echo "Publishing AssetStudio.Avalonia ($CONFIGURATION, $FRAMEWORK, $RUNTIME, self-contained=$SELF_CONTAINED)"
+fi
 
 if [[ "$SKIP_NATIVE" != "true" ]]; then
     echo "Building Texture2DDecoderNative.so..."
@@ -137,13 +166,20 @@ if [[ "$SKIP_NATIVE" != "true" ]]; then
     cmake --build "$NATIVE_BUILD_DIR"
 fi
 
-dotnet publish "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" \
-    -c "$CONFIGURATION" \
-    -f "$FRAMEWORK" \
-    -r "$RUNTIME" \
-    --self-contained "$SELF_CONTAINED" \
-    -m:1 \
+PUBLISH_ARGS=(
+    "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj"
+    -c "$CONFIGURATION"
+    -f "$FRAMEWORK"
+    -r "$RUNTIME"
+    --self-contained "$SELF_CONTAINED"
+    -m:1
     -o "$PUBLISH_DIR"
+)
+if [[ -n "$RESOLVED_VERSION" ]]; then
+    PUBLISH_ARGS+=("-p:ReleaseVersion=$RESOLVED_VERSION")
+fi
+
+dotnet publish "${PUBLISH_ARGS[@]}"
 
 if [[ "$SKIP_NATIVE" != "true" ]]; then
     if [[ ! -f "$NATIVE_BUILD_DIR/libTexture2DDecoderNative.so" ]]; then

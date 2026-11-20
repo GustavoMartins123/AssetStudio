@@ -14,8 +14,21 @@ PUBLISH_DIR="$REPO_ROOT/AssetStudio.Avalonia/bin/$CONFIGURATION/$FRAMEWORK/$RUNT
 
 echo "=== Linux Packaging Script for AssetStudio.Avalonia ==="
 
+if [[ -n "${RELEASE_VERSION:-}" ]]; then
+    VERSION="${RELEASE_VERSION#[vV]}"
+elif [[ -n "${VERSION:-}" ]]; then
+    VERSION="${VERSION#[vV]}"
+else
+    VERSION=$(grep -h -oP '(?<=<Version>)[^<]+' "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" "$REPO_ROOT/Directory.Build.props" 2>/dev/null | head -n 1 || true)
+    VERSION="${VERSION:-0.17.1}"
+fi
+while [[ "$VERSION" =~ ^[vV][0-9] ]]; do
+    VERSION="${VERSION#[vV]}"
+done
+echo "--> Detected version: $VERSION"
+
 echo "--> Compiling and publishing AssetStudio..."
-"$REPO_ROOT/scripts/publish-linux.sh" -c "$CONFIGURATION" --self-contained "$SELF_CONTAINED"
+"$REPO_ROOT/scripts/publish-linux.sh" -c "$CONFIGURATION" --self-contained "$SELF_CONTAINED" --version "$VERSION"
 
 echo "--> Cleaning up unused/Windows-only artifacts from publish folder..."
 if [[ -d "$PUBLISH_DIR/runtimes/win-x64" ]]; then
@@ -37,14 +50,6 @@ fi
 mkdir -p "$DIST_DIR"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
-
-if [[ -n "${RELEASE_VERSION:-}" ]]; then
-    VERSION="${RELEASE_VERSION#[vV]}"
-elif [[ -z "${VERSION:-}" ]]; then
-    VERSION=$(grep -h -oP '(?<=<Version>)[^<]+' "$REPO_ROOT/AssetStudio.Avalonia/AssetStudio.Avalonia.csproj" "$REPO_ROOT/Directory.Build.props" 2>/dev/null | head -n 1 || true)
-    VERSION="${VERSION:-0.17.1}"
-fi
-echo "--> Detected version: $VERSION"
 
 build_appimage() {
     echo "--> Packaging AppImage..."

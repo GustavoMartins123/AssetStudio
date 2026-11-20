@@ -12,6 +12,8 @@ param(
 
     [string]$OutputDir,
 
+    [string]$Version,
+
     [switch]$SkipNative,
 
     [switch]$KeepBuildServers
@@ -156,7 +158,19 @@ try {
         $env:MSBUILDDISABLENODEREUSE = "1"
     }
 
-    Write-Host "Publishing AssetStudio.Avalonia ($Configuration, $Framework, $Runtime, self-contained=$SelfContained)"
+    $resolvedVersion = if (-not [string]::IsNullOrWhiteSpace($Version)) {
+        $Version.Trim()
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+        $env:RELEASE_VERSION.Trim()
+    }
+    else {
+        ""
+    }
+    $resolvedVersion = $resolvedVersion -replace '^[vV]+(?=[0-9])', ''
+
+    $versionSummary = if (-not [string]::IsNullOrWhiteSpace($resolvedVersion)) { ", version=$resolvedVersion" } else { "" }
+    Write-Host "Publishing AssetStudio.Avalonia ($Configuration, $Framework, $Runtime, self-contained=$SelfContained$versionSummary)"
     Assert-OutputExecutableIsNotRunning
 
     if (-not $SkipNative) {
@@ -183,6 +197,10 @@ try {
         "--disable-build-servers",
         "/p:UseSharedCompilation=false"
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($resolvedVersion)) {
+        $publishArgs += "-p:ReleaseVersion=$resolvedVersion"
+    }
 
     if ($OutputDir) {
         $publishArgs += @("-o", $PublishDir)

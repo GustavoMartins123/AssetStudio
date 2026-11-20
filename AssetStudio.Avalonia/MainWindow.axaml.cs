@@ -181,12 +181,7 @@ public partial class MainWindow : Window
         FfmpegVideoPlayer.MediaEnded += FfmpegVideoPlayer_MediaEnded;
         FfmpegVideoPlayer.IsVisible = true;
 
-        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
-        Title = $"AssetStudio v{version}";
-        if (projectContext != null)
-        {
-            Title = $"AssetStudio v{version} - {projectContext.Project.DisplayName}";
-        }
+        Title = FormatWindowTitle();
 
         try
         {
@@ -1260,25 +1255,9 @@ public partial class MainWindow : Window
         }
         StatusStripUpdate(log);
 
-        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
-        if (assetsManager.assetsFileList.Count > 0)
-        {
-            var firstFile = assetsManager.assetsFileList[0];
-            if (!string.IsNullOrEmpty(result.ProductName))
-            {
-                Title = $"AssetStudio v{version} - {result.ProductName} - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
-            }
-            else
-            {
-                Title = $"AssetStudio v{version} - no productName - {firstFile.unityVersion} - {firstFile.m_TargetPlatform}";
-            }
-        }
-        else
-        {
-            Title = projectContext == null
-                ? $"AssetStudio v{version}"
-                : $"AssetStudio v{version} - {projectContext.Project.DisplayName}";
-        }
+        Title = assetsManager.assetsFileList.Count > 0
+            ? FormatLoadedWindowTitle(result.ProductName, assetsManager.assetsFileList[0])
+            : FormatWindowTitle();
 
         var assetCountForStats = assetsManager.LazyLoading
             ? assetsManager.ProjectIndex.Count
