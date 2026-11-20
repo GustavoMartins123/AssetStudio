@@ -1,6 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.IO;
 using System.Text;
@@ -97,14 +98,29 @@ internal sealed class AsyncPreviewRequestCoordinator : IDisposable
 
 public partial class MainWindow : Window
 {
-    private const int MaxPreviewTextChars = 100000;
-    private readonly AsyncPreviewRequestCoordinator _previewRequestCoordinator = new();
-    private readonly AsyncPreviewRequestCoordinator _dumpRequestCoordinator = new();
+    private const int MaxPreviewTextChars = PreviewSessionViewModel.MaxPreviewTextChars;
+    private PreviewSessionViewModel? _previewSession;
+    internal PreviewSessionViewModel PreviewSession => _previewSession ??= new PreviewSessionViewModel(DispatchToPreviewUi);
+    private AsyncPreviewRequestCoordinator _previewRequestCoordinator => PreviewSession.PreviewCoordinator;
+    private AsyncPreviewRequestCoordinator _dumpRequestCoordinator => PreviewSession.DumpCoordinator;
     private readonly SemaphoreSlim _assemblyLoaderGate = new(1, 1);
+
+    private static void DispatchToPreviewUi(Action action)
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            action();
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(action, DispatcherPriority.Background);
+        }
+    }
 
     private CancellationToken BeginAsyncPreviewRequest(out long requestId, out long previewVersion)
     {
         previewVersion = Volatile.Read(ref texturePreviewIdCounter);
+        PreviewSession.SyncPreviewVersion(previewVersion);
         return _previewRequestCoordinator.BeginNewRequest(out requestId);
     }
 
@@ -117,18 +133,7 @@ public partial class MainWindow : Window
 
     internal static string TruncatePreviewText(string? text, string fallbackText = "")
     {
-        if (text == null)
-        {
-            return fallbackText;
-        }
-
-        if (text.Length > MaxPreviewTextChars)
-        {
-            return text.Substring(0, MaxPreviewTextChars) +
-                $"{Environment.NewLine}...{Environment.NewLine}[Preview truncated: content is too large ({text.Length:N0} characters). Please export the asset to view full content]";
-        }
-
-        return text;
+        return PreviewSessionViewModel.TruncatePreviewText(text, fallbackText);
     }
 
     private async void AssetListDataGrid_SelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -184,9 +189,9 @@ public partial class MainWindow : Window
     private void CancelPendingPreview()
     {
         previewDebounce?.Cancel();
-        _previewRequestCoordinator.CancelCurrent();
-        _animationPreviewCoordinator.CancelCurrent();
-        Interlocked.Increment(ref texturePreviewIdCounter);
+        PreviewSession.CancelPendingPreview();
+        var nextVersion = Interlocked.Increment(ref texturePreviewIdCounter);
+        PreviewSession.SyncPreviewVersion(nextVersion);
     }
 
     private void PreviewSelectedAssetImmediately()
@@ -273,14 +278,15 @@ public partial class MainWindow : Window
     {
         if (AssetListDataGrid.SelectedItem is not AssetItem assetItem)
         {
-            _dumpRequestCoordinator.CancelCurrent();
+            PreviewSession.CancelPendingDump();
+            PreviewSession.DumpTextContent = string.Empty;
             DumpTextBox.Text = string.Empty;
             return;
         }
 
-        var token = _dumpRequestCoordinator.BeginNewRequest(out var requestId);
+        var token = PreviewSession.BeginDumpRequest(out var requestId, "Loading dump...");
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
-        DumpTextBox.Text = "Loading dump...";
+        DumpTextBox.Text = PreviewSession.DumpTextContent;
         var shouldPauseIndexing = assetsManager.LazyLoading && assetItem.Handle != null;
         if (shouldPauseIndexing)
         {
@@ -309,7 +315,8 @@ public partial class MainWindow : Window
 
             if (asset == null)
             {
-                DumpTextBox.Text = "No Dump Available";
+                PreviewSession.CompleteDumpRequest(requestId, null, "No Dump Available", truncate: false);
+                DumpTextBox.Text = PreviewSession.DumpTextContent;
                 return;
             }
 
@@ -321,7 +328,8 @@ public partial class MainWindow : Window
             {
                 return;
             }
-            DumpTextBox.Text = truncatedDump;
+            PreviewSession.CompleteDumpRequest(requestId, truncatedDump, "No Dump Available", truncate: false);
+            DumpTextBox.Text = PreviewSession.DumpTextContent;
         }
         catch (OperationCanceledException)
         {
@@ -333,7 +341,9 @@ public partial class MainWindow : Window
             {
                 return;
             }
-            DumpTextBox.Text = $"Dump {assetItem.Type}:{assetItem.Name} error{Environment.NewLine}{ex.Message}{Environment.NewLine}{ex.StackTrace}";
+            var dumpError = $"Dump {assetItem.Type}:{assetItem.Name} error{Environment.NewLine}{ex.Message}{Environment.NewLine}{ex.StackTrace}";
+            PreviewSession.FailDumpRequest(requestId, dumpError);
+            DumpTextBox.Text = PreviewSession.DumpTextContent;
         }
         finally
         {
@@ -494,7 +504,13 @@ public partial class MainWindow : Window
     private void PreviewShaderAsync(AssetItem assetItem, Shader m_Shader, string fbxHeader)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
-        TextPreviewBox.Text = "Loading shader preview...";
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Shader,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: $"Loading shader preview: {assetItem.Name}...");
+        PreviewSession.TextContent = "Loading shader preview...";
+        TextPreviewBox.Text = PreviewSession.TextContent;
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
         StatusStripUpdate($"Loading shader preview: {assetItem.Name}...");
@@ -515,6 +531,7 @@ public partial class MainWindow : Window
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(truncated, PreviewSurfaceKind.Shader, assetItem, truncate: false);
                     TextPreviewBox.Text = truncated;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
@@ -535,6 +552,7 @@ public partial class MainWindow : Window
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(errorText, PreviewSurfaceKind.Shader, assetItem, truncate: false);
                     TextPreviewBox.Text = errorText;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
@@ -547,7 +565,13 @@ public partial class MainWindow : Window
     private void PreviewPrefabInstanceAsync(AssetItem assetItem, Object prefab, string fbxHeader)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
-        TextPreviewBox.Text = "Loading prefab preview...";
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Prefab,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: $"Loading prefab preview: {assetItem.Name}...");
+        PreviewSession.TextContent = "Loading prefab preview...";
+        TextPreviewBox.Text = PreviewSession.TextContent;
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
         StatusStripUpdate($"Loading prefab preview: {assetItem.Name}...");
@@ -568,6 +592,7 @@ public partial class MainWindow : Window
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(truncated, PreviewSurfaceKind.Prefab, assetItem, truncate: false);
                     TextPreviewBox.Text = truncated;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
@@ -588,6 +613,7 @@ public partial class MainWindow : Window
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(errorText, PreviewSurfaceKind.Prefab, assetItem, truncate: false);
                     TextPreviewBox.Text = errorText;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
@@ -600,7 +626,13 @@ public partial class MainWindow : Window
     private void PreviewDefaultDumpAsync(AssetItem assetItem, Object asset, string fbxHeader)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
-        TextPreviewBox.Text = "Loading asset preview...";
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Text,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: $"Loading asset preview: {assetItem.Name}...");
+        PreviewSession.TextContent = "Loading asset preview...";
+        TextPreviewBox.Text = PreviewSession.TextContent;
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
 
@@ -631,12 +663,14 @@ public partial class MainWindow : Window
 
                     if (truncated != null)
                     {
+                        PreviewSession.ShowTextPreview(truncated, PreviewSurfaceKind.Text, assetItem, truncate: false);
                         TextPreviewBox.Text = truncated;
                         TextPreviewBox.IsVisible = true;
                         PreviewLabel.IsVisible = false;
                     }
                     else
                     {
+                        PreviewSession.ShowTextPreview(string.Empty, PreviewSurfaceKind.None, assetItem, truncate: false);
                         TextPreviewBox.Text = string.Empty;
                         TextPreviewBox.IsVisible = false;
                         PreviewLabel.IsVisible = displayInfo.IsChecked == true;
@@ -657,6 +691,7 @@ public partial class MainWindow : Window
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(errorText, PreviewSurfaceKind.Text, assetItem, truncate: false);
                     TextPreviewBox.Text = errorText;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;

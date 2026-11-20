@@ -5,6 +5,7 @@ using Avalonia.Media;
 using Avalonia.Media.Immutable;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -101,6 +102,10 @@ public partial class MainWindow
             BuildTextAssetDialogueCards(preview);
         }
 
+        bool isDark = ActualThemeVariant == global::Avalonia.Styling.ThemeVariant.Dark;
+        var vmCards = prebuiltCards ?? (TextAssetDialogueCardsList.ItemsSource as IReadOnlyList<TextAssetDialogueCardViewModel>);
+        PreviewSession.ShowDialogueCards(assetItem, preview, vmCards, isDark);
+
         TextAssetPreviewPanel.IsVisible = true;
         SetTextAssetPreviewMode(TextAssetPreviewMode.Cards);
     }
@@ -109,6 +114,7 @@ public partial class MainWindow
     {
         _previewRequestCoordinator.CancelCurrent();
         currentTextAssetPreview = null;
+        PreviewSession.ClearDialogueCards();
         TextAssetPreviewPanel.IsVisible = false;
         TextAssetDetailsTextBox.Text = string.Empty;
         TextAssetDialogueCardsList.ItemsSource = null;
@@ -141,6 +147,13 @@ public partial class MainWindow
         TextAssetDetailsTextBox.IsVisible = !showCards;
 
         currentPreviewMode = mode;
+        var vmMode = mode switch
+        {
+            TextAssetPreviewMode.Text => TextAssetDisplayMode.Text,
+            TextAssetPreviewMode.Info => TextAssetDisplayMode.Info,
+            _ => TextAssetDisplayMode.Cards
+        };
+        PreviewSession.SetDialogueDisplayMode(vmMode, currentTextAssetPreview.PlainTextScript, currentTextAssetPreview.DetailsText);
 
         if (mode == TextAssetPreviewMode.Text)
         {

@@ -1,6 +1,7 @@
 using Avalonia.Input;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using SkiaSharp;
 using System;
 using System.Collections.Generic;
@@ -189,6 +190,18 @@ public partial class MainWindow
                     _2dAnimCurrentFrameIndex = 0;
                     _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
                     _2dAnimStartTime = DateTime.UtcNow;
+                    PreviewSession.ActivateSurface(
+                        PreviewSurfaceKind.Animation2D,
+                        AssetListDataGrid?.SelectedItem as AssetItem,
+                        isLoading: false);
+                    MeshPreview.SetAnimationState(
+                        isLoaded: true,
+                        clipName: clip.m_Name ?? string.Empty,
+                        durationSeconds: _2dAnimDuration,
+                        currentTimeSeconds: 0.0,
+                        isPlaying: true,
+                        totalFrames: _2dAnimFrames.Count,
+                        sampleRate: clip.m_SampleRate > 0 ? clip.m_SampleRate : 30.0);
                     ShowAnimationPlayback(_2dAnimFrames.Count);
                     Render2DAnimationFrame(0);
 
@@ -273,6 +286,7 @@ public partial class MainWindow
         {
             _2dAnimCurrentFrameIndex = frameIndex;
             Set2DAnimationFrame(bitmap);
+            MeshPreview.SeekFrame(_2dAnimCurrentFrameIndex, _2dAnimFrames.Count);
             UpdateAnimationPlaybackFrame(_2dAnimCurrentFrameIndex, _2dAnimFrames.Count);
         }
     }
@@ -287,6 +301,7 @@ public partial class MainWindow
         _2dAnimPausedElapsedSeconds = (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
         _2dAnimPaused = true;
         _2dAnimTimer?.Stop();
+        MeshPreview.Pause();
         SetAnimationPlaybackPaused(true);
     }
 
@@ -300,6 +315,7 @@ public partial class MainWindow
         _2dAnimStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(_2dAnimPausedElapsedSeconds);
         _2dAnimPaused = false;
         _2dAnimTimer?.Start();
+        MeshPreview.Play();
         SetAnimationPlaybackPaused(false);
     }
 
@@ -313,6 +329,7 @@ public partial class MainWindow
         _2dAnimPaused = false;
         _2dAnimPausedElapsedSeconds = 0;
         _2dAnimStartTime = DateTime.UtcNow;
+        MeshPreview.Restart();
         Render2DAnimationFrame(0);
         _2dAnimTimer?.Start();
         SetAnimationPlaybackPaused(false);

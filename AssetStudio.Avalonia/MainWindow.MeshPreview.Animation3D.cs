@@ -1,6 +1,7 @@
 using Avalonia.Threading;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -439,11 +440,13 @@ internal sealed class AnimationRigPreviewCache
 
 public partial class MainWindow
 {
-    private readonly AnimationPreviewLoadCoordinator _animationPreviewCoordinator = new();
-    private readonly AnimationRigPreviewCache _animationRigPreviewCache = new();
+    private AnimationPreviewLoadCoordinator _animationPreviewCoordinator => PreviewSession.AnimationCoordinator;
+    private AnimationRigPreviewCache _animationRigPreviewCache => MeshPreview.RigCache;
 
     private sealed class PreparedAnimationClipPreviewOutcome
     {
+        public string ClipName { get; init; } = string.Empty;
+        public float SampleRate { get; init; } = 30f;
         public IReadOnlyList<PreviewCandidateItem>? Candidates { get; init; }
         public PreviewCandidateItem? SelectedCandidate { get; init; }
         public Avatar? Avatar { get; init; }
@@ -578,6 +581,16 @@ public partial class MainWindow
         PreparedAnimationClipPreviewOutcome outcome,
         bool rebuildCandidateControls)
     {
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Animation3D,
+            AssetListDataGrid?.SelectedItem as AssetItem,
+            isLoading: false);
+        MeshPreview.SetMeshAndRigSummary(
+            meshSummary: null,
+            rigSummary: outcome.StatusMessage,
+            meshName: outcome.Mesh?.m_Name,
+            avatarName: outcome.Avatar?.m_Name);
+
         if (rebuildCandidateControls && outcome.Candidates != null)
         {
             BuildPreviewCandidateControls(outcome.Candidates, outcome.SelectedCandidate, "Animation Target");
@@ -602,12 +615,29 @@ public partial class MainWindow
 
             if (outcome.FrameCount > 0)
             {
+                var fps = outcome.SampleRate > 0f ? outcome.SampleRate : 30f;
+                MeshPreview.SetAnimationState(
+                    isLoaded: true,
+                    clipName: outcome.ClipName,
+                    avatarName: outcome.Avatar?.m_Name ?? string.Empty,
+                    durationSeconds: outcome.FrameCount / (double)fps,
+                    currentTimeSeconds: 0.0,
+                    isPlaying: true,
+                    totalFrames: outcome.FrameCount,
+                    sampleRate: fps,
+                    availableAnimations: outcome.Candidates,
+                    selectedAnimation: outcome.SelectedCandidate);
                 ShowAnimationPlayback(outcome.FrameCount);
             }
             else
             {
+                MeshPreview.SetAnimationState(isLoaded: false);
                 HideAnimationPlayback();
             }
+        }
+        else
+        {
+            MeshPreview.SetAnimationState(isLoaded: false);
         }
 
         if (!string.IsNullOrEmpty(outcome.StatusMessage))
@@ -898,6 +928,8 @@ public partial class MainWindow
 
         return new PreparedAnimationClipPreviewOutcome
         {
+            ClipName = clip.m_Name ?? string.Empty,
+            SampleRate = resolvedSampleRate,
             Candidates = candidates,
             SelectedCandidate = resolvedCandidate ?? activeCandidate,
             Avatar = avatar,

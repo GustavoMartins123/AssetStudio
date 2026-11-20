@@ -1,6 +1,7 @@
 using Avalonia.Threading;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -322,6 +323,16 @@ public partial class MainWindow
     {
         currentPreviewAvatar = avatar;
         currentPreviewMesh = avatarMesh;
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Avatar,
+            AssetListDataGrid?.SelectedItem as AssetItem,
+            metadataSummary: infoText,
+            isLoading: false);
+        MeshPreview.SetMeshAndRigSummary(
+            meshSummary: null,
+            rigSummary: infoText,
+            meshName: avatarMesh?.m_Name,
+            avatarName: avatar.m_Name);
         var selectedMeshId = GetPreviewObjectKey(avatarMesh);
         var selectedCandidate = selectedCandidateOverride == null
             ? null
@@ -407,7 +418,10 @@ public partial class MainWindow
             sb.AppendLine("Skeleton nodes are not defined or parsed.");
         }
 
-        SetTextWithTruncation(TextPreviewBox, sb.ToString());
+        var fallbackReport = sb.ToString();
+        PreviewSession.ShowTextPreview(fallbackReport, PreviewSurfaceKind.Avatar, AssetListDataGrid?.SelectedItem as AssetItem);
+        MeshPreview.RigSummaryText = fallbackReport;
+        SetTextWithTruncation(TextPreviewBox, fallbackReport);
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
     }

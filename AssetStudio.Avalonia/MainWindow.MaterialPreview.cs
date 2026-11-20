@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 
 namespace AssetStudio.Avalonia;
 
@@ -23,7 +24,15 @@ public partial class MainWindow
 
         currentPreviewTexture = null;
         var currentId = ++texturePreviewIdCounter;
-        TextPreviewBox.Text = $"Material: {m_Material.m_Name}\n\nLoading material preview...";
+        PreviewSession.SyncPreviewVersion(currentId);
+        var initialText = $"Material: {m_Material.m_Name}\n\nLoading material preview...";
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Material,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: "Loading material preview...");
+        PreviewSession.TextContent = initialText;
+        TextPreviewBox.Text = initialText;
         TextPreviewBox.IsVisible = true;
         ImagePreviewBox.IsVisible = false;
         PreviewLabel.IsVisible = false;

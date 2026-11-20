@@ -11,6 +11,44 @@ using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
+public sealed class MeshMaterialPreviewSlot
+{
+    public int SlotIndex { get; init; }
+    public string MaterialName { get; init; } = string.Empty;
+    public global::OpenTK.Mathematics.Vector4 BaseColor { get; init; } = global::OpenTK.Mathematics.Vector4.One;
+    public global::OpenTK.Mathematics.Vector4 CurrentColor { get; set; } = global::OpenTK.Mathematics.Vector4.One;
+
+    public override string ToString()
+    {
+        return $"{SlotIndex + 1}: {MaterialName}";
+    }
+}
+
+public sealed class PreviewCandidateItem
+{
+    public AssetStudio.AnimationClip? AnimationClip { get; init; }
+    public AssetStudio.Avatar? Avatar { get; init; }
+    public AssetStudio.Mesh? Mesh { get; init; }
+    public string AvatarId { get; init; } = string.Empty;
+    public string MeshId { get; init; } = string.Empty;
+    public string ModelGroupId { get; init; } = string.Empty;
+    public string ModelGroupName { get; init; } = string.Empty;
+    public IReadOnlyList<string> ModelGroupMeshIds { get; init; } = Array.Empty<string>();
+    internal IReadOnlyList<ModelGroupMeshInfo> ModelGroupMeshInfos { get; init; } = Array.Empty<ModelGroupMeshInfo>();
+    public IReadOnlyList<AssetStudio.Mesh> ModelGroupMeshes { get; init; } = Array.Empty<AssetStudio.Mesh>();
+    public IReadOnlyList<float[]?> ModelGroupTransforms { get; init; } = Array.Empty<float[]?>();
+    public int ModelGroupMeshCount { get; init; }
+    public int ModelGroupConfidence { get; init; }
+    public string Label { get; init; } = string.Empty;
+
+    public bool IsModelGroup => !string.IsNullOrWhiteSpace(ModelGroupId);
+
+    public override string ToString()
+    {
+        return Label;
+    }
+}
+
 public partial class MainWindow
 {
     private const double MinAvatarPreviewBoneScale = 0.1;
@@ -28,44 +66,6 @@ public partial class MainWindow
     private CancellationTokenSource? previewCandidateSelectionCts;
     private const int PreviewCandidateInitialBatchSize = 64;
     private const int PreviewCandidateAppendBatchSize = 128;
-
-    private sealed class MeshMaterialPreviewSlot
-    {
-        public int SlotIndex { get; init; }
-        public string MaterialName { get; init; } = string.Empty;
-        public global::OpenTK.Mathematics.Vector4 BaseColor { get; init; } = global::OpenTK.Mathematics.Vector4.One;
-        public global::OpenTK.Mathematics.Vector4 CurrentColor { get; set; } = global::OpenTK.Mathematics.Vector4.One;
-
-        public override string ToString()
-        {
-            return $"{SlotIndex + 1}: {MaterialName}";
-        }
-    }
-
-    private sealed class PreviewCandidateItem
-    {
-        public AssetStudio.AnimationClip? AnimationClip { get; init; }
-        public AssetStudio.Avatar? Avatar { get; init; }
-        public AssetStudio.Mesh? Mesh { get; init; }
-        public string AvatarId { get; init; } = string.Empty;
-        public string MeshId { get; init; } = string.Empty;
-        public string ModelGroupId { get; init; } = string.Empty;
-        public string ModelGroupName { get; init; } = string.Empty;
-        public IReadOnlyList<string> ModelGroupMeshIds { get; init; } = Array.Empty<string>();
-        public IReadOnlyList<ModelGroupMeshInfo> ModelGroupMeshInfos { get; init; } = Array.Empty<ModelGroupMeshInfo>();
-        public IReadOnlyList<AssetStudio.Mesh> ModelGroupMeshes { get; init; } = Array.Empty<AssetStudio.Mesh>();
-        public IReadOnlyList<float[]?> ModelGroupTransforms { get; init; } = Array.Empty<float[]?>();
-        public int ModelGroupMeshCount { get; init; }
-        public int ModelGroupConfidence { get; init; }
-        public string Label { get; init; } = string.Empty;
-
-        public bool IsModelGroup => !string.IsNullOrWhiteSpace(ModelGroupId);
-
-        public override string ToString()
-        {
-            return Label;
-        }
-    }
 
     private void ResetViewBtn_Click(object? sender, RoutedEventArgs e)
     {
@@ -101,6 +101,7 @@ public partial class MainWindow
         }
 
         appSettings.ModelPreviewViewPreset = preset.ToString();
+        MeshPreview.ViewPreset = preset;
         if (GLPreviewControl != null)
         {
             GLPreviewControl.ViewPreset = preset;
@@ -181,6 +182,7 @@ public partial class MainWindow
 
         ApplyAvatarPreviewBoneScale(boneScale);
         ApplyAvatarPreviewMeshDensity(densityPercent);
+        MeshPreview.ViewPreset = viewPreset;
         if (GLPreviewControl != null)
         {
             GLPreviewControl.ViewPreset = viewPreset;
@@ -189,6 +191,7 @@ public partial class MainWindow
 
     private void ApplyAvatarPreviewBoneScale(double boneScale)
     {
+        MeshPreview.BoneScale = boneScale;
         if (GLPreviewControl != null)
         {
             GLPreviewControl.BoneScale = (float)boneScale;
@@ -201,6 +204,7 @@ public partial class MainWindow
 
     private void ApplyAvatarPreviewMeshDensity(double densityPercent)
     {
+        MeshPreview.MeshDensityPercent = densityPercent;
         if (GLPreviewControl != null)
         {
             GLPreviewControl.PreviewMeshDensityPercent = (float)densityPercent;
@@ -215,6 +219,8 @@ public partial class MainWindow
 
     private void ShowPreviewGeometryControls(bool showBoneControls)
     {
+        MeshPreview.IsGeometryControlsVisible = true;
+        MeshPreview.IsBoneControlsVisible = showBoneControls;
         if (BoneSizeContainer != null)
         {
             BoneSizeContainer.IsVisible = true;
@@ -227,6 +233,8 @@ public partial class MainWindow
 
     private void HidePreviewGeometryControls()
     {
+        MeshPreview.IsGeometryControlsVisible = false;
+        MeshPreview.IsBoneControlsVisible = false;
         if (BoneSizeContainer != null)
         {
             BoneSizeContainer.IsVisible = false;
@@ -238,6 +246,8 @@ public partial class MainWindow
         previewCandidateListVersion++;
         previewCandidateSelectionVersion++;
         previewCandidateSelectionCts?.Cancel();
+        PreviewSession.ClearCandidates();
+        MeshPreview.SetAvailableAnimations(null, null);
         updatingPreviewCandidateControls = true;
         try
         {
@@ -312,6 +322,14 @@ public partial class MainWindow
             updatingPreviewCandidateControls = false;
         }
 
+        var initialSlice = previewCandidateItems.ToArray();
+        var effectiveSelected = PreviewCandidateSelector?.SelectedItem as PreviewCandidateItem ?? selectedCandidate;
+        PreviewSession.SetCandidates(initialSlice, effectiveSelected, label);
+        if (candidates.Any(c => c.AnimationClip != null))
+        {
+            MeshPreview.SetAvailableAnimations(initialSlice, effectiveSelected);
+        }
+
         if (initialCount < candidates.Count)
         {
             _ = AppendPreviewCandidatesAsync(candidates.Skip(initialCount).ToList(), version);
@@ -334,10 +352,14 @@ public partial class MainWindow
                     return;
                 }
 
+                var chunk = new PreviewCandidateItem[count];
                 for (var i = 0; i < count; i++)
                 {
-                    previewCandidateItems.Add(candidates[start + i]);
+                    var item = candidates[start + i];
+                    previewCandidateItems.Add(item);
+                    chunk[i] = item;
                 }
+                PreviewSession.AppendCandidates(chunk);
             }, DispatcherPriority.Background);
 
             await Task.Delay(1);
@@ -345,7 +367,7 @@ public partial class MainWindow
     }
 
     private PreviewCandidateItem? SelectedPreviewCandidate =>
-        PreviewCandidateSelector?.SelectedItem as PreviewCandidateItem;
+        (PreviewCandidateSelector?.SelectedItem as PreviewCandidateItem) ?? PreviewSession.SelectedPreviewCandidate;
 
     private void PreviewCandidateSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
@@ -354,7 +376,12 @@ public partial class MainWindow
             return;
         }
 
-        var candidate = SelectedPreviewCandidate;
+        var candidate = PreviewCandidateSelector?.SelectedItem as PreviewCandidateItem;
+        PreviewSession.SelectedPreviewCandidate = candidate;
+        if (candidate?.AnimationClip != null)
+        {
+            MeshPreview.SelectedAnimation = candidate;
+        }
         if (candidate == null)
         {
             return;
@@ -585,6 +612,7 @@ public partial class MainWindow
 
     private void ClearMeshMaterialControls()
     {
+        MeshPreview.ClearMaterialSlots();
         updatingMeshMaterialControls = true;
         try
         {
@@ -657,6 +685,7 @@ public partial class MainWindow
             updatingMeshMaterialControls = false;
         }
 
+        MeshPreview.SetMaterialSlots(meshMaterialPreviewSlots.ToArray(), selectedIndex: 0);
         UpdateMeshMaterialControlValues();
         ApplyMeshMaterialOverrides();
     }
@@ -705,6 +734,7 @@ public partial class MainWindow
             updatingMeshMaterialControls = false;
         }
 
+        MeshPreview.SetMaterialSlots(meshMaterialPreviewSlots.ToArray(), selectedIndex: 0);
         UpdateMeshMaterialControlValues();
         ApplyMeshMaterialOverrides();
     }
@@ -754,7 +784,7 @@ public partial class MainWindow
     }
 
     private MeshMaterialPreviewSlot? SelectedMeshMaterialSlot =>
-        MeshMaterialSelector?.SelectedItem as MeshMaterialPreviewSlot;
+        (MeshMaterialSelector?.SelectedItem as MeshMaterialPreviewSlot) ?? MeshPreview.SelectedMaterialSlot;
 
     private void MeshMaterialSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
@@ -763,6 +793,7 @@ public partial class MainWindow
             return;
         }
 
+        MeshPreview.SelectedMaterialSlot = MeshMaterialSelector?.SelectedItem as MeshMaterialPreviewSlot;
         UpdateMeshMaterialControlValues();
         if (SelectedMeshMaterialSlot is { } selectedSlot)
         {

@@ -1,5 +1,6 @@
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using SkiaSharp;
 using System;
 using System.Collections.Generic;
@@ -16,17 +17,20 @@ public partial class MainWindow
     private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
     {
         currentPreviewTexture = m_Texture2D;
+        PreviewSession.ActivateSurface(PreviewSurfaceKind.Texture, assetItem, isLoading: true);
         UpdateImagePreview();
     }
 
     private void PreviewSprite(AssetItem assetItem, Sprite m_Sprite)
     {
         currentPreviewSprite = m_Sprite;
+        PreviewSession.ActivateSurface(PreviewSurfaceKind.Sprite, assetItem, isLoading: true);
         UpdateImagePreview();
     }
 
     private void PreviewFont(AssetItem assetItem, AssetStudio.Font m_Font)
     {
+        PreviewSession.ActivateSurface(PreviewSurfaceKind.Font, assetItem, isLoading: true);
         if (m_Font.m_FontData == null || m_Font.m_FontData.Length == 0)
         {
             StatusStripUpdate("Font has no embedded binary data.");
@@ -40,6 +44,7 @@ public partial class MainWindow
             sb.AppendLine();
             sb.AppendLine("Raw metadata export is still available.");
 
+            PreviewSession.ShowTextPreview(sb.ToString(), PreviewSurfaceKind.Font, assetItem);
             SetTextWithTruncation(TextPreviewBox, sb.ToString());
             ImagePreviewBox.IsVisible = false;
             TextPreviewBox.IsVisible = true;
@@ -48,6 +53,7 @@ public partial class MainWindow
             {
                 PreviewInfoBorder.IsVisible = false;
             }
+            PreviewSession.ClearCacheBadge();
             ClearPreviewCacheBadge();
             return;
         }
@@ -252,6 +258,7 @@ public partial class MainWindow
 
         Interlocked.Increment(ref texturePreviewIdCounter);
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        PreviewSession.SetChannels(textureChannels);
         var channelsSnapshot = (bool[])textureChannels.Clone();
 
         if (useGpuTexturePreview && TextureGLPreview != null && !forceCpu)

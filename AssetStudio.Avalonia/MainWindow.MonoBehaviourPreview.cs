@@ -1,4 +1,5 @@
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using Avalonia.Threading;
 using System;
 using System.Threading;
@@ -11,7 +12,13 @@ public partial class MainWindow
     private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
-        TextPreviewBox.Text = "Loading MonoBehaviour preview...";
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.MonoBehaviour,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: $"Loading MonoBehaviour preview: {assetItem.Name}...");
+        PreviewSession.TextContent = "Loading MonoBehaviour preview...";
+        TextPreviewBox.Text = PreviewSession.TextContent;
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
         StatusStripUpdate($"Loading MonoBehaviour preview: {assetItem.Name}...");
@@ -163,12 +170,14 @@ public partial class MainWindow
 
             if (truncatedText != null)
             {
+                PreviewSession.ShowTextPreview(truncatedText, PreviewSurfaceKind.MonoBehaviour, truncate: false);
                 TextPreviewBox.Text = truncatedText;
                 TextPreviewBox.IsVisible = true;
                 PreviewLabel.IsVisible = false;
             }
             else
             {
+                PreviewSession.ShowTextPreview(string.Empty, PreviewSurfaceKind.MonoBehaviour, truncate: false);
                 TextPreviewBox.Text = string.Empty;
                 TextPreviewBox.IsVisible = false;
                 PreviewLabel.IsVisible = displayInfo.IsChecked == true;

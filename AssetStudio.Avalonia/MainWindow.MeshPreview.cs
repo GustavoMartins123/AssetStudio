@@ -1,5 +1,6 @@
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -11,6 +12,8 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private MeshPreviewViewModel? _meshPreview;
+    internal MeshPreviewViewModel MeshPreview => _meshPreview ??= new MeshPreviewViewModel(DispatchToPreviewUi);
     private long _activeMeshBadgePreviewId;
     private string? _activeMeshBadgeSourceKind;
     private bool _activeMeshGeometryFromCache;
@@ -24,6 +27,10 @@ public partial class MainWindow
         }
 
         _activeMeshGeometryFromCache = fromCache;
+        PreviewSession.UpdateCacheBadge(
+            fromCache: fromCache,
+            sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
+            materialsLoading: _activeMeshMaterialsLoading);
         UpdatePreviewCacheBadge(
             fromCache: fromCache,
             sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
@@ -44,6 +51,12 @@ public partial class MainWindow
         }
 
         var meshPreviewId = texturePreviewIdCounter;
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Mesh3D,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: "Preparing mesh preview...");
+        MeshPreview.ActiveMeshName = m_Mesh.m_Name ?? assetItem.Name;
         PreviewLabel.IsVisible = false;
         StatusStripUpdate("Preparing mesh preview...");
         if (displayInfo.IsChecked == true && PreviewInfoBorder != null && PreviewInfoOverlay != null)
@@ -65,8 +78,9 @@ public partial class MainWindow
                 }
 
                 var uvs = BuildMeshPreviewUvs(m_Mesh);
+                var meshSummary = FormatMeshPreviewSummary(m_Mesh, localAssetItem);
                 var quickInfoText = includeMeshInfo
-                    ? FormatMeshPreviewSummary(m_Mesh, localAssetItem) + Environment.NewLine + "Loading material details..."
+                    ? meshSummary + Environment.NewLine + "Loading material details..."
                     : string.Empty;
 
                 Dispatcher.UIThread.Post(() =>
@@ -76,6 +90,12 @@ public partial class MainWindow
                         return;
                     }
 
+                    MeshPreview.SetMeshAndRigSummary(
+                        meshSummary: meshSummary,
+                        associatedMaterialsSummary: "Loading material details...",
+                        meshName: m_Mesh.m_Name);
+                    PreviewSession.PreviewMetadataSummary = quickInfoText;
+
                     if (GLPreviewControl != null)
                     {
                         currentPreviewMesh = m_Mesh;
@@ -83,6 +103,7 @@ public partial class MainWindow
                         _activeMeshBadgeSourceKind = "mesh-geometry";
                         _activeMeshGeometryFromCache = false;
                         _activeMeshMaterialsLoading = true;
+                        PreviewSession.UpdateCacheBadge(fromCache: false, sourceKind: "mesh-geometry", materialsLoading: true);
                         UpdatePreviewCacheBadge(fromCache: false, sourceKind: "mesh-geometry", materialsLoading: true);
                         GLPreviewControl.SetMesh(m_Mesh, uvs);
                         GLPreviewControl.IsVisible = true;
@@ -126,6 +147,8 @@ public partial class MainWindow
                         ? FormatLazyMeshPreview(m_Mesh, localAssetItem, allMaterials)
                         : FormatMeshPreview(m_Mesh, localAssetItem)
                     : string.Empty;
+                var materialsSummary = $"Associated Materials ({allMaterials.Count(m => m != null)}): " +
+                    string.Join(", ", allMaterials.Where(m => m != null).Select(m => m!.m_Name));
                 var hasTextures = subMeshTextures.Any(t => t != null);
 
                 Dispatcher.UIThread.Post(() =>
@@ -134,6 +157,13 @@ public partial class MainWindow
                     {
                         return;
                     }
+
+                    MeshPreview.SetMeshAndRigSummary(
+                        meshSummary: meshSummary,
+                        associatedMaterialsSummary: materialsSummary,
+                        meshName: m_Mesh.m_Name);
+                    PreviewSession.PreviewMetadataSummary = infoText;
+                    PreviewSession.IsLoading = false;
 
                     if (GLPreviewControl != null)
                     {
@@ -152,6 +182,10 @@ public partial class MainWindow
                     }
 
                     _activeMeshMaterialsLoading = false;
+                    PreviewSession.UpdateCacheBadge(
+                        fromCache: _activeMeshGeometryFromCache,
+                        sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
+                        materialsLoading: false);
                     UpdatePreviewCacheBadge(
                         fromCache: _activeMeshGeometryFromCache,
                         sourceKind: _activeMeshBadgeSourceKind ?? "mesh-geometry",
@@ -170,6 +204,8 @@ public partial class MainWindow
                     if (meshPreviewId == texturePreviewIdCounter && ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
                     {
                         _activeMeshMaterialsLoading = false;
+                        PreviewSession.IsLoading = false;
+                        PreviewSession.ClearCacheBadge();
                         ClearPreviewCacheBadge();
                         StatusStripUpdate($"Mesh preview error: {ex.Message}");
                         if (PreviewInfoOverlay != null)

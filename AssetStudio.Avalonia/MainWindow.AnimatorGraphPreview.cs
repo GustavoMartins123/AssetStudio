@@ -1,4 +1,5 @@
 using AssetStudio;
+using AssetStudio.Avalonia.ViewModels;
 using Avalonia.Threading;
 using System;
 using System.Collections.Generic;
@@ -15,7 +16,13 @@ public partial class MainWindow
     private void PreviewAnimatorGraph(Object asset)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
-        TextPreviewBox.Text = "Loading animator preview...";
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.AnimatorGraph,
+            AssetListDataGrid?.SelectedItem as AssetItem,
+            isLoading: true,
+            loadingStatusText: "Loading animator preview...");
+        PreviewSession.TextContent = "Loading animator preview...";
+        TextPreviewBox.Text = PreviewSession.TextContent;
         TextPreviewBox.IsVisible = true;
         PreviewLabel.IsVisible = false;
 
@@ -35,6 +42,7 @@ public partial class MainWindow
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(truncated, PreviewSurfaceKind.AnimatorGraph, truncate: false);
                     TextPreviewBox.Text = truncated;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
@@ -54,6 +62,7 @@ public partial class MainWindow
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(errorText, PreviewSurfaceKind.AnimatorGraph, truncate: false);
                     TextPreviewBox.Text = errorText;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;
