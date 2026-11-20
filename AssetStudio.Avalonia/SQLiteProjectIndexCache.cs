@@ -6,22 +6,29 @@ using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using Microsoft.Data.Sqlite;
 
 namespace AssetStudio.Avalonia
 {
-    public partial class SQLiteProjectIndexCache
+    public partial class SQLiteProjectIndexCache : IDisposable
     {
         private const int WriteBusyTimeoutSeconds = 60;
         private const int ReadBusyTimeoutSeconds = 5;
         private const int DefaultPageSizeBytes = 8192;
         private const int ConnectionCacheSizeKiB = -65536;
         private const long ConnectionMmapSizeBytes = 268435456;
+        internal static readonly int MaxIdleReadConnectionsPerDatabase = Math.Clamp(Environment.ProcessorCount, 4, 16);
         private static readonly object WriteGate = new object();
         private readonly string _cacheDir;
         private readonly HashSet<string> _initializedDbs = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _initLock = new object();
         private readonly ConcurrentDictionary<string, long> _projectIdCache = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, ReadConnectionPoolBucket> _readConnectionPools =
+            new(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+        private long _physicalReadConnectionsOpened;
+        private long _readPoolHits;
+        private int _disposed;
 
         public SQLiteProjectIndexCache()
             : this(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AssetStudio", "IndexCache"))
@@ -38,6 +45,9 @@ namespace AssetStudio.Avalonia
             _cacheDir = cacheDirectory;
             Directory.CreateDirectory(_cacheDir);
         }
+
+        internal long PhysicalReadConnectionsOpened => Interlocked.Read(ref _physicalReadConnectionsOpened);
+        internal long ReadPoolHits => Interlocked.Read(ref _readPoolHits);
 
         public string GetFolderSignature(ProjectScanResult scanResult)
         {
@@ -65,6 +75,7 @@ namespace AssetStudio.Avalonia
             {
                 lock (WriteGate)
                 {
+                    InvalidateReadConnectionPool(dbPath);
                     ClearConnectionPoolsForDb(dbPath);
                     InvalidateProjectIdCacheForDb(dbPath);
 
@@ -267,13 +278,13 @@ namespace AssetStudio.Avalonia
             }.ToString();
         }
 
-        private static string BuildReadConnectionString(string dbPath)
+        private static string BuildReadConnectionString(string dbPath, bool pooling = true)
         {
             return new SqliteConnectionStringBuilder
             {
                 DataSource = dbPath,
                 Mode = SqliteOpenMode.ReadOnly,
-                Pooling = true,
+                Pooling = pooling,
                 DefaultTimeout = ReadBusyTimeoutSeconds
             }.ToString();
         }
@@ -321,18 +332,288 @@ namespace AssetStudio.Avalonia
 
         internal static SqliteConnection CreateReadConnectionByDbPath(string dbPath)
         {
-            var connectionString = BuildReadConnectionString(dbPath);
-            var conn = new SqliteConnection(connectionString);
-            conn.Open();
-            using var pragma = conn.CreateCommand();
-            pragma.CommandText = $@"
-                PRAGMA query_only = ON;
-                PRAGMA busy_timeout = {ReadBusyTimeoutSeconds * 1000};
-                PRAGMA temp_store = MEMORY;
-                PRAGMA cache_size = {ConnectionCacheSizeKiB};
-                PRAGMA mmap_size = {ConnectionMmapSizeBytes};";
-            pragma.ExecuteNonQuery();
-            return conn;
+            return CreateReadConnectionCore(dbPath, pooling: true);
+        }
+
+        private static SqliteConnection CreateReadConnectionCore(string dbPath, bool pooling)
+        {
+            var conn = new SqliteConnection(BuildReadConnectionString(dbPath, pooling));
+            try
+            {
+                conn.Open();
+                using var pragma = conn.CreateCommand();
+                pragma.CommandText = $@"
+                    PRAGMA query_only = ON;
+                    PRAGMA busy_timeout = {ReadBusyTimeoutSeconds * 1000};
+                    PRAGMA temp_store = MEMORY;
+                    PRAGMA cache_size = {ConnectionCacheSizeKiB};
+                    PRAGMA mmap_size = {ConnectionMmapSizeBytes};";
+                pragma.ExecuteNonQuery();
+                return conn;
+            }
+            catch
+            {
+                DisposeQuietly(conn);
+                throw;
+            }
+        }
+
+        private static string NormalizeDbPath(string dbPath)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath))
+            {
+                throw new ArgumentException("Database path must not be empty.", nameof(dbPath));
+            }
+
+            return GetFullPathOrOriginal(dbPath.Trim());
+        }
+
+        internal int GetIdleReadConnectionCount(string dbPath)
+        {
+            var normalizedDbPath = NormalizeDbPath(dbPath);
+            return _readConnectionPools.TryGetValue(normalizedDbPath, out var bucket)
+                ? Volatile.Read(ref bucket.IdleCount)
+                : 0;
+        }
+
+        internal int GetTotalIdleReadConnectionCount()
+        {
+            var total = 0;
+            foreach (var bucket in _readConnectionPools.Values)
+            {
+                total += Volatile.Read(ref bucket.IdleCount);
+            }
+
+            return total;
+        }
+
+        internal long GetReadPoolGeneration(string dbPath)
+        {
+            var normalizedDbPath = NormalizeDbPath(dbPath);
+            return _readConnectionPools.TryGetValue(normalizedDbPath, out var bucket)
+                ? Volatile.Read(ref bucket.Generation)
+                : 0;
+        }
+
+        internal PooledReadConnectionLease RentReadConnection(string dbPath)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var normalizedDbPath = NormalizeDbPath(dbPath);
+            var bucket = _readConnectionPools.GetOrAdd(normalizedDbPath, static _ => new ReadConnectionPoolBucket());
+
+            while (true)
+            {
+                var generation = Volatile.Read(ref bucket.Generation);
+                if (!bucket.IdleConnections.TryTake(out var idleConn))
+                {
+                    break;
+                }
+
+                Interlocked.Decrement(ref bucket.IdleCount);
+
+                if (Volatile.Read(ref _disposed) == 0
+                    && Volatile.Read(ref bucket.Generation) == generation
+                    && idleConn.State == ConnectionState.Open)
+                {
+                    Interlocked.Increment(ref _readPoolHits);
+                    return new PooledReadConnectionLease(this, bucket, idleConn, generation, isPoolHit: true);
+                }
+
+                DisposeQuietly(idleConn);
+            }
+
+            var openGeneration = Volatile.Read(ref bucket.Generation);
+            // Disable Microsoft.Data.Sqlite pooling so our bucket owns deterministic handle disposal on Windows.
+            var freshConn = CreateReadConnectionCore(normalizedDbPath, pooling: false);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                DisposeQuietly(freshConn);
+                throw new ObjectDisposedException(nameof(SQLiteProjectIndexCache));
+            }
+
+            Interlocked.Increment(ref _physicalReadConnectionsOpened);
+            return new PooledReadConnectionLease(this, bucket, freshConn, openGeneration, isPoolHit: false);
+        }
+
+        private void ReturnReadConnection(ReadConnectionPoolBucket bucket, SqliteConnection conn, long leaseGeneration, bool healthy)
+        {
+            Interlocked.Increment(ref bucket.PendingReturns);
+            try
+            {
+                if (!healthy
+                    || Volatile.Read(ref _disposed) != 0
+                    || conn.State != ConnectionState.Open
+                    || Volatile.Read(ref bucket.Generation) != leaseGeneration
+                    || !TryReserveIdleSlot(bucket))
+                {
+                    DisposeQuietly(conn);
+                    return;
+                }
+
+                bucket.IdleConnections.Add(conn);
+
+                // Re-check after Add so a racing invalidation never leaves an idle handle in the bag.
+                if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref bucket.Generation) != leaseGeneration)
+                {
+                    DrainBucket(bucket);
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref bucket.PendingReturns);
+            }
+        }
+
+        private static bool TryReserveIdleSlot(ReadConnectionPoolBucket bucket)
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref bucket.IdleCount);
+                if (current >= MaxIdleReadConnectionsPerDatabase)
+                {
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref bucket.IdleCount, current + 1, current) == current)
+                {
+                    return true;
+                }
+            }
+        }
+
+        private static void DrainBucket(ReadConnectionPoolBucket bucket)
+        {
+            while (bucket.IdleConnections.TryTake(out var conn))
+            {
+                Interlocked.Decrement(ref bucket.IdleCount);
+                DisposeQuietly(conn);
+            }
+        }
+
+        private static void InvalidateBucket(ReadConnectionPoolBucket bucket)
+        {
+            Interlocked.Increment(ref bucket.Generation);
+            DrainBucket(bucket);
+
+            var spin = new SpinWait();
+            while (Volatile.Read(ref bucket.PendingReturns) > 0)
+            {
+                spin.SpinOnce();
+            }
+
+            DrainBucket(bucket);
+        }
+
+        private bool HasReadConnectionPoolBucket(string dbPath)
+        {
+            return _readConnectionPools.ContainsKey(NormalizeDbPath(dbPath));
+        }
+
+        internal void InvalidateReadConnectionPool(string? dbPath = null)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath))
+            {
+                foreach (var bucket in _readConnectionPools.Values)
+                {
+                    InvalidateBucket(bucket);
+                }
+            }
+            else
+            {
+                var normalizedDbPath = NormalizeDbPath(dbPath);
+                if (_readConnectionPools.TryGetValue(normalizedDbPath, out var bucket))
+                {
+                    InvalidateBucket(bucket);
+                }
+            }
+
+            SqliteConnection.ClearAllPools();
+        }
+
+        public void ReleaseReadConnections()
+        {
+            InvalidateReadConnectionPool(dbPath: null);
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            InvalidateReadConnectionPool(dbPath: null);
+            GC.SuppressFinalize(this);
+        }
+
+        private static void DisposeQuietly(SqliteConnection conn)
+        {
+            try
+            {
+                conn.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
+        internal sealed class ReadConnectionPoolBucket
+        {
+            public readonly ConcurrentBag<SqliteConnection> IdleConnections = new();
+            public int IdleCount;
+            public long Generation;
+            public int PendingReturns;
+        }
+
+        internal struct PooledReadConnectionLease : IDisposable
+        {
+            private SQLiteProjectIndexCache? _owner;
+            private ReadConnectionPoolBucket? _bucket;
+            private SqliteConnection? _connection;
+            private readonly long _generation;
+            private bool _healthy;
+
+            internal PooledReadConnectionLease(
+                SQLiteProjectIndexCache owner,
+                ReadConnectionPoolBucket bucket,
+                SqliteConnection connection,
+                long generation,
+                bool isPoolHit)
+            {
+                _owner = owner;
+                _bucket = bucket;
+                _connection = connection;
+                _generation = generation;
+                _healthy = true;
+                IsPoolHit = isPoolHit;
+            }
+
+            public SqliteConnection Connection =>
+                _connection ?? throw new ObjectDisposedException(nameof(PooledReadConnectionLease));
+
+            public bool IsPoolHit { get; }
+            public long Generation => _generation;
+
+            public void MarkUnhealthy()
+            {
+                _healthy = false;
+            }
+
+            public void Dispose()
+            {
+                var conn = _connection;
+                var owner = _owner;
+                var bucket = _bucket;
+                if (conn == null || owner == null || bucket == null)
+                {
+                    return;
+                }
+
+                _connection = null;
+                _owner = null;
+                _bucket = null;
+                owner.ReturnReadConnection(bucket, conn, _generation, _healthy);
+            }
         }
 
         private void InitializeDatabaseByPath(string dbPath)
@@ -341,6 +622,11 @@ namespace AssetStudio.Avalonia
             {
                 lock (WriteGate)
                 {
+                    if (HasReadConnectionPoolBucket(dbPath))
+                    {
+                        InvalidateReadConnectionPool(dbPath);
+                    }
+
                     var isNewOrEmptyDb = !File.Exists(dbPath) || new FileInfo(dbPath).Length == 0;
                     using (var conn = CreateConnectionByDbPath(dbPath, initializePageSize: isNewOrEmptyDb))
                     {
@@ -356,6 +642,7 @@ namespace AssetStudio.Avalonia
                         if (TryUpgradeOrRebuildSchema(conn))
                         {
                             InvalidateProjectIdCacheForDb(dbPath);
+                            InvalidateReadConnectionPool(dbPath);
                         }
 
                         CreateSchema(conn);
@@ -467,7 +754,7 @@ namespace AssetStudio.Avalonia
             return id == null ? null : Convert.ToInt64(id);
         }
 
-        private void ExecuteProjectReadQuery(
+        internal void ExecuteProjectReadQuery(
             string folderPath,
             string signature,
             string errorContext,
@@ -477,15 +764,24 @@ namespace AssetStudio.Avalonia
             var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnectionByDbPath(dbPath);
-                using var transaction = conn.BeginTransaction(deferred: true);
-                var projectId = TryGetOrResolveProjectId(conn, transaction, dbPath, folderPath, signature, out _);
-                if (projectId == null)
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
                 {
-                    return;
-                }
+                    using var transaction = conn.BeginTransaction(deferred: true);
+                    var projectId = TryGetOrResolveProjectId(conn, transaction, dbPath, folderPath, signature, out _);
+                    if (projectId == null)
+                    {
+                        return;
+                    }
 
-                query(conn, transaction, projectId.Value);
+                    query(conn, transaction, projectId.Value);
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
             }
             catch (Exception ex)
             {
