@@ -23,6 +23,11 @@ namespace AssetStudio
         private Dictionary<Transform, ImportedFrame> transformDictionary = new Dictionary<Transform, ImportedFrame>();
         Dictionary<uint, string> morphChannelNames = new Dictionary<uint, string>();
 
+        protected ModelConverter(ImageFormat imageFormat)
+        {
+            this.imageFormat = imageFormat;
+        }
+
         public ModelConverter(GameObject m_GameObject, ImageFormat imageFormat, AnimationClip[] animationList = null)
         {
             this.imageFormat = imageFormat;
@@ -887,16 +892,21 @@ namespace AssetStudio
                 }
             }
 
-            //TODO combine mesh
+            // Reset frame transforms for Unity static-batched meshes (vertices are already baked in world space)
             if (combine)
             {
-                meshR.m_GameObject.TryGet(out var m_GameObject);
-                var frame = RootFrame.FindChild(m_GameObject.m_Name);
+                var batchGameObject = m_GameObject2;
+                if (batchGameObject == null && meshR.m_GameObject != null)
+                {
+                    meshR.m_GameObject.TryGet(out batchGameObject);
+                }
+                var frame = batchGameObject != null && RootFrame != null ? RootFrame.FindChild(batchGameObject.m_Name) : null;
                 if (frame != null)
                 {
                     frame.LocalPosition = RootFrame.LocalPosition;
                     frame.LocalRotation = RootFrame.LocalRotation;
-                    while (frame.Parent != null)
+                    var visitedBatchFrames = new HashSet<ImportedFrame> { frame };
+                    while (frame.Parent != null && visitedBatchFrames.Add(frame.Parent))
                     {
                         frame = frame.Parent;
                         frame.LocalPosition = RootFrame.LocalPosition;
@@ -2265,6 +2275,2009 @@ namespace AssetStudio
                     track.Rotations.Add(new ImportedKeyframe<Vector3>(time, QuaternionToEuler(qFbx)));
                 }
             }
+        }
+
+        public static ModelConverter CreateFromModelGroup(
+            string groupName,
+            GameObject rootGameObject,
+            IReadOnlyList<Mesh> meshes,
+            IReadOnlyList<Renderer> renderers,
+            Avatar avatar,
+            AnimationClip[] animationClips,
+            ImageFormat imageFormat,
+            bool combineMeshes = false)
+        {
+            return CreateFromModelGroup(
+                groupName,
+                rootGameObject,
+                meshes,
+                renderers,
+                avatar,
+                animationClips,
+                imageFormat,
+                combineMeshes,
+                partTransforms: null,
+                partMaterials: null,
+                partNames: null);
+        }
+
+        public static ModelConverter CreateFromModelGroup(
+            string groupName,
+            GameObject rootGameObject,
+            IReadOnlyList<Mesh> meshes,
+            IReadOnlyList<Renderer> renderers,
+            Avatar avatar,
+            AnimationClip[] animationClips,
+            ImageFormat imageFormat,
+            bool combineMeshes,
+            IReadOnlyList<float[]> partTransforms,
+            IReadOnlyList<IReadOnlyList<Material>> partMaterials = null,
+            IReadOnlyList<string> partNames = null)
+        {
+            var converter = new ModelConverter(imageFormat);
+            converter.InitFromModelGroup(
+                groupName,
+                rootGameObject,
+                meshes,
+                renderers,
+                avatar,
+                animationClips,
+                combineMeshes,
+                partTransforms,
+                partMaterials,
+                partNames);
+            return converter;
+        }
+
+        private void InitFromModelGroup(
+            string groupName,
+            GameObject rootGameObject,
+            IReadOnlyList<Mesh> meshes,
+            IReadOnlyList<Renderer> renderers,
+            Avatar providedAvatar,
+            AnimationClip[] animationClips,
+            bool combineMeshes,
+            IReadOnlyList<float[]> partTransforms,
+            IReadOnlyList<IReadOnlyList<Material>> partMaterials,
+            IReadOnlyList<string> partNames)
+        {
+            var effectiveGroupName = !string.IsNullOrWhiteSpace(groupName)
+                ? groupName
+                : !string.IsNullOrWhiteSpace(rootGameObject?.m_Name)
+                    ? rootGameObject.m_Name
+                    : "ModelGroup";
+
+            if (providedAvatar != null)
+            {
+                avatar = providedAvatar;
+            }
+
+            var convertedRenderers = new HashSet<Renderer>();
+            var convertedMeshes = new HashSet<Mesh>();
+
+            if (rootGameObject != null)
+            {
+                HydrateGameObjectHierarchy(rootGameObject);
+                if (rootGameObject.m_Animator != null)
+                {
+                    InitWithAnimator(rootGameObject.m_Animator);
+                    if (animationClips == null)
+                    {
+                        CollectAnimationClip(rootGameObject.m_Animator);
+                    }
+                }
+                else
+                {
+                    InitWithGameObject(rootGameObject);
+                }
+
+                if (avatar == null)
+                {
+                    avatar = FindAvatar(rootGameObject);
+                }
+
+                CollectConvertedRenderersAndMeshesFromHierarchy(rootGameObject.m_Transform, convertedRenderers, convertedMeshes);
+            }
+
+            if (RootFrame == null)
+            {
+                RootFrame = CreateFrame(effectiveGroupName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+                if (avatar != null)
+                {
+                    TryBuildAvatarSkeletonFrames(meshes);
+                }
+            }
+
+            if (renderers != null)
+            {
+                for (int i = 0; i < renderers.Count; i++)
+                {
+                    var renderer = renderers[i];
+                    if (renderer == null || !convertedRenderers.Add(renderer))
+                    {
+                        continue;
+                    }
+
+                    var rendererMesh = GetMesh(renderer);
+                    if (rendererMesh == null && meshes != null && i < meshes.Count)
+                    {
+                        rendererMesh = meshes[i];
+                    }
+
+                    if (rendererMesh == null)
+                    {
+                        continue;
+                    }
+
+                    var rendererGo = ResolveRendererGameObject(renderer);
+                    if (rendererGo != null)
+                    {
+                        HydrateGameObjectHierarchy(rendererGo);
+                        if (rendererGo.m_Transform != null && !transformDictionary.ContainsKey(rendererGo.m_Transform))
+                        {
+                            ConvertTransforms(rendererGo.m_Transform, RootFrame);
+                            CreateBonePathHash(rendererGo.m_Transform);
+                        }
+                    }
+
+                    if (renderer is SkinnedMeshRenderer smr && smr.m_Bones != null)
+                    {
+                        EnsureBoneTransformsInHierarchy(smr);
+                    }
+
+                    var fallbackMats = partMaterials != null && i < partMaterials.Count ? partMaterials[i] : null;
+                    var partTransform = partTransforms != null && i < partTransforms.Count ? partTransforms[i] : null;
+                    var explicitName = partNames != null && i < partNames.Count ? partNames[i] : null;
+
+                    string framePath;
+                    if (rendererGo?.m_Transform != null && transformDictionary.TryGetValue(rendererGo.m_Transform, out var existingFrame))
+                    {
+                        framePath = existingFrame.Path;
+                    }
+                    else
+                    {
+                        var partFrame = CreatePartFrameUnderRoot(
+                            !string.IsNullOrWhiteSpace(explicitName) ? explicitName : rendererGo?.m_Name ?? rendererMesh.m_Name ?? $"Part_{i}",
+                            partTransform);
+                        framePath = partFrame.Path;
+                    }
+
+                    ConvertModelGroupMeshPart(rendererMesh, framePath, fallbackMats, renderer);
+                    convertedMeshes.Add(rendererMesh);
+                }
+            }
+
+            if (meshes != null)
+            {
+                for (int i = 0; i < meshes.Count; i++)
+                {
+                    var mesh = meshes[i];
+                    if (mesh == null)
+                    {
+                        continue;
+                    }
+
+                    var partTransform = partTransforms != null && i < partTransforms.Count ? partTransforms[i] : null;
+                    var partMats = partMaterials != null && i < partMaterials.Count ? partMaterials[i] : null;
+                    var explicitName = partNames != null && i < partNames.Count ? partNames[i] : null;
+
+                    // If the same Mesh asset appears multiple times in a ModelGroup with distinct transforms/names,
+                    // still emit each part instance when rootGameObject was not used to convert them.
+                    if (rootGameObject != null && convertedMeshes.Contains(mesh))
+                    {
+                        continue;
+                    }
+                    if (rootGameObject == null && renderers != null && i < renderers.Count && renderers[i] != null && convertedMeshes.Contains(mesh))
+                    {
+                        continue;
+                    }
+
+                    var partName = !string.IsNullOrWhiteSpace(explicitName)
+                        ? explicitName
+                        : !string.IsNullOrWhiteSpace(mesh.m_Name)
+                            ? mesh.m_Name
+                            : $"Part_{i}";
+                    var partFrame = CreatePartFrameUnderRoot(partName, partTransform);
+                    ConvertModelGroupMeshPart(mesh, partFrame.Path, partMats, null);
+                    convertedMeshes.Add(mesh);
+                }
+            }
+
+            if (animationClips != null)
+            {
+                for (int i = 0; i < animationClips.Length; i++)
+                {
+                    if (animationClips[i] != null)
+                    {
+                        animationClipHashSet.Add(animationClips[i]);
+                    }
+                }
+            }
+
+            ConvertAnimations();
+
+            if (combineMeshes)
+            {
+                CombineMeshes();
+            }
+        }
+
+        private static void HydrateGameObjectHierarchy(GameObject rootGameObject)
+        {
+            if (rootGameObject == null)
+            {
+                return;
+            }
+
+            var visited = new HashSet<GameObject>();
+            var queue = new Queue<GameObject>();
+            queue.Enqueue(rootGameObject);
+
+            while (queue.Count > 0)
+            {
+                var go = queue.Dequeue();
+                if (go == null || !visited.Add(go))
+                {
+                    continue;
+                }
+
+                if (go.m_Components != null)
+                {
+                    for (int i = 0; i < go.m_Components.Length; i++)
+                    {
+                        var compPtr = go.m_Components[i];
+                        if (compPtr == null || compPtr.IsNull)
+                        {
+                            continue;
+                        }
+
+                        Component comp = null;
+                        if (!compPtr.TryGet(out comp) && go.assetsFile?.assetsManager != null)
+                        {
+                            var files = go.assetsFile.assetsManager.assetsFileList;
+                            for (int f = 0; f < files.Count; f++)
+                            {
+                                if (files[f].ObjectsDic.TryGetValue(compPtr.m_PathID, out var obj) && obj is Component foundComp)
+                                {
+                                    comp = foundComp;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (comp == null)
+                        {
+                            continue;
+                        }
+
+                        switch (comp)
+                        {
+                            case Transform tr when go.m_Transform == null:
+                                go.m_Transform = tr;
+                                break;
+                            case MeshRenderer mr when go.m_MeshRenderer == null:
+                                go.m_MeshRenderer = mr;
+                                break;
+                            case MeshFilter mf when go.m_MeshFilter == null:
+                                go.m_MeshFilter = mf;
+                                break;
+                            case SkinnedMeshRenderer smr when go.m_SkinnedMeshRenderer == null:
+                                go.m_SkinnedMeshRenderer = smr;
+                                break;
+                            case Animator anim when go.m_Animator == null:
+                                go.m_Animator = anim;
+                                break;
+                            case Animation legacyAnim when go.m_Animation == null:
+                                go.m_Animation = legacyAnim;
+                                break;
+                        }
+                    }
+                }
+
+                if (go.m_Transform?.m_Children != null)
+                {
+                    for (int c = 0; c < go.m_Transform.m_Children.Length; c++)
+                    {
+                        var childPtr = go.m_Transform.m_Children[c];
+                        if (childPtr == null || childPtr.IsNull)
+                        {
+                            continue;
+                        }
+
+                        if (!childPtr.TryGet(out var childTrans) && go.assetsFile?.assetsManager != null)
+                        {
+                            var files = go.assetsFile.assetsManager.assetsFileList;
+                            for (int f = 0; f < files.Count; f++)
+                            {
+                                if (files[f].ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundTrans)
+                                {
+                                    childTrans = foundTrans;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (childTrans?.m_GameObject == null || childTrans.m_GameObject.IsNull)
+                        {
+                            continue;
+                        }
+
+                        if (!childTrans.m_GameObject.TryGet(out var childGo) && childTrans.assetsFile?.assetsManager != null)
+                        {
+                            var files = childTrans.assetsFile.assetsManager.assetsFileList;
+                            for (int f = 0; f < files.Count; f++)
+                            {
+                                if (files[f].ObjectsDic.TryGetValue(childTrans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                                {
+                                    childGo = foundGo;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (childGo != null && !visited.Contains(childGo))
+                        {
+                            queue.Enqueue(childGo);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void CollectConvertedRenderersAndMeshesFromHierarchy(
+            Transform rootTransform,
+            HashSet<Renderer> convertedRenderers,
+            HashSet<Mesh> convertedMeshes)
+        {
+            if (rootTransform == null)
+            {
+                return;
+            }
+
+            var visited = new HashSet<Transform>();
+            var stack = new Stack<Transform>();
+            stack.Push(rootTransform);
+
+            while (stack.Count > 0)
+            {
+                var trans = stack.Pop();
+                if (trans == null || !visited.Add(trans))
+                {
+                    continue;
+                }
+
+                if (trans.m_GameObject != null && trans.m_GameObject.TryGet(out var go) && go != null)
+                {
+                    if (go.m_MeshRenderer != null)
+                    {
+                        convertedRenderers.Add(go.m_MeshRenderer);
+                        var mesh = GetMesh(go.m_MeshRenderer);
+                        if (mesh != null) convertedMeshes.Add(mesh);
+                    }
+                    if (go.m_SkinnedMeshRenderer != null)
+                    {
+                        convertedRenderers.Add(go.m_SkinnedMeshRenderer);
+                        var mesh = GetMesh(go.m_SkinnedMeshRenderer);
+                        if (mesh != null) convertedMeshes.Add(mesh);
+                    }
+                }
+
+                if (trans.m_Children != null)
+                {
+                    for (int i = 0; i < trans.m_Children.Length; i++)
+                    {
+                        if (trans.m_Children[i] != null && trans.m_Children[i].TryGet(out var child) && child != null)
+                        {
+                            stack.Push(child);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static GameObject ResolveRendererGameObject(Renderer renderer)
+        {
+            if (renderer?.m_GameObject == null || renderer.m_GameObject.IsNull)
+            {
+                return null;
+            }
+
+            if (renderer.m_GameObject.TryGet(out var go) && go != null)
+            {
+                return go;
+            }
+
+            if (renderer.assetsFile?.assetsManager != null)
+            {
+                var files = renderer.assetsFile.assetsManager.assetsFileList;
+                for (int i = 0; i < files.Count; i++)
+                {
+                    if (files[i].ObjectsDic.TryGetValue(renderer.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                    {
+                        return foundGo;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private void EnsureBoneTransformsInHierarchy(SkinnedMeshRenderer smr)
+        {
+            if (smr.m_Bones == null || RootFrame == null)
+            {
+                return;
+            }
+
+            var rootBoneTransforms = new HashSet<Transform>();
+            for (int i = 0; i < smr.m_Bones.Length; i++)
+            {
+                if (!TryGetBoneTransform(smr.m_Bones[i], smr, out var boneTrans) || boneTrans == null)
+                {
+                    continue;
+                }
+
+                if (transformDictionary.ContainsKey(boneTrans))
+                {
+                    continue;
+                }
+
+                // Walk up to the highest ancestor transform not yet in transformDictionary
+                var top = boneTrans;
+                var visitedAncestors = new HashSet<Transform> { top };
+                while (top.m_Father != null && !top.m_Father.IsNull)
+                {
+                    Transform father = null;
+                    if (!top.m_Father.TryGet(out father) && smr.assetsFile?.assetsManager != null)
+                    {
+                        var files = smr.assetsFile.assetsManager.assetsFileList;
+                        for (int f = 0; f < files.Count; f++)
+                        {
+                            if (files[f].ObjectsDic.TryGetValue(top.m_Father.m_PathID, out var obj) && obj is Transform foundFather)
+                            {
+                                father = foundFather;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (father == null || !visitedAncestors.Add(father))
+                    {
+                        break;
+                    }
+
+                    if (transformDictionary.ContainsKey(father))
+                    {
+                        ConvertTransforms(top, transformDictionary[father]);
+                        CreateBonePathHash(top);
+                        top = null;
+                        break;
+                    }
+
+                    top = father;
+                }
+
+                if (top != null && rootBoneTransforms.Add(top))
+                {
+                    ConvertTransforms(top, RootFrame);
+                    CreateBonePathHash(top);
+                }
+            }
+        }
+
+        private void TryBuildAvatarSkeletonFrames(IReadOnlyList<Mesh> meshes)
+        {
+            var skeleton = avatar?.m_Avatar?.m_AvatarSkeleton;
+            var skeletonPose = avatar?.m_Avatar?.m_DefaultPose;
+            var nodes = skeleton?.m_Node;
+            if (nodes == null || nodes.Length == 0 || skeletonPose?.m_X == null || skeleton.m_ID == null)
+            {
+                return;
+            }
+
+            Mesh bestMesh = null;
+            int bestBoneCount = 0;
+            if (meshes != null)
+            {
+                for (int i = 0; i < meshes.Count; i++)
+                {
+                    var m = meshes[i];
+                    if (m == null) continue;
+                    m.EnsureProcessed();
+                    if (m.m_BoneNameHashes != null && m.m_BindPose != null
+                        && m.m_BoneNameHashes.Length == m.m_BindPose.Length
+                        && m.m_BoneNameHashes.Length > bestBoneCount)
+                    {
+                        bestBoneCount = m.m_BoneNameHashes.Length;
+                        bestMesh = m;
+                    }
+                }
+            }
+
+            var skelCount = nodes.Length;
+            var skelNodeToMeshBone = new int[skelCount];
+            for (int i = 0; i < skelCount; i++) skelNodeToMeshBone[i] = -1;
+
+            int[] meshParentIndices = null;
+            System.Numerics.Matrix4x4[] bindPoseInverses = null;
+            System.Numerics.Matrix4x4[] bindPoses = null;
+            bool hasBindPose = false;
+
+            if (bestMesh != null && bestBoneCount > 0)
+            {
+                var meshBoneHashToIdx = new Dictionary<uint, int>(bestBoneCount);
+                for (int j = 0; j < bestBoneCount; j++)
+                {
+                    meshBoneHashToIdx[bestMesh.m_BoneNameHashes[j]] = j;
+                }
+
+                var meshBoneToSkelNode = new int[bestBoneCount];
+                for (int j = 0; j < bestBoneCount; j++) meshBoneToSkelNode[j] = -1;
+
+                for (int i = 0; i < skelCount && i < skeleton.m_ID.Length; i++)
+                {
+                    if (meshBoneHashToIdx.TryGetValue(skeleton.m_ID[i], out int mbIdx))
+                    {
+                        skelNodeToMeshBone[i] = mbIdx;
+                        meshBoneToSkelNode[mbIdx] = i;
+                    }
+                }
+
+                meshParentIndices = new int[bestBoneCount];
+                for (int mb = 0; mb < bestBoneCount; mb++)
+                {
+                    meshParentIndices[mb] = -1;
+                    int skelIdx = meshBoneToSkelNode[mb];
+                    if (skelIdx < 0) continue;
+
+                    int current = nodes[skelIdx].m_ParentId;
+                    int guard = 0;
+                    while (current >= 0 && current < skelCount && guard++ < skelCount)
+                    {
+                        if (skelNodeToMeshBone[current] >= 0)
+                        {
+                            meshParentIndices[mb] = skelNodeToMeshBone[current];
+                            break;
+                        }
+                        current = nodes[current].m_ParentId;
+                    }
+                }
+
+                bindPoseInverses = new System.Numerics.Matrix4x4[bestBoneCount];
+                bindPoses = new System.Numerics.Matrix4x4[bestBoneCount];
+                hasBindPose = true;
+                for (int j = 0; j < bestBoneCount; j++)
+                {
+                    var bp = ToNumericsMatrix(bestMesh.m_BindPose[j]);
+                    bindPoseInverses[j] = bp;
+                    bindPoses[j] = System.Numerics.Matrix4x4.Invert(bp, out var inv)
+                        ? inv
+                        : System.Numerics.Matrix4x4.Identity;
+                }
+            }
+
+            var frames = new ImportedFrame[skelCount];
+            for (int i = 0; i < skelCount; i++)
+            {
+                var xform = i < skeletonPose.m_X.Length ? skeletonPose.m_X[i] : null;
+                uint nodeId = i < skeleton.m_ID.Length ? skeleton.m_ID[i] : (uint)i;
+                var name = avatar.FindBonePath(nodeId);
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = $"Bone_{nodeId}";
+                }
+                else
+                {
+                    var lastSlash = name.LastIndexOf('/');
+                    if (lastSlash >= 0) name = name.Substring(lastSlash + 1);
+                }
+
+                var tVec = xform?.t ?? Vector3.Zero;
+                var qQuat = xform?.q ?? new Quaternion(0, 0, 0, 1);
+                var sVec = xform?.s ?? Vector3.One;
+
+                int mb = skelNodeToMeshBone[i];
+                if (hasBindPose && mb >= 0)
+                {
+                    int pMb = meshParentIndices[mb];
+                    var localMat = pMb >= 0 ? bindPoses[mb] * bindPoseInverses[pMb] : bindPoses[mb];
+                    if (System.Numerics.Matrix4x4.Decompose(localMat, out var s, out var q, out var t))
+                    {
+                        tVec = new Vector3(t.X, t.Y, t.Z);
+                        qQuat = new Quaternion(q.X, q.Y, q.Z, q.W);
+                        sVec = new Vector3(s.X, s.Y, s.Z);
+                    }
+                }
+
+                var frame = RootFrame.FindChild(name);
+                if (frame != null)
+                {
+                    SetFrame(frame, tVec, qQuat, sVec);
+                }
+                else
+                {
+                    frame = CreateFrame(name, tVec, qQuat, sVec);
+                }
+                frames[i] = frame;
+            }
+
+            for (int i = 0; i < skelCount; i++)
+            {
+                var parentId = nodes[i].m_ParentId;
+                var parentFrame = (parentId >= 0 && parentId < frames.Length && parentId != i)
+                    ? frames[parentId]
+                    : RootFrame;
+                if (frames[i].Parent == null)
+                {
+                    parentFrame.AddChild(frames[i]);
+                }
+            }
+
+            for (int i = 0; i < skelCount && i < skeleton.m_ID.Length; i++)
+            {
+                bonePathHash[skeleton.m_ID[i]] = frames[i].Path;
+            }
+        }
+
+        private ImportedFrame CreatePartFrameUnderRoot(string preferredName, float[] unityRowMajorMatrix)
+        {
+            var baseName = string.IsNullOrWhiteSpace(preferredName) ? "Part" : preferredName;
+            var uniqueName = baseName;
+            if (RootFrame != null && RootFrame.FindChild(uniqueName, recursive: false) != null)
+            {
+                for (int suffix = 1; ; suffix++)
+                {
+                    var candidate = $"{baseName}_{suffix}";
+                    if (RootFrame.FindChild(candidate, recursive: false) == null)
+                    {
+                        uniqueName = candidate;
+                        break;
+                    }
+                }
+            }
+
+            var tVec = Vector3.Zero;
+            var qQuat = new Quaternion(0, 0, 0, 1);
+            var sVec = Vector3.One;
+
+            if (unityRowMajorMatrix != null && unityRowMajorMatrix.Length == 16)
+            {
+                // ModelGroupMeshInfo.TransformMatrix stores a Unity column-vector 4x4 matrix in row-major order
+                // (translation in [3], [7], [11]). Transpose to System.Numerics row-vector layout before decomposing.
+                var unityNumerics = new System.Numerics.Matrix4x4(
+                    unityRowMajorMatrix[0], unityRowMajorMatrix[4], unityRowMajorMatrix[8], unityRowMajorMatrix[12],
+                    unityRowMajorMatrix[1], unityRowMajorMatrix[5], unityRowMajorMatrix[9], unityRowMajorMatrix[13],
+                    unityRowMajorMatrix[2], unityRowMajorMatrix[6], unityRowMajorMatrix[10], unityRowMajorMatrix[14],
+                    unityRowMajorMatrix[3], unityRowMajorMatrix[7], unityRowMajorMatrix[11], unityRowMajorMatrix[15]);
+
+                if (System.Numerics.Matrix4x4.Decompose(unityNumerics, out var s, out var q, out var t))
+                {
+                    tVec = new Vector3(t.X, t.Y, t.Z);
+                    qQuat = new Quaternion(q.X, q.Y, q.Z, q.W);
+                    sVec = new Vector3(s.X, s.Y, s.Z);
+                }
+                else
+                {
+                    tVec = new Vector3(unityRowMajorMatrix[3], unityRowMajorMatrix[7], unityRowMajorMatrix[11]);
+                }
+            }
+
+            var frame = CreateFrame(uniqueName, tVec, qQuat, sVec);
+            RootFrame?.AddChild(frame);
+            return frame;
+        }
+
+        private void ConvertModelGroupMeshPart(Mesh mesh, string framePath, IReadOnlyList<Material> fallbackMaterials, Renderer renderer)
+        {
+            if (mesh == null)
+            {
+                return;
+            }
+
+            mesh.EnsureProcessed();
+            if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
+            {
+                return;
+            }
+
+            var iMesh = new ImportedMesh
+            {
+                Path = framePath ?? string.Empty,
+                SubmeshList = new List<ImportedSubmesh>()
+            };
+
+            HashSet<int> subHashSet = null;
+            int firstSubMesh = 0;
+            if (renderer != null)
+            {
+                if (renderer.m_StaticBatchInfo?.subMeshCount > 0)
+                {
+                    firstSubMesh = renderer.m_StaticBatchInfo.firstSubMesh;
+                    var finalSubMesh = firstSubMesh + renderer.m_StaticBatchInfo.subMeshCount;
+                    subHashSet = new HashSet<int>();
+                    for (int i = firstSubMesh; i < finalSubMesh; i++)
+                    {
+                        subHashSet.Add(i);
+                    }
+                }
+                else if (renderer.m_SubsetIndices?.Length > 0)
+                {
+                    subHashSet = new HashSet<int>();
+                    uint minIdx = uint.MaxValue;
+                    for (int i = 0; i < renderer.m_SubsetIndices.Length; i++)
+                    {
+                        var idx = renderer.m_SubsetIndices[i];
+                        if (idx < minIdx) minIdx = idx;
+                        subHashSet.Add((int)idx);
+                    }
+                    firstSubMesh = (int)minIdx;
+                }
+            }
+
+            iMesh.hasNormal = mesh.m_Normals?.Length > 0;
+            iMesh.hasUV = new bool[8];
+            for (int uv = 0; uv < 8; uv++)
+            {
+                iMesh.hasUV[uv] = mesh.GetUV(uv)?.Length > 0;
+            }
+            iMesh.hasTangent = mesh.m_Tangents != null && mesh.m_Tangents.Length == mesh.m_VertexCount * 4;
+            iMesh.hasColor = mesh.m_Colors?.Length > 0;
+
+            var subMeshes = mesh.m_SubMeshes;
+            if (subMeshes != null && subMeshes.Length > 0)
+            {
+                int firstFace = 0;
+                for (int i = 0; i < subMeshes.Length; i++)
+                {
+                    int numFaces = (int)subMeshes[i].indexCount / 3;
+                    if (subHashSet != null && subHashSet.Count > 0 && !subHashSet.Contains(i))
+                    {
+                        firstFace += numFaces;
+                        continue;
+                    }
+
+                    var submesh = subMeshes[i];
+                    var matSlotIndex = i - firstSubMesh;
+                    Material mat = ResolvePartMaterial(renderer, matSlotIndex, fallbackMaterials);
+                    var iMat = ConvertMaterial(mat);
+
+                    var iSubmesh = new ImportedSubmesh
+                    {
+                        Material = iMat.Name,
+                        BaseVertex = checked((int)(submesh.firstVertex + submesh.baseVertex)),
+                        FaceList = new List<ImportedFace>(numFaces)
+                    };
+
+                    var end = firstFace + numFaces;
+                    for (int f = firstFace; f < end; f++)
+                    {
+                        if (f * 3 + 2 >= mesh.m_Indices.Count)
+                        {
+                            break;
+                        }
+
+                        var face = new ImportedFace
+                        {
+                            VertexIndices = new[]
+                            {
+                                (int)(mesh.m_Indices[f * 3 + 2] - submesh.firstVertex),
+                                (int)(mesh.m_Indices[f * 3 + 1] - submesh.firstVertex),
+                                (int)(mesh.m_Indices[f * 3] - submesh.firstVertex)
+                            }
+                        };
+                        iSubmesh.FaceList.Add(face);
+                    }
+
+                    firstFace = end;
+                    iMesh.SubmeshList.Add(iSubmesh);
+                }
+            }
+            else if (mesh.m_Indices != null && mesh.m_Indices.Count >= 3)
+            {
+                var mat = ResolvePartMaterial(renderer, 0, fallbackMaterials);
+                var iMat = ConvertMaterial(mat);
+                int numFaces = mesh.m_Indices.Count / 3;
+                var iSubmesh = new ImportedSubmesh
+                {
+                    Material = iMat.Name,
+                    BaseVertex = 0,
+                    FaceList = new List<ImportedFace>(numFaces)
+                };
+                for (int f = 0; f < numFaces; f++)
+                {
+                    iSubmesh.FaceList.Add(new ImportedFace
+                    {
+                        VertexIndices = new[]
+                        {
+                            (int)mesh.m_Indices[f * 3 + 2],
+                            (int)mesh.m_Indices[f * 3 + 1],
+                            (int)mesh.m_Indices[f * 3]
+                        }
+                    });
+                }
+                iMesh.SubmeshList.Add(iSubmesh);
+            }
+
+            int vertexCount = mesh.m_VertexCount;
+            int posStride = mesh.m_Vertices.Length == vertexCount * 4 ? 4 : 3;
+            int normalStride = iMesh.hasNormal && mesh.m_Normals.Length == vertexCount * 4 ? 4 : 3;
+            int colorStride = iMesh.hasColor && mesh.m_Colors.Length == vertexCount * 3 ? 3 : 4;
+            var uvArrays = new float[8][];
+            var uvStrides = new int[8];
+            for (int uv = 0; uv < 8; uv++)
+            {
+                if (iMesh.hasUV[uv])
+                {
+                    uvArrays[uv] = mesh.GetUV(uv);
+                    uvStrides[uv] = uvArrays[uv].Length == vertexCount * 3 ? 3 : (uvArrays[uv].Length == vertexCount * 4 ? 4 : 2);
+                }
+            }
+
+            iMesh.VertexList = new List<ImportedVertex>(vertexCount);
+            for (int j = 0; j < vertexCount; j++)
+            {
+                var iVertex = new ImportedVertex
+                {
+                    Vertex = new Vector3(-mesh.m_Vertices[j * posStride], mesh.m_Vertices[j * posStride + 1], mesh.m_Vertices[j * posStride + 2]),
+                    UV = new float[8][]
+                };
+
+                if (iMesh.hasNormal && j * normalStride + 2 < mesh.m_Normals.Length)
+                {
+                    iVertex.Normal = new Vector3(-mesh.m_Normals[j * normalStride], mesh.m_Normals[j * normalStride + 1], mesh.m_Normals[j * normalStride + 2]);
+                }
+
+                for (int uv = 0; uv < 8; uv++)
+                {
+                    if (iMesh.hasUV[uv] && j * uvStrides[uv] + 1 < uvArrays[uv].Length)
+                    {
+                        iVertex.UV[uv] = new[] { uvArrays[uv][j * uvStrides[uv]], uvArrays[uv][j * uvStrides[uv] + 1] };
+                    }
+                }
+
+                if (iMesh.hasTangent)
+                {
+                    iVertex.Tangent = new Vector4(-mesh.m_Tangents[j * 4], mesh.m_Tangents[j * 4 + 1], mesh.m_Tangents[j * 4 + 2], mesh.m_Tangents[j * 4 + 3]);
+                }
+
+                if (iMesh.hasColor && j * colorStride + 2 < mesh.m_Colors.Length)
+                {
+                    iVertex.Color = colorStride == 3
+                        ? new Color(mesh.m_Colors[j * 3], mesh.m_Colors[j * 3 + 1], mesh.m_Colors[j * 3 + 2], 1.0f)
+                        : new Color(mesh.m_Colors[j * 4], mesh.m_Colors[j * 4 + 1], mesh.m_Colors[j * 4 + 2], mesh.m_Colors[j * 4 + 3]);
+                }
+
+                if (mesh.m_Skin != null && j < mesh.m_Skin.Length && mesh.m_Skin[j]?.boneIndex != null && mesh.m_Skin[j]?.weight != null)
+                {
+                    var inf = mesh.m_Skin[j];
+                    iVertex.BoneIndices = new int[4];
+                    iVertex.Weights = new float[4];
+                    int count = Math.Min(4, Math.Min(inf.boneIndex.Length, inf.weight.Length));
+                    for (int k = 0; k < count; k++)
+                    {
+                        iVertex.BoneIndices[k] = inf.boneIndex[k];
+                        iVertex.Weights[k] = inf.weight[k];
+                    }
+                }
+
+                iMesh.VertexList.Add(iVertex);
+            }
+
+            // Bones (from SkinnedMeshRenderer.m_Bones or Mesh.m_BoneNameHashes)
+            if (mesh.m_BindPose != null && mesh.m_BindPose.Length > 0)
+            {
+                var boneType = 0;
+                var sMesh = renderer as SkinnedMeshRenderer;
+                if (sMesh != null && sMesh.m_Bones != null && sMesh.m_Bones.Length == mesh.m_BindPose.Length)
+                {
+                    int verified = 0;
+                    for (int b = 0; b < sMesh.m_Bones.Length; b++)
+                    {
+                        if (TryGetBoneTransform(sMesh.m_Bones[b], sMesh, out _)) verified++;
+                    }
+
+                    if (verified > 0)
+                    {
+                        boneType = 1;
+                    }
+                    if (verified != sMesh.m_Bones.Length && mesh.m_BoneNameHashes != null && mesh.m_BoneNameHashes.Length == mesh.m_BindPose.Length)
+                    {
+                        int verifiedByHash = 0;
+                        for (int b = 0; b < mesh.m_BoneNameHashes.Length; b++)
+                        {
+                            if (FixBonePath(GetPathFromHash(mesh.m_BoneNameHashes[b])) != null) verifiedByHash++;
+                        }
+                        if (verifiedByHash > verified)
+                        {
+                            boneType = 2;
+                        }
+                    }
+                }
+
+                if (boneType == 0 && mesh.m_BoneNameHashes != null && mesh.m_BoneNameHashes.Length == mesh.m_BindPose.Length)
+                {
+                    int verifiedByHash = 0;
+                    for (int b = 0; b < mesh.m_BoneNameHashes.Length; b++)
+                    {
+                        if (FixBonePath(GetPathFromHash(mesh.m_BoneNameHashes[b])) != null) verifiedByHash++;
+                    }
+                    if (verifiedByHash > 0)
+                    {
+                        boneType = 2;
+                    }
+                }
+
+                var convert = Matrix4x4.Scale(new Vector3(-1, 1, 1));
+                if (boneType == 1 && sMesh != null)
+                {
+                    var boneCount = sMesh.m_Bones.Length;
+                    iMesh.BoneList = new List<ImportedBone>(boneCount);
+                    for (int b = 0; b < boneCount; b++)
+                    {
+                        var bone = new ImportedBone();
+                        if (TryGetBoneTransform(sMesh.m_Bones[b], sMesh, out var boneTransform))
+                        {
+                            bone.Path = GetTransformPath(boneTransform);
+                        }
+                        bone.Matrix = convert * mesh.m_BindPose[b] * convert;
+                        iMesh.BoneList.Add(bone);
+                    }
+                }
+                else if (boneType == 2)
+                {
+                    var boneCount = mesh.m_BindPose.Length;
+                    iMesh.BoneList = new List<ImportedBone>(boneCount);
+                    for (int b = 0; b < boneCount; b++)
+                    {
+                        var bone = new ImportedBone
+                        {
+                            Path = FixBonePath(GetPathFromHash(mesh.m_BoneNameHashes[b])),
+                            Matrix = convert * mesh.m_BindPose[b] * convert
+                        };
+                        iMesh.BoneList.Add(bone);
+                    }
+                }
+            }
+
+            // BlendShapes / Morphs
+            if (mesh.m_Shapes?.channels?.Length > 0)
+            {
+                var morph = new ImportedMorph
+                {
+                    Path = iMesh.Path,
+                    Channels = new List<ImportedMorphChannel>(mesh.m_Shapes.channels.Length)
+                };
+                MorphList.Add(morph);
+                for (int i = 0; i < mesh.m_Shapes.channels.Length; i++)
+                {
+                    var shapeChannel = mesh.m_Shapes.channels[i];
+                    var blendShapeName = "blendShape." + shapeChannel.name;
+                    var crc = new SevenZip.CRC();
+                    var bytes = Encoding.UTF8.GetBytes(blendShapeName);
+                    crc.Update(bytes, 0, (uint)bytes.Length);
+                    morphChannelNames[crc.GetDigest()] = blendShapeName;
+
+                    var lastDot = shapeChannel.name.LastIndexOf('.');
+                    var channel = new ImportedMorphChannel
+                    {
+                        Name = lastDot >= 0 ? shapeChannel.name.Substring(lastDot + 1) : shapeChannel.name,
+                        KeyframeList = new List<ImportedMorphKeyframe>(shapeChannel.frameCount)
+                    };
+                    morph.Channels.Add(channel);
+
+                    var frameEnd = shapeChannel.frameIndex + shapeChannel.frameCount;
+                    for (int frameIdx = shapeChannel.frameIndex; frameIdx < frameEnd; frameIdx++)
+                    {
+                        if (frameIdx < 0 || frameIdx >= mesh.m_Shapes.fullWeights.Length || frameIdx >= mesh.m_Shapes.shapes.Length)
+                            break;
+                        var shape = mesh.m_Shapes.shapes[frameIdx];
+                        var keyframe = new ImportedMorphKeyframe
+                        {
+                            Weight = mesh.m_Shapes.fullWeights[frameIdx],
+                            hasNormals = shape.hasNormals,
+                            hasTangents = shape.hasTangents,
+                            VertexList = new List<ImportedMorphVertex>((int)shape.vertexCount)
+                        };
+                        channel.KeyframeList.Add(keyframe);
+
+                        var vertexEnd = shape.firstVertex + shape.vertexCount;
+                        for (uint j = shape.firstVertex; j < vertexEnd; j++)
+                        {
+                            if (j >= (uint)mesh.m_Shapes.vertices.Length)
+                                break;
+                            var morphVertex = mesh.m_Shapes.vertices[j];
+                            if (morphVertex.index >= (uint)iMesh.VertexList.Count)
+                                continue;
+                            var sourceVertex = iMesh.VertexList[(int)morphVertex.index];
+                            var destVertex = new ImportedMorphVertex
+                            {
+                                Index = morphVertex.index,
+                                Vertex = new ImportedVertex
+                                {
+                                    Vertex = sourceVertex.Vertex + new Vector3(-morphVertex.vertex.X, morphVertex.vertex.Y, morphVertex.vertex.Z)
+                                }
+                            };
+                            if (shape.hasNormals)
+                            {
+                                destVertex.Vertex.Normal = new Vector3(-morphVertex.normal.X, morphVertex.normal.Y, morphVertex.normal.Z);
+                            }
+                            if (shape.hasTangents)
+                            {
+                                destVertex.Vertex.Tangent = new Vector4(-morphVertex.tangent.X, morphVertex.tangent.Y, morphVertex.tangent.Z, 0);
+                            }
+                            keyframe.VertexList.Add(destVertex);
+                        }
+                    }
+                }
+            }
+
+            MeshList.Add(iMesh);
+        }
+
+        private static Material ResolvePartMaterial(Renderer renderer, int slotIndex, IReadOnlyList<Material> fallbackMaterials)
+        {
+            if (renderer?.m_Materials != null && slotIndex >= 0 && slotIndex < renderer.m_Materials.Length)
+            {
+                var matPPtr = renderer.m_Materials[slotIndex];
+                if (matPPtr != null && !matPPtr.IsNull)
+                {
+                    if (matPPtr.TryGet(out var resolvedMat) && resolvedMat != null)
+                    {
+                        return resolvedMat;
+                    }
+
+                    if (renderer.assetsFile?.assetsManager != null)
+                    {
+                        var files = renderer.assetsFile.assetsManager.assetsFileList;
+                        for (int i = 0; i < files.Count; i++)
+                        {
+                            if (files[i].ObjectsDic.TryGetValue(matPPtr.m_PathID, out var obj) && obj is Material foundMat)
+                            {
+                                return foundMat;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (fallbackMaterials != null && slotIndex >= 0 && slotIndex < fallbackMaterials.Count && fallbackMaterials[slotIndex] != null)
+            {
+                return fallbackMaterials[slotIndex];
+            }
+
+            return null;
+        }
+
+        public void CombineMeshes(string combinedMeshName = null)
+        {
+            if (MeshList == null || MeshList.Count <= 1)
+            {
+                return;
+            }
+
+            ImportedFrame targetFrame = RootFrame;
+            if (RootFrame != null && !string.IsNullOrWhiteSpace(combinedMeshName))
+            {
+                var normalizedRootName = RootFrame.Name ?? string.Empty;
+                var normalizedRootPath = NormalizeFramePath(RootFrame.Path);
+                var normalizedTarget = NormalizeFramePath(combinedMeshName);
+                if (!string.Equals(normalizedRootName, combinedMeshName, StringComparison.Ordinal)
+                    && !string.Equals(normalizedRootPath, normalizedTarget, StringComparison.Ordinal))
+                {
+                    var existing = FindFrameForMesh(RootFrame, combinedMeshName);
+                    if (existing != null)
+                    {
+                        targetFrame = existing;
+                    }
+                    else
+                    {
+                        var childFrame = CreateFrame(combinedMeshName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One);
+                        RootFrame.AddChild(childFrame);
+                        targetFrame = childFrame;
+                    }
+                }
+            }
+
+            var combinedMesh = CombineMeshesInternal(
+                MeshList,
+                RootFrame,
+                targetFrame,
+                combinedMeshName,
+                MorphList,
+                AnimationList,
+                out var combinedMorphs,
+                out var updatedAnimations,
+                cloneAnimationsForView: false);
+
+            MeshList = new List<ImportedMesh> { combinedMesh };
+            MorphList = combinedMorphs;
+            AnimationList = updatedAnimations;
+        }
+
+        public static ImportedMesh CombineMeshList(IReadOnlyList<ImportedMesh> meshes, ImportedFrame rootFrame, string combinedName = null)
+        {
+            if (meshes == null || meshes.Count == 0)
+            {
+                return new ImportedMesh
+                {
+                    Path = !string.IsNullOrWhiteSpace(combinedName)
+                        ? combinedName
+                        : !string.IsNullOrWhiteSpace(rootFrame?.Path)
+                            ? rootFrame.Path
+                            : "CombinedMesh",
+                    VertexList = new List<ImportedVertex>(),
+                    SubmeshList = new List<ImportedSubmesh>(),
+                    hasUV = new bool[8]
+                };
+            }
+
+            ImportedFrame targetFrame = rootFrame;
+            if (rootFrame != null && !string.IsNullOrWhiteSpace(combinedName))
+            {
+                var existing = FindFrameForMesh(rootFrame, combinedName);
+                if (existing != null)
+                {
+                    targetFrame = existing;
+                }
+            }
+
+            return CombineMeshesInternal(
+                meshes,
+                rootFrame,
+                targetFrame,
+                combinedName,
+                morphList: null,
+                animationList: null,
+                out _,
+                out _,
+                cloneAnimationsForView: false);
+        }
+
+        public static IImported CreateCombinedView(IImported imported, string combinedMeshName = null)
+        {
+            if (imported == null || imported.MeshList == null || imported.MeshList.Count <= 1)
+            {
+                return imported;
+            }
+
+            ImportedFrame targetFrame = imported.RootFrame;
+            if (imported.RootFrame != null && !string.IsNullOrWhiteSpace(combinedMeshName))
+            {
+                var existing = FindFrameForMesh(imported.RootFrame, combinedMeshName);
+                if (existing != null)
+                {
+                    targetFrame = existing;
+                }
+            }
+
+            var combinedMesh = CombineMeshesInternal(
+                imported.MeshList,
+                imported.RootFrame,
+                targetFrame,
+                combinedMeshName,
+                imported.MorphList,
+                imported.AnimationList,
+                out var combinedMorphs,
+                out var updatedAnimations,
+                cloneAnimationsForView: true);
+
+            return new ImportedWrapper(imported)
+            {
+                MeshList = new List<ImportedMesh> { combinedMesh },
+                MorphList = combinedMorphs,
+                AnimationList = updatedAnimations
+            };
+        }
+
+        private readonly struct CombinedPartTransformMeta
+        {
+            public CombinedPartTransformMeta(
+                string normalizedPath,
+                int vertexOffset,
+                int vertexCount,
+                System.Numerics.Matrix4x4 relativeMatrix,
+                System.Numerics.Matrix4x4 normalMatrix)
+            {
+                NormalizedPath = normalizedPath;
+                VertexOffset = vertexOffset;
+                VertexCount = vertexCount;
+                RelativeMatrix = relativeMatrix;
+                NormalMatrix = normalMatrix;
+            }
+
+            public string NormalizedPath { get; }
+            public int VertexOffset { get; }
+            public int VertexCount { get; }
+            public System.Numerics.Matrix4x4 RelativeMatrix { get; }
+            public System.Numerics.Matrix4x4 NormalMatrix { get; }
+        }
+
+        private static ImportedMesh CombineMeshesInternal(
+            IReadOnlyList<ImportedMesh> meshes,
+            ImportedFrame rootFrame,
+            ImportedFrame targetFrame,
+            string combinedName,
+            List<ImportedMorph> morphList,
+            List<ImportedKeyframedAnimation> animationList,
+            out List<ImportedMorph> combinedMorphs,
+            out List<ImportedKeyframedAnimation> updatedAnimations,
+            bool cloneAnimationsForView)
+        {
+            int totalVertices = 0;
+            int totalSubmeshes = 0;
+            bool anyNormal = false;
+            bool anyTangent = false;
+            bool anyColor = false;
+            var anyUV = new bool[8];
+            string firstNonEmptyMeshPath = null;
+
+            for (int m = 0; m < meshes.Count; m++)
+            {
+                var mesh = meshes[m];
+                if (mesh == null) continue;
+
+                if (firstNonEmptyMeshPath == null && !string.IsNullOrWhiteSpace(mesh.Path))
+                {
+                    firstNonEmptyMeshPath = mesh.Path;
+                }
+
+                totalVertices += mesh.VertexList?.Count ?? 0;
+                totalSubmeshes += mesh.SubmeshList?.Count ?? 0;
+                if (mesh.hasNormal) anyNormal = true;
+                if (mesh.hasTangent) anyTangent = true;
+                if (mesh.hasColor) anyColor = true;
+                if (mesh.hasUV != null)
+                {
+                    int uvLen = Math.Min(8, mesh.hasUV.Length);
+                    for (int u = 0; u < uvLen; u++)
+                    {
+                        if (mesh.hasUV[u]) anyUV[u] = true;
+                    }
+                }
+            }
+
+            string targetPath;
+            if (targetFrame != null && !string.IsNullOrWhiteSpace(targetFrame.Path))
+            {
+                if (!string.IsNullOrWhiteSpace(combinedName)
+                    && !string.Equals(targetFrame.Name, combinedName, StringComparison.Ordinal)
+                    && !string.Equals(NormalizeFramePath(targetFrame.Path), NormalizeFramePath(combinedName), StringComparison.Ordinal))
+                {
+                    targetPath = combinedName;
+                }
+                else
+                {
+                    targetPath = targetFrame.Path;
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(combinedName))
+            {
+                targetPath = combinedName;
+            }
+            else
+            {
+                targetPath = firstNonEmptyMeshPath ?? "CombinedMesh";
+            }
+
+            var unifiedBones = new List<ImportedBone>();
+            var boneIndexByNormalizedPath = new Dictionary<string, int>(StringComparer.Ordinal);
+            var perMeshBoneRemaps = new int[meshes.Count][];
+            var partMetas = new List<CombinedPartTransformMeta>(meshes.Count);
+            var partRelMatrices = new System.Numerics.Matrix4x4[meshes.Count];
+            var partNormalMatrices = new System.Numerics.Matrix4x4[meshes.Count];
+            var partFlipWinding = new bool[meshes.Count];
+
+            // Precompute relative transform matrices and unified bone table
+            for (int m = 0; m < meshes.Count; m++)
+            {
+                var mesh = meshes[m];
+                if (mesh == null) continue;
+
+                var meshFrame = FindFrameForMesh(rootFrame, mesh.Path);
+                var relMatrix = ComputeRelativeFrameMatrix(meshFrame, targetFrame);
+                var normalMatrix = BuildNormalMatrix(relMatrix, out var flipWinding);
+                partRelMatrices[m] = relMatrix;
+                partNormalMatrices[m] = normalMatrix;
+                partFlipWinding[m] = flipWinding;
+
+                if (mesh.BoneList != null && mesh.BoneList.Count > 0)
+                {
+                    var remap = new int[mesh.BoneList.Count];
+                    for (int b = 0; b < mesh.BoneList.Count; b++)
+                    {
+                        var bone = mesh.BoneList[b];
+                        var normBonePath = NormalizeFramePath(bone?.Path);
+                        if (!string.IsNullOrEmpty(normBonePath) && boneIndexByNormalizedPath.TryGetValue(normBonePath, out var existingIdx))
+                        {
+                            remap[b] = existingIdx;
+                        }
+                        else
+                        {
+                            var newIdx = unifiedBones.Count;
+                            var adjustedBindPose = bone != null
+                                ? TransformBindPoseMatrix(bone.Matrix, relMatrix)
+                                : default(Matrix4x4);
+                            unifiedBones.Add(new ImportedBone
+                            {
+                                Path = bone?.Path,
+                                Matrix = adjustedBindPose
+                            });
+                            if (!string.IsNullOrEmpty(normBonePath))
+                            {
+                                boneIndexByNormalizedPath[normBonePath] = newIdx;
+                            }
+                            remap[b] = newIdx;
+                        }
+                    }
+                    perMeshBoneRemaps[m] = remap;
+                }
+            }
+
+            bool hasAnySkinning = unifiedBones.Count > 0;
+            var combinedVertices = new List<ImportedVertex>(totalVertices);
+            var combinedSubmeshes = new List<ImportedSubmesh>(totalSubmeshes);
+
+            for (int m = 0; m < meshes.Count; m++)
+            {
+                var mesh = meshes[m];
+                if (mesh?.VertexList == null || mesh.VertexList.Count == 0)
+                {
+                    continue;
+                }
+
+                int vertexOffset = combinedVertices.Count;
+                int srcVertCount = mesh.VertexList.Count;
+                var relMatrix = partRelMatrices[m];
+                var normalMatrix = partNormalMatrices[m];
+                bool flipWinding = partFlipWinding[m];
+                var boneRemap = perMeshBoneRemaps[m];
+                bool meshHasSkinning = boneRemap != null && boneRemap.Length > 0;
+
+                partMetas.Add(new CombinedPartTransformMeta(
+                    NormalizeFramePath(mesh.Path),
+                    vertexOffset,
+                    srcVertCount,
+                    relMatrix,
+                    normalMatrix));
+
+                for (int v = 0; v < srcVertCount; v++)
+                {
+                    var src = mesh.VertexList[v];
+                    var dst = new ImportedVertex();
+
+                    var transformedPos = System.Numerics.Vector3.Transform(
+                        new System.Numerics.Vector3(src.Vertex.X, src.Vertex.Y, src.Vertex.Z),
+                        relMatrix);
+                    dst.Vertex = new Vector3(
+                        SanitizeFloat(transformedPos.X, 0f),
+                        SanitizeFloat(transformedPos.Y, 0f),
+                        SanitizeFloat(transformedPos.Z, 0f));
+
+                    if (anyNormal)
+                    {
+                        dst.Normal = mesh.hasNormal
+                            ? TransformDirectionNormalized(src.Normal, normalMatrix)
+                            : new Vector3(0f, 1f, 0f);
+                    }
+
+                    dst.UV = new float[8][];
+                    for (int u = 0; u < 8; u++)
+                    {
+                        if (!anyUV[u]) continue;
+                        if (mesh.hasUV != null && u < mesh.hasUV.Length && mesh.hasUV[u]
+                            && src.UV != null && u < src.UV.Length && src.UV[u] != null && src.UV[u].Length >= 2)
+                        {
+                            dst.UV[u] = new[]
+                            {
+                                SanitizeFloat(src.UV[u][0], 0f),
+                                SanitizeFloat(src.UV[u][1], 0f)
+                            };
+                        }
+                        else
+                        {
+                            dst.UV[u] = new[] { 0f, 0f };
+                        }
+                    }
+
+                    if (anyTangent)
+                    {
+                        if (mesh.hasTangent)
+                        {
+                            var transformedTangent = TransformDirectionNormalized(
+                                new Vector3(src.Tangent.X, src.Tangent.Y, src.Tangent.Z),
+                                normalMatrix);
+                            dst.Tangent = new Vector4(
+                                transformedTangent.X,
+                                transformedTangent.Y,
+                                transformedTangent.Z,
+                                SanitizeFloat(src.Tangent.W, 1f));
+                        }
+                        else
+                        {
+                            dst.Tangent = new Vector4(1f, 0f, 0f, 1f);
+                        }
+                    }
+
+                    if (anyColor)
+                    {
+                        dst.Color = mesh.hasColor
+                            ? src.Color
+                            : new Color(1f, 1f, 1f, 1f);
+                    }
+
+                    if (hasAnySkinning)
+                    {
+                        dst.BoneIndices = new int[4];
+                        dst.Weights = new float[4];
+                        if (meshHasSkinning && src.BoneIndices != null && src.Weights != null)
+                        {
+                            int count = Math.Min(4, Math.Min(src.BoneIndices.Length, src.Weights.Length));
+                            for (int k = 0; k < count; k++)
+                            {
+                                int oldBoneIdx = src.BoneIndices[k];
+                                float weight = SanitizeFloat(src.Weights[k], 0f);
+                                if (oldBoneIdx >= 0 && oldBoneIdx < boneRemap.Length)
+                                {
+                                    dst.BoneIndices[k] = boneRemap[oldBoneIdx];
+                                    dst.Weights[k] = weight;
+                                }
+                            }
+                        }
+                    }
+
+                    combinedVertices.Add(dst);
+                }
+
+                if (mesh.SubmeshList != null)
+                {
+                    for (int s = 0; s < mesh.SubmeshList.Count; s++)
+                    {
+                        var srcSub = mesh.SubmeshList[s];
+                        if (srcSub?.FaceList == null) continue;
+
+                        var dstSub = new ImportedSubmesh
+                        {
+                            Material = srcSub.Material,
+                            BaseVertex = 0,
+                            FaceList = new List<ImportedFace>(srcSub.FaceList.Count)
+                        };
+
+                        for (int f = 0; f < srcSub.FaceList.Count; f++)
+                        {
+                            var face = srcSub.FaceList[f];
+                            if (!TryResolveCombinedFaceIndices(face, srcSub.BaseVertex, srcVertCount, out int i0, out int i1, out int i2))
+                            {
+                                continue;
+                            }
+
+                            var newFace = new ImportedFace
+                            {
+                                VertexIndices = flipWinding
+                                    ? new[] { i0 + vertexOffset, i2 + vertexOffset, i1 + vertexOffset }
+                                    : new[] { i0 + vertexOffset, i1 + vertexOffset, i2 + vertexOffset }
+                            };
+                            dstSub.FaceList.Add(newFace);
+                        }
+
+                        combinedSubmeshes.Add(dstSub);
+                    }
+                }
+            }
+
+            var combinedMesh = new ImportedMesh
+            {
+                Path = targetPath,
+                VertexList = combinedVertices,
+                SubmeshList = combinedSubmeshes,
+                BoneList = hasAnySkinning ? unifiedBones : null,
+                hasNormal = anyNormal,
+                hasUV = anyUV,
+                hasTangent = anyTangent,
+                hasColor = anyColor
+            };
+
+            combinedMorphs = MergeMorphsForCombinedMesh(morphList, partMetas, targetPath);
+            updatedAnimations = RemapBlendShapeAnimationTracks(animationList, partMetas, targetPath, cloneAnimationsForView);
+
+            return combinedMesh;
+        }
+
+        private static List<ImportedMorph> MergeMorphsForCombinedMesh(
+            List<ImportedMorph> morphList,
+            List<CombinedPartTransformMeta> partMetas,
+            string combinedMeshPath)
+        {
+            if (morphList == null || morphList.Count == 0)
+            {
+                return morphList ?? new List<ImportedMorph>();
+            }
+
+            var metaByPath = new Dictionary<string, List<CombinedPartTransformMeta>>(StringComparer.Ordinal);
+            for (int i = 0; i < partMetas.Count; i++)
+            {
+                var key = partMetas[i].NormalizedPath ?? string.Empty;
+                if (!metaByPath.TryGetValue(key, out var list))
+                {
+                    list = new List<CombinedPartTransformMeta>(1);
+                    metaByPath[key] = list;
+                }
+                list.Add(partMetas[i]);
+            }
+
+            var consumedCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var remainingMorphs = new List<ImportedMorph>();
+            var mergedChannels = new List<ImportedMorphChannel>();
+            var channelByName = new Dictionary<string, ImportedMorphChannel>(StringComparer.Ordinal);
+
+            for (int i = 0; i < morphList.Count; i++)
+            {
+                var morph = morphList[i];
+                if (morph == null) continue;
+
+                var normPath = NormalizeFramePath(morph.Path) ?? string.Empty;
+                if (!metaByPath.TryGetValue(normPath, out var candidates) || candidates.Count == 0)
+                {
+                    remainingMorphs.Add(morph);
+                    continue;
+                }
+
+                consumedCounts.TryGetValue(normPath, out var useIndex);
+                var meta = candidates[Math.Min(useIndex, candidates.Count - 1)];
+                consumedCounts[normPath] = useIndex + 1;
+
+                if (morph.Channels == null) continue;
+
+                for (int c = 0; c < morph.Channels.Count; c++)
+                {
+                    var srcChannel = morph.Channels[c];
+                    if (srcChannel == null) continue;
+
+                    var channelName = srcChannel.Name ?? string.Empty;
+                    if (!channelByName.TryGetValue(channelName, out var dstChannel))
+                    {
+                        dstChannel = new ImportedMorphChannel
+                        {
+                            Name = channelName,
+                            KeyframeList = new List<ImportedMorphKeyframe>()
+                        };
+                        channelByName[channelName] = dstChannel;
+                        mergedChannels.Add(dstChannel);
+                    }
+
+                    if (srcChannel.KeyframeList == null) continue;
+
+                    for (int k = 0; k < srcChannel.KeyframeList.Count; k++)
+                    {
+                        var srcKf = srcChannel.KeyframeList[k];
+                        if (srcKf == null) continue;
+
+                        ImportedMorphKeyframe dstKf = null;
+                        for (int ek = 0; ek < dstChannel.KeyframeList.Count; ek++)
+                        {
+                            if (Math.Abs(dstChannel.KeyframeList[ek].Weight - srcKf.Weight) <= 1e-4f)
+                            {
+                                dstKf = dstChannel.KeyframeList[ek];
+                                break;
+                            }
+                        }
+
+                        if (dstKf == null)
+                        {
+                            dstKf = new ImportedMorphKeyframe
+                            {
+                                Weight = srcKf.Weight,
+                                hasNormals = srcKf.hasNormals,
+                                hasTangents = srcKf.hasTangents,
+                                VertexList = new List<ImportedMorphVertex>(srcKf.VertexList?.Count ?? 0)
+                            };
+                            dstChannel.KeyframeList.Add(dstKf);
+                        }
+                        else
+                        {
+                            dstKf.hasNormals |= srcKf.hasNormals;
+                            dstKf.hasTangents |= srcKf.hasTangents;
+                        }
+
+                        if (srcKf.VertexList == null) continue;
+
+                        for (int v = 0; v < srcKf.VertexList.Count; v++)
+                        {
+                            var mv = srcKf.VertexList[v];
+                            if (mv?.Vertex == null || mv.Index >= (uint)meta.VertexCount)
+                            {
+                                continue;
+                            }
+
+                            var transformedPos = System.Numerics.Vector3.Transform(
+                                new System.Numerics.Vector3(mv.Vertex.Vertex.X, mv.Vertex.Vertex.Y, mv.Vertex.Vertex.Z),
+                                meta.RelativeMatrix);
+
+                            var dstVert = new ImportedVertex
+                            {
+                                Vertex = new Vector3(
+                                    SanitizeFloat(transformedPos.X, 0f),
+                                    SanitizeFloat(transformedPos.Y, 0f),
+                                    SanitizeFloat(transformedPos.Z, 0f))
+                            };
+
+                            if (srcKf.hasNormals)
+                            {
+                                var transformedNormal = System.Numerics.Vector3.TransformNormal(
+                                    new System.Numerics.Vector3(mv.Vertex.Normal.X, mv.Vertex.Normal.Y, mv.Vertex.Normal.Z),
+                                    meta.NormalMatrix);
+                                dstVert.Normal = new Vector3(
+                                    SanitizeFloat(transformedNormal.X, 0f),
+                                    SanitizeFloat(transformedNormal.Y, 0f),
+                                    SanitizeFloat(transformedNormal.Z, 0f));
+                            }
+
+                            if (srcKf.hasTangents)
+                            {
+                                var transformedTangent = System.Numerics.Vector3.TransformNormal(
+                                    new System.Numerics.Vector3(mv.Vertex.Tangent.X, mv.Vertex.Tangent.Y, mv.Vertex.Tangent.Z),
+                                    meta.NormalMatrix);
+                                dstVert.Tangent = new Vector4(
+                                    SanitizeFloat(transformedTangent.X, 0f),
+                                    SanitizeFloat(transformedTangent.Y, 0f),
+                                    SanitizeFloat(transformedTangent.Z, 0f),
+                                    SanitizeFloat(mv.Vertex.Tangent.W, 0f));
+                            }
+
+                            dstKf.VertexList.Add(new ImportedMorphVertex
+                            {
+                                Index = mv.Index + (uint)meta.VertexOffset,
+                                Vertex = dstVert
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (mergedChannels.Count > 0)
+            {
+                remainingMorphs.Add(new ImportedMorph
+                {
+                    Path = combinedMeshPath,
+                    Channels = mergedChannels
+                });
+            }
+
+            return remainingMorphs;
+        }
+
+        private static List<ImportedKeyframedAnimation> RemapBlendShapeAnimationTracks(
+            List<ImportedKeyframedAnimation> animationList,
+            List<CombinedPartTransformMeta> partMetas,
+            string combinedMeshPath,
+            bool cloneForView)
+        {
+            if (animationList == null || animationList.Count == 0 || string.IsNullOrEmpty(combinedMeshPath))
+            {
+                return animationList ?? new List<ImportedKeyframedAnimation>();
+            }
+
+            var combinedNormalizedPaths = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < partMetas.Count; i++)
+            {
+                if (!string.IsNullOrEmpty(partMetas[i].NormalizedPath))
+                {
+                    combinedNormalizedPaths.Add(partMetas[i].NormalizedPath);
+                }
+            }
+
+            var normalizedTargetPath = NormalizeFramePath(combinedMeshPath);
+            bool anyRemapNeeded = false;
+            for (int a = 0; a < animationList.Count && !anyRemapNeeded; a++)
+            {
+                var tracks = animationList[a]?.TrackList;
+                if (tracks == null) continue;
+                for (int t = 0; t < tracks.Count; t++)
+                {
+                    var tr = tracks[t];
+                    if (tr?.BlendShape != null)
+                    {
+                        var normTrackPath = NormalizeFramePath(tr.Path);
+                        if (!string.IsNullOrEmpty(normTrackPath)
+                            && combinedNormalizedPaths.Contains(normTrackPath)
+                            && !string.Equals(normTrackPath, normalizedTargetPath, StringComparison.Ordinal))
+                        {
+                            anyRemapNeeded = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!anyRemapNeeded)
+            {
+                return animationList;
+            }
+
+            var result = cloneForView ? new List<ImportedKeyframedAnimation>(animationList.Count) : animationList;
+            for (int a = 0; a < animationList.Count; a++)
+            {
+                var srcAnim = animationList[a];
+                if (srcAnim == null)
+                {
+                    if (cloneForView) result.Add(null);
+                    continue;
+                }
+
+                var dstAnim = srcAnim;
+                if (cloneForView)
+                {
+                    dstAnim = new ImportedKeyframedAnimation
+                    {
+                        Name = srcAnim.Name,
+                        SampleRate = srcAnim.SampleRate,
+                        TrackList = new List<ImportedAnimationKeyframedTrack>(srcAnim.TrackList?.Count ?? 0)
+                    };
+                    if (srcAnim.TrackList != null)
+                    {
+                        for (int t = 0; t < srcAnim.TrackList.Count; t++)
+                        {
+                            var tr = srcAnim.TrackList[t];
+                            dstAnim.TrackList.Add(new ImportedAnimationKeyframedTrack
+                            {
+                                Path = tr.Path,
+                                Translations = tr.Translations,
+                                Rotations = tr.Rotations,
+                                Scalings = tr.Scalings,
+                                BlendShape = tr.BlendShape
+                            });
+                        }
+                    }
+                    result.Add(dstAnim);
+                }
+
+                if (dstAnim.TrackList == null) continue;
+
+                int trackCount = dstAnim.TrackList.Count;
+                for (int t = 0; t < trackCount; t++)
+                {
+                    var tr = dstAnim.TrackList[t];
+                    if (tr?.BlendShape == null) continue;
+
+                    var normTrackPath = NormalizeFramePath(tr.Path);
+                    if (!string.IsNullOrEmpty(normTrackPath)
+                        && combinedNormalizedPaths.Contains(normTrackPath)
+                        && !string.Equals(normTrackPath, normalizedTargetPath, StringComparison.Ordinal))
+                    {
+                        var targetTrack = dstAnim.FindTrack(combinedMeshPath);
+                        if (targetTrack.BlendShape == null)
+                        {
+                            targetTrack.BlendShape = tr.BlendShape;
+                        }
+                        tr.BlendShape = null;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static bool TryResolveCombinedFaceIndices(ImportedFace face, int baseVertex, int vertexCount, out int index0, out int index1, out int index2)
+        {
+            index0 = index1 = index2 = 0;
+            if (face?.VertexIndices == null || face.VertexIndices.Length < 3)
+                return false;
+
+            index0 = face.VertexIndices[0] + baseVertex;
+            index1 = face.VertexIndices[1] + baseVertex;
+            index2 = face.VertexIndices[2] + baseVertex;
+            if ((uint)index0 < (uint)vertexCount && (uint)index1 < (uint)vertexCount && (uint)index2 < (uint)vertexCount)
+                return true;
+
+            index0 = face.VertexIndices[0];
+            index1 = face.VertexIndices[1];
+            index2 = face.VertexIndices[2];
+            return (uint)index0 < (uint)vertexCount && (uint)index1 < (uint)vertexCount && (uint)index2 < (uint)vertexCount;
+        }
+
+        private static ImportedFrame FindFrameForMesh(ImportedFrame rootFrame, string meshPath)
+        {
+            if (rootFrame == null || string.IsNullOrWhiteSpace(meshPath))
+            {
+                return null;
+            }
+
+            var normalizedTarget = NormalizeFramePath(meshPath);
+            if (string.IsNullOrEmpty(normalizedTarget))
+            {
+                return null;
+            }
+
+            var visited = new HashSet<ImportedFrame>();
+            var stack = new Stack<ImportedFrame>();
+            stack.Push(rootFrame);
+
+            ImportedFrame uniqueSuffixMatch = null;
+            int suffixMatchCount = 0;
+            var suffix = "/" + normalizedTarget;
+
+            while (stack.Count > 0)
+            {
+                var frame = stack.Pop();
+                if (frame == null || !visited.Add(frame))
+                {
+                    continue;
+                }
+
+                var framePath = NormalizeFramePath(frame.Path);
+                if (string.Equals(framePath, normalizedTarget, StringComparison.Ordinal))
+                {
+                    return frame;
+                }
+
+                if (framePath != null && framePath.EndsWith(suffix, StringComparison.Ordinal))
+                {
+                    uniqueSuffixMatch = frame;
+                    suffixMatchCount++;
+                }
+
+                for (int i = frame.Count - 1; i >= 0; i--)
+                {
+                    stack.Push(frame[i]);
+                }
+            }
+
+            return suffixMatchCount == 1 ? uniqueSuffixMatch : null;
+        }
+
+        private static System.Numerics.Matrix4x4 ComputeRelativeFrameMatrix(ImportedFrame meshFrame, ImportedFrame targetFrame)
+        {
+            if (meshFrame == null || ReferenceEquals(meshFrame, targetFrame))
+            {
+                return System.Numerics.Matrix4x4.Identity;
+            }
+
+            // Fast path: walk up parent chain looking for targetFrame (cycle-safe)
+            var rel = System.Numerics.Matrix4x4.Identity;
+            var visited = new HashSet<ImportedFrame>();
+            var current = meshFrame;
+            while (current != null && visited.Add(current))
+            {
+                rel = rel * BuildImportedFrameLocalMatrix(current);
+                if (ReferenceEquals(current.Parent, targetFrame))
+                {
+                    return rel;
+                }
+                current = current.Parent;
+            }
+
+            // Fallback when targetFrame is not a direct ancestor of meshFrame
+            if (targetFrame == null)
+            {
+                return rel;
+            }
+
+            var targetGlobal = ComputeFrameGlobalMatrix(targetFrame);
+            return System.Numerics.Matrix4x4.Invert(targetGlobal, out var invTarget)
+                ? rel * invTarget
+                : rel;
+        }
+
+        private static System.Numerics.Matrix4x4 ComputeFrameGlobalMatrix(ImportedFrame frame)
+        {
+            var global = System.Numerics.Matrix4x4.Identity;
+            var visited = new HashSet<ImportedFrame>();
+            var current = frame;
+            while (current != null && visited.Add(current))
+            {
+                global = global * BuildImportedFrameLocalMatrix(current);
+                current = current.Parent;
+            }
+            return global;
+        }
+
+        private static System.Numerics.Matrix4x4 BuildImportedFrameLocalMatrix(ImportedFrame frame)
+        {
+            var scale = System.Numerics.Matrix4x4.CreateScale(
+                SanitizeFloat(frame.LocalScale.X, 0f),
+                SanitizeFloat(frame.LocalScale.Y, 0f),
+                SanitizeFloat(frame.LocalScale.Z, 0f));
+            var rotation =
+                System.Numerics.Matrix4x4.CreateRotationX(DegreesToRadians(frame.LocalRotation.X)) *
+                System.Numerics.Matrix4x4.CreateRotationY(DegreesToRadians(frame.LocalRotation.Y)) *
+                System.Numerics.Matrix4x4.CreateRotationZ(DegreesToRadians(frame.LocalRotation.Z));
+            var translation = System.Numerics.Matrix4x4.CreateTranslation(
+                SanitizeFloat(frame.LocalPosition.X, 0f),
+                SanitizeFloat(frame.LocalPosition.Y, 0f),
+                SanitizeFloat(frame.LocalPosition.Z, 0f));
+            return scale * rotation * translation;
+        }
+
+        private static System.Numerics.Matrix4x4 BuildNormalMatrix(System.Numerics.Matrix4x4 relMatrix, out bool flipWinding)
+        {
+            var upper = new System.Numerics.Matrix4x4(
+                relMatrix.M11, relMatrix.M12, relMatrix.M13, 0f,
+                relMatrix.M21, relMatrix.M22, relMatrix.M23, 0f,
+                relMatrix.M31, relMatrix.M32, relMatrix.M33, 0f,
+                0f, 0f, 0f, 1f);
+
+            var det = upper.GetDeterminant();
+            flipWinding = det < -1e-9f;
+            if (Math.Abs(det) > 1e-12f && System.Numerics.Matrix4x4.Invert(upper, out var invUpper))
+            {
+                return System.Numerics.Matrix4x4.Transpose(invUpper);
+            }
+
+            return upper;
+        }
+
+        private static Vector3 TransformDirectionNormalized(Vector3 dir, System.Numerics.Matrix4x4 normalMatrix)
+        {
+            var transformed = System.Numerics.Vector3.TransformNormal(
+                new System.Numerics.Vector3(
+                    SanitizeFloat(dir.X, 0f),
+                    SanitizeFloat(dir.Y, 0f),
+                    SanitizeFloat(dir.Z, 0f)),
+                normalMatrix);
+            var lenSq = transformed.LengthSquared();
+            if (lenSq > 1e-12f && !float.IsNaN(lenSq) && !float.IsInfinity(lenSq))
+            {
+                var invLen = 1f / (float)Math.Sqrt(lenSq);
+                return new Vector3(transformed.X * invLen, transformed.Y * invLen, transformed.Z * invLen);
+            }
+
+            var origLenSq = dir.X * dir.X + dir.Y * dir.Y + dir.Z * dir.Z;
+            if (origLenSq > 1e-12f && !float.IsNaN(origLenSq) && !float.IsInfinity(origLenSq))
+            {
+                var invLen = 1f / (float)Math.Sqrt(origLenSq);
+                return new Vector3(dir.X * invLen, dir.Y * invLen, dir.Z * invLen);
+            }
+
+            return Vector3.Zero;
+        }
+
+        private static Matrix4x4 TransformBindPoseMatrix(Matrix4x4 bindPose, System.Numerics.Matrix4x4 relMatrix)
+        {
+            if (relMatrix.IsIdentity)
+            {
+                return bindPose;
+            }
+
+            if (System.Numerics.Matrix4x4.Invert(relMatrix, out var invRel))
+            {
+                var adjusted = invRel * ToNumericsMatrix(bindPose);
+                return FromNumericsMatrix(adjusted);
+            }
+
+            return bindPose;
+        }
+
+        private static System.Numerics.Matrix4x4 ToNumericsMatrix(Matrix4x4 m)
+        {
+            return new System.Numerics.Matrix4x4(
+                m[0, 0], m[0, 1], m[0, 2], m[0, 3],
+                m[1, 0], m[1, 1], m[1, 2], m[1, 3],
+                m[2, 0], m[2, 1], m[2, 2], m[2, 3],
+                m[3, 0], m[3, 1], m[3, 2], m[3, 3]);
+        }
+
+        private static Matrix4x4 FromNumericsMatrix(System.Numerics.Matrix4x4 m)
+        {
+            var result = new Matrix4x4();
+            result[0, 0] = SanitizeFloat(m.M11, 0f); result[0, 1] = SanitizeFloat(m.M12, 0f); result[0, 2] = SanitizeFloat(m.M13, 0f); result[0, 3] = SanitizeFloat(m.M14, 0f);
+            result[1, 0] = SanitizeFloat(m.M21, 0f); result[1, 1] = SanitizeFloat(m.M22, 0f); result[1, 2] = SanitizeFloat(m.M23, 0f); result[1, 3] = SanitizeFloat(m.M24, 0f);
+            result[2, 0] = SanitizeFloat(m.M31, 0f); result[2, 1] = SanitizeFloat(m.M32, 0f); result[2, 2] = SanitizeFloat(m.M33, 0f); result[2, 3] = SanitizeFloat(m.M34, 0f);
+            result[3, 0] = SanitizeFloat(m.M41, 0f); result[3, 1] = SanitizeFloat(m.M42, 0f); result[3, 2] = SanitizeFloat(m.M43, 0f); result[3, 3] = SanitizeFloat(m.M44, 0f);
+            return result;
+        }
+
+        private static float DegreesToRadians(float degrees)
+        {
+            return (float)(SanitizeFloat(degrees, 0f) * Math.PI / 180.0);
+        }
+
+        private static float SanitizeFloat(float value, float fallback)
+        {
+            return (float.IsNaN(value) || float.IsInfinity(value)) ? fallback : value;
+        }
+
+        private static string NormalizeFramePath(string path)
+        {
+            return path?.Replace('\\', '/').Trim('/');
         }
     }
 }

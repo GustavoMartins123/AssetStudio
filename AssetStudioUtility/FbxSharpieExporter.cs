@@ -26,17 +26,23 @@ namespace AssetStudio
         private string _exportDirectory;
         private ImportedFrame _rootFrame;
         private Dictionary<string, long> _frameIdMap = new Dictionary<string, long>();
+        private Dictionary<string, string> _frameUniqueSuffixMap = new Dictionary<string, string>();
+        private Dictionary<string, ImportedFrame> _frameByPathMap = new Dictionary<string, ImportedFrame>();
+        private Dictionary<string, ImportedFrame> _frameUniqueLeafMap = new Dictionary<string, ImportedFrame>();
         private Dictionary<string, System.Numerics.Matrix4x4> _frameGlobalMatrixMap = new Dictionary<string, System.Numerics.Matrix4x4>();
         private Dictionary<string, long> _materialIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _meshIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _blendShapeChannelMap = new Dictionary<string, long>();
         private Dictionary<string, long> _textureIdMap = new Dictionary<string, long>();
         private Dictionary<string, long> _videoIdMap = new Dictionary<string, long>();
+        private Dictionary<string, ImportedTexture> _sourceTextureMap = new Dictionary<string, ImportedTexture>();
         private Dictionary<string, int> _fbxNameCounts = new Dictionary<string, int>();
         private HashSet<string> _bonePathSet = new HashSet<string>();
         private HashSet<string> _skinBonePathSet = new HashSet<string>();
         private HashSet<string> _meshPathSet = new HashSet<string>();
         private List<(string Name, long Start, long Stop)> _takes = new List<(string Name, long Start, long Stop)>();
+        private static readonly int[] DefaultKeyAttrFlags = { 24840 };
+        private static readonly float[] DefaultKeyAttrDataFloat = { 0f, 0f, 9.419963E-30f, 0f };
         private int _exportedFrameCount;
         private int _exportedBoneCount;
         private int _exportedMeshCount;
@@ -116,6 +122,8 @@ namespace AssetStudio
                 if (!string.IsNullOrEmpty(_exportDirectory))
                     Directory.CreateDirectory(_exportDirectory);
 
+                BuildSourceTextureMap(convert.TextureList);
+                BuildFrameLookupMaps(convert.RootFrame);
                 BuildBonePathSet(convert);
 
                 if (convert.RootFrame != null)
@@ -126,26 +134,26 @@ namespace AssetStudio
 
                 if (_exportMeshes && convert.MaterialList != null)
                 {
-                    foreach (var mat in convert.MaterialList)
-                        ExportMaterial(mat, convert);
+                    for (int i = 0; i < convert.MaterialList.Count; i++)
+                        ExportMaterial(convert.MaterialList[i], convert);
                 }
 
                 if (_exportMeshes && convert.MeshList != null)
                 {
-                    foreach (var mesh in convert.MeshList)
-                        ExportMesh(mesh, convert);
+                    for (int i = 0; i < convert.MeshList.Count; i++)
+                        ExportMesh(convert.MeshList[i], convert);
                 }
 
                 if (_exportBlendShape && convert.MorphList != null)
                 {
-                    foreach (var morph in convert.MorphList)
-                        ExportMorph(morph);
+                    for (int i = 0; i < convert.MorphList.Count; i++)
+                        ExportMorph(convert.MorphList[i]);
                 }
 
                 if (_exportAnimations && convert.AnimationList != null)
                 {
-                    foreach (var anim in convert.AnimationList)
-                        ExportAnimation(anim);
+                    for (int i = 0; i < convert.AnimationList.Count; i++)
+                        ExportAnimation(convert.AnimationList[i]);
                 }
 
                 BuildTakes();
@@ -305,91 +313,129 @@ namespace AssetStudio
             geo.AddProperty(new StringToken("Mesh"));
 
             BuildVertices(geo, mesh);
-            BuildPolygonVertexIndex(geo, mesh);
+            var resolvedFaces = BuildPolygonVertexIndex(geo, mesh);
 
             if (mesh.hasNormal)
-                BuildLayerElementNormal(geo, mesh);
+                BuildLayerElementNormal(geo, mesh, resolvedFaces.Indices);
             if (mesh.hasUV != null)
             {
                 for (int uvIndex = 0; uvIndex < mesh.hasUV.Length; uvIndex++)
                 {
                     if (mesh.hasUV[uvIndex])
-                        BuildLayerElementUV(geo, mesh, uvIndex);
+                        BuildLayerElementUV(geo, mesh, uvIndex, resolvedFaces.Indices);
                 }
             }
             if (mesh.hasTangent)
-                BuildLayerElementTangent(geo, mesh);
+                BuildLayerElementTangent(geo, mesh, resolvedFaces.Indices);
             if (mesh.hasColor)
-                BuildLayerElementColor(geo, mesh);
+                BuildLayerElementColor(geo, mesh, resolvedFaces.Indices);
 
-            if (mesh.SubmeshList.Count > 0)
-                BuildLayerElementMaterial(geo, mesh, GetMeshMaterialOrder(mesh));
+            List<string> materialOrder = null;
+            if (mesh.SubmeshList != null && mesh.SubmeshList.Count > 0)
+            {
+                materialOrder = GetMeshMaterialOrder(mesh);
+                BuildLayerElementMaterial(geo, mesh, materialOrder, resolvedFaces.ValidFacesPerSubmesh, resolvedFaces.ValidFaceCount);
+            }
 
             BuildLayer(geo, mesh);
             _objects.AddNode(geo);
 
             Connect(geoId, modelId);
 
-            ConnectMaterialsToModel(mesh, modelId, convert);
+            ConnectMaterialsToModel(materialOrder, modelId, convert);
 
             if (_exportSkins && mesh.BoneList != null && mesh.BoneList.Count > 0)
                 ExportSkin(mesh, geoId);
         }
 
+        private readonly struct ResolvedMeshFaces
+        {
+            public ResolvedMeshFaces(int[] indices, int[] validFacesPerSubmesh, int validFaceCount)
+            {
+                Indices = indices;
+                ValidFacesPerSubmesh = validFacesPerSubmesh;
+                ValidFaceCount = validFaceCount;
+            }
+
+            public int[] Indices { get; }
+            public int[] ValidFacesPerSubmesh { get; }
+            public int ValidFaceCount { get; }
+        }
+
         private void BuildVertices(FbxNode geo, ImportedMesh mesh)
         {
-            var verts = new double[mesh.VertexList.Count * 3];
-            for (int i = 0; i < mesh.VertexList.Count; i++)
+            var vertexList = mesh.VertexList;
+            int vertexCount = vertexList.Count;
+            var verts = new double[vertexCount * 3];
+            for (int i = 0; i < vertexCount; i++)
             {
-                var v = mesh.VertexList[i].Vertex;
-                verts[i * 3] = v.X;
-                verts[i * 3 + 1] = v.Y;
-                verts[i * 3 + 2] = v.Z;
+                var v = vertexList[i].Vertex;
+                int offset = i * 3;
+                verts[offset] = SanitizeFinite(v.X);
+                verts[offset + 1] = SanitizeFinite(v.Y);
+                verts[offset + 2] = SanitizeFinite(v.Z);
             }
             var n = N("Vertices");
             n.AddProperty(new DoubleArrayToken(verts));
             geo.AddNode(n);
         }
 
-        private void BuildPolygonVertexIndex(FbxNode geo, ImportedMesh mesh)
+        private ResolvedMeshFaces BuildPolygonVertexIndex(FbxNode geo, ImportedMesh mesh)
         {
-            var faceCount = GetFaceCount(mesh);
-            var indices = new List<int>(faceCount * 3);
-            var skippedFaces = 0;
+            var submeshList = mesh.SubmeshList;
+            int submeshCount = submeshList?.Count ?? 0;
+            int totalFaceCount = GetFaceCount(mesh);
+            int vertexCount = mesh.VertexList.Count;
+
+            var polygonIndices = new int[totalFaceCount * 3];
+            var resolvedIndices = new int[totalFaceCount * 3];
+            var validFacesPerSubmesh = new int[submeshCount];
+            int writePos = 0;
+            int skippedFaces = 0;
+
             var meshDiag = new MeshDiagnosticInfo
             {
                 Path = mesh.Path ?? "<no path>",
-                VertexCount = mesh.VertexList.Count,
+                VertexCount = vertexCount,
                 PolygonCount = 0,
-                Submeshes = new List<SubmeshDiagnosticInfo>(mesh.SubmeshList.Count)
+                Submeshes = new List<SubmeshDiagnosticInfo>(submeshCount)
             };
 
-            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
+            for (int subIdx = 0; subIdx < submeshCount; subIdx++)
             {
-                var sub = mesh.SubmeshList[subIdx];
+                var sub = submeshList[subIdx];
+                var faceList = sub.FaceList;
+                int subFaceCount = faceList?.Count ?? 0;
+                int baseVertex = sub.BaseVertex;
+                int validSubFaces = 0;
+
                 var subDiag = new SubmeshDiagnosticInfo
                 {
                     Index = subIdx,
-                    BaseVertex = sub.BaseVertex,
+                    BaseVertex = baseVertex,
                     Material = sub.Material ?? "<none>",
-                    IndexCount = sub.FaceList.Count * 3
+                    IndexCount = subFaceCount * 3
                 };
 
-                foreach (var face in sub.FaceList)
+                for (int f = 0; f < subFaceCount; f++)
                 {
-                    if (!TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
+                    if (!TryResolveFaceIndices(faceList[f], baseVertex, vertexCount, out var index0, out var index1, out var index2))
                     {
                         skippedFaces++;
                         continue;
                     }
 
-                    indices.Add(index0);
-                    indices.Add(index1);
-                    indices.Add(~index2);
+                    resolvedIndices[writePos] = index0;
+                    resolvedIndices[writePos + 1] = index1;
+                    resolvedIndices[writePos + 2] = index2;
 
+                    polygonIndices[writePos] = index0;
+                    polygonIndices[writePos + 1] = index1;
+                    polygonIndices[writePos + 2] = ~index2;
+                    writePos += 3;
+                    validSubFaces++;
                     meshDiag.PolygonCount++;
 
-                    // Update submesh indices
                     if (index0 < subDiag.MinIndex) subDiag.MinIndex = index0;
                     if (index1 < subDiag.MinIndex) subDiag.MinIndex = index1;
                     if (index2 < subDiag.MinIndex) subDiag.MinIndex = index2;
@@ -398,7 +444,6 @@ namespace AssetStudio
                     if (index1 > subDiag.MaxIndex) subDiag.MaxIndex = index1;
                     if (index2 > subDiag.MaxIndex) subDiag.MaxIndex = index2;
 
-                    // Update mesh indices
                     if (index0 < meshDiag.MinIndex) meshDiag.MinIndex = index0;
                     if (index1 < meshDiag.MinIndex) meshDiag.MinIndex = index1;
                     if (index2 < meshDiag.MinIndex) meshDiag.MinIndex = index2;
@@ -407,6 +452,8 @@ namespace AssetStudio
                     if (index1 > meshDiag.MaxIndex) meshDiag.MaxIndex = index1;
                     if (index2 > meshDiag.MaxIndex) meshDiag.MaxIndex = index2;
                 }
+
+                validFacesPerSubmesh[subIdx] = validSubFaces;
 
                 if (subDiag.MaxIndex >= subDiag.MinIndex)
                 {
@@ -422,6 +469,12 @@ namespace AssetStudio
                 meshDiag.Submeshes.Add(subDiag);
             }
 
+            if (writePos != polygonIndices.Length)
+            {
+                Array.Resize(ref polygonIndices, writePos);
+                Array.Resize(ref resolvedIndices, writePos);
+            }
+
             meshDiag.SkippedFaces = skippedFaces;
             _meshDiagnostics.Add(meshDiag);
 
@@ -429,8 +482,10 @@ namespace AssetStudio
                 Logger.Warning($"Mesh '{mesh.Path}' skipped {skippedFaces} FBX faces because their vertex indices were outside the exported vertex buffer.");
 
             var n = N("PolygonVertexIndex");
-            n.AddProperty(new IntegerArrayToken(indices.ToArray()));
+            n.AddProperty(new IntegerArrayToken(polygonIndices));
             geo.AddNode(n);
+
+            return new ResolvedMeshFaces(resolvedIndices, validFacesPerSubmesh, writePos / 3);
         }
 
         private static bool TryResolveFaceIndices(ImportedFace face, int baseVertex, int vertexCount, out int index0, out int index1, out int index2)
@@ -453,10 +508,10 @@ namespace AssetStudio
 
         private static bool IsValidIndex(int index, int vertexCount)
         {
-            return index >= 0 && index < vertexCount;
+            return (uint)index < (uint)vertexCount;
         }
 
-        private void BuildLayerElementNormal(FbxNode geo, ImportedMesh mesh)
+        private void BuildLayerElementNormal(FbxNode geo, ImportedMesh mesh, int[] resolvedIndices)
         {
             var layer = N("LayerElementNormal");
             layer.AddProperty(new IntegerToken(0));
@@ -465,31 +520,25 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var normalData = new List<double>(GetFaceCount(mesh) * 9);
-            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
+            var vertexList = mesh.VertexList;
+            int indexCount = resolvedIndices.Length;
+            var normalData = new double[indexCount * 3];
+            for (int i = 0; i < indexCount; i++)
             {
-                var sub = mesh.SubmeshList[subIdx];
-                foreach (var face in sub.FaceList)
-                {
-                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
-                    {
-                        var n0 = mesh.VertexList[index0].Normal;
-                        var n1 = mesh.VertexList[index1].Normal;
-                        var n2 = mesh.VertexList[index2].Normal;
-                        normalData.Add(n0.X); normalData.Add(n0.Y); normalData.Add(n0.Z);
-                        normalData.Add(n1.X); normalData.Add(n1.Y); normalData.Add(n1.Z);
-                        normalData.Add(n2.X); normalData.Add(n2.Y); normalData.Add(n2.Z);
-                    }
-                }
+                var n = vertexList[resolvedIndices[i]].Normal;
+                int offset = i * 3;
+                normalData[offset] = SanitizeFinite(n.X);
+                normalData[offset + 1] = SanitizeFinite(n.Y);
+                normalData[offset + 2] = SanitizeFinite(n.Z);
             }
 
             var normNode = N("Normals");
-            normNode.AddProperty(new DoubleArrayToken(normalData.ToArray()));
+            normNode.AddProperty(new DoubleArrayToken(normalData));
             layer.AddNode(normNode);
             geo.AddNode(layer);
         }
 
-        private void BuildLayerElementUV(FbxNode geo, ImportedMesh mesh, int uvIndex)
+        private void BuildLayerElementUV(FbxNode geo, ImportedMesh mesh, int uvIndex, int[] resolvedIndices)
         {
             var layer = N("LayerElementUV");
             layer.AddProperty(new IntegerToken(uvIndex));
@@ -498,46 +547,31 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "IndexToDirect");
 
-            var uvData = new List<double>(mesh.VertexList.Count * 2);
-            for (int i = 0; i < mesh.VertexList.Count; i++)
+            var vertexList = mesh.VertexList;
+            int vertexCount = vertexList.Count;
+            var uvData = new double[vertexCount * 2];
+            for (int i = 0; i < vertexCount; i++)
             {
-                if (mesh.VertexList[i].UV?[uvIndex] != null)
+                var uvChannels = vertexList[i].UV;
+                int offset = i * 2;
+                if (uvChannels != null && uvIndex < uvChannels.Length && uvChannels[uvIndex] != null && uvChannels[uvIndex].Length >= 2)
                 {
-                    uvData.Add(mesh.VertexList[i].UV[uvIndex][0]);
-                    uvData.Add(mesh.VertexList[i].UV[uvIndex][1]);
-                }
-                else
-                {
-                    uvData.Add(0.0);
-                    uvData.Add(0.0);
+                    uvData[offset] = SanitizeFinite(uvChannels[uvIndex][0]);
+                    uvData[offset + 1] = SanitizeFinite(uvChannels[uvIndex][1]);
                 }
             }
             var uvNode = N("UV");
-            uvNode.AddProperty(new DoubleArrayToken(uvData.ToArray()));
+            uvNode.AddProperty(new DoubleArrayToken(uvData));
             layer.AddNode(uvNode);
 
-            var uvIndices = new List<int>(GetFaceCount(mesh) * 3);
-            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
-            {
-                var sub = mesh.SubmeshList[subIdx];
-                foreach (var face in sub.FaceList)
-                {
-                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
-                    {
-                        uvIndices.Add(index0);
-                        uvIndices.Add(index1);
-                        uvIndices.Add(index2);
-                    }
-                }
-            }
             var uvIndexNode = N("UVIndex");
-            uvIndexNode.AddProperty(new IntegerArrayToken(uvIndices.ToArray()));
+            uvIndexNode.AddProperty(new IntegerArrayToken(resolvedIndices));
             layer.AddNode(uvIndexNode);
 
             geo.AddNode(layer);
         }
 
-        private void BuildLayerElementTangent(FbxNode geo, ImportedMesh mesh)
+        private void BuildLayerElementTangent(FbxNode geo, ImportedMesh mesh, int[] resolvedIndices)
         {
             var layer = N("LayerElementTangent");
             layer.AddProperty(new IntegerToken(0));
@@ -546,31 +580,25 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var tangentData = new List<double>(GetFaceCount(mesh) * 9);
-            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
+            var vertexList = mesh.VertexList;
+            int indexCount = resolvedIndices.Length;
+            var tangentData = new double[indexCount * 3];
+            for (int i = 0; i < indexCount; i++)
             {
-                var sub = mesh.SubmeshList[subIdx];
-                foreach (var face in sub.FaceList)
-                {
-                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
-                    {
-                        var t0 = mesh.VertexList[index0].Tangent;
-                        var t1 = mesh.VertexList[index1].Tangent;
-                        var t2 = mesh.VertexList[index2].Tangent;
-                        tangentData.Add(t0.X); tangentData.Add(t0.Y); tangentData.Add(t0.Z);
-                        tangentData.Add(t1.X); tangentData.Add(t1.Y); tangentData.Add(t1.Z);
-                        tangentData.Add(t2.X); tangentData.Add(t2.Y); tangentData.Add(t2.Z);
-                    }
-                }
+                var t = vertexList[resolvedIndices[i]].Tangent;
+                int offset = i * 3;
+                tangentData[offset] = SanitizeFinite(t.X);
+                tangentData[offset + 1] = SanitizeFinite(t.Y);
+                tangentData[offset + 2] = SanitizeFinite(t.Z);
             }
 
             var tangNode = N("Tangents");
-            tangNode.AddProperty(new DoubleArrayToken(tangentData.ToArray()));
+            tangNode.AddProperty(new DoubleArrayToken(tangentData));
             layer.AddNode(tangNode);
             geo.AddNode(layer);
         }
 
-        private void BuildLayerElementColor(FbxNode geo, ImportedMesh mesh)
+        private void BuildLayerElementColor(FbxNode geo, ImportedMesh mesh, int[] resolvedIndices)
         {
             var layer = N("LayerElementColor");
             layer.AddProperty(new IntegerToken(0));
@@ -579,31 +607,26 @@ namespace AssetStudio
             AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
             AddSimpleNode(layer, "ReferenceInformationType", "Direct");
 
-            var colorData = new List<double>(GetFaceCount(mesh) * 12);
-            for (int subIdx = 0; subIdx < mesh.SubmeshList.Count; subIdx++)
+            var vertexList = mesh.VertexList;
+            int indexCount = resolvedIndices.Length;
+            var colorData = new double[indexCount * 4];
+            for (int i = 0; i < indexCount; i++)
             {
-                var sub = mesh.SubmeshList[subIdx];
-                foreach (var face in sub.FaceList)
-                {
-                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out var index0, out var index1, out var index2))
-                    {
-                        var c0 = mesh.VertexList[index0].Color;
-                        var c1 = mesh.VertexList[index1].Color;
-                        var c2 = mesh.VertexList[index2].Color;
-                        colorData.Add(c0.R); colorData.Add(c0.G); colorData.Add(c0.B); colorData.Add(c0.A);
-                        colorData.Add(c1.R); colorData.Add(c1.G); colorData.Add(c1.B); colorData.Add(c1.A);
-                        colorData.Add(c2.R); colorData.Add(c2.G); colorData.Add(c2.B); colorData.Add(c2.A);
-                    }
-                }
+                var c = vertexList[resolvedIndices[i]].Color;
+                int offset = i * 4;
+                colorData[offset] = SanitizeFinite(c.R);
+                colorData[offset + 1] = SanitizeFinite(c.G);
+                colorData[offset + 2] = SanitizeFinite(c.B);
+                colorData[offset + 3] = SanitizeFinite(c.A);
             }
 
             var colorNode = N("Colors");
-            colorNode.AddProperty(new DoubleArrayToken(colorData.ToArray()));
+            colorNode.AddProperty(new DoubleArrayToken(colorData));
             layer.AddNode(colorNode);
             geo.AddNode(layer);
         }
 
-        private void BuildLayerElementMaterial(FbxNode geo, ImportedMesh mesh, List<string> materialOrder)
+        private void BuildLayerElementMaterial(FbxNode geo, ImportedMesh mesh, List<string> materialOrder, int[] validFacesPerSubmesh, int validFaceCount)
         {
             var layer = N("LayerElementMaterial");
             layer.AddProperty(new IntegerToken(0));
@@ -616,24 +639,25 @@ namespace AssetStudio
             for (var i = 0; i < materialOrder.Count; i++)
                 materialIndexByName[materialOrder[i]] = i;
 
-            var materialIndices = new List<int>(GetFaceCount(mesh));
-            foreach (var sub in mesh.SubmeshList)
+            var materialIndices = new int[validFaceCount];
+            int writePos = 0;
+            var submeshList = mesh.SubmeshList;
+            for (int subIdx = 0; subIdx < submeshList.Count; subIdx++)
             {
+                var sub = submeshList[subIdx];
                 var materialIndex = 0;
                 if (!string.IsNullOrEmpty(sub.Material) && materialIndexByName.TryGetValue(sub.Material, out var index))
                     materialIndex = index;
 
-                foreach (var face in sub.FaceList)
+                int subValidFaces = validFacesPerSubmesh[subIdx];
+                for (int f = 0; f < subValidFaces; f++)
                 {
-                    if (TryResolveFaceIndices(face, sub.BaseVertex, mesh.VertexList.Count, out _, out _, out _))
-                    {
-                        materialIndices.Add(materialIndex);
-                    }
+                    materialIndices[writePos++] = materialIndex;
                 }
             }
 
             var matIdx = N("Materials");
-            matIdx.AddProperty(new IntegerArrayToken(materialIndices.ToArray()));
+            matIdx.AddProperty(new IntegerArrayToken(materialIndices));
             layer.AddNode(matIdx);
             geo.AddNode(layer);
         }
@@ -658,7 +682,7 @@ namespace AssetStudio
                 AddLayerRef(layer, "LayerElementTangent");
             if (mesh.hasColor)
                 AddLayerRef(layer, "LayerElementColor");
-            if (mesh.SubmeshList.Count > 0)
+            if (mesh.SubmeshList != null && mesh.SubmeshList.Count > 0)
                 AddLayerRef(layer, "LayerElementMaterial");
 
             geo.AddNode(layer);
@@ -673,28 +697,30 @@ namespace AssetStudio
             layer.AddNode(el);
         }
 
-        private void ConnectMaterialsToModel(ImportedMesh mesh, long modelId, IImported convert)
+        private void ConnectMaterialsToModel(List<string> materialOrder, long modelId, IImported convert)
         {
-            if (modelId == 0 || convert.MaterialList == null)
+            if (modelId == 0 || convert.MaterialList == null || materialOrder == null)
                 return;
 
-            foreach (var material in GetMeshMaterialOrder(mesh))
+            for (int i = 0; i < materialOrder.Count; i++)
             {
-                if (_materialIdMap.TryGetValue(material, out var matId))
+                if (_materialIdMap.TryGetValue(materialOrder[i], out var matId))
                     Connect(matId, modelId);
             }
         }
 
         private static List<string> GetMeshMaterialOrder(ImportedMesh mesh)
         {
-            var materials = new List<string>(mesh.SubmeshList.Count);
+            var submeshList = mesh.SubmeshList;
+            var materials = new List<string>(submeshList.Count);
             var seen = new HashSet<string>();
-            foreach (var sub in mesh.SubmeshList)
+            for (int i = 0; i < submeshList.Count; i++)
             {
-                if (string.IsNullOrEmpty(sub.Material) || !seen.Add(sub.Material))
+                var matName = submeshList[i].Material;
+                if (string.IsNullOrEmpty(matName) || !seen.Add(matName))
                     continue;
 
-                materials.Add(sub.Material);
+                materials.Add(matName);
             }
 
             return materials;
@@ -716,31 +742,81 @@ namespace AssetStudio
             var meshBindMatrix = GetFrameMatrix(mesh.Path, System.Numerics.Matrix4x4.Identity);
             var transform = NumericsToFbxArray(meshBindMatrix);
 
-            for (int boneIdx = 0; boneIdx < mesh.BoneList.Count; boneIdx++)
+            var boneList = mesh.BoneList;
+            var vertexList = mesh.VertexList;
+            int boneCount = boneList.Count;
+            int vertexCount = vertexList.Count;
+
+            // Single-pass count per bone: O(V) instead of O(B * V) and exact-sized arrays with zero LOH waste
+            var influenceCounts = new int[boneCount];
+            for (int v = 0; v < vertexCount; v++)
             {
-                var bone = mesh.BoneList[boneIdx];
+                var vert = vertexList[v];
+                var boneIndices = vert.BoneIndices;
+                var weights = vert.Weights;
+                if (boneIndices == null || weights == null) continue;
+                int weightSlots = boneIndices.Length < weights.Length ? boneIndices.Length : weights.Length;
+                if (weightSlots > 4) weightSlots = 4;
+                for (int w = 0; w < weightSlots; w++)
+                {
+                    float weight = weights[w];
+                    if (weight > 0f && !float.IsNaN(weight) && !float.IsInfinity(weight))
+                    {
+                        int bIdx = boneIndices[w];
+                        if ((uint)bIdx < (uint)boneCount && boneList[bIdx].Path != null)
+                        {
+                            influenceCounts[bIdx]++;
+                        }
+                    }
+                }
+            }
+
+            var boneVertexIndices = new int[boneCount][];
+            var boneVertexWeights = new double[boneCount][];
+            var writeCursor = new int[boneCount];
+            for (int b = 0; b < boneCount; b++)
+            {
+                int count = influenceCounts[b];
+                if (count > 0)
+                {
+                    boneVertexIndices[b] = new int[count];
+                    boneVertexWeights[b] = new double[count];
+                }
+            }
+
+            for (int v = 0; v < vertexCount; v++)
+            {
+                var vert = vertexList[v];
+                var boneIndices = vert.BoneIndices;
+                var weights = vert.Weights;
+                if (boneIndices == null || weights == null) continue;
+                int weightSlots = boneIndices.Length < weights.Length ? boneIndices.Length : weights.Length;
+                if (weightSlots > 4) weightSlots = 4;
+                for (int w = 0; w < weightSlots; w++)
+                {
+                    float weight = weights[w];
+                    if (weight > 0f && !float.IsNaN(weight) && !float.IsInfinity(weight))
+                    {
+                        int bIdx = boneIndices[w];
+                        if ((uint)bIdx < (uint)boneCount && boneVertexIndices[bIdx] != null)
+                        {
+                            int pos = writeCursor[bIdx]++;
+                            boneVertexIndices[bIdx][pos] = v;
+                            boneVertexWeights[bIdx][pos] = weight;
+                        }
+                    }
+                }
+            }
+
+            for (int boneIdx = 0; boneIdx < boneCount; boneIdx++)
+            {
+                var bone = boneList[boneIdx];
                 if (bone.Path == null)
                     continue;
 
                 _candidateClusterCount++;
 
-                var indices = new List<int>(mesh.VertexList.Count);
-                var weights = new List<double>(mesh.VertexList.Count);
-                for (int v = 0; v < mesh.VertexList.Count; v++)
-                {
-                    var vert = mesh.VertexList[v];
-                    if (vert.BoneIndices == null) continue;
-                    for (int w = 0; w < 4; w++)
-                    {
-                        if (vert.BoneIndices[w] == boneIdx && vert.Weights[w] > 0)
-                        {
-                            indices.Add(v);
-                            weights.Add(vert.Weights[w]);
-                        }
-                    }
-                }
-
-                if (indices.Count == 0)
+                if (influenceCounts[boneIdx] == 0)
                 {
                     _omittedClusterCount++;
                     Logger.Verbose($"Omitted zero-weight skin cluster for mesh '{mesh.Path}' and bone '{bone.Path}'.");
@@ -758,11 +834,11 @@ namespace AssetStudio
                 AddSimpleNode(cluster, "UserData", "");
 
                 var idxNode = N("Indexes");
-                idxNode.AddProperty(new IntegerArrayToken(indices.ToArray()));
+                idxNode.AddProperty(new IntegerArrayToken(boneVertexIndices[boneIdx]));
                 cluster.AddNode(idxNode);
 
                 var wNode = N("Weights");
-                wNode.AddProperty(new DoubleArrayToken(weights.ToArray()));
+                wNode.AddProperty(new DoubleArrayToken(boneVertexWeights[boneIdx]));
                 cluster.AddNode(wNode);
 
                 var transformLink = NumericsToFbxArray(GetBindPoseLinkMatrix(meshBindMatrix, bone));
@@ -808,26 +884,27 @@ namespace AssetStudio
             shininess.AddProperty(new StringToken("Number"));
             shininess.AddProperty(new StringToken(""));
             shininess.AddProperty(new StringToken("A"));
-            shininess.AddProperty(new DoubleToken(mat.Shininess));
+            shininess.AddProperty(new DoubleToken(SanitizeFinite(mat.Shininess)));
             props.AddNode(shininess);
 
             matNode.AddNode(props);
             _objects.AddNode(matNode);
 
-            ExportMaterialTextures(mat, id, convert);
+            ExportMaterialTextures(mat, id);
         }
 
-        private void ExportMaterialTextures(ImportedMaterial mat, long materialId, IImported convert)
+        private void ExportMaterialTextures(ImportedMaterial mat, long materialId)
         {
             if (mat.Textures == null)
                 return;
 
-            foreach (var matTex in mat.Textures)
+            for (int i = 0; i < mat.Textures.Count; i++)
             {
+                var matTex = mat.Textures[i];
                 if (string.IsNullOrEmpty(matTex.Name))
                     continue;
 
-                var texture = convert.TextureList != null ? ImportedHelpers.FindTexture(matTex.Name, convert.TextureList) : null;
+                _sourceTextureMap.TryGetValue(matTex.Name, out var texture);
                 long textureId;
                 if (texture != null)
                 {
@@ -847,6 +924,108 @@ namespace AssetStudio
 
                 ConnectProperty(textureId, materialId, GetMaterialTextureProperty(matTex.Dest));
             }
+        }
+
+        private void BuildSourceTextureMap(List<ImportedTexture> textureList)
+        {
+            _sourceTextureMap.Clear();
+            if (textureList == null)
+                return;
+
+            for (int i = 0; i < textureList.Count; i++)
+            {
+                var tex = textureList[i];
+                if (tex != null && !string.IsNullOrEmpty(tex.Name) && !_sourceTextureMap.ContainsKey(tex.Name))
+                {
+                    _sourceTextureMap[tex.Name] = tex;
+                }
+            }
+        }
+
+        private void BuildFrameLookupMaps(ImportedFrame rootFrame)
+        {
+            _frameByPathMap.Clear();
+            _frameUniqueLeafMap.Clear();
+            _frameUniqueSuffixMap.Clear();
+
+            if (rootFrame == null)
+                return;
+
+            var visited = new HashSet<ImportedFrame>();
+            var stack = new Stack<ImportedFrame>();
+            stack.Push(rootFrame);
+
+            while (stack.Count > 0)
+            {
+                var frame = stack.Pop();
+                if (frame == null || !visited.Add(frame))
+                    continue;
+
+                var normalizedPath = NormalizeFramePath(frame.Path);
+                if (!string.IsNullOrEmpty(normalizedPath))
+                {
+                    if (!_frameByPathMap.ContainsKey(normalizedPath))
+                        _frameByPathMap[normalizedPath] = frame;
+
+                    // Register all slash-separated suffixes for O(1) unique suffix lookup
+                    int slashIdx = normalizedPath.IndexOf('/');
+                    while (slashIdx >= 0 && slashIdx + 1 < normalizedPath.Length)
+                    {
+                        var suffix = normalizedPath.Substring(slashIdx + 1);
+                        if (_frameUniqueSuffixMap.TryGetValue(suffix, out var existing))
+                        {
+                            if (existing != null && !string.Equals(existing, normalizedPath, StringComparison.Ordinal))
+                                _frameUniqueSuffixMap[suffix] = null; // ambiguous
+                        }
+                        else
+                        {
+                            _frameUniqueSuffixMap[suffix] = normalizedPath;
+                        }
+                        slashIdx = normalizedPath.IndexOf('/', slashIdx + 1);
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(frame.Name))
+                {
+                    if (_frameUniqueLeafMap.TryGetValue(frame.Name, out var existingLeaf))
+                    {
+                        if (existingLeaf != null && !ReferenceEquals(existingLeaf, frame))
+                            _frameUniqueLeafMap[frame.Name] = null; // ambiguous
+                    }
+                    else
+                    {
+                        _frameUniqueLeafMap[frame.Name] = frame;
+                    }
+                }
+
+                for (int i = frame.Count - 1; i >= 0; i--)
+                    stack.Push(frame[i]);
+            }
+        }
+
+        private ImportedFrame FindFrameFast(string normalizedPath)
+        {
+            if (string.IsNullOrEmpty(normalizedPath))
+                return null;
+
+            if (_frameByPathMap.TryGetValue(normalizedPath, out var exactFrame))
+                return exactFrame;
+
+            if (_frameUniqueSuffixMap.TryGetValue(normalizedPath, out var canonicalPath)
+                && canonicalPath != null
+                && _frameByPathMap.TryGetValue(canonicalPath, out var suffixFrame))
+            {
+                return suffixFrame;
+            }
+
+            if (normalizedPath.IndexOf('/') < 0
+                && _frameUniqueLeafMap.TryGetValue(normalizedPath, out var leafFrame)
+                && leafFrame != null)
+            {
+                return leafFrame;
+            }
+
+            return _rootFrame?.FindFrameByPath(normalizedPath);
         }
 
         private long ExportTexture(ImportedTexture texture)
@@ -966,14 +1145,32 @@ namespace AssetStudio
 
             var stackProps = N("Properties70");
             float maxTime = 0;
-            foreach (var track in anim.TrackList)
+            for (int tIdx = 0; tIdx < anim.TrackList.Count; tIdx++)
             {
-                foreach (var k in track.Translations) if (k.time > maxTime) maxTime = k.time;
-                foreach (var k in track.Rotations) if (k.time > maxTime) maxTime = k.time;
-                foreach (var k in track.Scalings) if (k.time > maxTime) maxTime = k.time;
+                var track = anim.TrackList[tIdx];
+                for (int i = 0; i < track.Translations.Count; i++)
+                {
+                    float t = (float)SanitizeFinite(track.Translations[i].time);
+                    if (t > maxTime) maxTime = t;
+                }
+                for (int i = 0; i < track.Rotations.Count; i++)
+                {
+                    float t = (float)SanitizeFinite(track.Rotations[i].time);
+                    if (t > maxTime) maxTime = t;
+                }
+                for (int i = 0; i < track.Scalings.Count; i++)
+                {
+                    float t = (float)SanitizeFinite(track.Scalings[i].time);
+                    if (t > maxTime) maxTime = t;
+                }
                 if (track.BlendShape != null)
                 {
-                    foreach (var k in track.BlendShape.Keyframes) if (k.time > maxTime) maxTime = k.time;
+                    var bsKeys = track.BlendShape.Keyframes;
+                    for (int i = 0; i < bsKeys.Count; i++)
+                    {
+                        float t = (float)SanitizeFinite(bsKeys[i].time);
+                        if (t > maxTime) maxTime = t;
+                    }
                 }
             }
             var fbxTime = (long)(maxTime * 46186158000L);
@@ -996,8 +1193,9 @@ namespace AssetStudio
 
             var exportedTrackCount = 0;
             var missingTrackCount = 0;
-            foreach (var track in anim.TrackList)
+            for (int tIdx = 0; tIdx < anim.TrackList.Count; tIdx++)
             {
+                var track = anim.TrackList[tIdx];
                 if (track.Path == null) continue;
                 if (!TryGetFrameId(track.Path, out var modelId))
                 {
@@ -1056,27 +1254,16 @@ namespace AssetStudio
             if (_frameIdMap.TryGetValue(normalizedPath, out modelId))
                 return true;
 
-            var rootMatch = _rootFrame?.FindFrameByPath(normalizedPath);
+            if (_frameUniqueSuffixMap.TryGetValue(normalizedPath, out var canonicalPath) && canonicalPath != null)
+            {
+                return _frameIdMap.TryGetValue(canonicalPath, out modelId);
+            }
+
+            var rootMatch = FindFrameFast(normalizedPath);
             if (rootMatch != null && _frameIdMap.TryGetValue(NormalizeFramePath(rootMatch.Path), out modelId))
                 return true;
 
-            var suffix = "/" + normalizedPath;
-            var matchCount = 0;
-            foreach (var item in _frameIdMap)
-            {
-                if (!item.Key.EndsWith(suffix, StringComparison.Ordinal))
-                    continue;
-
-                modelId = item.Value;
-                matchCount++;
-                if (matchCount > 1)
-                {
-                    modelId = 0;
-                    return false;
-                }
-            }
-
-            return matchCount == 1;
+            return false;
         }
 
         private System.Numerics.Matrix4x4 GetBindPoseLinkMatrix(System.Numerics.Matrix4x4 meshBindMatrix, ImportedBone bone)
@@ -1138,22 +1325,12 @@ namespace AssetStudio
                 if (_frameGlobalMatrixMap.TryGetValue(normalizedPath, out var matrix))
                     return matrix;
 
-                var suffix = "/" + normalizedPath;
-                var matchCount = 0;
-                var match = fallback;
-                foreach (var item in _frameGlobalMatrixMap)
+                if (_frameUniqueSuffixMap.TryGetValue(normalizedPath, out var canonicalPath)
+                    && canonicalPath != null
+                    && _frameGlobalMatrixMap.TryGetValue(canonicalPath, out var suffixMatrix))
                 {
-                    if (!item.Key.EndsWith(suffix, StringComparison.Ordinal))
-                        continue;
-
-                    match = item.Value;
-                    matchCount++;
-                    if (matchCount > 1)
-                        return fallback;
+                    return suffixMatrix;
                 }
-
-                if (matchCount == 1)
-                    return match;
             }
 
             return fallback;
@@ -1203,31 +1380,27 @@ namespace AssetStudio
             _skinBonePathSet.Clear();
             _meshPathSet.Clear();
 
-            if (convert.MeshList != null)
-            {
-                foreach (var mesh in convert.MeshList)
-                {
-                    var meshPath = NormalizeFramePath(mesh.Path);
-                    if (!string.IsNullOrEmpty(meshPath))
-                        _meshPathSet.Add(meshPath);
-                }
-            }
-
             if (convert.MeshList == null)
                 return;
 
-            foreach (var mesh in convert.MeshList)
+            for (int m = 0; m < convert.MeshList.Count; m++)
             {
+                var mesh = convert.MeshList[m];
+                var meshPath = NormalizeFramePath(mesh.Path);
+                if (!string.IsNullOrEmpty(meshPath))
+                    _meshPathSet.Add(meshPath);
+
                 if (mesh.BoneList == null)
                     continue;
 
-                foreach (var bone in mesh.BoneList)
+                for (int b = 0; b < mesh.BoneList.Count; b++)
                 {
+                    var bone = mesh.BoneList[b];
                     var normalizedPath = NormalizeFramePath(bone.Path);
                     if (string.IsNullOrEmpty(normalizedPath))
                         continue;
 
-                    var frame = _rootFrame?.FindFrameByPath(normalizedPath);
+                    var frame = FindFrameFast(normalizedPath);
                     var resolvedPath = NormalizeFramePath(frame?.Path ?? normalizedPath);
                     if (!string.IsNullOrEmpty(resolvedPath))
                         _skinBonePathSet.Add(resolvedPath);
@@ -1290,12 +1463,14 @@ namespace AssetStudio
             Connect(curveNodeId, layerId);
             ConnectProperty(curveNodeId, targetId, propName);
 
-            var timesArr = new long[keyframes.Count];
-            var valuesArr = new double[keyframes.Count];
-            for (int i = 0; i < keyframes.Count; i++)
+            int keyCount = keyframes.Count;
+            var timesArr = new long[keyCount];
+            var valuesArr = new float[keyCount];
+            for (int i = 0; i < keyCount; i++)
             {
-                timesArr[i] = (long)(keyframes[i].time * 46186158000L);
-                valuesArr[i] = keyframes[i].value;
+                var k = keyframes[i];
+                timesArr[i] = (long)(SanitizeFinite(k.time) * 46186158000L);
+                valuesArr[i] = (float)SanitizeDouble(k.value);
             }
 
             ExportCurve(curveNodeId, "d", timesArr, valuesArr);
@@ -1321,16 +1496,18 @@ namespace AssetStudio
             Connect(curveNodeId, layerId);
             ConnectProperty(curveNodeId, modelId, propName);
 
-            var timesArr = new long[keyframes.Count];
-            var xArr = new double[keyframes.Count];
-            var yArr = new double[keyframes.Count];
-            var zArr = new double[keyframes.Count];
-            for (int i = 0; i < keyframes.Count; i++)
+            int keyCount = keyframes.Count;
+            var timesArr = new long[keyCount];
+            var xArr = new float[keyCount];
+            var yArr = new float[keyCount];
+            var zArr = new float[keyCount];
+            for (int i = 0; i < keyCount; i++)
             {
-                timesArr[i] = (long)(keyframes[i].time * 46186158000L);
-                xArr[i] = keyframes[i].value.X;
-                yArr[i] = keyframes[i].value.Y;
-                zArr[i] = keyframes[i].value.Z;
+                var k = keyframes[i];
+                timesArr[i] = (long)(SanitizeFinite(k.time) * 46186158000L);
+                xArr[i] = (float)SanitizeDouble(k.value.X);
+                yArr[i] = (float)SanitizeDouble(k.value.Y);
+                zArr[i] = (float)SanitizeDouble(k.value.Z);
             }
 
             ExportCurve(curveNodeId, "d|X", timesArr, xArr);
@@ -1338,7 +1515,7 @@ namespace AssetStudio
             ExportCurve(curveNodeId, "d|Z", timesArr, zArr);
         }
 
-        private void ExportCurve(long curveNodeId, string channel, long[] times, double[] values)
+        private void ExportCurve(long curveNodeId, string channel, long[] times, float[] floatValues)
         {
             var curveId = GenId();
             _exportedAnimationCurveCount++;
@@ -1355,22 +1532,19 @@ namespace AssetStudio
             curve.AddNode(keyTime);
 
             var keyValueFloat = N("KeyValueFloat");
-            var floatValues = new float[values.Length];
-            for (int i = 0; i < values.Length; i++)
-                floatValues[i] = (float)SanitizeDouble(values[i]);
             keyValueFloat.AddProperty(new FloatArrayToken(floatValues));
             curve.AddNode(keyValueFloat);
 
             var keyAttrFlags = N("KeyAttrFlags");
-            keyAttrFlags.AddProperty(new IntegerArrayToken(new[] { 24840 }));
+            keyAttrFlags.AddProperty(new IntegerArrayToken(DefaultKeyAttrFlags));
             curve.AddNode(keyAttrFlags);
 
             var keyAttrDataFloat = N("KeyAttrDataFloat");
-            keyAttrDataFloat.AddProperty(new FloatArrayToken(new[] { 0f, 0f, 9.419963E-30f, 0f }));
+            keyAttrDataFloat.AddProperty(new FloatArrayToken(DefaultKeyAttrDataFloat));
             curve.AddNode(keyAttrDataFloat);
 
             var keyAttrRefCount = N("KeyAttrRefCount");
-            keyAttrRefCount.AddProperty(new IntegerArrayToken(new[] { values.Length }));
+            keyAttrRefCount.AddProperty(new IntegerArrayToken(new[] { floatValues.Length }));
             curve.AddNode(keyAttrRefCount);
 
             _objects.AddNode(curve);
@@ -1402,8 +1576,9 @@ namespace AssetStudio
             _objects.AddNode(bs);
             Connect(blendShapeId, geoId);
 
-            foreach (var channel in morph.Channels)
+            for (int cIdx = 0; cIdx < morph.Channels.Count; cIdx++)
             {
+                var channel = morph.Channels[cIdx];
                 var channelId = GenId();
                 var bc = N("Deformer");
                 bc.AddProperty(new LongToken(channelId));
@@ -1413,8 +1588,10 @@ namespace AssetStudio
                 AddSimpleNode(bc, "DeformPercent", 0.0);
 
                 var fullWeights = N("FullWeights");
-                var weights = new double[channel.KeyframeList.Count];
-                for (int i = 0; i < weights.Length; i++) weights[i] = channel.KeyframeList[i].Weight;
+                int kfCount = channel.KeyframeList.Count;
+                var weights = new double[kfCount];
+                for (int i = 0; i < kfCount; i++)
+                    weights[i] = SanitizeFinite(channel.KeyframeList[i].Weight);
                 fullWeights.AddProperty(new DoubleArrayToken(weights));
                 bc.AddNode(fullWeights);
 
@@ -1423,8 +1600,9 @@ namespace AssetStudio
 
                 _blendShapeChannelMap[morph.Path + "::" + channel.Name] = channelId;
 
-                foreach (var keyframe in channel.KeyframeList)
+                for (int kIdx = 0; kIdx < kfCount; kIdx++)
                 {
+                    var keyframe = channel.KeyframeList[kIdx];
                     var shapeId = GenId();
                     var shape = N("Geometry");
                     shape.AddProperty(new LongToken(shapeId));
@@ -1433,19 +1611,25 @@ namespace AssetStudio
 
                     AddSimpleNode(shape, "Version", 100);
 
-                    var indices = new int[keyframe.VertexList.Count];
-                    var verts = new double[keyframe.VertexList.Count * 3];
-                    var normals = new double[keyframe.VertexList.Count * 3];
-                    for (int i = 0; i < keyframe.VertexList.Count; i++)
+                    var morphVerts = keyframe.VertexList;
+                    int vertCount = morphVerts.Count;
+                    var indices = new int[vertCount];
+                    var verts = new double[vertCount * 3];
+                    var normals = keyframe.hasNormals ? new double[vertCount * 3] : null;
+                    for (int i = 0; i < vertCount; i++)
                     {
-                        var v = keyframe.VertexList[i];
+                        var v = morphVerts[i];
+                        int offset = i * 3;
                         indices[i] = (int)v.Index;
-                        verts[i * 3] = v.Vertex.Vertex.X;
-                        verts[i * 3 + 1] = v.Vertex.Vertex.Y;
-                        verts[i * 3 + 2] = v.Vertex.Vertex.Z;
-                        normals[i * 3] = v.Vertex.Normal.X;
-                        normals[i * 3 + 1] = v.Vertex.Normal.Y;
-                        normals[i * 3 + 2] = v.Vertex.Normal.Z;
+                        verts[offset] = SanitizeFinite(v.Vertex.Vertex.X);
+                        verts[offset + 1] = SanitizeFinite(v.Vertex.Vertex.Y);
+                        verts[offset + 2] = SanitizeFinite(v.Vertex.Vertex.Z);
+                        if (normals != null)
+                        {
+                            normals[offset] = SanitizeFinite(v.Vertex.Normal.X);
+                            normals[offset + 1] = SanitizeFinite(v.Vertex.Normal.Y);
+                            normals[offset + 2] = SanitizeFinite(v.Vertex.Normal.Z);
+                        }
                     }
 
                     var idxNode = N("Indexes");
@@ -1456,7 +1640,7 @@ namespace AssetStudio
                     vertNode.AddProperty(new DoubleArrayToken(verts));
                     shape.AddNode(vertNode);
 
-                    if (keyframe.hasNormals)
+                    if (normals != null)
                     {
                         var normNode = N("Normals");
                         normNode.AddProperty(new DoubleArrayToken(normals));
@@ -1848,10 +2032,18 @@ namespace AssetStudio
             p.AddProperty(new StringToken("Color"));
             p.AddProperty(new StringToken(""));
             p.AddProperty(new StringToken("A"));
-            p.AddProperty(new DoubleToken(color.R));
-            p.AddProperty(new DoubleToken(color.G));
-            p.AddProperty(new DoubleToken(color.B));
+            p.AddProperty(new DoubleToken(SanitizeFinite(color.R)));
+            p.AddProperty(new DoubleToken(SanitizeFinite(color.G)));
+            p.AddProperty(new DoubleToken(SanitizeFinite(color.B)));
             return p;
+        }
+
+        private static double SanitizeFinite(double value)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+                return 0;
+
+            return value;
         }
 
         private static double SanitizeDouble(double value)
