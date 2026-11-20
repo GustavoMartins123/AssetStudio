@@ -402,11 +402,23 @@ public partial class MainWindow : Window
 
             if (!string.IsNullOrEmpty(selectedFolder))
             {
-                await Task.Run(() => assemblyLoader.Load(selectedFolder), cancellationToken);
+                await Task.Run(() =>
+                {
+                    lock (assemblyLoader)
+                    {
+                        if (!assemblyLoader.Loaded)
+                        {
+                            assemblyLoader.Load(selectedFolder);
+                        }
+                    }
+                }, cancellationToken);
             }
             else
             {
-                assemblyLoader.Loaded = true;
+                lock (assemblyLoader)
+                {
+                    assemblyLoader.Loaded = true;
+                }
             }
         }
         finally
@@ -441,7 +453,10 @@ public partial class MainWindow : Window
         return await Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return monoBehaviour.ConvertToTypeTree(assemblyLoader);
+            lock (assemblyLoader)
+            {
+                return monoBehaviour.ConvertToTypeTree(assemblyLoader);
+            }
         }, cancellationToken);
     }
 

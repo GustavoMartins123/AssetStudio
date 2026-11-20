@@ -304,8 +304,9 @@ public partial class MainWindow
                 }
                 else
                 {
+                    _dumpRequestCoordinator.CancelCurrent();
                     DumpTextBox.Text = string.Empty;
-                    previewDebounce?.Cancel();
+                    CancelPendingPreview();
                     ClearPreview("Preview Panel");
                 }
             }
@@ -585,6 +586,26 @@ public partial class MainWindow
             }
             cts.Dispose();
         }
+    }
+
+    private int[] SnapshotExportableArenaIndices()
+    {
+        return exportableArenaIndices.Count == 0
+            ? Array.Empty<int>()
+            : exportableArenaIndices.ToArray();
+    }
+
+    private int[] SnapshotVisibleArenaIndices()
+    {
+        var count = visibleArenaCount;
+        if (count <= 0)
+        {
+            return Array.Empty<int>();
+        }
+
+        var copy = new int[count];
+        Array.Copy(visibleArenaIndices, copy, count);
+        return copy;
     }
 
     private AssetItem MaterializeArenaAssetItem(int arenaIndex)

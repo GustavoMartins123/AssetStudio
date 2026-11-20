@@ -7,7 +7,7 @@ namespace AssetStudio
 {
     public class AssemblyLoader
     {
-        public bool Loaded;
+        public volatile bool Loaded;
         private Dictionary<string, ModuleDefinition> moduleDic = new Dictionary<string, ModuleDefinition>(StringComparer.OrdinalIgnoreCase);
 
         public void Load(string path)

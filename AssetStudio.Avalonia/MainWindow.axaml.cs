@@ -1448,6 +1448,8 @@ public partial class MainWindow : Window
             _eagerExportableAssets = result.ExportableAssets;
             ApplyExportableAssetIndexes(result);
             sceneTreeNodes = result.SceneTreeNodes;
+            treeSearchSession.Invalidate();
+            appliedTreeSearchMatches = null;
             treeSearchResults.Clear();
             nextGameObjectSearchIndex = 0;
             objectToAssetItemCache = result.ObjectToAssetItemCache;
@@ -1751,14 +1753,20 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        lazyIndexingSessionId++;
+        ViewModel.LoadingService.StopIndexing();
         ProjectAnalysisReportUpdated -= OnProjectAnalysisReportUpdated;
         CancelProjectAnalysis();
         CancelPendingArenaCoalescedSort();
         listSearchDebounce?.Cancel();
         listSearchDebounce?.Dispose();
         listSearchDebounce = null;
+        _previewRequestCoordinator.CancelCurrent();
+        _dumpRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         _animationRigPreviewCache.Clear();
+        treeSearchSession.Invalidate();
+        appliedTreeSearchMatches = null;
         ClearPreview();
         ReleaseGlPreviewResources();
         if (GLPreviewControl != null)
@@ -1777,7 +1785,13 @@ public partial class MainWindow : Window
         AudioReset(recreateAudioPlayer: false);
         VideoReset();
         _pcmWavePreviewPlayer?.Dispose();
+        Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         SpriteHelper.ClearAtlasCache();
+        AssetExportHelper.ClearShaderGuidCache();
+        lock (assemblyLoader)
+        {
+            assemblyLoader.Clear();
+        }
         _sqliteCache.Dispose();
         assetsManager.Dispose();
         base.OnClosing(e);

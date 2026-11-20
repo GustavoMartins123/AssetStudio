@@ -34,18 +34,280 @@ public partial class MainWindow
             1,
             16);
     }
-    private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets.ToList(), ExportMode.Convert);
+    private async void ExportAllAssets_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsAsync(ExportMode.Convert);
     private async void ExportSelectedAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Convert);
-    private async void ExportFilteredAssets_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Convert);
-    private async void ExportAllAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets, ExportMode.Raw);
+    private async void ExportFilteredAssets_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsAsync(ExportMode.Convert);
+    private async void ExportAllAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsAsync(ExportMode.Raw);
     private async void ExportSelectedAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Raw);
-    private async void ExportFilteredAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Raw);
-    private async void ExportAllAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(exportableAssets, ExportMode.Dump);
+    private async void ExportFilteredAssetsRaw_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsAsync(ExportMode.Raw);
+    private async void ExportAllAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsAsync(ExportMode.Dump);
     private async void ExportSelectedAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(GetSelectedAssets(), ExportMode.Dump);
-    private async void ExportFilteredAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportAssets(visibleAssets.ToList(), ExportMode.Dump);
-    private async void ExportAllAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(exportableAssets);
+    private async void ExportFilteredAssetsDump_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsAsync(ExportMode.Dump);
+    private async void ExportAllAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAllAssetsListAsync();
     private async void ExportSelectedAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(GetSelectedAssets());
-    private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportAssetsList(visibleAssets.ToList());
+    private async void ExportFilteredAssetsXML_Click(object? sender, RoutedEventArgs e) => await ExportFilteredAssetsListAsync();
+
+    private Task ExportAllAssetsAsync(ExportMode mode)
+    {
+        return _isArenaAssetListMode
+            ? ExportArenaAssetsAsync(SnapshotExportableArenaIndices(), mode)
+            : ExportAssets(_eagerExportableAssets.ToList(), mode);
+    }
+
+    private Task ExportFilteredAssetsAsync(ExportMode mode)
+    {
+        return _isArenaAssetListMode
+            ? ExportArenaAssetsAsync(SnapshotVisibleArenaIndices(), mode)
+            : ExportAssets(_eagerVisibleAssets.ToList(), mode);
+    }
+
+    private Task ExportAllAssetsListAsync()
+    {
+        return _isArenaAssetListMode
+            ? ExportArenaAssetsListAsync(SnapshotExportableArenaIndices())
+            : ExportAssetsList(_eagerExportableAssets.ToList());
+    }
+
+    private Task ExportFilteredAssetsListAsync()
+    {
+        return _isArenaAssetListMode
+            ? ExportArenaAssetsListAsync(SnapshotVisibleArenaIndices())
+            : ExportAssetsList(_eagerVisibleAssets.ToList());
+    }
+
+    private async Task ExportArenaAssetsListAsync(int[] arenaIndices)
+    {
+        if (arenaIndices.Length == 0)
+        {
+            StatusStripUpdate("No assets to export.");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (folders == null || folders.Count == 0) return;
+
+        var savePath = folders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+        var arena = assetsManager.ProjectIndex.Arena;
+
+        StatusStripUpdate("Exporting asset list to XML...");
+        await Task.Run(() =>
+        {
+            var filename = Path.Combine(savePath, "assets.xml");
+            try
+            {
+                var exportedCount = WriteArenaAssetsXml(arena, arenaIndices, filename);
+                StatusStripUpdate($"Finished exporting asset list to XML with {exportedCount} items.");
+                if (exportOptions.OpenAfterExport)
+                {
+                    OpenFolder(savePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                TryDeletePartialExport(filename);
+                Logger.Error("Error exporting asset list to XML", ex);
+                StatusStripUpdate($"Error exporting asset list to XML: {ex.Message}");
+            }
+        });
+    }
+
+    internal static int WriteArenaAssetsXml(AssetIndexArena arena, IReadOnlyList<int> arenaIndices, string filename)
+    {
+        ArgumentNullException.ThrowIfNull(arena);
+        ArgumentNullException.ThrowIfNull(arenaIndices);
+
+        var settings = new XmlWriterSettings
+        {
+            Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            Indent = true,
+            CloseOutput = true
+        };
+
+        var writtenCount = 0;
+        var arenaCount = arena.Count;
+        using (var output = new FileStream(filename, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+        using (var writer = XmlWriter.Create(output, settings))
+        {
+            writer.WriteStartDocument();
+            writer.WriteStartElement("Assets");
+            writer.WriteAttributeString("filename", filename);
+            writer.WriteAttributeString("createdAt", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+            for (var i = 0; i < arenaIndices.Count; i++)
+            {
+                var idx = arenaIndices[i];
+                if ((uint)idx >= (uint)arenaCount)
+                {
+                    continue;
+                }
+
+                var name = arena.GetName(idx);
+                var container = arena.GetContainer(idx);
+                var type = arena.GetType(idx);
+                var pathId = arena.GetPathId(idx);
+                var byteSize = arena.GetByteSize(idx);
+                var sourceFile = arena.GetSourceFile(idx);
+                var sourcePath = !string.IsNullOrWhiteSpace(sourceFile?.originalPath)
+                    ? sourceFile.originalPath
+                    : !string.IsNullOrWhiteSpace(sourceFile?.fullName)
+                        ? sourceFile.fullName
+                        : arena.GetOriginalPath(idx);
+                var displayType = AssetListQuery.GetCachedDisplayType(type, AssetItem.ContainsFbxSegment(container));
+
+                writer.WriteStartElement("Asset");
+                writer.WriteElementString("Name", name ?? string.Empty);
+                writer.WriteElementString("Container", container ?? string.Empty);
+                writer.WriteStartElement("Type");
+                writer.WriteAttributeString("id", ((int)type).ToString(CultureInfo.InvariantCulture));
+                writer.WriteString(displayType ?? string.Empty);
+                writer.WriteEndElement();
+                writer.WriteElementString("PathID", pathId.ToString(CultureInfo.InvariantCulture));
+                writer.WriteElementString("Source", sourcePath ?? string.Empty);
+                writer.WriteElementString("Size", byteSize.ToString(CultureInfo.InvariantCulture));
+                writer.WriteEndElement();
+                writtenCount++;
+            }
+            writer.WriteEndElement();
+            writer.WriteEndDocument();
+            writer.Flush();
+        }
+
+        return writtenCount;
+    }
+
+    internal static bool ArenaIndicesContainType(AssetIndexArena arena, IReadOnlyList<int> arenaIndices, ClassIDType targetType)
+    {
+        ArgumentNullException.ThrowIfNull(arena);
+        ArgumentNullException.ThrowIfNull(arenaIndices);
+
+        var arenaCount = arena.Count;
+        for (var i = 0; i < arenaIndices.Count; i++)
+        {
+            var idx = arenaIndices[i];
+            if ((uint)idx < (uint)arenaCount && arena.GetType(idx) == targetType)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static List<AssetItem> MaterializeArenaItemsForExport(
+        AssetIndexArena arena,
+        IReadOnlyList<int> arenaIndices,
+        ExportMode mode)
+    {
+        ArgumentNullException.ThrowIfNull(arena);
+        ArgumentNullException.ThrowIfNull(arenaIndices);
+
+        var arenaCount = arena.Count;
+        var items = new List<AssetItem>(arenaIndices.Count);
+        for (var i = 0; i < arenaIndices.Count; i++)
+        {
+            var idx = arenaIndices[i];
+            if ((uint)idx >= (uint)arenaCount)
+            {
+                continue;
+            }
+
+            if (mode == ExportMode.Convert)
+            {
+                var type = arena.GetType(idx);
+                if (type is ClassIDType.Material or ClassIDType.Shader
+                    && AssetItem.ContainsFbxSegment(arena.GetContainer(idx)))
+                {
+                    continue;
+                }
+            }
+
+            items.Add(new AssetItem(arena.MaterializeHandle(idx), idx));
+        }
+
+        return mode == ExportMode.Convert
+            ? OrderConvertedAssetsForExport(items)
+            : items;
+    }
+
+    private async Task ExportArenaAssetsAsync(int[] arenaIndices, ExportMode mode)
+    {
+        if (arenaIndices.Length == 0)
+        {
+            StatusStripUpdate("No exportable assets loaded");
+            return;
+        }
+
+        var topLevel = TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+
+        var arena = assetsManager.ProjectIndex.Arena;
+        if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump))
+        {
+            var hasMonoBehaviour = await Task.Run(() => ArenaIndicesContainType(arena, arenaIndices, ClassIDType.MonoBehaviour));
+            if (hasMonoBehaviour)
+            {
+                await EnsureAssemblyLoaderReadyAsync();
+            }
+        }
+
+        var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
+        if (exportFolders == null || exportFolders.Count == 0) return;
+
+        var savePath = exportFolders[0].Path.LocalPath;
+        SaveExportFolder(savePath);
+
+        int exported = 0;
+        int skipped = 0;
+        int failed = 0;
+        var exportErrors = new List<string>();
+        bool hadAnyItems = false;
+
+        StatusStripUpdate($"Preparing {arenaIndices.Length:N0} assets for export...");
+
+        await Task.Run(() =>
+        {
+            var toExport = MaterializeArenaItemsForExport(arena, arenaIndices, mode);
+            if (toExport.Count == 0)
+            {
+                return;
+            }
+
+            hadAnyItems = true;
+            StatusStripUpdate($"Exporting {toExport.Count:N0} assets...");
+
+            var summary = ExportAssetsBatchCore(
+                toExport,
+                mode,
+                savePath,
+                progress => global::Avalonia.Threading.Dispatcher.UIThread.Post(() => progressBar.Value = progress));
+
+            exported = summary.Exported;
+            skipped = summary.Skipped;
+            failed = summary.Failed;
+            exportErrors.AddRange(summary.Errors);
+        });
+
+        if (!hadAnyItems)
+        {
+            StatusStripUpdate("No exportable assets loaded");
+            return;
+        }
+
+        var errorReportPath = WriteErrorReport(savePath, exportErrors, logger);
+
+        var status = exported == 0 ? "Nothing exported." : $"Finished exporting {exported} assets.";
+        if (skipped > 0) status += $" {skipped} skipped (already exported or unsupported).";
+        if (failed > 0) status += $" {failed} failed.";
+        if (errorReportPath != null) status += $" Error report: {Path.GetFileName(errorReportPath)}.";
+        StatusStripUpdate(status);
+
+        if (exportOptions.OpenAfterExport && exported > 0)
+        {
+            OpenFolder(savePath);
+        }
+    }
 
     private async void ExportErrorLog_Click(object? sender, RoutedEventArgs e)
     {
@@ -156,19 +418,9 @@ public partial class MainWindow
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        string? assemblyFolderToLoad = null;
         if (!assemblyLoader.Loaded && (mode == ExportMode.Convert || mode == ExportMode.Dump) && toExport.Any(x => x.Type == ClassIDType.MonoBehaviour))
         {
-            var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateLoadFolderOptions("Select Assembly Folder"));
-            if (folders != null && folders.Count > 0)
-            {
-                assemblyFolderToLoad = folders[0].Path.LocalPath;
-                SaveLoadFolder(assemblyFolderToLoad);
-            }
-            else
-            {
-                assemblyLoader.Loaded = true;
-            }
+            await EnsureAssemblyLoaderReadyAsync();
         }
 
         var exportFolders = await topLevel.StorageProvider.OpenFolderPickerAsync(await CreateExportFolderOptions("Select the save folder"));
@@ -192,17 +444,6 @@ public partial class MainWindow
 
         await Task.Run(() =>
         {
-            if (!string.IsNullOrEmpty(assemblyFolderToLoad) && !assemblyLoader.Loaded)
-            {
-                lock (assemblyLoader)
-                {
-                    if (!assemblyLoader.Loaded)
-                    {
-                        assemblyLoader.Load(assemblyFolderToLoad);
-                    }
-                }
-            }
-
             var summary = ExportAssetsBatchCore(
                 toExport,
                 mode,
@@ -1949,9 +2190,19 @@ public partial class MainWindow
         }
     }
 
-    private static bool ShouldSkipConvertedAsset(AssetItem item)
+    internal static bool ShouldSkipConvertedAsset(AssetItem item)
     {
-        return (item.IsFbxSubAsset() && (item.Asset is Material || item.Asset is Shader));
+        if (!item.IsFbxSubAsset())
+        {
+            return false;
+        }
+
+        if (item.Type is ClassIDType.Material or ClassIDType.Shader)
+        {
+            return true;
+        }
+
+        return item.Handle == null && (item.Asset is Material || item.Asset is Shader);
     }
 
     private bool ExportMesh(

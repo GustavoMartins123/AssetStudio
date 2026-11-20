@@ -69,6 +69,7 @@ public partial class MainWindow : Window
             }
             _animationRigPreviewCache.Clear();
             SpriteHelper.ClearAtlasCache();
+            AssetExportHelper.ClearShaderGuidCache();
 
             StatusStripUpdate($"Cleared project cache for: {folderPath}");
         }

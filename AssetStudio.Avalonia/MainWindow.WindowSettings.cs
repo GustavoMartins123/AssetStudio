@@ -13,10 +13,15 @@ public partial class MainWindow
     private void ResetForm()
     {
         lazyIndexingSessionId++;
+        ViewModel.LoadingService.StopIndexing();
         CancelProjectAnalysis();
         HideProjectAnalysisBanner();
+        _previewRequestCoordinator.CancelCurrent();
+        _dumpRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         _animationRigPreviewCache.Clear();
+        treeSearchSession.Invalidate();
+        appliedTreeSearchMatches = null;
         ClearPreview();
         ReleaseGlPreviewResources();
         _sqliteCache.ReleaseReadConnections();
@@ -45,7 +50,9 @@ public partial class MainWindow
             meshSkinnedRenderersCache = null;
             animationClipTransformBindingsCache = null;
         }
+        Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         SpriteHelper.ClearAtlasCache();
+        AssetExportHelper.ClearShaderGuidCache();
         logger.ClearErrors();
         ResetArenaAssetListState();
         _eagerExportableAssets.Clear();
@@ -76,7 +83,10 @@ public partial class MainWindow
         assetListSortDescending = false;
         assetContextCellText = string.Empty;
         assetContextItem = null;
-        assemblyLoader.Clear();
+        lock (assemblyLoader)
+        {
+            assemblyLoader.Clear();
+        }
         nextGameObjectSearchIndex = 0;
         SceneTreeView.ItemsSource = null;
         DumpTextBox.Text = string.Empty;
@@ -86,7 +96,6 @@ public partial class MainWindow
         classSearch.Text = string.Empty;
         PreviewLabel.IsVisible = true;
         PreviewLabel.Text = "[Preview Panel]";
-        ViewModel.LoadingService.StopIndexing();
         ViewModel.IsIndexingActive = false;
         ViewModel.LoadingProgress = 0;
         HideIndexingProgressPanel();
@@ -207,11 +216,14 @@ public partial class MainWindow
         }
         currentPreviewTexture = null;
         currentPreviewSprite = null;
+        Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         currentPreviewMesh = null;
         currentPreviewAvatar = null;
         currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
-        texturePreviewIdCounter++; // Cancel any running background image decoding task
+        _previewRequestCoordinator.CancelCurrent();
+        _animationPreviewCoordinator.CancelCurrent();
+        Interlocked.Increment(ref texturePreviewIdCounter); // Cancel any running background image decoding task
         previewDebounce?.Cancel();
         previewDebounce?.Dispose();
         previewDebounce = null;
