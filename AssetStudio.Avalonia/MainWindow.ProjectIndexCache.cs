@@ -5,42 +5,20 @@ using AssetStudio.Avalonia.Services;
 using AssetStudio;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
-using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace AssetStudio.Avalonia;
 
 public partial class MainWindow : Window
 {
-    internal const int LazyConnectionStagingFlushRowThreshold = 10_000;
+    internal const int LazyConnectionStagingFlushRowThreshold = SemanticGraphService.LazyConnectionStagingFlushRowThreshold;
 
-    internal static int CountBufferedSemanticRelationRows(SemanticAssetRelations? relations)
-    {
-        if (relations == null)
-        {
-            return 0;
-        }
+    internal static int CountBufferedSemanticRelationRows(SemanticAssetRelations? relations) =>
+        SemanticGraphService.CountBufferedSemanticRelationRows(relations);
 
-        return relations.SourceFiles.Count
-            + relations.AssetEdges.Count
-            + relations.ModelGroups.Count
-            + relations.ModelGroupMeshes.Count
-            + relations.MeshRenderers.Count
-            + relations.MeshMaterials.Count
-            + relations.MaterialTextures.Count
-            + relations.AnimationClipTargets.Count
-            + relations.RigBoneHashes.Count
-            + relations.ClipBoneHashes.Count;
-    }
-
-    private static string GetFolderCacheKey(string folderPath)
-    {
-        var hashBytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
-        return Convert.ToHexStringLower(hashBytes);
-    }
+    private static string GetFolderCacheKey(string folderPath) =>
+        ProjectLoadingService.GetFolderCacheKey(folderPath);
 
     private void ClearCurrentProjectCache_Click(object? sender, RoutedEventArgs e)
     {
@@ -53,10 +31,7 @@ public partial class MainWindow : Window
 
         try
         {
-            _sqliteCache.EvictPreviewCache(folderPath, maxTotalBytes: 0, maxEntryCount: 0);
-            _sqliteCache.DeleteIndexCache(folderPath);
-            DeleteDecompressedCacheFolder(folderPath);
-            DeletePreviewCacheFolder(folderPath);
+            ProjectLoadingService.ClearProjectCache(_sqliteCache, folderPath);
 
             lock (previewCacheLock)
             {
@@ -68,8 +43,6 @@ public partial class MainWindow : Window
                 materialTextureSlotsCache = null;
             }
             _animationRigPreviewCache.Clear();
-            SpriteHelper.ClearAtlasCache();
-            AssetExportHelper.ClearShaderGuidCache();
 
             StatusStripUpdate($"Cleared project cache for: {folderPath}");
         }
@@ -80,402 +53,50 @@ public partial class MainWindow : Window
         }
     }
 
-    private string GetCurrentCacheFolderPath()
-    {
-        if (!string.IsNullOrWhiteSpace(appSettings.LoadFolderPath) && Directory.Exists(appSettings.LoadFolderPath))
-        {
-            return appSettings.LoadFolderPath;
-        }
+    private string GetCurrentCacheFolderPath() =>
+        ProjectLoadingService.ResolveCacheFolderPath(appSettings.LoadFolderPath, assetsManager.ProjectRoot);
 
-        if (!string.IsNullOrWhiteSpace(assetsManager.ProjectRoot) && Directory.Exists(assetsManager.ProjectRoot))
-        {
-            return assetsManager.ProjectRoot;
-        }
+    private static void DeleteDecompressedCacheFolder(string folderPath) =>
+        ProjectLoadingService.DeleteDecompressedCacheFolder(folderPath);
 
-        return string.Empty;
-    }
+    internal static string GetDecompressedBundleScopeKey(string folderPath) =>
+        ProjectLoadingService.GetDecompressedBundleScopeKey(folderPath);
 
-    private static void DeleteDecompressedCacheFolder(string folderPath)
-    {
-        if (string.IsNullOrWhiteSpace(folderPath))
-        {
-            return;
-        }
+    private static void DeletePreviewCacheFolder(string folderPath) =>
+        ProjectLoadingService.DeletePreviewCacheFolder(folderPath);
 
-        var cacheRoot = DecompressedBundleCache.GetDefaultCacheBaseDirectory();
-        var legacyDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(folderPath));
-        DeleteDirectoryInsideRoot(cacheRoot, legacyDirectory);
+    private MeshPreviewGeometryCache? LoadMeshPreviewGeometryCache(Mesh mesh, float densityPercent) =>
+        ProjectLoadingService.LoadMeshPreviewGeometryCache(_sqliteCache, GetCurrentCacheFolderPath(), currentScanResult, mesh, densityPercent);
 
-        var scopedDirectory = Path.Combine(cacheRoot, GetDecompressedBundleScopeKey(folderPath));
-        DeleteDirectoryInsideRoot(cacheRoot, scopedDirectory);
-    }
+    private void SaveMeshPreviewGeometryCache(Mesh mesh, float densityPercent, MeshPreviewGeometryCache cache) =>
+        ProjectLoadingService.SaveMeshPreviewGeometryCache(_sqliteCache, GetCurrentCacheFolderPath(), currentScanResult, mesh, densityPercent, cache);
 
-    internal static string GetDecompressedBundleScopeKey(string folderPath)
-    {
-        string normalized;
-        try
-        {
-            normalized = Path.GetFullPath(folderPath)
-                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        }
-        catch
-        {
-            normalized = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        }
+    private TexturePreviewImageResult? LoadTexturePreviewThumbnail(Texture2D texture, int maxDimension) =>
+        ProjectLoadingService.LoadTexturePreviewThumbnail(
+            _sqliteCache,
+            GetCurrentCacheFolderPath(),
+            currentScanResult,
+            texture,
+            maxDimension,
+            TexturePreviewThumbnailAlgorithmVersion,
+            LimitPreviewImage);
 
-        if (OperatingSystem.IsWindows())
-        {
-            normalized = normalized.ToLowerInvariant();
-        }
-
-        var hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
-        var hex = Convert.ToHexStringLower(hashBytes);
-        return hex.Length > 16 ? hex.Substring(0, 16) : hex;
-    }
-
-    private static void DeletePreviewCacheFolder(string folderPath)
-    {
-        if (string.IsNullOrWhiteSpace(folderPath))
-        {
-            return;
-        }
-
-        var cacheRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AssetStudio",
-            "PreviewCache");
-        var targetDirectory = Path.Combine(cacheRoot, GetFolderCacheKey(folderPath));
-        DeleteDirectoryInsideRoot(cacheRoot, targetDirectory);
-    }
-
-    private MeshPreviewGeometryCache? LoadMeshPreviewGeometryCache(Mesh mesh, float densityPercent)
-    {
-        if (mesh.assetsFile == null || currentScanResult == null)
-        {
-            return null;
-        }
-
-        var folderPath = GetCurrentCacheFolderPath();
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return null;
-        }
-
-        try
-        {
-            var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
-            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-            var parameters = BuildMeshPreviewCacheParameters(mesh, densityPercent);
-            if (!_sqliteCache.TryLoadPreviewCacheBytes(
-                folderPath,
-                signature,
-                assetId,
-                "mesh-geometry",
-                MeshPreviewGeometryCache.AlgorithmVersion,
-                parameters,
-                out var bytes,
-                out var entry)
-                || bytes == null
-                || entry == null)
-            {
-                return null;
-            }
-
-            if (!entry.IsInlineBlob
-                && (string.IsNullOrWhiteSpace(entry.PayloadPath)
-                    || !IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath)))
-            {
-                return null;
-            }
-
-            if (!string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
-            {
-                return null;
-            }
-
-            return MeshPreviewGeometryCacheSerializer.Deserialize(bytes);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to load mesh preview geometry cache: {ex.Message}");
-            return null;
-        }
-    }
-
-    private void SaveMeshPreviewGeometryCache(Mesh mesh, float densityPercent, MeshPreviewGeometryCache cache)
-    {
-        if (mesh.assetsFile == null || currentScanResult == null || cache == null)
-        {
-            return;
-        }
-
-        var folderPath = GetCurrentCacheFolderPath();
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return;
-        }
-
-        try
-        {
-            var bytes = MeshPreviewGeometryCacheSerializer.Serialize(cache);
-            var hash = ComputeSha256Hex(bytes);
-            var payloadPath = GetPreviewCachePayloadPath(folderPath, hash);
-            var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
-            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-            _sqliteCache.SavePreviewCachePayload(
-                folderPath,
-                signature,
-                assetId,
-                "mesh-geometry",
-                MeshPreviewGeometryCache.AlgorithmVersion,
-                BuildMeshPreviewCacheParameters(mesh, densityPercent),
-                hash,
-                bytes,
-                payloadPath);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to save mesh preview geometry cache: {ex.Message}");
-        }
-    }
-
-    private TexturePreviewImageResult? LoadTexturePreviewThumbnail(Texture2D texture, int maxDimension)
-    {
-        if (texture == null)
-        {
-            return null;
-        }
-
-        var sourceWidth = texture.m_Width;
-        var sourceHeight = texture.m_Height;
-        var folderPath = GetCurrentCacheFolderPath();
-        var canUsePersistentCache = texture.assetsFile != null
-            && currentScanResult != null
-            && !string.IsNullOrWhiteSpace(folderPath)
-            && Directory.Exists(folderPath);
-
-        if (canUsePersistentCache)
-        {
-            try
-            {
-                var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
-                var signature = _sqliteCache.GetFolderSignature(currentScanResult!);
-                var parameters = BuildTexturePreviewCacheParameters(texture, maxDimension);
-                if (_sqliteCache.TryLoadPreviewCacheBytes(
-                    folderPath,
-                    signature,
-                    assetId,
-                    "texture-thumbnail-png",
-                    TexturePreviewThumbnailAlgorithmVersion,
-                    parameters,
-                    out var bytes,
-                    out var entry)
-                    && bytes != null
-                    && entry != null
-                    && (entry.IsInlineBlob
-                        || (!string.IsNullOrWhiteSpace(entry.PayloadPath)
-                            && IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))))
-                {
-                    if (string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
-                    {
-                        var cachedImage = ImageExtensions.DecodeBgraUnpremul(bytes);
-                        if (cachedImage != null)
-                        {
-                            return new TexturePreviewImageResult(
-                                cachedImage,
-                                fromCache: true,
-                                downscaled: sourceWidth > cachedImage.Width || sourceHeight > cachedImage.Height,
-                                sourceWidth,
-                                sourceHeight);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Failed to load texture thumbnail cache: {ex.Message}");
-            }
-        }
-
-        var image = texture.ConvertToImage(true);
-        if (image == null)
-        {
-            return null;
-        }
-
-        var downscaled = LimitPreviewImage(ref image, maxDimension);
-        if (canUsePersistentCache)
-        {
-            try
-            {
-                using var stream = new MemoryStream();
-                image.WriteToStream(stream, ImageFormat.Png);
-                var bytes = stream.ToArray();
-                var hash = ComputeSha256Hex(bytes);
-                var payloadPath = GetPreviewCachePayloadPath(folderPath, hash, ".texturepreview.png");
-                var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
-                var signature = _sqliteCache.GetFolderSignature(currentScanResult!);
-                _sqliteCache.SavePreviewCachePayload(
-                    folderPath,
-                    signature,
-                    assetId,
-                    "texture-thumbnail-png",
-                    TexturePreviewThumbnailAlgorithmVersion,
-                    BuildTexturePreviewCacheParameters(texture, maxDimension),
-                    hash,
-                    bytes,
-                    payloadPath);
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Failed to save texture thumbnail cache: {ex.Message}");
-            }
-        }
-
-        return new TexturePreviewImageResult(image, fromCache: false, downscaled, sourceWidth, sourceHeight);
-    }
-
-    private static string BuildMeshPreviewCacheParameters(Mesh mesh, float densityPercent)
-    {
-        return string.Join("|",
-            "density=" + densityPercent.ToString("0.###", CultureInfo.InvariantCulture),
-            "vertices=" + mesh.m_VertexCount.ToString(CultureInfo.InvariantCulture),
-            "indices=" + (mesh.m_Indices?.Count ?? 0).ToString(CultureInfo.InvariantCulture),
-            "submeshes=" + (mesh.m_SubMeshes?.Length ?? 0).ToString(CultureInfo.InvariantCulture),
-            "bytes=" + mesh.byteSize.ToString(CultureInfo.InvariantCulture));
-    }
-
-    private static string BuildTexturePreviewCacheParameters(Texture2D texture, int maxDimension)
-    {
-        return string.Join("|",
-            "max=" + maxDimension.ToString(CultureInfo.InvariantCulture),
-            "width=" + texture.m_Width.ToString(CultureInfo.InvariantCulture),
-            "height=" + texture.m_Height.ToString(CultureInfo.InvariantCulture),
-            "format=" + texture.m_TextureFormat,
-            "mips=" + texture.m_MipCount.ToString(CultureInfo.InvariantCulture),
-            "bytes=" + texture.byteSize.ToString(CultureInfo.InvariantCulture),
-            "streamSize=" + (texture.m_StreamData?.size ?? 0).ToString(CultureInfo.InvariantCulture),
-            "streamOffset=" + (texture.m_StreamData?.offset ?? 0).ToString(CultureInfo.InvariantCulture));
-    }
-
-    private static string GetPreviewCacheRoot(string folderPath)
-    {
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AssetStudio",
-            "PreviewCache",
-            GetFolderCacheKey(folderPath));
-    }
-
-    private static string GetPreviewCachePayloadPath(string folderPath, string hash)
-    {
-        return GetPreviewCachePayloadPath(folderPath, hash, ".meshpreview");
-    }
-
-    private static string GetPreviewCachePayloadPath(string folderPath, string hash, string extension)
-    {
-        var safeHash = string.IsNullOrWhiteSpace(hash) ? "empty" : hash.ToLowerInvariant();
-        var prefix = safeHash.Length >= 2 ? safeHash.Substring(0, 2) : "00";
-        var safeExtension = string.IsNullOrWhiteSpace(extension) ? ".cache" : extension;
-        if (!safeExtension.StartsWith(".", StringComparison.Ordinal))
-        {
-            safeExtension = "." + safeExtension;
-        }
-
-        return Path.Combine(GetPreviewCacheRoot(folderPath), prefix, safeHash + safeExtension);
-    }
-
-    private static string ComputeSha256Hex(byte[] bytes)
-    {
-        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
-    }
-
-    private static bool IsPathInsideDirectory(string root, string path)
-    {
-        var rootFullPath = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var targetFullPath = Path.GetFullPath(path);
-        return targetFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static void DeleteDirectoryInsideRoot(string root, string targetDirectory)
-    {
-        var rootFullPath = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var targetFullPath = Path.GetFullPath(targetDirectory);
-
-        if (!targetFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException("Refusing to delete a cache directory outside the AssetStudio cache root.");
-        }
-
-        if (Directory.Exists(targetFullPath))
-        {
-            Directory.Delete(targetFullPath, recursive: true);
-        }
-    }
+    private static void DeleteDirectoryInsideRoot(string root, string targetDirectory) =>
+        ProjectLoadingService.DeleteDirectoryInsideRoot(root, targetDirectory);
 
     private void SaveIndexCache(
         string folderPath,
         ProjectScanResult scanResult,
         bool preserveSemanticRelations = false,
-        Action<int, int, string>? progress = null)
-    {
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            var unityVersion = assetsManager.SpecifyUnityVersion;
-            var handles = assetsManager.ProjectIndex.GetHandles();
-            PublishDatabaseWriteProgress(
-                folderPath,
-                scanResult,
-                "saving_index",
-                0,
-                1,
-                "Waiting for SQLite writer",
-                persist: true);
-
-            void ReportSaveProgress(int processed, int total, string stage)
-            {
-                progress?.Invoke(processed, total, stage);
-                PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "saving_index",
-                    processed,
-                    total,
-                    stage,
-                    persist: false);
-            }
-
-            var saved = _sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations, ReportSaveProgress);
-
-            if (saved)
-            {
-                PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "completed",
-                    1,
-                    1,
-                    "SQLite index cache saved",
-                    persist: true);
-            }
-            else
-            {
-                PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "failed",
-                    1,
-                    1,
-                    "SQLite index cache save failed",
-                    persist: true);
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to save index cache: {ex.Message}");
-        }
-    }
+        Action<int, int, string>? progress = null) =>
+        ProjectLoadingService.SaveIndexCache(
+            _sqliteCache,
+            assetsManager,
+            folderPath,
+            scanResult,
+            preserveSemanticRelations,
+            progress,
+            ShowIndexingProgressPanel);
 
     private void PublishDatabaseWriteProgress(
         string folderPath,
@@ -484,224 +105,62 @@ public partial class MainWindow : Window
         int processed,
         int total,
         string stage,
-        bool persist)
-    {
-        var safeTotal = Math.Max(1, total);
-        var safeProcessed = Math.Clamp(processed, 0, safeTotal);
-        var percent = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal));
-        var update = new IndexingProgressUpdate
-        {
-            Status = status,
-            TotalFiles = safeTotal,
-            ProcessedFiles = safeProcessed,
-            PendingFiles = Math.Max(0, safeTotal - safeProcessed),
-            PercentComplete = percent,
-            CurrentFile = stage ?? string.Empty,
-            LastReadFile = stage ?? string.Empty,
-            NewlyReadFiles = Array.Empty<string>()
-        };
+        bool persist) =>
+        ProjectLoadingService.PublishDatabaseWriteProgress(
+            _sqliteCache,
+            folderPath,
+            scanResult,
+            status,
+            processed,
+            total,
+            stage,
+            persist,
+            ShowIndexingProgressPanel);
 
-        if (persist)
-        {
-            try
-            {
-                var signature = _sqliteCache.GetFolderSignature(scanResult);
-                _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Failed to persist database write progress: {ex.Message}");
-            }
-        }
+    private bool TrySaveSemanticRelations(SemanticAssetRelations relations) =>
+        ProjectLoadingService.TrySaveSemanticRelations(
+            _sqliteCache,
+            GetCurrentCacheFolderPath(),
+            currentScanResult,
+            relations,
+            replaceExisting: false,
+            ShowIndexingProgressPanel);
 
-        ShowIndexingProgressPanel(update, 3);
-    }
+    private bool TrySaveSemanticRelations(string folderPath, ProjectScanResult scanResult, SemanticAssetRelations relations, bool replaceExisting = false) =>
+        ProjectLoadingService.TrySaveSemanticRelations(
+            _sqliteCache,
+            folderPath,
+            scanResult,
+            relations,
+            replaceExisting,
+            ShowIndexingProgressPanel);
 
-    private bool TrySaveSemanticRelations(SemanticAssetRelations relations)
-    {
-        if (currentScanResult == null)
-        {
-            return false;
-        }
+    private void TrySaveIndexingProgress(string[] paths, IndexingProgressUpdate update) =>
+        ProjectLoadingService.TrySaveIndexingProgress(_sqliteCache, paths, currentScanResult, update);
 
-        var folderPath = GetCurrentCacheFolderPath();
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return false;
-        }
+    private ProjectIndexingState? TryLoadIndexingProgress(string folderPath, ProjectScanResult scanResult) =>
+        ProjectLoadingService.TryLoadIndexingProgress(_sqliteCache, folderPath, scanResult);
 
-        return TrySaveSemanticRelations(folderPath, currentScanResult, relations);
-    }
+    private List<AssetHandle>? LoadIndexCache(string folderPath, ProjectScanResult scanResult) =>
+        ProjectLoadingService.LoadIndexCache(_sqliteCache, folderPath, scanResult);
 
-    private bool TrySaveSemanticRelations(string folderPath, ProjectScanResult scanResult, SemanticAssetRelations relations, bool replaceExisting = false)
-    {
-        if (relations == null || (!relations.HasRelations && relations.SourceFiles.Count == 0) || scanResult == null)
-        {
-            return false;
-        }
+    private bool HasCompletedLazyConnectionBuild(string folderPath, ProjectScanResult scanResult) =>
+        ProjectLoadingService.HasCompletedLazyConnectionBuild(_sqliteCache, folderPath, scanResult);
 
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return false;
-        }
+    private bool HasCompletedLazyStructureBuild(string folderPath, ProjectScanResult scanResult) =>
+        ProjectLoadingService.HasCompletedLazyStructureBuild(_sqliteCache, folderPath, scanResult);
 
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            PublishDatabaseWriteProgress(
-                folderPath,
-                scanResult,
-                "saving_connections",
-                0,
-                1,
-                "Waiting for SQLite writer",
-                persist: true);
+    private bool HasSavedSemanticRelations(string folderPath, ProjectScanResult scanResult) =>
+        ProjectLoadingService.HasSavedSemanticRelations(_sqliteCache, folderPath, scanResult);
 
-            var saved = _sqliteCache.SaveSemanticRelations(
-                folderPath,
-                signature,
-                relations,
-                replaceExisting,
-                (processed, total, stage) => PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "saving_connections",
-                    processed,
-                    total,
-                    stage,
-                    persist: false));
+    private static bool IsConnectionReadyStatus(string? status) =>
+        ProjectLoadingService.IsConnectionReadyStatus(status);
 
-            if (saved)
-            {
-                PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "saving_connections",
-                    1,
-                    1,
-                    "Semantic relations saved",
-                    persist: false);
-            }
+    private static bool IsCompletedLazyIndexingStatus(string? status) =>
+        ProjectLoadingService.IsCompletedLazyIndexingStatus(status);
 
-            return saved;
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to save semantic relation cache: {ex.Message}");
-            return false;
-        }
-    }
-
-    private void TrySaveIndexingProgress(string[] paths, IndexingProgressUpdate update)
-    {
-        if (update == null || currentScanResult == null || paths.Length != 1 || !Directory.Exists(paths[0]))
-        {
-            return;
-        }
-
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
-            _sqliteCache.SaveIndexingProgress(paths[0], signature, currentScanResult, update);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to persist indexing progress: {ex.Message}");
-        }
-    }
-
-    private ProjectIndexingState? TryLoadIndexingProgress(string folderPath, ProjectScanResult scanResult)
-    {
-        if (scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return null;
-        }
-
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            return _sqliteCache.LoadIndexingState(folderPath, signature);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to load indexing progress: {ex.Message}");
-            return null;
-        }
-    }
-
-    private List<AssetHandle>? LoadIndexCache(string folderPath, ProjectScanResult scanResult)
-    {
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            return _sqliteCache.LoadIndexCache(folderPath, signature);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to load index cache: {ex.Message}");
-            return null;
-        }
-    }
-
-    private bool HasCompletedLazyConnectionBuild(string folderPath, ProjectScanResult scanResult)
-    {
-        var state = TryLoadIndexingProgress(folderPath, scanResult);
-        if (state == null || !IsConnectionReadyStatus(state.Status))
-        {
-            return false;
-        }
-
-        return HasSavedSemanticRelations(folderPath, scanResult);
-    }
-
-    private bool HasCompletedLazyStructureBuild(string folderPath, ProjectScanResult scanResult)
-    {
-        var state = TryLoadIndexingProgress(folderPath, scanResult);
-        return string.Equals(state?.Status, "structure_completed", StringComparison.OrdinalIgnoreCase)
-            && HasSavedSemanticRelations(folderPath, scanResult);
-    }
-
-    private bool HasSavedSemanticRelations(string folderPath, ProjectScanResult scanResult)
-    {
-        if (scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return false;
-        }
-
-        try
-        {
-            var signature = _sqliteCache.GetFolderSignature(scanResult);
-            return _sqliteCache.HasSemanticRelations(folderPath, signature);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to inspect saved semantic relations: {ex.Message}");
-            return false;
-        }
-    }
-
-    private static bool IsConnectionReadyStatus(string? status)
-    {
-        return string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "building_structure", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsCompletedLazyIndexingStatus(string? status)
-    {
-        return string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "structure_completed", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private bool CanUseLazySemanticRelationCache(string folderPath)
-    {
-        return currentScanResult != null
-            && !string.IsNullOrWhiteSpace(folderPath)
-            && Directory.Exists(folderPath)
-            && HasCompletedLazyConnectionBuild(folderPath, currentScanResult);
-    }
+    private bool CanUseLazySemanticRelationCache(string folderPath) =>
+        ProjectLoadingService.CanUseLazySemanticRelationCache(_sqliteCache, folderPath, currentScanResult);
 
     private async Task BuildLazyConnectionsIfNeededAsync(string[] paths, bool force = false)
     {
@@ -720,28 +179,14 @@ public partial class MainWindow : Window
         await BuildLazyConnectionsAsync(folderPath, currentScanResult);
     }
 
-    private bool ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(string[] paths)
-    {
-        if (!assetsManager.LazyLoading || currentScanResult == null || paths.Length != 1 || !Directory.Exists(paths[0]))
-        {
-            return false;
-        }
-
-        var folderPath = paths[0];
-        if (HasCompletedLazyConnectionBuild(folderPath, currentScanResult))
-        {
-            return false;
-        }
-
-        var state = TryLoadIndexingProgress(folderPath, currentScanResult);
-        if (state != null)
-        {
-            ShowIndexingProgressPanel(state);
-        }
-
-        StatusStripUpdate("Connections did not produce saved relations; asset structure finalization was skipped.");
-        return true;
-    }
+    private bool ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(string[] paths) =>
+        ProjectLoadingService.ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(
+            _sqliteCache,
+            assetsManager.LazyLoading,
+            currentScanResult,
+            paths,
+            state => ShowIndexingProgressPanel(state),
+            StatusStripUpdate);
 
     private async Task BuildLazyConnectionsAsync(string folderPath, ProjectScanResult scanResult)
     {
@@ -756,8 +201,7 @@ public partial class MainWindow : Window
         ViewModel.IsResumeEnabled = false;
         ViewModel.IsStopEnabled = false;
         ViewModel.LoadingProgress = 0;
-        
-        // Show connecting progress panel immediately on the UI thread before background scan starts
+
         ShowIndexingProgressPanel("connecting", 0, 100, 100, 0, string.Empty, string.Empty, null);
 
         var lastSourcePath = string.Empty;
@@ -810,8 +254,8 @@ public partial class MainWindow : Window
                 LazyConnectionStagingFlushRowThreshold));
             var relations = buildResult.Relations;
             var diagnostics = buildResult.Diagnostics;
-            var diagnosticSummary = FormatLazyConnectionStatusSummary(sourcePaths.Count, diagnostics);
-            Logger.Info($"Lazy connection diagnostics: {FormatLazyConnectionDetailedSummary(sourcePaths.Count, diagnostics, relations)}");
+            var diagnosticSummary = SemanticGraphService.FormatLazyConnectionStatusSummary(sourcePaths.Count, diagnostics);
+            Logger.Info($"Lazy connection diagnostics: {SemanticGraphService.FormatLazyConnectionDetailedSummary(sourcePaths.Count, diagnostics, relations)}");
 
             if (!stagingSession.HasStagedMaterialRelations)
             {
@@ -863,45 +307,18 @@ public partial class MainWindow : Window
         int processedFiles,
         int totalFiles,
         string currentFile,
-        string lastReadFile)
-    {
-        var safeTotal = Math.Max(0, totalFiles);
-        var safeProcessed = Math.Clamp(processedFiles, 0, safeTotal == 0 ? processedFiles : safeTotal);
-        var update = new IndexingProgressUpdate
-        {
-            Status = status,
-            TotalFiles = safeTotal,
-            ProcessedFiles = safeProcessed,
-            PendingFiles = Math.Max(0, safeTotal - safeProcessed),
-            PercentComplete = safeTotal <= 0 ? 100 : Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal)),
-            CurrentFile = currentFile ?? string.Empty,
-            LastReadFile = lastReadFile ?? string.Empty,
-            NewlyReadFiles = Array.Empty<string>()
-        };
-
-        var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-        var elapsedMs = (nowTicks - lastConnectionDbWriteTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-
-        bool isTerminal = string.Equals(status, "connections_completed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "connections_failed", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(status, "cancelled", StringComparison.OrdinalIgnoreCase);
-
-        if (processedFiles == 0 || processedFiles == safeTotal || isTerminal || elapsedMs >= 2000)
-        {
-            lastConnectionDbWriteTicks = nowTicks;
-            try
-            {
-                var signature = _sqliteCache.GetFolderSignature(scanResult);
-                _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Failed to persist connection build progress: {ex.Message}");
-            }
-        }
-
-        ShowIndexingProgressPanel(update);
-    }
+        string lastReadFile) =>
+        ProjectLoadingService.PublishLazyConnectionProgress(
+            _sqliteCache,
+            folderPath,
+            scanResult,
+            status,
+            processedFiles,
+            totalFiles,
+            currentFile,
+            lastReadFile,
+            ref lastConnectionDbWriteTicks,
+            update => ShowIndexingProgressPanel(update));
 
     private void PublishStructureBuildProgress(
         string status,
@@ -909,535 +326,54 @@ public partial class MainWindow : Window
         int totalSteps,
         string currentStage,
         bool persist = true,
-        int percentDecimals = 1)
-    {
-        var safeTotal = Math.Max(1, totalSteps);
-        var safeProcessed = Math.Clamp(processedSteps, 0, safeTotal);
-        var percentComplete = Math.Min(100, Math.Max(0, safeProcessed * 100.0 / safeTotal));
-        var update = new IndexingProgressUpdate
-        {
-            Status = status,
-            TotalFiles = safeTotal,
-            ProcessedFiles = safeProcessed,
-            PendingFiles = Math.Max(0, safeTotal - safeProcessed),
-            PercentComplete = percentComplete,
-            CurrentFile = currentStage ?? string.Empty,
-            LastReadFile = currentStage ?? string.Empty,
-            NewlyReadFiles = Array.Empty<string>()
-        };
+        int percentDecimals = 1) =>
+        ProjectLoadingService.PublishStructureBuildProgress(
+            _sqliteCache,
+            GetCurrentCacheFolderPath(),
+            currentScanResult,
+            status,
+            processedSteps,
+            totalSteps,
+            currentStage,
+            persist,
+            percentDecimals,
+            ShowIndexingProgressPanel);
 
-        if (persist && currentScanResult != null)
-        {
-            var folderPath = GetCurrentCacheFolderPath();
-            if (!string.IsNullOrWhiteSpace(folderPath) && Directory.Exists(folderPath))
-            {
-                var scanResult = currentScanResult;
-                _ = Task.Run(() =>
-                {
-                    try
-                    {
-                        var signature = _sqliteCache.GetFolderSignature(scanResult);
-                        _sqliteCache.SaveIndexingProgress(folderPath, signature, scanResult, update);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warning($"Failed to persist structure build progress: {ex.Message}");
-                    }
-                });
-            }
-        }
-
-        ShowIndexingProgressPanel(update, percentDecimals);
-    }
-
-    private List<string> GetLazyConnectionSourcePaths()
-    {
-        var sourcePaths = new List<string>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var failedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var handle in assetsManager.ProjectIndex.GetHandles())
-        {
-            if (handle == null)
-            {
-                continue;
-            }
-
-            RememberLazyHandleSourcePath(handle);
-
-            if (!LazyConnectionReferenceTypes.Contains(handle.Type))
-            {
-                continue;
-            }
-
-            var sourcePath = ResolveLazyHandleSourcePath(handle);
-            if (string.IsNullOrWhiteSpace(sourcePath))
-            {
-                continue;
-            }
-
-            if (seen.Contains(sourcePath))
-            {
-                continue;
-            }
-
-            if (failedPaths.Contains(sourcePath))
-            {
-                continue;
-            }
-
-            if (!File.Exists(sourcePath))
-            {
-                failedPaths.Add(sourcePath);
-                continue;
-            }
-
-            var fullPath = Path.GetFullPath(sourcePath);
-            if (seen.Add(fullPath))
-            {
-                sourcePaths.Add(fullPath);
-            }
-        }
-
-        sourcePaths.Sort(StringComparer.OrdinalIgnoreCase);
-        return sourcePaths;
-    }
+    private List<string> GetLazyConnectionSourcePaths() =>
+        SemanticGraphService.GetLazyConnectionSourcePaths(
+            assetsManager.ProjectIndex,
+            RememberLazyHandleSourcePath,
+            ResolveLazyHandleSourcePath);
 
     private bool TryCommitSemanticStagingSession(
         string folderPath,
         ProjectScanResult scanResult,
-        SQLiteProjectIndexCache.SemanticStagingSession stagingSession)
-    {
-        if (stagingSession == null || scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
-        {
-            return false;
-        }
+        SQLiteProjectIndexCache.SemanticStagingSession stagingSession) =>
+        ProjectLoadingService.TryCommitSemanticStagingSession(
+            _sqliteCache,
+            folderPath,
+            scanResult,
+            stagingSession,
+            ShowIndexingProgressPanel);
 
-        try
-        {
-            PublishDatabaseWriteProgress(
-                folderPath,
-                scanResult,
-                "saving_connections",
-                0,
-                1,
-                "Waiting for SQLite writer",
-                persist: true);
-
-            var saved = stagingSession.Commit(
-                (processed, total, stage) => PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "saving_connections",
-                    processed,
-                    total,
-                    stage,
-                    persist: false));
-
-            if (saved)
-            {
-                PublishDatabaseWriteProgress(
-                    folderPath,
-                    scanResult,
-                    "saving_connections",
-                    1,
-                    1,
-                    "Semantic relations saved",
-                    persist: false);
-            }
-
-            return saved;
-        }
-        catch (Exception ex)
-        {
-            Logger.Warning($"Failed to commit semantic relation staging cache: {ex.Message}");
-            return false;
-        }
-    }
-
-    private static string FormatLazyConnectionStatusSummary(int totalSources, LazyConnectionBuildDiagnostics diagnostics)
-    {
-        return $"sources {totalSources:N0}, matched {diagnostics.SourcesWithLoadedFiles:N0}, no files {diagnostics.SourcesWithoutLoadedFiles:N0}, " +
-            $"handles {diagnostics.CandidateHandles:N0}, objects {diagnostics.ResolvedObjects:N0}, " +
-            $"model-groups {diagnostics.ModelGroups:N0}, group-meshes {diagnostics.ModelGroupMeshes:N0}, " +
-            $"mesh-material {diagnostics.MeshMaterials:N0}, material-texture {diagnostics.MaterialTextures:N0}, edges {diagnostics.AssetEdges:N0}";
-    }
-
-    private static string FormatLazyConnectionDetailedSummary(
-        int totalSources,
-        LazyConnectionBuildDiagnostics diagnostics,
-        SemanticAssetRelations remainingRelations)
-    {
-        var placeholderPrefix = diagnostics.FormatStatusSummary(totalSources, remainingRelations);
-        var fullDetailed = diagnostics.FormatDetailedSummary(totalSources, remainingRelations);
-        var actualPrefix = FormatLazyConnectionStatusSummary(totalSources, diagnostics);
-        return fullDetailed.StartsWith(placeholderPrefix, StringComparison.Ordinal)
-            ? actualPrefix + fullDetailed.Substring(placeholderPrefix.Length)
-            : fullDetailed;
-    }
-
-    private sealed class SourceConnectionMaterializationResult
-    {
-        public int ObjectsBefore;
-        public int ObjectsAfter;
-        public int CandidateHandles;
-        public int FailedObjects;
-        public readonly Dictionary<ClassIDType, int> ResolvedByType = new();
-    }
-
-    internal async Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
+    internal Task<LazyConnectionBuildResult> BuildLazySemanticRelationsForSourcesAsync(
         IReadOnlyList<string> sourcePaths,
         Action<int, string> reportProgress,
         SQLiteProjectIndexCache.SemanticStagingSession? stagingSession = null,
-        int stagingFlushRowThreshold = LazyConnectionStagingFlushRowThreshold)
-    {
-        var mergedRelations = new SemanticAssetRelations();
-        var diagnostics = new LazyConnectionBuildDiagnostics();
-        diagnostics.SourceCount = sourcePaths.Count;
-        var failedSources = new List<string>();
-        var effectiveFlushThreshold = Math.Max(1, stagingFlushRowThreshold);
-        const int batchSize = 32;
-        var parallelOptions = CreateSemanticGraphParallelOptions();
+        int stagingFlushRowThreshold = LazyConnectionStagingFlushRowThreshold) =>
+        SemanticGraphService.BuildLazySemanticRelationsForSourcesAsync(
+            assetsManager,
+            sourcePaths,
+            reportProgress,
+            stagingSession,
+            stagingFlushRowThreshold,
+            WaitForUserInteractionPriorityToClearAsync,
+            IsLazyHandlePinnedForPreview);
 
-        for (var i = 0; i < sourcePaths.Count; i += batchSize)
-        {
-            var batch = sourcePaths.Skip(i).Take(batchSize).ToList();
-            diagnostics.BatchCount++;
-            try
-            {
-                await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
-                AssetsManager.ThrowIfMemoryPressureTooHigh("building lazy connections");
-                await assetsManager.LoadFilesAsync(batch.ToArray());
-
-                var filesBySource = ResolveLoadedFilesForConnectionBatch(batch);
-                var materializationResults = new SourceConnectionMaterializationResult?[batch.Count];
-                var sourceRelations = new SemanticAssetRelations?[batch.Count];
-                var sourceExceptions = new Exception?[batch.Count];
-
-                using (assetsManager.LruCache.SuspendEviction())
-                {
-                    // Phase 1: Materialize reference objects across all loaded sources in the batch in parallel.
-                    Parallel.For(0, batch.Count, parallelOptions, j =>
-                    {
-                        var filesForSource = filesBySource[j];
-                        if (filesForSource.Count == 0)
-                        {
-                            return;
-                        }
-
-                        try
-                        {
-                            materializationResults[j] = MaterializeReferenceObjectsForConnectionFiles(filesForSource);
-                        }
-                        catch (Exception ex)
-                        {
-                            sourceExceptions[j] = ex;
-                        }
-                    });
-
-                    // Phase 2: Collect all loaded SerializedFiles across the entire batch and extract semantic relations in parallel across CPU cores.
-                    var flattenedFiles = new List<(int SourceIndex, SerializedFile File)>(batch.Count);
-                    for (var j = 0; j < batch.Count; j++)
-                    {
-                        if (sourceExceptions[j] != null)
-                        {
-                            continue;
-                        }
-
-                        var filesForSource = filesBySource[j];
-                        for (var f = 0; f < filesForSource.Count; f++)
-                        {
-                            var file = filesForSource[f];
-                            if (file != null)
-                            {
-                                flattenedFiles.Add((j, file));
-                            }
-                        }
-                    }
-
-                    var perFileRelations = new SemanticAssetRelations?[flattenedFiles.Count];
-                    Parallel.For(0, flattenedFiles.Count, parallelOptions, flatIndex =>
-                    {
-                        var entry = flattenedFiles[flatIndex];
-                        try
-                        {
-                            var fileRel = new SemanticAssetRelations();
-                            BuildSemanticRelationsForFilesBackground(new[] { entry.File }, fileRel, maxDegreeOfParallelism: 1);
-                            perFileRelations[flatIndex] = fileRel;
-                        }
-                        catch (Exception ex)
-                        {
-                            sourceExceptions[entry.SourceIndex] ??= ex;
-                        }
-                    });
-
-                    for (var flatIndex = 0; flatIndex < flattenedFiles.Count; flatIndex++)
-                    {
-                        var entry = flattenedFiles[flatIndex];
-                        if (sourceExceptions[entry.SourceIndex] != null)
-                        {
-                            continue;
-                        }
-
-                        var rel = perFileRelations[flatIndex];
-                        if (rel != null)
-                        {
-                            var target = sourceRelations[entry.SourceIndex];
-                            if (target == null)
-                            {
-                                target = new SemanticAssetRelations();
-                                sourceRelations[entry.SourceIndex] = target;
-                            }
-                            target.Merge(rel);
-                        }
-                    }
-                }
-
-                // Phase 3: Unload materialized reference objects across the batch in parallel.
-                Parallel.For(0, batch.Count, parallelOptions, j =>
-                {
-                    var filesForSource = filesBySource[j];
-                    if (filesForSource.Count > 0)
-                    {
-                        try
-                        {
-                            UnloadConnectionBuildObjects(filesForSource);
-                        }
-                        catch
-                        {
-                            // Ignore best-effort unload errors.
-                        }
-                    }
-                });
-
-                // Phase 4: Deterministically merge batch relations, update diagnostics, flush to SQLite staging session, and report progress.
-                for (var j = 0; j < batch.Count; j++)
-                {
-                    var sourcePath = batch[j];
-                    var overallIndex = i + j;
-                    try
-                    {
-                        if (sourceExceptions[j] != null)
-                        {
-                            throw sourceExceptions[j]!;
-                        }
-
-                        var filesForSource = filesBySource[j];
-                        diagnostics.RecordLoadedFiles(sourcePath, filesForSource.Count);
-                        if (filesForSource.Count == 0)
-                        {
-                            continue;
-                        }
-
-                        var mat = materializationResults[j];
-                        if (mat != null)
-                        {
-                            diagnostics.RecordMaterializationCandidateCount(mat.CandidateHandles);
-                            for (var f = 0; f < mat.FailedObjects; f++)
-                            {
-                                diagnostics.RecordFailedObject();
-                            }
-
-                            foreach (var kvp in mat.ResolvedByType)
-                            {
-                                for (var c = 0; c < kvp.Value; c++)
-                                {
-                                    diagnostics.RecordResolvedObject(kvp.Key);
-                                }
-                            }
-
-                            diagnostics.RecordMaterializedSource(sourcePath, mat.ObjectsBefore, mat.ObjectsAfter);
-                        }
-
-                        var semanticRelations = sourceRelations[j] ?? new SemanticAssetRelations();
-                        mergedRelations.Merge(semanticRelations);
-                        diagnostics.RecordRelationsPass(semanticRelations);
-
-                        if (stagingSession != null
-                            && CountBufferedSemanticRelationRows(mergedRelations) >= effectiveFlushThreshold)
-                        {
-                            stagingSession.FlushBatch(mergedRelations, clearBatch: true);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        failedSources.Add(sourcePath);
-                        diagnostics.FailedSources++;
-                        Logger.Warning($"Failed to build connections for {Path.GetFileName(sourcePath)}: {ex.Message}");
-                    }
-                    finally
-                    {
-                        reportProgress(overallIndex + 1, sourcePath);
-                    }
-                }
-            }
-            catch (MemoryPressureException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                foreach (var sourcePath in batch)
-                {
-                    failedSources.Add(sourcePath);
-                    diagnostics.FailedSources++;
-                    Logger.Warning($"Failed to load/build connections for {Path.GetFileName(sourcePath)} in batch: {ex.Message}");
-                }
-                for (var j = 0; j < batch.Count; j++)
-                {
-                    var sourcePath = batch[j];
-                    var overallIndex = i + j;
-                    reportProgress(overallIndex + 1, sourcePath);
-                }
-            }
-            finally
-            {
-                await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
-                assetsManager.ClearLoadedFilesKeepIndex();
-            }
-        }
-
-        if (stagingSession != null && CountBufferedSemanticRelationRows(mergedRelations) > 0)
-        {
-            stagingSession.FlushBatch(mergedRelations, clearBatch: true);
-        }
-
-        if (failedSources.Count > 0)
-        {
-            Logger.Warning($"Connections build completed with {failedSources.Count:N0} failed source file(s). First failure: {Path.GetFileName(failedSources[0])}");
-        }
-
-        return new LazyConnectionBuildResult(mergedRelations, diagnostics);
-    }
-
-    private SourceConnectionMaterializationResult MaterializeReferenceObjectsForConnectionFiles(IReadOnlyList<SerializedFile> filesForSource)
-    {
-        var stats = new SourceConnectionMaterializationResult
-        {
-            ObjectsBefore = filesForSource.Sum(file => file.Objects.Count)
-        };
-
-        foreach (var sourceFile in filesForSource)
-        {
-            var handles = assetsManager.ProjectIndex
-                .GetHandlesForFile(sourceFile.fileName)
-                .Where(handle => LazyConnectionReferenceTypes.Contains(handle.Type)
-                    && (ReferenceEquals(handle.SourceFile, sourceFile)
-                        || IsSameLazySource(handle.OriginalPath, sourceFile.originalPath)
-                        || string.IsNullOrEmpty(handle.OriginalPath)))
-                .ToList();
-
-            stats.CandidateHandles += handles.Count;
-            foreach (var handle in handles)
-            {
-                if (handle.SourceFile?.reader == null)
-                {
-                    handle.SourceFile = sourceFile;
-                }
-
-                var obj = assetsManager.ResolveHandle(handle);
-                if (obj == null)
-                {
-                    stats.FailedObjects++;
-                    continue;
-                }
-
-                stats.ResolvedByType.TryGetValue(handle.Type, out var count);
-                stats.ResolvedByType[handle.Type] = count + 1;
-                if (handle.Tag is AssetItem item)
-                {
-                    UpdateLazyAssetItemHandle(item, handle);
-                }
-            }
-        }
-
-        stats.ObjectsAfter = filesForSource.Sum(file => file.Objects.Count);
-        return stats;
-    }
-
-    private List<SerializedFile>[] ResolveLoadedFilesForConnectionBatch(IReadOnlyList<string> batch)
-    {
-        var results = new List<SerializedFile>[batch.Count];
-        for (var j = 0; j < batch.Count; j++)
-        {
-            results[j] = GetLoadedFilesForConnectionSource(batch[j]);
-        }
-
-        return results;
-    }
-
-    private List<SerializedFile> GetLoadedFilesForConnectionSource(string sourcePath)
-    {
-        lock (assetsManager.loadLock)
-        {
-            var directMatches = assetsManager.assetsFileList
-                .Where(file => file != null
-                    && (IsSameLazySource(file.originalPath, sourcePath)
-                        || IsSameLazySource(file.fullName, sourcePath)))
-                .ToList();
-            if (directMatches.Count > 0)
-            {
-                return directMatches;
-            }
-
-            var expectedSerializedFileNames = assetsManager.ProjectIndex.GetHandles()
-                .Where(handle => handle != null && IsSameLazySource(handle.OriginalPath, sourcePath))
-                .Select(handle => handle.SerializedFileName)
-                .Where(name => !string.IsNullOrWhiteSpace(name))
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            if (expectedSerializedFileNames.Count == 0)
-            {
-                return directMatches;
-            }
-
-            return assetsManager.assetsFileList
-                .Where(file => file != null && expectedSerializedFileNames.Contains(file.fileName))
-                .ToList();
-        }
-    }
-
-    private void UnloadConnectionBuildObjects(IReadOnlyList<SerializedFile> files)
-    {
-        foreach (var file in files)
-        {
-            if (file == null)
-            {
-                continue;
-            }
-
-            foreach (var handle in assetsManager.ProjectIndex.GetHandlesForFile(file.fileName).ToList())
-            {
-                if (handle == null
-                    || !ReferenceEquals(handle.SourceFile, file)
-                    || !LazyConnectionReferenceTypes.Contains(handle.Type)
-                    || IsLazyHandlePinnedForPreview(handle))
-                {
-                    continue;
-                }
-
-                UnloadAsset(handle);
-            }
-        }
-    }
-
-    private bool IsLazyHandlePinnedForPreview(AssetHandle handle)
-    {
-        if (handle == null || !handle.HasUniqueId)
-        {
-            return false;
-        }
-
-        lock (preloaderLock)
-        {
-            if (preloadedUniqueIds.Count == 0 && string.IsNullOrEmpty(_currentlySelectedUniqueID))
-            {
-                return false;
-            }
-
-            var uniqueId = handle.UniqueID;
-            return !string.IsNullOrEmpty(uniqueId)
-                && (preloadedUniqueIds.Contains(uniqueId)
-                    || string.Equals(_currentlySelectedUniqueID, uniqueId, StringComparison.Ordinal));
-        }
-    }
+    private bool IsLazyHandlePinnedForPreview(AssetHandle handle) =>
+        ProjectLoadingService.IsLazyHandlePinnedForPreview(
+            handle,
+            preloaderLock,
+            preloadedUniqueIds,
+            _currentlySelectedUniqueID);
 }
