@@ -28,7 +28,7 @@
     <PackageReference Include="FFmpegVideoPlayer.Avalonia" Version="2.8.0" />
     <PackageReference Include="OpenTK" Version="4.8.2" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.15" />
   </ItemGroup>
 
   <ItemGroup>
@@ -42,7 +42,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="Libraries\x64\ffmpeg\**\*" Condition="$([MSBuild]::IsOSPlatform('Linux')) or '$(RuntimeIdentifier)' == 'linux-x64'">
+    <None Include="Libraries\x64\ffmpeg\**\*" Condition="($([MSBuild]::IsOSPlatform('Linux')) or '$(RuntimeIdentifier)' == 'linux-x64') and Exists('Libraries\x64\ffmpeg')">
       <Link>x64\ffmpeg\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
