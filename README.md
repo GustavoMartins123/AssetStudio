@@ -25,19 +25,15 @@ AssetStudio is a tool for exploring, extracting and exporting assets and assetbu
   * **VideoClip**
   * **MonoBehaviour** : json
   * **Animator** : export to FBX file with bound AnimationClip
-* Cross-Platform Linux Support:
+* Cross-Platform Support (Windows & Linux):
   * **AssetStudio.Avalonia**
-  * Includes feature-parity with the legacy Windows Forms UI (Scene Hierarchy search & check propagation, Asset List column sorting & filters, Asset Classes TypeTrees explorer, Log Viewer, settings persistence, etc.).
+  * Unified Avalonia UI frontend on .NET 10 (Scene Hierarchy search & check propagation, Asset List column sorting & filters, Asset Classes TypeTrees explorer, Log Viewer, Project Manager, settings persistence, etc.).
 
 ## Requirements
 
-- AssetStudio.net472 (Windows-only)
-   - [.NET Framework 4.7.2](https://dotnet.microsoft.com/download/dotnet-framework/net472)
-- AssetStudio.net10 (Windows-only)
-   - [.NET Desktop Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)
-- AssetStudio.Avalonia (Linux / Cross-Platform)
-   - [.NET Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)
-   - Tested on: **Ubuntu 24.04.4 LTS**
+- **AssetStudio.Avalonia** (Windows / Linux)
+   - [.NET 10 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (only required for framework-dependent builds; default publish scripts produce self-contained builds)
+   - Tested on Windows (x64) and **Ubuntu 24.04.4 LTS** (x64)
 
 ## Usage
 
@@ -132,7 +128,7 @@ First, use [Il2CppDumper by Perfare](https://github.com/Perfare/Il2CppDumper) to
 
 ## Build
 
-* Windows: Visual Studio 2022 or newer
+* Windows: .NET 10.0 SDK and Visual Studio 2022 or newer (with C++ desktop workload for native texture decoder)
 * Linux: .NET 10.0 SDK, CMake, and GCC/G++
 
 ### One-command Windows publish
