@@ -1293,6 +1293,7 @@ public partial class MainWindow : Window
         AudioReset(recreateAudioPlayer: false);
         VideoReset();
         _pcmWavePreviewPlayer?.Dispose();
+        SpriteHelper.ClearAtlasCache();
         assetsManager.Dispose();
         base.OnClosing(e);
     }

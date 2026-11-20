@@ -36,6 +36,7 @@ public partial class MainWindow
             meshSkinnedRenderersCache = null;
             animationClipTransformBindingsCache = null;
         }
+        SpriteHelper.ClearAtlasCache();
         logger.ClearErrors();
         exportableAssets.Clear();
         visibleAssets.Clear();

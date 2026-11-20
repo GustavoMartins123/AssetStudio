@@ -45,6 +45,7 @@ public partial class MainWindow : Window
                 materialPreviewMaterialCache = null;
                 materialTextureSlotsCache = null;
             }
+            SpriteHelper.ClearAtlasCache();
 
             StatusStripUpdate($"Cleared project cache for: {folderPath}");
         }
