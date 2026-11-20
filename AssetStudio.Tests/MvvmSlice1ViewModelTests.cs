@@ -674,6 +674,37 @@ namespace AssetStudio.Tests
             Assert.Equal(0, changeCount);
         }
 
+        [Theory]
+        [InlineData("", "", "none")]
+        [InlineData("   \t  ", "", "none")]
+        [InlineData("/", "/", "/")]
+        [InlineData("\\", "\\", "\\")]
+        [InlineData(@"C:\", "C:", "C:")]
+        [InlineData("chunk_01.bundle", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData(@"C:\Game\Bundles\chunk_01.bundle", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData("/opt/game/bundles/chunk_01.bundle", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData(@"C:\Game/Bundles\chunk_01.bundle", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData(@"C:\Game\Bundles/chunk_01.bundle", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData(@"C:\Game\Bundles\chunk_01.bundle\", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData("/opt/game/bundles/chunk_01.bundle/", "chunk_01.bundle", "chunk_01.bundle")]
+        [InlineData(@"C:\Game\Bundles\", "Bundles", "Bundles")]
+        [InlineData("/opt/game/bundles/", "bundles", "bundles")]
+        public void IndexingProgressViewModel_CrossPlatformPathSeparators_ExtractFileNameConsistently(
+            string rawPath,
+            string expectedCurrentFileName,
+            string expectedIncompleteSummaryFileName)
+        {
+            var vm = new IndexingProgressViewModel();
+
+            vm.BeginIndexing(totalFiles: 10, currentFile: rawPath);
+            Assert.Equal(expectedCurrentFileName, vm.CurrentFileName);
+
+            vm.SetIncompletePreviousSession("paused", 50.0, lastReadFile: rawPath, processedFiles: 5, totalFiles: 10);
+            Assert.Equal(
+                $"Previous indexing state: paused, 50% complete, last file: {expectedIncompleteSummaryFileName}",
+                vm.IncompleteSessionSummary);
+        }
+
         private static void AssertViewportParity(AssetListViewModel left, AssetListViewModel right)
         {
             Assert.Equal(left.VisibleItems.Count, right.VisibleItems.Count);

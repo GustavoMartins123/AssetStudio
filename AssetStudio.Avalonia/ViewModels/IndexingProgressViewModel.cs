@@ -1,6 +1,5 @@
 using System;
 using System.Globalization;
-using System.IO;
 using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia.ViewModels
@@ -744,15 +743,17 @@ namespace AssetStudio.Avalonia.ViewModels
                 return string.Empty;
             }
 
-            try
+            var trimmed = path.Trim();
+            var span = trimmed.AsSpan().TrimEnd("/\\".AsSpan());
+            if (span.IsEmpty)
             {
-                var name = Path.GetFileName(path);
-                return string.IsNullOrWhiteSpace(name) ? path.Trim() : name;
+                return trimmed;
             }
-            catch
-            {
-                return path.Trim();
-            }
+
+            var lastSeparator = span.LastIndexOfAny('/', '\\');
+            var segment = lastSeparator >= 0 ? span.Slice(lastSeparator + 1) : span;
+            var fileName = segment.Trim();
+            return fileName.IsEmpty ? trimmed : fileName.ToString();
         }
     }
 }
