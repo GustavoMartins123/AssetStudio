@@ -372,6 +372,7 @@ namespace AssetStudio
             int stringBufferSize = reader.ReadInt32();
             ValidateCount(numberOfNodes, 24, "TypeTree node");
             ValidateCount(stringBufferSize, 1, "TypeTree string buffer byte");
+            m_Type.m_Nodes.EnsureCapacity(m_Type.m_Nodes.Count + numberOfNodes);
             for (int i = 0; i < numberOfNodes; i++)
             {
                 var typeTreeNode = new TypeTreeNode();
@@ -391,26 +392,24 @@ namespace AssetStudio
             }
             m_Type.m_StringBuffer = reader.ReadBytes(stringBufferSize);
 
-            using (var stringBufferReader = new BinaryReader(new MemoryStream(m_Type.m_StringBuffer)))
+            var stringBufferReader = new EndianSpanReader(m_Type.m_StringBuffer, reader.Endian);
+            for (int i = 0; i < numberOfNodes; i++)
             {
-                for (int i = 0; i < numberOfNodes; i++)
-                {
-                    var m_Node = m_Type.m_Nodes[i];
-                    m_Node.m_Type = ReadString(stringBufferReader, m_Node.m_TypeStrOffset);
-                    m_Node.m_Name = ReadString(stringBufferReader, m_Node.m_NameStrOffset);
-                }
+                var m_Node = m_Type.m_Nodes[i];
+                m_Node.m_Type = ReadString(ref stringBufferReader, m_Node.m_TypeStrOffset);
+                m_Node.m_Name = ReadString(ref stringBufferReader, m_Node.m_NameStrOffset);
             }
 
-            string ReadString(BinaryReader stringBufferReader, uint value)
+            static string ReadString(ref EndianSpanReader stringBufferReader, uint value)
             {
                 var isOffset = (value & 0x80000000) == 0;
                 if (isOffset)
                 {
-                    if (value >= m_Type.m_StringBuffer.Length)
+                    if (value >= (uint)stringBufferReader.Length)
                     {
-                        throw new InvalidDataException($"Invalid TypeTree string offset {value} (string buffer size {m_Type.m_StringBuffer.Length}).");
+                        throw new InvalidDataException($"Invalid TypeTree string offset {value} (string buffer size {stringBufferReader.Length}).");
                     }
-                    stringBufferReader.BaseStream.Position = value;
+                    stringBufferReader.Position = (int)value;
                     return stringBufferReader.ReadStringToNull();
                 }
                 var offset = value & 0x7FFFFFFF;

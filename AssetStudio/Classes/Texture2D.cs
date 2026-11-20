@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
 
@@ -82,10 +81,12 @@ namespace AssetStudio
 
         public Texture2D(ObjectReader reader) : base(reader)
         {
+            var position = reader.Position;
             if (TryReadFromTypeTree())
             {
                 return;
             }
+            reader.Position = position;
 
             m_Width = reader.ReadInt32();
             m_Height = reader.ReadInt32();
@@ -215,140 +216,228 @@ namespace AssetStudio
         [System.Diagnostics.CodeAnalysis.MemberNotNullWhen(true, nameof(m_TextureSettings), nameof(image_data))]
         private bool TryReadFromTypeTree()
         {
-            if (serializedType?.m_Type == null)
+            var typeTree = serializedType?.m_Type;
+            if (typeTree == null || typeTree.m_Nodes.Count == 0)
             {
                 return false;
             }
 
             try
             {
-                var obj = ToType();
-                if (obj == null)
+                var nodes = typeTree.m_Nodes;
+                var nextSibling = TypeTreeHelper.GetNextSiblingTable(nodes);
+                reader.Reset();
+
+                int width = 0;
+                int height = 0;
+                int format = 0;
+                bool hasFormat = false;
+                bool mipMap = false;
+                int mipCount = 0;
+                GLTextureSettings? textureSettings = null;
+                StreamingInfo? streamData = null;
+                long imageDataOffset = 0;
+                int imageDataSize = 0;
+                long imageDataUnderscoreOffset = 0;
+                int imageDataUnderscoreSize = 0;
+
+                for (int i = 1; i < nodes.Count; i++)
                 {
-                    ResetForManualParsing();
+                    switch (nodes[i].m_Name)
+                    {
+                        case "m_Width":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out width))
+                                return false;
+                            break;
+                        case "m_Height":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out height))
+                                return false;
+                            break;
+                        case "m_TextureFormat":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out format))
+                                return false;
+                            hasFormat = true;
+                            break;
+                        case "m_MipMap":
+                            if (!TypeTreeHelper.TryReadBoolean(nodes, nextSibling, reader, ref i, out mipMap))
+                                return false;
+                            break;
+                        case "m_MipCount":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out mipCount))
+                                return false;
+                            break;
+                        case "m_TextureSettings":
+                            textureSettings = ReadTextureSettingsStreaming(nodes, nextSibling, reader, ref i);
+                            break;
+                        case "m_StreamData":
+                            streamData = ReadStreamingInfoStreaming(nodes, nextSibling, reader, ref i);
+                            break;
+                        case "image data":
+                            TypeTreeHelper.TrySkipBlob(nodes, nextSibling, reader, ref i, out imageDataOffset, out imageDataSize);
+                            break;
+                        case "image_data":
+                            TypeTreeHelper.TrySkipBlob(nodes, nextSibling, reader, ref i, out imageDataUnderscoreOffset, out imageDataUnderscoreSize);
+                            break;
+                        default:
+                            TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref i);
+                            break;
+                    }
+                }
+
+                if (width <= 0 || height <= 0 || !hasFormat || !Enum.IsDefined(typeof(TextureFormat), format))
+                {
                     return false;
                 }
 
-                var width = GetInt32(obj, "m_Width");
-                var height = GetInt32(obj, "m_Height");
-                var format = GetInt32(obj, "m_TextureFormat");
-                if (width <= 0 || height <= 0 || !Enum.IsDefined(typeof(TextureFormat), format))
+                ResourceReader? resourceReader = null;
+                if (!string.IsNullOrEmpty(streamData?.path) && streamData.size > 0)
                 {
-                    ResetForManualParsing();
+                    resourceReader = new ResourceReader(streamData.path, assetsFile, streamData.offset, streamData.size);
+                }
+                else if (imageDataSize > 0)
+                {
+                    resourceReader = new ResourceReader(reader, imageDataOffset, imageDataSize);
+                }
+                else if (imageDataUnderscoreSize > 0)
+                {
+                    resourceReader = new ResourceReader(reader, imageDataUnderscoreOffset, imageDataUnderscoreSize);
+                }
+
+                if (resourceReader == null)
+                {
                     return false;
                 }
 
                 m_Width = width;
                 m_Height = height;
                 m_TextureFormat = (TextureFormat)format;
-                m_MipMap = GetBoolean(obj, "m_MipMap");
-                m_MipCount = GetInt32(obj, "m_MipCount");
-                m_TextureSettings = ReadTextureSettings(GetObject(obj, "m_TextureSettings"));
-
-                var streamData = GetObject(obj, "m_StreamData");
-                if (streamData != null)
-                {
-                    m_StreamData = new StreamingInfo
-                    {
-                        offset = GetInt64(streamData, "offset"),
-                        size = GetUInt32(streamData, "size"),
-                        path = GetString(streamData, "path")
-                    };
-                }
-
-                ResourceReader? resourceReader = null;
-                if (!string.IsNullOrEmpty(m_StreamData?.path) && m_StreamData.size > 0)
-                {
-                    resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size);
-                }
-                else if (GetByteArray(obj, "image data") is byte[] data && data.Length > 0)
-                {
-                    resourceReader = new ResourceReader(data);
-                }
-                else if (GetByteArray(obj, "image_data") is byte[] imageData && imageData.Length > 0)
-                {
-                    resourceReader = new ResourceReader(imageData);
-                }
-
-                if (resourceReader == null)
-                {
-                    ResetForManualParsing();
-                    return false;
-                }
-
+                m_MipMap = mipMap;
+                m_MipCount = mipCount;
+                m_TextureSettings = textureSettings ?? new GLTextureSettings();
+                m_StreamData = streamData;
                 image_data = resourceReader;
                 return true;
             }
             catch
             {
-                ResetForManualParsing();
                 return false;
             }
         }
 
-        private void ResetForManualParsing()
+        private static GLTextureSettings ReadTextureSettingsStreaming(System.Collections.Generic.List<TypeTreeNode> nodes, int[] nextSibling, ObjectReader reader, ref int index)
         {
-            reader.Reset();
-            if (platform == BuildTarget.NoTarget)
+            if (!TypeTreeHelper.IsClassNode(nodes, index))
             {
-                var m_ObjectHideFlags = reader.ReadUInt32();
-            }
-        }
-
-        private static GLTextureSettings ReadTextureSettings(OrderedDictionary? obj)
-        {
-            if (obj == null)
-            {
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth: 1);
                 return new GLTextureSettings();
+            }
+
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
+
+            int filterMode = 0;
+            int aniso = 0;
+            float mipBias = 0f;
+            int wrapMode = 0;
+            int wrapU = 0;
+            bool hasWrapMode = false;
+
+            for (int j = childStart; j < childEnd; j++)
+            {
+                switch (nodes[j].m_Name)
+                {
+                    case "m_FilterMode":
+                        if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref j, out filterMode, depth: 1))
+                            throw new InvalidDataException("Invalid m_FilterMode node.");
+                        break;
+                    case "m_Aniso":
+                        if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref j, out aniso, depth: 1))
+                            throw new InvalidDataException("Invalid m_Aniso node.");
+                        break;
+                    case "m_MipBias":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out mipBias, depth: 1))
+                            throw new InvalidDataException("Invalid m_MipBias node.");
+                        break;
+                    case "m_WrapMode":
+                        if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref j, out wrapMode, depth: 1))
+                            throw new InvalidDataException("Invalid m_WrapMode node.");
+                        hasWrapMode = true;
+                        break;
+                    case "m_WrapU":
+                        if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref j, out wrapU, depth: 1))
+                            throw new InvalidDataException("Invalid m_WrapU node.");
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth: 1);
+                        break;
+                }
+            }
+
+            if (align)
+            {
+                reader.AlignStream();
             }
 
             return new GLTextureSettings
             {
-                m_FilterMode = GetInt32(obj, "m_FilterMode"),
-                m_Aniso = GetInt32(obj, "m_Aniso"),
-                m_MipBias = GetSingle(obj, "m_MipBias"),
-                m_WrapMode = obj.Contains("m_WrapMode") ? GetInt32(obj, "m_WrapMode") : GetInt32(obj, "m_WrapU")
+                m_FilterMode = filterMode,
+                m_Aniso = aniso,
+                m_MipBias = mipBias,
+                m_WrapMode = hasWrapMode ? wrapMode : wrapU
             };
         }
 
-        private static OrderedDictionary? GetObject(OrderedDictionary obj, string name)
+        private static StreamingInfo? ReadStreamingInfoStreaming(System.Collections.Generic.List<TypeTreeNode> nodes, int[] nextSibling, ObjectReader reader, ref int index)
         {
-            return obj.Contains(name) ? obj[name] as OrderedDictionary : null;
-        }
+            if (!TypeTreeHelper.IsClassNode(nodes, index))
+            {
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth: 1);
+                return null;
+            }
 
-        private static byte[]? GetByteArray(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? obj[name] as byte[] : null;
-        }
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
 
-        private static string GetString(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? obj[name] as string ?? string.Empty : string.Empty;
-        }
+            long offset = 0;
+            uint size = 0;
+            string path = string.Empty;
 
-        private static bool GetBoolean(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) && Convert.ToBoolean(obj[name]);
-        }
+            for (int j = childStart; j < childEnd; j++)
+            {
+                switch (nodes[j].m_Name)
+                {
+                    case "offset":
+                        if (!TypeTreeHelper.TryReadInt64(nodes, nextSibling, reader, ref j, out offset, depth: 1))
+                            throw new InvalidDataException("Invalid StreamingInfo.offset node.");
+                        break;
+                    case "size":
+                        if (!TypeTreeHelper.TryReadUInt32(nodes, nextSibling, reader, ref j, out size, depth: 1))
+                            throw new InvalidDataException("Invalid StreamingInfo.size node.");
+                        break;
+                    case "path":
+                        TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref j, out path, depth: 1);
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth: 1);
+                        break;
+                }
+            }
 
-        private static int GetInt32(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? Convert.ToInt32(obj[name]) : 0;
-        }
+            if (align)
+            {
+                reader.AlignStream();
+            }
 
-        private static long GetInt64(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? Convert.ToInt64(obj[name]) : 0;
-        }
-
-        private static uint GetUInt32(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? Convert.ToUInt32(obj[name]) : 0;
-        }
-
-        private static float GetSingle(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? Convert.ToSingle(obj[name]) : 0;
+            return new StreamingInfo
+            {
+                offset = offset,
+                size = size,
+                path = path
+            };
         }
     }
 

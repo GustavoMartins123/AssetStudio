@@ -1,6 +1,6 @@
+using System;
 using System.Collections.Generic;
-
-using System.Collections.Specialized;
+using System.IO;
 
 namespace AssetStudio
 {
@@ -154,29 +154,49 @@ namespace AssetStudio
         [System.Diagnostics.CodeAnalysis.MemberNotNullWhen(true, nameof(m_Shader), nameof(m_Parent), nameof(m_SavedProperties))]
         private bool TryReadFromTypeTree(ObjectReader reader)
         {
-            if (serializedType?.m_Type == null)
+            var typeTree = serializedType?.m_Type;
+            if (typeTree == null || typeTree.m_Nodes.Count == 0)
             {
                 return false;
             }
 
             try
             {
-                var obj = ToType();
-                var savedProperties = GetObject(obj, "m_SavedProperties");
+                var nodes = typeTree.m_Nodes;
+                var nextSibling = TypeTreeHelper.GetNextSiblingTable(nodes);
+                reader.Reset();
+
+                PPtr<Shader>? shader = null;
+                PPtr<Material>? parent = null;
+                UnityPropertySheet? savedProperties = null;
+
+                for (int i = 1; i < nodes.Count; i++)
+                {
+                    switch (nodes[i].m_Name)
+                    {
+                        case "m_Shader":
+                            shader = ReadPPtrStreaming<Shader>(nodes, nextSibling, reader, ref i, reader.assetsFile, depth: 0);
+                            break;
+                        case "m_Parent":
+                            parent = ReadPPtrStreaming<Material>(nodes, nextSibling, reader, ref i, reader.assetsFile, depth: 0);
+                            break;
+                        case "m_SavedProperties":
+                            savedProperties = ReadUnityPropertySheetStreaming(nodes, nextSibling, reader, ref i, reader.assetsFile);
+                            break;
+                        default:
+                            TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref i, depth: 0);
+                            break;
+                    }
+                }
+
                 if (savedProperties == null)
                 {
                     return false;
                 }
 
-                m_Shader = ReadPPtr<Shader>(GetObject(obj, "m_Shader"), reader.assetsFile);
-                m_Parent = ReadPPtr<Material>(GetObject(obj, "m_Parent"), reader.assetsFile);
-                m_SavedProperties = new UnityPropertySheet
-                {
-                    m_TexEnvs = ReadTexEnvs(savedProperties, reader.assetsFile),
-                    m_Ints = ReadIntMap(savedProperties, "m_Ints"),
-                    m_Floats = ReadFloatMap(savedProperties, "m_Floats"),
-                    m_Colors = ReadColorMap(savedProperties, "m_Colors")
-                };
+                m_Shader = shader ?? new PPtr<Shader>(0, 0, reader.assetsFile);
+                m_Parent = parent ?? new PPtr<Material>(0, 0, reader.assetsFile);
+                m_SavedProperties = savedProperties;
                 return true;
             }
             catch
@@ -185,110 +205,417 @@ namespace AssetStudio
             }
         }
 
-        private static KeyValuePair<string, UnityTexEnv>[] ReadTexEnvs(OrderedDictionary savedProperties, SerializedFile assetsFile)
+        private static UnityPropertySheet? ReadUnityPropertySheetStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index,
+            SerializedFile assetsFile)
         {
-            if (!(savedProperties["m_TexEnvs"] is List<KeyValuePair<object, object>> map))
+            if (!TypeTreeHelper.IsClassNode(nodes, index))
             {
-                return new KeyValuePair<string, UnityTexEnv>[0];
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth: 1);
+                return null;
             }
 
-            var result = new List<KeyValuePair<string, UnityTexEnv>>(map.Count);
-            foreach (var item in map)
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
+
+            var texEnvs = Array.Empty<KeyValuePair<string, UnityTexEnv>>();
+            var ints = Array.Empty<KeyValuePair<string, int>>();
+            var floats = Array.Empty<KeyValuePair<string, float>>();
+            var colors = Array.Empty<KeyValuePair<string, Color>>();
+
+            for (int j = childStart; j < childEnd; j++)
             {
-                if (!(item.Value is OrderedDictionary value))
+                switch (nodes[j].m_Name)
                 {
-                    continue;
+                    case "m_TexEnvs":
+                        texEnvs = ReadTexEnvsStreaming(nodes, nextSibling, reader, ref j, assetsFile);
+                        break;
+                    case "m_Ints":
+                        ints = ReadIntMapStreaming(nodes, nextSibling, reader, ref j);
+                        break;
+                    case "m_Floats":
+                        floats = ReadFloatMapStreaming(nodes, nextSibling, reader, ref j);
+                        break;
+                    case "m_Colors":
+                        colors = ReadColorMapStreaming(nodes, nextSibling, reader, ref j);
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth: 1);
+                        break;
                 }
-
-                result.Add(new KeyValuePair<string, UnityTexEnv>(
-                    item.Key as string ?? string.Empty,
-                    new UnityTexEnv(
-                        ReadPPtr<Texture>(GetObject(value, "m_Texture"), assetsFile),
-                        ReadVector2(GetObject(value, "m_Scale")),
-                        ReadVector2(GetObject(value, "m_Offset")))));
             }
-            return result.ToArray();
+
+            if (align)
+            {
+                reader.AlignStream();
+            }
+
+            return new UnityPropertySheet
+            {
+                m_TexEnvs = texEnvs,
+                m_Ints = ints,
+                m_Floats = floats,
+                m_Colors = colors
+            };
         }
 
-        private static KeyValuePair<string, int>[] ReadIntMap(OrderedDictionary obj, string name)
+        private static bool TryBeginMap(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index,
+            out int size,
+            out int firstIndex,
+            out int secondIndex,
+            out bool align,
+            out int mapEnd)
         {
-            if (!(obj[name] is List<KeyValuePair<object, object>> map))
+            if (nodes[index].m_Type != "map")
             {
-                return new KeyValuePair<string, int>[0];
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth: 2);
+                size = 0;
+                firstIndex = 0;
+                secondIndex = 0;
+                align = false;
+                mapEnd = 0;
+                return false;
             }
-            var result = new List<KeyValuePair<string, int>>(map.Count);
-            foreach (var item in map)
+
+            mapEnd = nextSibling[index];
+            align = (nodes[index].m_MetaFlag & 0x4000) != 0
+                || (index + 1 < mapEnd && (nodes[index + 1].m_MetaFlag & 0x4000) != 0);
+            firstIndex = index + 4;
+            secondIndex = firstIndex < mapEnd ? nextSibling[firstIndex] : mapEnd;
+
+            size = reader.ReadInt32();
+            reader.CheckArrayLength(size);
+            if (size > 0 && (firstIndex >= mapEnd || secondIndex >= mapEnd))
             {
-                result.Add(new KeyValuePair<string, int>(item.Key as string ?? string.Empty, System.Convert.ToInt32(item.Value)));
+                throw new InvalidDataException("Invalid map TypeTree node layout.");
             }
-            return result.ToArray();
+
+            return true;
         }
 
-        private static KeyValuePair<string, float>[] ReadFloatMap(OrderedDictionary obj, string name)
+        private static KeyValuePair<string, UnityTexEnv>[] ReadTexEnvsStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index,
+            SerializedFile assetsFile)
         {
-            if (!(obj[name] is List<KeyValuePair<object, object>> map))
+            if (!TryBeginMap(nodes, nextSibling, reader, ref index, out int size, out int firstIndex, out int secondIndex, out bool align, out int mapEnd))
             {
-                return new KeyValuePair<string, float>[0];
+                return Array.Empty<KeyValuePair<string, UnityTexEnv>>();
             }
-            var result = new List<KeyValuePair<string, float>>(map.Count);
-            foreach (var item in map)
+
+            index = mapEnd - 1;
+            if (size == 0)
             {
-                result.Add(new KeyValuePair<string, float>(item.Key as string ?? string.Empty, System.Convert.ToSingle(item.Value)));
+                if (align) reader.AlignStream();
+                return Array.Empty<KeyValuePair<string, UnityTexEnv>>();
             }
-            return result.ToArray();
+
+            if (!TypeTreeHelper.IsClassNode(nodes, secondIndex))
+            {
+                for (int j = 0; j < size; j++)
+                {
+                    int tmp1 = firstIndex;
+                    int tmp2 = secondIndex;
+                    TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref tmp1, depth: 3);
+                    TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref tmp2, depth: 3);
+                }
+                if (align) reader.AlignStream();
+                return Array.Empty<KeyValuePair<string, UnityTexEnv>>();
+            }
+
+            var result = new KeyValuePair<string, UnityTexEnv>[size];
+            for (int j = 0; j < size; j++)
+            {
+                int kIdx = firstIndex;
+                TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref kIdx, out string key, depth: 3);
+                int vIdx = secondIndex;
+                var value = ReadUnityTexEnvStreaming(nodes, nextSibling, reader, ref vIdx, assetsFile);
+                result[j] = new KeyValuePair<string, UnityTexEnv>(key, value);
+            }
+
+            if (align) reader.AlignStream();
+            return result;
         }
 
-        private static KeyValuePair<string, Color>[] ReadColorMap(OrderedDictionary obj, string name)
+        private static UnityTexEnv ReadUnityTexEnvStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index,
+            SerializedFile assetsFile)
         {
-            if (!(obj[name] is List<KeyValuePair<object, object>> map))
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
+
+            PPtr<Texture>? texture = null;
+            Vector2 scale = Vector2.Zero;
+            Vector2 offset = Vector2.Zero;
+
+            for (int j = childStart; j < childEnd; j++)
             {
-                return new KeyValuePair<string, Color>[0];
+                switch (nodes[j].m_Name)
+                {
+                    case "m_Texture":
+                        texture = ReadPPtrStreaming<Texture>(nodes, nextSibling, reader, ref j, assetsFile, depth: 4);
+                        break;
+                    case "m_Scale":
+                        scale = ReadVector2Streaming(nodes, nextSibling, reader, ref j, depth: 4);
+                        break;
+                    case "m_Offset":
+                        offset = ReadVector2Streaming(nodes, nextSibling, reader, ref j, depth: 4);
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth: 4);
+                        break;
+                }
             }
-            var result = new List<KeyValuePair<string, Color>>(map.Count);
-            foreach (var item in map)
-            {
-                result.Add(new KeyValuePair<string, Color>(item.Key as string ?? string.Empty, ReadColor(item.Value as OrderedDictionary)));
-            }
-            return result.ToArray();
+
+            if (align) reader.AlignStream();
+            return new UnityTexEnv(texture ?? new PPtr<Texture>(0, 0, assetsFile), scale, offset);
         }
 
-        private static PPtr<T> ReadPPtr<T>(OrderedDictionary? obj, SerializedFile assetsFile) where T : Object
+        private static KeyValuePair<string, int>[] ReadIntMapStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index)
         {
-            if (obj == null)
+            if (!TryBeginMap(nodes, nextSibling, reader, ref index, out int size, out int firstIndex, out int secondIndex, out bool align, out int mapEnd))
             {
+                return Array.Empty<KeyValuePair<string, int>>();
+            }
+
+            index = mapEnd - 1;
+            if (size == 0)
+            {
+                if (align) reader.AlignStream();
+                return Array.Empty<KeyValuePair<string, int>>();
+            }
+
+            var result = new KeyValuePair<string, int>[size];
+            for (int j = 0; j < size; j++)
+            {
+                int kIdx = firstIndex;
+                TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref kIdx, out string key, depth: 3);
+                int vIdx = secondIndex;
+                if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref vIdx, out int value, depth: 3))
+                    throw new InvalidDataException("Invalid m_Ints map value node.");
+                result[j] = new KeyValuePair<string, int>(key, value);
+            }
+
+            if (align) reader.AlignStream();
+            return result;
+        }
+
+        private static KeyValuePair<string, float>[] ReadFloatMapStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index)
+        {
+            if (!TryBeginMap(nodes, nextSibling, reader, ref index, out int size, out int firstIndex, out int secondIndex, out bool align, out int mapEnd))
+            {
+                return Array.Empty<KeyValuePair<string, float>>();
+            }
+
+            index = mapEnd - 1;
+            if (size == 0)
+            {
+                if (align) reader.AlignStream();
+                return Array.Empty<KeyValuePair<string, float>>();
+            }
+
+            var result = new KeyValuePair<string, float>[size];
+            for (int j = 0; j < size; j++)
+            {
+                int kIdx = firstIndex;
+                TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref kIdx, out string key, depth: 3);
+                int vIdx = secondIndex;
+                if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref vIdx, out float value, depth: 3))
+                    throw new InvalidDataException("Invalid m_Floats map value node.");
+                result[j] = new KeyValuePair<string, float>(key, value);
+            }
+
+            if (align) reader.AlignStream();
+            return result;
+        }
+
+        private static KeyValuePair<string, Color>[] ReadColorMapStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index)
+        {
+            if (!TryBeginMap(nodes, nextSibling, reader, ref index, out int size, out int firstIndex, out int secondIndex, out bool align, out int mapEnd))
+            {
+                return Array.Empty<KeyValuePair<string, Color>>();
+            }
+
+            index = mapEnd - 1;
+            if (size == 0)
+            {
+                if (align) reader.AlignStream();
+                return Array.Empty<KeyValuePair<string, Color>>();
+            }
+
+            var result = new KeyValuePair<string, Color>[size];
+            for (int j = 0; j < size; j++)
+            {
+                int kIdx = firstIndex;
+                TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref kIdx, out string key, depth: 3);
+                int vIdx = secondIndex;
+                var value = ReadColorStreaming(nodes, nextSibling, reader, ref vIdx);
+                result[j] = new KeyValuePair<string, Color>(key, value);
+            }
+
+            if (align) reader.AlignStream();
+            return result;
+        }
+
+        private static PPtr<T> ReadPPtrStreaming<T>(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index,
+            SerializedFile assetsFile,
+            int depth) where T : Object
+        {
+            if (!TypeTreeHelper.IsClassNode(nodes, index))
+            {
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth + 1);
                 return new PPtr<T>(0, 0, assetsFile);
             }
-            return new PPtr<T>(ReadInt32(obj, "m_FileID"), ReadInt64(obj, "m_PathID"), assetsFile);
+
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
+
+            int fileId = 0;
+            long pathId = 0;
+            for (int j = childStart; j < childEnd; j++)
+            {
+                switch (nodes[j].m_Name)
+                {
+                    case "m_FileID":
+                        if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref j, out fileId, depth + 1))
+                            throw new InvalidDataException("Invalid PPtr.m_FileID node.");
+                        break;
+                    case "m_PathID":
+                        if (!TypeTreeHelper.TryReadInt64(nodes, nextSibling, reader, ref j, out pathId, depth + 1))
+                            throw new InvalidDataException("Invalid PPtr.m_PathID node.");
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth + 1);
+                        break;
+                }
+            }
+
+            if (align) reader.AlignStream();
+            return new PPtr<T>(fileId, pathId, assetsFile);
         }
 
-        private static Vector2 ReadVector2(OrderedDictionary? obj)
+        private static Vector2 ReadVector2Streaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index,
+            int depth)
         {
-            return obj == null ? Vector2.Zero : new Vector2(ReadSingle(obj, "x"), ReadSingle(obj, "y"));
+            if (!TypeTreeHelper.IsClassNode(nodes, index))
+            {
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth + 1);
+                return Vector2.Zero;
+            }
+
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
+
+            float x = 0f;
+            float y = 0f;
+            for (int j = childStart; j < childEnd; j++)
+            {
+                switch (nodes[j].m_Name)
+                {
+                    case "x":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out x, depth + 1))
+                            throw new InvalidDataException("Invalid Vector2.x node.");
+                        break;
+                    case "y":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out y, depth + 1))
+                            throw new InvalidDataException("Invalid Vector2.y node.");
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth + 1);
+                        break;
+                }
+            }
+
+            if (align) reader.AlignStream();
+            return new Vector2(x, y);
         }
 
-        private static Color ReadColor(OrderedDictionary? obj)
+        private static Color ReadColorStreaming(
+            List<TypeTreeNode> nodes,
+            int[] nextSibling,
+            ObjectReader reader,
+            ref int index)
         {
-            return obj == null ? new Color() : new Color(ReadSingle(obj, "r"), ReadSingle(obj, "g"), ReadSingle(obj, "b"), ReadSingle(obj, "a"));
-        }
+            if (!TypeTreeHelper.IsClassNode(nodes, index))
+            {
+                TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref index, depth: 3);
+                return new Color();
+            }
 
-        private static OrderedDictionary? GetObject(OrderedDictionary? obj, string name)
-        {
-            return obj != null && obj.Contains(name) ? obj[name] as OrderedDictionary : null;
-        }
+            bool align = (nodes[index].m_MetaFlag & 0x4000) != 0;
+            int childStart = index + 1;
+            int childEnd = nextSibling[index];
+            index = childEnd - 1;
 
-        private static int ReadInt32(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? System.Convert.ToInt32(obj[name]) : 0;
-        }
+            float r = 0f, g = 0f, b = 0f, a = 0f;
+            for (int j = childStart; j < childEnd; j++)
+            {
+                switch (nodes[j].m_Name)
+                {
+                    case "r":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out r, depth: 4))
+                            throw new InvalidDataException("Invalid Color.r node.");
+                        break;
+                    case "g":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out g, depth: 4))
+                            throw new InvalidDataException("Invalid Color.g node.");
+                        break;
+                    case "b":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out b, depth: 4))
+                            throw new InvalidDataException("Invalid Color.b node.");
+                        break;
+                    case "a":
+                        if (!TypeTreeHelper.TryReadSingle(nodes, nextSibling, reader, ref j, out a, depth: 4))
+                            throw new InvalidDataException("Invalid Color.a node.");
+                        break;
+                    default:
+                        TypeTreeHelper.SkipNode(nodes, nextSibling, reader, ref j, depth: 4);
+                        break;
+                }
+            }
 
-        private static long ReadInt64(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? System.Convert.ToInt64(obj[name]) : 0;
-        }
-
-        private static float ReadSingle(OrderedDictionary obj, string name)
-        {
-            return obj.Contains(name) ? System.Convert.ToSingle(obj[name]) : 0;
+            if (align) reader.AlignStream();
+            return new Color(r, g, b, a);
         }
     }
 }
