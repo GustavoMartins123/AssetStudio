@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 namespace AssetStudio
 {
@@ -25,6 +26,11 @@ namespace AssetStudio
         private static readonly ConcurrentDictionary<(string SerializedFileName, string OriginalPath, string SourceHash, string UnityVersion, string UniqueIdFileName), AssetHandleOrigin> OriginPool =
             new ConcurrentDictionary<(string, string, string, string, string), AssetHandleOrigin>();
 
+        private static readonly ConcurrentDictionary<string, int> KeyOriginIdPool =
+            new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+
+        private static int s_nextKeyOriginId;
+
         [ThreadStatic]
         private static AssetHandleOrigin? t_lastOrigin;
 
@@ -34,6 +40,7 @@ namespace AssetStudio
         public string UnityVersion { get; }
         public string UniqueIdFileName { get; }
         public string UniqueIdPrefix { get; }
+        public int KeyOriginId { get; }
 
         private AssetHandleOrigin(
             string serializedFileName,
@@ -48,6 +55,42 @@ namespace AssetStudio
             UnityVersion = unityVersion ?? string.Empty;
             UniqueIdFileName = string.IsNullOrWhiteSpace(uniqueIdFileName) ? "unknown" : uniqueIdFileName;
             UniqueIdPrefix = string.Concat(UniqueIdFileName, "#", SourceHash);
+            KeyOriginId = (SerializedFileName.Length == 0
+                && OriginalPath.Length == 0
+                && SourceHash.Length == 0
+                && UnityVersion.Length == 0
+                && string.Equals(UniqueIdFileName, "unknown", StringComparison.Ordinal))
+                ? 0
+                : GetOrAddKeyOriginId(UniqueIdPrefix);
+        }
+
+        internal static int GetOrAddKeyOriginId(string prefix)
+        {
+            if (string.IsNullOrEmpty(prefix))
+            {
+                return 0;
+            }
+
+            if (KeyOriginIdPool.TryGetValue(prefix, out int existing))
+            {
+                return existing;
+            }
+
+            return KeyOriginIdPool.GetOrAdd(prefix, static _ => Interlocked.Increment(ref s_nextKeyOriginId));
+        }
+
+        public static AssetHandleOrigin Intern(SerializedFile? file)
+        {
+            if (file == null)
+            {
+                return Empty;
+            }
+
+            string? sourcePath = !string.IsNullOrWhiteSpace(file.originalPath)
+                ? file.originalPath
+                : file.fullName;
+            string sourceHash = AssetHandle.BuildSourceHash(file.fileName, sourcePath);
+            return Intern(file.fileName, file.originalPath, sourceHash, file.unityVersion);
         }
 
         internal static AssetHandleOrigin InternFromSpans(
@@ -170,7 +213,109 @@ namespace AssetStudio
             _customUniqueId = null;
         }
 
-        internal bool HasUniqueId
+        public static AssetHandle CreateCanonical(
+            AssetHandleOrigin origin,
+            long pathId,
+            string? name = null,
+            ClassIDType type = ClassIDType.UnknownType,
+            string? container = null,
+            long byteStart = 0,
+            long byteSize = 0,
+            SerializedFile? sourceFile = null,
+            Object? realObject = null,
+            object? tag = null)
+        {
+            return new AssetHandle
+            {
+                _origin = origin ?? AssetHandleOrigin.Empty,
+                _uniqueIdPathId = pathId,
+                _hasCanonicalUniqueId = true,
+                _customUniqueId = null,
+                _pathId = pathId,
+                _name = name ?? string.Empty,
+                _type = type,
+                _container = container ?? string.Empty,
+                _byteStart = byteStart,
+                _byteSize = byteSize,
+                _sourceFile = sourceFile,
+                _realObject = realObject,
+                _tag = tag
+            };
+        }
+
+        public static AssetHandle CreateWithOrigin(
+            AssetHandleOrigin origin,
+            string? uniqueId,
+            long pathId,
+            string? name = null,
+            ClassIDType type = ClassIDType.UnknownType,
+            string? container = null,
+            long byteStart = 0,
+            long byteSize = 0,
+            SerializedFile? sourceFile = null,
+            Object? realObject = null,
+            object? tag = null)
+        {
+            var resolvedOrigin = origin ?? AssetHandleOrigin.Empty;
+            var handle = new AssetHandle
+            {
+                _origin = resolvedOrigin,
+                _pathId = pathId,
+                _name = name ?? string.Empty,
+                _type = type,
+                _container = container ?? string.Empty,
+                _byteStart = byteStart,
+                _byteSize = byteSize,
+                _sourceFile = sourceFile,
+                _realObject = realObject,
+                _tag = tag
+            };
+
+            if (!string.IsNullOrEmpty(uniqueId)
+                && AssetHandleKey.TryParseUniqueIdWithPrefix(
+                    uniqueId.AsSpan(),
+                    out ReadOnlySpan<char> originPrefix,
+                    out _,
+                    out _,
+                    out long parsedPathId,
+                    out bool isCanonicalPathId)
+                && isCanonicalPathId
+                && originPrefix.SequenceEqual(resolvedOrigin.UniqueIdPrefix.AsSpan()))
+            {
+                handle._uniqueIdPathId = parsedPathId;
+                handle._hasCanonicalUniqueId = true;
+                handle._customUniqueId = null;
+            }
+            else
+            {
+                handle.UniqueID = uniqueId ?? string.Empty;
+            }
+
+            return handle;
+        }
+
+        public int ArenaIndex => IsArenaBound(out _) ? _arenaIndex : -1;
+
+        public AssetHandleOrigin Origin
+        {
+            get
+            {
+                if (IsArenaBound(out AssetIndexArena arena))
+                {
+                    SourceOriginRecord record = arena.GetOrigin(_arenaIndex);
+                    return AssetHandleOrigin.Intern(
+                        record.SerializedFileName,
+                        record.OriginalPath,
+                        record.SourceHash,
+                        record.UnityVersion,
+                        record.UniqueIdFileName);
+                }
+
+                return _origin;
+            }
+        }
+
+        public bool HasUniqueId
         {
             get
             {
@@ -181,6 +326,30 @@ namespace AssetStudio
 
                 return _hasCanonicalUniqueId || !string.IsNullOrEmpty(_customUniqueId);
             }
+        }
+
+        public bool TryGetKey(out AssetHandleKey key)
+        {
+            if (IsArenaBound(out AssetIndexArena arena))
+            {
+                key = arena.GetKey(_arenaIndex);
+                return true;
+            }
+
+            if (_hasCanonicalUniqueId && _customUniqueId == null)
+            {
+                key = new AssetHandleKey(_origin.KeyOriginId, _uniqueIdPathId);
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(_customUniqueId))
+            {
+                key = new AssetHandleKey(AssetHandleOrigin.GetOrAddKeyOriginId(_customUniqueId), _pathId);
+                return true;
+            }
+
+            key = default;
+            return false;
         }
 
         public string UniqueID

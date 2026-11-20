@@ -96,8 +96,8 @@ public partial class MainWindow : Window
     private string? _currentlySelectedUniqueID;
     private bool isRefreshingClassesList;
     private bool _statusUpdatePending;
-    private Dictionary<string, AssetItem> lazyAssetItemsByHandleId = new(StringComparer.Ordinal);
-    private HashSet<string> exportableAssetHandleIds = new(StringComparer.Ordinal);
+    private Dictionary<AssetHandleKey, AssetItem> lazyAssetItemsByHandleId = new();
+    private HashSet<AssetHandleKey> exportableAssetHandleIds = new();
     private HashSet<ClassIDType> exportableAssetTypes = new();
     private int lazyAssetItemOrdinal;
     private long lazyIndexingSessionId;
@@ -790,10 +790,16 @@ public partial class MainWindow : Window
 
             await Task.Run(() =>
             {
+                AssetHandleOrigin? lastOrigin = null;
                 for (var i = start; i < start + count; i++)
                 {
                     var handle = cachedHandles[i];
-                    RememberLazyHandleSourcePath(handle);
+                    var origin = handle.Origin;
+                    if (!ReferenceEquals(origin, lastOrigin))
+                    {
+                        RememberLazyHandleSourcePath(handle);
+                        lastOrigin = origin;
+                    }
                     assetsManager.ProjectIndex.AddHandle(handle);
                 }
             });
@@ -843,17 +849,27 @@ public partial class MainWindow : Window
         var displayAllChecked = displayAll.IsChecked == true;
         var filterTypesChanged = false;
         var newExportableItems = new List<AssetItem>();
+        string? lastRememberedOriginalPath = null;
+        string? lastRememberedSerializedFile = null;
 
         foreach (var handle in pendingHandles)
         {
-            if (handle == null || string.IsNullOrEmpty(handle.UniqueID))
+            if (handle == null || !handle.TryGetKey(out var handleKey))
             {
                 continue;
             }
 
-            RememberLazyHandleSourcePath(handle);
+            var originalPath = handle.OriginalPath;
+            var serializedFileName = handle.SerializedFileName;
+            if (!string.Equals(originalPath, lastRememberedOriginalPath, StringComparison.Ordinal)
+                || !string.Equals(serializedFileName, lastRememberedSerializedFile, StringComparison.Ordinal))
+            {
+                RememberLazyHandleSourcePath(handle);
+                lastRememberedOriginalPath = originalPath;
+                lastRememberedSerializedFile = serializedFileName;
+            }
 
-            if (!lazyAssetItemsByHandleId.TryGetValue(handle.UniqueID, out var assetItem))
+            if (!lazyAssetItemsByHandleId.TryGetValue(handleKey, out var assetItem))
             {
                 assetItem = handle.Tag as AssetItem;
                 if (assetItem == null)
@@ -869,7 +885,7 @@ public partial class MainWindow : Window
                     UpdateLazyAssetItemHandle(assetItem, handle);
                 }
 
-                lazyAssetItemsByHandleId[handle.UniqueID] = assetItem;
+                lazyAssetItemsByHandleId[handleKey] = assetItem;
             }
             else
             {
@@ -888,7 +904,7 @@ public partial class MainWindow : Window
                 continue;
             }
 
-            if (!exportableAssetHandleIds.Add(handle.UniqueID))
+            if (!exportableAssetHandleIds.Add(handleKey))
             {
                 continue;
             }
@@ -1029,7 +1045,8 @@ public partial class MainWindow : Window
                     localPathIDAssetItemDic,
                     localObjectAssetItemDic,
                     localExportableAssets,
-                    localNewExportableAssets);
+                    localNewExportableAssets,
+                    populatePathIdDictionary: localContainers.Count > 0);
                 i += handles.Length;
             }
             else

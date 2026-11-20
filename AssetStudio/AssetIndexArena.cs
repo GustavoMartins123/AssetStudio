@@ -397,6 +397,22 @@ namespace AssetStudio
             {
                 ValidateIndexUnlocked(index);
                 SourceOriginRecord origin = _origins[_originIds[index]];
+                if (_customUniqueIdsByIndex != null && _customUniqueIdsByIndex.TryGetValue(index, out string? customUid))
+                {
+                    if (AssetHandleKey.TryParseUniqueIdWithPrefix(
+                        customUid.AsSpan(),
+                        out _,
+                        out _,
+                        out _,
+                        out long parsedPathId,
+                        out bool isCanonicalPathId) && isCanonicalPathId)
+                    {
+                        return new AssetHandleKey(origin.KeyOriginId, parsedPathId);
+                    }
+
+                    return new AssetHandleKey(GetOrAddKeyOriginIdUnlocked(customUid), _pathIds[index]);
+                }
+
                 return new AssetHandleKey(origin.KeyOriginId, _pathIds[index]);
             }
         }
@@ -1257,7 +1273,7 @@ namespace AssetStudio
         {
             if (!_keyOriginIdByPrefix.TryGetValue(prefix, out int keyOriginId))
             {
-                keyOriginId = _keyOriginIdByPrefix.Count + 1;
+                keyOriginId = AssetHandleOrigin.GetOrAddKeyOriginId(prefix);
                 _keyOriginIdByPrefix[prefix] = keyOriginId;
             }
 

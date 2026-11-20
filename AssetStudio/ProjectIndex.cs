@@ -73,6 +73,23 @@ namespace AssetStudio
             return _arena.MaterializeHandle(index);
         }
 
+        public AssetHandle? GetHandle(AssetHandleKey key)
+        {
+            if (_arena.TryGetIndex(key, out int index)
+                && _arena.TryMaterializeHandle(index, out AssetHandle? handle))
+            {
+                return handle;
+            }
+
+            return null;
+        }
+
+        public AssetHandle? GetHandle(SerializedFile? file, long pathID)
+        {
+            AssetHandleOrigin origin = AssetHandleOrigin.Intern(file);
+            return GetHandle(new AssetHandleKey(origin.KeyOriginId, pathID));
+        }
+
         public AssetHandle? GetHandle(string? uniqueID)
         {
             if (string.IsNullOrEmpty(uniqueID))

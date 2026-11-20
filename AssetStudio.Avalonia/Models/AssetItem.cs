@@ -316,7 +316,7 @@ public class AssetItem : IAssetHandleTag
         _container = handle.Container ?? string.Empty;
     }
 
-    internal AssetItem(AssetHandle handle, int ordinal)
+    public AssetItem(AssetHandle handle, int ordinal)
         : this(handle)
     {
         if (ordinal >= 0)

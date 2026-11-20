@@ -260,7 +260,8 @@ namespace AssetStudio.Avalonia
             var stringPool = StringPool;
             var poolLen = stringPool.Length;
             var sourceRecords = SourceFiles;
-            var origins = new (string SerializedFileName, string OriginalPath)[sourceRecords.Length];
+            var origins = new AssetHandleOrigin[sourceRecords.Length];
+            var originPrefixUtf8 = new byte[sourceRecords.Length][];
 
             for (var i = 0; i < sourceRecords.Length; i++)
             {
@@ -274,7 +275,9 @@ namespace AssetStudio.Avalonia
                 var originalPath = src.OriginalPathLength > 0
                     ? Encoding.UTF8.GetString(stringPool.Slice(src.OriginalPathOffset, src.OriginalPathLength))
                     : string.Empty;
-                origins[i] = (serializedFileName, originalPath);
+                var origin = AssetHandleOrigin.Intern(serializedFileName, originalPath);
+                origins[i] = origin;
+                originPrefixUtf8[i] = Encoding.UTF8.GetBytes(origin.UniqueIdPrefix);
             }
 
             var records = Records;
@@ -282,37 +285,75 @@ namespace AssetStudio.Avalonia
             var handles = new List<AssetHandle>(records.Length);
             CollectionsMarshal.SetCount(handles, records.Length);
             var handleSpan = CollectionsMarshal.AsSpan(handles);
+            Span<byte> pathIdUtf8Scratch = stackalloc byte[32];
 
             for (var i = 0; i < records.Length; i++)
             {
                 ref readonly var rec = ref records[i];
                 ValidateSlice(rec.UniqueIdOffset, rec.UniqueIdLength, poolLen);
 
-                var uniqueId = rec.UniqueIdLength > 0
-                    ? Encoding.UTF8.GetString(stringPool.Slice(rec.UniqueIdOffset, rec.UniqueIdLength))
-                    : string.Empty;
                 var name = DecodePooledString(stringPool, poolLen, stringCache, rec.NameOffset, rec.NameLength);
                 var container = DecodePooledString(stringPool, poolLen, stringCache, rec.ContainerOffset, rec.ContainerLength);
 
-                var origin = (uint)rec.SourceFileIndex < (uint)origins.Length
-                    ? origins[rec.SourceFileIndex]
-                    : (SerializedFileName: string.Empty, OriginalPath: string.Empty);
+                var hasOrigin = (uint)rec.SourceFileIndex < (uint)origins.Length;
+                var origin = hasOrigin ? origins[rec.SourceFileIndex] : AssetHandleOrigin.Empty;
+                var prefixBytes = hasOrigin ? originPrefixUtf8[rec.SourceFileIndex] : Array.Empty<byte>();
+                var uidBytes = rec.UniqueIdLength > 0
+                    ? stringPool.Slice(rec.UniqueIdOffset, rec.UniqueIdLength)
+                    : ReadOnlySpan<byte>.Empty;
 
-                handleSpan[i] = new AssetHandle
+                if (hasOrigin && IsCanonicalUniqueIdUtf8(uidBytes, prefixBytes, rec.PathID, pathIdUtf8Scratch))
                 {
-                    UniqueID = uniqueId,
-                    Name = name,
-                    Type = (ClassIDType)rec.ClassID,
-                    Container = container,
-                    OriginalPath = origin.OriginalPath,
-                    SerializedFileName = origin.SerializedFileName,
-                    PathID = rec.PathID,
-                    ByteStart = rec.ByteStart,
-                    ByteSize = rec.ByteSize
-                };
+                    handleSpan[i] = AssetHandle.CreateCanonical(
+                        origin,
+                        rec.PathID,
+                        name,
+                        (ClassIDType)rec.ClassID,
+                        container,
+                        rec.ByteStart,
+                        rec.ByteSize);
+                }
+                else
+                {
+                    var uniqueId = uidBytes.Length > 0
+                        ? Encoding.UTF8.GetString(uidBytes)
+                        : string.Empty;
+
+                    handleSpan[i] = AssetHandle.CreateWithOrigin(
+                        origin,
+                        uniqueId,
+                        rec.PathID,
+                        name,
+                        (ClassIDType)rec.ClassID,
+                        container,
+                        rec.ByteStart,
+                        rec.ByteSize);
+                }
             }
 
             return handles;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsCanonicalUniqueIdUtf8(
+            ReadOnlySpan<byte> uidBytes,
+            ReadOnlySpan<byte> prefixBytes,
+            long pathId,
+            Span<byte> pathIdUtf8Scratch)
+        {
+            if (uidBytes.Length <= prefixBytes.Length + 1 || uidBytes[prefixBytes.Length] != (byte)'#')
+            {
+                return false;
+            }
+
+            if (!pathId.TryFormat(pathIdUtf8Scratch, out var written, default, System.Globalization.CultureInfo.InvariantCulture))
+            {
+                return false;
+            }
+
+            return uidBytes.Length == prefixBytes.Length + 1 + written
+                && uidBytes.Slice(0, prefixBytes.Length).SequenceEqual(prefixBytes)
+                && uidBytes.Slice(prefixBytes.Length + 1).SequenceEqual(pathIdUtf8Scratch.Slice(0, written));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

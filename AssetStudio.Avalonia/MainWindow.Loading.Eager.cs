@@ -112,10 +112,8 @@ namespace AssetStudio.Avalonia
         private static EagerAssetRecord BuildEagerAssetRecord(EagerAssetWorkItem workItem, bool displayAllChecked)
         {
             var asset = workItem.Asset;
-            var assetItem = new AssetItem(asset)
-            {
-                UniqueID = " #" + workItem.Index.ToString(CultureInfo.InvariantCulture)
-            };
+            var assetItem = new AssetItem(asset);
+            assetItem.SetOrdinal(workItem.Index);
             var exportable = false;
             string? productName = null;
             GameObject? gameObject = null;

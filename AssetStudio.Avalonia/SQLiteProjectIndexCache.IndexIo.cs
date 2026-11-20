@@ -107,19 +107,16 @@ namespace AssetStudio.Avalonia
                     {
                         var origin = !reader.IsDBNull(4) && sourceFiles.TryGetValue(reader.GetInt64(4), out var resolved)
                             ? resolved
-                            : (SerializedFileName: string.Empty, OriginalPath: string.Empty);
-                        handles.Add(new AssetHandle
-                        {
-                            UniqueID = reader.GetString(0),
-                            Name = reader.GetString(1),
-                            Type = (ClassIDType)reader.GetInt32(2),
-                            Container = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
-                            OriginalPath = origin.OriginalPath,
-                            SerializedFileName = origin.SerializedFileName,
-                            PathID = reader.GetInt64(5),
-                            ByteStart = reader.GetInt64(6),
-                            ByteSize = reader.GetInt64(7)
-                        });
+                            : AssetHandleOrigin.Empty;
+                        handles.Add(AssetHandle.CreateWithOrigin(
+                            origin,
+                            reader.GetString(0),
+                            reader.GetInt64(5),
+                            reader.GetString(1),
+                            (ClassIDType)reader.GetInt32(2),
+                            reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                            reader.GetInt64(6),
+                            reader.GetInt64(7)));
                     }
                 }
             }
@@ -127,9 +124,9 @@ namespace AssetStudio.Avalonia
             return handles;
         }
 
-        private static Dictionary<long, (string SerializedFileName, string OriginalPath)> LoadSourceFileOriginsForProject(SqliteConnection conn, long projectId)
+        private static Dictionary<long, AssetHandleOrigin> LoadSourceFileOriginsForProject(SqliteConnection conn, long projectId)
         {
-            var result = new Dictionary<long, (string SerializedFileName, string OriginalPath)>();
+            var result = new Dictionary<long, AssetHandleOrigin>();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"
                 SELECT Id, SerializedFileName, OriginalPath
@@ -139,9 +136,9 @@ namespace AssetStudio.Avalonia
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
-                result[reader.GetInt64(0)] = (
-                    reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
-                    reader.IsDBNull(2) ? string.Empty : reader.GetString(2));
+                var serializedFileName = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                var originalPath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                result[reader.GetInt64(0)] = AssetHandleOrigin.Intern(serializedFileName, originalPath);
             }
 
             return result;

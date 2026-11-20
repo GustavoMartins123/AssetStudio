@@ -268,6 +268,31 @@ public sealed class VirtualAssetList :
     }
 
     /// <summary>
+    /// Binds directly to an <see cref="AssetIndexArena"/> in virtual flyweight mode, materializing
+    /// <see cref="AssetItem"/> rows on demand within a bounded LRU viewport cache and resolving
+    /// row indices in O(1) via <see cref="AssetHandle.ArenaIndex"/>.
+    /// </summary>
+    public void ReplaceWithArena(AssetIndexArena arena, int lruCapacity = 512)
+    {
+        ArgumentNullException.ThrowIfNull(arena);
+        ReplaceWithProvider(
+            arena.Count,
+            index => new AssetItem(arena.MaterializeHandle(index), index),
+            lruCapacity,
+            item =>
+            {
+                var handle = item?.Handle;
+                if (handle == null)
+                {
+                    return -1;
+                }
+
+                var arenaIdx = handle.ArenaIndex;
+                return (uint)arenaIdx < (uint)arena.Count ? arenaIdx : -1;
+            });
+    }
+
+    /// <summary>
     /// Switches to virtual index-backed flyweight mode over <paramref name="count"/> logical rows,
     /// retaining at most <paramref name="lruCapacity"/> materialized <see cref="AssetItem"/> instances.
     /// </summary>

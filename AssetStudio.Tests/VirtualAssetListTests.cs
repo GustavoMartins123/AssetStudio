@@ -609,6 +609,139 @@ namespace AssetStudio.Tests
                 $"[Virtual Viewport 200K rows / 512 LRU] Retained heap for 200 scrolled rows: {flyweightBytes:N0} B (Cached={flyweightList.CachedItemCount})");
         }
 
+        [Fact]
+        public void ProjectIndexArena_And_VirtualAssetList_FlyweightProviderBridge_100kRecordsParityAndMinimalHeap()
+        {
+            const int recordCount = 100_000;
+            const int bundleCount = 200;
+            const int lruCapacity = 512;
+
+            var projectIndex = new ProjectIndex();
+            var origins = new AssetHandleOrigin[bundleCount];
+            for (var b = 0; b < bundleCount; b++)
+            {
+                var fileName = $"CAB-{b:x8}aabbccddeeff00112233";
+                var originalPath = $@"C:\Games\MegaProject\StreamingAssets\Bundles\chunk_{b:D4}.bundle";
+                origins[b] = AssetHandleOrigin.Intern(fileName, originalPath, unityVersion: "2022.3.20f1");
+            }
+
+            for (var i = 0; i < recordCount; i++)
+            {
+                var origin = origins[i % bundleCount];
+                var pathId = 500_000L + i;
+                var type = (i % 5) switch
+                {
+                    0 => ClassIDType.Texture2D,
+                    1 => ClassIDType.Mesh,
+                    2 => ClassIDType.Material,
+                    3 => ClassIDType.Transform,
+                    _ => ClassIDType.GameObject
+                };
+                var container = (i % 3 == 0)
+                    ? $"assets/art/characters/group_{i % 40}/hero_{i % 200}.fbx/submesh"
+                    : $"assets/art/environments/zone_{i % 25}/prop_{i % 500}.prefab";
+
+                var handle = AssetHandle.CreateCanonical(
+                    origin,
+                    pathId,
+                    name: $"ArenaAsset_{i % 1024:D4}",
+                    type: type,
+                    container: container,
+                    byteStart: i * 256L,
+                    byteSize: 256L + (i & 1023));
+
+                // Verify zero-alloc key before and after adding to ProjectIndex.
+                Assert.True(handle.TryGetKey(out var keyBeforeAdd));
+                projectIndex.AddHandle(handle);
+                Assert.Equal(i, handle.ArenaIndex);
+                Assert.True(handle.TryGetKey(out var keyAfterAdd));
+                Assert.Equal(keyBeforeAdd, keyAfterAdd);
+            }
+
+            var arena = projectIndex.Arena;
+            Assert.Equal(recordCount, arena.Count);
+            Assert.Equal(bundleCount, arena.OriginCount);
+
+            // Measure retained heap of VirtualAssetList bound to 100K-record AssetIndexArena via ReplaceWithProvider.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            var heapBefore = GC.GetTotalMemory(forceFullCollection: true);
+
+            var virtualList = new VirtualAssetList();
+            virtualList.ReplaceWithProvider(
+                arena.Count,
+                i => new AssetItem(arena.MaterializeHandle(i), i),
+                lruCapacity);
+
+            Assert.Equal(recordCount, virtualList.Count);
+            Assert.Equal(0, virtualList.CachedItemCount);
+
+            // Simulate scrolling across multiple viewports (start, middle, end) over 100K arena rows.
+            int[] sampleOffsets = { 0, 12_345, 49_900, 77_700, 99_750 };
+            foreach (var offset in sampleOffsets)
+            {
+                for (var r = 0; r < 120; r++)
+                {
+                    var idx = offset + r;
+                    var item = virtualList[idx];
+                    var expectedOrigin = origins[idx % bundleCount];
+                    var expectedPathId = 500_000L + idx;
+                    var expectedType = (idx % 5) switch
+                    {
+                        0 => ClassIDType.Texture2D,
+                        1 => ClassIDType.Mesh,
+                        2 => ClassIDType.Material,
+                        3 => ClassIDType.Transform,
+                        _ => ClassIDType.GameObject
+                    };
+                    var expectedContainer = (idx % 3 == 0)
+                        ? $"assets/art/characters/group_{idx % 40}/hero_{idx % 200}.fbx/submesh"
+                        : $"assets/art/environments/zone_{idx % 25}/prop_{idx % 500}.prefab";
+
+                    Assert.Equal($"ArenaAsset_{idx % 1024:D4}", item.Name);
+                    Assert.Equal(expectedType, item.Type);
+                    Assert.Equal(expectedContainer, item.Container);
+                    Assert.Equal(expectedPathId, item.PathID);
+                    Assert.Equal(expectedPathId.ToString(CultureInfo.InvariantCulture), item.PathIDString);
+                    Assert.Equal(256L + (idx & 1023), item.FullSize);
+                    Assert.Equal(" #" + idx.ToString(CultureInfo.InvariantCulture), item.UniqueID);
+                    Assert.NotNull(item.Handle);
+                    Assert.Equal(idx, item.Handle!.ArenaIndex);
+                    Assert.Equal(expectedOrigin.SerializedFileName, item.Handle.SerializedFileName);
+                    Assert.Equal(expectedOrigin.OriginalPath, item.Handle.OriginalPath);
+                    Assert.Same(expectedOrigin, item.Handle.Origin);
+                    Assert.True(item.Handle.TryGetKey(out var handleKey));
+                    Assert.True(projectIndex.TryGetIndex(handleKey, out var lookedUpIdx));
+                    Assert.Equal(idx, lookedUpIdx);
+                    Assert.True(virtualList.CachedItemCount <= lruCapacity);
+                }
+            }
+
+            var heapAfter = GC.GetTotalMemory(forceFullCollection: true);
+            GC.KeepAlive(virtualList);
+            var retainedViewportBytes = Math.Max(0L, heapAfter - heapBefore);
+
+            _output.WriteLine(
+                $"[Arena + VirtualAssetList 100K Bridge] Arena={arena.EstimateMemoryBytes() / (1024.0 * 1024.0):F2} MB | " +
+                $"Viewport LRU Retained={retainedViewportBytes / 1024.0:F1} KB ({retainedViewportBytes:N0} B, Cached={virtualList.CachedItemCount}/{lruCapacity})");
+
+            // Retained viewport heap for 512 LRU items must stay well under 512 KB (versus >20 MB if all 100K items were materialized).
+            Assert.True(
+                retainedViewportBytes < 512 * 1024,
+                $"Expected VirtualAssetList flyweight viewport over 100K arena records to retain < 512 KB, got {retainedViewportBytes:N0} B.");
+
+            // Also verify ReplaceWithArena resolves IndexOf in O(1) via ArenaIndex even for evicted rows.
+            virtualList.ReplaceWithArena(arena, lruCapacity: 16);
+            var firstRow = virtualList[0];
+            for (var i = 1; i <= 32; i++)
+            {
+                _ = virtualList[i];
+            }
+            Assert.Equal(16, virtualList.CachedItemCount);
+            Assert.Equal(0, virtualList.IndexOf(firstRow));
+        }
+
         private sealed class LegacyEagerStringsStub
         {
             public readonly AssetHandle Handle;

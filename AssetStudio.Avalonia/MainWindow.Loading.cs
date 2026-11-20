@@ -27,8 +27,8 @@ namespace AssetStudio.Avalonia
             public Dictionary<Mesh, Avatar?> MeshAvatarCache;
             public Dictionary<AnimationClip, HashSet<uint>> AnimationClipTransformBindingsCache;
             public List<AssetClassItem> AssetClassItems;
-            public Dictionary<string, AssetItem> LazyAssetItemsByHandleId;
-            public HashSet<string> ExportableAssetHandleIds;
+            public Dictionary<AssetHandleKey, AssetItem> LazyAssetItemsByHandleId;
+            public HashSet<AssetHandleKey> ExportableAssetHandleIds;
             public HashSet<ClassIDType> ExportableAssetTypes;
         }
 
@@ -70,7 +70,8 @@ namespace AssetStudio.Avalonia
             Dictionary<string, AssetItem> pathIDAssetItemDic,
             Dictionary<AssetStudio.Object, AssetItem> objectAssetItemDic,
             List<AssetItem> exportableAssets,
-            List<AssetItem> newExportableAssets)
+            List<AssetItem> newExportableAssets,
+            bool populatePathIdDictionary = true)
         {
             var assetItems = new AssetItem?[handles.Count];
             var includeItems = new bool[handles.Count];
@@ -84,18 +85,18 @@ namespace AssetStudio.Avalonia
                 if (handle.Tag is AssetItem existingItem)
                 {
                     assetItem = existingItem;
+                    if (!assetItem.HasOrdinalOrUniqueId)
+                    {
+                        assetItem.SetOrdinal(index);
+                    }
                 }
                 else
                 {
-                    assetItem = new AssetItem(handle);
+                    assetItem = new AssetItem(handle, index);
                     handle.Tag = assetItem;
                     isNewHandle = true;
                 }
 
-                if (string.IsNullOrEmpty(assetItem.UniqueID))
-                {
-                    assetItem.UniqueID = " #" + index.ToString(CultureInfo.InvariantCulture);
-                }
                 assetItems[index] = assetItem;
                 includeItems[index] = displayAllChecked || IsLazyExportableType(handle.Type);
                 newItems[index] = isNewHandle;
@@ -110,7 +111,10 @@ namespace AssetStudio.Avalonia
                     continue;
                 }
 
-                pathIDAssetItemDic[handle.UniqueID] = assetItem;
+                if (populatePathIdDictionary)
+                {
+                    pathIDAssetItemDic[handle.UniqueID] = assetItem;
+                }
                 if (handle.RealObject != null)
                 {
                     objectAssetItemDic[handle.RealObject] = assetItem;
@@ -131,12 +135,12 @@ namespace AssetStudio.Avalonia
 
         private static void BuildExportableAssetIndexesBackground(
             IEnumerable<AssetItem> exportableAssets,
-            out Dictionary<string, AssetItem> lazyItemsByHandleId,
-            out HashSet<string> exportableHandleIds,
+            out Dictionary<AssetHandleKey, AssetItem> lazyItemsByHandleId,
+            out HashSet<AssetHandleKey> exportableHandleIds,
             out HashSet<ClassIDType> exportableTypes)
         {
-            lazyItemsByHandleId = new Dictionary<string, AssetItem>(StringComparer.Ordinal);
-            exportableHandleIds = new HashSet<string>(StringComparer.Ordinal);
+            lazyItemsByHandleId = new Dictionary<AssetHandleKey, AssetItem>();
+            exportableHandleIds = new HashSet<AssetHandleKey>();
             exportableTypes = new HashSet<ClassIDType>();
 
             foreach (var item in exportableAssets)
@@ -146,10 +150,10 @@ namespace AssetStudio.Avalonia
                     continue;
                 }
 
-                if (!string.IsNullOrEmpty(item.Handle?.UniqueID))
+                if (item.Handle != null && item.Handle.TryGetKey(out var handleKey))
                 {
-                    lazyItemsByHandleId[item.Handle.UniqueID] = item;
-                    exportableHandleIds.Add(item.Handle.UniqueID);
+                    lazyItemsByHandleId[handleKey] = item;
+                    exportableHandleIds.Add(handleKey);
                 }
 
                 exportableTypes.Add(item.Type);

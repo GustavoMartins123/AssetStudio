@@ -17,7 +17,7 @@ namespace AssetStudio.Avalonia
 
             if (pptr.TryGetAssetsFile(out var targetFile))
             {
-                var handle = sourceFile.assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(targetFile, pptr.m_PathID));
+                var handle = sourceFile.assetsManager.ProjectIndex.GetHandle(targetFile, pptr.m_PathID);
                 if (handle != null)
                 {
                     return handle;
@@ -26,7 +26,7 @@ namespace AssetStudio.Avalonia
 
             if (pptr.m_FileID == 0)
             {
-                return sourceFile.assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(sourceFile, pptr.m_PathID));
+                return sourceFile.assetsManager.ProjectIndex.GetHandle(sourceFile, pptr.m_PathID);
             }
 
             return FindSemanticHandleForPPtr(sourceFile, pptr.m_FileID, pptr.m_PathID, expectedType: null);

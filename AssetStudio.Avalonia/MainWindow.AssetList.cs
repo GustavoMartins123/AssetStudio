@@ -172,22 +172,21 @@ public partial class MainWindow
         var assetsSnapshot = exportableAssets.ToArray();
 
         // Capture selection before filtering
-        var selectedUniqueIds = new HashSet<string>(StringComparer.Ordinal);
-        string? oldSelectedUniqueId = null;
+        var selectedKeys = new HashSet<AssetSelectionKey>();
+        AssetSelectionKey oldSelectedKey = default;
         if (AssetListDataGrid.SelectedItems != null)
         {
             foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
             {
-                var id = GetAssetUniqueKey(item);
-                if (!string.IsNullOrEmpty(id))
+                if (TryGetAssetSelectionKey(item, out var key))
                 {
-                    selectedUniqueIds.Add(id);
+                    selectedKeys.Add(key);
                 }
             }
 
             if (AssetListDataGrid.SelectedItem is AssetItem selectedItem)
             {
-                oldSelectedUniqueId = GetAssetUniqueKey(selectedItem);
+                TryGetAssetSelectionKey(selectedItem, out oldSelectedKey);
             }
         }
 
@@ -211,7 +210,7 @@ public partial class MainWindow
                 StatusStripUpdate($"Showing {visibleAssets.Count} assets");
 
                 // Restore selection if DataGrid Reset did not already retain all matching items (e.g. re-materialized instances).
-                RestoreSelectionIfNeeded(selectedUniqueIds);
+                RestoreSelectionIfNeeded(selectedKeys);
             }
             finally
             {
@@ -240,10 +239,10 @@ public partial class MainWindow
                     preloaderCts?.Cancel();
                 }
             }
-            var newSelectedUniqueId = GetAssetUniqueKey(newSelectedItem);
-            if (newSelectedUniqueId != oldSelectedUniqueId)
+            TryGetAssetSelectionKey(newSelectedItem, out var newSelectedKey);
+            if (newSelectedKey != oldSelectedKey)
             {
-                _currentlySelectedUniqueID = newSelectedUniqueId;
+                _currentlySelectedUniqueID = GetAssetUniqueKey(newSelectedItem);
                 if (newSelectedItem != null)
                 {
                     if (RightTabControl.SelectedIndex == 1)
@@ -276,15 +275,14 @@ public partial class MainWindow
         var sortMember = assetListSortMember;
         var sortDescending = assetListSortDescending;
         var currentAssets = new List<AssetItem>(visibleAssets);
-        var selectedUniqueIds = new HashSet<string>(StringComparer.Ordinal);
+        var selectedKeys = new HashSet<AssetSelectionKey>();
         if (AssetListDataGrid.SelectedItems != null)
         {
             foreach (var item in AssetListDataGrid.SelectedItems.OfType<AssetItem>())
             {
-                var id = GetAssetUniqueKey(item);
-                if (!string.IsNullOrEmpty(id))
+                if (TryGetAssetSelectionKey(item, out var key))
                 {
-                    selectedUniqueIds.Add(id);
+                    selectedKeys.Add(key);
                 }
             }
         }
@@ -296,7 +294,7 @@ public partial class MainWindow
             try
             {
                 ReplaceVisibleAssetsOwned(sorted);
-                RestoreSelectionIfNeeded(selectedUniqueIds);
+                RestoreSelectionIfNeeded(selectedKeys);
                 StatusStripUpdate($"Showing {visibleAssets.Count} assets");
             }
             finally
@@ -311,6 +309,33 @@ public partial class MainWindow
         }
     }
 
+    private readonly record struct AssetSelectionKey(AssetHandleKey HandleKey, string? FallbackUniqueId);
+
+    private static bool TryGetAssetSelectionKey(AssetItem? item, out AssetSelectionKey key)
+    {
+        if (item == null)
+        {
+            key = default;
+            return false;
+        }
+
+        if (item.Handle != null && item.Handle.TryGetKey(out var handleKey))
+        {
+            key = new AssetSelectionKey(handleKey, null);
+            return true;
+        }
+
+        var uid = item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
+        if (!string.IsNullOrEmpty(uid))
+        {
+            key = new AssetSelectionKey(default, uid);
+            return true;
+        }
+
+        key = default;
+        return false;
+    }
+
     private static string? GetAssetUniqueKey(AssetItem? item)
     {
         if (item == null)
@@ -321,9 +346,9 @@ public partial class MainWindow
         return item.Handle != null ? item.Handle.UniqueID : item.UniqueID;
     }
 
-    private void RestoreSelectionIfNeeded(HashSet<string> selectedUniqueIds)
+    private void RestoreSelectionIfNeeded(HashSet<AssetSelectionKey> selectedKeys)
     {
-        if (selectedUniqueIds.Count == 0)
+        if (selectedKeys.Count == 0)
         {
             return;
         }
@@ -341,14 +366,13 @@ public partial class MainWindow
             var preservedCount = 0;
             foreach (var item in selectedItems.OfType<AssetItem>())
             {
-                var id = GetAssetUniqueKey(item);
-                if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+                if (TryGetAssetSelectionKey(item, out var key) && selectedKeys.Contains(key))
                 {
                     preservedCount++;
                 }
             }
 
-            if (preservedCount == selectedUniqueIds.Count || preservedCount == selectedItems.Count)
+            if (preservedCount == selectedKeys.Count || preservedCount == selectedItems.Count)
             {
                 return;
             }
@@ -357,8 +381,7 @@ public partial class MainWindow
         var newSelectedItems = new List<AssetItem>();
         foreach (var item in visibleAssets)
         {
-            var id = GetAssetUniqueKey(item);
-            if (!string.IsNullOrEmpty(id) && selectedUniqueIds.Contains(id))
+            if (TryGetAssetSelectionKey(item, out var key) && selectedKeys.Contains(key))
             {
                 newSelectedItems.Add(item);
             }
@@ -423,10 +446,10 @@ public partial class MainWindow
         exportableAssetTypes.Clear();
         foreach (var item in exportableAssets)
         {
-            if (!string.IsNullOrEmpty(item.Handle?.UniqueID))
+            if (item.Handle != null && item.Handle.TryGetKey(out var handleKey))
             {
-                lazyAssetItemsByHandleId[item.Handle.UniqueID] = item;
-                exportableAssetHandleIds.Add(item.Handle.UniqueID);
+                lazyAssetItemsByHandleId[handleKey] = item;
+                exportableAssetHandleIds.Add(handleKey);
             }
             exportableAssetTypes.Add(item.Type);
         }
@@ -434,8 +457,8 @@ public partial class MainWindow
 
     private void ApplyExportableAssetIndexes(BuildAssetStructuresResult result)
     {
-        lazyAssetItemsByHandleId = result.LazyAssetItemsByHandleId ?? new Dictionary<string, AssetItem>(StringComparer.Ordinal);
-        exportableAssetHandleIds = result.ExportableAssetHandleIds ?? new HashSet<string>(StringComparer.Ordinal);
+        lazyAssetItemsByHandleId = result.LazyAssetItemsByHandleId ?? new Dictionary<AssetHandleKey, AssetItem>();
+        exportableAssetHandleIds = result.ExportableAssetHandleIds ?? new HashSet<AssetHandleKey>();
         exportableAssetTypes = result.ExportableAssetTypes ?? new HashSet<ClassIDType>();
     }
 

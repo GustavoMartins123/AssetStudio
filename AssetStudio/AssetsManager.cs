@@ -1482,6 +1482,7 @@ namespace AssetStudio
                             else
                             {
                                 var localObjects = new Object?[assetsFile.m_Objects.Count];
+                                var fileOrigin = AssetHandleOrigin.Intern(assetsFile);
                                 using var localReader = assetsFile.reader.Clone();
 
                                 for (int objectIndex = 0; objectIndex < assetsFile.m_Objects.Count; objectIndex++)
@@ -1511,17 +1512,13 @@ namespace AssetStudio
                                     
                                     var type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
 
-                                    var handle = new AssetHandle
-                                    {
-                                        UniqueID = AssetHandle.BuildUniqueID(assetsFile, objectInfo.m_PathID),
-                                        Type = type,
-                                        OriginalPath = assetsFile.originalPath,
-                                        SerializedFileName = assetsFile.fileName,
-                                        SourceFile = assetsFile,
-                                        PathID = objectInfo.m_PathID,
-                                        ByteStart = objectInfo.byteStart,
-                                        ByteSize = objectInfo.byteSize
-                                    };
+                                    var handle = AssetHandle.CreateCanonical(
+                                        fileOrigin,
+                                        objectInfo.m_PathID,
+                                        type: type,
+                                        byteStart: objectInfo.byteStart,
+                                        byteSize: objectInfo.byteSize,
+                                        sourceFile: assetsFile);
 
                                     string? name = null;
                                     if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)

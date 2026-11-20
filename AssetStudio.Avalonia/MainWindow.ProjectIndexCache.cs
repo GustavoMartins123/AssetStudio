@@ -1238,15 +1238,22 @@ public partial class MainWindow : Window
 
     private bool IsLazyHandlePinnedForPreview(AssetHandle handle)
     {
-        if (handle == null || string.IsNullOrEmpty(handle.UniqueID))
+        if (handle == null || !handle.HasUniqueId)
         {
             return false;
         }
 
         lock (preloaderLock)
         {
-            return preloadedUniqueIds.Contains(handle.UniqueID)
-                || string.Equals(_currentlySelectedUniqueID, handle.UniqueID, StringComparison.Ordinal);
+            if (preloadedUniqueIds.Count == 0 && string.IsNullOrEmpty(_currentlySelectedUniqueID))
+            {
+                return false;
+            }
+
+            var uniqueId = handle.UniqueID;
+            return !string.IsNullOrEmpty(uniqueId)
+                && (preloadedUniqueIds.Contains(uniqueId)
+                    || string.Equals(_currentlySelectedUniqueID, uniqueId, StringComparison.Ordinal));
         }
     }
 }
