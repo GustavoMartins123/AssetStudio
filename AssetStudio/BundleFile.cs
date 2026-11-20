@@ -78,8 +78,15 @@ namespace AssetStudio
 
         public StreamFile[] fileList = null!;
         public Stream? BlocksStream { get; set; }
+        public bool LoadedFromDecompressionCache { get; private set; }
+        public string? CachedBlocksPath { get; private set; }
 
         public BundleFile(FileReader reader)
+            : this(reader, null)
+        {
+        }
+
+        public BundleFile(FileReader reader, DecompressedBundleCache? decompressionCache)
         {
             m_Header = new Header();
             m_Header.signature = reader.ReadStringToNull();
@@ -98,6 +105,30 @@ namespace AssetStudio
                             goto case "UnityFS";
                         }
                         ReadHeaderAndBlocksInfo(reader);
+                        if (decompressionCache != null
+                            && HasCompressedBlocks()
+                            && !string.IsNullOrEmpty(reader.FullPath)
+                            && File.Exists(reader.FullPath))
+                        {
+                            var uncompressedSizeSum = m_BlocksInfo.Sum(x => (long)x.uncompressedSize);
+                            var cacheEntry = decompressionCache.GetOrExtractBlocks(
+                                reader.FullPath,
+                                uncompressedSizeSum,
+                                tempStream => ReadBlocksAndDirectory(reader, tempStream));
+                            if (cacheEntry.FromCache)
+                            {
+                                using var cachedStream = new FileStream(
+                                    cacheEntry.BlocksFilePath,
+                                    FileMode.Open,
+                                    FileAccess.Read,
+                                    FileShare.ReadWrite | FileShare.Delete);
+                                ReadDirectoryInfoOnly(cachedStream);
+                            }
+                            LoadedFromDecompressionCache = cacheEntry.FromCache;
+                            CachedBlocksPath = cacheEntry.BlocksFilePath;
+                            ReadFilesFromDiskPath(cacheEntry.BlocksFilePath, cacheEntry.UncompressedSize);
+                            break;
+                        }
                         var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached, out var tempCachePath, out var targetCachePath);
                         try
                         {
@@ -187,6 +218,23 @@ namespace AssetStudio
                     {
                         ReadHeader(reader);
                         ReadBlocksInfoAndDirectory(reader);
+                        if (decompressionCache != null
+                            && HasCompressedBlocks()
+                            && !string.IsNullOrEmpty(reader.FullPath)
+                            && File.Exists(reader.FullPath))
+                        {
+                            var uncompressedSizeSum = m_BlocksInfo.Sum(x => (long)x.uncompressedSize);
+                            var cachedNodes = BuildCachedNodes(m_DirectoryInfo);
+                            var cacheEntry = decompressionCache.GetOrExtractBlocks(
+                                reader.FullPath,
+                                uncompressedSizeSum,
+                                tempStream => ReadBlocks(reader, tempStream),
+                                cachedNodes);
+                            LoadedFromDecompressionCache = cacheEntry.FromCache;
+                            CachedBlocksPath = cacheEntry.BlocksFilePath;
+                            ReadFilesFromDiskPath(cacheEntry.BlocksFilePath, cacheEntry.UncompressedSize);
+                            break;
+                        }
                         var blocksStream = CreateBlocksStream(reader.FullPath, out var isCached, out var tempCachePath, out var targetCachePath);
                         try
                         {
@@ -269,6 +317,53 @@ namespace AssetStudio
                         break;
                     }
             }
+        }
+
+        private bool HasCompressedBlocks()
+        {
+            if (m_Header.signature == "UnityWeb")
+            {
+                return true;
+            }
+
+            if (m_BlocksInfo == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < m_BlocksInfo.Length; i++)
+            {
+                var compressionType = (CompressionType)(m_BlocksInfo[i].flags & StorageBlockFlags.CompressionTypeMask);
+                if (compressionType != CompressionType.None)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static CachedBundleNode[] BuildCachedNodes(Node[] directoryInfo)
+        {
+            var result = new CachedBundleNode[directoryInfo.Length];
+            for (int i = 0; i < directoryInfo.Length; i++)
+            {
+                var node = directoryInfo[i];
+                result[i] = new CachedBundleNode
+                {
+                    Path = node.path,
+                    Offset = node.offset,
+                    Size = node.size,
+                    Flags = node.flags
+                };
+            }
+
+            return result;
+        }
+
+        private void ReadFilesFromDiskPath(string cachedBlocksPath, long blocksLength)
+        {
+            fileList = DecompressedBundleCache.CreateStreamFiles(cachedBlocksPath, blocksLength, m_DirectoryInfo);
         }
 
         private void ReadHeaderAndBlocksInfo(EndianBinaryReader reader)
@@ -847,7 +942,7 @@ namespace AssetStudio
                     {
                         case CompressionType.None:
                             {
-                                reader.BaseStream.CopyTo(blocksStream, blockInfo.compressedSize);
+                                CopyExact(reader.BaseStream, blocksStream, blockInfo.compressedSize);
                                 break;
                             }
                         case CompressionType.Lzma:
@@ -912,6 +1007,37 @@ namespace AssetStudio
                 }
             }
             blocksStream.Position = 0;
+        }
+
+        private static void CopyExact(Stream source, Stream destination, long byteCount)
+        {
+            if (byteCount <= 0)
+            {
+                return;
+            }
+
+            var bufferSize = (int)Math.Min(byteCount, 1024 * 1024);
+            var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+            try
+            {
+                long remaining = byteCount;
+                while (remaining > 0)
+                {
+                    var toRead = (int)Math.Min(buffer.Length, remaining);
+                    var read = source.Read(buffer, 0, toRead);
+                    if (read <= 0)
+                    {
+                        throw new EndOfStreamException($"Unexpected end of bundle stream while copying uncompressed block: {remaining} bytes remaining.");
+                    }
+
+                    destination.Write(buffer, 0, read);
+                    remaining -= read;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
 
         public void Dispose()

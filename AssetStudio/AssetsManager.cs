@@ -77,6 +77,9 @@ namespace AssetStudio
         public ConcurrentBag<Stream> bundleStreams = new ConcurrentBag<Stream>();
         public ProjectIndex ProjectIndex = new ProjectIndex();
         public bool LazyLoading = false;
+#nullable enable
+        public DecompressedBundleCache? DecompressionCache { get; set; }
+#nullable restore
 
         private readonly object unityVersionInferenceLock = new object();
         private string inferredUnityVersion = "";
@@ -630,7 +633,7 @@ namespace AssetStudio
             int handedOffCount = 0;
             try
             {
-                bundleFile = new BundleFile(reader);
+                bundleFile = new BundleFile(reader, DecompressionCache);
                 if (bundleFile.BlocksStream != null)
                 {
                     bundleStreams.Add(bundleFile.BlocksStream);
@@ -1116,7 +1119,7 @@ namespace AssetStudio
             try
             {
                 using (var reader = new FileReader(path))
-                using (var bundleFile = new BundleFile(reader))
+                using (var bundleFile = new BundleFile(reader, DecompressionCache))
                 {
                     if (!string.IsNullOrWhiteSpace(bundleFile.m_Header.unityRevision))
                     {

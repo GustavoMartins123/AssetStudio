@@ -10,6 +10,8 @@ namespace AssetStudio.Avalonia.Services
 {
     public class AssetLoadingService
     {
+        public const int DefaultHandleFlushBatchSize = 5000;
+
         private CancellationTokenSource? _indexingCts;
         private Task? _indexingTask;
         private bool _isIndexingPaused;
@@ -70,7 +72,9 @@ namespace AssetStudio.Avalonia.Services
             Action onBatchLoaded,
             Action<string, ProjectScanResult> saveCacheCallback,
             Action<IndexingProgressUpdate> onIndexingProgressChanged,
-            Action<bool, int, int> onFinished)
+            Action<bool, int, int> onFinished,
+            Action<IReadOnlyList<AssetHandle>>? onHandleBatchReady = null,
+            int handleFlushBatchSize = DefaultHandleFlushBatchSize)
         {
             if (_indexingCts != null)
             {
@@ -84,6 +88,9 @@ namespace AssetStudio.Avalonia.Services
             _pendingFilesToIndex = files.ToList();
             _uiThrottleStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
+            var effectiveHandleFlushBatchSize = handleFlushBatchSize > 0
+                ? handleFlushBatchSize
+                : DefaultHandleFlushBatchSize;
             var originalTotal = _pendingFilesToIndex.Count;
             lock (_indexingStateLock)
             {
@@ -99,6 +106,9 @@ namespace AssetStudio.Avalonia.Services
             {
                 int batchSize = 40;
                 int loadedCount = 0;
+                var pendingHandleFlushBuffer = onHandleBatchReady != null
+                    ? new List<AssetHandle>(Math.Min(effectiveHandleFlushBatchSize, DefaultHandleFlushBatchSize))
+                    : null;
 
                 while (_pendingFilesToIndex.Count > 0)
                 {
@@ -215,6 +225,16 @@ namespace AssetStudio.Avalonia.Services
                         assetsManager.ClearLoadedFilesKeepIndex();
                     }
 
+                    if (onHandleBatchReady != null && pendingHandleFlushBuffer != null)
+                    {
+                        FlushHandleBatches(
+                            assetsManager.ProjectIndex,
+                            pendingHandleFlushBuffer,
+                            effectiveHandleFlushBatchSize,
+                            onHandleBatchReady,
+                            flushRemainder: false);
+                    }
+
                     loadedCount += batch.Count;
                     lock (_indexingStateLock)
                     {
@@ -231,6 +251,16 @@ namespace AssetStudio.Avalonia.Services
                         updateProgress(progressPercent, $"Indexed: {loadedCount:N0} / {originalTotal:N0} files ({progressPercent}%)");
                         onBatchLoaded();
                     }
+                }
+
+                if (onHandleBatchReady != null && pendingHandleFlushBuffer != null)
+                {
+                    FlushHandleBatches(
+                        assetsManager.ProjectIndex,
+                        pendingHandleFlushBuffer,
+                        effectiveHandleFlushBatchSize,
+                        onHandleBatchReady,
+                        flushRemainder: true);
                 }
 
                 var wasCancelled = token.IsCancellationRequested;
@@ -253,6 +283,81 @@ namespace AssetStudio.Avalonia.Services
 
                 onFinished(wasCancelled, loadedCount, originalTotal);
             }, token);
+        }
+
+        public static int FlushHandleBatches(
+            ProjectIndex projectIndex,
+            List<AssetHandle> pendingBuffer,
+            int batchSize,
+            Action<IReadOnlyList<AssetHandle>> onHandleBatchReady,
+            bool flushRemainder = false)
+        {
+            if (projectIndex == null)
+            {
+                throw new ArgumentNullException(nameof(projectIndex));
+            }
+
+            if (pendingBuffer == null)
+            {
+                throw new ArgumentNullException(nameof(pendingBuffer));
+            }
+
+            if (onHandleBatchReady == null)
+            {
+                throw new ArgumentNullException(nameof(onHandleBatchReady));
+            }
+
+            var effectiveBatchSize = batchSize > 0 ? batchSize : DefaultHandleFlushBatchSize;
+            var flushedTotal = 0;
+
+            while (true)
+            {
+                var needed = Math.Max(1, effectiveBatchSize - pendingBuffer.Count);
+                var drainedAny = false;
+                foreach (var handle in projectIndex.DrainPendingHandles(needed))
+                {
+                    pendingBuffer.Add(handle);
+                    drainedAny = true;
+                }
+
+                if (pendingBuffer.Count >= effectiveBatchSize)
+                {
+                    var chunk = pendingBuffer.ToArray();
+                    pendingBuffer.Clear();
+                    flushedTotal += chunk.Length;
+                    InvokeHandleBatchCallbackSafe(onHandleBatchReady, chunk);
+                    continue;
+                }
+
+                if (!drainedAny)
+                {
+                    break;
+                }
+            }
+
+            if (flushRemainder && pendingBuffer.Count > 0)
+            {
+                var remainder = pendingBuffer.ToArray();
+                pendingBuffer.Clear();
+                flushedTotal += remainder.Length;
+                InvokeHandleBatchCallbackSafe(onHandleBatchReady, remainder);
+            }
+
+            return flushedTotal;
+        }
+
+        private static void InvokeHandleBatchCallbackSafe(
+            Action<IReadOnlyList<AssetHandle>> onHandleBatchReady,
+            IReadOnlyList<AssetHandle> batch)
+        {
+            try
+            {
+                onHandleBatchReady(batch);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to flush indexed handle batch ({batch.Count:N0} handles): {ex.Message}");
+            }
         }
 
         public void PauseIndexing()

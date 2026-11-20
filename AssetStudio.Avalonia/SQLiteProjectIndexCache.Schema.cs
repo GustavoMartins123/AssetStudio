@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using Microsoft.Data.Sqlite;
 
@@ -215,7 +216,9 @@ namespace AssetStudio.Avalonia
                                 PayloadPath TEXT,
                                 ByteSize INTEGER NOT NULL DEFAULT 0,
                                 CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-                                LastAccessed DATETIME DEFAULT CURRENT_TIMESTAMP
+                                LastAccessed DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                UpdatedUtc TEXT NOT NULL DEFAULT '',
+                                LastAccessedUtc TEXT NOT NULL DEFAULT ''
                             );
 
                             CREATE TABLE IF NOT EXISTS ProjectIndexingState (
@@ -287,6 +290,55 @@ namespace AssetStudio.Avalonia
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_indexing_read_files_unique ON IndexingReadFiles(ProjectId, FilePath);
                         ";
                 cmd.ExecuteNonQuery();
+            }
+
+            EnsurePreviewCacheSchemaUpgrades(conn);
+        }
+
+        private static void EnsurePreviewCacheSchemaUpgrades(SqliteConnection conn)
+        {
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var infoCmd = conn.CreateCommand())
+            {
+                infoCmd.CommandText = "PRAGMA table_info(PreviewCacheEntries);";
+                using var reader = infoCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!reader.IsDBNull(1))
+                    {
+                        columns.Add(reader.GetString(1));
+                    }
+                }
+            }
+
+            if (!columns.Contains("UpdatedUtc"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.CommandText = @"
+                    ALTER TABLE PreviewCacheEntries ADD COLUMN UpdatedUtc TEXT NOT NULL DEFAULT '';
+                    UPDATE PreviewCacheEntries
+                    SET UpdatedUtc = COALESCE(NULLIF(CreatedAt, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    WHERE UpdatedUtc = '';";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!columns.Contains("LastAccessedUtc"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.CommandText = @"
+                    ALTER TABLE PreviewCacheEntries ADD COLUMN LastAccessedUtc TEXT NOT NULL DEFAULT '';
+                    UPDATE PreviewCacheEntries
+                    SET LastAccessedUtc = COALESCE(NULLIF(LastAccessed, ''), NULLIF(UpdatedUtc, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    WHERE LastAccessedUtc = '';";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            using (var indexCmd = conn.CreateCommand())
+            {
+                indexCmd.CommandText = @"
+                    CREATE INDEX IF NOT EXISTS IX_PreviewCacheEntries_LastAccessed
+                    ON PreviewCacheEntries(LastAccessedUtc, UpdatedUtc, Id);";
+                indexCmd.ExecuteNonQuery();
             }
         }
     }

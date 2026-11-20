@@ -120,7 +120,11 @@ namespace AssetStudio.Avalonia
 
         private void EnsureInitialized(string folderPath)
         {
-            var dbPath = GetDbPath(folderPath);
+            EnsureInitializedByDbPath(GetDbPath(folderPath));
+        }
+
+        private void EnsureInitializedByDbPath(string dbPath)
+        {
             lock (_initLock)
             {
                 if (_initializedDbs.Contains(dbPath))
@@ -128,8 +132,25 @@ namespace AssetStudio.Avalonia
                     return;
                 }
 
-                InitializeDatabase(folderPath);
+                InitializeDatabaseByPath(dbPath);
                 _initializedDbs.Add(dbPath);
+            }
+        }
+
+        private IEnumerable<string> EnumerateCacheDatabasePaths()
+        {
+            if (!Directory.Exists(_cacheDir))
+            {
+                return Array.Empty<string>();
+            }
+
+            try
+            {
+                return Directory.GetFiles(_cacheDir, "project_index_*.db", SearchOption.TopDirectoryOnly);
+            }
+            catch
+            {
+                return Array.Empty<string>();
             }
         }
 
@@ -146,7 +167,11 @@ namespace AssetStudio.Avalonia
 
         private SqliteConnection CreateConnection(string folderPath)
         {
-            var dbPath = GetDbPath(folderPath);
+            return CreateConnectionByDbPath(GetDbPath(folderPath));
+        }
+
+        private static SqliteConnection CreateConnectionByDbPath(string dbPath)
+        {
             var conn = new SqliteConnection($"Data Source={dbPath}");
             conn.DefaultTimeout = 60;
             conn.Open();
@@ -158,7 +183,12 @@ namespace AssetStudio.Avalonia
 
         private SqliteConnection CreateReadConnection(string folderPath)
         {
-            var connectionString = BuildReadConnectionString(GetDbPath(folderPath));
+            return CreateReadConnectionByDbPath(GetDbPath(folderPath));
+        }
+
+        private static SqliteConnection CreateReadConnectionByDbPath(string dbPath)
+        {
+            var connectionString = BuildReadConnectionString(dbPath);
             var conn = new SqliteConnection(connectionString);
             conn.Open();
             using var pragma = conn.CreateCommand();
@@ -172,11 +202,16 @@ namespace AssetStudio.Avalonia
 
         private void InitializeDatabase(string folderPath)
         {
+            InitializeDatabaseByPath(GetDbPath(folderPath));
+        }
+
+        private static void InitializeDatabaseByPath(string dbPath)
+        {
             try
             {
                 lock (WriteGate)
                 {
-                    using (var conn = CreateConnection(folderPath))
+                    using (var conn = CreateConnectionByDbPath(dbPath))
                     {
                         using (var pragma = conn.CreateCommand())
                         {
@@ -198,7 +233,7 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
-                Logger.Error($"Failed to initialize SQLite database cache for {folderPath}: {ex.Message}", ex);
+                Logger.Error($"Failed to initialize SQLite database cache at {dbPath}: {ex.Message}", ex);
             }
         }
 
