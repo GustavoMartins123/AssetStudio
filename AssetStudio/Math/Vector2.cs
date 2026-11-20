@@ -43,7 +43,7 @@ namespace AssetStudio
             return X.GetHashCode() ^ (Y.GetHashCode() << 2);
         }
 
-        public override bool Equals(object other)
+        public override bool Equals(object? other)
         {
             if (!(other is Vector2))
                 return false;

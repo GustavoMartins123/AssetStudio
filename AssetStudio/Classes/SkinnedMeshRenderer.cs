@@ -9,7 +9,7 @@ namespace AssetStudio
     {
         public PPtr<Mesh> m_Mesh;
         public PPtr<Transform>[] m_Bones;
-        public float[] m_BlendShapeWeights;
+        public float[] m_BlendShapeWeights = Array.Empty<float>();
 
         public SkinnedMeshRenderer(ObjectReader reader) : base(reader)
         {

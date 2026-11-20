@@ -24,7 +24,7 @@ namespace AssetStudio
             return ((Vector4)this).GetHashCode();
         }
 
-        public override bool Equals(object other)
+        public override bool Equals(object? other)
         {
             if (!(other is Color))
                 return false;

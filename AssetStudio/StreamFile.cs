@@ -4,8 +4,8 @@ namespace AssetStudio
 {
     public class StreamFile
     {
-        public string path;
-        public string fileName;
-        public Stream stream;
+        public string path = string.Empty;
+        public string fileName = string.Empty;
+        public Stream stream = Stream.Null;
     }
 }

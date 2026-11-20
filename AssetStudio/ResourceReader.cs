@@ -20,12 +20,12 @@ namespace AssetStudio
         }
 
         private bool needSearch;
-        private string path;
-        private SerializedFile assetsFile;
+        private string path = string.Empty;
+        private SerializedFile? assetsFile;
         private long offset;
         private long size;
-        private BinaryReader reader;
-        private readonly byte[] rawData;
+        private BinaryReader? reader;
+        private readonly byte[]? rawData;
         private bool isEmbedded;
 
         public int Size { get => (int)size; }
@@ -77,22 +77,28 @@ namespace AssetStudio
                     return CloneIfFileReader(reader, out shouldDispose);
                 }
 
-                if (assetsFile.assetsManager.resourceFileReaders.TryGetValue(normalizedPath, out reader) && CanReadRange(reader))
+                if (assetsFile?.assetsManager != null
+                    && assetsFile.assetsManager.resourceFileReaders.TryGetValue(normalizedPath, out var cachedReader)
+                    && CanReadRange(cachedReader))
                 {
                     needSearch = false;
-                    return CloneIfFileReader(reader, out shouldDispose);
+                    reader = cachedReader;
+                    return CloneIfFileReader(cachedReader, out shouldDispose);
                 }
-                if (TryGetResourceReaderBySuffix(normalizedPath, out reader))
+                if (TryGetResourceReaderBySuffix(normalizedPath, out var suffixReader))
                 {
                     needSearch = false;
-                    return CloneIfFileReader(reader, out shouldDispose);
+                    reader = suffixReader;
+                    return CloneIfFileReader(suffixReader, out shouldDispose);
                 }
                 if (!HasDirectory(normalizedPath)
-                    && assetsFile.assetsManager.resourceFileReaders.TryGetValue(resourceFileName, out reader)
-                    && CanReadRange(reader))
+                    && assetsFile?.assetsManager != null
+                    && assetsFile.assetsManager.resourceFileReaders.TryGetValue(resourceFileName, out var fileNameReader)
+                    && CanReadRange(fileNameReader))
                 {
                     needSearch = false;
-                    return CloneIfFileReader(reader, out shouldDispose);
+                    reader = fileNameReader;
+                    return CloneIfFileReader(fileNameReader, out shouldDispose);
                 }
 
                 var resourceFilePath = ResolveResourceFilePath(resourceFileName, normalizedPath);
@@ -101,16 +107,19 @@ namespace AssetStudio
                     var resolvedKey = NormalizePath(Path.GetFullPath(resourceFilePath));
                     needSearch = false;
                     var fileReader = new FileReader(resourceFilePath);
-                    if (!HasDirectory(normalizedPath) && !assetsFile.assetsManager.resourceFileReaders.ContainsKey(resourceFileName))
+                    if (assetsFile?.assetsManager != null)
                     {
-                        assetsFile.assetsManager.RegisterResourceFileReader(fileReader, normalizedPath, resolvedKey, resourceFileName);
-                    }
-                    else
-                    {
-                        assetsFile.assetsManager.RegisterResourceFileReader(fileReader, normalizedPath, resolvedKey);
+                        if (!HasDirectory(normalizedPath) && !assetsFile.assetsManager.resourceFileReaders.ContainsKey(resourceFileName))
+                        {
+                            assetsFile.assetsManager.RegisterResourceFileReader(fileReader, normalizedPath, resolvedKey, resourceFileName);
+                        }
+                        else
+                        {
+                            assetsFile.assetsManager.RegisterResourceFileReader(fileReader, normalizedPath, resolvedKey);
+                        }
                     }
                     reader = fileReader;
-                    return CloneIfFileReader(reader, out shouldDispose);
+                    return CloneIfFileReader(fileReader, out shouldDispose);
                 }
                 throw new FileNotFoundException($"Can't find the resource file {path}");
             }
@@ -121,11 +130,15 @@ namespace AssetStudio
                     shouldDispose = true;
                     return assetsFile.reader.Clone();
                 }
+                if (reader == null)
+                {
+                    throw new InvalidOperationException("Resource reader is not initialized.");
+                }
                 return CloneIfFileReader(reader, out shouldDispose);
             }
         }
 
-        private bool TryGetResourceReaderBySuffix(string normalizedPath, out BinaryReader reader)
+        private bool TryGetResourceReaderBySuffix(string normalizedPath, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BinaryReader? reader)
         {
             reader = null;
             if (string.IsNullOrEmpty(normalizedPath) || assetsFile?.assetsManager == null)
@@ -133,7 +146,7 @@ namespace AssetStudio
                 return false;
             }
 
-            BinaryReader matchedReader = null;
+            BinaryReader? matchedReader = null;
             foreach (var pair in assetsFile.assetsManager.resourceFileReaders)
             {
                 var key = NormalizePath(pair.Key);
@@ -167,7 +180,7 @@ namespace AssetStudio
             return binaryReader;
         }
 
-        private string ResolveResourceFilePath(string resourceFileName, string normalizedPath)
+        private string? ResolveResourceFilePath(string resourceFileName, string normalizedPath)
         {
             var searchRoots = GetSearchRoots();
             if (searchRoots.Length == 0 || string.IsNullOrEmpty(normalizedPath))
@@ -272,8 +285,8 @@ namespace AssetStudio
             }
 
             // Fallback for renamed companion files (like level77 + level77.resS / level77.assets.resS)
-            var assetsFileDir = Path.GetDirectoryName(assetsFile.fullName);
-            if (hasValidFileName && !string.IsNullOrEmpty(assetsFileDir))
+            var assetsFileDir = assetsFile != null ? Path.GetDirectoryName(assetsFile.fullName) : null;
+            if (hasValidFileName && assetsFile != null && !string.IsNullOrEmpty(assetsFileDir))
             {
                 var assetsFileNameWithoutExt = Path.GetFileNameWithoutExtension(assetsFile.fullName);
                 var resourceExtension = Path.GetExtension(resourceFileName); // e.g. ".resS" or ".resource"
@@ -302,6 +315,11 @@ namespace AssetStudio
 
         private string[] GetSearchRoots()
         {
+            if (assetsFile == null)
+            {
+                return Array.Empty<string>();
+            }
+
             var candidates = new[]
             {
                 Path.GetDirectoryName(assetsFile.fullName),
@@ -313,10 +331,11 @@ namespace AssetStudio
                 .Where(x => !string.IsNullOrEmpty(x) && Directory.Exists(x))
                 .Select(x =>
                 {
-                    try { return Path.GetFullPath(x); }
+                    try { return Path.GetFullPath(x!); }
                     catch { return null; }
                 })
                 .Where(x => !string.IsNullOrEmpty(x))
+                .Select(x => x!)
                 .Distinct(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal)
                 .ToArray();
         }
@@ -362,11 +381,11 @@ namespace AssetStudio
             return value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
         }
 
-        private static string NormalizeResourcePath(string value)
+        private static string NormalizeResourcePath(string? value)
         {
             if (value == null)
             {
-                return null;
+                return string.Empty;
             }
 
             const string archivePrefix = "archive:/";
@@ -547,8 +566,8 @@ namespace AssetStudio
 
         public sealed class ReadSession : IDisposable
         {
-            private readonly byte[] rawData;
-            private BinaryReader binaryReader;
+            private readonly byte[]? rawData;
+            private BinaryReader? binaryReader;
             private readonly bool shouldDispose;
             private readonly long baseOffset;
             private readonly long size;
@@ -602,14 +621,15 @@ namespace AssetStudio
                     return count;
                 }
 
+                var reader = binaryReader ?? throw new ObjectDisposedException(nameof(ReadSession));
                 var targetPosition = baseOffset + segmentOffset;
-                var stream = binaryReader.BaseStream;
+                var stream = reader.BaseStream;
                 if (stream.Position != targetPosition)
                 {
                     stream.Position = targetPosition;
                 }
 
-                var read = ReadExact(binaryReader, buff, buffOffset, count);
+                var read = ReadExact(reader, buff, buffOffset, count);
                 if (read != count)
                 {
                     throw new EndOfStreamException($"Unable to read {count} bytes from resource {resourcePath} at segment offset {segmentOffset}. Read {read} bytes.");

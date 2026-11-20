@@ -78,15 +78,15 @@ namespace AssetStudio
     public class SpriteRenderData
     {
         public PPtr<Texture2D> texture;
-        public PPtr<Texture2D> alphaTexture;
-        public SecondarySpriteTexture[] secondaryTextures;
-        public SubMesh[] m_SubMeshes;
-        public byte[] m_IndexBuffer;
-        public VertexData m_VertexData;
-        public SpriteVertex[] vertices;
-        public ushort[] indices;
-        public Matrix4x4[] m_Bindpose;
-        public BoneWeights4[] m_SourceSkin;
+        public PPtr<Texture2D>? alphaTexture;
+        public SecondarySpriteTexture[]? secondaryTextures;
+        public SubMesh[]? m_SubMeshes;
+        public byte[]? m_IndexBuffer;
+        public VertexData? m_VertexData;
+        public SpriteVertex[]? vertices;
+        public ushort[]? indices;
+        public Matrix4x4[]? m_Bindpose;
+        public BoneWeights4[]? m_SourceSkin;
         public Rectf textureRect;
         public Vector2 textureRectOffset;
         public Vector2 atlasRectOffset;
@@ -206,10 +206,10 @@ namespace AssetStudio
         public uint m_Extrude;
         public bool m_IsPolygon;
         public KeyValuePair<Guid, long> m_RenderDataKey;
-        public string[] m_AtlasTags;
-        public PPtr<SpriteAtlas> m_SpriteAtlas;
+        public string[] m_AtlasTags = Array.Empty<string>();
+        public PPtr<SpriteAtlas>? m_SpriteAtlas;
         public SpriteRenderData m_RD;
-        public Vector2[][] m_PhysicsShape;
+        public Vector2[][] m_PhysicsShape = Array.Empty<Vector2[]>();
 
         public Sprite(ObjectReader reader) : base(reader)
         {
@@ -224,7 +224,7 @@ namespace AssetStudio
             if (version[0] > 5
                 || (version[0] == 5 && version[1] > 4)
                 || (version[0] == 5 && version[1] == 4 && version[2] >= 2)
-                || (version[0] == 5 && version[1] == 4 && version[2] == 1 && buildType.IsPatch && version[3] >= 3)) //5.4.1p3 and up
+                || (version[0] == 5 && version[1] == 4 && version[2] == 1 && buildType?.IsPatch == true && version[3] >= 3)) //5.4.1p3 and up
             {
                 m_Pivot = reader.ReadVector2();
             }

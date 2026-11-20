@@ -15,6 +15,6 @@ namespace AssetStudio
         public byte stripped;
 
         public long m_PathID;
-        public SerializedType serializedType;
+        public SerializedType? serializedType;
     }
 }

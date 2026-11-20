@@ -22,16 +22,16 @@ namespace AssetStudio
     {
         public PackedFloatVector m_Vertices;
         public PackedFloatVector m_UV;
-        public PackedFloatVector m_BindPoses;
+        public PackedFloatVector? m_BindPoses;
         public PackedFloatVector m_Normals;
         public PackedFloatVector m_Tangents;
         public PackedIntVector m_Weights;
         public PackedIntVector m_NormalSigns;
         public PackedIntVector m_TangentSigns;
-        public PackedFloatVector m_FloatColors;
+        public PackedFloatVector? m_FloatColors;
         public PackedIntVector m_BoneIndices;
         public PackedIntVector m_Triangles;
-        public PackedIntVector m_Colors;
+        public PackedIntVector? m_Colors;
         public uint m_UVInfo;
 
         public CompressedMesh(ObjectReader reader)
@@ -123,9 +123,9 @@ namespace AssetStudio
     {
         public uint m_CurrentChannels;
         public uint m_VertexCount;
-        public ChannelInfo[] m_Channels;
-        public StreamInfo[] m_Streams;
-        public byte[] m_DataSize;
+        public ChannelInfo[] m_Channels = Array.Empty<ChannelInfo>();
+        public StreamInfo[] m_Streams = Array.Empty<StreamInfo>();
+        public byte[] m_DataSize = Array.Empty<byte>();
 
         public VertexData(ObjectReader reader)
         {
@@ -183,7 +183,7 @@ namespace AssetStudio
 
         private void GetStreams(int[] version)
         {
-            var streamCount = m_Channels.Max(x => x.stream) + 1;
+            var streamCount = m_Channels.Length > 0 ? m_Channels.Max(x => x.stream) + 1 : 0;
             m_Streams = new StreamInfo[streamCount];
             uint offset = 0;
             for (int s = 0; s < streamCount; s++)
@@ -346,10 +346,10 @@ namespace AssetStudio
 
     public class BlendShapeData
     {
-        public BlendShapeVertex[] vertices;
-        public MeshBlendShape[] shapes;
-        public MeshBlendShapeChannel[] channels;
-        public float[] fullWeights;
+        public BlendShapeVertex[] vertices = Array.Empty<BlendShapeVertex>();
+        public MeshBlendShape[] shapes = Array.Empty<MeshBlendShape>();
+        public MeshBlendShapeChannel[] channels = Array.Empty<MeshBlendShapeChannel>();
+        public float[] fullWeights = Array.Empty<float>();
 
         public BlendShapeData(ObjectReader reader)
         {
@@ -423,7 +423,7 @@ namespace AssetStudio
         public uint baseVertex;
         public uint firstVertex;
         public uint vertexCount;
-        public AABB localAABB;
+        public AABB? localAABB;
 
         public SubMesh(ObjectReader reader)
         {
@@ -458,27 +458,27 @@ namespace AssetStudio
 
         private bool m_Use16BitIndices = true;
         public SubMesh[] m_SubMeshes;
-        private uint[] m_IndexBuffer;
-        public BlendShapeData m_Shapes;
-        public Matrix4x4[] m_BindPose;
-        public uint[] m_BoneNameHashes;
+        private uint[] m_IndexBuffer = Array.Empty<uint>();
+        public BlendShapeData? m_Shapes;
+        public Matrix4x4[]? m_BindPose;
+        public uint[] m_BoneNameHashes = Array.Empty<uint>();
         public int m_VertexCount;
-        public float[] m_Vertices;
-        public BoneWeights4[] m_Skin;
-        public float[] m_Normals;
-        public float[] m_Colors;
-        public float[] m_UV0;
-        public float[] m_UV1;
-        public float[] m_UV2;
-        public float[] m_UV3;
-        public float[] m_UV4;
-        public float[] m_UV5;
-        public float[] m_UV6;
-        public float[] m_UV7;
-        public float[] m_Tangents;
-        private VertexData m_VertexData;
-        private CompressedMesh m_CompressedMesh;
-        private StreamingInfo m_StreamData;
+        public float[]? m_Vertices;
+        public BoneWeights4[]? m_Skin;
+        public float[]? m_Normals;
+        public float[]? m_Colors;
+        public float[] m_UV0 = Array.Empty<float>();
+        public float[]? m_UV1;
+        public float[]? m_UV2;
+        public float[]? m_UV3;
+        public float[]? m_UV4;
+        public float[]? m_UV5;
+        public float[]? m_UV6;
+        public float[]? m_UV7;
+        public float[]? m_Tangents;
+        private VertexData? m_VertexData;
+        private CompressedMesh? m_CompressedMesh;
+        private StreamingInfo? m_StreamData;
         private bool m_DataProcessed;
         private readonly object m_ProcessLock = new object();
 
@@ -560,7 +560,7 @@ namespace AssetStudio
 
                 //Unity fixed it in 2017.3.1p1 and later versions
                 if ((version[0] > 2017 || (version[0] == 2017 && version[1] >= 4)) || //2017.4
-                    ((version[0] == 2017 && version[1] == 3 && version[2] == 1) && buildType.IsPatch) || //fixed after 2017.3.1px
+                    ((version[0] == 2017 && version[1] == 3 && version[2] == 1) && buildType?.IsPatch == true) || //fixed after 2017.3.1px
                     ((version[0] == 2017 && version[1] == 3) && m_MeshCompression == 0))//2017.3.xfx with no compression
                 {
                     var m_IndexFormat = reader.ReadInt32();
@@ -747,7 +747,7 @@ namespace AssetStudio
 
             if (!string.IsNullOrEmpty(m_StreamData?.path))
             {
-                if (m_VertexData.m_VertexCount > 0)
+                if (m_VertexData != null && m_VertexData.m_VertexCount > 0)
                 {
                     var resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size);
                     m_VertexData.m_DataSize = resourceReader.GetData();
@@ -768,6 +768,11 @@ namespace AssetStudio
 
         private void ReadVertexData()
         {
+            if (m_VertexData == null)
+            {
+                return;
+            }
+
             m_VertexCount = (int)m_VertexData.m_VertexCount;
 
             for (var chn = 0; chn < m_VertexData.m_Channels.Length; chn++)
@@ -805,8 +810,8 @@ namespace AssetStudio
                             }
                         }
 
-                        int[] componentsIntArray = null;
-                        float[] componentsFloatArray = null;
+                        int[]? componentsIntArray = null;
+                        float[]? componentsFloatArray = null;
                         if (MeshHelper.IsIntFormat(vertexFormat))
                             componentsIntArray = MeshHelper.BytesToIntArray(componentBytes, vertexFormat);
                         else
@@ -829,7 +834,7 @@ namespace AssetStudio
                                     m_Colors = componentsFloatArray;
                                     break;
                                 case 4: //kShaderChannelTexCoord0
-                                    m_UV0 = componentsFloatArray;
+                                    m_UV0 = componentsFloatArray ?? Array.Empty<float>();
                                     break;
                                 case 5: //kShaderChannelTexCoord1
                                     m_UV1 = componentsFloatArray;
@@ -854,6 +859,10 @@ namespace AssetStudio
                                     break;
                                 //2018.2 and up
                                 case 12: //kShaderChannelBlendWeight
+                                    if (componentsFloatArray == null)
+                                    {
+                                        break;
+                                    }
                                     if (m_Skin == null)
                                     {
                                         InitMSkin();
@@ -871,6 +880,10 @@ namespace AssetStudio
                                     }
                                     break;
                                 case 13: //kShaderChannelBlendIndices
+                                    if (componentsIntArray == null)
+                                    {
+                                        break;
+                                    }
                                     if (m_Skin == null)
                                     {
                                         InitMSkin();
@@ -902,7 +915,7 @@ namespace AssetStudio
                                     m_Colors = componentsFloatArray;
                                     break;
                                 case 3: //kShaderChannelTexCoord0
-                                    m_UV0 = componentsFloatArray;
+                                    m_UV0 = componentsFloatArray ?? Array.Empty<float>();
                                     break;
                                 case 4: //kShaderChannelTexCoord1
                                     m_UV1 = componentsFloatArray;
@@ -932,6 +945,11 @@ namespace AssetStudio
 
         private void DecompressCompressedMesh()
         {
+            if (m_CompressedMesh == null)
+            {
+                return;
+            }
+
             //Vertex
             if (m_CompressedMesh.m_Vertices.m_NumItems > 0)
             {
@@ -975,7 +993,7 @@ namespace AssetStudio
             //BindPose
             if (version[0] < 5)
             {
-                if (m_CompressedMesh.m_BindPoses.m_NumItems > 0)
+                if (m_CompressedMesh.m_BindPoses?.m_NumItems > 0)
                 {
                     m_BindPose = new Matrix4x4[m_CompressedMesh.m_BindPoses.m_NumItems / 16];
                     var m_BindPoses_Unpacked = m_CompressedMesh.m_BindPoses.UnpackFloats(16, 4 * 16);
@@ -1052,7 +1070,7 @@ namespace AssetStudio
             //FloatColor
             if (version[0] >= 5)
             {
-                if (m_CompressedMesh.m_FloatColors.m_NumItems > 0)
+                if (m_CompressedMesh.m_FloatColors?.m_NumItems > 0)
                 {
                     m_Colors = m_CompressedMesh.m_FloatColors.UnpackFloats(1, 4);
                 }
@@ -1195,6 +1213,7 @@ namespace AssetStudio
             }
         }
 
+        [System.Diagnostics.CodeAnalysis.MemberNotNull(nameof(m_Skin))]
         private void InitMSkin()
         {
             m_Skin = new BoneWeights4[m_VertexCount];
@@ -1237,7 +1256,7 @@ namespace AssetStudio
             }
         }
 
-        public float[] GetUV(int uv)
+        public float[]? GetUV(int uv)
         {
             EnsureProcessed();
             switch (uv)

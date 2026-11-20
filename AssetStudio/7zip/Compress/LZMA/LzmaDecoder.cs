@@ -96,7 +96,7 @@ namespace SevenZip.Compression.LZMA
 				}
 			}
 
-			Decoder2[] m_Coders;
+			Decoder2[] m_Coders = Array.Empty<Decoder2>();
 			int m_NumPrevBits;
 			int m_NumPosBits;
 			uint m_PosMask;
@@ -228,7 +228,7 @@ namespace SevenZip.Compression.LZMA
 		}
 
 		public void Code(System.IO.Stream inStream, System.IO.Stream outStream,
-			Int64 inSize, Int64 outSize, ICodeProgress progress)
+			Int64 inSize, Int64 outSize, ICodeProgress? progress)
 		{
 			Init(inStream, outStream);
 

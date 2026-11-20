@@ -8,7 +8,7 @@ namespace AssetStudio
         public PPtr<VideoClip> m_VideoClip;
         public int m_Target;
         public int m_Source;
-        public string m_Url;
+        public string m_Url = string.Empty;
 
         public VideoPlayer(ObjectReader reader) : base(reader)
         {
@@ -22,6 +22,7 @@ namespace AssetStudio
             catch (Exception ex) when (ex is EndOfStreamException || ex is InvalidDataException || ex is ArgumentOutOfRangeException)
             {
                 Logger.Warning($"VideoPlayer (PathID {m_PathID}): failed to read trailing fields ({ex.GetType().Name}: {ex.Message}).");
+                m_VideoClip ??= new PPtr<VideoClip>(0, 0, assetsFile);
                 m_Url ??= string.Empty;
             }
         }

@@ -9,7 +9,7 @@ namespace AssetStudio
     {
         public long offset; //ulong
         public uint size;
-        public string path;
+        public string path = string.Empty;
 
         public StreamingInfo() { }
 
@@ -78,7 +78,7 @@ namespace AssetStudio
         public int m_MipCount;
         public GLTextureSettings m_TextureSettings;
         public ResourceReader image_data;
-        public StreamingInfo m_StreamData;
+        public StreamingInfo? m_StreamData;
 
         public Texture2D(ObjectReader reader) : base(reader)
         {
@@ -212,6 +212,7 @@ namespace AssetStudio
             return (version[0] == 5 && version[1] >= 3) || version[0] > 5;
         }
 
+        [System.Diagnostics.CodeAnalysis.MemberNotNullWhen(true, nameof(m_TextureSettings), nameof(image_data))]
         private bool TryReadFromTypeTree()
         {
             if (serializedType?.m_Type == null)
@@ -255,7 +256,7 @@ namespace AssetStudio
                     };
                 }
 
-                ResourceReader resourceReader = null;
+                ResourceReader? resourceReader = null;
                 if (!string.IsNullOrEmpty(m_StreamData?.path) && m_StreamData.size > 0)
                 {
                     resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size);
@@ -294,7 +295,7 @@ namespace AssetStudio
             }
         }
 
-        private static GLTextureSettings ReadTextureSettings(OrderedDictionary obj)
+        private static GLTextureSettings ReadTextureSettings(OrderedDictionary? obj)
         {
             if (obj == null)
             {
@@ -310,12 +311,12 @@ namespace AssetStudio
             };
         }
 
-        private static OrderedDictionary GetObject(OrderedDictionary obj, string name)
+        private static OrderedDictionary? GetObject(OrderedDictionary obj, string name)
         {
             return obj.Contains(name) ? obj[name] as OrderedDictionary : null;
         }
 
-        private static byte[] GetByteArray(OrderedDictionary obj, string name)
+        private static byte[]? GetByteArray(OrderedDictionary obj, string name)
         {
             return obj.Contains(name) ? obj[name] as byte[] : null;
         }

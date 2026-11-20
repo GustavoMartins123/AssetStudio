@@ -5,14 +5,15 @@ namespace AssetStudio
 {
     public class Object
     {
+        [System.Diagnostics.CodeAnalysis.AllowNull]
         public SerializedFile assetsFile;
         public ObjectReader reader;
         public long m_PathID;
         public int[] version;
-        protected BuildType buildType;
+        protected BuildType? buildType;
         public BuildTarget platform;
         public ClassIDType type;
-        public SerializedType serializedType;
+        public SerializedType? serializedType;
         public uint byteSize;
 
         public Object(ObjectReader reader)
@@ -34,7 +35,7 @@ namespace AssetStudio
             }
         }
 
-        public virtual string Dump()
+        public virtual string? Dump()
         {
             if (serializedType?.m_Type != null)
             {
@@ -43,7 +44,7 @@ namespace AssetStudio
             return null;
         }
 
-        public string Dump(TypeTree m_Type)
+        public string? Dump(TypeTree? m_Type)
         {
             if (m_Type != null)
             {
@@ -52,7 +53,7 @@ namespace AssetStudio
             return null;
         }
 
-        public OrderedDictionary ToType()
+        public OrderedDictionary? ToType()
         {
             if (serializedType?.m_Type != null)
             {
@@ -61,7 +62,7 @@ namespace AssetStudio
             return null;
         }
 
-        public OrderedDictionary ToType(TypeTree m_Type)
+        public OrderedDictionary? ToType(TypeTree? m_Type)
         {
             if (m_Type != null)
             {

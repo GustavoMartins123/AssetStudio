@@ -9,9 +9,9 @@ namespace AssetStudio
     {
         public Guid guid;
         public int type; //enum { kNonAssetType = 0, kDeprecatedCachedAssetType = 1, kSerializedAssetType = 2, kMetaAssetType = 3 };
-        public string pathName;
+        public string pathName = string.Empty;
 
         //custom
-        public string fileName;
+        public string fileName = string.Empty;
     }
 }

@@ -10,7 +10,12 @@ namespace AssetStudio
         public Vector2 m_Scale;
         public Vector2 m_Offset;
 
-        public UnityTexEnv() { }
+        public UnityTexEnv(PPtr<Texture> texture, Vector2 scale, Vector2 offset)
+        {
+            m_Texture = texture;
+            m_Scale = scale;
+            m_Offset = offset;
+        }
 
         public UnityTexEnv(ObjectReader reader)
         {
@@ -22,10 +27,10 @@ namespace AssetStudio
 
     public class UnityPropertySheet
     {
-        public KeyValuePair<string, UnityTexEnv>[] m_TexEnvs;
-        public KeyValuePair<string, int>[] m_Ints;
-        public KeyValuePair<string, float>[] m_Floats;
-        public KeyValuePair<string, Color>[] m_Colors;
+        public KeyValuePair<string, UnityTexEnv>[] m_TexEnvs = System.Array.Empty<KeyValuePair<string, UnityTexEnv>>();
+        public KeyValuePair<string, int>[] m_Ints = System.Array.Empty<KeyValuePair<string, int>>();
+        public KeyValuePair<string, float>[] m_Floats = System.Array.Empty<KeyValuePair<string, float>>();
+        public KeyValuePair<string, Color>[] m_Colors = System.Array.Empty<KeyValuePair<string, Color>>();
 
         public UnityPropertySheet() { }
 
@@ -146,6 +151,7 @@ namespace AssetStudio
             //vector m_BuildTextureStacks 2020 and up
         }
 
+        [System.Diagnostics.CodeAnalysis.MemberNotNullWhen(true, nameof(m_Shader), nameof(m_Parent), nameof(m_SavedProperties))]
         private bool TryReadFromTypeTree(ObjectReader reader)
         {
             if (serializedType?.m_Type == null)
@@ -196,12 +202,10 @@ namespace AssetStudio
 
                 result.Add(new KeyValuePair<string, UnityTexEnv>(
                     item.Key as string ?? string.Empty,
-                    new UnityTexEnv
-                    {
-                        m_Texture = ReadPPtr<Texture>(GetObject(value, "m_Texture"), assetsFile),
-                        m_Scale = ReadVector2(GetObject(value, "m_Scale")),
-                        m_Offset = ReadVector2(GetObject(value, "m_Offset"))
-                    }));
+                    new UnityTexEnv(
+                        ReadPPtr<Texture>(GetObject(value, "m_Texture"), assetsFile),
+                        ReadVector2(GetObject(value, "m_Scale")),
+                        ReadVector2(GetObject(value, "m_Offset")))));
             }
             return result.ToArray();
         }
@@ -248,7 +252,7 @@ namespace AssetStudio
             return result.ToArray();
         }
 
-        private static PPtr<T> ReadPPtr<T>(OrderedDictionary obj, SerializedFile assetsFile) where T : Object
+        private static PPtr<T> ReadPPtr<T>(OrderedDictionary? obj, SerializedFile assetsFile) where T : Object
         {
             if (obj == null)
             {
@@ -257,17 +261,17 @@ namespace AssetStudio
             return new PPtr<T>(ReadInt32(obj, "m_FileID"), ReadInt64(obj, "m_PathID"), assetsFile);
         }
 
-        private static Vector2 ReadVector2(OrderedDictionary obj)
+        private static Vector2 ReadVector2(OrderedDictionary? obj)
         {
             return obj == null ? Vector2.Zero : new Vector2(ReadSingle(obj, "x"), ReadSingle(obj, "y"));
         }
 
-        private static Color ReadColor(OrderedDictionary obj)
+        private static Color ReadColor(OrderedDictionary? obj)
         {
             return obj == null ? new Color() : new Color(ReadSingle(obj, "r"), ReadSingle(obj, "g"), ReadSingle(obj, "b"), ReadSingle(obj, "a"));
         }
 
-        private static OrderedDictionary GetObject(OrderedDictionary obj, string name)
+        private static OrderedDictionary? GetObject(OrderedDictionary? obj, string name)
         {
             return obj != null && obj.Contains(name) ? obj[name] as OrderedDictionary : null;
         }

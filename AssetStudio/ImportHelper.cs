@@ -26,7 +26,7 @@ namespace AssetStudio
 
         public static void ClearMergedSplitFallbackPaths() => MergedSplitFallbackPaths.Clear();
 
-        public static bool TryGetMergedSplitFallbackPath(string destFull, out string fallbackPath)
+        public static bool TryGetMergedSplitFallbackPath(string destFull, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? fallbackPath)
         {
             fallbackPath = null;
             if (string.IsNullOrWhiteSpace(destFull))
@@ -115,7 +115,7 @@ namespace AssetStudio
             }
         }
 
-        private static bool TryCollectOrderedSplitParts(string destPath, string destFile, string destFull, out List<string> orderedParts)
+        private static bool TryCollectOrderedSplitParts(string destPath, string destFile, string destFull, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out List<string>? orderedParts)
         {
             orderedParts = null;
             string[] candidates;

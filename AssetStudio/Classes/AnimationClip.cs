@@ -5,7 +5,7 @@ using System.Linq;
 
 namespace AssetStudio
 {
-    public class Keyframe<T>
+    public class Keyframe<T> where T : struct
     {
         public float time;
         public T value;
@@ -31,7 +31,7 @@ namespace AssetStudio
         }
     }
 
-    public class AnimationCurve<T>
+    public class AnimationCurve<T> where T : struct
     {
         public Keyframe<T>[] m_Curve;
         public int m_PreInfinity;
@@ -105,7 +105,7 @@ namespace AssetStudio
         public uint m_NumItems;
         public float m_Range;
         public float m_Start;
-        public byte[] m_Data;
+        public byte[] m_Data = Array.Empty<byte>();
         public byte m_BitSize;
 
         public PackedFloatVector() { }
@@ -225,7 +225,7 @@ namespace AssetStudio
     public class PackedIntVector
     {
         public uint m_NumItems;
-        public byte[] m_Data;
+        public byte[] m_Data = Array.Empty<byte>();
         public byte m_BitSize;
 
         public PackedIntVector() { }
@@ -289,7 +289,7 @@ namespace AssetStudio
     public class PackedQuatVector
     {
         public uint m_NumItems;
-        public byte[] m_Data;
+        public byte[] m_Data = Array.Empty<byte>();
 
         public PackedQuatVector() { }
 
@@ -416,7 +416,11 @@ namespace AssetStudio
         public float time;
         public PPtr<Object> value;
 
-        public PPtrKeyframe() { }
+        public PPtrKeyframe(float time, PPtr<Object> value)
+        {
+            this.time = time;
+            this.value = value;
+        }
 
         public PPtrKeyframe(ObjectReader reader)
         {
@@ -427,11 +431,11 @@ namespace AssetStudio
 
     public class PPtrCurve
     {
-        public PPtrKeyframe[] curve;
-        public string attribute;
-        public string path;
+        public PPtrKeyframe[] curve = Array.Empty<PPtrKeyframe>();
+        public string attribute = string.Empty;
+        public string path = string.Empty;
         public int classID;
-        public PPtr<MonoScript> script;
+        public PPtr<MonoScript>? script;
 
         public PPtrCurve() { }
 
@@ -530,7 +534,7 @@ namespace AssetStudio
         public HandPose m_LeftHandPose;
         public HandPose m_RightHandPose;
         public float[] m_DoFArray;
-        public Vector3[] m_TDoFArray;
+        public Vector3[] m_TDoFArray = Array.Empty<Vector3>();
 
         public HumanPose(ObjectReader reader)
         {
@@ -732,8 +736,8 @@ namespace AssetStudio
     {
         public StreamedClip m_StreamedClip;
         public DenseClip m_DenseClip;
-        public ConstantClip m_ConstantClip;
-        public ValueArrayConstant m_Binding;
+        public ConstantClip? m_ConstantClip;
+        public ValueArrayConstant? m_Binding;
 
         public Clip(ObjectReader reader)
         {
@@ -755,39 +759,42 @@ namespace AssetStudio
             var bindings = new AnimationClipBindingConstant();
             var genericBindings = new List<GenericBinding>();
             var values = m_Binding;
-            for (int i = 0; i < values.m_ValueArray.Length;)
+            if (values != null)
             {
-                var curveID = values.m_ValueArray[i].m_ID;
-                var curveTypeID = values.m_ValueArray[i].m_TypeID;
-                var binding = new GenericBinding();
-                genericBindings.Add(binding);
-                if (curveTypeID == 4174552735) //CRC(PositionX))
+                for (int i = 0; i < values.m_ValueArray.Length;)
                 {
-                    binding.path = curveID;
-                    binding.attribute = 1; //kBindTransformPosition
-                    binding.typeID = ClassIDType.Transform;
-                    i += 3;
-                }
-                else if (curveTypeID == 2211994246) //CRC(QuaternionX))
-                {
-                    binding.path = curveID;
-                    binding.attribute = 2; //kBindTransformRotation
-                    binding.typeID = ClassIDType.Transform;
-                    i += 4;
-                }
-                else if (curveTypeID == 1512518241) //CRC(ScaleX))
-                {
-                    binding.path = curveID;
-                    binding.attribute = 3; //kBindTransformScale
-                    binding.typeID = ClassIDType.Transform;
-                    i += 3;
-                }
-                else
-                {
-                    binding.typeID = ClassIDType.Animator;
-                    binding.path = 0;
-                    binding.attribute = curveID;
-                    i++;
+                    var curveID = values.m_ValueArray[i].m_ID;
+                    var curveTypeID = values.m_ValueArray[i].m_TypeID;
+                    var binding = new GenericBinding();
+                    genericBindings.Add(binding);
+                    if (curveTypeID == 4174552735) //CRC(PositionX))
+                    {
+                        binding.path = curveID;
+                        binding.attribute = 1; //kBindTransformPosition
+                        binding.typeID = ClassIDType.Transform;
+                        i += 3;
+                    }
+                    else if (curveTypeID == 2211994246) //CRC(QuaternionX))
+                    {
+                        binding.path = curveID;
+                        binding.attribute = 2; //kBindTransformRotation
+                        binding.typeID = ClassIDType.Transform;
+                        i += 4;
+                    }
+                    else if (curveTypeID == 1512518241) //CRC(ScaleX))
+                    {
+                        binding.path = curveID;
+                        binding.attribute = 3; //kBindTransformScale
+                        binding.typeID = ClassIDType.Transform;
+                        i += 3;
+                    }
+                    else
+                    {
+                        binding.typeID = ClassIDType.Animator;
+                        binding.path = 0;
+                        binding.attribute = curveID;
+                        i++;
+                    }
                 }
             }
             bindings.genericBindings = genericBindings.ToArray();
@@ -811,11 +818,11 @@ namespace AssetStudio
     {
         public HumanPose m_DeltaPose;
         public XForm m_StartX;
-        public XForm m_StopX;
+        public XForm? m_StopX;
         public XForm m_LeftFootStartX;
         public XForm m_RightFootStartX;
-        public XForm m_MotionStartX;
-        public XForm m_MotionStopX;
+        public XForm? m_MotionStartX;
+        public XForm? m_MotionStopX;
         public Vector3 m_AverageSpeed;
         public Clip m_Clip;
         public float m_StartTime;
@@ -826,7 +833,7 @@ namespace AssetStudio
         public float m_AverageAngularSpeed;
         public int[] m_IndexArray;
         public ValueDelta[] m_ValueArrayDelta;
-        public float[] m_ValueArrayReferencePose;
+        public float[] m_ValueArrayReferencePose = Array.Empty<float>();
         public bool m_Mirror;
         public bool m_LoopTime;
         public bool m_LoopBlend;
@@ -906,7 +913,7 @@ namespace AssetStudio
     {
         public uint path;
         public uint attribute;
-        public PPtr<Object> script;
+        public PPtr<Object>? script;
         public ClassIDType typeID;
         public byte customType;
         public byte isPPtrCurve;
@@ -940,8 +947,8 @@ namespace AssetStudio
 
     public class AnimationClipBindingConstant
     {
-        public GenericBinding[] genericBindings;
-        public PPtr<Object>[] pptrCurveMapping;
+        public GenericBinding[] genericBindings = Array.Empty<GenericBinding>();
+        public PPtr<Object>[] pptrCurveMapping = Array.Empty<PPtr<Object>>();
 
         public AnimationClipBindingConstant() { }
 
@@ -964,7 +971,7 @@ namespace AssetStudio
             }
         }
 
-        public GenericBinding FindBinding(int index)
+        public GenericBinding? FindBinding(int index)
         {
             int curves = 0;
             foreach (var b in genericBindings)
@@ -1042,17 +1049,17 @@ namespace AssetStudio
         public bool m_UseHighQualityCurve;
         public QuaternionCurve[] m_RotationCurves;
         public CompressedAnimationCurve[] m_CompressedRotationCurves;
-        public Vector3Curve[] m_EulerCurves;
+        public Vector3Curve[] m_EulerCurves = Array.Empty<Vector3Curve>();
         public Vector3Curve[] m_PositionCurves;
         public Vector3Curve[] m_ScaleCurves;
         public FloatCurve[] m_FloatCurves;
-        public PPtrCurve[] m_PPtrCurves;
+        public PPtrCurve[] m_PPtrCurves = Array.Empty<PPtrCurve>();
         public float m_SampleRate;
         public int m_WrapMode;
-        public AABB m_Bounds;
+        public AABB? m_Bounds;
         public uint m_MuscleClipSize;
-        public ClipMuscleConstant m_MuscleClip;
-        public AnimationClipBindingConstant m_ClipBindingConstant;
+        public ClipMuscleConstant? m_MuscleClip;
+        public AnimationClipBindingConstant? m_ClipBindingConstant;
         public AnimationEvent[] m_Events;
 
 
@@ -1217,11 +1224,7 @@ namespace AssetStudio
                     if (m_ClipBindingConstant.pptrCurveMapping != null && pptrIndex >= 0 && pptrIndex < m_ClipBindingConstant.pptrCurveMapping.Length)
                     {
                         var pptr = m_ClipBindingConstant.pptrCurveMapping[pptrIndex];
-                        var kf = new PPtrKeyframe
-                        {
-                            time = time < 0f ? 0f : time,
-                            value = pptr
-                        };
+                        var kf = new PPtrKeyframe(time < 0f ? 0f : time, pptr);
                         list.Add(kf);
                     }
                     curveIndex++;

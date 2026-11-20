@@ -7,8 +7,8 @@ namespace AssetStudio
 {
     public class TypeTreeNode
     {
-        public string m_Type;
-        public string m_Name;
+        public string m_Type = string.Empty;
+        public string m_Name = string.Empty;
         public int m_ByteSize;
         public int m_Index;
         public int m_TypeFlags; //m_IsArray

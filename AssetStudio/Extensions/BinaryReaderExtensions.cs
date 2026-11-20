@@ -45,7 +45,7 @@ namespace AssetStudio
 
             const int StackBufferSize = 256;
             Span<byte> stackBuffer = stackalloc byte[StackBufferSize];
-            byte[] pooled = null;
+            byte[]? pooled = null;
             int count = 0;
 
             try

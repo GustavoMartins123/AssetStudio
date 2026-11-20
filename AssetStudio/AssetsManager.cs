@@ -66,20 +66,18 @@ namespace AssetStudio
         private static long lastGCCollectTime = 0;
 
         public static bool DisableMemoryPressureCheck = false;
-        public static Func<string, int, int, MemoryPressureResult> MemoryPressureCallback;
-        public static Func<bool> ShouldYieldForUserInteraction;
-        public Func<string, bool> ShouldKeepFileCallback;
+        public static Func<string, int, int, MemoryPressureResult>? MemoryPressureCallback;
+        public static Func<bool>? ShouldYieldForUserInteraction;
+        public Func<string, bool>? ShouldKeepFileCallback;
         public static volatile bool ShouldStopLoading = false;
 
-        public string SpecifyUnityVersion;
-        public string ProjectRoot;
+        public string SpecifyUnityVersion = string.Empty;
+        public string? ProjectRoot;
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
         public ConcurrentBag<Stream> bundleStreams = new ConcurrentBag<Stream>();
         public ProjectIndex ProjectIndex = new ProjectIndex();
         public bool LazyLoading = false;
-#nullable enable
         public DecompressedBundleCache? DecompressionCache { get; set; }
-#nullable restore
 
         private readonly object unityVersionInferenceLock = new object();
         private string inferredUnityVersion = "";
@@ -119,7 +117,7 @@ namespace AssetStudio
             return value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
         }
 
-        private static string BuildSafeContainerPath(string baseDirectory, string entryPath)
+        private static string BuildSafeContainerPath(string? baseDirectory, string? entryPath)
         {
             var baseDir = baseDirectory ?? string.Empty;
             var safeSegments = (entryPath ?? string.Empty)
@@ -134,7 +132,7 @@ namespace AssetStudio
             return Path.Combine(baseDir, Path.Combine(safeSegments));
         }
 
-        private static bool IsPathWithinDirectory(string candidatePath, string directoryPath)
+        private static bool IsPathWithinDirectory(string? candidatePath, string? directoryPath)
         {
             if (string.IsNullOrEmpty(candidatePath) || string.IsNullOrEmpty(directoryPath))
             {
@@ -158,7 +156,7 @@ namespace AssetStudio
             }
         }
 
-        internal void RegisterResourceFileReader(BinaryReader reader, params string[] keys)
+        internal void RegisterResourceFileReader(BinaryReader? reader, params string?[] keys)
         {
             if (reader == null)
             {
@@ -201,12 +199,12 @@ namespace AssetStudio
             resourceFileReaders.Clear();
         }
 
-        private System.Threading.ManualResetEventSlim GetAssetsFileLoadEvent(string fileName)
+        private System.Threading.ManualResetEventSlim GetAssetsFileLoadEvent(string? fileName)
         {
             return assetsFileLoadEvents.GetOrAdd(fileName ?? string.Empty, _ => new System.Threading.ManualResetEventSlim(false));
         }
 
-        public bool WaitForAssetsFileLoaded(string fileName, int timeoutMilliseconds)
+        public bool WaitForAssetsFileLoaded(string? fileName, int timeoutMilliseconds)
         {
             if (string.IsNullOrEmpty(fileName))
             {
@@ -226,15 +224,15 @@ namespace AssetStudio
             return false;
         }
 
-        public bool TryFindSerializedFile(string serializedFileName, string originalPath, out SerializedFile result)
+        public bool TryFindSerializedFile(string? serializedFileName, string? originalPath, out SerializedFile result)
         {
             lock (loadLock)
             {
-                result = null;
+                result = null!;
                 if (!string.IsNullOrEmpty(originalPath))
                 {
                     result = assetsFileList.FirstOrDefault(file => IsSameAssetSource(file.originalPath, originalPath)
-                        || IsSameAssetSource(file.fullName, originalPath));
+                        || IsSameAssetSource(file.fullName, originalPath))!;
                     if (result != null)
                     {
                         return true;
@@ -244,14 +242,14 @@ namespace AssetStudio
                 if (string.IsNullOrEmpty(originalPath) && !string.IsNullOrEmpty(serializedFileName))
                 {
                     result = assetsFileList.FirstOrDefault(file =>
-                        string.Equals(file.fileName, serializedFileName, StringComparison.OrdinalIgnoreCase));
+                        string.Equals(file.fileName, serializedFileName, StringComparison.OrdinalIgnoreCase))!;
                 }
             }
 
             return result != null;
         }
 
-        private static bool IsSameAssetSource(string left, string right)
+        private static bool IsSameAssetSource(string? left, string? right)
         {
             if (string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right))
             {
@@ -268,22 +266,22 @@ namespace AssetStudio
             }
         }
 
-        public void LoadFiles(params string[] files)
+        public void LoadFiles(params string?[] files)
         {
             LoadFilesAsync(files).GetAwaiter().GetResult();
         }
 
-        public async System.Threading.Tasks.Task LoadFilesAsync(params string[] files)
+        public async System.Threading.Tasks.Task LoadFilesAsync(params string?[] files)
         {
             await LoadFilesAsync(false, files);
         }
 
-        public void LoadFilesForPreview(params string[] files)
+        public void LoadFilesForPreview(params string?[] files)
         {
             LoadFilesAsync(true, files).GetAwaiter().GetResult();
         }
 
-        private async System.Threading.Tasks.Task LoadFilesAsync(bool highPriority, params string[] files)
+        private async System.Threading.Tasks.Task LoadFilesAsync(bool highPriority, params string?[] files)
         {
             DisableMemoryPressureCheck = false;
             ShouldStopLoading = false;
@@ -291,21 +289,26 @@ namespace AssetStudio
             {
                 return;
             }
-            var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));
+            var nonEmptyFiles = files.Where(f => !string.IsNullOrWhiteSpace(f)).Select(f => f!).ToArray();
+            if (nonEmptyFiles.Length == 0)
+            {
+                return;
+            }
+            var path = Path.GetDirectoryName(Path.GetFullPath(nonEmptyFiles[0]));
             if (string.IsNullOrEmpty(ProjectRoot))
             {
                 ProjectRoot = path;
             }
             var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-            foreach (var dir in files
-                .Where(f => !string.IsNullOrWhiteSpace(f))
+            foreach (var dir in nonEmptyFiles
                 .Select(f => Path.GetDirectoryName(Path.GetFullPath(f)))
                 .Where(d => !string.IsNullOrEmpty(d))
+                .Select(d => d!)
                 .Distinct(dirComparer))
             {
                 MergeSplitAssets(dir);
             }
-            var toReadFile = ProcessingSplitFiles(files);
+            var toReadFile = ProcessingSplitFiles(nonEmptyFiles);
             await LoadAsync(toReadFile, highPriority);
         }
 
@@ -389,8 +392,7 @@ namespace AssetStudio
                             break;
                         }
 
-                        string file = null;
-                        if (context.Queue.TryDequeue(out file))
+                        if (context.Queue.TryDequeue(out var file))
                         {
                             ThrowIfMemoryPressureTooHigh("loading files");
 
@@ -581,7 +583,7 @@ namespace AssetStudio
             }
         }
 
-        private void LoadAssetsFromMemory(FileReader reader, LoadContext context, string originalPath, string unityVersion = null)
+        private void LoadAssetsFromMemory(FileReader reader, LoadContext context, string? originalPath, string? unityVersion = null)
         {
             var eventHandle = GetAssetsFileLoadEvent(reader.FileName);
             bool alreadyLoaded = !assetsFileListHash.TryAdd(reader.FileName, 0);
@@ -626,10 +628,10 @@ namespace AssetStudio
             }
         }
 
-        private void LoadBundleFile(FileReader reader, LoadContext context, string originalPath = null)
+        private void LoadBundleFile(FileReader reader, LoadContext context, string? originalPath = null)
         {
             Logger.Info("Loading " + reader.FullPath);
-            BundleFile bundleFile = null;
+            BundleFile? bundleFile = null;
             int handedOffCount = 0;
             try
             {
@@ -690,7 +692,7 @@ namespace AssetStudio
         private void LoadWebFile(FileReader reader, LoadContext context)
         {
             Logger.Info("Loading " + reader.FullPath);
-            WebFile webFile = null;
+            WebFile? webFile = null;
             int handedOffCount = 0;
             try
             {
@@ -770,7 +772,7 @@ namespace AssetStudio
                         if (entry.Name.Contains(".split"))
                         {
                             string baseName = Path.GetFileNameWithoutExtension(entry.Name);
-                            string basePath = Path.Combine(Path.GetDirectoryName(entry.FullName), baseName);
+                            string basePath = Path.Combine(Path.GetDirectoryName(entry.FullName) ?? string.Empty, baseName);
                             if (!splitFiles.Contains(basePath))
                             {
                                 splitFiles.Add(basePath);
@@ -786,7 +788,7 @@ namespace AssetStudio
                     // merge split files and load the result
                     foreach (string basePath in splitFiles)
                     {
-                        Stream splitStream = null;
+                        Stream? splitStream = null;
                         try
                         {
                             var safeSplitPath = BuildSafeContainerPath(readerDir, basePath);
@@ -795,7 +797,7 @@ namespace AssetStudio
                             while (true)
                             {
                                 string path = $"{basePath}.split{i++}";
-                                ZipArchiveEntry entry = archive.GetEntry(path);
+                                ZipArchiveEntry? entry = archive.GetEntry(path);
                                 if (entry == null)
                                     break;
                                 totalSize += entry.Length;
@@ -823,7 +825,7 @@ namespace AssetStudio
                                 while (true)
                                 {
                                     string path = $"{basePath}.split{i++}";
-                                    ZipArchiveEntry entry = archive.GetEntry(path);
+                                    ZipArchiveEntry? entry = archive.GetEntry(path);
                                     if (entry == null)
                                         break;
                                     using (Stream entryStream = entry.Open())
@@ -880,7 +882,7 @@ namespace AssetStudio
                         {
                             continue;
                         }
-                        Stream streamReader = null;
+                        Stream? streamReader = null;
                         try
                         {
                             string dummyPath = BuildSafeContainerPath(zipEntryBaseDir, entry.FullName);
@@ -975,7 +977,7 @@ namespace AssetStudio
 
                     try
                     {
-                        directory = Directory.GetParent(directory)?.FullName;
+                        directory = Directory.GetParent(directory)?.FullName ?? string.Empty;
                     }
                     catch
                     {
@@ -1322,7 +1324,7 @@ namespace AssetStudio
             }
         }
 
-        public Object ResolveHandle(AssetHandle handle)
+        public Object? ResolveHandle(AssetHandle? handle)
         {
             if (handle == null) return null;
             if (handle.RealObject != null)
@@ -1479,7 +1481,7 @@ namespace AssetStudio
                             }
                             else
                             {
-                                var localObjects = new Object[assetsFile.m_Objects.Count];
+                                var localObjects = new Object?[assetsFile.m_Objects.Count];
                                 using var localReader = assetsFile.reader.Clone();
 
                                 for (int objectIndex = 0; objectIndex < assetsFile.m_Objects.Count; objectIndex++)
@@ -1521,7 +1523,7 @@ namespace AssetStudio
                                         ByteSize = objectInfo.byteSize
                                     };
 
-                                    string name = null;
+                                    string? name = null;
                                     if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
                                     {
                                         try
@@ -1577,7 +1579,7 @@ namespace AssetStudio
 
             foreach (var assetsFile in ClaimUnprocessedFiles(filesForRead))
             {
-                var localObjects = new Object[assetsFile.m_Objects.Count];
+                var localObjects = new Object?[assetsFile.m_Objects.Count];
 
                 var parallelOptions = new System.Threading.Tasks.ParallelOptions
                 {
@@ -1924,12 +1926,12 @@ namespace AssetStudio
                 MaxDegreeOfParallelism = GetConfiguredThreadCount("ASSETSTUDIO_PROCESS_THREADS", DefaultReadThreadRatio)
             };
 
-            var spriteAtlasEntries = new List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>>[assetsFileList.Count];
+            var spriteAtlasEntries = new List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>>?[assetsFileList.Count];
 
             System.Threading.Tasks.Parallel.For(0, assetsFileList.Count, processOptions, fileIndex =>
             {
                 var assetsFile = assetsFileList[fileIndex];
-                List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>> entries = null;
+                List<KeyValuePair<KeyValuePair<Guid, long>, SpriteAtlas>>? entries = null;
                 foreach (var obj in assetsFile.Objects)
                 {
                     if (obj is SpriteAtlas m_SpriteAtlas && m_SpriteAtlas.m_RenderDataMap != null)
@@ -2005,7 +2007,12 @@ namespace AssetStudio
                         {
                             if (m_PackedSprite.TryGet(out var m_Sprite))
                             {
-                                if (m_Sprite.m_SpriteAtlas.IsNull)
+                                if (m_Sprite.m_SpriteAtlas == null)
+                                {
+                                    m_Sprite.m_SpriteAtlas = new PPtr<SpriteAtlas>(0, 0, m_Sprite.assetsFile);
+                                    m_Sprite.m_SpriteAtlas.Set(m_SpriteAtlas);
+                                }
+                                else if (m_Sprite.m_SpriteAtlas.IsNull)
                                 {
                                     m_Sprite.m_SpriteAtlas.Set(m_SpriteAtlas);
                                 }
@@ -2022,10 +2029,11 @@ namespace AssetStudio
                     }
                     else if (obj is Sprite m_Sprite)
                     {
-                        if (m_Sprite.m_SpriteAtlas.IsNull && m_Sprite.m_RenderDataKey.Key != Guid.Empty)
+                        if ((m_Sprite.m_SpriteAtlas == null || m_Sprite.m_SpriteAtlas.IsNull) && m_Sprite.m_RenderDataKey.Key != Guid.Empty)
                         {
                             if (spriteAtlasCache.TryGetValue(m_Sprite.m_RenderDataKey, out var atlas))
                             {
+                                m_Sprite.m_SpriteAtlas ??= new PPtr<SpriteAtlas>(0, 0, m_Sprite.assetsFile);
                                 m_Sprite.m_SpriteAtlas.Set(atlas);
                             }
                         }
@@ -2177,7 +2185,7 @@ namespace AssetStudio
 
             private sealed class EvictionSuspension : IDisposable
             {
-                private AssetLruCache cache;
+                private AssetLruCache? cache;
 
                 public EvictionSuspension(AssetLruCache cache)
                 {

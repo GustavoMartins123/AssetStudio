@@ -27,7 +27,7 @@ namespace AssetStudio
             }
         }
 
-        public AssetHandle GetHandle(string uniqueID)
+        public AssetHandle? GetHandle(string? uniqueID)
         {
             if (string.IsNullOrEmpty(uniqueID)) return null;
             _handles.TryGetValue(uniqueID, out var handle);

@@ -10,7 +10,7 @@ namespace AssetStudio
         public string FullPath;
         public string FileName;
         public FileType FileType;
-        private byte[] cachedMemoryBuffer;
+        private byte[]? cachedMemoryBuffer;
         private readonly object cachedMemoryBufferLock = new object();
 
         private static readonly byte[] gzipMagic = { 0x1f, 0x8b };
@@ -21,14 +21,14 @@ namespace AssetStudio
 
         public FileReader(string path) : this(path, File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { }
 
-        public FileReader(string path, Stream stream) : base(DecryptionHelper.CheckAndDecryptStream(stream, path), EndianType.BigEndian)
+        public FileReader(string path, Stream stream) : base(DecryptionHelper.CheckAndDecryptStream(stream, path) ?? stream, EndianType.BigEndian)
         {
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
             FileType = CheckFileType();
         }
 
-        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[] cachedMemoryBuffer) : base(stream, endian)
+        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[]? cachedMemoryBuffer) : base(stream, endian)
         {
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
@@ -256,7 +256,7 @@ namespace AssetStudio
         private sealed class PooledReadOnlyMemoryStream : Stream
         {
             private static readonly ConcurrentBag<PooledReadOnlyMemoryStream> Pool = new ConcurrentBag<PooledReadOnlyMemoryStream>();
-            private byte[] buffer;
+            private byte[] buffer = Array.Empty<byte>();
             private int origin;
             private int length;
             private int position;
@@ -371,7 +371,7 @@ namespace AssetStudio
             {
                 if (disposing && isOpen)
                 {
-                    buffer = null;
+                    buffer = Array.Empty<byte>();
                     origin = 0;
                     length = 0;
                     position = 0;

@@ -117,7 +117,7 @@ namespace AssetStudio
             return GetColumn(0).GetHashCode() ^ (GetColumn(1).GetHashCode() << 2) ^ (GetColumn(2).GetHashCode() >> 2) ^ (GetColumn(3).GetHashCode() >> 1);
         }
 
-        public override bool Equals(object other)
+        public override bool Equals(object? other)
         {
             if (!(other is Matrix4x4))
                 return false;

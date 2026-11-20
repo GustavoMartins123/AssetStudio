@@ -24,9 +24,9 @@ namespace AssetStudio
             assetsFile = reader.assetsFile;
         }
 
-        public bool TryGetAssetsFile(out SerializedFile result)
+        public bool TryGetAssetsFile([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out SerializedFile result)
         {
-            result = null;
+            result = null!;
             if (m_FileID == 0)
             {
                 result = assetsFile;
@@ -64,7 +64,7 @@ namespace AssetStudio
             return false;
         }
 
-        public bool TryGet(out T result)
+        public bool TryGet([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out T result)
         {
             if (TryGetAssetsFile(out var sourceFile))
             {
@@ -75,11 +75,11 @@ namespace AssetStudio
             if (TryGetObjectFromLoadedFiles(out result))
                 return true;
 
-            result = null;
+            result = null!;
             return false;
         }
 
-        public bool TryGet<T2>(out T2 result) where T2 : Object
+        public bool TryGet<T2>([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out T2 result) where T2 : Object
         {
             if (TryGetAssetsFile(out var sourceFile))
             {
@@ -90,7 +90,7 @@ namespace AssetStudio
             if (TryGetObjectFromLoadedFiles(out result))
                 return true;
 
-            result = null;
+            result = null!;
             return false;
         }
 
@@ -99,7 +99,7 @@ namespace AssetStudio
             index = -2;
         }
 
-        private bool TryGetObject<TObject>(SerializedFile sourceFile, out TObject result) where TObject : Object
+        private bool TryGetObject<TObject>(SerializedFile sourceFile, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out TObject result) where TObject : Object
         {
             // SerializedFile.TryGetObject synchronizes on the file's internal objectCollectionLock,
             // the same lock used by AddObject/RemoveObject (lazy materialization / LRU eviction).
@@ -110,7 +110,7 @@ namespace AssetStudio
             }
 
             var handle = sourceFile.assetsManager?.ProjectIndex?.GetHandle(AssetHandle.BuildUniqueID(sourceFile, m_PathID));
-            if (handle != null)
+            if (handle != null && sourceFile.assetsManager != null)
             {
                 var obj = sourceFile.assetsManager.ResolveHandle(handle);
                 if (obj is TObject variable)
@@ -120,13 +120,13 @@ namespace AssetStudio
                 }
             }
 
-            result = null;
+            result = null!;
             return false;
         }
 
-        private bool TryGetObjectFromLoadedFiles<TObject>(out TObject result) where TObject : Object
+        private bool TryGetObjectFromLoadedFiles<TObject>([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out TObject result) where TObject : Object
         {
-            result = null;
+            result = null!;
             if (m_FileID <= 0)
             {
                 return false;
@@ -147,7 +147,7 @@ namespace AssetStudio
                     continue;
                 }
 
-                if (TryGetObject(sourceFile, out TObject variable))
+                if (TryGetObject<TObject>(sourceFile, out var variable))
                 {
                     matches.Add(variable);
                     matchFiles.Add(sourceFile);
@@ -165,7 +165,7 @@ namespace AssetStudio
                 return true;
             }
 
-            TObject bestMatch = null;
+            TObject? bestMatch = null;
             int bestScore = -1;
 
             var refFile = assetsFile;

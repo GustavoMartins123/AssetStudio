@@ -210,11 +210,11 @@ namespace AssetStudio
         public string m_Name;
         public SerializedShaderRTBlendState[] rtBlend;
         public bool rtSeparateBlend;
-        public SerializedShaderFloatValue zClip;
+        public SerializedShaderFloatValue? zClip;
         public SerializedShaderFloatValue zTest;
         public SerializedShaderFloatValue zWrite;
         public SerializedShaderFloatValue culling;
-        public SerializedShaderFloatValue conservative;
+        public SerializedShaderFloatValue? conservative;
         public SerializedShaderFloatValue offsetFactor;
         public SerializedShaderFloatValue offsetUnits;
         public SerializedShaderFloatValue alphaToMask;
@@ -396,7 +396,7 @@ namespace AssetStudio
         public int m_NameIndex;
         public MatrixParameter[] m_MatrixParams;
         public VectorParameter[] m_VectorParams;
-        public StructParameter[] m_StructParams;
+        public StructParameter[] m_StructParams = Array.Empty<StructParameter>();
         public int m_Size;
         public bool m_IsPartialCB;
 
@@ -579,18 +579,18 @@ namespace AssetStudio
     {
         public uint m_BlobIndex;
         public ParserBindChannels m_Channels;
-        public ushort[] m_KeywordIndices;
+        public ushort[] m_KeywordIndices = Array.Empty<ushort>();
         public sbyte m_ShaderHardwareTier;
         public ShaderGpuProgramType m_GpuProgramType;
-        public SerializedProgramParameters m_Parameters;
-        public VectorParameter[] m_VectorParams;
-        public MatrixParameter[] m_MatrixParams;
-        public TextureParameter[] m_TextureParams;
-        public BufferBinding[] m_BufferParams;
-        public ConstantBuffer[] m_ConstantBuffers;
-        public BufferBinding[] m_ConstantBufferBindings;
-        public UAVParameter[] m_UAVParams;
-        public SamplerParameter[] m_Samplers;
+        public SerializedProgramParameters? m_Parameters;
+        public VectorParameter[] m_VectorParams = Array.Empty<VectorParameter>();
+        public MatrixParameter[] m_MatrixParams = Array.Empty<MatrixParameter>();
+        public TextureParameter[] m_TextureParams = Array.Empty<TextureParameter>();
+        public BufferBinding[] m_BufferParams = Array.Empty<BufferBinding>();
+        public ConstantBuffer[] m_ConstantBuffers = Array.Empty<ConstantBuffer>();
+        public BufferBinding[] m_ConstantBufferBindings = Array.Empty<BufferBinding>();
+        public UAVParameter[] m_UAVParams = Array.Empty<UAVParameter>();
+        public SamplerParameter[] m_Samplers = Array.Empty<SamplerParameter>();
 
         public SerializedSubProgram(ObjectReader reader)
         {
@@ -714,8 +714,8 @@ namespace AssetStudio
     public class SerializedProgram
     {
         public SerializedSubProgram[] m_SubPrograms;
-        public SerializedProgramParameters m_CommonParameters;
-        public ushort[] m_SerializedKeywordStateMask;
+        public SerializedProgramParameters? m_CommonParameters;
+        public ushort[] m_SerializedKeywordStateMask = Array.Empty<ushort>();
 
         public SerializedProgram(ObjectReader reader)
         {
@@ -755,10 +755,10 @@ namespace AssetStudio
 
     public class SerializedPass
     {
-        public Hash128[] m_EditorDataHash;
-        public byte[] m_Platforms;
-        public ushort[] m_LocalKeywordMask;
-        public ushort[] m_GlobalKeywordMask;
+        public Hash128[] m_EditorDataHash = Array.Empty<Hash128>();
+        public byte[] m_Platforms = Array.Empty<byte>();
+        public ushort[] m_LocalKeywordMask = Array.Empty<ushort>();
+        public ushort[] m_GlobalKeywordMask = Array.Empty<ushort>();
         public KeyValuePair<string, int>[] m_NameIndices;
         public PassType m_Type;
         public SerializedShaderState m_State;
@@ -768,14 +768,14 @@ namespace AssetStudio
         public SerializedProgram progGeometry;
         public SerializedProgram progHull;
         public SerializedProgram progDomain;
-        public SerializedProgram progRayTracing;
+        public SerializedProgram? progRayTracing;
         public bool m_HasInstancingVariant;
         public string m_UseName;
         public string m_Name;
         public string m_TextureName;
         public SerializedTagMap m_Tags;
-        public ushort[] m_SerializedKeywordStateMask;
-        public SerializedPackageRequirements m_PackageRequirements;
+        public ushort[] m_SerializedKeywordStateMask = Array.Empty<ushort>();
+        public SerializedPackageRequirements? m_PackageRequirements;
 
         public SerializedPass(ObjectReader reader)
         {
@@ -909,13 +909,13 @@ namespace AssetStudio
     {
         public SerializedProperties m_PropInfo;
         public SerializedSubShader[] m_SubShaders;
-        public string[] m_KeywordNames;
-        public byte[] m_KeywordFlags;
+        public string[] m_KeywordNames = Array.Empty<string>();
+        public byte[] m_KeywordFlags = Array.Empty<byte>();
         public string m_Name;
         public string m_CustomEditorName;
         public string m_FallbackName;
         public SerializedShaderDependency[] m_Dependencies;
-        public SerializedCustomEditorForRenderPipeline[] m_CustomEditorForRenderPipelines;
+        public SerializedCustomEditorForRenderPipeline[] m_CustomEditorForRenderPipelines = Array.Empty<SerializedCustomEditorForRenderPipeline>();
         public bool m_DisableNoSubshadersMessage;
 
         public SerializedShader(ObjectReader reader)
@@ -999,17 +999,17 @@ namespace AssetStudio
 
     public class Shader : NamedObject
     {
-        public byte[] m_Script;
+        public byte[]? m_Script;
         //5.3 - 5.4
         public uint decompressedSize;
-        public byte[] m_SubProgramBlob;
+        public byte[]? m_SubProgramBlob;
         //5.5 and up
-        public SerializedShader m_ParsedForm;
-        public ShaderCompilerPlatform[] platforms;
-        public uint[][] offsets;
-        public uint[][] compressedLengths;
-        public uint[][] decompressedLengths;
-        public byte[] compressedBlob;
+        public SerializedShader? m_ParsedForm;
+        public ShaderCompilerPlatform[] platforms = Array.Empty<ShaderCompilerPlatform>();
+        public uint[][] offsets = Array.Empty<uint[]>();
+        public uint[][] compressedLengths = Array.Empty<uint[]>();
+        public uint[][] decompressedLengths = Array.Empty<uint[]>();
+        public byte[] compressedBlob = Array.Empty<byte>();
 
         public Shader(ObjectReader reader) : base(reader)
         {

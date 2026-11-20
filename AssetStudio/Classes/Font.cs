@@ -7,7 +7,7 @@ namespace AssetStudio
 {
     public sealed class Font : NamedObject
     {
-        public byte[] m_FontData;
+        public byte[]? m_FontData;
 
         public Font(ObjectReader reader) : base(reader)
         {

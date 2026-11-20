@@ -31,7 +31,7 @@ namespace AssetStudio
             var level = m_Node.m_Level;
             var varTypeStr = m_Node.m_Type;
             var varNameStr = m_Node.m_Name;
-            object value = null;
+            object? value = null;
             var append = true;
             var align = (m_Node.m_MetaFlag & 0x4000) != 0;
             switch (varTypeStr)

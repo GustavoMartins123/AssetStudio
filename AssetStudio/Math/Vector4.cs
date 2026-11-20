@@ -59,7 +59,7 @@ namespace AssetStudio
             return X.GetHashCode() ^ (Y.GetHashCode() << 2) ^ (Z.GetHashCode() >> 2) ^ (W.GetHashCode() >> 1);
         }
 
-        public override bool Equals(object other)
+        public override bool Equals(object? other)
         {
             if (!(other is Vector4))
                 return false;

@@ -12,7 +12,7 @@ namespace AssetStudio
         {
             public int dataOffset;
             public int dataLength;
-            public string path;
+            public string path = string.Empty;
         }
 
         public WebFile(EndianBinaryReader reader)

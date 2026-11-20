@@ -19,13 +19,13 @@ namespace AssetStudio
 
     public sealed class ScannedFileInfo
     {
-        public string Path { get; internal set; }
+        public string Path { get; internal set; } = string.Empty;
         public long Size { get; internal set; }
         public ProjectFileKind Kind { get; internal set; }
-        public string BundleSignature { get; internal set; }
+        public string? BundleSignature { get; internal set; }
         public uint BundleVersion { get; internal set; }
-        public string BundleUnityVersion { get; internal set; }
-        public string AddressablesGroup { get; internal set; }
+        public string? BundleUnityVersion { get; internal set; }
+        public string? AddressablesGroup { get; internal set; }
     }
 
     public struct ScanProgress
@@ -39,7 +39,7 @@ namespace AssetStudio
 
     public sealed class ProjectScanResult
     {
-        public string RootPath { get; internal set; }
+        public string RootPath { get; internal set; } = string.Empty;
         public int TotalFiles { get; internal set; }
         public long TotalBytes { get; internal set; }
         public int UnityBundleCount { get; internal set; }
@@ -89,7 +89,7 @@ namespace AssetStudio
         public static ProjectScanResult ScanFolder(
             string path,
             CancellationToken cancellationToken = default,
-            IProgress<ScanProgress> progress = null)
+            IProgress<ScanProgress>? progress = null)
         {
             var result = new ProjectScanResult
             {
@@ -128,9 +128,9 @@ namespace AssetStudio
                 bool isError = false;
                 long length = 0;
                 ProjectFileKind kind = ProjectFileKind.Other;
-                string bundleSig = null;
+                string? bundleSig = null;
                 uint bundleVer = 0;
-                string bundleUnityVer = null;
+                string? bundleUnityVer = null;
 
                 try
                 {
@@ -279,9 +279,9 @@ namespace AssetStudio
         private struct FileDetectionResult
         {
             public ProjectFileKind Kind;
-            public string BundleSignature;
+            public string? BundleSignature;
             public uint BundleVersion;
-            public string BundleUnityVersion;
+            public string? BundleUnityVersion;
         }
 
         private static FileDetectionResult DetectFileKindExtended(string path, long fileSize)
@@ -301,7 +301,7 @@ namespace AssetStudio
                     read = stream.Read(header, 0, headerSize);
                 }
 
-                string detectedSignature = null;
+                string? detectedSignature = null;
                 if (StartsWithAscii(header, read, "UnityFS"))
                     detectedSignature = "UnityFS";
                 else if (StartsWithAscii(header, read, "UnityWeb"))
@@ -352,7 +352,7 @@ namespace AssetStudio
 
         #region Addressables group inference
 
-        private static string InferAddressablesGroup(string filePath)
+        private static string? InferAddressablesGroup(string filePath)
         {
             if (!AddressablesPlatformSegment.IsMatch(filePath))
                 return null;
@@ -402,7 +402,7 @@ namespace AssetStudio
             return true;
         }
 
-        private static string ReadNullTerminatedAscii(byte[] bytes, int length, int offset)
+        private static string? ReadNullTerminatedAscii(byte[] bytes, int length, int offset)
         {
             if (offset >= length)
                 return null;

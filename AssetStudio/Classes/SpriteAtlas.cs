@@ -13,7 +13,7 @@ namespace AssetStudio
         public Vector4 uvTransform;
         public float downscaleMultiplier;
         public SpriteSettings settingsRaw;
-        public SecondarySpriteTexture[] secondaryTextures;
+        public SecondarySpriteTexture[] secondaryTextures = Array.Empty<SecondarySpriteTexture>();
 
         public SpriteAtlasData(ObjectReader reader)
         {

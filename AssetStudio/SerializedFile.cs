@@ -16,7 +16,7 @@ namespace AssetStudio
         public string fileName;
         public bool IsProcessed = false;
         public int[] version = { 0, 0, 0, 0 };
-        public BuildType buildType;
+        public BuildType? buildType;
         public List<Object> Objects;
         public Dictionary<long, Object> ObjectsDic;
         public Dictionary<long, ObjectInfo> ObjectInfoDic;
@@ -30,10 +30,10 @@ namespace AssetStudio
         public List<SerializedType> m_Types;
         public int bigIDEnabled = 0;
         public List<ObjectInfo> m_Objects;
-        private List<LocalSerializedObjectIdentifier> m_ScriptTypes;
+        private List<LocalSerializedObjectIdentifier>? m_ScriptTypes;
         public List<FileIdentifier> m_Externals;
-        public List<SerializedType> m_RefTypes;
-        public string userInformation;
+        public List<SerializedType>? m_RefTypes;
+        public string? userInformation;
 
         public SerializedFile(FileReader reader, AssetsManager assetsManager)
         {
@@ -241,7 +241,7 @@ namespace AssetStudio
             //reader.AlignStream(16);
         }
 
-        public void SetVersion(string stringVersion)
+        public void SetVersion(string? stringVersion)
         {
             if (stringVersion != null && stringVersion != strippedVersion)
             {
@@ -436,7 +436,7 @@ namespace AssetStudio
             }
         }
 
-        public bool TryGetObject(long pathID, out Object obj)
+        public bool TryGetObject(long pathID, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out Object obj)
         {
             lock (objectCollectionLock)
             {

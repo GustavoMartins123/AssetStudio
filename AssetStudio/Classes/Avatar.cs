@@ -166,11 +166,11 @@ namespace AssetStudio
         public SkeletonPose m_SkeletonPose;
         public Hand m_LeftHand;
         public Hand m_RightHand;
-        public Handle[] m_Handles;
-        public Collider[] m_ColliderArray;
+        public Handle[]? m_Handles;
+        public Collider[]? m_ColliderArray;
         public int[] m_HumanBoneIndex;
         public float[] m_HumanBoneMass;
-        public int[] m_ColliderIndex;
+        public int[]? m_ColliderIndex;
         public float m_Scale;
         public float m_ArmTwist;
         public float m_ForeArmTwist;
@@ -242,16 +242,16 @@ namespace AssetStudio
     {
         public Skeleton m_AvatarSkeleton;
         public SkeletonPose m_AvatarSkeletonPose;
-        public SkeletonPose m_DefaultPose;
-        public uint[] m_SkeletonNameIDArray;
+        public SkeletonPose? m_DefaultPose;
+        public uint[]? m_SkeletonNameIDArray;
         public Human m_Human;
         public int[] m_HumanSkeletonIndexArray;
-        public int[] m_HumanSkeletonReverseIndexArray;
+        public int[]? m_HumanSkeletonReverseIndexArray;
         public int m_RootMotionBoneIndex;
         public XForm m_RootMotionBoneX;
-        public Skeleton m_RootMotionSkeleton;
-        public SkeletonPose m_RootMotionSkeletonPose;
-        public int[] m_RootMotionSkeletonIndexArray;
+        public Skeleton? m_RootMotionSkeleton;
+        public SkeletonPose? m_RootMotionSkeletonPose;
+        public int[]? m_RootMotionSkeletonIndexArray;
 
         public AvatarConstant(ObjectReader reader)
         {

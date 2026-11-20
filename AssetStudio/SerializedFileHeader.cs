@@ -12,6 +12,6 @@ namespace AssetStudio
         public SerializedFileFormatVersion m_Version;
         public long m_DataOffset;
         public byte m_Endianess;
-        public byte[] m_Reserved;
+        public byte[] m_Reserved = Array.Empty<byte>();
     }
 }

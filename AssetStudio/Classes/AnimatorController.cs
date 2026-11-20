@@ -241,10 +241,10 @@ namespace AssetStudio
         public uint m_BlendEventID;
         public uint m_BlendEventYID;
         public uint[] m_ChildIndices;
-        public float[] m_ChildThresholdArray;
-        public Blend1dDataConstant m_Blend1dData;
-        public Blend2dDataConstant m_Blend2dData;
-        public BlendDirectDataConstant m_BlendDirectData;
+        public float[]? m_ChildThresholdArray;
+        public Blend1dDataConstant? m_Blend1dData;
+        public Blend2dDataConstant? m_Blend2dData;
+        public BlendDirectDataConstant? m_BlendDirectData;
         public uint m_ClipID;
         public uint m_ClipIndex;
         public float m_Duration;
@@ -303,7 +303,7 @@ namespace AssetStudio
     public class BlendTreeConstant
     {
         public BlendTreeNodeConstant[] m_NodeArray;
-        public ValueArrayConstant m_BlendEventArrayConstant;
+        public ValueArrayConstant? m_BlendEventArrayConstant;
 
         public BlendTreeConstant(ObjectReader reader)
         {
@@ -329,7 +329,7 @@ namespace AssetStudio
     {
         public TransitionConstant[] m_TransitionConstantArray;
         public int[] m_BlendTreeConstantIndexArray;
-        public LeafInfoConstant[] m_LeafInfoArray;
+        public LeafInfoConstant[]? m_LeafInfoArray;
         public BlendTreeConstant[] m_BlendTreeConstantArray;
         public uint m_NameID;
         public uint m_PathID;
@@ -467,7 +467,7 @@ namespace AssetStudio
     {
         public StateConstant[] m_StateConstantArray;
         public TransitionConstant[] m_AnyStateTransitionConstantArray;
-        public SelectorStateConstant[] m_SelectorStateConstantArray;
+        public SelectorStateConstant[]? m_SelectorStateConstantArray;
         public uint m_DefaultState;
         public uint m_MotionSetCount;
 
@@ -509,13 +509,13 @@ namespace AssetStudio
 
     public class ValueArray
     {
-        public bool[] m_BoolValues;
-        public int[] m_IntValues;
-        public float[] m_FloatValues;
-        public Vector4[] m_VectorValues;
-        public Vector3[] m_PositionValues;
-        public Vector4[] m_QuaternionValues;
-        public Vector3[] m_ScaleValues;
+        public bool[] m_BoolValues = Array.Empty<bool>();
+        public int[] m_IntValues = Array.Empty<int>();
+        public float[] m_FloatValues = Array.Empty<float>();
+        public Vector4[] m_VectorValues = Array.Empty<Vector4>();
+        public Vector3[] m_PositionValues = Array.Empty<Vector3>();
+        public Vector4[] m_QuaternionValues = Array.Empty<Vector4>();
+        public Vector3[] m_ScaleValues = Array.Empty<Vector3>();
 
         public ValueArray(ObjectReader reader)
         {
