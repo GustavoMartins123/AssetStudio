@@ -18,7 +18,7 @@ namespace AssetStudio
                 var audioData = m_AudioClip.m_AudioData.GetData();
                 if (audioData != null && audioData.Length > 0)
                 {
-                    return UnityAudioDecoder.ConvertToWav(audioData);
+                    return UnityAudioDecoder.ConvertToWav(audioData, m_AudioClip.m_SubsoundIndex);
                 }
             }
             return null;
@@ -98,7 +98,8 @@ namespace AssetStudio
                 }
                 else
                 {
-                    return m_AudioClip.m_CompressionFormat == AudioCompressionFormat.ADPCM
+                    return m_AudioClip.m_CompressionFormat == AudioCompressionFormat.PCM
+                        || m_AudioClip.m_CompressionFormat == AudioCompressionFormat.ADPCM
                         || m_AudioClip.m_CompressionFormat == AudioCompressionFormat.GCADPCM;
                 }
             }

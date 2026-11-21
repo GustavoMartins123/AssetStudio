@@ -1,5 +1,6 @@
 using SkiaSharp;
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -43,20 +44,29 @@ namespace AssetStudio
             {
                 if (m_SpriteAtlas.m_RenderDataMap.TryGetValue(m_Sprite.m_RenderDataKey, out var spriteAtlasData) && spriteAtlasData.texture.TryGet(out var m_Texture2D))
                 {
-                    return CutImage(m_Sprite, m_Texture2D, spriteAtlasData.textureRect, spriteAtlasData.textureRectOffset, spriteAtlasData.downscaleMultiplier, spriteAtlasData.settingsRaw);
+                    Texture2D? alphaTexture = null;
+                    spriteAtlasData.alphaTexture?.TryGet(out alphaTexture);
+                    return CutImageCore(m_Sprite, m_Texture2D, alphaTexture, spriteAtlasData.textureRect, spriteAtlasData.textureRectOffset, spriteAtlasData.downscaleMultiplier, spriteAtlasData.settingsRaw);
                 }
             }
             else
             {
                 if (m_Sprite.m_RD.texture.TryGet(out var m_Texture2D))
                 {
-                    return CutImage(m_Sprite, m_Texture2D, m_Sprite.m_RD.textureRect, m_Sprite.m_RD.textureRectOffset, m_Sprite.m_RD.downscaleMultiplier, m_Sprite.m_RD.settingsRaw);
+                    Texture2D? alphaTexture = null;
+                    m_Sprite.m_RD.alphaTexture?.TryGet(out alphaTexture);
+                    return CutImageCore(m_Sprite, m_Texture2D, alphaTexture, m_Sprite.m_RD.textureRect, m_Sprite.m_RD.textureRectOffset, m_Sprite.m_RD.downscaleMultiplier, m_Sprite.m_RD.settingsRaw);
                 }
             }
             return null;
         }
 
         private static SKBitmap? CutImage(Sprite m_Sprite, Texture2D m_Texture2D, Rectf textureRect, Vector2 textureRectOffset, float downscaleMultiplier, SpriteSettings settingsRaw)
+        {
+            return CutImageCore(m_Sprite, m_Texture2D, null, textureRect, textureRectOffset, downscaleMultiplier, settingsRaw);
+        }
+
+        private static SKBitmap? CutImageCore(Sprite m_Sprite, Texture2D m_Texture2D, Texture2D? alphaTexture, Rectf textureRect, Vector2 textureRectOffset, float downscaleMultiplier, SpriteSettings settingsRaw)
         {
             if (m_Texture2D == null)
             {
@@ -77,6 +87,8 @@ namespace AssetStudio
 
             SKBitmap? spriteImage;
             SKRectI rect;
+            int atlasWidth;
+            int atlasHeight;
             using (var atlasLease = AcquireAtlasLease(m_Texture2D, targetWidth, targetHeight))
             {
                 if (atlasLease.Entry == null)
@@ -84,6 +96,8 @@ namespace AssetStudio
                     return null;
                 }
 
+                atlasWidth = atlasLease.Entry.Image.Width;
+                atlasHeight = atlasLease.Entry.Image.Height;
                 spriteImage = CropSpriteRegion(atlasLease.Entry, textureRect, out rect);
                 if (spriteImage == null)
                 {
@@ -93,6 +107,11 @@ namespace AssetStudio
 
             try
             {
+                if (alphaTexture != null && !ReferenceEquals(alphaTexture, m_Texture2D))
+                {
+                    ApplyAlphaTexture(spriteImage, alphaTexture, atlasWidth, atlasHeight, rect);
+                }
+
                 if (settingsRaw.packed == 1)
                 {
                     //RotateAndFlip
@@ -122,7 +141,9 @@ namespace AssetStudio
                 {
                     try
                     {
-                        var triangles = GetTriangles(m_Sprite.m_RD);
+                        var triangles = GetTriangles(m_Sprite.m_RD, m_Sprite.version);
+                        if (triangles.Length > 0)
+                        {
                         int maskWidth = spriteImage.Width;
                         int maskHeight = spriteImage.Height;
                         float scale = m_Sprite.m_PixelsToUnits;
@@ -182,6 +203,7 @@ namespace AssetStudio
                         }
                         GC.KeepAlive(mask);
                         GC.KeepAlive(spriteImage);
+                        }
 
                         spriteImage.FlipVerticalInPlace();
                         return spriteImage;
@@ -661,55 +683,164 @@ namespace AssetStudio
             }
         }
 
-        private static Vector2[][] GetTriangles(SpriteRenderData m_RD)
+        private static void ApplyAlphaTexture(SKBitmap spriteImage, Texture2D alphaTexture, int atlasWidth, int atlasHeight, SKRectI rect)
+        {
+            using var alphaLease = AcquireAtlasLease(alphaTexture, atlasWidth, atlasHeight);
+            if (alphaLease.Entry == null)
+            {
+                return;
+            }
+
+            int alphaChannelIndex = alphaTexture.m_TextureFormat == TextureFormat.Alpha8 ? 3 : 2;
+            lock (alphaLease.Entry.SyncRoot)
+            {
+                var alphaImage = alphaLease.Entry.Image;
+                if (rect.Left < 0 || rect.Top < 0 || rect.Right > alphaImage.Width || rect.Bottom > alphaImage.Height)
+                {
+                    return;
+                }
+
+                int copyWidth = Math.Min(spriteImage.Width, rect.Width);
+                int copyHeight = Math.Min(spriteImage.Height, rect.Height);
+                var alphaPixels = alphaImage.GetPixelSpan();
+                var dstPixels = spriteImage.GetWritablePixelSpan();
+                int alphaRowBytes = alphaImage.RowBytes;
+                int dstRowBytes = spriteImage.RowBytes;
+                int alphaXBytes = rect.Left * 4;
+
+                for (int y = 0; y < copyHeight; y++)
+                {
+                    var alphaRow = alphaPixels.Slice((rect.Top + y) * alphaRowBytes + alphaXBytes, copyWidth * 4);
+                    var dstRow = dstPixels.Slice(y * dstRowBytes, copyWidth * 4);
+                    for (int x = 0; x < copyWidth; x++)
+                    {
+                        int offset = x * 4;
+                        dstRow[offset + 3] = alphaRow[offset + alphaChannelIndex];
+                    }
+                }
+
+                GC.KeepAlive(alphaImage);
+                GC.KeepAlive(spriteImage);
+            }
+        }
+
+        public static Vector2[][] GetTriangles(SpriteRenderData m_RD, int[]? version = null)
         {
             if (m_RD.vertices != null && m_RD.indices != null) //5.6 down
             {
                 var vertices = m_RD.vertices.Select(x => (Vector2)x.pos).ToArray();
                 var triangleCount = m_RD.indices.Length / 3;
-                var triangles = new Vector2[triangleCount][];
+                var triangles = new List<Vector2[]>(triangleCount);
                 for (int i = 0; i < triangleCount; i++)
                 {
                     var first = m_RD.indices[i * 3];
                     var second = m_RD.indices[i * 3 + 1];
                     var third = m_RD.indices[i * 3 + 2];
-                    var triangle = new[] { vertices[first], vertices[second], vertices[third] };
-                    triangles[i] = triangle;
+                    if (first < vertices.Length && second < vertices.Length && third < vertices.Length)
+                    {
+                        triangles.Add(new[] { vertices[first], vertices[second], vertices[third] });
+                    }
                 }
-                return triangles;
+                return triangles.ToArray();
             }
             else if (m_RD.m_VertexData != null && m_RD.m_IndexBuffer != null && m_RD.m_SubMeshes != null) //5.6 and up
             {
-                var triangles = new List<Vector2[]>();
                 var m_VertexData = m_RD.m_VertexData;
-                var m_Channel = m_VertexData.m_Channels[0]; //kShaderChannelVertex
-                var m_Stream = m_VertexData.m_Streams[m_Channel.stream];
-                using (var vertexReader = new BinaryReader(new MemoryStream(m_VertexData.m_DataSize)))
+                if (m_VertexData.m_Channels == null || m_VertexData.m_Channels.Length == 0
+                    || m_VertexData.m_Streams == null || m_VertexData.m_DataSize == null)
                 {
-                    using (var indexReader = new BinaryReader(new MemoryStream(m_RD.m_IndexBuffer)))
+                    return Array.Empty<Vector2[]>();
+                }
+
+                var m_Channel = m_VertexData.m_Channels[0]; //kShaderChannelVertex
+                if (m_Channel.dimension == 0 || m_Channel.stream >= m_VertexData.m_Streams.Length)
+                {
+                    return Array.Empty<Vector2[]>();
+                }
+
+                var m_Stream = m_VertexData.m_Streams[m_Channel.stream];
+                var vertexFormat = ResolveVertexFormat(m_Channel.format, version);
+                int componentSize = (int)MeshHelper.GetFormatSize(vertexFormat);
+                uint stride = m_Stream.stride;
+                if (stride == 0)
+                {
+                    stride = ComputeFallbackStreamStride(m_VertexData.m_Channels, m_Channel.stream, version);
+                    if (stride == 0)
                     {
-                        foreach (var subMesh in m_RD.m_SubMeshes)
+                        stride = (uint)(componentSize * Math.Max(2, (int)m_Channel.dimension));
+                    }
+                }
+
+                long totalIndexCount = 0;
+                foreach (var sm in m_RD.m_SubMeshes)
+                {
+                    totalIndexCount += sm.indexCount;
+                }
+
+                bool use32BitIndices = m_VertexData.m_VertexCount > ushort.MaxValue
+                    || (totalIndexCount > 0
+                        && m_RD.m_IndexBuffer.Length >= totalIndexCount * 4L
+                        && m_RD.m_SubMeshes.All(sm => (long)sm.firstByte + (long)sm.indexCount * 4L <= m_RD.m_IndexBuffer.Length));
+                int indexSize = use32BitIndices ? 4 : 2;
+
+                var triangles = new List<Vector2[]>();
+                ReadOnlySpan<byte> vertexBytes = m_VertexData.m_DataSize;
+                ReadOnlySpan<byte> indexBytes = m_RD.m_IndexBuffer;
+
+                foreach (var subMesh in m_RD.m_SubMeshes)
+                {
+                    if (subMesh.vertexCount == 0 || subMesh.indexCount < 3)
+                    {
+                        continue;
+                    }
+
+                    var vertices = new Vector2[subMesh.vertexCount];
+                    for (uint v = 0; v < subMesh.vertexCount; v++)
+                    {
+                        long posOffset = m_Stream.offset + ((long)subMesh.firstVertex + v) * stride + m_Channel.offset;
+                        if (posOffset < 0 || posOffset + componentSize * 2L > vertexBytes.Length)
                         {
-                            vertexReader.BaseStream.Position = m_Stream.offset + subMesh.firstVertex * m_Stream.stride + m_Channel.offset;
+                            break;
+                        }
 
-                            var vertices = new Vector2[subMesh.vertexCount];
-                            for (int v = 0; v < subMesh.vertexCount; v++)
-                            {
-                                vertices[v] = vertexReader.ReadVector3();
-                                vertexReader.BaseStream.Position += m_Stream.stride - 12;
-                            }
+                        var elemSpan = vertexBytes.Slice((int)posOffset);
+                        float x = ReadVertexComponent(elemSpan, 0, vertexFormat);
+                        float y = ReadVertexComponent(elemSpan, componentSize, vertexFormat);
+                        vertices[v] = new Vector2(x, y);
+                    }
 
-                            indexReader.BaseStream.Position = subMesh.firstByte;
+                    var triangleCount = subMesh.indexCount / 3u;
+                    for (uint i = 0; i < triangleCount; i++)
+                    {
+                        long idxOffset = (long)subMesh.firstByte + (long)i * 3L * indexSize;
+                        if (idxOffset < 0 || idxOffset + 3L * indexSize > indexBytes.Length)
+                        {
+                            break;
+                        }
 
-                            var triangleCount = subMesh.indexCount / 3u;
-                            for (int i = 0; i < triangleCount; i++)
-                            {
-                                var first = indexReader.ReadUInt16() - subMesh.firstVertex;
-                                var second = indexReader.ReadUInt16() - subMesh.firstVertex;
-                                var third = indexReader.ReadUInt16() - subMesh.firstVertex;
-                                var triangle = new[] { vertices[first], vertices[second], vertices[third] };
-                                triangles.Add(triangle);
-                            }
+                        uint raw0, raw1, raw2;
+                        if (use32BitIndices)
+                        {
+                            raw0 = BinaryPrimitives.ReadUInt32LittleEndian(indexBytes.Slice((int)idxOffset, 4));
+                            raw1 = BinaryPrimitives.ReadUInt32LittleEndian(indexBytes.Slice((int)idxOffset + 4, 4));
+                            raw2 = BinaryPrimitives.ReadUInt32LittleEndian(indexBytes.Slice((int)idxOffset + 8, 4));
+                        }
+                        else
+                        {
+                            raw0 = BinaryPrimitives.ReadUInt16LittleEndian(indexBytes.Slice((int)idxOffset, 2));
+                            raw1 = BinaryPrimitives.ReadUInt16LittleEndian(indexBytes.Slice((int)idxOffset + 2, 2));
+                            raw2 = BinaryPrimitives.ReadUInt16LittleEndian(indexBytes.Slice((int)idxOffset + 4, 2));
+                        }
+
+                        long first = (long)raw0 + subMesh.baseVertex - subMesh.firstVertex;
+                        long second = (long)raw1 + subMesh.baseVertex - subMesh.firstVertex;
+                        long third = (long)raw2 + subMesh.baseVertex - subMesh.firstVertex;
+
+                        if ((ulong)first < (ulong)vertices.Length
+                            && (ulong)second < (ulong)vertices.Length
+                            && (ulong)third < (ulong)vertices.Length)
+                        {
+                            triangles.Add(new[] { vertices[first], vertices[second], vertices[third] });
                         }
                     }
                 }
@@ -717,6 +848,67 @@ namespace AssetStudio
             }
 
             return Array.Empty<Vector2[]>();
+        }
+
+        private static MeshHelper.VertexFormat ResolveVertexFormat(byte format, int[]? version)
+        {
+            try
+            {
+                if (version != null && version.Length > 0)
+                {
+                    return MeshHelper.ToVertexFormat(format, version);
+                }
+
+                if (Enum.IsDefined(typeof(MeshHelper.VertexFormat), (int)format))
+                {
+                    return (MeshHelper.VertexFormat)format;
+                }
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+            }
+
+            return MeshHelper.VertexFormat.Float;
+        }
+
+        private static uint ComputeFallbackStreamStride(ChannelInfo[] channels, byte streamIndex, int[]? version)
+        {
+            uint maxEnd = 0;
+            for (int i = 0; i < channels.Length; i++)
+            {
+                var ch = channels[i];
+                if (ch.stream == streamIndex && ch.dimension > 0)
+                {
+                    var fmt = ResolveVertexFormat(ch.format, version);
+                    uint end = ch.offset + MeshHelper.GetFormatSize(fmt) * ch.dimension;
+                    if (end > maxEnd)
+                    {
+                        maxEnd = end;
+                    }
+                }
+            }
+            return maxEnd;
+        }
+
+        private static float ReadVertexComponent(ReadOnlySpan<byte> data, int byteOffset, MeshHelper.VertexFormat format)
+        {
+            var slice = data.Slice(byteOffset);
+            return format switch
+            {
+                MeshHelper.VertexFormat.Float => BinaryPrimitives.ReadSingleLittleEndian(slice),
+                MeshHelper.VertexFormat.Float16 => (float)BinaryPrimitives.ReadHalfLittleEndian(slice),
+                MeshHelper.VertexFormat.UNorm8 => slice[0] / 255f,
+                MeshHelper.VertexFormat.SNorm8 => Math.Max((sbyte)slice[0] / 127f, -1f),
+                MeshHelper.VertexFormat.UNorm16 => BinaryPrimitives.ReadUInt16LittleEndian(slice) / 65535f,
+                MeshHelper.VertexFormat.SNorm16 => Math.Max(BinaryPrimitives.ReadInt16LittleEndian(slice) / 32767f, -1f),
+                MeshHelper.VertexFormat.UInt8 => slice[0],
+                MeshHelper.VertexFormat.SInt8 => (sbyte)slice[0],
+                MeshHelper.VertexFormat.UInt16 => BinaryPrimitives.ReadUInt16LittleEndian(slice),
+                MeshHelper.VertexFormat.SInt16 => BinaryPrimitives.ReadInt16LittleEndian(slice),
+                MeshHelper.VertexFormat.UInt32 => BinaryPrimitives.ReadUInt32LittleEndian(slice),
+                MeshHelper.VertexFormat.SInt32 => BinaryPrimitives.ReadInt32LittleEndian(slice),
+                _ => BinaryPrimitives.ReadSingleLittleEndian(slice)
+            };
         }
     }
 }

@@ -921,7 +921,7 @@ namespace AssetStudio
             {
                 buff[i] = 0;
                 buff[i + 1] = 0;
-                buff[i + 2] = (byte)Math.Round(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i, 4)) * 255f);
+                buff[i + 2] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i, 4)));
                 buff[i + 3] = 255;
             }
             return true;
@@ -932,8 +932,8 @@ namespace AssetStudio
             for (var i = 0; i < outPutSize; i += 4)
             {
                 buff[i] = 0;
-                buff[i + 1] = (byte)Math.Round(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 2 + 4, 4)) * 255f);
-                buff[i + 2] = (byte)Math.Round(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 2, 4)) * 255f);
+                buff[i + 1] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 2 + 4, 4)));
+                buff[i + 2] = FloatToByte(BinaryPrimitives.ReadSingleLittleEndian(image_data.Slice(i * 2, 4)));
                 buff[i + 3] = 255;
             }
             return true;
@@ -973,13 +973,139 @@ namespace AssetStudio
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static byte FloatToByte(float value)
+        public static byte FloatToByte(float value)
         {
             if (float.IsNaN(value) || value <= 0f)
                 return 0;
             if (value >= 1f)
                 return 255;
             return (byte)Math.Round(value * 255f);
+        }
+
+        /// <summary>
+        /// Heuristic detection for Unity DXT5nm tangent-space normal maps decoded into BGRA32.
+        /// Unity packs X into Alpha, Y into Green, and fills Red with 255 (with Blue either 0, 255, or mirrored G).
+        /// </summary>
+        public static bool IsLikelyDxt5NormalMap(ReadOnlySpan<byte> bgra)
+        {
+            int pixelCount = bgra.Length / 4;
+            if (pixelCount <= 0)
+            {
+                return false;
+            }
+
+            int step = Math.Max(1, pixelCount / 65536);
+            int sampled = 0;
+            int redNearMax = 0;
+            int inUnitDisk = 0;
+            int alphaInterior = 0;
+            int whitePixels = 0;
+
+            const float inv127_5 = 2f / 255f;
+            for (int p = 0; p < pixelCount; p += step)
+            {
+                int o = p * 4;
+                byte b = bgra[o];
+                byte g = bgra[o + 1];
+                byte r = bgra[o + 2];
+                byte a = bgra[o + 3];
+                sampled++;
+
+                if (r >= 250)
+                {
+                    redNearMax++;
+                    if (g >= 250 && b >= 250)
+                    {
+                        whitePixels++;
+                    }
+                }
+
+                if (a >= 5 && a <= 250)
+                {
+                    alphaInterior++;
+                }
+
+                float nx = a * inv127_5 - 1f;
+                float ny = g * inv127_5 - 1f;
+                if (nx * nx + ny * ny <= 1.10f)
+                {
+                    inUnitDisk++;
+                }
+            }
+
+            if (sampled == 0)
+            {
+                return false;
+            }
+
+            // Reject pure white UI/alpha masks where RGB == 255 everywhere
+            if ((long)whitePixels * 100L >= (long)sampled * 95L)
+            {
+                return false;
+            }
+
+            return (long)redNearMax * 100L >= (long)sampled * 95L
+                && (long)inUnitDisk * 100L >= (long)sampled * 90L
+                && (long)alphaInterior * 100L >= (long)sampled * 15L;
+        }
+
+        /// <summary>
+        /// Unpacks Unity DXT5nm or BC5 normal map data in-place (BGRA32 layout) into standard
+        /// tangent-space RGB normal maps with reconstructed blue (Z) channel and opaque alpha (255).
+        /// </summary>
+        /// <returns><c>true</c> if the buffer was unpacked; <c>false</c> if left unchanged.</returns>
+        public static bool UnpackNormalMapBgra32(Span<byte> bgra, TextureFormat format, bool forceUnpack = false)
+        {
+            int byteCount = bgra.Length & ~3;
+            if (byteCount == 0)
+            {
+                return false;
+            }
+
+            const float inv127_5 = 2f / 255f;
+
+            if (format is TextureFormat.DXT5 or TextureFormat.DXT5Crunched)
+            {
+                if (!forceUnpack && !IsLikelyDxt5NormalMap(bgra.Slice(0, byteCount)))
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < byteCount; i += 4)
+                {
+                    byte g = bgra[i + 1];
+                    byte a = bgra[i + 3];
+                    float nx = a * inv127_5 - 1f;
+                    float ny = g * inv127_5 - 1f;
+                    float nzSq = 1f - nx * nx - ny * ny;
+                    float nz = nzSq > 0f ? MathF.Sqrt(nzSq) : 0f;
+
+                    bgra[i] = FloatToByte(nz * 0.5f + 0.5f); // B = reconstructed Z
+                    bgra[i + 1] = g;                          // G = Y
+                    bgra[i + 2] = a;                          // R = X (moved from A)
+                    bgra[i + 3] = 255;                        // A = opaque
+                }
+                return true;
+            }
+
+            if (format == TextureFormat.BC5 && forceUnpack)
+            {
+                for (int i = 0; i < byteCount; i += 4)
+                {
+                    byte g = bgra[i + 1];
+                    byte r = bgra[i + 2];
+                    float nx = r * inv127_5 - 1f;
+                    float ny = g * inv127_5 - 1f;
+                    float nzSq = 1f - nx * nx - ny * ny;
+                    float nz = nzSq > 0f ? MathF.Sqrt(nzSq) : 0f;
+
+                    bgra[i] = FloatToByte(nz * 0.5f + 0.5f); // B = reconstructed Z
+                    bgra[i + 3] = 255;                        // A = opaque
+                }
+                return true;
+            }
+
+            return false;
         }
 
         private bool DecodeYUY2(ReadOnlySpan<byte> image_data, Span<byte> buff)
@@ -1016,15 +1142,15 @@ namespace AssetStudio
         {
             for (var i = 0; i < outPutSize; i += 4)
             {
-                var n = BinaryPrimitives.ReadInt32LittleEndian(image_data.Slice(i, 4));
-                var scale = n >> 27 & 0x1f;
-                var scalef = Math.Pow(2, scale - 24);
-                var b = n >> 18 & 0x1ff;
-                var g = n >> 9 & 0x1ff;
-                var r = n & 0x1ff;
-                buff[i] = (byte)Math.Round(b * scalef * 255f);
-                buff[i + 1] = (byte)Math.Round(g * scalef * 255f);
-                buff[i + 2] = (byte)Math.Round(r * scalef * 255f);
+                var n = BinaryPrimitives.ReadUInt32LittleEndian(image_data.Slice(i, 4));
+                var scale = (int)((n >> 27) & 0x1fu);
+                var scalef = MathF.ScaleB(1f, scale - 24);
+                var b = ((n >> 18) & 0x1ffu) * scalef;
+                var g = ((n >> 9) & 0x1ffu) * scalef;
+                var r = (n & 0x1ffu) * scalef;
+                buff[i] = FloatToByte(b);
+                buff[i + 1] = FloatToByte(g);
+                buff[i + 2] = FloatToByte(r);
                 buff[i + 3] = 255;
             }
             return true;

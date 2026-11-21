@@ -290,6 +290,7 @@ namespace AssetStudio.Avalonia.Services
         private Dictionary<uint, string>? _bonePathHash;
         private Dictionary<uint, string>? _morphChannelNames;
         private Dictionary<Mesh, EagerModelGroupEntry>? _eagerModelGroupsByMesh;
+        private HashSet<Texture2D>? _knownNormalMaps;
 
         public ExportConversionContext(List<SerializedFile> assetsFiles, object? filesLock = null)
         {
@@ -306,6 +307,7 @@ namespace AssetStudio.Avalonia.Services
                 _bonePathHash = null;
                 _morphChannelNames = null;
                 _eagerModelGroupsByMesh = null;
+                _knownNormalMaps = null;
             }
         }
 
@@ -385,6 +387,25 @@ namespace AssetStudio.Avalonia.Services
                     return _eagerModelGroupsByMesh ??= AssetExportService.BuildEagerModelGroupLookup(SnapshotAssetsFiles());
                 }
             }
+        }
+
+        public bool IsKnownNormalMap(Texture2D? texture)
+        {
+            if (texture == null)
+            {
+                return false;
+            }
+
+            var cached = Volatile.Read(ref _knownNormalMaps);
+            if (cached == null)
+            {
+                lock (_cacheLock)
+                {
+                    cached = _knownNormalMaps ??= AssetExportService.BuildKnownNormalMapLookup(SnapshotAssetsFiles());
+                }
+            }
+
+            return cached.Contains(texture);
         }
 
         public bool TryGetAssetFilePath(
@@ -1822,7 +1843,8 @@ namespace AssetStudio.Avalonia.Services
                         return true;
                     }
 
-                    using var image = m_Texture2D.ConvertToImage(true);
+                    bool isKnownNormalMap = conversionContext.IsKnownNormalMap(m_Texture2D);
+                    using var image = m_Texture2D.ConvertToImage(flip: true, unpackNormalMap: true, forceNormalMapUnpack: isKnownNormalMap);
                     if (image == null) return false;
                     var extension = "." + exportOptions.ConvertTextureFormat.ToString().ToLowerInvariant();
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
@@ -1845,18 +1867,19 @@ namespace AssetStudio.Avalonia.Services
                     var m_AudioData = m_AudioClip.m_AudioData.GetData();
                     if (m_AudioData == null || m_AudioData.Length == 0) return false;
                     var converter = new AudioClipConverter(m_AudioClip);
-                    if (exportOptions.ConvertAudio && converter.IsSupport)
+                    if (exportOptions.ConvertAudio)
                     {
-                        if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".wav", item, out var filePath)) return false;
-                        var buffer = converter.ConvertToWav();
-                        if (buffer == null) return false;
-                        WriteBytesExport(filePath, buffer);
+                        var wavBuffer = TryConvertAudioClipToWav(m_AudioClip, m_AudioData);
+                        if (wavBuffer != null && wavBuffer.Length > 0)
+                        {
+                            if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".wav", item, out var wavPath)) return false;
+                            WriteBytesExport(wavPath, wavBuffer);
+                            return true;
+                        }
                     }
-                    else
-                    {
-                        if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, converter.GetExtensionName(), item, out var filePath)) return false;
-                        WriteBytesExport(filePath, m_AudioData);
-                    }
+
+                    if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, converter.GetExtensionName(), item, out var filePath)) return false;
+                    WriteBytesExport(filePath, m_AudioData);
                     return true;
                 }
 
@@ -1928,7 +1951,7 @@ namespace AssetStudio.Avalonia.Services
                         TryDeletePartialExport(filePath);
                         throw;
                     }
-                    AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Sprite);
+                    WriteSpriteMetaIfMissing(filePath, m_Sprite);
                     return true;
                 }
 
@@ -2386,6 +2409,187 @@ namespace AssetStudio.Avalonia.Services
             }
 
             return new SplitObjectsExportSummary(exported, failed, errorQueue.ToArray(), wasCancelled);
+        }
+
+        public static HashSet<Texture2D> BuildKnownNormalMapLookup(IReadOnlyList<SerializedFile> filesSnapshot)
+        {
+            var result = new HashSet<Texture2D>(ReferenceEqualityComparer.Instance);
+            if (filesSnapshot == null || filesSnapshot.Count == 0)
+            {
+                return result;
+            }
+
+            for (int f = 0; f < filesSnapshot.Count; f++)
+            {
+                var objects = filesSnapshot[f].Objects;
+                for (int i = 0; i < objects.Count; i++)
+                {
+                    if (objects[i] is not Material mat || mat.m_SavedProperties?.m_TexEnvs == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var kv in mat.m_SavedProperties.m_TexEnvs)
+                    {
+                        if (kv.Key != null
+                            && (kv.Key.Contains("Bump", StringComparison.OrdinalIgnoreCase)
+                                || kv.Key.Contains("Normal", StringComparison.OrdinalIgnoreCase))
+                            && kv.Value?.m_Texture != null
+                            && kv.Value.m_Texture.TryGet<Texture2D>(out var tex)
+                            && tex != null)
+                        {
+                            result.Add(tex);
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        public static byte[]? TryConvertAudioClipToWav(
+            AudioClip audioClip,
+            byte[]? audioData = null,
+            AudioPreviewPreparer.TranscodeToWavDelegate? transcoder = null,
+            string? tempDirectory = null)
+        {
+            var data = audioData ?? audioClip.m_AudioData.GetData();
+            if (data == null || data.Length == 0)
+            {
+                return null;
+            }
+
+            var converter = new AudioClipConverter(audioClip);
+            if (converter.IsSupport)
+            {
+                var directWav = UnityAudioDecoder.ConvertToWav(data, audioClip.m_SubsoundIndex);
+                if (directWav != null && directWav.Length > 0)
+                {
+                    return directWav;
+                }
+            }
+
+            if (AudioPreviewPreparer.IsFsb5Header(data))
+            {
+                // Try direct managed FSB5 decode even if metadata compression enum differed
+                var fsbWav = UnityAudioDecoder.ConvertToWav(data, audioClip.m_SubsoundIndex);
+                if (fsbWav != null && fsbWav.Length > 0)
+                {
+                    return fsbWav;
+                }
+
+                // Fallback to FFmpegAudioTranscoder for compressed FSB5 payloads (e.g. Vorbis/MPEG/Opus)
+                var workDir = string.IsNullOrEmpty(tempDirectory) ? Path.GetTempPath() : tempDirectory;
+                var inputPath = MediaTempFiles.CreateUniquePath(workDir, "assetstudio_export_audio_in_", ".fsb");
+                var outputPath = MediaTempFiles.CreateUniquePath(workDir, "assetstudio_export_audio_out_", ".wav");
+                try
+                {
+                    File.WriteAllBytes(inputPath, data);
+                    bool succeeded = transcoder != null
+                        ? transcoder(inputPath, outputPath, CancellationToken.None)
+                        : FFmpegAudioTranscoder.TryTranscodeToPcmWav(inputPath, outputPath, CancellationToken.None).Success;
+
+                    if (succeeded && File.Exists(outputPath))
+                    {
+                        var transcoded = File.ReadAllBytes(outputPath);
+                        if (transcoded.Length > 44
+                            && transcoded[0] == (byte)'R'
+                            && transcoded[1] == (byte)'I'
+                            && transcoded[2] == (byte)'F'
+                            && transcoded[3] == (byte)'F')
+                        {
+                            return transcoded;
+                        }
+                    }
+                }
+                catch
+                {
+                    // FFmpeg native libraries may be unavailable in headless environments; fall back to raw FSB5.
+                }
+                finally
+                {
+                    MediaTempFiles.TryDeleteNow(inputPath);
+                    MediaTempFiles.TryDeleteNow(outputPath);
+                }
+            }
+
+            return null;
+        }
+
+        public static void WriteSpriteMetaIfMissing(string spritePath, Sprite? sprite)
+        {
+            var metaPath = spritePath + ".meta";
+            if (File.Exists(metaPath))
+            {
+                return;
+            }
+
+            File.WriteAllText(metaPath, BuildSpriteMeta(AssetExportHelper.GenerateStableGuid(sprite), sprite), Encoding.UTF8);
+        }
+
+        public static string BuildSpriteMeta(string guid, Sprite? sprite)
+        {
+            var inv = CultureInfo.InvariantCulture;
+            float ppu = sprite != null && sprite.m_PixelsToUnits > 0f ? sprite.m_PixelsToUnits : 100f;
+            float pivotX = sprite != null ? sprite.m_Pivot.X : 0.5f;
+            float pivotY = sprite != null ? sprite.m_Pivot.Y : 0.5f;
+            float borderX = sprite != null ? sprite.m_Border.X : 0f;
+            float borderY = sprite != null ? sprite.m_Border.Y : 0f;
+            float borderZ = sprite != null ? sprite.m_Border.Z : 0f;
+            float borderW = sprite != null ? sprite.m_Border.W : 0f;
+
+            return $@"fileFormatVersion: 2
+guid: {guid}
+TextureImporter:
+  internalIDToNameTable: []
+  externalObjects: {{}}
+  serializedVersion: 13
+  mipmaps:
+    mipMapMode: 0
+    enableMipMap: 0
+    sRGBTexture: 1
+    linearTexture: 0
+    fadeOut: 0
+    borderMipMap: 0
+    mipMapsPreserveCoverage: 0
+    alphaTestReferenceValue: 0.5
+    mipMapFadeDistanceStart: 1
+    mipMapFadeDistanceEnd: 3
+  textureSettings:
+    serializedVersion: 2
+    filterMode: 1
+    aniso: 1
+    mipBias: 0
+    wrapU: 1
+    wrapV: 1
+    wrapW: 1
+  alphaIsTransparency: 1
+  spriteMode: 1
+  spriteExtrude: 1
+  spriteMeshType: 1
+  alignment: 0
+  spritePivot: {{x: {pivotX.ToString("0.######", inv)}, y: {pivotY.ToString("0.######", inv)}}}
+  spritePixelsToUnits: {ppu.ToString("0.######", inv)}
+  spriteBorder: {{x: {borderX.ToString("0.######", inv)}, y: {borderY.ToString("0.######", inv)}, z: {borderZ.ToString("0.######", inv)}, w: {borderW.ToString("0.######", inv)}}}
+  textureType: 8
+  textureShape: 1
+  platformSettings: []
+  spriteSheet:
+    serializedVersion: 2
+    sprites: []
+    outline: []
+    physicsShape: []
+    bones: []
+    spriteID: 
+    internalID: 0
+    vertices: []
+    indices: 
+    edges: []
+    weights: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+";
         }
 
         public static Dictionary<Mesh, EagerModelGroupEntry> BuildEagerModelGroupLookup(

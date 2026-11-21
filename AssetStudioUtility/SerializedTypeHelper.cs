@@ -44,7 +44,7 @@ namespace AssetStudio
 
         public void AddArray(List<TypeTreeNode> nodes, int indent)
         {
-            nodes.Add(new TypeTreeNode("Array", "Array", indent, false));
+            nodes.Add(new TypeTreeNode("Array", "Array", indent, true));
             nodes.Add(new TypeTreeNode("int", "size", indent + 1, false));
         }
 
@@ -113,7 +113,12 @@ namespace AssetStudio
             nodes.Add(new TypeTreeNode("UInt16", "atime5", indent + 1, false));
             nodes.Add(new TypeTreeNode("UInt16", "atime6", indent + 1, false));
             nodes.Add(new TypeTreeNode("UInt16", "atime7", indent + 1, false));
-            if (version[0] > 5 || (version[0] == 5 && version[1] >= 5)) //5.5 and up
+            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) //2022.2 and up
+            {
+                nodes.Add(new TypeTreeNode("UInt8", "m_Mode", indent + 1, false));
+                nodes.Add(new TypeTreeNode("SInt8", "m_ColorSpace", indent + 1, false));
+            }
+            else if (version[0] > 5 || (version[0] == 5 && version[1] >= 5)) //5.5 - 2022.1
             {
                 nodes.Add(new TypeTreeNode("int", "m_Mode", indent + 1, false));
             }
@@ -275,7 +280,48 @@ namespace AssetStudio
         public void AddPropertyName(List<TypeTreeNode> nodes, string name, int indent)
         {
             nodes.Add(new TypeTreeNode("PropertyName", name, indent, false));
-            AddString(nodes, "id", indent + 1);
+            nodes.Add(new TypeTreeNode("int", "id", indent + 1, false));
+        }
+
+        public void AddHash128(List<TypeTreeNode> nodes, string name, int indent)
+        {
+            nodes.Add(new TypeTreeNode("Hash128", name, indent, false));
+            for (int i = 0; i < 16; i++)
+            {
+                nodes.Add(new TypeTreeNode("UInt8", $"bytes[{i}]", indent + 1, false));
+            }
+        }
+
+        public void AddRenderingLayerMask(List<TypeTreeNode> nodes, string name, int indent)
+        {
+            nodes.Add(new TypeTreeNode("RenderingLayerMask", name, indent, false));
+            nodes.Add(new TypeTreeNode("UInt32", "m_Bits", indent + 1, false));
+        }
+
+        public void AddLazyLoadReference(List<TypeTreeNode> nodes, string elementTypeName, string name, int indent)
+        {
+            AddPPtr(nodes, string.IsNullOrEmpty(elementTypeName) ? "Object" : elementTypeName, name, indent);
+        }
+
+        public void AddManagedReference(List<TypeTreeNode> nodes, string name, int indent)
+        {
+            nodes.Add(new TypeTreeNode("ManagedReference", name, indent, false));
+            nodes.Add(new TypeTreeNode("SInt64", "rid", indent + 1, false));
+        }
+
+        public void AddManagedReferencesRegistry(List<TypeTreeNode> nodes, string name, int indent)
+        {
+            nodes.Add(new TypeTreeNode("ManagedReferencesRegistry", name, indent, false));
+            nodes.Add(new TypeTreeNode("int", "version", indent + 1, false));
+            nodes.Add(new TypeTreeNode("vector", "RefIds", indent + 1, false));
+            AddArray(nodes, indent + 2);
+            nodes.Add(new TypeTreeNode("ReferencedObject", "data", indent + 3, false));
+            nodes.Add(new TypeTreeNode("SInt64", "rid", indent + 4, false));
+            nodes.Add(new TypeTreeNode("ReferencedManagedType", "type", indent + 4, false));
+            AddString(nodes, "class", indent + 5);
+            AddString(nodes, "ns", indent + 5);
+            AddString(nodes, "asm", indent + 5);
+            nodes.Add(new TypeTreeNode("ReferencedObjectData", "data", indent + 4, false));
         }
     }
 }

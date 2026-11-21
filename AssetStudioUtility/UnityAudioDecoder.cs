@@ -140,7 +140,12 @@ namespace AssetStudio
 
         public static byte[]? ConvertToWav(byte[] containerData)
         {
-            if (containerData == null || containerData.Length < 60)
+            return ConvertToWav(containerData, 0);
+        }
+
+        public static byte[]? ConvertToWav(byte[] containerData, int subsoundIndex)
+        {
+            if (containerData == null || containerData.Length < 60 || subsoundIndex < 0)
                 return null;
 
             using (var stream = new MemoryStream(containerData))
@@ -165,6 +170,7 @@ namespace AssetStudio
                 long audioDataStart = sampleHeadersEnd + sizeOfNameTable;
                 if (containerData.Length < headerSize
                     || numSamples == 0
+                    || subsoundIndex >= numSamples
                     || (long)numSamples * 8 > sizeOfSampleHeaders
                     || sampleHeadersEnd > containerData.Length
                     || audioDataStart > containerData.Length)
@@ -172,7 +178,7 @@ namespace AssetStudio
                     return null;
                 }
 
-                // Read sample headers
+                // Read sample headers and their immediately-following chunks in FSB5 wire order
                 stream.Position = headerSize;
                 var sampleMetadatas = new List<UnityAudioSampleMetadata>((int)numSamples);
                 for (int i = 0; i < numSamples; i++)
@@ -181,13 +187,6 @@ namespace AssetStudio
                         return null;
                     var meta = new UnityAudioSampleMetadata();
                     meta.Read(reader);
-                    sampleMetadatas.Add(meta);
-                }
-
-                // Process chunks if any
-                for (int i = 0; i < numSamples; i++)
-                {
-                    var meta = sampleMetadatas[i];
                     if (meta.HasAnyChunks)
                     {
                         bool moreChunks = true;
@@ -219,19 +218,18 @@ namespace AssetStudio
                             }
                         }
                     }
+                    sampleMetadatas.Add(meta);
                 }
 
-                // For simplicity, we decode the first sample.
-                var activeSample = sampleMetadatas[0];
+                var activeSample = sampleMetadatas[subsoundIndex];
                 if (activeSample.NumChannels <= 0 || activeSample.NumChannels > 16 || activeSample.Frequency <= 0)
                     return null;
 
                 long sampleOffset = audioDataStart + activeSample.DataOffset;
-                long sampleSize = (long)sizeOfData - activeSample.DataOffset;
-                if (numSamples > 1)
-                {
-                    sampleSize = (long)sampleMetadatas[1].DataOffset - activeSample.DataOffset;
-                }
+                long nextDataOffset = (subsoundIndex + 1 < sampleMetadatas.Count)
+                    ? sampleMetadatas[subsoundIndex + 1].DataOffset
+                    : sizeOfData;
+                long sampleSize = nextDataOffset - activeSample.DataOffset;
 
                 if (sampleOffset < 0 || sampleSize <= 0 || sampleSize > int.MaxValue || sampleOffset > containerData.Length - sampleSize)
                 {
@@ -250,9 +248,9 @@ namespace AssetStudio
                     if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
                         return null;
 
-                    if (activeSample.NumChannels == 2)
+                    if (activeSample.NumChannels >= 2)
                     {
-                        decodedPcm = DecodeImaAdpcmStereo(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels);
+                        decodedPcm = DecodeImaAdpcmInterleaved(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels);
                     }
                     else
                     {
@@ -278,14 +276,19 @@ namespace AssetStudio
                         decodedPcm = DecodeGcadpcm(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels, dspCoeffs);
                     }
                 }
-                else if (codec == UnityAudioCodec.Pcm8 || codec == UnityAudioCodec.Pcm16 || codec == UnityAudioCodec.Pcm32)
+                else if (codec == UnityAudioCodec.Pcm8
+                    || codec == UnityAudioCodec.Pcm16
+                    || codec == UnityAudioCodec.Pcm24
+                    || codec == UnityAudioCodec.Pcm32
+                    || codec == UnityAudioCodec.PcmFloat)
                 {
-                    // Fallback to direct raw PCM copy if requested
                     int bytesPerSample = codec switch
                     {
                         UnityAudioCodec.Pcm8 => 1,
                         UnityAudioCodec.Pcm16 => 2,
+                        UnityAudioCodec.Pcm24 => 3,
                         UnityAudioCodec.Pcm32 => 4,
+                        UnityAudioCodec.PcmFloat => 4,
                         _ => 2
                     };
                     long sampleLength64 = (long)activeSample.SampleCount * activeSample.NumChannels;
@@ -300,19 +303,38 @@ namespace AssetStudio
                         int srcOffset = i * bytesPerSample;
                         if (srcOffset + bytesPerSample <= sampleBytes.Length)
                         {
-                            if (bytesPerSample == 1)
+                            if (codec == UnityAudioCodec.Pcm8)
                             {
-                                // Convert signed/unsigned 8-bit to 16-bit
+                                // Convert unsigned 8-bit to signed 16-bit
                                 decodedPcm[i] = (short)((sampleBytes[srcOffset] - 128) * 256);
                             }
-                            else if (bytesPerSample == 2)
+                            else if (codec == UnityAudioCodec.Pcm16)
                             {
                                 decodedPcm[i] = ReadInt16LE(sampleBytes, srcOffset);
                             }
-                            else if (bytesPerSample == 4)
+                            else if (codec == UnityAudioCodec.Pcm24)
+                            {
+                                // Signed 24-bit little-endian: top 16 bits map directly to signed 16-bit PCM
+                                decodedPcm[i] = (short)(sampleBytes[srcOffset + 1] | (sampleBytes[srcOffset + 2] << 8));
+                            }
+                            else if (codec == UnityAudioCodec.Pcm32)
                             {
                                 int val32 = (int)ReadUInt32LE(sampleBytes, srcOffset);
                                 decodedPcm[i] = (short)(val32 >> 16);
+                            }
+                            else if (codec == UnityAudioCodec.PcmFloat)
+                            {
+                                float f = BitConverter.Int32BitsToSingle((int)ReadUInt32LE(sampleBytes, srcOffset));
+                                if (float.IsNaN(f))
+                                {
+                                    decodedPcm[i] = 0;
+                                }
+                                else
+                                {
+                                    float clamped = Math.Clamp(f, -1f, 1f);
+                                    float scaled = clamped < 0f ? clamped * 32768f : clamped * 32767f;
+                                    decodedPcm[i] = (short)Math.Clamp((int)MathF.Round(scaled), short.MinValue, short.MaxValue);
+                                }
                             }
                         }
                     }
@@ -325,17 +347,23 @@ namespace AssetStudio
             }
         }
 
-        private static short[] DecodeImaAdpcmStereo(byte[] sampleBytes, int sampleCount, int channels)
+        private static short[] DecodeImaAdpcmInterleaved(byte[] sampleBytes, int sampleCount, int channels)
         {
             short[] array = new short[sampleCount * channels];
-            int numFrames = sampleCount / 64;
+            int numFrames = (sampleCount + 63) / 64;
+            int blockStride = 36 * channels;
+            int headerBytes = 4 * channels;
 
             int[] hist = new int[channels];
             int[] stepIndex = new int[channels];
 
             for (int j = 0; j < numFrames; j++)
             {
-                int blockStart = 36 * channels * j;
+                int blockStart = blockStride * j;
+                if (blockStart >= sampleBytes.Length)
+                    break;
+
+                int samplesInFrame = Math.Min(64, sampleCount - j * 64);
 
                 // Read headers for all channels
                 for (int i = 0; i < channels; i++)
@@ -356,16 +384,20 @@ namespace AssetStudio
                     }
                 }
 
-                // Decode remaining 63 samples per channel in frame
-                for (int k = 1; k < 64; k++)
+                // Decode remaining samples in frame (trimmed to exact sampleCount on the final block)
+                for (int k = 1; k < samplesInFrame; k++)
                 {
+                    int groupOffset = blockStart + headerBytes + headerBytes * ((k - 1) / 8);
+                    int byteInWord = ((k - 1) % 8) / 2;
+                    bool highNibble = ((k - 1) % 2) == 1;
+
                     for (int i = 0; i < channels; i++)
                     {
-                        int byteOffset = blockStart + 8 + 4 * (i % 2) + 8 * ((k - 1) / 8) + (k - 1) % 8 / 2;
+                        int byteOffset = groupOffset + 4 * i + byteInWord;
                         if (byteOffset < sampleBytes.Length)
                         {
                             int b = sampleBytes[byteOffset];
-                            int nibble = ((k - 1) % 2 == 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+                            int nibble = highNibble ? ((b >> 4) & 0xF) : (b & 0xF);
 
                             int step = ADPCMTable[stepIndex[i]];
                             int delta = step >> 3;
@@ -398,13 +430,15 @@ namespace AssetStudio
         private static short[] DecodeImaAdpcmMono(byte[] sampleBytes, int sampleCount)
         {
             short[] array = new short[sampleCount];
-            int numFrames = sampleCount / 64;
+            int numFrames = (sampleCount + 63) / 64;
             int outIdx = 0;
 
             for (int i = 0; i < numFrames; i++)
             {
                 int blockStart = 36 * i;
                 if (blockStart + 2 >= sampleBytes.Length) break;
+
+                int samplesInFrame = Math.Min(64, sampleCount - i * 64);
 
                 int hist = (short)(sampleBytes[blockStart] | (sampleBytes[blockStart + 1] << 8));
                 int stepIndex = sampleBytes[blockStart + 2];
@@ -416,7 +450,7 @@ namespace AssetStudio
                     array[outIdx++] = (short)hist;
                 }
 
-                for (int j = 1; j < 64; j++)
+                for (int j = 1; j < samplesInFrame; j++)
                 {
                     int byteOffset = blockStart + 4 + (j - 1) / 2;
                     if (byteOffset < sampleBytes.Length)

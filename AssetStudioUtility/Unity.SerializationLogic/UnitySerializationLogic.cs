@@ -264,10 +264,25 @@ namespace Unity.SerializationLogic
             {
                 if (!HasSerializeReferenceAttribute(fieldDefinition))
                     return IsSupportedCollection(typeReference);
+
+                if (typeReference.IsArray && ((ArrayType)typeReference).Rank > 1)
+                    return false;
+
+                var elementType = CecilUtils.ElementTypeOfCollection(typeReference);
+                return !elementType.IsValueType
+                    && elementType.MetadataType != MetadataType.String
+                    && !IsUnityEngineObject(elementType)
+                    && !IsDelegate(elementType);
             }
 
+            if (HasSerializeReferenceAttribute(fieldDefinition))
+            {
+                if (IsUnityEngineObject(typeReference) || IsDelegate(typeReference))
+                    return false;
+                return true;
+            }
 
-            if (!IsReferenceTypeSerializable(typeReference) && !HasSerializeReferenceAttribute(fieldDefinition))
+            if (!IsReferenceTypeSerializable(typeReference))
                 return false;
 
             if (IsDelegate(typeReference))
@@ -588,7 +603,7 @@ namespace Unity.SerializationLogic
 
         public static bool ShouldImplementIDeserializable(TypeReference typeDeclaration)
         {
-            if (typeDeclaration.FullName == "UnityEngine.ExposedReference`1")
+            if (typeDeclaration.FullName.StartsWith("UnityEngine.ExposedReference`1", StringComparison.Ordinal))
                 return true;
 
             if (IsNonSerialized(typeDeclaration))

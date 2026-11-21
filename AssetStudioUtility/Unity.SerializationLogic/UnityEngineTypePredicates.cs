@@ -2,6 +2,7 @@
 // Copyright (c) Unity Technologies. For terms of use, see
 // https://unity3d.com/legal/licenses/Unity_Reference_Only_License
 
+using System;
 using System.Collections.Generic;
 using Unity.CecilTools.Extensions;
 using Mono.Cecil;
@@ -54,6 +55,8 @@ namespace Unity.SerializationLogic
             "UnityEngine.Matrix4x4",
             "UnityEngine.Rendering.SphericalHarmonicsL2",
             "UnityEngine.PropertyName",
+            "UnityEngine.Hash128",
+            "UnityEngine.RenderingLayerMask",
         };
 
         public static bool IsMonoBehaviour(TypeReference type)
@@ -123,7 +126,7 @@ namespace Unity.SerializationLogic
                     return true;
             }
 
-            if (type.FullName.IndexOf("UnityEngine.LazyLoadReference`1") == 0)
+            if (type.FullName.StartsWith("UnityEngine.LazyLoadReference`1", StringComparison.Ordinal))
                 return true;
 
             return false;

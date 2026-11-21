@@ -299,27 +299,27 @@ namespace AssetStudio
 
             sb.Append(ConvertSerializedShaderRTBlendState(m_State.rtBlend, m_State.rtSeparateBlend));
 
-            if (!string.IsNullOrEmpty(m_State.alphaToMask?.name))
+            if (HasValidPropertyName(m_State.alphaToMask?.name))
             {
-                sb.Append($"  AlphaToMask [{m_State.alphaToMask.name}]\n");
+                sb.Append($"  AlphaToMask [{m_State.alphaToMask!.name}]\n");
             }
             else if (m_State.alphaToMask?.val > 0f)
             {
                 sb.Append("  AlphaToMask On\n");
             }
 
-            if (!string.IsNullOrEmpty(m_State.zClip?.name))
+            if (HasValidPropertyName(m_State.zClip?.name))
             {
-                sb.Append($"  ZClip [{m_State.zClip.name}]\n");
+                sb.Append($"  ZClip [{m_State.zClip!.name}]\n");
             }
             else if (m_State.zClip != null && m_State.zClip.val != 1f) //ZClip On
             {
                 sb.Append("  ZClip Off\n");
             }
 
-            if (!string.IsNullOrEmpty(m_State.zTest?.name))
+            if (HasValidPropertyName(m_State.zTest?.name))
             {
-                sb.Append($"  ZTest [{m_State.zTest.name}]\n");
+                sb.Append($"  ZTest [{m_State.zTest!.name}]\n");
             }
             else if (m_State.zTest != null && m_State.zTest.val != 4f) //ZTest LEqual
             {
@@ -355,18 +355,18 @@ namespace AssetStudio
                 sb.Append("\n");
             }
 
-            if (!string.IsNullOrEmpty(m_State.zWrite?.name))
+            if (HasValidPropertyName(m_State.zWrite?.name))
             {
-                sb.Append($"  ZWrite [{m_State.zWrite.name}]\n");
+                sb.Append($"  ZWrite [{m_State.zWrite!.name}]\n");
             }
             else if (m_State.zWrite != null && m_State.zWrite.val != 1f) //ZWrite On
             {
                 sb.Append("  ZWrite Off\n");
             }
 
-            if (!string.IsNullOrEmpty(m_State.culling?.name))
+            if (HasValidPropertyName(m_State.culling?.name))
             {
-                sb.Append($"  Cull [{m_State.culling.name}]\n");
+                sb.Append($"  Cull [{m_State.culling!.name}]\n");
             }
             else if (m_State.culling != null && m_State.culling.val != 2f) //Cull Back
             {
@@ -383,9 +383,9 @@ namespace AssetStudio
                 sb.Append("\n");
             }
 
-            if (!string.IsNullOrEmpty(m_State.conservative?.name))
+            if (HasValidPropertyName(m_State.conservative?.name))
             {
-                sb.Append($"  Conservative [{m_State.conservative.name}]\n");
+                sb.Append($"  Conservative [{m_State.conservative!.name}]\n");
             }
             else if (m_State.conservative != null && m_State.conservative.val > 0f)
             {
@@ -495,14 +495,20 @@ namespace AssetStudio
             return sb.ToString();
         }
 
+        private static bool HasValidPropertyName(string? name)
+        {
+            return !string.IsNullOrWhiteSpace(name)
+                && !string.Equals(name, "<noninit>", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool HasShaderFloatValue(SerializedShaderFloatValue value, float defaultVal)
         {
-            return value != null && (!string.IsNullOrEmpty(value.name) || value.val != defaultVal);
+            return value != null && (HasValidPropertyName(value.name) || value.val != defaultVal);
         }
 
         private static string FormatShaderFloatValue(SerializedShaderFloatValue value)
         {
-            return !string.IsNullOrEmpty(value.name)
+            return HasValidPropertyName(value.name)
                 ? $"[{value.name}]"
                 : value.val.ToString(CultureInfo.InvariantCulture);
         }
@@ -527,7 +533,7 @@ namespace AssetStudio
 
         private static string ConvertStencilOp(SerializedShaderFloatValue op)
         {
-            if (!string.IsNullOrEmpty(op.name))
+            if (HasValidPropertyName(op.name))
             {
                 return $"[{op.name}]";
             }
@@ -556,7 +562,7 @@ namespace AssetStudio
 
         private static string ConvertStencilComp(SerializedShaderFloatValue comp)
         {
-            if (!string.IsNullOrEmpty(comp.name))
+            if (HasValidPropertyName(comp.name))
             {
                 return $"[{comp.name}]";
             }
@@ -626,9 +632,9 @@ namespace AssetStudio
                     sb.Append("\n");
                 }
 
-                if (!string.IsNullOrEmpty(blend.colMask?.name))
+                if (HasValidPropertyName(blend.colMask?.name))
                 {
-                    sb.Append($"  ColorMask [{blend.colMask.name}] {i}\n");
+                    sb.Append($"  ColorMask [{blend.colMask!.name}] {i}\n");
                 }
                 else if (blend.colMask != null)
                 {
@@ -668,7 +674,7 @@ namespace AssetStudio
 
         private static string ConvertBlendOp(SerializedShaderFloatValue op)
         {
-            if (!string.IsNullOrEmpty(op.name))
+            if (HasValidPropertyName(op.name))
             {
                 return $"[{op.name}]";
             }
@@ -723,7 +729,7 @@ namespace AssetStudio
 
         private static string ConvertBlendFactor(SerializedShaderFloatValue factor)
         {
-            if (!string.IsNullOrEmpty(factor.name))
+            if (HasValidPropertyName(factor.name))
             {
                 return $"[{factor.name}]";
             }

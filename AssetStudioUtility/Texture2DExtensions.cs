@@ -8,6 +8,11 @@ namespace AssetStudio
     {
         public static SKBitmap? ConvertToImage(this Texture2D m_Texture2D, bool flip)
         {
+            return ConvertToImage(m_Texture2D, flip, unpackNormalMap: true, forceNormalMapUnpack: false);
+        }
+
+        public static SKBitmap? ConvertToImage(this Texture2D m_Texture2D, bool flip, bool unpackNormalMap, bool forceNormalMapUnpack = false)
+        {
             if (m_Texture2D.m_Width <= 0 || m_Texture2D.m_Height <= 0)
             {
                 Logger.Warning($"Invalid texture size for {m_Texture2D.m_Name}: {m_Texture2D.m_Width}x{m_Texture2D.m_Height}");
@@ -38,8 +43,13 @@ namespace AssetStudio
                     int expectedRowBytes = checked(m_Texture2D.m_Width * 4);
                     if (bitmap.RowBytes == expectedRowBytes && dstSpan.Length >= (int)outputSize)
                     {
-                        if (converter.DecodeTexture2D(dstSpan.Slice(0, (int)outputSize)))
+                        var pixelSpan = dstSpan.Slice(0, (int)outputSize);
+                        if (converter.DecodeTexture2D(pixelSpan))
                         {
+                            if (unpackNormalMap)
+                            {
+                                Texture2DConverter.UnpackNormalMapBgra32(pixelSpan, m_Texture2D.m_TextureFormat, forceNormalMapUnpack);
+                            }
                             if (flip)
                             {
                                 bitmap.FlipVerticalInPlace();
@@ -80,10 +90,15 @@ namespace AssetStudio
 
             if (converter.DecodeTexture2D(pixels))
             {
+                var pixelSpan = pixels.AsSpan(0, (int)outputSize);
+                if (unpackNormalMap)
+                {
+                    Texture2DConverter.UnpackNormalMapBgra32(pixelSpan, m_Texture2D.m_TextureFormat, forceNormalMapUnpack);
+                }
                 if (flip)
                 {
                     int rowBytes = checked(m_Texture2D.m_Width * 4);
-                    ImageExtensions.FlipVerticalInPlace(pixels.AsSpan(0, (int)outputSize), rowBytes, rowBytes, m_Texture2D.m_Height);
+                    ImageExtensions.FlipVerticalInPlace(pixelSpan, rowBytes, rowBytes, m_Texture2D.m_Height);
                 }
 
                 return ImageExtensions.WrapBgraUnpremulBitmap(pixels, m_Texture2D.m_Width, m_Texture2D.m_Height);
@@ -123,7 +138,12 @@ namespace AssetStudio
 
         public static MemoryStream? ConvertToStream(this Texture2D m_Texture2D, ImageFormat imageFormat, bool flip)
         {
-            var image = ConvertToImage(m_Texture2D, flip);
+            return ConvertToStream(m_Texture2D, imageFormat, flip, unpackNormalMap: true, forceNormalMapUnpack: false);
+        }
+
+        public static MemoryStream? ConvertToStream(this Texture2D m_Texture2D, ImageFormat imageFormat, bool flip, bool unpackNormalMap, bool forceNormalMapUnpack = false)
+        {
+            var image = ConvertToImage(m_Texture2D, flip, unpackNormalMap, forceNormalMapUnpack);
             if (image != null)
             {
                 using (image)
