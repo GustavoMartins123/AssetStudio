@@ -119,6 +119,11 @@ internal sealed class PreparedAnimationRigData
     public required Dictionary<uint, int> DirectBindingPathToMeshBoneIdx { get; init; }
     public required bool[] WeightedBoneMask { get; init; }
     public required bool[] DeformChainMask { get; init; }
+    public Dictionary<string, int> AvatarNodePathToIdx { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<uint, int> DirectBindingPathToAvatarNodeIdx { get; init; } = new();
+    public bool[] AvatarWeightedNodeMask { get; init; } = Array.Empty<bool>();
+    public bool[] AvatarDeformChainMask { get; init; } = Array.Empty<bool>();
+    public bool HasFullAvatarSkeleton => Skeleton.AvatarNodeCount > 0 && AvatarDeformChainMask.Length == Skeleton.AvatarNodeCount;
     public global::OpenTK.Mathematics.Vector3[]? SourceVertexData { get; init; }
     public global::OpenTK.Mathematics.Vector3 SourceMeshMin { get; init; }
     public global::OpenTK.Mathematics.Vector3 SourceMeshMax { get; init; }
@@ -143,6 +148,26 @@ internal sealed class PreparedAnimationRigData
         return Skeleton.MeshBoneHashToIdx.TryGetValue(binding.path, out meshBoneIdx);
     }
 
+    public bool TryResolveAvatarNodeBinding(GenericBinding binding, out int avatarNodeIdx)
+    {
+        if (DirectBindingPathToAvatarNodeIdx.TryGetValue(binding.path, out avatarNodeIdx))
+        {
+            return avatarNodeIdx >= 0;
+        }
+
+        if (Avatar != null)
+        {
+            var path = Avatar.FindBonePath(binding.path);
+            if (!string.IsNullOrEmpty(path)
+                && MeshPreviewSkeletonBuilder.TryResolvePathAlias(AvatarNodePathToIdx, path, out avatarNodeIdx))
+            {
+                return true;
+            }
+        }
+
+        return Skeleton.AvatarNodeHashToIdx.TryGetValue(binding.path, out avatarNodeIdx);
+    }
+
     public bool ShouldUseBinding(int meshBoneIdx)
     {
         return MeshPreviewSkeletonBuilder.ShouldUseAnimationBinding(
@@ -151,6 +176,13 @@ internal sealed class PreparedAnimationRigData
             DeformChainMask,
             WeightedBoneMask,
             Skeleton.MeshBoneNames);
+    }
+
+    public bool ShouldUseAvatarNodeBinding(int avatarNodeIdx)
+    {
+        return avatarNodeIdx >= 0
+            && avatarNodeIdx < AvatarDeformChainMask.Length
+            && AvatarDeformChainMask[avatarNodeIdx];
     }
 
     public PreviewMeshGeometry? GetOrBuildReferenceMesh(float densityPercent)
@@ -218,6 +250,50 @@ internal sealed class PreparedAnimationRigData
             }
         }
 
+        var avatarNodePathToIdx = MeshPreviewSkeletonBuilder.BuildBonePathAliasMap(skeleton.AvatarNodeNames, skeleton.AvatarNodeCount);
+        MeshPreviewSkeletonBuilder.BuildAvatarDeformChainMasks(
+            skeleton.AvatarNodeCount,
+            skeleton.AvatarParentIndices,
+            skeleton.SkelNodeToMeshBone,
+            weightedBoneMask,
+            out var avatarWeightedNodeMask,
+            out var avatarDeformChainMask);
+
+        var directBindingPathToAvatarNodeIdx = new Dictionary<uint, int>(
+            (avatar.m_TOS?.Length ?? 0) + skeleton.AvatarNodeHashToIdx.Count + skeleton.MeshBoneHashToIdx.Count);
+        foreach (var kvp in skeleton.AvatarNodeHashToIdx)
+        {
+            directBindingPathToAvatarNodeIdx[kvp.Key] = kvp.Value;
+        }
+
+        foreach (var kvp in skeleton.MeshBoneHashToIdx)
+        {
+            if (kvp.Value >= 0 && kvp.Value < skeleton.MeshBoneToSkelNode.Length)
+            {
+                var sn = skeleton.MeshBoneToSkelNode[kvp.Value];
+                if (sn >= 0)
+                {
+                    directBindingPathToAvatarNodeIdx.TryAdd(kvp.Key, sn);
+                }
+            }
+        }
+
+        if (avatar.m_TOS != null)
+        {
+            foreach (var pair in avatar.m_TOS)
+            {
+                if (pair.Key == 0 || string.IsNullOrEmpty(pair.Value))
+                {
+                    continue;
+                }
+
+                if (MeshPreviewSkeletonBuilder.TryResolvePathAlias(avatarNodePathToIdx, pair.Value, out var resolvedNodeIdx))
+                {
+                    directBindingPathToAvatarNodeIdx[pair.Key] = resolvedNodeIdx;
+                }
+            }
+        }
+
         global::OpenTK.Mathematics.Vector3[]? sourceVertexData = null;
         var min = global::OpenTK.Mathematics.Vector3.Zero;
         var max = global::OpenTK.Mathematics.Vector3.Zero;
@@ -236,6 +312,10 @@ internal sealed class PreparedAnimationRigData
             DirectBindingPathToMeshBoneIdx = directBindingPathToMeshBoneIdx,
             WeightedBoneMask = weightedBoneMask,
             DeformChainMask = deformChainMask,
+            AvatarNodePathToIdx = avatarNodePathToIdx,
+            DirectBindingPathToAvatarNodeIdx = directBindingPathToAvatarNodeIdx,
+            AvatarWeightedNodeMask = avatarWeightedNodeMask,
+            AvatarDeformChainMask = avatarDeformChainMask,
             SourceVertexData = sourceVertexData,
             SourceMeshMin = min,
             SourceMeshMax = max
@@ -248,14 +328,16 @@ internal sealed class PreparedAnimationRigData
         out global::OpenTK.Mathematics.Vector3 min,
         out global::OpenTK.Mathematics.Vector3 max)
     {
-        var count = Math.Min(vertexCount, vertices.Length / 3);
+        var componentCount = vertices.Length == vertexCount * 4 ? 4 : 3;
+        var count = Math.Min(vertexCount, vertices.Length / componentCount);
         var result = new global::OpenTK.Mathematics.Vector3[count];
         min = new global::OpenTK.Mathematics.Vector3(float.MaxValue);
         max = new global::OpenTK.Mathematics.Vector3(float.MinValue);
         for (var i = 0; i < count; i++)
         {
-            var offset = i * 3;
-            var v = new global::OpenTK.Mathematics.Vector3(-vertices[offset], vertices[offset + 1], vertices[offset + 2]);
+            var offset = i * componentCount;
+            // Keep Unity +X convention matching MeshPreviewControl.ExtractMeshVertices, m_BindPose, and Avatar FK transforms.
+            var v = new global::OpenTK.Mathematics.Vector3(vertices[offset], vertices[offset + 1], vertices[offset + 2]);
             result[i] = v;
             if (float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z))
             {
@@ -913,6 +995,8 @@ public partial class MainWindow
         token.ThrowIfCancellationRequested();
 
         var skeleton = rigData.Skeleton;
+        var defaultPose = avatar.m_Avatar.m_DefaultPose?.m_X ?? avatar.m_Avatar.m_AvatarSkeletonPose?.m_X;
+        var useFullAvatarSkeleton = rigData.HasFullAvatarSkeleton && defaultPose != null && defaultPose.Length > 0;
         var muscleClip = clip.m_MuscleClip;
         var tracks = new AnimationTrackSet();
 
@@ -926,8 +1010,8 @@ public partial class MainWindow
                     innerClip,
                     bindings,
                     muscleClip.m_StopTime,
-                    rigData.TryResolveBindingBone,
-                    rigData.ShouldUseBinding,
+                    useFullAvatarSkeleton ? rigData.TryResolveAvatarNodeBinding : rigData.TryResolveBindingBone,
+                    useFullAvatarSkeleton ? rigData.ShouldUseAvatarNodeBinding : rigData.ShouldUseBinding,
                     tracks,
                     updateMaxTimeBeforeBoundsCheck: true);
             }
@@ -938,20 +1022,26 @@ public partial class MainWindow
                     clip,
                     avatar,
                     skeleton,
-                    rigData.MeshBonePathToIdx,
-                    rigData.ShouldUseBinding,
-                    tracks);
+                    useFullAvatarSkeleton ? rigData.AvatarNodePathToIdx : rigData.MeshBonePathToIdx,
+                    useFullAvatarSkeleton ? rigData.ShouldUseAvatarNodeBinding : rigData.ShouldUseBinding,
+                    tracks,
+                    targetAvatarNodeIndices: useFullAvatarSkeleton);
             }
         }
 
         if (tracks.TotalTrackCount == 0)
         {
-            bool TryResolveCurvePath(string? path, out int meshBoneIdx)
+            var pathMap = useFullAvatarSkeleton ? rigData.AvatarNodePathToIdx : rigData.MeshBonePathToIdx;
+            bool TryResolveCurvePath(string? path, out int targetIdx)
             {
-                return MeshPreviewSkeletonBuilder.TryResolvePathAlias(rigData.MeshBonePathToIdx, path, out meshBoneIdx);
+                return MeshPreviewSkeletonBuilder.TryResolvePathAlias(pathMap, path, out targetIdx);
             }
 
-            MeshPreviewAnimationEvaluator.ExtractLegacyCurves(clip, TryResolveCurvePath, rigData.ShouldUseBinding, tracks);
+            MeshPreviewAnimationEvaluator.ExtractLegacyCurves(
+                clip,
+                TryResolveCurvePath,
+                useFullAvatarSkeleton ? rigData.ShouldUseAvatarNodeBinding : rigData.ShouldUseBinding,
+                tracks);
         }
 
         if (tracks.TotalTrackCount == 0 && muscleClip?.m_Clip == null)
@@ -994,33 +1084,61 @@ public partial class MainWindow
             };
         }
 
-        var defaultPose = avatar.m_Avatar.m_DefaultPose?.m_X ?? avatar.m_Avatar.m_AvatarSkeletonPose?.m_X;
         var sampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30f;
         var stopTime = muscleClip?.m_StopTime ?? 0f;
         var maxTime = tracks.MaxTime > 0 ? tracks.MaxTime : stopTime > 0 ? stopTime : 1f;
 
-        MeshPreviewAnimationEvaluator.EvaluateFramesFromTracks(
-            avatarMesh,
-            skeleton.RestBonePositions,
-            skeleton.MeshParentIndices,
-            skeleton.MeshBoneNames,
-            skeleton.BindPoseInverses,
-            rigData.DeformChainMask,
-            rigData.WeightedBoneMask,
-            tracks.PosTracks,
-            tracks.RotTracks,
-            tracks.ScaleTracks,
-            sampleRate,
-            maxTime,
-            defaultPose,
-            skeleton.MeshBoneToSkelNode,
-            useCeilingFrameCount: false,
-            failIfAllTracksFiltered: false,
-            out var allFrames,
-            out var allBoneMatrices,
-            out var renderParentIndices,
-            out var resolvedSampleRate,
-            out _);
+        global::OpenTK.Mathematics.Vector3[][] allFrames;
+        global::OpenTK.Mathematics.Matrix4[][] allBoneMatrices;
+        int[] renderParentIndices;
+        float resolvedSampleRate;
+
+        if (useFullAvatarSkeleton && defaultPose != null)
+        {
+            MeshPreviewAnimationEvaluator.EvaluateFramesFromAvatarSkeletonTracks(
+                avatarMesh,
+                skeleton,
+                defaultPose,
+                rigData.DeformChainMask,
+                rigData.WeightedBoneMask,
+                tracks.PosTracks,
+                tracks.RotTracks,
+                tracks.ScaleTracks,
+                sampleRate,
+                maxTime,
+                useCeilingFrameCount: false,
+                failIfAllTracksFiltered: false,
+                out allFrames,
+                out allBoneMatrices,
+                out renderParentIndices,
+                out resolvedSampleRate,
+                out _);
+        }
+        else
+        {
+            MeshPreviewAnimationEvaluator.EvaluateFramesFromTracks(
+                avatarMesh,
+                skeleton.RestBonePositions,
+                skeleton.MeshParentIndices,
+                skeleton.MeshBoneNames,
+                skeleton.BindPoseInverses,
+                rigData.DeformChainMask,
+                rigData.WeightedBoneMask,
+                tracks.PosTracks,
+                tracks.RotTracks,
+                tracks.ScaleTracks,
+                sampleRate,
+                maxTime,
+                defaultPose,
+                skeleton.MeshBoneToSkelNode,
+                useCeilingFrameCount: false,
+                failIfAllTracksFiltered: false,
+                out allFrames,
+                out allBoneMatrices,
+                out renderParentIndices,
+                out resolvedSampleRate,
+                out _);
+        }
 
         token.ThrowIfCancellationRequested();
 

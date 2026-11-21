@@ -149,14 +149,16 @@ namespace AssetStudio.Avalonia
             var referenceMesh = precomputedReferenceMesh
                 ?? PreviewMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, densityPercent);
 
+            var animMin = new Vector3(float.MaxValue);
+            var animMax = new Vector3(float.MinValue);
             Vector3[][]? localAnimatedMeshVerts = BuildAnimatedAvatarReferenceVertices(
                 m_Mesh,
                 sourceVertexData,
                 referenceMesh,
                 boneMatrices,
                 parentIndices,
-                ref min,
-                ref max,
+                ref animMin,
+                ref animMax,
                 expandBounds: true);
 
             var firstFrameBones = frames[0];
@@ -164,12 +166,24 @@ namespace AssetStudio.Avalonia
             {
                 foreach (var bonePosition in frame)
                 {
-                    ExpandBounds(bonePosition, ref min, ref max);
+                    ExpandBounds(bonePosition, ref animMin, ref animMax);
                 }
             }
 
+            if (localAnimatedMeshVerts == null || !IsFinitePoint(animMin) || !IsFinitePoint(animMax) || animMin.X > animMax.X)
+            {
+                ExpandBounds(sourceMeshMin, ref animMin, ref animMax);
+                ExpandBounds(sourceMeshMax, ref animMin, ref animMax);
+            }
+
+            if (!IsFinitePoint(animMin) || !IsFinitePoint(animMax) || animMin.X > animMax.X)
+            {
+                animMin = sourceMeshMin;
+                animMax = sourceMeshMax;
+            }
+
             var skeletonVerts = BuildSkeletonVerticesStatic(firstFrameBones, parentIndices, boneScale, out int boneLines, out int jointPoints);
-            var localModelMatrixData = CreatePreviewModelMatrix(min, max);
+            var localModelMatrixData = CreatePreviewModelMatrix(animMin, animMax);
             var autoViewMatrix = CreateAvatarInitialViewMatrix(firstFrameBones, boneNames);
 
             return new PreparedAvatarPreviewGLData
@@ -206,7 +220,9 @@ namespace AssetStudio.Avalonia
             avatarReferenceSourceIndices = prepared.SourceIndices;
             avatarReferenceMin = prepared.SourceMeshMin;
             avatarReferenceMax = prepared.SourceMeshMax;
-            vertexData = prepared.ReferenceMesh.Vertices;
+            vertexData = prepared.IsAnimated && prepared.AnimatedMeshVertices != null && prepared.AnimatedMeshVertices.Length > 0
+                ? prepared.AnimatedMeshVertices[0]
+                : prepared.ReferenceMesh.Vertices;
             SetInitialPreviewFrame(prepared.AutoViewMatrix, prepared.ModelMatrixData);
             indiceData = prepared.ReferenceMesh.Indices;
             normalData = null;
@@ -386,18 +402,33 @@ namespace AssetStudio.Avalonia
                 var localIndiceData = referenceMesh.Indices;
 
                 // Compute skinned mesh vertices for all frames of the animation
-                Vector3[][]? localAnimatedMeshVerts = BuildAnimatedAvatarReferenceVertices(m_Mesh, sourceVertexData, referenceMesh, boneMatrices, parentIndices, ref min, ref max, true);
+                var animMin = new Vector3(float.MaxValue);
+                var animMax = new Vector3(float.MinValue);
+                Vector3[][]? localAnimatedMeshVerts = BuildAnimatedAvatarReferenceVertices(m_Mesh, sourceVertexData, referenceMesh, boneMatrices, parentIndices, ref animMin, ref animMax, true);
 
                 var firstFrameBones = frames[0];
                 foreach (var frame in frames)
                 {
                     foreach (var bonePosition in frame)
                     {
-                        ExpandBounds(bonePosition, ref min, ref max);
+                        ExpandBounds(bonePosition, ref animMin, ref animMax);
                     }
                 }
+
+                if (localAnimatedMeshVerts == null || !IsFinitePoint(animMin) || !IsFinitePoint(animMax) || animMin.X > animMax.X)
+                {
+                    ExpandBounds(sourceMeshMin, ref animMin, ref animMax);
+                    ExpandBounds(sourceMeshMax, ref animMin, ref animMax);
+                }
+
+                if (!IsFinitePoint(animMin) || !IsFinitePoint(animMax) || animMin.X > animMax.X)
+                {
+                    animMin = sourceMeshMin;
+                    animMax = sourceMeshMax;
+                }
+
                 var skeletonVerts = BuildSkeletonVertices(firstFrameBones, parentIndices, out int boneLines, out int jointPoints);
-                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
+                var localModelMatrixData = CreatePreviewModelMatrix(animMin, animMax);
 
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -414,7 +445,9 @@ namespace AssetStudio.Avalonia
                     avatarReferenceMax = sourceMeshMax;
                     avatarReferenceBoneMatrices = boneMatrices;
                     avatarReferenceParentIndices = parentIndices;
-                    vertexData = localVertexData;
+                    vertexData = localAnimatedMeshVerts != null && localAnimatedMeshVerts.Length > 0
+                        ? localAnimatedMeshVerts[0]
+                        : localVertexData;
                     SetInitialPreviewFrame(autoViewMatrix, localModelMatrixData);
                     indiceData = localIndiceData;
                     normalData = null;
@@ -587,15 +620,20 @@ namespace AssetStudio.Avalonia
                     Vector3 skinnedPos = Vector3.Zero;
                     float totalWeight = 0f;
 
-                    for (int j = 0; j < 4; j++)
+                    var weights = skin?.weight;
+                    var boneIndices = skin?.boneIndex;
+                    int influenceCount = weights != null && boneIndices != null
+                        ? Math.Min(weights.Length, boneIndices.Length)
+                        : 0;
+                    for (int j = 0; j < influenceCount; j++)
                     {
-                        float w = skin.weight[j];
+                        float w = weights![j];
                         if (w <= 0)
                         {
                             continue;
                         }
 
-                        int bIdx = skin.boneIndex[j];
+                        int bIdx = boneIndices![j];
                         if (bIdx >= 0 && bIdx < skinningMatrices.Length)
                         {
                             var posB = Vector3.TransformPosition(sourceVertex, skinningMatrices[bIdx]);
@@ -653,7 +691,9 @@ namespace AssetStudio.Avalonia
                         return;
                     }
 
-                    vertexData = referenceMesh.Vertices;
+                    vertexData = rebuiltAnimatedVertices != null && animCurrentFrame < rebuiltAnimatedVertices.Length
+                        ? rebuiltAnimatedVertices[animCurrentFrame]
+                        : referenceMesh.Vertices;
                     indiceData = referenceMesh.Indices;
                     animatedMeshVertices = rebuiltAnimatedVertices;
 

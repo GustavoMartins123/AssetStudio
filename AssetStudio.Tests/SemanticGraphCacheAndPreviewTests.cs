@@ -1074,6 +1074,419 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void AnimationPreviewSkinning_FullAvatarHierarchy_UnflippedVertices_AndBindPoseFallback_AreExact()
+        {
+            static AssetStudio.Matrix4x4 ToAssetMatrix(OpenTK.Mathematics.Matrix4 m) => new AssetStudio.Matrix4x4
+            {
+                M00 = m.M11, M01 = m.M12, M02 = m.M13, M03 = m.M14,
+                M10 = m.M21, M11 = m.M22, M12 = m.M23, M13 = m.M24,
+                M20 = m.M31, M21 = m.M32, M22 = m.M33, M23 = m.M34,
+                M30 = m.M41, M31 = m.M42, M32 = m.M43, M33 = m.M44
+            };
+
+            // Avatar hierarchy:
+            //   0: Root        (non-mesh, identity)
+            //   1: Root/Point  (intermediate non-mesh parent: t=(0,10,0), q=-90 deg X, s=(2,2,2))
+            //   2: Root/Point/Arm (mesh bone 0: t=(3,0,4), q=identity, s=(1,1,1))
+            //   3: Root/Point/Arm/Hand (mesh bone 1: t=(2,0,0), q=identity, s=(1,1,1))
+            var paths = new[]
+            {
+                "Root",
+                "Root/Point",
+                "Root/Point/Arm",
+                "Root/Point/Arm/Hand"
+            };
+            var parentIds = new[] { -1, 0, 1, 2 };
+            var qNeg90X = OpenTK.Mathematics.Quaternion.FromAxisAngle(OpenTK.Mathematics.Vector3.UnitX, -MathF.PI * 0.5f);
+            var localPos = new[]
+            {
+                OpenTK.Mathematics.Vector3.Zero,
+                new OpenTK.Mathematics.Vector3(0f, 10f, 0f),
+                new OpenTK.Mathematics.Vector3(3f, 0f, 4f),
+                new OpenTK.Mathematics.Vector3(2f, 0f, 0f)
+            };
+            var localRot = new[]
+            {
+                OpenTK.Mathematics.Quaternion.Identity,
+                qNeg90X,
+                OpenTK.Mathematics.Quaternion.Identity,
+                OpenTK.Mathematics.Quaternion.Identity
+            };
+            var localScale = new[]
+            {
+                OpenTK.Mathematics.Vector3.One,
+                new OpenTK.Mathematics.Vector3(2f, 2f, 2f),
+                OpenTK.Mathematics.Vector3.One,
+                OpenTK.Mathematics.Vector3.One
+            };
+
+            var nodes = new Node[paths.Length];
+            var ids = new uint[paths.Length];
+            var tos = new KeyValuePair<uint, string>[paths.Length];
+            var poseX = new XForm[paths.Length];
+            var restWorlds = new OpenTK.Mathematics.Matrix4[paths.Length];
+
+            for (int i = 0; i < paths.Length; i++)
+            {
+                ids[i] = MainWindow.ComputeUnityBonePathHash(paths[i]);
+                tos[i] = new KeyValuePair<uint, string>(ids[i], paths[i]);
+
+                var node = (Node)RuntimeHelpers.GetUninitializedObject(typeof(Node));
+                node.m_ParentId = parentIds[i];
+                node.m_AxesId = -1;
+                nodes[i] = node;
+
+                var xf = (XForm)RuntimeHelpers.GetUninitializedObject(typeof(XForm));
+                xf.t = new AssetStudio.Vector3(localPos[i].X, localPos[i].Y, localPos[i].Z);
+                xf.q = new AssetStudio.Quaternion(localRot[i].X, localRot[i].Y, localRot[i].Z, localRot[i].W);
+                xf.s = new AssetStudio.Vector3(localScale[i].X, localScale[i].Y, localScale[i].Z);
+                poseX[i] = xf;
+
+                var localMat = MeshPreviewSkeletonBuilder.CreateLocalMatrix(localPos[i], localRot[i], localScale[i]);
+                restWorlds[i] = parentIds[i] >= 0 ? localMat * restWorlds[parentIds[i]] : localMat;
+            }
+
+            var avatar = (Avatar)RuntimeHelpers.GetUninitializedObject(typeof(Avatar));
+            avatar.m_Name = "SyntheticAvatar";
+            avatar.m_PathID = 9001;
+            var skeleton = (Skeleton)RuntimeHelpers.GetUninitializedObject(typeof(Skeleton));
+            skeleton.m_Node = nodes;
+            skeleton.m_ID = ids;
+            skeleton.m_AxesArray = Array.Empty<Axes>();
+            var skeletonPose = (SkeletonPose)RuntimeHelpers.GetUninitializedObject(typeof(SkeletonPose));
+            skeletonPose.m_X = poseX;
+            var avatarConstant = (AvatarConstant)RuntimeHelpers.GetUninitializedObject(typeof(AvatarConstant));
+            avatarConstant.m_AvatarSkeleton = skeleton;
+            avatarConstant.m_AvatarSkeletonPose = skeletonPose;
+            avatarConstant.m_DefaultPose = skeletonPose;
+            avatar.m_Avatar = avatarConstant;
+            avatar.m_TOS = tos;
+
+            // Asymmetric +X vertices in 4-component stride (x, y, z, w) so any -X flip or stride-3 bug fails loudly.
+            // Place vertices near Arm/Hand rest world positions so rest bind pose maps them to themselves.
+            var mesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            typeof(Mesh).GetField("m_ProcessLock", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(mesh, new object());
+            typeof(Mesh).GetField("m_DataProcessed", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.SetValue(mesh, true);
+            mesh.m_Name = "SyntheticArmMesh";
+            mesh.m_PathID = 9002;
+            mesh.m_VertexCount = 3;
+            var expectedLocalVerts = new[]
+            {
+                new OpenTK.Mathematics.Vector3(7f, 18f, 0f),
+                new OpenTK.Mathematics.Vector3(10f, 18f, 0f),
+                new OpenTK.Mathematics.Vector3(10f, 20f, 1f)
+            };
+            mesh.m_Vertices = new[]
+            {
+                expectedLocalVerts[0].X, expectedLocalVerts[0].Y, expectedLocalVerts[0].Z, 1f,
+                expectedLocalVerts[1].X, expectedLocalVerts[1].Y, expectedLocalVerts[1].Z, 1f,
+                expectedLocalVerts[2].X, expectedLocalVerts[2].Y, expectedLocalVerts[2].Z, 1f
+            };
+            mesh.m_Indices = new List<uint> { 0, 1, 2 };
+            mesh.m_BoneNameHashes = new[] { ids[2], ids[3] };
+            mesh.m_BindPose = new[]
+            {
+                ToAssetMatrix(restWorlds[2].Inverted()),
+                ToAssetMatrix(restWorlds[3].Inverted())
+            };
+            mesh.m_Skin = new BoneWeights4[3];
+            for (int v = 0; v < 3; v++)
+            {
+                var bw = (BoneWeights4)RuntimeHelpers.GetUninitializedObject(typeof(BoneWeights4));
+                bw.boneIndex = new[] { v == 0 ? 0 : 1, 0, 0, 0 };
+                bw.weight = new[] { 1f, 0f, 0f, 0f };
+                mesh.m_Skin[v] = bw;
+            }
+
+            var rig = PreparedAnimationRigData.TryBuild("synthetic", avatar, mesh);
+            Assert.NotNull(rig);
+            Assert.True(rig!.HasFullAvatarSkeleton);
+            Assert.Equal(4, rig.Skeleton.AvatarNodeCount);
+            Assert.Equal(2, rig.Skeleton.MeshBoneCount);
+            Assert.True(rig.AvatarDeformChainMask[0]);
+            Assert.True(rig.AvatarDeformChainMask[1]); // Intermediate non-mesh parent MUST be in deform chain
+            Assert.True(rig.AvatarDeformChainMask[2]);
+            Assert.True(rig.AvatarDeformChainMask[3]);
+
+            // 1. Verify ExtractRigMeshVertices keeps +X (no X-mirroring) and supports stride-4 vertices
+            Assert.NotNull(rig.SourceVertexData);
+            for (int v = 0; v < 3; v++)
+            {
+                Assert.True((rig.SourceVertexData![v] - expectedLocalVerts[v]).Length < 1e-5f,
+                    $"Vertex {v} mismatch: got {rig.SourceVertexData[v]}, expected {expectedLocalVerts[v]}");
+            }
+
+            // 2. Animate ONLY intermediate non-mesh node 1 (Root/Point): frame 0 = rest pose, frame 1 = +90 deg Y rotation on top of -90 deg X
+            var qFrame1 = qNeg90X * OpenTK.Mathematics.Quaternion.FromAxisAngle(OpenTK.Mathematics.Vector3.UnitY, MathF.PI * 0.5f);
+            var rotTracks = new Dictionary<int, List<(float time, OpenTK.Mathematics.Quaternion value)>>
+            {
+                [1] = new()
+                {
+                    (0f, qNeg90X),
+                    (1f, qFrame1)
+                }
+            };
+            var ok = MeshPreviewAnimationEvaluator.EvaluateFramesFromAvatarSkeletonTracks(
+                mesh,
+                rig.Skeleton,
+                poseX,
+                rig.DeformChainMask,
+                rig.WeightedBoneMask,
+                new Dictionary<int, List<(float time, OpenTK.Mathematics.Vector3 value)>>(),
+                rotTracks,
+                new Dictionary<int, List<(float time, OpenTK.Mathematics.Vector3 value)>>(),
+                sampleRate: 1f,
+                maxTime: 2f,
+                useCeilingFrameCount: false,
+                failIfAllTracksFiltered: true,
+                out var frames,
+                out var boneMatrices,
+                out var renderParents,
+                out var resolvedFps,
+                out var reason);
+
+            Assert.True(ok, reason);
+            Assert.Equal(2, frames.Length);
+
+            var gl = MeshPreviewControl.PrepareAnimatedAvatarGLData(
+                mesh, frames, boneMatrices, renderParents, resolvedFps, rig.Skeleton.MeshBoneNames,
+                100f, 0.1f, rig.SourceVertexData, rig.SourceMeshMin, rig.SourceMeshMax, rig.GetOrBuildReferenceMesh(100f));
+            Assert.NotNull(gl);
+            Assert.NotNull(gl!.AnimatedMeshVertices);
+            Assert.Equal(2, gl.AnimatedMeshVertices!.Length);
+
+            // Frame 0 is exact rest pose -> bindPose * restWorld == Identity -> vertices unchanged (no -X flip!)
+            for (int v = 0; v < 3; v++)
+            {
+                int srcIdx = gl.ReferenceMesh.SourceVertexIndices[v];
+                Assert.True((gl.AnimatedMeshVertices[0][v] - expectedLocalVerts[srcIdx]).Length < 1e-3f,
+                    $"Frame 0 skinned vertex {v} drifted: got {gl.AnimatedMeshVertices[0][v]}, expected {expectedLocalVerts[srcIdx]}");
+            }
+
+            // Frame 1 rotates intermediate non-mesh node 1 (Root/Point): verify world transform propagated to mesh bones & vertices
+            var expectedNode1WorldF1 = MeshPreviewSkeletonBuilder.CreateLocalMatrix(localPos[1], qFrame1, localScale[1]);
+            var expectedArmWorldF1 = MeshPreviewSkeletonBuilder.CreateLocalMatrix(localPos[2], localRot[2], localScale[2]) * expectedNode1WorldF1;
+            var expectedHandWorldF1 = MeshPreviewSkeletonBuilder.CreateLocalMatrix(localPos[3], localRot[3], localScale[3]) * expectedArmWorldF1;
+            Assert.True((frames[1][0] - expectedArmWorldF1.ExtractTranslation()).Length < 1e-3f);
+            Assert.True((frames[1][1] - expectedHandWorldF1.ExtractTranslation()).Length < 1e-3f);
+
+            var expectedSkinArmF1 = restWorlds[2].Inverted() * expectedArmWorldF1;
+            var expectedSkinHandF1 = restWorlds[3].Inverted() * expectedHandWorldF1;
+            for (int v = 0; v < 3; v++)
+            {
+                int srcIdx = gl.ReferenceMesh.SourceVertexIndices[v];
+                var skinMat = srcIdx == 0 ? expectedSkinArmF1 : expectedSkinHandF1;
+                var expectedPos = OpenTK.Mathematics.Vector3.TransformPosition(expectedLocalVerts[srcIdx], skinMat);
+                Assert.True((gl.AnimatedMeshVertices[1][v] - expectedPos).Length < 1e-3f,
+                    $"Frame 1 skinned vertex {v} mismatch: got {gl.AnimatedMeshVertices[1][v]}, expected {expectedPos}");
+            }
+
+            // 3. Verify EvaluateFramesFromTracks bind-pose local fallback (avatarDefaultPose == null) is NOT inverted:
+            // With an identity root track, child bone world matrix must equal BindPoseInverses[1] (restWorlds[3]).
+            var fallbackRotTracks = new Dictionary<int, List<(float time, OpenTK.Mathematics.Quaternion value)>>
+            {
+                [0] = new() { (0f, rig.Skeleton.BindPoseInverses[0].ExtractRotation()) }
+            };
+            var okFallback = MeshPreviewAnimationEvaluator.EvaluateFramesFromTracks(
+                mesh,
+                rig.Skeleton.RestBonePositions,
+                rig.Skeleton.MeshParentIndices,
+                rig.Skeleton.MeshBoneNames,
+                rig.Skeleton.BindPoseInverses,
+                rig.DeformChainMask,
+                rig.WeightedBoneMask,
+                new Dictionary<int, List<(float time, OpenTK.Mathematics.Vector3 value)>>(),
+                fallbackRotTracks,
+                new Dictionary<int, List<(float time, OpenTK.Mathematics.Vector3 value)>>(),
+                sampleRate: 1f,
+                maxTime: 1f,
+                avatarDefaultPose: null,
+                meshBoneToSkelNode: null,
+                useCeilingFrameCount: false,
+                failIfAllTracksFiltered: false,
+                out var fbFrames,
+                out var fbMatrices,
+                out _,
+                out _,
+                out var fbReason);
+
+            Assert.True(okFallback, fbReason);
+            Assert.Single(fbFrames);
+            Assert.True((fbMatrices[0][1].ExtractTranslation() - restWorlds[3].ExtractTranslation()).Length < 1e-3f,
+                $"Bind-pose fallback child translation mismatch: got {fbMatrices[0][1].ExtractTranslation()}, expected {restWorlds[3].ExtractTranslation()}");
+        }
+
+        [Fact]
+        public void AnimationPreviewSkinning_RealGameBaalSdAndRedLady_ProducesTightUndistortedMesh()
+        {
+            const string resPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\resources.assets";
+            if (!File.Exists(resPath))
+            {
+                return;
+            }
+
+            var am = new AssetsManager();
+            am.LoadFiles(resPath);
+            var sf = am.assetsFileList[0];
+
+            Mesh? baalMesh = null;
+            Avatar? baalAvatar = null;
+            AnimationClip? punchClip = null;
+            Mesh? redLadyMesh = null;
+            Avatar? redLadyAvatar = null;
+            AnimationClip? chargeBeamClip = null;
+
+            foreach (var info in sf.m_Objects)
+            {
+                if (info.m_PathID is not (1681 or 3367 or 2449 or 1631 or 3382 or 2799))
+                {
+                    continue;
+                }
+
+                var reader = new ObjectReader(sf.reader, sf, info);
+                switch (info.classID)
+                {
+                    case (int)ClassIDType.Mesh:
+                        var mesh = new Mesh(reader);
+                        if (info.m_PathID == 1681) baalMesh = mesh;
+                        else if (info.m_PathID == 1631) redLadyMesh = mesh;
+                        break;
+                    case (int)ClassIDType.Avatar:
+                        var av = new Avatar(reader);
+                        if (info.m_PathID == 3367) baalAvatar = av;
+                        else if (info.m_PathID == 3382) redLadyAvatar = av;
+                        break;
+                    case (int)ClassIDType.AnimationClip:
+                        var clip = new AnimationClip(reader);
+                        if (info.m_PathID == 2449) punchClip = clip;
+                        else if (info.m_PathID == 2799) chargeBeamClip = clip;
+                        break;
+                }
+            }
+
+            Assert.NotNull(baalMesh);
+            Assert.NotNull(baalAvatar);
+            Assert.NotNull(punchClip);
+
+            void VerifyClipRig(string label, Avatar avatar, Mesh mesh, AnimationClip clip, int probeFrame, int minTracks, float maxAllowedTriEdge, float maxBoundsMarginRatio)
+            {
+                var rig = PreparedAnimationRigData.TryBuild(label, avatar, mesh);
+                Assert.NotNull(rig);
+                Assert.True(rig!.HasFullAvatarSkeleton);
+
+                var defaultPose = avatar.m_Avatar.m_DefaultPose?.m_X ?? avatar.m_Avatar.m_AvatarSkeletonPose?.m_X;
+                Assert.NotNull(defaultPose);
+                Assert.NotEmpty(defaultPose!);
+
+                var innerClip = clip.m_MuscleClip!.m_Clip;
+                var bindings = clip.m_ClipBindingConstant ?? innerClip.ConvertValueArrayToGenericBinding();
+                var tracks = new AnimationTrackSet();
+                MeshPreviewAnimationEvaluator.ExtractMuscleClipTracks(
+                    innerClip,
+                    bindings,
+                    clip.m_MuscleClip.m_StopTime,
+                    rig.TryResolveAvatarNodeBinding,
+                    rig.ShouldUseAvatarNodeBinding,
+                    tracks,
+                    updateMaxTimeBeforeBoundsCheck: true);
+                tracks.SortAll();
+
+                Assert.True(tracks.TotalTrackCount >= minTracks,
+                    $"{label}: expected >= {minTracks} full-Avatar tracks, got {tracks.TotalTrackCount}");
+
+                var sampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30f;
+                var maxTime = tracks.MaxTime > 0 ? tracks.MaxTime : clip.m_MuscleClip.m_StopTime;
+                var ok = MeshPreviewAnimationEvaluator.EvaluateFramesFromAvatarSkeletonTracks(
+                    mesh,
+                    rig.Skeleton,
+                    defaultPose!,
+                    rig.DeformChainMask,
+                    rig.WeightedBoneMask,
+                    tracks.PosTracks,
+                    tracks.RotTracks,
+                    tracks.ScaleTracks,
+                    sampleRate,
+                    maxTime,
+                    useCeilingFrameCount: false,
+                    failIfAllTracksFiltered: false,
+                    out var frames,
+                    out var boneMatrices,
+                    out var renderParents,
+                    out var resolvedFps,
+                    out var reason);
+
+                Assert.True(ok, $"{label}: {reason}");
+                Assert.NotEmpty(frames);
+
+                var gl = MeshPreviewControl.PrepareAnimatedAvatarGLData(
+                    mesh,
+                    frames,
+                    boneMatrices,
+                    renderParents,
+                    resolvedFps,
+                    rig.Skeleton.MeshBoneNames,
+                    100f,
+                    0.1f,
+                    rig.SourceVertexData,
+                    rig.SourceMeshMin,
+                    rig.SourceMeshMax,
+                    rig.GetOrBuildReferenceMesh(100f));
+
+                Assert.NotNull(gl);
+                Assert.NotNull(gl!.AnimatedMeshVertices);
+                int f = Math.Clamp(probeFrame, 0, gl.AnimatedMeshVertices!.Length - 1);
+                var verts = gl.AnimatedMeshVertices[f];
+                var bones = frames[f];
+                var indices = gl.ReferenceMesh.Indices;
+
+                var vMin = new OpenTK.Mathematics.Vector3(float.MaxValue);
+                var vMax = new OpenTK.Mathematics.Vector3(float.MinValue);
+                foreach (var v in verts)
+                {
+                    Assert.True(float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z), $"{label}: non-finite skinned vertex");
+                    vMin = OpenTK.Mathematics.Vector3.ComponentMin(vMin, v);
+                    vMax = OpenTK.Mathematics.Vector3.ComponentMax(vMax, v);
+                }
+
+                var bMin = new OpenTK.Mathematics.Vector3(float.MaxValue);
+                var bMax = new OpenTK.Mathematics.Vector3(float.MinValue);
+                foreach (var b in bones)
+                {
+                    bMin = OpenTK.Mathematics.Vector3.ComponentMin(bMin, b);
+                    bMax = OpenTK.Mathematics.Vector3.ComponentMax(bMax, b);
+                }
+
+                float maxTriEdge = 0f;
+                for (int t = 0; t + 2 < indices.Length; t += 3)
+                {
+                    var p0 = verts[indices[t]];
+                    var p1 = verts[indices[t + 1]];
+                    var p2 = verts[indices[t + 2]];
+                    maxTriEdge = Math.Max(maxTriEdge, Math.Max((p0 - p1).Length, Math.Max((p1 - p2).Length, (p2 - p0).Length)));
+                }
+
+                var boneDiag = Math.Max(1e-3f, (bMax - bMin).Length);
+                var allowedMargin = boneDiag * maxBoundsMarginRatio;
+                _output.WriteLine($"{label} frame {f}/{frames.Length}: tracks={tracks.TotalTrackCount}, maxTriEdge={maxTriEdge:F2}, boneDiag={boneDiag:F2}, bones=({bMin.X:F1},{bMin.Y:F1},{bMin.Z:F1})..({bMax.X:F1},{bMax.Y:F1},{bMax.Z:F1}), verts=({vMin.X:F1},{vMin.Y:F1},{vMin.Z:F1})..({vMax.X:F1},{vMax.Y:F1},{vMax.Z:F1})");
+
+                Assert.True(maxTriEdge < maxAllowedTriEdge,
+                    $"{label}: max triangle edge {maxTriEdge:F2} exceeded {maxAllowedTriEdge:F2} (mesh tearing/explosion regression)");
+                Assert.True(bMin.X - vMin.X < allowedMargin && vMax.X - bMax.X < allowedMargin
+                    && bMin.Y - vMin.Y < allowedMargin && vMax.Y - bMax.Y < allowedMargin
+                    && bMin.Z - vMin.Z < allowedMargin && vMax.Z - bMax.Z < allowedMargin,
+                    $"{label}: skinned mesh bounds significantly overflow skeleton bounds (margin limit {allowedMargin:F2})");
+            }
+
+            // BOSS_baal_sd punch frame 123: previously maxTriEdge=234.35 with tracks=531; now maxTriEdge~15.52 with tracks=600
+            VerifyClipRig("baal-sd/punch", baalAvatar!, baalMesh!, punchClip!, probeFrame: 123, minTracks: 590, maxAllowedTriEdge: 25f, maxBoundsMarginRatio: 0.12f);
+
+            if (redLadyAvatar != null && redLadyMesh != null && chargeBeamClip != null)
+            {
+                VerifyClipRig("red-lady/chargebeam2", redLadyAvatar, redLadyMesh, chargeBeamClip, probeFrame: 30, minTracks: 100, maxAllowedTriEdge: 25f, maxBoundsMarginRatio: 0.35f);
+            }
+        }
+
         private static void SeedSyntheticV14Database(string dbPath, string projectDir, string signature, string sourcePath)
         {
             using var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False");

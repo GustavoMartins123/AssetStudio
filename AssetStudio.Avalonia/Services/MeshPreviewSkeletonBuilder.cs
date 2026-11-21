@@ -14,6 +14,11 @@ internal sealed class AvatarMeshSkeletonData
     public required int[] MeshBoneToSkelNode { get; init; }
     public required string[] MeshBoneNames { get; init; }
     public required int[] MeshParentIndices { get; init; }
+    public int AvatarNodeCount { get; init; }
+    public int[] AvatarParentIndices { get; init; } = Array.Empty<int>();
+    public string[] AvatarNodeNames { get; init; } = Array.Empty<string>();
+    public Dictionary<uint, int> AvatarNodeHashToIdx { get; init; } = new();
+    public int[] SkelNodeToMeshBone { get; init; } = Array.Empty<int>();
 }
 
 /// <summary>
@@ -154,6 +159,23 @@ internal static class MeshPreviewSkeletonBuilder
             }
         }
 
+        var avatarParentIndices = new int[skelCount];
+        var avatarNodeNames = new string[skelCount];
+        var avatarNodeHashToIdx = new Dictionary<uint, int>(skelCount);
+        for (var i = 0; i < skelCount; i++)
+        {
+            avatarParentIndices[i] = nodes[i].m_ParentId;
+            if (skelIds != null && i < skelIds.Length)
+            {
+                avatarNodeHashToIdx[skelIds[i]] = i;
+                avatarNodeNames[i] = avatar.FindBonePath(skelIds[i]) ?? string.Empty;
+            }
+            else
+            {
+                avatarNodeNames[i] = string.Empty;
+            }
+        }
+
         skeleton = new AvatarMeshSkeletonData
         {
             MeshBoneCount = meshBoneCount,
@@ -162,7 +184,12 @@ internal static class MeshPreviewSkeletonBuilder
             MeshBoneHashToIdx = meshBoneHashToIdx,
             MeshBoneToSkelNode = meshBoneToSkelNode,
             MeshBoneNames = meshBoneNames,
-            MeshParentIndices = meshParentIndices
+            MeshParentIndices = meshParentIndices,
+            AvatarNodeCount = skelCount,
+            AvatarParentIndices = avatarParentIndices,
+            AvatarNodeNames = avatarNodeNames,
+            AvatarNodeHashToIdx = avatarNodeHashToIdx,
+            SkelNodeToMeshBone = skelNodeToMeshBone
         };
         return true;
     }
@@ -362,5 +389,55 @@ internal static class MeshPreviewSkeletonBuilder
 
         return weightedBoneMask[meshBoneIdx]
             || !IsAuxiliaryAnimationBone(meshBoneIdx < meshBoneNames.Length ? meshBoneNames[meshBoneIdx] : null);
+    }
+
+    public static void BuildAvatarDeformChainMasks(
+        int avatarNodeCount,
+        int[] avatarParentIndices,
+        int[] skelNodeToMeshBone,
+        bool[] meshWeightedBoneMask,
+        out bool[] avatarWeightedNodeMask,
+        out bool[] avatarDeformChainMask)
+    {
+        avatarWeightedNodeMask = new bool[avatarNodeCount];
+        avatarDeformChainMask = new bool[avatarNodeCount];
+        if (avatarNodeCount <= 0)
+        {
+            return;
+        }
+
+        var hasAnyWeighted = false;
+        for (var s = 0; s < avatarNodeCount && s < skelNodeToMeshBone.Length; s++)
+        {
+            var mb = skelNodeToMeshBone[s];
+            if (mb >= 0 && mb < meshWeightedBoneMask.Length && meshWeightedBoneMask[mb])
+            {
+                avatarWeightedNodeMask[s] = true;
+                hasAnyWeighted = true;
+            }
+        }
+
+        if (hasAnyWeighted)
+        {
+            for (var s = 0; s < avatarNodeCount; s++)
+            {
+                if (!avatarWeightedNodeMask[s])
+                {
+                    continue;
+                }
+
+                var current = s;
+                var guard = 0;
+                while (current >= 0 && current < avatarNodeCount && !avatarDeformChainMask[current] && guard++ < avatarNodeCount)
+                {
+                    avatarDeformChainMask[current] = true;
+                    current = current < avatarParentIndices.Length ? avatarParentIndices[current] : -1;
+                }
+            }
+        }
+        else
+        {
+            Array.Fill(avatarDeformChainMask, true);
+        }
     }
 }
