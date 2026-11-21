@@ -152,22 +152,151 @@ function Copy-NativeDll {
     return $false
 }
 
+function Normalize-ReleaseVersion {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    return ($Value.Trim() -replace '^[vV]+(?=[0-9])', '')
+}
+
+function Get-DefaultReleaseVersion {
+    param([string]$RepoRootPath)
+
+    $propsPath = Join-Path $RepoRootPath "Directory.Build.props"
+    if (-not (Test-Path -LiteralPath $propsPath)) {
+        return ""
+    }
+
+    try {
+        [xml]$propsXml = Get-Content -LiteralPath $propsPath
+        $candidate = $propsXml.Project.PropertyGroup.DefaultReleaseVersion |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -First 1
+        return Normalize-ReleaseVersion $candidate
+    }
+    catch {
+        return ""
+    }
+}
+
+function Invoke-GitReleaseTagQuery {
+    param(
+        [string]$RepoRootPath,
+        [string[]]$GitArgs
+    )
+
+    $gitCmd = Get-Command "git" -ErrorAction SilentlyContinue
+    if (-not $gitCmd) {
+        return $null
+    }
+
+    try {
+        $output = & $gitCmd.Source -C $RepoRootPath -c versionsort.suffix=- tag @GitArgs --list "v[0-9]*" --sort=-v:refname 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $output) {
+            return $null
+        }
+
+        foreach ($line in @($output)) {
+            $trimmed = "$line".Trim()
+            if ($trimmed -match '^[vV][0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z.-]+)?$') {
+                return Normalize-ReleaseVersion $trimmed
+            }
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function ConvertTo-ComparableNumericVersion {
+    param([string]$VersionText)
+
+    if ([string]::IsNullOrWhiteSpace($VersionText)) {
+        return $null
+    }
+
+    if ($VersionText -match '^([0-9]+(?:\.[0-9]+){0,3})') {
+        $parts = @($Matches[1].Split('.'))
+        while ($parts.Count -lt 4) {
+            $parts += '0'
+        }
+        return [Version]::new([int]$parts[0], [int]$parts[1], [int]$parts[2], [int]$parts[3])
+    }
+
+    return $null
+}
+
+function Resolve-ReleaseVersion {
+    param(
+        [string]$ExplicitVersion,
+        [string]$RepoRootPath
+    )
+
+    $explicit = Normalize-ReleaseVersion $ExplicitVersion
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        return $explicit
+    }
+
+    $envVersion = Normalize-ReleaseVersion $env:RELEASE_VERSION
+    if (-not [string]::IsNullOrWhiteSpace($envVersion)) {
+        return $envVersion
+    }
+
+    $exactTag = Invoke-GitReleaseTagQuery -RepoRootPath $RepoRootPath -GitArgs @("--points-at", "HEAD")
+    if (-not [string]::IsNullOrWhiteSpace($exactTag)) {
+        return $exactTag
+    }
+
+    $defaultVersion = Get-DefaultReleaseVersion -RepoRootPath $RepoRootPath
+    $gitTag = Invoke-GitReleaseTagQuery -RepoRootPath $RepoRootPath -GitArgs @("--merged", "HEAD")
+    if ([string]::IsNullOrWhiteSpace($gitTag)) {
+        $gitTag = Invoke-GitReleaseTagQuery -RepoRootPath $RepoRootPath -GitArgs @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($gitTag)) {
+        return $defaultVersion
+    }
+
+    if ([string]::IsNullOrWhiteSpace($defaultVersion)) {
+        return $gitTag
+    }
+
+    $gitNumeric = ConvertTo-ComparableNumericVersion $gitTag
+    $defaultNumeric = ConvertTo-ComparableNumericVersion $defaultVersion
+    if ($null -eq $gitNumeric) {
+        return $defaultVersion
+    }
+    if ($null -eq $defaultNumeric) {
+        return $gitTag
+    }
+
+    if ($gitNumeric -gt $defaultNumeric) {
+        return $gitTag
+    }
+    if ($gitNumeric -lt $defaultNumeric) {
+        return $defaultVersion
+    }
+
+    $gitIsPre = $gitTag.Contains('-')
+    $defaultIsPre = $defaultVersion.Contains('-')
+    if (-not $gitIsPre -or $defaultIsPre) {
+        return $gitTag
+    }
+
+    return $defaultVersion
+}
+
 try {
     $previousNodeReuse = $env:MSBUILDDISABLENODEREUSE
     if (-not $KeepBuildServers) {
         $env:MSBUILDDISABLENODEREUSE = "1"
     }
 
-    $resolvedVersion = if (-not [string]::IsNullOrWhiteSpace($Version)) {
-        $Version.Trim()
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
-        $env:RELEASE_VERSION.Trim()
-    }
-    else {
-        ""
-    }
-    $resolvedVersion = $resolvedVersion -replace '^[vV]+(?=[0-9])', ''
+    $resolvedVersion = Resolve-ReleaseVersion -ExplicitVersion $Version -RepoRootPath $RepoRoot
 
     $versionSummary = if (-not [string]::IsNullOrWhiteSpace($resolvedVersion)) { ", version=$resolvedVersion" } else { "" }
     Write-Host "Publishing AssetStudio.Avalonia ($Configuration, $Framework, $Runtime, self-contained=$SelfContained$versionSummary)"

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Optional version tag for artifact naming (e.g. v0.17.1). Leave empty to use project <Version>.'
+        description: 'Optional version tag for artifact naming (e.g. v0.18.0). Leave empty to auto-resolve from git release tags / DefaultReleaseVersion.'
         required: false
         type: string
         default: ''
@@ -33,6 +33,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
@@ -51,6 +53,30 @@ jobs:
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $ErrorActionPreference = "Stop"
+          function Normalize-Ver([string]$v) {
+            if ([string]::IsNullOrWhiteSpace($v)) { return "" }
+            return ($v.Trim() -replace '^[vV]+(?=[0-9])', '')
+          }
+          function Get-GitTag([string[]]$gitArgs) {
+            $out = & git -c versionsort.suffix=- tag @gitArgs --list "v[0-9]*" --sort=-v:refname 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $out) { return "" }
+            foreach ($line in @($out)) {
+              $t = "$line".Trim()
+              if ($t -match '^[vV][0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z.-]+)?$') {
+                return (Normalize-Ver $t)
+              }
+            }
+            return ""
+          }
+          function Parse-NumVer([string]$v) {
+            if ($v -match '^([0-9]+(?:\.[0-9]+){0,3})') {
+              $p = @($Matches[1].Split('.'))
+              while ($p.Count -lt 4) { $p += '0' }
+              return [Version]::new([int]$p[0], [int]$p[1], [int]$p[2], [int]$p[3])
+            }
+            return $null
+          }
+
           $raw = ""
           if ($env:REF -like "refs/tags/v*") {
             $raw = $env:REF_NAME
@@ -59,22 +85,50 @@ jobs:
             $raw = $env:INPUT_RELEASE_TAG.Trim()
           }
           else {
-            foreach ($projFile in @("AssetStudio.Avalonia/AssetStudio.Avalonia.csproj", "Directory.Build.props")) {
-              if (Test-Path -LiteralPath $projFile) {
-                [xml]$xml = Get-Content -LiteralPath $projFile
-                $candidate = $xml.Project.PropertyGroup.Version | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
-                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                  $raw = $candidate.Trim()
-                  break
+            $exactTag = Get-GitTag @("--points-at", "HEAD")
+            if (-not [string]::IsNullOrWhiteSpace($exactTag)) {
+              $raw = $exactTag
+            }
+            else {
+              $defaultVer = ""
+              if (Test-Path -LiteralPath "Directory.Build.props") {
+                [xml]$xml = Get-Content -LiteralPath "Directory.Build.props"
+                $candidate = $xml.Project.PropertyGroup.DefaultReleaseVersion | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+                $defaultVer = Normalize-Ver $candidate
+              }
+
+              $gitTag = Get-GitTag @("--merged", "HEAD")
+              if ([string]::IsNullOrWhiteSpace($gitTag)) {
+                $gitTag = Get-GitTag @()
+              }
+
+              if ([string]::IsNullOrWhiteSpace($gitTag)) {
+                $raw = $defaultVer
+              }
+              elseif ([string]::IsNullOrWhiteSpace($defaultVer)) {
+                $raw = $gitTag
+              }
+              else {
+                $gNum = Parse-NumVer $gitTag
+                $dNum = Parse-NumVer $defaultVer
+                if ($null -ne $gNum -and $null -ne $dNum -and $gNum -lt $dNum) {
+                  $raw = $defaultVer
+                }
+                elseif ($null -ne $gNum -and $null -ne $dNum -and $gNum -eq $dNum -and $gitTag.Contains('-') -and -not $defaultVer.Contains('-')) {
+                  $raw = $defaultVer
+                }
+                else {
+                  $raw = $gitTag
                 }
               }
-            }
-            if ([string]::IsNullOrWhiteSpace($raw)) {
-              $raw = "0.17.1"
+
+              if ([string]::IsNullOrWhiteSpace($raw)) {
+                $raw = "0.18.0"
+              }
             }
           }
 
-          $version = $raw -replace '^[vV]', ''
+          $version = Normalize-Ver $raw
           if ($version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
             throw "Invalid release version '$version' derived from '$raw'."
           }
@@ -138,6 +192,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
@@ -158,21 +214,75 @@ jobs:
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
+          normalize_ver() {
+            local v="${1:-}"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            while [[ "$v" =~ ^[vV][0-9] ]]; do
+              v="${v#[vV]}"
+            done
+            printf '%s' "$v"
+          }
+          get_git_tag() {
+            local tag=""
+            tag="$(git -c versionsort.suffix=- tag "$@" --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -n 1 || true)"
+            if [[ "$tag" =~ ^[vV][0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z.-]+)?$ ]]; then
+              normalize_ver "$tag"
+              return 0
+            fi
+            return 1
+          }
+          cmp_num_ver() {
+            local v1="${1%%-*}" v2="${2%%-*}"
+            local -a a1 a2
+            IFS='.' read -r -a a1 <<< "$v1"
+            IFS='.' read -r -a a2 <<< "$v2"
+            local i n1 n2
+            for i in 0 1 2 3; do
+              n1="${a1[$i]:-0}"
+              n2="${a2[$i]:-0}"
+              if (( 10#$n1 > 10#$n2 )); then echo 1; return 0; fi
+              if (( 10#$n1 < 10#$n2 )); then echo -1; return 0; fi
+            done
+            echo 0
+          }
+
           raw=""
           if [[ "$REF" == refs/tags/v* ]]; then
             raw="$REF_NAME"
           elif [[ -n "${INPUT_RELEASE_TAG//[[:space:]]/}" ]]; then
-            raw="${INPUT_RELEASE_TAG#"${INPUT_RELEASE_TAG%%[![:space:]]*}"}"
-            raw="${raw%"${raw##*[![:space:]]}"}"
+            raw="$INPUT_RELEASE_TAG"
           else
-            raw="$(grep -oP '(?<=<Version>)[^<]+' AssetStudio.Avalonia/AssetStudio.Avalonia.csproj | head -n 1 || true)"
-            if [[ -z "$raw" ]]; then
-              raw="$(grep -oP '(?<=<Version>)[^<]+' Directory.Build.props | head -n 1 || true)"
+            if exact_tag="$(get_git_tag --points-at HEAD)"; then
+              raw="$exact_tag"
+            else
+              default_ver="$(sed -n 's/.*<DefaultReleaseVersion>\([^<]*\)<\/DefaultReleaseVersion>.*/\1/p' Directory.Build.props 2>/dev/null | head -n 1 || true)"
+              default_ver="$(normalize_ver "$default_ver")"
+              git_tag=""
+              if ! git_tag="$(get_git_tag --merged HEAD)"; then
+                git_tag="$(get_git_tag || true)"
+              fi
+              if [[ -z "$git_tag" ]]; then
+                raw="$default_ver"
+              elif [[ -z "$default_ver" ]]; then
+                raw="$git_tag"
+              else
+                cmp="$(cmp_num_ver "$git_tag" "$default_ver")"
+                if (( cmp > 0 )); then
+                  raw="$git_tag"
+                elif (( cmp < 0 )); then
+                  raw="$default_ver"
+                elif [[ "$git_tag" != *-* || "$default_ver" == *-* ]]; then
+                  raw="$git_tag"
+                else
+                  raw="$default_ver"
+                fi
+              fi
+              raw="${raw:-0.18.0}"
             fi
-            raw="${raw:-0.17.1}"
           fi
 
-          version="${raw#[vV]}"
+          version="$(normalize_ver "$raw")"
           if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
             echo "Invalid release version '$version' derived from '$raw'." >&2
             exit 1

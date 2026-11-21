@@ -57,7 +57,7 @@ Options:
   -r, --runtime RID         Target runtime identifier (default: linux-x64)
   --self-contained BOOL     Publish self-contained (default: true)
   -o, --output DIR          Custom publish output directory
-  --version VER             Release version to stamp into the binary (fallback: RELEASE_VERSION)
+  --version VER             Release version to stamp into the binary (default: RELEASE_VERSION, git release tag, or DefaultReleaseVersion)
   --skip-native             Skip building/copying Texture2DDecoderNative
   --skip-ffmpeg             Do not bundle FFmpeg shared libraries (rely on system FFmpeg)
   --skip-ffmpeg-download    Skip automatic FFmpeg download (use pre-staged libs or system FFmpeg)
@@ -146,12 +146,108 @@ NATIVE_BUILD_DIR="$REPO_ROOT/Texture2DDecoderNative/build"
 FFMPEG_TARGET_DIR="$NATIVE_TARGET_DIR/ffmpeg"
 FFMPEG_SOURCE_DIR="$REPO_ROOT/AssetStudio.Avalonia/Libraries/x64/ffmpeg"
 
-RESOLVED_VERSION="${VERSION:-${RELEASE_VERSION:-}}"
-RESOLVED_VERSION="${RESOLVED_VERSION#"${RESOLVED_VERSION%%[![:space:]]*}"}"
-RESOLVED_VERSION="${RESOLVED_VERSION%"${RESOLVED_VERSION##*[![:space:]]}"}"
-while [[ "$RESOLVED_VERSION" =~ ^[vV][0-9] ]]; do
-    RESOLVED_VERSION="${RESOLVED_VERSION#[vV]}"
-done
+normalize_release_version() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    while [[ "$value" =~ ^[vV][0-9] ]]; do
+        value="${value#[vV]}"
+    done
+    printf '%s' "$value"
+}
+
+read_default_release_version() {
+    local props_file="$REPO_ROOT/Directory.Build.props"
+    local raw=""
+    if [[ -f "$props_file" ]]; then
+        raw="$(sed -n 's/.*<DefaultReleaseVersion>\([^<]*\)<\/DefaultReleaseVersion>.*/\1/p' "$props_file" | head -n 1 || true)"
+    fi
+    normalize_release_version "$raw"
+}
+
+query_git_release_tag() {
+    if ! command -v git >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local tag=""
+    tag="$(git -C "$REPO_ROOT" -c versionsort.suffix=- tag "$@" --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -n 1 || true)"
+    if [[ "$tag" =~ ^[vV][0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z.-]+)?$ ]]; then
+        normalize_release_version "$tag"
+        return 0
+    fi
+
+    return 1
+}
+
+compare_numeric_versions() {
+    local v1="${1%%-*}"
+    local v2="${2%%-*}"
+    local -a a1 a2
+    IFS='.' read -r -a a1 <<< "$v1"
+    IFS='.' read -r -a a2 <<< "$v2"
+    local i n1 n2
+    for i in 0 1 2 3; do
+        n1="${a1[$i]:-0}"
+        n2="${a2[$i]:-0}"
+        if (( 10#$n1 > 10#$n2 )); then
+            echo 1
+            return 0
+        elif (( 10#$n1 < 10#$n2 )); then
+            echo -1
+            return 0
+        fi
+    done
+    echo 0
+}
+
+resolve_release_version() {
+    local explicit_version="$1"
+    local normalized
+    normalized="$(normalize_release_version "$explicit_version")"
+    if [[ -n "$normalized" ]]; then
+        printf '%s' "$normalized"
+        return 0
+    fi
+
+    local default_ver
+    default_ver="$(read_default_release_version)"
+
+    local exact_tag=""
+    if exact_tag="$(query_git_release_tag --points-at HEAD)"; then
+        printf '%s' "$exact_tag"
+        return 0
+    fi
+
+    local git_tag=""
+    if ! git_tag="$(query_git_release_tag --merged HEAD)"; then
+        git_tag="$(query_git_release_tag || true)"
+    fi
+
+    if [[ -z "$git_tag" ]]; then
+        printf '%s' "$default_ver"
+        return 0
+    fi
+
+    if [[ -z "$default_ver" ]]; then
+        printf '%s' "$git_tag"
+        return 0
+    fi
+
+    local cmp
+    cmp="$(compare_numeric_versions "$git_tag" "$default_ver")"
+    if (( cmp > 0 )); then
+        printf '%s' "$git_tag"
+    elif (( cmp < 0 )); then
+        printf '%s' "$default_ver"
+    elif [[ "$git_tag" != *-* || "$default_ver" == *-* ]]; then
+        printf '%s' "$git_tag"
+    else
+        printf '%s' "$default_ver"
+    fi
+}
+
+RESOLVED_VERSION="$(resolve_release_version "${VERSION:-${RELEASE_VERSION:-}}")"
 
 if [[ -n "$RESOLVED_VERSION" ]]; then
     echo "Publishing AssetStudio.Avalonia ($CONFIGURATION, $FRAMEWORK, $RUNTIME, self-contained=$SELF_CONTAINED, version=$RESOLVED_VERSION)"

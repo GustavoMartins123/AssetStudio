@@ -2,17 +2,37 @@
   <PropertyGroup>
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!--
+      Keep <Version> pinned to the baseline ProjectReference version recorded in
+      packages.lock.json so multi-RID locked-mode restores never fail with NU1004
+      when new git release tags are created.
+      Runtime UI and executable versions are synchronized automatically from:
+        1. Explicit -p:ReleaseVersion=... or RELEASE_VERSION environment variable
+        2. Exact git release tag pointing at HEAD (vX.Y.Z...)
+        3. Highest of (latest reachable git v* release tag, DefaultReleaseVersion)
+    -->
     <Version>0.17.1</Version>
-    <AssemblyVersion>0.17.1</AssemblyVersion>
-    <FileVersion>0.17.1</FileVersion>
+    <DefaultReleaseVersion>0.18.0</DefaultReleaseVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
     <ReleaseVersion Condition="'$(ReleaseVersion)' == ''">$(RELEASE_VERSION)</ReleaseVersion>
-    <_NormalizedReleaseVersion Condition="'$(ReleaseVersion)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(ReleaseVersion)', '^\s*(?:[vV]+(?=[0-9]))?|\s+$', ''))</_NormalizedReleaseVersion>
+    <_ExplicitReleaseVersion Condition="'$(ReleaseVersion)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(ReleaseVersion)', '^\s*(?:[vV]+(?=[0-9]))?|\s+$', ''))</_ExplicitReleaseVersion>
+    <_HasExplicitReleaseVersion Condition="'$(_ExplicitReleaseVersion)' != ''">true</_HasExplicitReleaseVersion>
+
+    <_NormalizedDefaultReleaseVersion Condition="'$(DefaultReleaseVersion)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(DefaultReleaseVersion)', '^\s*(?:[vV]+(?=[0-9]))?|\s+$', ''))</_NormalizedDefaultReleaseVersion>
+    <_DefaultNumericPrefix Condition="'$(_NormalizedDefaultReleaseVersion)' != '' And $([System.Text.RegularExpressions.Regex]::IsMatch('$(_NormalizedDefaultReleaseVersion)', '^[0-9]+'))">$([System.Text.RegularExpressions.Regex]::Replace('$(_NormalizedDefaultReleaseVersion)', '^([0-9]+(?:\.[0-9]+){0,3}).*$', '$1'))</_DefaultNumericPrefix>
+    <_DefaultNumericVersion Condition="'$(_DefaultNumericPrefix)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(_DefaultNumericPrefix).0.0.0', '^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*$', '$1'))</_DefaultNumericVersion>
+
+    <_NormalizedReleaseVersion Condition="'$(_HasExplicitReleaseVersion)' == 'true'">$(_ExplicitReleaseVersion)</_NormalizedReleaseVersion>
+    <_NormalizedReleaseVersion Condition="'$(_NormalizedReleaseVersion)' == ''">$(_NormalizedDefaultReleaseVersion)</_NormalizedReleaseVersion>
     <_ReleaseNumericPrefix Condition="'$(_NormalizedReleaseVersion)' != '' And $([System.Text.RegularExpressions.Regex]::IsMatch('$(_NormalizedReleaseVersion)', '^[0-9]+'))">$([System.Text.RegularExpressions.Regex]::Replace('$(_NormalizedReleaseVersion)', '^([0-9]+(?:\.[0-9]+){0,3}).*$', '$1'))</_ReleaseNumericPrefix>
     <_ReleaseNumericVersion Condition="'$(_ReleaseNumericPrefix)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(_ReleaseNumericPrefix).0.0.0', '^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*$', '$1'))</_ReleaseNumericVersion>
+
     <InformationalVersion Condition="'$(_NormalizedReleaseVersion)' != ''">$(_NormalizedReleaseVersion)</InformationalVersion>
     <AssemblyVersion Condition="'$(_ReleaseNumericVersion)' != ''">$(_ReleaseNumericVersion)</AssemblyVersion>
     <FileVersion Condition="'$(_ReleaseNumericVersion)' != ''">$(_ReleaseNumericVersion)</FileVersion>
+
     <DefaultItemExcludes>$(DefaultItemExcludes);**\bin\**;**\Bin\**;**\obj\**;**\Obj\**</DefaultItemExcludes>
     <RuntimeIdentifiers>win-x64;win-x86;linux-x64</RuntimeIdentifiers>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
@@ -23,4 +43,82 @@
     <EmbeddedResource Remove="**\bin\**;**\Bin\**;**\obj\**;**\Obj\**" />
     <None Remove="**\bin\**;**\Bin\**;**\obj\**;**\Obj\**" />
   </ItemGroup>
+
+  <!--
+    Automatically synchronize InformationalVersion, AssemblyVersion, and FileVersion
+    with git release tags on every local and CI build without changing <Version> or
+    invalidating NuGet packages.lock.json. Never runs during dotnet restore.
+  -->
+  <Target Name="_ResolveAutoReleaseVersion"
+          BeforeTargets="GetAssemblyVersion;GetAssemblyAttributes"
+          Condition="'$(_HasExplicitReleaseVersion)' != 'true' And '$(DisableGitReleaseVersionSync)' != 'true'">
+    <PropertyGroup>
+      <_GitNullDevice Condition="'$(OS)' == 'Windows_NT'">nul</_GitNullDevice>
+      <_GitNullDevice Condition="'$(OS)' != 'Windows_NT'">/dev/null</_GitNullDevice>
+    </PropertyGroup>
+
+    <!-- 1. Exact release tag pointing at HEAD (always wins on a tagged release commit) -->
+    <Exec Command="git -c versionsort.suffix=- tag --points-at HEAD --list &quot;v[0-9]*&quot; --sort=-v:refname 2&gt;$(_GitNullDevice)"
+          WorkingDirectory="$(MSBuildThisFileDirectory)"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          IgnoreStandardErrorWarningFormat="true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low">
+      <Output TaskParameter="ExitCode" PropertyName="_GitExactTagExitCode" />
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitExactTagLines" />
+    </Exec>
+
+    <!-- 2. Highest release tag reachable from HEAD -->
+    <Exec Command="git -c versionsort.suffix=- tag --merged HEAD --list &quot;v[0-9]*&quot; --sort=-v:refname 2&gt;$(_GitNullDevice)"
+          WorkingDirectory="$(MSBuildThisFileDirectory)"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          IgnoreStandardErrorWarningFormat="true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low"
+          Condition="'$(_GitExactTagExitCode)' == '0' And '$(_GitExactTagLines)' == ''">
+      <Output TaskParameter="ExitCode" PropertyName="_GitMergedTagExitCode" />
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitMergedTagLines" />
+    </Exec>
+
+    <!-- 3. Shallow-clone fallback when tags exist without full commit ancestry -->
+    <Exec Command="git -c versionsort.suffix=- tag --list &quot;v[0-9]*&quot; --sort=-v:refname 2&gt;$(_GitNullDevice)"
+          WorkingDirectory="$(MSBuildThisFileDirectory)"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          IgnoreStandardErrorWarningFormat="true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low"
+          Condition="'$(_GitExactTagExitCode)' == '0' And '$(_GitExactTagLines)' == '' And '$(_GitMergedTagExitCode)' == '0' And '$(_GitMergedTagLines)' == ''">
+      <Output TaskParameter="ExitCode" PropertyName="_GitAllTagExitCode" />
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitAllTagLines" />
+    </Exec>
+
+    <PropertyGroup>
+      <_GitHasExactTag Condition="'$(_GitExactTagExitCode)' == '0' And '$(_GitExactTagLines)' != ''">true</_GitHasExactTag>
+      <_GitSelectedTagLines Condition="'$(_GitHasExactTag)' == 'true'">$(_GitExactTagLines)</_GitSelectedTagLines>
+      <_GitSelectedTagLines Condition="'$(_GitSelectedTagLines)' == '' And '$(_GitMergedTagExitCode)' == '0' And '$(_GitMergedTagLines)' != ''">$(_GitMergedTagLines)</_GitSelectedTagLines>
+      <_GitSelectedTagLines Condition="'$(_GitSelectedTagLines)' == '' And '$(_GitAllTagExitCode)' == '0' And '$(_GitAllTagLines)' != ''">$(_GitAllTagLines)</_GitSelectedTagLines>
+
+      <_GitCandidateTag Condition="'$(_GitSelectedTagLines)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(_GitSelectedTagLines)', '^\s*([^;\r\n]+?)\s*(?:;.*)?$', '$1'))</_GitCandidateTag>
+      <_GitNormalizedTag Condition="'$(_GitCandidateTag)' != '' And $([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitCandidateTag)', '^[vV][0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z.-]+)?$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(_GitCandidateTag)', '^[vV]+(?=[0-9])', ''))</_GitNormalizedTag>
+      <_GitNumericPrefix Condition="'$(_GitNormalizedTag)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(_GitNormalizedTag)', '^([0-9]+(?:\.[0-9]+){0,3}).*$', '$1'))</_GitNumericPrefix>
+      <_GitNumericVersion Condition="'$(_GitNumericPrefix)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(_GitNumericPrefix).0.0.0', '^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*$', '$1'))</_GitNumericVersion>
+
+      <_GitIsPreRelease Condition="'$(_GitNormalizedTag)' != '' And $(_GitNormalizedTag.Contains('-'))">true</_GitIsPreRelease>
+      <_DefaultIsPreRelease Condition="'$(_NormalizedDefaultReleaseVersion)' != '' And $(_NormalizedDefaultReleaseVersion.Contains('-'))">true</_DefaultIsPreRelease>
+
+      <_UseGitReleaseVersion>false</_UseGitReleaseVersion>
+      <_UseGitReleaseVersion Condition="'$(_GitNormalizedTag)' != '' And '$(_GitHasExactTag)' == 'true'">true</_UseGitReleaseVersion>
+      <_UseGitReleaseVersion Condition="'$(_UseGitReleaseVersion)' != 'true' And '$(_GitNormalizedTag)' != '' And '$(_DefaultNumericVersion)' == ''">true</_UseGitReleaseVersion>
+      <_UseGitReleaseVersion Condition="'$(_UseGitReleaseVersion)' != 'true' And '$(_GitNormalizedTag)' != '' And '$(_GitNumericVersion)' != '' And $([MSBuild]::VersionGreaterThan('$(_GitNumericVersion)', '$(_DefaultNumericVersion)'))">true</_UseGitReleaseVersion>
+      <_UseGitReleaseVersion Condition="'$(_UseGitReleaseVersion)' != 'true' And '$(_GitNormalizedTag)' != '' And '$(_GitNumericVersion)' != '' And $([MSBuild]::VersionEquals('$(_GitNumericVersion)', '$(_DefaultNumericVersion)')) And ('$(_GitIsPreRelease)' != 'true' Or '$(_DefaultIsPreRelease)' == 'true')">true</_UseGitReleaseVersion>
+
+      <ReleaseVersion Condition="'$(_UseGitReleaseVersion)' == 'true'">$(_GitNormalizedTag)</ReleaseVersion>
+      <InformationalVersion Condition="'$(_UseGitReleaseVersion)' == 'true'">$(_GitNormalizedTag)</InformationalVersion>
+      <AssemblyVersion Condition="'$(_UseGitReleaseVersion)' == 'true' And '$(_GitNumericVersion)' != ''">$(_GitNumericVersion)</AssemblyVersion>
+      <FileVersion Condition="'$(_UseGitReleaseVersion)' == 'true' And '$(_GitNumericVersion)' != ''">$(_GitNumericVersion)</FileVersion>
+    </PropertyGroup>
+  </Target>
 </Project>
