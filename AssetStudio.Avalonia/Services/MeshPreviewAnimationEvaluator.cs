@@ -160,6 +160,39 @@ internal static class MeshPreviewAnimationEvaluator
             }
         }
 
+        foreach (var curve in clip.m_CompressedRotationCurves ?? Array.Empty<CompressedAnimationCurve>())
+        {
+            if (curve == null
+                || !tryResolveCurvePath(curve.m_Path, out var boneIdx)
+                || !shouldUseBone(boneIdx)
+                || curve.m_Times == null
+                || curve.m_Values == null)
+            {
+                continue;
+            }
+
+            int[] timeDeltas;
+            AssetStudio.Quaternion[] quats;
+            try
+            {
+                timeDeltas = curve.m_Times.UnpackInts();
+                quats = curve.m_Values.UnpackQuats();
+            }
+            catch
+            {
+                continue;
+            }
+
+            var numKeys = Math.Min(timeDeltas.Length, quats.Length);
+            var cumulativeTime = 0;
+            for (var i = 0; i < numKeys; i++)
+            {
+                cumulativeTime += timeDeltas[i];
+                var time = cumulativeTime * 0.01f;
+                tracks.AddRotation(boneIdx, time, MeshPreviewSkeletonBuilder.ToOtkQuaternion(quats[i]));
+            }
+        }
+
         foreach (var curve in clip.m_EulerCurves ?? Array.Empty<Vector3Curve>())
         {
             if (!tryResolveCurvePath(curve.path, out var boneIdx) || !shouldUseBone(boneIdx) || curve.curve?.m_Curve == null)
@@ -358,77 +391,142 @@ internal static class MeshPreviewAnimationEvaluator
             }
         }
 
-        if (innerClip.m_StreamedClip != null)
+        if (innerClip.m_StreamedClip != null
+            && innerClip.m_StreamedClip.curveCount > 0
+            && innerClip.m_StreamedClip.data != null
+            && innerClip.m_StreamedClip.data.Length > 0)
         {
-            var streamedFrames = innerClip.m_StreamedClip.ReadData();
-            var frameValues = new float[totalCurveSlots];
-            var frameValueStamp = new int[totalCurveSlots];
-            var touchedBindings = new int[bindingCount];
-            var touchedBindingStamp = new int[bindingCount];
-            var currentStamp = 0;
-
-            for (var frameIndex = 1; frameIndex < streamedFrames.Count - 1; frameIndex++)
+            List<StreamedClip.StreamedFrame>? streamedFrames = null;
+            try
             {
-                var frame = streamedFrames[frameIndex];
-                var keyList = frame.keyList;
-                if (keyList == null || keyList.Length == 0)
+                streamedFrames = innerClip.m_StreamedClip.ReadData();
+            }
+            catch
+            {
+                streamedFrames = null;
+            }
+
+            if (streamedFrames != null && streamedFrames.Count >= 3)
+            {
+                var streamedEval = new HumanoidMuscleDecoder.StreamedCurveEvaluator(streamedFrames);
+                if (streamedEval.HasAnyKeys)
                 {
-                    continue;
-                }
+                    var streamLimit = (int)Math.Min(innerClip.m_StreamedClip.curveCount, (uint)totalCurveSlots);
+                    var tempValues = new float[4];
+                    var bindingTimes = new List<float>();
+                    const float dtStep = 1f / 30f;
 
-                currentStamp++;
-                var touchedCount = 0;
-                for (var k = 0; k < keyList.Length; k++)
-                {
-                    var key = keyList[k];
-                    if (!TryFindBindingIndex(key.index, out var bIdx))
+                    for (var bIdx = 0; bIdx < bindingCount; bIdx++)
                     {
-                        continue;
-                    }
-
-                    // Keep first occurrence per index to match ToDictionary behavior without throwing or allocating
-                    if (frameValueStamp[key.index] != currentStamp)
-                    {
-                        frameValueStamp[key.index] = currentStamp;
-                        frameValues[key.index] = key.value;
-                    }
-
-                    if (bindingIsValidTransform[bIdx] && touchedBindingStamp[bIdx] != currentStamp)
-                    {
-                        touchedBindingStamp[bIdx] = currentStamp;
-                        touchedBindings[touchedCount++] = bIdx;
-                    }
-                }
-
-                if (touchedCount > 1)
-                {
-                    Array.Sort(touchedBindings, 0, touchedCount);
-                }
-
-                for (var t = 0; t < touchedCount; t++)
-                {
-                    var bIdx = touchedBindings[t];
-                    var start = bindingStartIndices[bIdx];
-                    var width = bindingWidths[bIdx];
-                    var hasAllComponents = true;
-                    for (var c = 0; c < width; c++)
-                    {
-                        if (frameValueStamp[start + c] != currentStamp)
+                        var start = bindingStartIndices[bIdx];
+                        if (start >= streamLimit)
                         {
-                            hasAllComponents = false;
                             break;
                         }
-                    }
 
-                    if (hasAllComponents)
-                    {
-                        tracks.AddGenericKeyframe(
-                            bindingMeshBones[bIdx],
-                            bindingAttributes[bIdx],
-                            frame.time,
-                            frameValues,
-                            start,
-                            updateMaxTimeBeforeBoundsCheck);
+                        if (!bindingIsValidTransform[bIdx])
+                        {
+                            continue;
+                        }
+
+                        var width = bindingWidths[bIdx];
+                        var attr = bindingAttributes[bIdx];
+                        var boneIdx = bindingMeshBones[bIdx];
+                        bindingTimes.Clear();
+                        for (var c = 0; c < width && start + c < streamLimit; c++)
+                        {
+                            if (streamedEval.TryGetCurveKeys(start + c, out var keys) && keys.Count > 0)
+                            {
+                                for (var k = 0; k < keys.Count; k++)
+                                {
+                                    bindingTimes.Add(keys[k].Time);
+                                }
+                            }
+                        }
+
+                        if (bindingTimes.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        bindingTimes.Sort();
+                        var uniqueCount = 0;
+                        for (var i = 0; i < bindingTimes.Count; i++)
+                        {
+                            if (uniqueCount == 0 || bindingTimes[i] - bindingTimes[uniqueCount - 1] > 1e-6f)
+                            {
+                                bindingTimes[uniqueCount++] = bindingTimes[i];
+                            }
+                        }
+
+                        var curvatureTol = attr == 4 ? 0.05f : 1e-3f;
+                        void EmitStreamedSample(float sampleTime)
+                        {
+                            for (var c = 0; c < width; c++)
+                            {
+                                var fallback = attr == 3
+                                    ? 1f
+                                    : (attr == 2 && c == 3 ? 1f : 0f);
+                                tempValues[c] = start + c < streamLimit
+                                    ? streamedEval.EvaluateOrDefault(start + c, sampleTime, fallback)
+                                    : fallback;
+                            }
+
+                            tracks.AddGenericKeyframe(
+                                boneIdx,
+                                attr,
+                                sampleTime,
+                                tempValues,
+                                0,
+                                updateMaxTimeBeforeBoundsCheck);
+                        }
+
+                        for (var i = 0; i < uniqueCount; i++)
+                        {
+                            var t0 = bindingTimes[i];
+                            var segStepped = true;
+                            for (var c = 0; c < width && start + c < streamLimit; c++)
+                            {
+                                if (streamedEval.TryEvaluate(start + c, t0, out _, out var compStepped) && !compStepped)
+                                {
+                                    segStepped = false;
+                                    break;
+                                }
+                            }
+
+                            EmitStreamedSample(t0);
+
+                            if (!segStepped && i + 1 < uniqueCount)
+                            {
+                                var t1 = bindingTimes[i + 1];
+                                var span = t1 - t0;
+                                if (span > dtStep * 1.25f)
+                                {
+                                    var tMid = 0.5f * (t0 + t1);
+                                    var needsSubdivision = false;
+                                    for (var c = 0; c < width && start + c < streamLimit; c++)
+                                    {
+                                        var v0 = streamedEval.EvaluateOrDefault(start + c, t0, 0f);
+                                        var v1 = streamedEval.EvaluateOrDefault(start + c, t1, 0f);
+                                        var vMid = streamedEval.EvaluateOrDefault(start + c, tMid, 0f);
+                                        if (MathF.Abs(vMid - 0.5f * (v0 + v1)) > curvatureTol)
+                                        {
+                                            needsSubdivision = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (needsSubdivision)
+                                    {
+                                        var subSteps = Math.Clamp((int)MathF.Ceiling(span / dtStep), 2, 120);
+                                        for (var s = 1; s < subSteps; s++)
+                                        {
+                                            EmitStreamedSample(t0 + span * s / subSteps);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

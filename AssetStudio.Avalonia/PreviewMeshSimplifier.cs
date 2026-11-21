@@ -23,7 +23,7 @@ internal sealed class PreviewMeshGeometry
 
 internal static class PreviewMeshSimplifier
 {
-    public const float DefaultDensityPercent = 70f;
+    public const float DefaultDensityPercent = 100f;
     public const float MinDensityPercent = 1f;
     public const float MaxDensityPercent = 100f;
 
@@ -246,39 +246,55 @@ internal static class PreviewMeshSimplifier
         int sectionCount)
     {
         var grid = CreateGrid(min, max, axisResolution);
-        var cells = new Dictionary<long, VertexCell>();
-        foreach (var sourceIndex in usedVertexIndices)
+        var cells = new Dictionary<(int Section, long CellKey), VertexCell>();
+        void AccumulateSectionVertex(int section, int sourceIndex)
         {
             var vertex = sourceVertices[sourceIndex];
-            long key = grid.GetCellKey(vertex);
+            var key = (section, grid.GetCellKey(vertex));
             if (!cells.TryGetValue(key, out var cell))
             {
                 cell = new VertexCell();
                 cells.Add(key, cell);
             }
 
-            double weight = Math.Max(sourceVertexScores[sourceIndex], 1e-12);
-            cell.SourceIndices.Add(sourceIndex);
-            cell.WeightedPosition += vertex * (float)weight;
-            cell.Weight += weight;
+            if (cell.AddedSourceIndices.Add(sourceIndex))
+            {
+                double weight = Math.Max(sourceVertexScores[sourceIndex], 1e-12);
+                cell.SourceIndices.Add(sourceIndex);
+                cell.WeightedPosition += vertex * (float)weight;
+                cell.Weight += weight;
+            }
         }
 
-        var sourceToPreview = new int[sourceVertices.Length];
-        Array.Fill(sourceToPreview, -1);
+        if (sectionCount > 1)
+        {
+            foreach (var triangle in triangles)
+            {
+                int sec = Math.Max(0, triangle.Section);
+                AccumulateSectionVertex(sec, triangle.A);
+                AccumulateSectionVertex(sec, triangle.B);
+                AccumulateSectionVertex(sec, triangle.C);
+            }
+        }
+        else
+        {
+            foreach (var sourceIndex in usedVertexIndices)
+            {
+                AccumulateSectionVertex(0, sourceIndex);
+            }
+        }
 
+        var cellToPreview = new Dictionary<(int Section, long CellKey), int>(cells.Count);
         var previewVertices = new List<Vector3>(cells.Count);
         var previewSourceIndices = new List<int>(cells.Count);
-        foreach (var cell in cells.Values)
+        foreach (var kvp in cells)
         {
+            var cell = kvp.Value;
             int representativeSourceIndex = ChooseRepresentativeVertex(sourceVertices, sourceVertexScores, cell, grid.CellSize);
             int previewIndex = previewVertices.Count;
             previewVertices.Add(sourceVertices[representativeSourceIndex]);
             previewSourceIndices.Add(representativeSourceIndex);
-
-            foreach (int sourceIndex in cell.SourceIndices)
-            {
-                sourceToPreview[sourceIndex] = previewIndex;
-            }
+            cellToPreview[kvp.Key] = previewIndex;
         }
 
         var previewIndices = new List<int>(triangles.Count * 3);
@@ -286,9 +302,14 @@ internal static class PreviewMeshSimplifier
         var emittedTriangles = new HashSet<TriangleKey>();
         foreach (var triangle in triangles)
         {
-            int i0 = sourceToPreview[triangle.A];
-            int i1 = sourceToPreview[triangle.B];
-            int i2 = sourceToPreview[triangle.C];
+            int sec = sectionCount > 1 ? Math.Max(0, triangle.Section) : 0;
+            if (!cellToPreview.TryGetValue((sec, grid.GetCellKey(sourceVertices[triangle.A])), out int i0)
+                || !cellToPreview.TryGetValue((sec, grid.GetCellKey(sourceVertices[triangle.B])), out int i1)
+                || !cellToPreview.TryGetValue((sec, grid.GetCellKey(sourceVertices[triangle.C])), out int i2))
+            {
+                continue;
+            }
+
             if (i0 < 0 || i1 < 0 || i2 < 0 || i0 == i1 || i1 == i2 || i2 == i0)
             {
                 continue;
@@ -440,6 +461,7 @@ internal static class PreviewMeshSimplifier
 
     private sealed class VertexCell
     {
+        public readonly HashSet<int> AddedSourceIndices = new();
         public readonly List<int> SourceIndices = new();
         public Vector3 WeightedPosition;
         public double Weight;

@@ -127,7 +127,7 @@ void main()
 	vec4 texColor = texture(mainTex, texCoord);
 	if (texColor.a < 0.25)
 		discard;
-	outputColor = vec4(texColor.rgb * materialTint.rgb * lightColor, texColor.a * materialTint.a);
+	outputColor = vec4(texColor.rgb * materialTint.rgb * sqrt(lightColor), texColor.a * materialTint.a);
 }";
 
         private const int LocationPosition = 0;
@@ -457,8 +457,8 @@ void main()
                 GL.EnableVertexAttribArray(LocationPosition);
             }
 
-            var activeNormals = (normalMode == 1 && normalData != null)
-                ? normalData
+            var activeNormals = normalMode == 0
+                ? (normalData ?? normal2Data)
                 : (normal2Data ?? normalData);
             if (activeNormals != null)
             {
@@ -562,7 +562,7 @@ void main()
             GL.GenBuffers(1, out vboSkeleton);
             vbos.Add(vboSkeleton);
             GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
-            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(vertices.Length * 12), vertices, BufferUsageHint.StaticDraw);
+            GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(vertices.Length * 12), vertices, isAvatarMode ? BufferUsageHint.DynamicDraw : BufferUsageHint.StaticDraw);
             GL.VertexAttribPointer(LocationPosition, 3, VertexAttribPointerType.Float, false, 0, 0);
             GL.EnableVertexAttribArray(LocationPosition);
 

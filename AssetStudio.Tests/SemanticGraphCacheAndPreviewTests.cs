@@ -1708,6 +1708,473 @@ namespace AssetStudio.Tests
             Assert.True(session.IsPreviewTabActive);
         }
 
+        [Fact]
+        public void AnimationPreviewRegressions_SparseStreamedHermite_CompressedRotations_MissingNormals_SubMeshSimplifierIsolation_AndNoStaleFallback()
+        {
+            // 1. Default density settings must be 100% ("Original") so character meshes are never decimated by default
+            Assert.Equal(100f, PreviewMeshSimplifier.DefaultDensityPercent);
+            Assert.Equal(100.0, new AvaloniaAppSettings().AvatarPreviewMeshDensityPercent);
+
+            // 2. SelectBestAnimationClipCandidate must NEVER fall back to an incompatible IsCurrentPreviewFallback candidate
+            var nonSkeletalClip = (AnimationClip)RuntimeHelpers.GetUninitializedObject(typeof(AnimationClip));
+            nonSkeletalClip.m_Name = "ending3-5b";
+            nonSkeletalClip.m_PathID = 120;
+            nonSkeletalClip.m_SampleRate = 60f;
+
+            var staleAvatar = (Avatar)RuntimeHelpers.GetUninitializedObject(typeof(Avatar));
+            staleAvatar.m_Name = "BOSS_baal_sdAvatar";
+            staleAvatar.m_PathID = 3367;
+
+            var staleMesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            staleMesh.m_Name = "baal-sd";
+            staleMesh.m_PathID = 1681;
+
+            var staleAvatarFallback = new PreviewCandidateItem
+            {
+                AnimationClip = nonSkeletalClip,
+                Avatar = staleAvatar,
+                Mesh = staleMesh,
+                AvatarId = "resources.assets#3367",
+                MeshId = "resources.assets#1681",
+                IsCurrentPreviewFallback = true,
+                Label = "Current: BOSS_baal_sdAvatar -> baal-sd"
+            };
+            var staleMeshOnlyFallback = new PreviewCandidateItem
+            {
+                AnimationClip = nonSkeletalClip,
+                Avatar = null,
+                Mesh = staleMesh,
+                MeshId = "resources.assets#1681",
+                IsCurrentPreviewFallback = true,
+                Label = "Current mesh: baal-sd"
+            };
+
+            var selectedWhenIncompatible = MainWindow.SelectBestAnimationClipCandidate(
+                nonSkeletalClip,
+                new[] { staleAvatarFallback, staleMeshOnlyFallback },
+                preferredAvatar: null,
+                preferredMesh: null,
+                preferredAvatarId: null,
+                preferredMeshId: null,
+                isCompatibleWithAvatar: (_, _) => false,
+                isCompatibleWithMesh: (_, _) => false);
+            Assert.Null(selectedWhenIncompatible);
+
+            // Clean summary text for non-skeletal clip
+            var summary = MainWindow.BuildAnimationClipCurveSummaryText(
+                nonSkeletalClip,
+                "Non-skeletal clip summary check");
+            Assert.Contains("AnimationClip: ending3-5b (PathID: 120)", summary, StringComparison.Ordinal);
+            Assert.Contains("Sample Rate: 60 FPS", summary, StringComparison.Ordinal);
+            Assert.Contains("Curves Summary", summary, StringComparison.Ordinal);
+            Assert.Contains("Non-skeletal clip summary check", summary, StringComparison.Ordinal);
+
+            // 3. ExtractLegacyCurves must unpack and extract m_CompressedRotationCurves
+            // Pack 2 time deltas (10, 20 -> 0.10s, 0.30s) at 8 bits each
+            var packedTimes = new PackedIntVector
+            {
+                m_NumItems = 2,
+                m_BitSize = 8,
+                m_Data = new byte[] { 10, 20 }
+            };
+            // Pack 2 identity quaternions (flags=3 -> W largest positive, x=y=z=0 -> midpoint 1<<(bitSize-1))
+            // Easier: verify UnpackQuats round-trip on a valid 8-byte buffer (2 quats * 4 bytes)
+            var packedQuats = new PackedQuatVector
+            {
+                m_NumItems = 2,
+                m_Data = new byte[] { 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 }
+            };
+            var compCurve = (CompressedAnimationCurve)RuntimeHelpers.GetUninitializedObject(typeof(CompressedAnimationCurve));
+            compCurve.m_Path = "Root/BoneA";
+            compCurve.m_Times = packedTimes;
+            compCurve.m_Values = packedQuats;
+
+            var legacyCompClip = (AnimationClip)RuntimeHelpers.GetUninitializedObject(typeof(AnimationClip));
+            legacyCompClip.m_Name = "LegacyCompressed";
+            legacyCompClip.m_CompressedRotationCurves = new[] { compCurve };
+
+            var legacyTracks = new AnimationTrackSet();
+            MeshPreviewAnimationEvaluator.ExtractLegacyCurves(
+                legacyCompClip,
+                (string? p, out int idx) =>
+                {
+                    idx = p == "Root/BoneA" ? 0 : -1;
+                    return idx >= 0;
+                },
+                _ => true,
+                legacyTracks);
+            Assert.True(legacyTracks.RotTracks.ContainsKey(0));
+            Assert.Equal(2, legacyTracks.RotTracks[0].Count);
+            Assert.Equal(0.10f, legacyTracks.RotTracks[0][0].time, 4);
+            Assert.Equal(0.30f, legacyTracks.RotTracks[0][1].time, 4);
+
+            // 4. ExtractMuscleClipTracks must evaluate sparse single-component StreamedClip frames & cubic Hermite arcs
+            // Curve 0 = Pos.X (keys at t=0 -> 1.0, t=1 -> 1.0)
+            // Curve 1 = Pos.Y (keys at t=0 -> 0.0, t=0.5 ONLY -> 5.0, t=1 -> 0.0) -- sparse frame at t=0.5 has ONLY curve 1!
+            // Curve 2 = Pos.Z (keys at t=0 -> 2.0, t=1 -> 2.0)
+            using var ms = new MemoryStream();
+            using (var bw = new BinaryWriter(ms))
+            {
+                void WriteFrame(float time, params (int idx, float c0, float c1, float c2, float c3)[] keys)
+                {
+                    bw.Write(time);
+                    bw.Write(keys.Length);
+                    foreach (var k in keys)
+                    {
+                        bw.Write(k.idx);
+                        bw.Write(k.c0);
+                        bw.Write(k.c1);
+                        bw.Write(k.c2);
+                        bw.Write(k.c3);
+                    }
+                }
+
+                WriteFrame(-3.4028235e38f, (0, 0f, 0f, 0f, 1f), (1, 0f, 0f, 0f, 0f), (2, 0f, 0f, 0f, 2f));
+                WriteFrame(0.0f, (0, 0f, 0f, 0f, 1f), (1, 0f, 0f, 10f, 0f), (2, 0f, 0f, 0f, 2f));
+                WriteFrame(0.5f, (1, 0f, 0f, -10f, 5f)); // ONLY Y component present at t=0.5!
+                WriteFrame(1.0f, (0, 0f, 0f, 0f, 1f), (1, 0f, 0f, 0f, 0f), (2, 0f, 0f, 0f, 2f));
+                WriteFrame(float.PositiveInfinity, (0, 0f, 0f, 0f, 1f), (1, 0f, 0f, 0f, 0f), (2, 0f, 0f, 0f, 2f));
+            }
+            var streamBytes = ms.ToArray();
+            var streamUint = new uint[streamBytes.Length / 4];
+            Buffer.BlockCopy(streamBytes, 0, streamUint, 0, streamBytes.Length);
+
+            var streamedClip = (StreamedClip)RuntimeHelpers.GetUninitializedObject(typeof(StreamedClip));
+            streamedClip.data = streamUint;
+            streamedClip.curveCount = 3;
+
+            var innerClip = (Clip)RuntimeHelpers.GetUninitializedObject(typeof(Clip));
+            innerClip.m_StreamedClip = streamedClip;
+
+            var bindingConst = new AnimationClipBindingConstant
+            {
+                genericBindings = new[]
+                {
+                    new GenericBinding { path = 777u, attribute = 1u, typeID = ClassIDType.Transform }
+                }
+            };
+
+            var sparseTracks = new AnimationTrackSet();
+            MeshPreviewAnimationEvaluator.ExtractMuscleClipTracks(
+                innerClip,
+                bindingConst,
+                constantStopTime: 1.0f,
+                (GenericBinding b, out int boneIdx) =>
+                {
+                    boneIdx = b.path == 777u ? 0 : -1;
+                    return boneIdx >= 0;
+                },
+                _ => true,
+                sparseTracks,
+                updateMaxTimeBeforeBoundsCheck: true);
+
+            Assert.True(sparseTracks.PosTracks.ContainsKey(0));
+            var posKeys = sparseTracks.PosTracks[0];
+            Assert.Contains(posKeys, k => MathF.Abs(k.time - 0.5f) < 1e-4f
+                && MathF.Abs(k.value.X - 1f) < 1e-3f
+                && MathF.Abs(k.value.Y - 5f) < 1e-3f
+                && MathF.Abs(k.value.Z - 2f) < 1e-3f);
+
+            // 5. PrepareAnimatedAvatarGLData synthesizes rest-pose normals and skins them when m_Normals == null
+            static AssetStudio.Matrix4x4 ToAssetMat(OpenTK.Mathematics.Matrix4 m) => new AssetStudio.Matrix4x4
+            {
+                M00 = m.M11, M01 = m.M12, M02 = m.M13, M03 = m.M14,
+                M10 = m.M21, M11 = m.M22, M12 = m.M23, M13 = m.M24,
+                M20 = m.M31, M21 = m.M32, M22 = m.M33, M23 = m.M34,
+                M30 = m.M41, M31 = m.M42, M32 = m.M43, M33 = m.M44
+            };
+
+            var noNormMesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            typeof(Mesh).GetField("m_ProcessLock", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(noNormMesh, new object());
+            typeof(Mesh).GetField("m_DataProcessed", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.SetValue(noNormMesh, true);
+            noNormMesh.m_Name = "NoNormalsSkinnedMesh";
+            noNormMesh.m_VertexCount = 3;
+            noNormMesh.m_Vertices = new[] { 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f }; // XZ triangle -> rest normal (0, -1, 0)
+            noNormMesh.m_Normals = null;
+            noNormMesh.m_Indices = new List<uint> { 0, 1, 2 };
+            noNormMesh.m_BindPose = new[] { ToAssetMat(OpenTK.Mathematics.Matrix4.Identity) };
+            noNormMesh.m_Skin = new BoneWeights4[3];
+            for (int v = 0; v < 3; v++)
+            {
+                var bw = (BoneWeights4)RuntimeHelpers.GetUninitializedObject(typeof(BoneWeights4));
+                bw.boneIndex = new[] { 0, 0, 0, 0 };
+                bw.weight = new[] { 1f, 0f, 0f, 0f };
+                noNormMesh.m_Skin[v] = bw;
+            }
+
+            var rot90X = OpenTK.Mathematics.Matrix4.CreateRotationX(MathF.PI * 0.5f);
+            var noNormGl = MeshPreviewControl.PrepareAnimatedAvatarGLData(
+                noNormMesh,
+                new[] { new[] { OpenTK.Mathematics.Vector3.Zero }, new[] { OpenTK.Mathematics.Vector3.Zero } },
+                new[] { new[] { OpenTK.Mathematics.Matrix4.Identity }, new[] { rot90X } },
+                new[] { -1 },
+                30f,
+                new[] { "Root" },
+                100f,
+                1.0f);
+            Assert.NotNull(noNormGl);
+            Assert.NotNull(noNormGl!.AnimatedMeshNormals);
+            Assert.Equal(2, noNormGl.AnimatedMeshNormals!.Length);
+            // Frame 0 normal is along Y; Frame 1 rotated 90 deg around X -> normal rotates to Z!
+            Assert.True(MathF.Abs(noNormGl.AnimatedMeshNormals[0][0].Y) > 0.99f);
+            Assert.True(MathF.Abs(noNormGl.AnimatedMeshNormals[1][0].Z) > 0.99f);
+
+            // 6. PreviewMeshSimplifier at < 100% density isolates submeshes so shared 3D seam positions never cross-weld submeshes
+            var subVerts = new OpenTK.Mathematics.Vector3[12];
+            for (int i = 0; i < 6; i++)
+            {
+                var p = new OpenTK.Mathematics.Vector3((i % 3) * 0.01f, (i / 3) * 0.01f, 0f);
+                subVerts[i] = p;       // SubMesh 0 (indices 0..5)
+                subVerts[i + 6] = p;   // SubMesh 1 at identical 3D positions (indices 6..11)
+            }
+            var subIndices = new List<uint>
+            {
+                0, 1, 3,  1, 4, 3,  1, 2, 4,  2, 5, 4,
+                6, 7, 9,  7, 10, 9, 7, 8, 10, 8, 11, 10
+            };
+            var simplified = PreviewMeshSimplifier.Build(
+                subVerts,
+                subIndices,
+                new OpenTK.Mathematics.Vector3(0f, 0f, 0f),
+                new OpenTK.Mathematics.Vector3(1f, 1f, 1f),
+                densityPercent: 20f,
+                subMeshIndexCounts: new[] { 12, 12 });
+            Assert.NotNull(simplified.SubMeshIndexCounts);
+            int sub0Count = simplified.SubMeshIndexCounts![0];
+            for (int idx = 0; idx < simplified.Indices.Length; idx++)
+            {
+                int previewVertIdx = simplified.Indices[idx];
+                int srcVertIdx = simplified.SourceVertexIndices[previewVertIdx];
+                if (idx < sub0Count)
+                {
+                    Assert.InRange(srcVertIdx, 0, 5);
+                }
+                else
+                {
+                    Assert.InRange(srcVertIdx, 6, 11);
+                }
+            }
+
+            // 7. Source-level guards for PreviewRouting cleanup & fsTexSource sqrt(lightColor) & NormalMode default
+            var repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+            var routingSrc = File.ReadAllText(Path.Combine(repoRoot, "AssetStudio.Avalonia", "MainWindow.PreviewRouting.cs"));
+            Assert.DoesNotContain("if (asset is not AnimationClip)", routingSrc, StringComparison.Ordinal);
+
+            var openGlSrc = File.ReadAllText(Path.Combine(repoRoot, "AssetStudio.Avalonia", "MeshPreviewControl.OpenGL.cs"));
+            Assert.Contains("sqrt(lightColor)", openGlSrc, StringComparison.Ordinal);
+            Assert.Contains("normalMode == 0", openGlSrc, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void AnimationClipPreview_NonSkeletalAndMultiClipRealGameAudit_NeverLeaksUnrelatedMesh_AndEvaluatesAllSkeletalClipsCleanly()
+        {
+            const string resPath = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\resources.assets";
+            const string shared78Path = @"F:\SteamLibrary\steamapps\common\Anima Gate of Memories\AnimaGateOfMemories_Data\sharedassets78.assets";
+            if (!File.Exists(resPath))
+            {
+                return;
+            }
+
+            var am = new AssetsManager();
+            if (File.Exists(shared78Path))
+            {
+                am.LoadFiles(resPath, shared78Path);
+            }
+            else
+            {
+                am.LoadFiles(resPath);
+            }
+            var sf = am.assetsFileList[0];
+
+            var avatars = new List<Avatar>();
+            var skinnedMeshes = new Dictionary<long, Mesh>();
+            var allClips = new List<AnimationClip>();
+            AnimationClip? endingClip = null;
+
+            var targetClipIds = new HashSet<long>
+            {
+                2294, 2351, 2391, 2436, 2449, 2451, 2453, 2496, 2502, 2503, 2526, 2551, 2565, 2598,
+                2363, 2399, 2528, 2799
+            };
+
+            foreach (var file in am.assetsFileList)
+            {
+                bool isResources = string.Equals(file.fileName, "resources.assets", StringComparison.OrdinalIgnoreCase);
+                bool isShared78 = string.Equals(file.fileName, "sharedassets78.assets", StringComparison.OrdinalIgnoreCase);
+                foreach (var info in file.m_Objects)
+                {
+                    if (isShared78)
+                    {
+                        if (info.classID == (int)ClassIDType.AnimationClip && info.m_PathID == 120)
+                        {
+                            endingClip = new AnimationClip(new ObjectReader(file.reader, file, info));
+                        }
+                        continue;
+                    }
+
+                    if (!isResources)
+                    {
+                        continue;
+                    }
+
+                    if (info.classID == (int)ClassIDType.Avatar && info.m_PathID is 3367 or 3382 or 3356)
+                    {
+                        avatars.Add(new Avatar(new ObjectReader(file.reader, file, info)));
+                    }
+                    else if (info.classID == (int)ClassIDType.Mesh && info.m_PathID is 1681 or 1631)
+                    {
+                        skinnedMeshes[info.m_PathID] = new Mesh(new ObjectReader(file.reader, file, info));
+                    }
+                    else if (info.classID == (int)ClassIDType.AnimationClip
+                        && (targetClipIds.Contains(info.m_PathID)
+                            || (info.m_PathID >= 2350 && info.m_PathID <= 2410)
+                            || (info.m_PathID >= 2780 && info.m_PathID <= 2830)))
+                    {
+                        allClips.Add(new AnimationClip(new ObjectReader(file.reader, file, info)));
+                    }
+                }
+            }
+
+            Assert.True(skinnedMeshes.TryGetValue(1681, out var baalMesh));
+            Assert.True(skinnedMeshes.TryGetValue(1631, out var redLadyMesh));
+            var baalAvatar = avatars.FirstOrDefault(a => a.m_PathID == 3367);
+            var redLadyAvatar = avatars.FirstOrDefault(a => a.m_PathID == 3382);
+            var mehirimAvatar = avatars.FirstOrDefault(a => a.m_PathID == 3356);
+            Assert.NotNull(baalAvatar);
+            Assert.NotNull(redLadyAvatar);
+            Assert.NotNull(mehirimAvatar);
+
+            // 1. Audit ending3-5b (PathID 120 in sharedassets78.assets) and cross-character clip #2294 (mehirim idle):
+            var baalRigHashes = SemanticGraphService.ExtractAvatarBindingPathHashes(baalAvatar!);
+            var redLadyRigHashes = SemanticGraphService.ExtractAvatarBindingPathHashes(redLadyAvatar!);
+            var mehirimRigHashes = SemanticGraphService.ExtractAvatarBindingPathHashes(mehirimAvatar!);
+            if (endingClip != null)
+            {
+                var endingBindings = SemanticGraphService.GetTransformBindingPathsBackground(endingClip);
+                int endingBaalOverlap = endingBindings.Count(baalRigHashes.Contains);
+                int endingRedLadyOverlap = endingBindings.Count(redLadyRigHashes.Contains);
+                Assert.False(SemanticGraphService.IsStrongAnimationAvatarMatch(endingBindings.Count, endingBaalOverlap));
+                Assert.False(SemanticGraphService.IsStrongAnimationAvatarMatch(endingBindings.Count, endingRedLadyOverlap));
+
+                var endingSummary = MainWindow.BuildAnimationClipCurveSummaryText(endingClip);
+                _output.WriteLine(endingSummary);
+                Assert.Contains("AnimationClip: ending3-5b (PathID: 120)", endingSummary, StringComparison.Ordinal);
+                Assert.Contains("Curves Summary", endingSummary, StringComparison.Ordinal);
+            }
+
+            var clip2294 = allClips.FirstOrDefault(c => c.m_PathID == 2294);
+            Assert.NotNull(clip2294);
+            var bindings2294 = SemanticGraphService.GetTransformBindingPathsBackground(clip2294!);
+            Assert.True(SemanticGraphService.IsStrongAnimationAvatarMatch(bindings2294.Count, bindings2294.Count(mehirimRigHashes.Contains)));
+            Assert.False(SemanticGraphService.IsStrongAnimationAvatarMatch(bindings2294.Count, bindings2294.Count(baalRigHashes.Contains)));
+
+            // 2. Audit 24+ real skeletal AnimationClips across BOSS_baal_sdAvatar and red ladyAvatar at 100% AND 70% density!
+            var rigs = new (string Label, Avatar Avatar, Mesh Mesh, HashSet<uint> Hashes, PreparedAnimationRigData Rig)[]
+            {
+                ("baal-sd", baalAvatar!, baalMesh!, baalRigHashes, PreparedAnimationRigData.TryBuild("baal-sd", baalAvatar!, baalMesh!)!),
+                ("red-lady", redLadyAvatar!, redLadyMesh!, redLadyRigHashes, PreparedAnimationRigData.TryBuild("red-lady", redLadyAvatar!, redLadyMesh!)!)
+            };
+
+            int auditedSkeletalClips = 0;
+            foreach (var rigEntry in rigs)
+            {
+                var matchingClips = allClips
+                    .Select(clip =>
+                    {
+                        var paths = SemanticGraphService.GetTransformBindingPathsBackground(clip);
+                        int overlap = paths.Count(rigEntry.Hashes.Contains);
+                        return (Clip: clip, BindingCount: paths.Count, Overlap: overlap);
+                    })
+                    .Where(x => SemanticGraphService.IsStrongAnimationAvatarMatch(x.BindingCount, x.Overlap))
+                    .OrderByDescending(x => x.Overlap)
+                    .Take(15)
+                    .ToList();
+
+                Assert.True(matchingClips.Count >= 10, $"Expected at least 10 matching skeletal clips for {rigEntry.Label}, found {matchingClips.Count}");
+
+                var defaultPose = rigEntry.Avatar.m_Avatar.m_DefaultPose?.m_X ?? rigEntry.Avatar.m_Avatar.m_AvatarSkeletonPose?.m_X;
+                Assert.NotNull(defaultPose);
+
+                foreach (var match in matchingClips)
+                {
+                    var clip = match.Clip;
+                    var innerClip = clip.m_MuscleClip?.m_Clip;
+                    Assert.NotNull(innerClip);
+                    var bindings = clip.m_ClipBindingConstant ?? innerClip!.ConvertValueArrayToGenericBinding();
+                    var tracks = new AnimationTrackSet();
+                    MeshPreviewAnimationEvaluator.ExtractMuscleClipTracks(
+                        innerClip!,
+                        bindings,
+                        clip.m_MuscleClip!.m_StopTime,
+                        rigEntry.Rig.TryResolveAvatarNodeBinding,
+                        rigEntry.Rig.ShouldUseAvatarNodeBinding,
+                        tracks,
+                        updateMaxTimeBeforeBoundsCheck: true);
+                    tracks.SortAll();
+
+                    Assert.True(tracks.TotalTrackCount > 0, $"{rigEntry.Label}/{clip.m_Name} (#{clip.m_PathID}) extracted 0 tracks");
+
+                    var sampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30f;
+                    var maxTime = tracks.MaxTime > 0 ? tracks.MaxTime : clip.m_MuscleClip.m_StopTime;
+                    var ok = MeshPreviewAnimationEvaluator.EvaluateFramesFromAvatarSkeletonTracks(
+                        rigEntry.Mesh,
+                        rigEntry.Rig.Skeleton,
+                        defaultPose!,
+                        rigEntry.Rig.DeformChainMask,
+                        rigEntry.Rig.WeightedBoneMask,
+                        tracks.PosTracks,
+                        tracks.RotTracks,
+                        tracks.ScaleTracks,
+                        sampleRate,
+                        maxTime,
+                        useCeilingFrameCount: false,
+                        failIfAllTracksFiltered: false,
+                        out var frames,
+                        out var boneMatrices,
+                        out var renderParents,
+                        out var resolvedFps,
+                        out var reason);
+
+                    Assert.True(ok, $"{rigEntry.Label}/{clip.m_Name} (#{clip.m_PathID}): {reason}");
+                    Assert.NotEmpty(frames);
+
+                    foreach (float density in new[] { 100f, 70f })
+                    {
+                        var refMesh = rigEntry.Rig.GetOrBuildReferenceMesh(density);
+                        Assert.NotNull(refMesh);
+                        var gl = MeshPreviewControl.PrepareAnimatedAvatarGLData(
+                            rigEntry.Mesh,
+                            frames,
+                            boneMatrices,
+                            renderParents,
+                            resolvedFps,
+                            rigEntry.Rig.Skeleton.MeshBoneNames,
+                            density,
+                            1.0f,
+                            rigEntry.Rig.SourceVertexData,
+                            rigEntry.Rig.SourceMeshMin,
+                            rigEntry.Rig.SourceMeshMax,
+                            refMesh);
+
+                        Assert.NotNull(gl);
+                        Assert.NotNull(gl!.AnimatedMeshVertices);
+                        Assert.Equal(frames.Length, gl.AnimatedMeshVertices!.Length);
+                        Assert.NotNull(gl.Uvs);
+                        Assert.Equal(gl.ReferenceMesh.Vertices.Length, gl.Uvs!.Length);
+
+                        int midFrame = frames.Length / 2;
+                        var verts = gl.AnimatedMeshVertices[midFrame];
+                        Assert.All(verts, v => Assert.True(float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z)));
+                    }
+
+                    auditedSkeletalClips++;
+                    _output.WriteLine($"[OK] {rigEntry.Label}/{clip.m_Name} (#{clip.m_PathID}): overlap={match.Overlap}/{match.BindingCount}, tracks={tracks.TotalTrackCount}, frames={frames.Length}");
+                }
+            }
+
+            Assert.True(auditedSkeletalClips >= 24, $"Expected >= 24 audited skeletal clips, got {auditedSkeletalClips}");
+        }
+
         private static void SeedSyntheticV14Database(string dbPath, string projectDir, string signature, string sourcePath)
         {
             using var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False");

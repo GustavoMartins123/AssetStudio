@@ -203,7 +203,13 @@ public partial class MainWindow
             AddCandidate(preferredAvatar, preferredMesh, preferredAvatarId, preferredMeshId, "Selected");
         }
 
-        if (activePreviewMesh != null)
+        var isCurrentAvatarCompatible = activePreviewAvatar != null
+            && IsAnimationClipCompatibleWithAvatar(clip, activePreviewAvatar);
+        var isCurrentMeshCompatible = activePreviewMesh != null
+            && (isCurrentAvatarCompatible
+                || (activePreviewAvatar == null && IsAnimationClipCompatibleWithMesh(clip, activePreviewMesh)));
+
+        if (activePreviewMesh != null && isCurrentMeshCompatible)
         {
             AddCandidate(
                 activePreviewAvatar,
@@ -214,7 +220,7 @@ public partial class MainWindow
                 isCurrentPreviewFallback: true);
         }
 
-        if (activePreviewAvatar != null)
+        if (activePreviewAvatar != null && isCurrentAvatarCompatible)
         {
             var addedCurrentMesh = false;
             List<Mesh>? currentMeshes = null;
@@ -664,7 +670,9 @@ public partial class MainWindow
 
                     foreach (var avatar in objs.OfType<Avatar>())
                     {
-                        var rigHashes = Services.SemanticGraphService.ExtractAvatarRigBoneHashes(avatar);
+                        var rigHashes = clip.m_Legacy
+                            ? Services.SemanticGraphService.ExtractAvatarRigBoneHashes(avatar)
+                            : Services.SemanticGraphService.ExtractAvatarBindingPathHashes(avatar);
                         if (rigHashes.Count == 0)
                         {
                             continue;
@@ -678,7 +686,9 @@ public partial class MainWindow
                     }
                 }
 
+                var bestOverlap = scoredAvatars.Count > 0 ? scoredAvatars.Max(m => m.Overlap) : 0;
                 foreach (var match in scoredAvatars
+                    .Where(m => m.Overlap >= Math.Max(6, bestOverlap / 2))
                     .OrderByDescending(m => m.Overlap)
                     .ThenByDescending(m => m.SameFile)
                     .Take(4))
@@ -740,7 +750,8 @@ public partial class MainWindow
             preferredMesh,
             preferredAvatarId,
             preferredMeshId,
-            IsAnimationClipCompatibleWithAvatar);
+            IsAnimationClipCompatibleWithAvatar,
+            IsAnimationClipCompatibleWithMesh);
     }
 
     internal static PreviewCandidateItem? SelectBestAnimationClipCandidate(
@@ -750,7 +761,8 @@ public partial class MainWindow
         Mesh? preferredMesh,
         string? preferredAvatarId,
         string? preferredMeshId,
-        Func<AnimationClip, Avatar, bool>? isCompatibleWithAvatar = null)
+        Func<AnimationClip, Avatar, bool>? isCompatibleWithAvatar = null,
+        Func<AnimationClip, Mesh, bool>? isCompatibleWithMesh = null)
     {
         if (candidates == null || candidates.Count == 0)
         {
@@ -812,17 +824,30 @@ public partial class MainWindow
         }
 
         // 6. Current preview Avatar + Mesh ONLY if bone-compatible with clip
-        if (isCompatibleWithAvatar != null)
+        bool IsCurrentCandidateCompatible(PreviewCandidateItem c)
         {
-            var compatibleCurrent = candidates.FirstOrDefault(c =>
-                c.IsCurrentPreviewFallback
-                && c.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
-                && c.Mesh != null
-                && isCompatibleWithAvatar(clip, c.Avatar));
-            if (compatibleCurrent != null)
+            if (c.Avatar != null)
             {
-                return compatibleCurrent;
+                return c.Avatar.m_Avatar?.m_AvatarSkeleton?.m_Node != null
+                    && isCompatibleWithAvatar != null
+                    && isCompatibleWithAvatar(clip, c.Avatar);
             }
+
+            if (c.Mesh != null)
+            {
+                return isCompatibleWithMesh != null && isCompatibleWithMesh(clip, c.Mesh);
+            }
+
+            return false;
+        }
+
+        var compatibleCurrentWithMesh = candidates.FirstOrDefault(c =>
+            c.IsCurrentPreviewFallback
+            && c.Mesh != null
+            && IsCurrentCandidateCompatible(c));
+        if (compatibleCurrentWithMesh != null)
+        {
+            return compatibleCurrentWithMesh;
         }
 
         // 7. Clip-linked Avatar-only (lazy ID or loaded object)
@@ -833,13 +858,9 @@ public partial class MainWindow
             return linkedAvatarOnly;
         }
 
-        // 8. Remaining non-Current fallback, then compatible Current avatar, then first available
+        // 8. Remaining non-Current fallback, or compatible Current fallback only (never pick an incompatible Current fallback)
         return candidates.FirstOrDefault(c => !c.IsCurrentPreviewFallback)
-            ?? (isCompatibleWithAvatar != null
-                ? candidates.FirstOrDefault(c => c.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null && isCompatibleWithAvatar(clip, c.Avatar))
-                : null)
-            ?? candidates.FirstOrDefault(c => c.Mesh != null)
-            ?? candidates.FirstOrDefault();
+            ?? candidates.FirstOrDefault(c => c.IsCurrentPreviewFallback && IsCurrentCandidateCompatible(c));
     }
 
     private PreviewCandidateItem? ResolveAnimationClipPreviewCandidate(PreviewCandidateItem? candidate, bool cacheRelation = true)
@@ -1038,18 +1059,30 @@ public partial class MainWindow
         return meshes;
     }
 
-    private bool IsAnimationClipCompatibleWithAvatar(AnimationClip clip, Avatar avatar)
+    internal static bool IsHumanoidMuscleClip(AnimationClip? clip)
+    {
+        var indexArray = clip?.m_MuscleClip?.m_IndexArray;
+        if (indexArray == null || indexArray.Length <= HumanoidMuscleDecoder.RootSlotOffset)
+        {
+            return false;
+        }
+
+        for (var i = HumanoidMuscleDecoder.RootSlotOffset; i < indexArray.Length; i++)
+        {
+            if (indexArray[i] >= 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private HashSet<uint> GetCachedOrExtractTransformBindingPaths(AnimationClip clip)
     {
         HashSet<uint>? bindingPaths;
         lock (previewCacheLock)
         {
-            if (animationClipAvatarCache != null
-                && animationClipAvatarCache.TryGetValue(clip, out var cachedAvatar)
-                && ReferenceEquals(cachedAvatar, avatar))
-            {
-                return true;
-            }
-
             animationClipTransformBindingsCache ??= new Dictionary<AnimationClip, HashSet<uint>>();
             animationClipTransformBindingsCache.TryGetValue(clip, out bindingPaths);
         }
@@ -1064,12 +1097,58 @@ public partial class MainWindow
             }
         }
 
-        if (bindingPaths.Count == 0 || avatar.m_TOS == null)
+        return bindingPaths;
+    }
+
+    internal bool IsAnimationClipCompatibleWithMesh(AnimationClip clip, Mesh? mesh)
+    {
+        if (clip == null || mesh == null || mesh.m_BindPose == null || mesh.m_BindPose.Length == 0)
         {
             return false;
         }
 
-        var avatarPathHashes = new HashSet<uint>(avatar.m_TOS.Select(x => x.Key));
+        var bindingPaths = GetCachedOrExtractTransformBindingPaths(clip);
+        if (bindingPaths.Count == 0 || mesh.m_BoneNameHashes == null || mesh.m_BoneNameHashes.Length == 0)
+        {
+            return false;
+        }
+
+        var meshBoneHashes = new HashSet<uint>(mesh.m_BoneNameHashes.Where(h => h != 0));
+        if (meshBoneHashes.Count == 0)
+        {
+            return false;
+        }
+
+        var overlap = bindingPaths.Count(meshBoneHashes.Contains);
+        return IsStrongAnimationAvatarMatch(bindingPaths.Count, overlap);
+    }
+
+    private bool IsAnimationClipCompatibleWithAvatar(AnimationClip clip, Avatar avatar)
+    {
+        lock (previewCacheLock)
+        {
+            if (animationClipAvatarCache != null
+                && animationClipAvatarCache.TryGetValue(clip, out var cachedAvatar)
+                && ReferenceEquals(cachedAvatar, avatar))
+            {
+                return true;
+            }
+        }
+
+        var bindingPaths = GetCachedOrExtractTransformBindingPaths(clip);
+        if (bindingPaths.Count == 0)
+        {
+            return IsHumanoidMuscleClip(clip) && AssetExportHelper.IsHumanoidAvatar(avatar);
+        }
+
+        var avatarPathHashes = clip.m_Legacy
+            ? Services.SemanticGraphService.ExtractAvatarRigBoneHashes(avatar)
+            : Services.SemanticGraphService.ExtractAvatarBindingPathHashes(avatar);
+        if (avatarPathHashes.Count == 0)
+        {
+            return false;
+        }
+
         var overlap = bindingPaths.Count(avatarPathHashes.Contains);
         return IsStrongAnimationAvatarMatch(bindingPaths.Count, overlap);
     }

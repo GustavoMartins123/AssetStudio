@@ -3088,6 +3088,34 @@ namespace AssetStudio.Avalonia.Services
                     || avatarBaseName.Contains(goName, StringComparison.OrdinalIgnoreCase));
         }
 
+        public static HashSet<uint> ExtractAvatarBindingPathHashes(Avatar avatar)
+        {
+            var hashes = new HashSet<uint>();
+            if (avatar.m_Avatar?.m_AvatarSkeleton?.m_ID != null)
+            {
+                foreach (var id in avatar.m_Avatar.m_AvatarSkeleton.m_ID)
+                {
+                    if (id != 0)
+                    {
+                        hashes.Add(id);
+                    }
+                }
+            }
+
+            if (avatar.m_TOS != null)
+            {
+                foreach (var pair in avatar.m_TOS)
+                {
+                    if (pair.Key != 0)
+                    {
+                        hashes.Add(pair.Key);
+                    }
+                }
+            }
+
+            return hashes;
+        }
+
         public static HashSet<uint> ExtractAvatarRigBoneHashes(Avatar avatar)
         {
             var hashes = new HashSet<uint>();
@@ -3816,7 +3844,7 @@ namespace AssetStudio.Avalonia.Services
                 return false;
             }
 
-            var minimum = bindingCount < 6 ? bindingCount : Math.Max(6, bindingCount / 20);
+            var minimum = bindingCount < 6 ? bindingCount : Math.Max(6, bindingCount / 4);
             return overlap >= minimum;
         }
 

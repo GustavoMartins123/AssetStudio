@@ -196,6 +196,10 @@ namespace AssetStudio.Avalonia
             var referenceMesh = precomputedReferenceMesh
                 ?? PreviewMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, densityPercent, subMeshIndexCounts);
             var sourceNormals = ExtractMeshNormals(m_Mesh.m_Normals, m_Mesh.m_VertexCount);
+            if (sourceNormals == null && sourceVertexData.Length > 0 && m_Indices.Count >= 3)
+            {
+                sourceNormals = BuildCalculatedNormals(sourceVertexData, ExtractMeshIndices(m_Indices));
+            }
 
             var animMin = new Vector3(float.MaxValue);
             var animMax = new Vector3(float.MinValue);
@@ -269,7 +273,7 @@ namespace AssetStudio.Avalonia
                 ReferenceMesh = referenceMesh,
                 SourceNormals = sourceNormals,
                 Normals = initialSkinnedNormals ?? remappedNormals,
-                CalculatedNormals = initialSkinnedNormals ?? calculatedNormals,
+                CalculatedNormals = calculatedNormals,
                 Colors = colors,
                 Uvs = uvs,
                 SubMeshIndexCounts = referenceMesh.SubMeshIndexCounts ?? subMeshIndexCounts,
@@ -930,8 +934,9 @@ namespace AssetStudio.Avalonia
                     avatarReferenceSourceVertexIndices = referenceMesh.SourceVertexIndices;
                     vertexData = activeVertices;
                     indiceData = referenceMesh.Indices;
+                    var activeCalcNormals = BuildCalculatedNormals(activeVertices, referenceMesh.Indices);
                     normalData = activeNormals ?? rebuiltNormals;
-                    normal2Data = activeNormals ?? rebuiltCalcNormals ?? BuildCalculatedNormals(activeVertices, referenceMesh.Indices);
+                    normal2Data = activeCalcNormals;
                     colorData = rebuiltColors ?? ExtractMeshColors(null, activeVertices.Length);
                     uvData = rebuiltUvs;
                     previewSubMeshIndexCounts = referenceMesh.SubMeshIndexCounts ?? subMeshIndexCounts;
@@ -944,7 +949,9 @@ namespace AssetStudio.Avalonia
                         pendingMeshVertices = rebuiltAnimatedVertices != null && activeFrame < rebuiltAnimatedVertices.Length
                             ? rebuiltAnimatedVertices[activeFrame]
                             : null;
-                        pendingMeshNormals = activeNormals;
+                        pendingMeshNormals = normalMode == 0
+                            ? (normalData ?? normal2Data)
+                            : (normal2Data ?? normalData);
                     }
 
                     vao = 0;
@@ -974,10 +981,13 @@ namespace AssetStudio.Avalonia
 
             if (animatedMeshVertices != null && animCurrentFrame < animatedMeshVertices.Length)
             {
-                Vector3[]? frameNormals = null;
+                var frameVerts = animatedMeshVertices[animCurrentFrame];
+                vertexData = frameVerts;
+
+                Vector3[]? skinnedNormals = null;
                 if (animatedMeshNormals != null && animCurrentFrame < animatedMeshNormals.Length)
                 {
-                    frameNormals = animatedMeshNormals[animCurrentFrame];
+                    skinnedNormals = animatedMeshNormals[animCurrentFrame];
                 }
                 else if (avatarReferenceMeshSource != null
                     && avatarReferenceSourceNormals != null
@@ -991,12 +1001,37 @@ namespace AssetStudio.Avalonia
                         avatarReferenceSourceVertexIndices,
                         avatarReferenceBoneMatrices[animCurrentFrame],
                         dynamicSkinNormalsScratch);
-                    frameNormals = dynamicSkinNormalsScratch;
+                    skinnedNormals = dynamicSkinNormalsScratch;
+                }
+
+                if (skinnedNormals != null)
+                {
+                    normalData = skinnedNormals;
+                }
+
+                Vector3[]? frameNormals;
+                if (normalMode == 1 && indiceData != null)
+                {
+                    normal2Data = BuildCalculatedNormals(frameVerts, indiceData);
+                    frameNormals = normal2Data;
+                }
+                else if (skinnedNormals != null)
+                {
+                    frameNormals = skinnedNormals;
+                }
+                else if (indiceData != null)
+                {
+                    normal2Data = BuildCalculatedNormals(frameVerts, indiceData);
+                    frameNormals = normal2Data;
+                }
+                else
+                {
+                    frameNormals = null;
                 }
 
                 lock (meshLock)
                 {
-                    pendingMeshVertices = animatedMeshVertices[animCurrentFrame];
+                    pendingMeshVertices = frameVerts;
                     if (frameNormals != null)
                     {
                         pendingMeshNormals = frameNormals;

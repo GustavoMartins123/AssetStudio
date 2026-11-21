@@ -4,7 +4,9 @@ using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -538,6 +540,7 @@ public partial class MainWindow
         public MeshPreviewControl.PreparedAvatarPreviewGLData? GlData { get; init; }
         public int FrameCount { get; init; }
         public string StatusMessage { get; init; } = string.Empty;
+        public string SummaryText { get; init; } = string.Empty;
     }
 
     private void PreviewAnimationClip(
@@ -665,23 +668,29 @@ public partial class MainWindow
         PreparedAnimationClipPreviewOutcome outcome,
         bool rebuildCandidateControls)
     {
-        PreviewSession.ActivateSurface(
-            PreviewSurfaceKind.Animation3D,
-            AssetListDataGrid?.SelectedItem as AssetItem,
-            isLoading: false);
-        MeshPreview.SetMeshAndRigSummary(
-            meshSummary: null,
-            rigSummary: outcome.StatusMessage,
-            meshName: outcome.Mesh?.m_Name,
-            avatarName: outcome.Avatar?.m_Name);
-
-        if (rebuildCandidateControls && outcome.Candidates != null)
+        if (rebuildCandidateControls)
         {
-            BuildPreviewCandidateControls(outcome.Candidates, outcome.SelectedCandidate, "Animation Target");
+            if (outcome.Candidates != null && outcome.Candidates.Count > 0 && outcome.GlData != null)
+            {
+                BuildPreviewCandidateControls(outcome.Candidates, outcome.SelectedCandidate, "Animation Target");
+            }
+            else
+            {
+                ClearPreviewCandidateControls();
+            }
         }
 
         if (outcome.GlData != null && GLPreviewControl != null)
         {
+            PreviewSession.ActivateSurface(
+                PreviewSurfaceKind.Animation3D,
+                AssetListDataGrid?.SelectedItem as AssetItem,
+                isLoading: false);
+            MeshPreview.SetMeshAndRigSummary(
+                meshSummary: null,
+                rigSummary: outcome.StatusMessage,
+                meshName: outcome.Mesh?.m_Name,
+                avatarName: outcome.Avatar?.m_Name);
             currentPreviewAvatar = outcome.Avatar;
             currentPreviewMesh = outcome.Mesh;
             ClearMeshMaterialControls();
@@ -729,7 +738,39 @@ public partial class MainWindow
         }
         else
         {
+            currentPreviewAvatar = null;
+            currentPreviewMesh = null;
+            ClearMeshMaterialControls();
+            if (GLPreviewControl != null)
+            {
+                GLPreviewControl.StopAnimation();
+                GLPreviewControl.IsVisible = false;
+            }
+            HidePreviewGeometryControls();
             MeshPreview.SetAnimationState(isLoaded: false);
+            HideAnimationPlayback();
+
+            var summaryText = !string.IsNullOrWhiteSpace(outcome.SummaryText)
+                ? outcome.SummaryText
+                : outcome.StatusMessage;
+            PreviewSession.ShowTextPreview(
+                summaryText,
+                PreviewSurfaceKind.Text,
+                AssetListDataGrid?.SelectedItem as AssetItem);
+            MeshPreview.SetMeshAndRigSummary(
+                meshSummary: null,
+                rigSummary: summaryText,
+                meshName: null,
+                avatarName: null);
+            if (TextPreviewBox != null)
+            {
+                SetTextWithTruncation(TextPreviewBox, summaryText);
+                TextPreviewBox.IsVisible = true;
+            }
+            if (PreviewLabel != null)
+            {
+                PreviewLabel.IsVisible = false;
+            }
         }
 
         if (!string.IsNullOrEmpty(outcome.StatusMessage))
@@ -755,6 +796,11 @@ public partial class MainWindow
         IReadOnlyList<PreviewCandidateItem>? candidates = null;
         PreviewCandidateItem? activeCandidate = selectedCandidate;
 
+        var explicitUserTargetRequested = preferredAvatar != null
+            || preferredMesh != null
+            || !string.IsNullOrWhiteSpace(preferredAvatarId)
+            || !string.IsNullOrWhiteSpace(preferredMeshId);
+
         if (rebuildCandidateControls)
         {
             candidates = BuildAnimationClipPreviewCandidates(
@@ -776,7 +822,7 @@ public partial class MainWindow
                     preferredAvatarId,
                     preferredMeshId);
         }
-        else if (activeCandidate == null)
+        else if (activeCandidate == null && explicitUserTargetRequested)
         {
             activeCandidate = new PreviewCandidateItem
             {
@@ -793,9 +839,34 @@ public partial class MainWindow
         // Build bounded ordered attempt list (primary activeCandidate + up to 5 distinct alternate (AvatarId, MeshId) pairs).
         var attempts = new List<PreviewCandidateItem>();
         var seenPairs = new HashSet<string>(StringComparer.Ordinal);
-        void TryAddAttempt(PreviewCandidateItem? item)
+        bool IsCandidateEligibleForAttempt(PreviewCandidateItem? item)
         {
             if (item == null)
+            {
+                return false;
+            }
+
+            if (!item.IsCurrentPreviewFallback)
+            {
+                return true;
+            }
+
+            if (item.Avatar != null)
+            {
+                return IsAnimationClipCompatibleWithAvatar(clip, item.Avatar);
+            }
+
+            if (item.Mesh != null)
+            {
+                return IsAnimationClipCompatibleWithMesh(clip, item.Mesh);
+            }
+
+            return false;
+        }
+
+        void TryAddAttempt(PreviewCandidateItem? item)
+        {
+            if (item == null || !IsCandidateEligibleForAttempt(item))
             {
                 return;
             }
@@ -831,6 +902,18 @@ public partial class MainWindow
             }
         }
 
+        if (attempts.Count == 0)
+        {
+            attempts.Add(new PreviewCandidateItem
+            {
+                AnimationClip = clip,
+                Avatar = preferredAvatar,
+                Mesh = preferredMesh,
+                AvatarId = preferredAvatarId ?? string.Empty,
+                MeshId = preferredMeshId ?? string.Empty
+            });
+        }
+
         PreparedAnimationClipPreviewOutcome? bestStaticFallback = null;
         PreparedAnimationClipPreviewOutcome? lastOutcome = null;
 
@@ -848,6 +931,7 @@ public partial class MainWindow
                 densityPercent,
                 boneScale,
                 allowMeshFallbackWithoutAvatar: attemptIndex == attempts.Count - 1,
+                allowStaticBindPoseFallback: explicitUserTargetRequested && !candidateToTry.IsCurrentPreviewFallback,
                 token);
 
             if (outcome.FrameCount > 0 && outcome.GlData != null)
@@ -865,13 +949,21 @@ public partial class MainWindow
             lastOutcome = outcome;
         }
 
+        var fallbackStatus = lastOutcome?.StatusMessage;
+        if (string.IsNullOrWhiteSpace(fallbackStatus))
+        {
+            fallbackStatus = $"AnimationClip: {clip.m_Name} | Non-skeletal or curve-only clip (no compatible skeletal Avatar/Mesh target matched).";
+        }
+
         var finalOutcome = bestStaticFallback
-            ?? lastOutcome
             ?? new PreparedAnimationClipPreviewOutcome
             {
+                ClipName = clip.m_Name ?? string.Empty,
+                SampleRate = clip.m_SampleRate > 0f ? clip.m_SampleRate : 30f,
                 Candidates = candidates,
                 SelectedCandidate = activeCandidate,
-                StatusMessage = $"AnimationClip: No compatible Avatar or mesh target found for {clip.m_Name}."
+                StatusMessage = fallbackStatus!,
+                SummaryText = BuildAnimationClipCurveSummaryText(clip, fallbackStatus)
             };
 
         SetActivePreviewDependencyFiles(clip, finalOutcome.Avatar, finalOutcome.Mesh);
@@ -890,6 +982,7 @@ public partial class MainWindow
         float densityPercent,
         float boneScale,
         bool allowMeshFallbackWithoutAvatar,
+        bool allowStaticBindPoseFallback,
         CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
@@ -908,6 +1001,7 @@ public partial class MainWindow
                     currentMeshSnapshot,
                     densityPercent,
                     boneScale,
+                    allowStaticBindPoseFallback,
                     token,
                     out var fallbackOutcome,
                     candidates,
@@ -934,6 +1028,7 @@ public partial class MainWindow
                     currentMeshSnapshot,
                     densityPercent,
                     boneScale,
+                    allowStaticBindPoseFallback,
                     token,
                     out var fallbackOutcome,
                     candidates,
@@ -946,7 +1041,7 @@ public partial class MainWindow
             {
                 Candidates = candidates,
                 SelectedCandidate = resolvedCandidate ?? activeCandidate,
-                StatusMessage = $"AnimationClip: No compatible Avatar or mesh target found for {clip.m_Name}."
+                StatusMessage = $"AnimationClip: {clip.m_Name} | Non-skeletal or curve-only clip (no compatible Avatar or skeletal mesh target)."
             };
         }
 
@@ -1070,6 +1165,16 @@ public partial class MainWindow
         var referenceMesh = rigData.GetOrBuildReferenceMesh(densityPercent);
         if (tracks.TotalTrackCount == 0)
         {
+            if (!allowStaticBindPoseFallback)
+            {
+                return new PreparedAnimationClipPreviewOutcome
+                {
+                    Candidates = candidates,
+                    SelectedCandidate = resolvedCandidate ?? activeCandidate,
+                    StatusMessage = $"AnimationClip: {clip.m_Name} | No animation tracks matched skeletal rig {avatar.m_Name} -> {avatarMesh.m_Name}."
+                };
+            }
+
             var staticGlData = MeshPreviewControl.PrepareStaticAvatarGLData(
                 avatarMesh,
                 skeleton.RestBonePositions,
@@ -1191,6 +1296,7 @@ public partial class MainWindow
         Mesh? currentMeshSnapshot,
         float densityPercent,
         float boneScale,
+        bool allowStaticBindPoseFallback,
         CancellationToken token,
         out PreparedAnimationClipPreviewOutcome? outcome,
         IReadOnlyList<PreviewCandidateItem>? candidates,
@@ -1212,7 +1318,11 @@ public partial class MainWindow
             AddMesh(ResolveMeshPreviewCandidate(preferredMeshId));
         }
 
-        AddMesh(currentMeshSnapshot);
+        if (currentMeshSnapshot != null && IsAnimationClipCompatibleWithMesh(clip, currentMeshSnapshot))
+        {
+            AddMesh(currentMeshSnapshot);
+        }
+
         if (meshes.Count == 0)
         {
             var firstMeshId = LoadAnimationClipMeshAssetIdsForPreview(clip).FirstOrDefault();
@@ -1255,7 +1365,7 @@ public partial class MainWindow
                 continue;
             }
 
-            if (staticMesh == null)
+            if (staticMesh == null && allowStaticBindPoseFallback && !AreSamePreviewObject(mesh, currentMeshSnapshot))
             {
                 staticMesh = mesh;
                 staticBonePositions = bonePositions;
@@ -1289,6 +1399,8 @@ public partial class MainWindow
 
                 outcome = new PreparedAnimationClipPreviewOutcome
                 {
+                    ClipName = clip.m_Name ?? string.Empty,
+                    SampleRate = sampleRate,
                     Candidates = candidates,
                     SelectedCandidate = selectedCandidate,
                     Avatar = null,
@@ -1301,7 +1413,7 @@ public partial class MainWindow
             }
         }
 
-        if (staticMesh != null && staticBonePositions != null && staticParentIndices != null)
+        if (allowStaticBindPoseFallback && staticMesh != null && staticBonePositions != null && staticParentIndices != null)
         {
             token.ThrowIfCancellationRequested();
             var staticGlData = MeshPreviewControl.PrepareStaticAvatarGLData(
@@ -1314,6 +1426,8 @@ public partial class MainWindow
 
             outcome = new PreparedAnimationClipPreviewOutcome
             {
+                ClipName = clip.m_Name ?? string.Empty,
+                SampleRate = clip.m_SampleRate > 0f ? clip.m_SampleRate : 30f,
                 Candidates = candidates,
                 SelectedCandidate = selectedCandidate,
                 Avatar = null,
@@ -1326,6 +1440,174 @@ public partial class MainWindow
         }
 
         return false;
+    }
+
+    internal static string BuildAnimationClipCurveSummaryText(AnimationClip clip, string? statusNote = null)
+    {
+        var sb = new StringBuilder();
+        var clipName = !string.IsNullOrWhiteSpace(clip.m_Name) ? clip.m_Name : "Unnamed AnimationClip";
+        sb.AppendLine($"AnimationClip: {clipName} (PathID: {clip.m_PathID})");
+        sb.AppendLine(new string('=', 50));
+
+        var sampleRate = clip.m_SampleRate > 0f && float.IsFinite(clip.m_SampleRate) ? clip.m_SampleRate : 30f;
+        var muscleClip = clip.m_MuscleClip;
+        var innerClip = muscleClip?.m_Clip;
+        var bindings = clip.m_ClipBindingConstant;
+        if (bindings == null && innerClip?.m_Binding != null)
+        {
+            try
+            {
+                bindings = innerClip.ConvertValueArrayToGenericBinding();
+            }
+            catch
+            {
+                bindings = null;
+            }
+        }
+
+        var isHumanoid = IsHumanoidMuscleClip(clip);
+        var clipKind = clip.m_Legacy
+            ? "Legacy"
+            : isHumanoid
+                ? "Humanoid"
+                : "Generic / Property Curves";
+
+        var startTime = muscleClip != null && float.IsFinite(muscleClip.m_StartTime) ? muscleClip.m_StartTime : 0f;
+        var stopTime = muscleClip != null && float.IsFinite(muscleClip.m_StopTime) ? muscleClip.m_StopTime : 0f;
+        var duration = stopTime > startTime ? stopTime - startTime : 0f;
+        if (duration <= 0f)
+        {
+            foreach (var c in clip.m_PositionCurves ?? Array.Empty<Vector3Curve>())
+            {
+                if (c?.curve?.m_Curve is { Length: > 0 } kfs) duration = Math.Max(duration, kfs[^1].time);
+            }
+            foreach (var c in clip.m_RotationCurves ?? Array.Empty<QuaternionCurve>())
+            {
+                if (c?.curve?.m_Curve is { Length: > 0 } kfs) duration = Math.Max(duration, kfs[^1].time);
+            }
+            foreach (var c in clip.m_EulerCurves ?? Array.Empty<Vector3Curve>())
+            {
+                if (c?.curve?.m_Curve is { Length: > 0 } kfs) duration = Math.Max(duration, kfs[^1].time);
+            }
+            foreach (var c in clip.m_ScaleCurves ?? Array.Empty<Vector3Curve>())
+            {
+                if (c?.curve?.m_Curve is { Length: > 0 } kfs) duration = Math.Max(duration, kfs[^1].time);
+            }
+            foreach (var c in clip.m_FloatCurves ?? Array.Empty<FloatCurve>())
+            {
+                if (c?.curve?.m_Curve is { Length: > 0 } kfs) duration = Math.Max(duration, kfs[^1].time);
+            }
+        }
+
+        sb.AppendLine($"Type: {clipKind}");
+        sb.AppendLine($"Duration: {duration.ToString("0.###", CultureInfo.InvariantCulture)} s");
+        sb.AppendLine($"Sample Rate: {sampleRate.ToString("0.##", CultureInfo.InvariantCulture)} FPS");
+        sb.AppendLine($"Loop Time: {(muscleClip?.m_LoopTime == true ? "Yes" : "No")}");
+        sb.AppendLine($"Compressed: {(clip.m_Compressed ? "Yes" : "No")}");
+
+        var posCount = clip.m_PositionCurves?.Length ?? 0;
+        var rotCount = clip.m_RotationCurves?.Length ?? 0;
+        var compRotCount = clip.m_CompressedRotationCurves?.Length ?? 0;
+        var eulerCount = clip.m_EulerCurves?.Length ?? 0;
+        var scaleCount = clip.m_ScaleCurves?.Length ?? 0;
+        var floatCount = clip.m_FloatCurves?.Length ?? 0;
+        var pptrCount = clip.m_PPtrCurves?.Length ?? 0;
+        var streamedCount = (int)(innerClip?.m_StreamedClip?.curveCount ?? 0);
+        var denseCount = (int)(innerClip?.m_DenseClip?.m_CurveCount ?? 0);
+        var denseFrames = innerClip?.m_DenseClip?.m_FrameCount ?? 0;
+        var constantCount = innerClip?.m_ConstantClip?.data?.Length ?? 0;
+        var totalCurves = posCount + rotCount + compRotCount + eulerCount + scaleCount + floatCount + pptrCount
+            + streamedCount + denseCount + constantCount;
+
+        sb.AppendLine();
+        sb.AppendLine($"Curves Summary (Total channels: {totalCurves}):");
+        if (totalCurves == 0)
+        {
+            sb.AppendLine("  - No animation curves or property bindings stored in this clip.");
+        }
+        if (streamedCount > 0 || denseCount > 0 || constantCount > 0)
+        {
+            sb.AppendLine($"  - Streamed Channels: {streamedCount}");
+            sb.AppendLine($"  - Dense Channels: {denseCount} ({denseFrames} frames)");
+            sb.AppendLine($"  - Constant Channels: {constantCount}");
+        }
+        if (posCount > 0 || rotCount > 0 || compRotCount > 0 || eulerCount > 0 || scaleCount > 0 || floatCount > 0 || pptrCount > 0)
+        {
+            if (posCount > 0) sb.AppendLine($"  - Position Curves: {posCount}");
+            if (rotCount > 0) sb.AppendLine($"  - Rotation Curves: {rotCount}");
+            if (compRotCount > 0) sb.AppendLine($"  - Compressed Rotation Curves: {compRotCount}");
+            if (eulerCount > 0) sb.AppendLine($"  - Euler Curves: {eulerCount}");
+            if (scaleCount > 0) sb.AppendLine($"  - Scale Curves: {scaleCount}");
+            if (floatCount > 0) sb.AppendLine($"  - Float Curves: {floatCount}");
+            if (pptrCount > 0) sb.AppendLine($"  - PPtr Curves: {pptrCount}");
+        }
+
+        if (bindings?.genericBindings is { Length: > 0 } genericBindings)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Animated Bindings ({genericBindings.Length}):");
+            foreach (var b in genericBindings.Take(48))
+            {
+                var target = b.path == 0 ? "<root>" : $"pathHash={b.path}";
+                var prop = b.typeID == ClassIDType.Transform
+                    ? b.attribute switch
+                    {
+                        1 => "m_LocalPosition",
+                        2 => "m_LocalRotation",
+                        3 => "m_LocalScale",
+                        4 => "localEulerAnglesRaw",
+                        _ => $"attr_{b.attribute}"
+                    }
+                    : b.attribute switch
+                    {
+                        2086281974 => "m_IsActive",
+                        2015549526 => "m_Sprite",
+                        _ => $"attr_{b.attribute}"
+                    };
+                sb.AppendLine($"  - [{b.typeID}] {target} -> {prop}");
+            }
+
+            if (genericBindings.Length > 48)
+            {
+                sb.AppendLine($"  ... {genericBindings.Length - 48} more bindings");
+            }
+        }
+
+        if (floatCount > 0 && clip.m_FloatCurves != null)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Float Property Curves ({floatCount}):");
+            foreach (var fc in clip.m_FloatCurves.Take(32))
+            {
+                if (fc == null) continue;
+                var target = string.IsNullOrWhiteSpace(fc.path) ? "<root>" : fc.path;
+                var keyCount = fc.curve?.m_Curve?.Length ?? 0;
+                sb.AppendLine($"  - [{fc.classID}] {target} -> {fc.attribute} ({keyCount} keys)");
+            }
+            if (floatCount > 32)
+            {
+                sb.AppendLine($"  ... {floatCount - 32} more float curves");
+            }
+        }
+
+        if (clip.m_Events is { Length: > 0 } events)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Animation Events ({events.Length}):");
+            foreach (var ev in events.Take(16))
+            {
+                if (ev == null) continue;
+                sb.AppendLine($"  - t={ev.time.ToString("0.###", CultureInfo.InvariantCulture)}s: {ev.functionName}({ev.data})");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(statusNote))
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Note: {statusNote}");
+        }
+
+        return sb.ToString();
     }
 
     private bool TryBuildAnimationFramesFromRendererSkeleton(

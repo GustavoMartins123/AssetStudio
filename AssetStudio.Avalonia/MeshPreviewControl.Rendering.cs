@@ -256,11 +256,18 @@ namespace AssetStudio.Avalonia
                 }
             }
 
-            if (localSkeletonVerts != null && vaoSkeleton != 0 && vboSkeleton != 0)
+            if (localSkeletonVerts != null)
             {
-                GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
-                GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localSkeletonVerts.Length * 12), localSkeletonVerts, BufferUsageHint.DynamicDraw);
-                GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+                if (vaoSkeleton != 0 && vboSkeleton != 0 && localSkeletonVerts.Length > 0)
+                {
+                    GL.BindBuffer(BufferTarget.ArrayBuffer, vboSkeleton);
+                    GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localSkeletonVerts.Length * 12), localSkeletonVerts, BufferUsageHint.DynamicDraw);
+                    GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+                }
+                else
+                {
+                    CreateSkeletonVAO(localSkeletonVerts);
+                }
             }
 
             Vector3[]? localMeshVerts = null;

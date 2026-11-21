@@ -756,14 +756,11 @@ public partial class MainWindow : Window
         ClearMeshMaterialControls();
         ClearPreviewCandidateControls();
         ClearPreviewCacheBadge();
-        if (asset is not AnimationClip)
-        {
-            Stop2DAnimation();
-            HideAnimationPlayback();
-            GLPreviewControl?.StopAnimation();
-            currentPreviewMesh = null;
-            currentPreviewAvatar = null;
-        }
+        Stop2DAnimation();
+        HideAnimationPlayback();
+        GLPreviewControl?.StopAnimation();
+        currentPreviewMesh = null;
+        currentPreviewAvatar = null;
         currentPreviewTexture = null;
         currentPreviewSprite = null;
         currentPreviewAudioClip = null;
