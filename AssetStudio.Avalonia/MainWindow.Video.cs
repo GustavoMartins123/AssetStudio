@@ -981,7 +981,10 @@ public partial class MainWindow
         var savePath = await PickExportFolderDialogAsync("Select the save folder");
         if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var fileName = FixFileName(source.ExportBaseName) + extension;
+        var safeBase = FixFileName(source.ExportBaseName);
+        var fileName = safeBase.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
+            ? safeBase
+            : safeBase + extension;
         var filePath = Path.Combine(savePath, fileName);
 
         try

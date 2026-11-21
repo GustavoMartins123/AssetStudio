@@ -66,45 +66,23 @@ public partial class MainWindow
         TextAssetFormatDetectionResult detected)
     {
         var descriptor = BuildTextAssetEmbeddedVideoDescriptor(assetItem, m_TextAsset, detected);
-        var syntheticVideoClip = CreateSyntheticVideoClipForTextAsset(m_TextAsset, assetItem.Name, data, detected);
 
-        TextPreviewBox.IsVisible = false;
-        ImagePreviewBox.IsVisible = false;
         if (GLPreviewControl != null) GLPreviewControl.IsVisible = false;
         if (TextureGLPreview != null) TextureGLPreview.IsVisible = false;
-        PreviewLabel.IsVisible = false;
         ClearPreviewInfoOverlay();
 
-        PreviewSession.ActivateSurface(
-            PreviewSurfaceKind.Video,
-            assetItem,
+        PreviewEmbeddedVideoBytes(
+            assetItem: assetItem,
             title: descriptor.Title,
-            metadataSummary: detected.SummaryText);
-
-        PreviewVideoClip(assetItem, syntheticVideoClip);
-
-        MediaPlayback.SetMediaTitle(descriptor.Title);
-        MediaPlayback.SetMediaInfo(descriptor.ReadyInfoText);
-
-        if (VideoResolutionLabel != null)
-        {
-            VideoResolutionLabel.Text = descriptor.ResolutionText;
-        }
-        if (VideoFrameRateLabel != null)
-        {
-            VideoFrameRateLabel.Text = descriptor.FrameRateText;
-        }
-        if (VideoFormatLabel != null)
-        {
-            VideoFormatLabel.Text = descriptor.FormatLabel;
-        }
-        if (VideoAudioLabel != null)
-        {
-            VideoAudioLabel.Text = descriptor.AudioText;
-            bool hasAudio = !string.IsNullOrEmpty(detected.AudioCodec) || detected.Channels > 0;
-            VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(
-                global::Avalonia.Media.Color.Parse(hasAudio ? "#00e676" : "#ff9800"));
-        }
+            videoBytes: data,
+            assetIdKey: descriptor.AssetIdKey,
+            extension: descriptor.Extension,
+            formatLabel: descriptor.FormatLabel,
+            resolutionText: descriptor.ResolutionText,
+            frameRateText: descriptor.FrameRateText,
+            audioText: descriptor.AudioText,
+            readyInfoText: descriptor.ReadyInfoText,
+            defaultLoop: false);
 
         StatusStripUpdate($"Loaded embedded {detected.FormatName} TextAsset: {assetItem.Name} ({data.Length:N0} bytes)");
     }
