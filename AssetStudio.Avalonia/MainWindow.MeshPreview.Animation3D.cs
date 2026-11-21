@@ -538,6 +538,8 @@ public partial class MainWindow
         public Avatar? Avatar { get; init; }
         public Mesh? Mesh { get; init; }
         public MeshPreviewControl.PreparedAvatarPreviewGLData? GlData { get; init; }
+        public IReadOnlyList<CompositePreviewMaterialPart>? MaterialParts { get; init; }
+        public int AvailableGroupPartCount { get; init; }
         public int FrameCount { get; init; }
         public string StatusMessage { get; init; } = string.Empty;
         public string SummaryText { get; init; } = string.Empty;
@@ -588,6 +590,7 @@ public partial class MainWindow
             ?? (float)Math.Clamp(appSettings.AvatarPreviewMeshDensityPercent, MinAvatarPreviewMeshDensityPercent, MaxAvatarPreviewMeshDensityPercent);
         var boneScaleSnapshot = GLPreviewControl?.BoneScale
             ?? (float)Math.Clamp(appSettings.AvatarPreviewBoneScale, MinAvatarPreviewBoneScale, MaxAvatarPreviewBoneScale);
+        var showFullModelGroupSnapshot = MeshPreview.ShowFullModelGroup;
 
         StatusStripUpdate($"Resolving rig & loading animation '{clip.m_Name}'...");
 
@@ -616,6 +619,7 @@ public partial class MainWindow
                     currentMeshSnapshot,
                     densityPercentSnapshot,
                     boneScaleSnapshot,
+                    showFullModelGroupSnapshot,
                     token);
 
                 token.ThrowIfCancellationRequested();
@@ -682,6 +686,10 @@ public partial class MainWindow
 
         if (outcome.GlData != null && GLPreviewControl != null)
         {
+            UpdateModelGroupToggleContext(
+                outcome.Candidates ?? previewCandidateItems,
+                outcome.SelectedCandidate,
+                outcome.AvailableGroupPartCount);
             PreviewSession.ActivateSurface(
                 PreviewSurfaceKind.Animation3D,
                 AssetListDataGrid?.SelectedItem as AssetItem,
@@ -698,7 +706,15 @@ public partial class MainWindow
             GLPreviewControl.IsVisible = true;
             ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
-            if (outcome.Mesh != null)
+            if (outcome.MaterialParts != null && outcome.MaterialParts.Count > 0)
+            {
+                QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+                    outcome.MaterialParts,
+                    outcome.Mesh,
+                    texturePreviewIdCounter,
+                    AssetListDataGrid?.SelectedItem as AssetItem);
+            }
+            else if (outcome.Mesh != null)
             {
                 QueueLoadMaterialsForUnifiedMeshPreviewAsync(
                     outcome.Mesh,
@@ -791,6 +807,7 @@ public partial class MainWindow
         Mesh? currentMeshSnapshot,
         float densityPercent,
         float boneScale,
+        bool showFullModelGroup,
         CancellationToken token)
     {
         IReadOnlyList<PreviewCandidateItem>? candidates = null;
@@ -930,13 +947,22 @@ public partial class MainWindow
                 currentMeshSnapshot,
                 densityPercent,
                 boneScale,
+                showFullModelGroup,
                 allowMeshFallbackWithoutAvatar: attemptIndex == attempts.Count - 1,
                 allowStaticBindPoseFallback: explicitUserTargetRequested && !candidateToTry.IsCurrentPreviewFallback,
                 token);
 
             if (outcome.FrameCount > 0 && outcome.GlData != null)
             {
-                SetActivePreviewDependencyFiles(clip, outcome.Avatar, outcome.Mesh);
+                var depAssets = new List<AssetStudio.Object?> { clip, outcome.Avatar, outcome.Mesh };
+                if (outcome.GlData.CompositeParts != null)
+                {
+                    foreach (var p in outcome.GlData.CompositeParts)
+                    {
+                        depAssets.Add(p.Mesh);
+                    }
+                }
+                SetActivePreviewDependencyFiles(depAssets.ToArray());
                 _activePreviewNeedsConnectionRefresh = false;
                 return outcome;
             }
@@ -981,6 +1007,7 @@ public partial class MainWindow
         Mesh? currentMeshSnapshot,
         float densityPercent,
         float boneScale,
+        bool showFullModelGroup,
         bool allowMeshFallbackWithoutAvatar,
         bool allowStaticBindPoseFallback,
         CancellationToken token)
@@ -1063,12 +1090,70 @@ public partial class MainWindow
         token.ThrowIfCancellationRequested();
         avatarMesh?.EnsureProcessed();
 
+        var effectiveCandidate = resolvedCandidate ?? activeCandidate;
+        var availableGroupPartCount = effectiveCandidate.IsModelGroup
+            ? Math.Max(
+                effectiveCandidate.ModelGroupMeshCount,
+                Math.Max(
+                    effectiveCandidate.ModelGroupMeshInfos.Count,
+                    Math.Max(effectiveCandidate.ModelGroupMeshIds.Count, effectiveCandidate.ModelGroupMeshes.Count)))
+            : 0;
+        var meshHasBindPose = avatarMesh?.m_BindPose is { Length: > 0 }
+            && avatarMesh.m_Skin is { Length: > 0 }
+            && avatarMesh.m_Skin.Length >= avatarMesh.m_VertexCount;
+        var shouldUseCompositePipeline = (showFullModelGroup && availableGroupPartCount > 1)
+            || !meshHasBindPose
+            || avatarMesh == null;
+
+        if (shouldUseCompositePipeline
+            && MeshPreviewSkeletonBuilder.TryBuildAvatarSkeletonFromDefaultPose(avatar, out var defaultSkeleton))
+        {
+            token.ThrowIfCancellationRequested();
+            var partSpecs = BuildCompositeAvatarPartSpecsForCandidate(
+                avatar,
+                defaultSkeleton,
+                effectiveCandidate,
+                avatarMesh,
+                includeAllGroupParts: showFullModelGroup && availableGroupPartCount > 1,
+                token,
+                out var primaryCompositeMesh,
+                out var resolvedGroupPartCount);
+            availableGroupPartCount = Math.Max(availableGroupPartCount, resolvedGroupPartCount);
+            if (primaryCompositeMesh != null)
+            {
+                avatarMesh = primaryCompositeMesh;
+            }
+
+            if (partSpecs.Count > 1
+                || (partSpecs.Count == 1 && !partSpecs[0].IsSkinned)
+                || (partSpecs.Count == 0 && defaultSkeleton.NodeCount >= 2))
+            {
+                var compositeOutcome = PrepareCompositeAvatarAnimationOutcome(
+                    clip,
+                    avatar,
+                    avatarMesh,
+                    defaultSkeleton,
+                    partSpecs,
+                    candidates,
+                    effectiveCandidate,
+                    availableGroupPartCount,
+                    densityPercent,
+                    boneScale,
+                    allowStaticBindPoseFallback,
+                    token);
+                if (compositeOutcome != null)
+                {
+                    return compositeOutcome;
+                }
+            }
+        }
+
         if (avatarMesh == null)
         {
             return new PreparedAnimationClipPreviewOutcome
             {
                 Candidates = candidates,
-                SelectedCandidate = resolvedCandidate ?? activeCandidate,
+                SelectedCandidate = effectiveCandidate,
                 StatusMessage = "AnimationClip: No suitable mesh with bind poses found."
             };
         }
@@ -1194,6 +1279,8 @@ public partial class MainWindow
                 Avatar = avatar,
                 Mesh = avatarMesh,
                 GlData = staticGlData,
+                MaterialParts = BuildCompositeMaterialPartsFromGlData(staticGlData, avatarMesh),
+                AvailableGroupPartCount = availableGroupPartCount,
                 FrameCount = 0,
                 StatusMessage = $"AnimationClip: {clip.m_Name} | No animation tracks extracted, showing bind pose | Bones: {skeleton.MeshBoneCount}"
             };
@@ -1284,8 +1371,215 @@ public partial class MainWindow
             Avatar = avatar,
             Mesh = avatarMesh,
             GlData = animatedGlData,
+            MaterialParts = BuildCompositeMaterialPartsFromGlData(animatedGlData, avatarMesh),
+            AvailableGroupPartCount = availableGroupPartCount,
             FrameCount = allFrames.Length,
             StatusMessage = $"Animation Preview | Clip: {clip.m_Name}{targetStatus} | Frames: {allFrames.Length} | FPS: {resolvedSampleRate} | Tracks: {tracks.TotalTrackCount}"
+        };
+    }
+
+    private PreparedAnimationClipPreviewOutcome? PrepareCompositeAvatarAnimationOutcome(
+        AnimationClip clip,
+        Avatar avatar,
+        Mesh? primaryMesh,
+        AvatarDefaultSkeletonData defaultSkeleton,
+        IReadOnlyList<MeshPreviewControl.AvatarPreviewPartSpec> partSpecs,
+        IReadOnlyList<PreviewCandidateItem>? candidates,
+        PreviewCandidateItem activeCandidate,
+        int availableGroupPartCount,
+        float densityPercent,
+        float boneScale,
+        bool allowStaticBindPoseFallback,
+        CancellationToken token)
+    {
+        var skinnedPartPairs = new List<(Mesh Mesh, int[] BoneToNodeMap)>();
+        var rigidAttachNodes = new List<int>();
+        for (var i = 0; i < partSpecs.Count; i++)
+        {
+            var part = partSpecs[i];
+            if (part.IsSkinned && part.BoneToSkeletonNodeMap != null)
+            {
+                skinnedPartPairs.Add((part.Mesh, part.BoneToSkeletonNodeMap));
+            }
+            else if (!part.IsSkinned && part.RigidAttachNodeIndex >= 0)
+            {
+                rigidAttachNodes.Add(part.RigidAttachNodeIndex);
+            }
+        }
+
+        MeshPreviewSkeletonBuilder.BuildCompositeAvatarDeformChainMasks(
+            defaultSkeleton,
+            skinnedPartPairs,
+            rigidAttachNodes,
+            out var activeNodeMask,
+            out var deformChainMask);
+
+        bool TryResolveBindingNode(GenericBinding binding, out int nodeIdx) =>
+            defaultSkeleton.TryResolveBindingNode(avatar, binding, out nodeIdx);
+
+        bool ShouldUseNode(int nodeIdx) =>
+            nodeIdx >= 0 && nodeIdx < deformChainMask.Length && deformChainMask[nodeIdx];
+
+        var muscleClip = clip.m_MuscleClip;
+        var tracks = new AnimationTrackSet();
+        if (muscleClip?.m_Clip != null)
+        {
+            var innerClip = muscleClip.m_Clip;
+            var bindings = clip.m_ClipBindingConstant ?? innerClip.ConvertValueArrayToGenericBinding();
+            if (bindings?.genericBindings != null)
+            {
+                MeshPreviewAnimationEvaluator.ExtractMuscleClipTracks(
+                    innerClip,
+                    bindings,
+                    muscleClip.m_StopTime,
+                    TryResolveBindingNode,
+                    ShouldUseNode,
+                    tracks,
+                    updateMaxTimeBeforeBoundsCheck: true);
+            }
+
+            if (AssetExportHelper.IsHumanoidAvatar(avatar) && muscleClip.m_IndexArray?.Length > HumanoidMuscleDecoder.RootSlotOffset)
+            {
+                MeshPreviewAnimationEvaluator.ExtractHumanoidMuscleTracksForAvatarSkeleton(
+                    clip,
+                    avatar,
+                    defaultSkeleton,
+                    ShouldUseNode,
+                    tracks);
+            }
+        }
+
+        if (tracks.TotalTrackCount == 0)
+        {
+            MeshPreviewAnimationEvaluator.ExtractLegacyCurves(
+                clip,
+                defaultSkeleton.TryResolvePathNode,
+                ShouldUseNode,
+                tracks);
+        }
+
+        if (tracks.TotalTrackCount == 0 && muscleClip?.m_Clip == null)
+        {
+            return new PreparedAnimationClipPreviewOutcome
+            {
+                Candidates = candidates,
+                SelectedCandidate = activeCandidate,
+                AvailableGroupPartCount = availableGroupPartCount,
+                StatusMessage = "AnimationClip: No muscle clip data."
+            };
+        }
+
+        tracks.SortAll();
+        token.ThrowIfCancellationRequested();
+
+        if (tracks.TotalTrackCount == 0)
+        {
+            if (!allowStaticBindPoseFallback)
+            {
+                return new PreparedAnimationClipPreviewOutcome
+                {
+                    Candidates = candidates,
+                    SelectedCandidate = activeCandidate,
+                    AvailableGroupPartCount = availableGroupPartCount,
+                    StatusMessage = $"AnimationClip: {clip.m_Name} | No animation tracks matched skeletal rig {avatar.m_Name}."
+                };
+            }
+
+            var staticGlData = partSpecs.Count > 0
+                ? MeshPreviewControl.PrepareCompositeStaticAvatarGLData(
+                    partSpecs,
+                    defaultSkeleton.RestWorldPositions,
+                    defaultSkeleton.RestWorldMatrices,
+                    defaultSkeleton.ParentIndices,
+                    defaultSkeleton.NodeNames,
+                    densityPercent,
+                    boneScale)
+                : MeshPreviewControl.PrepareSkeletonOnlyAvatarGLData(
+                    defaultSkeleton.RestWorldPositions,
+                    defaultSkeleton.ParentIndices,
+                    defaultSkeleton.NodeNames,
+                    boneScale);
+
+            return new PreparedAnimationClipPreviewOutcome
+            {
+                ClipName = clip.m_Name ?? string.Empty,
+                SampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30f,
+                Candidates = candidates,
+                SelectedCandidate = activeCandidate,
+                Avatar = avatar,
+                Mesh = primaryMesh,
+                GlData = staticGlData,
+                MaterialParts = BuildCompositeMaterialPartsFromGlData(staticGlData, primaryMesh),
+                AvailableGroupPartCount = availableGroupPartCount,
+                FrameCount = 0,
+                StatusMessage = $"AnimationClip: {clip.m_Name} | No animation tracks extracted, showing rest pose | Parts: {staticGlData?.PartCount ?? 0} | Bones: {defaultSkeleton.NodeCount}"
+            };
+        }
+
+        var sampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30f;
+        var stopTime = muscleClip?.m_StopTime ?? 0f;
+        var maxTime = tracks.MaxTime > 0 ? tracks.MaxTime : stopTime > 0 ? stopTime : 1f;
+
+        if (!MeshPreviewAnimationEvaluator.EvaluateAvatarSkeletonFrames(
+                defaultSkeleton,
+                activeNodeMask,
+                deformChainMask,
+                tracks.PosTracks,
+                tracks.RotTracks,
+                tracks.ScaleTracks,
+                sampleRate,
+                maxTime,
+                useCeilingFrameCount: false,
+                failIfAllTracksFiltered: false,
+                out var allNodeFrames,
+                out var allNodeWorldMatrices,
+                out var renderParentIndices,
+                out var resolvedSampleRate,
+                out _))
+        {
+            return null;
+        }
+
+        token.ThrowIfCancellationRequested();
+
+        var animatedGlData = MeshPreviewControl.PrepareCompositeAnimatedAvatarGLData(
+            partSpecs,
+            allNodeFrames,
+            allNodeWorldMatrices,
+            renderParentIndices,
+            resolvedSampleRate,
+            defaultSkeleton.NodeNames,
+            densityPercent,
+            boneScale);
+
+        if (animatedGlData == null)
+        {
+            return null;
+        }
+
+        var renderedParts = animatedGlData.PartCount;
+        var groupLabel = !string.IsNullOrWhiteSpace(activeCandidate.ModelGroupName)
+            ? activeCandidate.ModelGroupName
+            : avatar.m_Name;
+        var targetStatus = renderedParts > 1
+            ? $" | Full Object: {groupLabel} ({renderedParts:N0} parts)"
+            : animatedGlData.IsSkeletonOnly
+                ? $" | Skeleton only: {avatar.m_Name}"
+                : $" | Mesh: {primaryMesh?.m_Name ?? avatar.m_Name}";
+
+        return new PreparedAnimationClipPreviewOutcome
+        {
+            ClipName = clip.m_Name ?? string.Empty,
+            SampleRate = resolvedSampleRate,
+            Candidates = candidates,
+            SelectedCandidate = activeCandidate,
+            Avatar = avatar,
+            Mesh = primaryMesh,
+            GlData = animatedGlData,
+            MaterialParts = BuildCompositeMaterialPartsFromGlData(animatedGlData, primaryMesh),
+            AvailableGroupPartCount = availableGroupPartCount,
+            FrameCount = allNodeFrames.Length,
+            StatusMessage = $"Animation Preview | Clip: {clip.m_Name}{targetStatus} | Frames: {allNodeFrames.Length} | FPS: {resolvedSampleRate} | Tracks: {tracks.TotalTrackCount}"
         };
     }
 

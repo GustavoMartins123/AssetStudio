@@ -681,6 +681,15 @@
                                                           IsChecked="{Binding MeshPreview.SkeletonXRay, Mode=TwoWay}"
                                                           ToolTip.Tip="Render bones on top of the solid model" />
                                             </Grid>
+
+                                            <CheckBox x:Name="ShowFullModelGroupCheckBox"
+                                                      Content="{Binding MeshPreview.FullModelGroupToggleLabel}"
+                                                      Foreground="White"
+                                                      FontSize="10"
+                                                      MinHeight="24"
+                                                      IsVisible="{Binding MeshPreview.HasMultiPartModelGroup}"
+                                                      IsChecked="{Binding MeshPreview.ShowFullModelGroup, Mode=TwoWay}"
+                                                      ToolTip.Tip="Toggle between full multi-part object and single mesh" />
                                         </StackPanel>
 
                                         <StackPanel x:Name="PreviewCandidateControlsContainer" Spacing="6" IsVisible="{Binding PreviewSession.HasCandidates}">

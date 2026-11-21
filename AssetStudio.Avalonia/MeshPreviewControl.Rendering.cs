@@ -111,7 +111,9 @@ namespace AssetStudio.Avalonia
             try
             {
                 var indices = indiceData;
-                if (vertexData == null || indices == null)
+                bool hasMeshGeometry = vertexData != null && vertexData.Length > 0 && indices != null && indices.Length > 0;
+                bool hasSkeletonGeometry = isAvatarMode && (boneLinesVertexCount > 0 || jointPointsVertexCount > 0 || pendingSkeletonVertices != null);
+                if (!hasMeshGeometry && !hasSkeletonGeometry)
                 {
                     GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
                     return;
@@ -146,7 +148,7 @@ namespace AssetStudio.Avalonia
                     UploadPendingDynamicGeometry();
                 }
 
-                if (showMesh)
+                if (showMesh && hasMeshGeometry && indices != null)
                 {
                     GL.BindVertexArray(vao);
 

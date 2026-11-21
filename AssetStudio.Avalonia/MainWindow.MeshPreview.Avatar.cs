@@ -20,20 +20,25 @@ public partial class MainWindow
         var seenModelGroupIds = new HashSet<string>(StringComparer.Ordinal);
         var avatarId = GetPreviewObjectKey(avatar);
 
-        void AddModelGroup(ModelGroupInfo group, IReadOnlyList<ModelGroupMeshInfo> groupMeshes, string source)
+        void AddModelGroup(
+            ModelGroupInfo group,
+            IReadOnlyList<ModelGroupMeshInfo> groupMeshes,
+            string source,
+            IReadOnlyList<Mesh>? resolvedMeshes = null)
         {
             if (string.IsNullOrWhiteSpace(group.GroupId) || !seenModelGroupIds.Add(group.GroupId))
             {
                 return;
             }
 
-            var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+            var dedupedMeshes = DeduplicateModelGroupMeshInfos(groupMeshes);
+            var representative = SelectRepresentativeModelGroupMesh(dedupedMeshes);
             if (representative == null)
             {
                 return;
             }
 
-            var meshIds = groupMeshes
+            var meshIds = dedupedMeshes
                 .Select(mesh => mesh.MeshAssetId)
                 .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
                 .ToArray();
@@ -53,13 +58,16 @@ public partial class MainWindow
             candidates.Add(new PreviewCandidateItem
             {
                 Avatar = avatar,
+                Mesh = resolvedMeshes?.FirstOrDefault(m => string.Equals(GetPreviewObjectKey(m), representative.MeshAssetId, StringComparison.Ordinal)),
                 MeshId = representative.MeshAssetId,
                 AvatarId = avatarId,
                 ModelGroupId = group.GroupId,
                 ModelGroupName = displayName,
+                ModelGroupKind = group.GroupKind,
                 ModelGroupMeshIds = meshIds,
-                ModelGroupMeshInfos = groupMeshes.ToArray(),
-                ModelGroupTransforms = groupMeshes.Select(mesh => mesh.TransformMatrix).ToArray(),
+                ModelGroupMeshInfos = dedupedMeshes.ToArray(),
+                ModelGroupMeshes = resolvedMeshes ?? Array.Empty<Mesh>(),
+                ModelGroupTransforms = dedupedMeshes.Select(mesh => mesh.TransformMatrix).ToArray(),
                 ModelGroupMeshCount = meshIds.Length,
                 ModelGroupConfidence = group.Confidence,
                 Label = $"{source}: {displayName} ({meshIds.Length:N0} parts) -> {representativeName} (Mesh PathID: {pathId})"
@@ -96,6 +104,14 @@ public partial class MainWindow
             foreach (var group in LoadModelGroupsByAvatarIdsForPreview(new[] { avatarId }).GetValueOrDefault(avatarId) ?? new List<ModelGroupInfo>())
             {
                 AddModelGroup(group, LoadModelGroupMeshesForPreview(group.GroupId), "Model group");
+            }
+        }
+
+        if (seenModelGroupIds.Count == 0)
+        {
+            foreach (var eagerGroup in BuildEagerAvatarModelGroups(avatar))
+            {
+                AddModelGroup(eagerGroup.Group, eagerGroup.Meshes, "Model group", eagerGroup.ResolvedMeshes);
             }
         }
 
@@ -188,6 +204,7 @@ public partial class MainWindow
         var boneScale = GLPreviewControl?.BoneScale
             ?? (float)Math.Clamp(appSettings.AvatarPreviewBoneScale, MinAvatarPreviewBoneScale, MaxAvatarPreviewBoneScale);
         var includeInfo = ViewModel.Options.DisplayInfo;
+        var showFullModelGroup = MeshPreview.ShowFullModelGroup;
         StatusStripUpdate("Loading avatar relations & preparing rig...");
 
         _ = Task.Run(() =>
@@ -197,6 +214,24 @@ public partial class MainWindow
                 token.ThrowIfCancellationRequested();
                 var candidates = BuildAvatarPreviewCandidates(avatar, preferredMesh, preferredMeshId);
                 token.ThrowIfCancellationRequested();
+
+                var activeCandidate = selectedCandidateOverride != null
+                    ? candidates.FirstOrDefault(x =>
+                        (!string.IsNullOrWhiteSpace(selectedCandidateOverride.ModelGroupId)
+                            && string.Equals(x.ModelGroupId, selectedCandidateOverride.ModelGroupId, StringComparison.Ordinal))
+                        || (!string.IsNullOrWhiteSpace(selectedCandidateOverride.MeshId)
+                            && !selectedCandidateOverride.IsModelGroup
+                            && !x.IsModelGroup
+                            && string.Equals(x.MeshId, selectedCandidateOverride.MeshId, StringComparison.Ordinal))
+                        || (!selectedCandidateOverride.IsModelGroup
+                            && !x.IsModelGroup
+                            && AreSamePreviewObject(x.Mesh, selectedCandidateOverride.Mesh)))
+                        ?? selectedCandidateOverride
+                    : candidates.FirstOrDefault(x => x.IsModelGroup) ?? candidates.FirstOrDefault();
+
+                var explicitSingleMeshRequested = selectedCandidateOverride != null
+                    && !selectedCandidateOverride.IsModelGroup;
+
                 var avatarMesh = SelectAvatarPreviewMesh(candidates, preferredMesh, preferredMeshId);
                 token.ThrowIfCancellationRequested();
 
@@ -206,52 +241,123 @@ public partial class MainWindow
                     CacheAvatarMeshRelation(avatar, avatarMesh);
                 }
 
-                global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
-                int[]? parentIndices = null;
-                string[]? boneNames = null;
-
-                var skinnedRenderer = avatarMesh != null ? FindSkinnedRendererForAvatarMesh(avatar, avatarMesh) : null;
-                if (avatarMesh != null
-                    && skinnedRenderer == null
-                    && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
-                {
-                    EnsureMeshPreviewDependenciesLoaded(avatarMesh);
-                    skinnedRenderer = FindSkinnedRendererForAvatarMesh(avatar, avatarMesh);
-                }
-
-                if (avatarMesh != null
-                    && skinnedRenderer != null
-                    && TryBuildSkeletonFromSkinnedRenderer(avatar, avatarMesh, skinnedRenderer, out var rendererBonePositions, out var rendererParentIndices, out var rendererBoneNames))
-                {
-                    bonePositions = rendererBonePositions;
-                    parentIndices = rendererParentIndices;
-                    boneNames = rendererBoneNames;
-                }
-
-                if (bonePositions == null
-                    && avatarMesh != null
-                    && MeshPreviewSkeletonBuilder.TryBuildAvatarMeshSkeleton(avatar, avatarMesh, out var avatarSkeleton))
-                {
-                    bonePositions = avatarSkeleton.RestBonePositions;
-                    parentIndices = avatarSkeleton.MeshParentIndices;
-                    boneNames = avatarSkeleton.MeshBoneNames;
-                }
-
-                token.ThrowIfCancellationRequested();
                 MeshPreviewControl.PreparedAvatarPreviewGLData? preparedGl = null;
-                if (avatarMesh != null && bonePositions != null && parentIndices != null)
+                List<CompositePreviewMaterialPart>? materialParts = null;
+                var boneJointCount = 0;
+                var availableGroupPartCount = 0;
+
+                if (MeshPreviewSkeletonBuilder.TryBuildAvatarSkeletonFromDefaultPose(avatar, out var defaultSkeleton))
                 {
-                    preparedGl = MeshPreviewControl.PrepareStaticAvatarGLData(
+                    token.ThrowIfCancellationRequested();
+                    var includeAllParts = showFullModelGroup && !explicitSingleMeshRequested;
+                    var partSpecs = BuildCompositeAvatarPartSpecsForCandidate(
+                        avatar,
+                        defaultSkeleton,
+                        activeCandidate,
                         avatarMesh,
-                        bonePositions,
-                        parentIndices,
-                        boneNames,
-                        densityPercent,
-                        boneScale);
+                        includeAllParts,
+                        token,
+                        out var primaryPartMesh,
+                        out availableGroupPartCount);
+
+                    if (primaryPartMesh != null)
+                    {
+                        avatarMesh = primaryPartMesh;
+                        CacheAvatarMeshRelation(avatar, avatarMesh);
+                    }
+
+                    token.ThrowIfCancellationRequested();
+                    if (partSpecs.Count > 0)
+                    {
+                        var useCompositePipeline = partSpecs.Count > 1
+                            || !partSpecs[0].IsSkinned
+                            || defaultSkeleton.RestWorldMatrices.Length > 0;
+                        if (useCompositePipeline)
+                        {
+                            preparedGl = MeshPreviewControl.PrepareCompositeStaticAvatarGLData(
+                                partSpecs,
+                                defaultSkeleton.RestWorldPositions,
+                                defaultSkeleton.RestWorldMatrices,
+                                defaultSkeleton.ParentIndices,
+                                defaultSkeleton.NodeNames,
+                                densityPercent,
+                                boneScale);
+                            boneJointCount = defaultSkeleton.NodeCount;
+                            materialParts = BuildCompositeMaterialPartsFromGlData(preparedGl, avatarMesh);
+                        }
+                    }
+                    else if (defaultSkeleton.NodeCount >= 2)
+                    {
+                        // Render 3D skeleton directly even when an Avatar has 0 resolved meshes.
+                        preparedGl = MeshPreviewControl.PrepareSkeletonOnlyAvatarGLData(
+                            defaultSkeleton.RestWorldPositions,
+                            defaultSkeleton.ParentIndices,
+                            defaultSkeleton.NodeNames,
+                            boneScale);
+                        boneJointCount = defaultSkeleton.NodeCount;
+                    }
                 }
 
-                var infoText = includeInfo && avatarMesh != null && preparedGl != null
-                    ? BuildAvatarPreviewInfoText(avatar, candidates, avatarMesh)
+                if (preparedGl == null && avatarMesh != null)
+                {
+                    global::OpenTK.Mathematics.Vector3[]? bonePositions = null;
+                    int[]? parentIndices = null;
+                    string[]? boneNames = null;
+
+                    var skinnedRenderer = FindSkinnedRendererForAvatarMesh(avatar, avatarMesh);
+                    if (skinnedRenderer == null
+                        && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    {
+                        EnsureMeshPreviewDependenciesLoaded(avatarMesh);
+                        skinnedRenderer = FindSkinnedRendererForAvatarMesh(avatar, avatarMesh);
+                    }
+
+                    if (skinnedRenderer != null
+                        && TryBuildSkeletonFromSkinnedRenderer(avatar, avatarMesh, skinnedRenderer, out var rendererBonePositions, out var rendererParentIndices, out var rendererBoneNames))
+                    {
+                        bonePositions = rendererBonePositions;
+                        parentIndices = rendererParentIndices;
+                        boneNames = rendererBoneNames;
+                    }
+
+                    if (bonePositions == null
+                        && MeshPreviewSkeletonBuilder.TryBuildAvatarMeshSkeleton(avatar, avatarMesh, out var avatarSkeleton))
+                    {
+                        bonePositions = avatarSkeleton.RestBonePositions;
+                        parentIndices = avatarSkeleton.MeshParentIndices;
+                        boneNames = avatarSkeleton.MeshBoneNames;
+                    }
+
+                    token.ThrowIfCancellationRequested();
+                    if (bonePositions != null && parentIndices != null)
+                    {
+                        preparedGl = MeshPreviewControl.PrepareStaticAvatarGLData(
+                            avatarMesh,
+                            bonePositions,
+                            parentIndices,
+                            boneNames,
+                            densityPercent,
+                            boneScale);
+                        boneJointCount = bonePositions.Length;
+                        materialParts = BuildCompositeMaterialPartsFromGlData(preparedGl, avatarMesh);
+                    }
+                }
+
+                if (preparedGl != null)
+                {
+                    var depAssets = new List<AssetStudio.Object?> { avatar, avatarMesh };
+                    if (preparedGl.CompositeParts != null)
+                    {
+                        foreach (var p in preparedGl.CompositeParts)
+                        {
+                            depAssets.Add(p.Mesh);
+                        }
+                    }
+                    SetActivePreviewDependencyFiles(depAssets.ToArray());
+                }
+
+                var infoText = includeInfo && preparedGl != null
+                    ? BuildAvatarPreviewInfoText(avatar, candidates, avatarMesh, preparedGl.PartCount, boneJointCount)
                     : string.Empty;
 
                 Dispatcher.UIThread.Post(() =>
@@ -268,9 +374,11 @@ public partial class MainWindow
                         avatar,
                         avatarMesh,
                         candidates,
-                        selectedCandidateOverride,
+                        activeCandidate,
                         preparedGl,
-                        bonePositions?.Length ?? 0,
+                        materialParts,
+                        boneJointCount,
+                        availableGroupPartCount,
                         infoText);
                 });
             }
@@ -293,6 +401,8 @@ public partial class MainWindow
                             Array.Empty<PreviewCandidateItem>(),
                             selectedCandidateOverride,
                             null,
+                            null,
+                            0,
                             0,
                             string.Empty);
                     }
@@ -318,7 +428,9 @@ public partial class MainWindow
         IReadOnlyList<PreviewCandidateItem> avatarCandidates,
         PreviewCandidateItem? selectedCandidateOverride,
         MeshPreviewControl.PreparedAvatarPreviewGLData? preparedGl,
+        IReadOnlyList<CompositePreviewMaterialPart>? materialParts,
         int boneJointCount,
+        int availableGroupPartCount,
         string infoText)
     {
         currentPreviewAvatar = avatar;
@@ -348,21 +460,38 @@ public partial class MainWindow
                 && !string.IsNullOrWhiteSpace(selectedMeshId)
                 && string.Equals(x.MeshId, selectedMeshId, StringComparison.Ordinal)));
         BuildPreviewCandidateControls(avatarCandidates, selectedCandidate, "Avatar Mesh");
+        UpdateModelGroupToggleContext(avatarCandidates, selectedCandidate, availableGroupPartCount);
 
-        if (avatarMesh != null && preparedGl != null && GLPreviewControl != null)
+        if (preparedGl != null && GLPreviewControl != null)
         {
             ClearMeshMaterialControls();
             GLPreviewControl.ApplyPreparedAvatarPreview(preparedGl);
             GLPreviewControl.IsVisible = true;
             ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
-            QueueLoadMaterialsForUnifiedMeshPreviewAsync(
-                avatarMesh,
-                texturePreviewIdCounter,
-                AssetListDataGrid?.SelectedItem as AssetItem);
+            if (materialParts != null && materialParts.Count > 0)
+            {
+                QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+                    materialParts,
+                    avatarMesh,
+                    texturePreviewIdCounter,
+                    AssetListDataGrid?.SelectedItem as AssetItem);
+            }
+            else if (avatarMesh != null)
+            {
+                QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+                    avatarMesh,
+                    texturePreviewIdCounter,
+                    AssetListDataGrid?.SelectedItem as AssetItem);
+            }
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
-            StatusStripUpdate($"OpenGL Avatar Preview | Mesh: {avatarMesh.m_Name} | Related meshes: {avatarCandidates.Count} | Skeleton Joints: {boneJointCount}");
+            var statusSummary = preparedGl.IsSkeletonOnly
+                ? $"OpenGL Avatar Preview | Skeleton only ({avatar.m_Name}) | Skeleton Joints: {boneJointCount}"
+                : preparedGl.PartCount > 1
+                    ? $"OpenGL Avatar Preview | Full Object ({preparedGl.PartCount:N0} parts) | Primary: {avatarMesh?.m_Name} | Skeleton Joints: {boneJointCount}"
+                    : $"OpenGL Avatar Preview | Mesh: {avatarMesh?.m_Name} | Related meshes: {avatarCandidates.Count} | Skeleton Joints: {boneJointCount}";
+            StatusStripUpdate(statusSummary);
             return;
         }
 
@@ -426,15 +555,34 @@ public partial class MainWindow
         PreviewLabel.IsVisible = false;
     }
 
-    private static string BuildAvatarPreviewInfoText(Avatar avatar, IReadOnlyList<PreviewCandidateItem> relatedMeshes, Mesh? selectedMesh)
+    private static string BuildAvatarPreviewInfoText(
+        Avatar avatar,
+        IReadOnlyList<PreviewCandidateItem> relatedMeshes,
+        Mesh? selectedMesh,
+        int renderedPartCount = 0,
+        int skeletonJointCount = 0)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"Avatar: {avatar.m_Name} (PathID: {avatar.m_PathID})");
         sb.AppendLine(new string('=', 42));
         sb.AppendLine($"Avatar Size: {avatar.m_AvatarSize} bytes");
+        if (skeletonJointCount > 0)
+        {
+            sb.AppendLine($"Skeleton Joints: {skeletonJointCount}");
+        }
+
+        if (renderedPartCount > 1)
+        {
+            sb.AppendLine($"Rendered Parts: {renderedPartCount}");
+        }
+
         if (selectedMesh != null)
         {
             sb.AppendLine($"Preview Mesh: {selectedMesh.m_Name} (PathID: {selectedMesh.m_PathID})");
+        }
+        else if (renderedPartCount == 0 && skeletonJointCount > 0)
+        {
+            sb.AppendLine("Preview Mode: 3D Skeleton Only (no linked meshes resolved)");
         }
 
         sb.AppendLine($"Related Meshes ({relatedMeshes.Count}):");

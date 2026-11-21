@@ -524,6 +524,36 @@ public partial class MainWindow
         {
             foreach (var candidateAvatar in FindCandidateAvatarsForAnimationClip(clip))
             {
+                var eagerGroups = BuildEagerAvatarModelGroups(candidateAvatar);
+                if (eagerGroups.Count > 0)
+                {
+                    foreach (var eagerGroup in eagerGroups)
+                    {
+                        var rep = SelectRepresentativeModelGroupMesh(eagerGroup.Meshes);
+                        var repMesh = rep != null
+                            ? eagerGroup.ResolvedMeshes.FirstOrDefault(m => string.Equals(GetPreviewObjectKey(m), rep.MeshAssetId, StringComparison.Ordinal))
+                            : eagerGroup.ResolvedMeshes.FirstOrDefault();
+                        var meshIds = eagerGroup.Meshes
+                            .Select(m => m.MeshAssetId)
+                            .Where(id => !string.IsNullOrWhiteSpace(id))
+                            .ToArray();
+                        AddCandidate(
+                            candidateAvatar,
+                            repMesh,
+                            GetPreviewObjectKey(candidateAvatar),
+                            rep?.MeshAssetId ?? GetPreviewObjectKey(repMesh),
+                            "Model group",
+                            candidateAvatar.m_Name,
+                            repMesh?.m_Name,
+                            eagerGroup.Group.GroupId,
+                            eagerGroup.Group.GroupName,
+                            meshIds,
+                            eagerGroup.Meshes,
+                            eagerGroup.Group.Confidence);
+                    }
+                    continue;
+                }
+
                 var meshes = FindMeshesForAvatar(candidateAvatar);
                 if (meshes.Count == 0)
                 {

@@ -34,6 +34,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _skeletonXRay = true;
         private bool _showMaterials = true;
         private bool _useTextures = true;
+        private bool _showFullModelGroup = true;
+        private bool _hasMultiPartModelGroup;
+        private int _modelGroupPartCount;
         private MeshPreviewViewPreset _viewPreset = MeshPreviewViewPreset.Auto;
         private double _boneScale = DefaultBoneScale;
         private double _meshDensityPercent = DefaultMeshDensityPercent;
@@ -181,6 +184,66 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _useTextures;
             set => SetProperty(ref _useTextures, value);
+        }
+
+        public bool ShowFullModelGroup
+        {
+            get => _showFullModelGroup;
+            set => SetProperty(ref _showFullModelGroup, value);
+        }
+
+        public bool HasMultiPartModelGroup
+        {
+            get => _hasMultiPartModelGroup;
+            set
+            {
+                if (SetProperty(ref _hasMultiPartModelGroup, value))
+                {
+                    OnPropertyChanged(nameof(FullModelGroupToggleLabel));
+                }
+            }
+        }
+
+        public int ModelGroupPartCount
+        {
+            get => _modelGroupPartCount;
+            set
+            {
+                var safe = Math.Max(0, value);
+                if (SetProperty(ref _modelGroupPartCount, safe))
+                {
+                    OnPropertyChanged(nameof(FullModelGroupToggleLabel));
+                }
+            }
+        }
+
+        public string FullModelGroupToggleLabel =>
+            _modelGroupPartCount > 1
+                ? string.Create(CultureInfo.InvariantCulture, $"Full Object ({_modelGroupPartCount} parts)")
+                : "Full Object";
+
+        public bool ToggleShowFullModelGroup()
+        {
+            ShowFullModelGroup = !_showFullModelGroup;
+            return _showFullModelGroup;
+        }
+
+        public void SetModelGroupContext(bool hasMultiPartGroup, int partCount)
+        {
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    var safeCount = hasMultiPartGroup ? Math.Max(0, partCount) : 0;
+                    ModelGroupPartCount = safeCount;
+                    HasMultiPartModelGroup = hasMultiPartGroup && safeCount > 1;
+                }
+            });
+        }
+
+        public void ClearModelGroupContext()
+        {
+            SetModelGroupContext(hasMultiPartGroup: false, partCount: 0);
         }
 
         public MeshPreviewViewPreset ViewPreset
@@ -894,6 +957,9 @@ namespace AssetStudio.Avalonia.ViewModels
                     SkeletonXRay = true;
                     ShowMaterials = true;
                     UseTextures = true;
+                    ShowFullModelGroup = true;
+                    HasMultiPartModelGroup = false;
+                    ModelGroupPartCount = 0;
                     ViewPreset = MeshPreviewViewPreset.Auto;
                     BoneScale = DefaultBoneScale;
                     MeshDensityPercent = DefaultMeshDensityPercent;

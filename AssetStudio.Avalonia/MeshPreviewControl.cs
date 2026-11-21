@@ -51,6 +51,8 @@ namespace AssetStudio.Avalonia
         private Vector3 avatarReferenceMax;
         private Matrix4[][]? avatarReferenceBoneMatrices;
         private int[]? avatarReferenceParentIndices;
+        private IReadOnlyList<PreparedAvatarPartRuntime>? avatarCompositeParts;
+        private Matrix4[]? avatarStaticSkeletonWorldMatrices;
 
         // Animation playback state
         private Vector3[][]? animationFrames;

@@ -1416,4 +1416,406 @@ internal static class MeshPreviewAnimationEvaluator
 
         return true;
     }
+
+    public static int ExtractHumanoidMuscleTracksForAvatarSkeleton(
+        AnimationClip clip,
+        Avatar avatar,
+        AvatarDefaultSkeletonData skeleton,
+        Func<int, bool> shouldUseNode,
+        AnimationTrackSet tracks)
+    {
+        if (clip == null || avatar?.m_Avatar?.m_AvatarSkeleton?.m_ID == null || skeleton == null)
+        {
+            return 0;
+        }
+
+        var decodedTracks = HumanoidMuscleDecoder.DecodeHumanoidClip(clip, avatar);
+        if (decodedTracks.Count == 0)
+        {
+            return 0;
+        }
+
+        var skelIds = avatar.m_Avatar.m_AvatarSkeleton.m_ID;
+        var addedTracks = 0;
+        for (var i = 0; i < decodedTracks.Count; i++)
+        {
+            var decoded = decodedTracks[i];
+            int targetIdx = -1;
+            if (decoded.AvatarNodeIndex >= 0 && decoded.AvatarNodeIndex < skeleton.NodeCount)
+            {
+                targetIdx = decoded.AvatarNodeIndex;
+            }
+            else if (decoded.AvatarNodeIndex >= 0 && decoded.AvatarNodeIndex < skelIds.Length
+                && skeleton.NodeHashToIdx.TryGetValue(skelIds[decoded.AvatarNodeIndex], out var byHash))
+            {
+                targetIdx = byHash;
+            }
+            else if (!string.IsNullOrEmpty(decoded.BonePath)
+                && MeshPreviewSkeletonBuilder.TryResolvePathAlias(skeleton.NodePathToIdx, decoded.BonePath, out var byPath))
+            {
+                targetIdx = byPath;
+            }
+
+            if (targetIdx < 0 || !shouldUseNode(targetIdx))
+            {
+                continue;
+            }
+
+            var addedAny = false;
+            if (!tracks.PosTracks.ContainsKey(targetIdx) && decoded.Translations.Count > 0)
+            {
+                for (var k = 0; k < decoded.Translations.Count; k++)
+                {
+                    var kf = decoded.Translations[k];
+                    tracks.AddPosition(targetIdx, kf.time, MeshPreviewSkeletonBuilder.ToOtkVector3(kf.value));
+                }
+                addedAny = true;
+            }
+
+            if (!tracks.RotTracks.ContainsKey(targetIdx) && decoded.Rotations.Count > 0)
+            {
+                for (var k = 0; k < decoded.Rotations.Count; k++)
+                {
+                    var kf = decoded.Rotations[k];
+                    tracks.AddRotation(targetIdx, kf.time, MeshPreviewSkeletonBuilder.ToOtkQuaternion(kf.value));
+                }
+                addedAny = true;
+            }
+
+            if (addedAny)
+            {
+                addedTracks++;
+            }
+        }
+
+        return addedTracks;
+    }
+
+    /// <summary>
+    /// Evaluates forward kinematics directly across the FULL Avatar skeleton hierarchy
+    /// (without requiring any SkinnedMeshRenderer or m_BindPose), producing world positions
+    /// and world matrices for every Avatar node per frame. Used for composite multi-part
+    /// skinned+rigid characters as well as rigid-only chain/prop Avatars.
+    /// </summary>
+    public static bool EvaluateAvatarSkeletonFrames(
+        AvatarDefaultSkeletonData skeleton,
+        bool[]? activeNodeMask,
+        bool[]? deformChainMask,
+        Dictionary<int, List<(float time, global::OpenTK.Mathematics.Vector3 value)>> posTracks,
+        Dictionary<int, List<(float time, global::OpenTK.Mathematics.Quaternion value)>> rotTracks,
+        Dictionary<int, List<(float time, global::OpenTK.Mathematics.Vector3 value)>> scaleTracks,
+        float sampleRate,
+        float maxTime,
+        bool useCeilingFrameCount,
+        bool failIfAllTracksFiltered,
+        out global::OpenTK.Mathematics.Vector3[][] allNodeFrames,
+        out global::OpenTK.Mathematics.Matrix4[][] allNodeWorldMatrices,
+        out int[] renderParentIndices,
+        out float resolvedSampleRate,
+        out string reason)
+    {
+        allNodeFrames = Array.Empty<global::OpenTK.Mathematics.Vector3[]>();
+        allNodeWorldMatrices = Array.Empty<global::OpenTK.Mathematics.Matrix4[]>();
+        renderParentIndices = Array.Empty<int>();
+        resolvedSampleRate = sampleRate;
+        reason = string.Empty;
+
+        var skelCount = skeleton?.NodeCount ?? 0;
+        if (skeleton == null || skelCount == 0)
+        {
+            reason = "No Avatar skeleton nodes available for frame generation.";
+            return false;
+        }
+
+        static int FindSegment<T>(List<(float time, T value)> track, float t)
+        {
+            int lo = 0;
+            int hi = track.Count - 2;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                if (track[mid + 1].time < t)
+                {
+                    lo = mid + 1;
+                }
+                else if (track[mid].time > t)
+                {
+                    hi = mid - 1;
+                }
+                else
+                {
+                    return mid;
+                }
+            }
+
+            return Math.Clamp(lo, 0, track.Count - 2);
+        }
+
+        global::OpenTK.Mathematics.Vector3 EvalPos(int nodeIdx, float t)
+        {
+            if (!posTracks.TryGetValue(nodeIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Vector3.Zero;
+            if (track.Count == 1 || t <= track[0].time) return track[0].value;
+            if (t >= track[^1].time) return track[^1].value;
+            var idx = FindSegment(track, t);
+            var span = track[idx + 1].time - track[idx].time;
+            var factor = span > 1e-6f ? (t - track[idx].time) / span : 0f;
+            return global::OpenTK.Mathematics.Vector3.Lerp(track[idx].value, track[idx + 1].value, factor);
+        }
+
+        global::OpenTK.Mathematics.Quaternion EvalRot(int nodeIdx, float t)
+        {
+            if (!rotTracks.TryGetValue(nodeIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Quaternion.Identity;
+            if (track.Count == 1 || t <= track[0].time) return track[0].value;
+            if (t >= track[^1].time) return track[^1].value;
+            var idx = FindSegment(track, t);
+            var span = track[idx + 1].time - track[idx].time;
+            var factor = span > 1e-6f ? (t - track[idx].time) / span : 0f;
+            return global::OpenTK.Mathematics.Quaternion.Slerp(track[idx].value, track[idx + 1].value, factor);
+        }
+
+        global::OpenTK.Mathematics.Vector3 EvalScale(int nodeIdx, float t)
+        {
+            if (!scaleTracks.TryGetValue(nodeIdx, out var track) || track.Count == 0) return global::OpenTK.Mathematics.Vector3.One;
+            if (track.Count == 1 || t <= track[0].time) return track[0].value;
+            if (t >= track[^1].time) return track[^1].value;
+            var idx = FindSegment(track, t);
+            var span = track[idx + 1].time - track[idx].time;
+            var factor = span > 1e-6f ? (t - track[idx].time) / span : 0f;
+            return global::OpenTK.Mathematics.Vector3.Lerp(track[idx].value, track[idx + 1].value, factor);
+        }
+
+        var avatarParents = skeleton.ParentIndices;
+        var skelRestPos = skeleton.RestLocalPositions;
+        var skelRestRot = skeleton.RestLocalRotations;
+        var skelRestScale = skeleton.RestLocalScales;
+        var skelRestLocals = skeleton.RestLocalMatrices;
+        var skelRestWorlds = skeleton.RestWorldMatrices;
+        var skelRestWorldPositions = skeleton.RestWorldPositions;
+
+        var restMin = new global::OpenTK.Mathematics.Vector3(float.MaxValue);
+        var restMax = new global::OpenTK.Mathematics.Vector3(float.MinValue);
+        for (var i = 0; i < skelCount; i++)
+        {
+            var pos = skelRestWorldPositions[i];
+            if (MeshPreviewSkeletonBuilder.IsFiniteVector(pos))
+            {
+                restMin = global::OpenTK.Mathematics.Vector3.ComponentMin(restMin, pos);
+                restMax = global::OpenTK.Mathematics.Vector3.ComponentMax(restMax, pos);
+            }
+        }
+
+        var restExtent = float.IsFinite(restMin.X) && float.IsFinite(restMax.X)
+            ? (restMax - restMin).Length
+            : 1f;
+        if (!float.IsFinite(restExtent) || restExtent <= 0f)
+        {
+            restExtent = 1f;
+        }
+
+        foreach (var item in posTracks.ToArray())
+        {
+            var nodeIdx = item.Key;
+            if (nodeIdx < 0 || nodeIdx >= skelCount)
+            {
+                posTracks.Remove(nodeIdx);
+                continue;
+            }
+
+            var p = nodeIdx < avatarParents.Length ? avatarParents[nodeIdx] : -1;
+            if (p < 0 || p >= skelCount)
+            {
+                continue;
+            }
+
+            var parentWorld = skelRestWorlds[p];
+            var sx = parentWorld.Row0.Xyz.Length;
+            var sy = parentWorld.Row1.Xyz.Length;
+            var sz = parentWorld.Row2.Xyz.Length;
+            var minParentScale = Math.Min(sx, Math.Min(sy, sz));
+            var safeParentScale = float.IsFinite(minParentScale) && minParentScale > 1e-4f ? minParentScale : 1f;
+            var localPositionLimit = Math.Max(1f, (restExtent * 2f) / safeParentScale);
+
+            var restLocalPosition = skelRestPos[nodeIdx];
+            if (item.Value.Any(x => !MeshPreviewSkeletonBuilder.IsFiniteVector(x.value) || (x.value - restLocalPosition).Length > localPositionLimit))
+            {
+                posTracks.Remove(nodeIdx);
+            }
+        }
+
+        foreach (var item in scaleTracks.ToArray())
+        {
+            var nodeIdx = item.Key;
+            if (nodeIdx < 0 || nodeIdx >= skelCount)
+            {
+                scaleTracks.Remove(nodeIdx);
+                continue;
+            }
+
+            var restScale = skelRestScale[nodeIdx];
+            var restScaleMag = Math.Max(Math.Abs(restScale.X), Math.Max(Math.Abs(restScale.Y), Math.Abs(restScale.Z)));
+            var maxScaleLimit = Math.Max(10f, float.IsFinite(restScaleMag) ? restScaleMag * 10f : 10f);
+            if (item.Value.Any(x => !MeshPreviewSkeletonBuilder.IsFiniteVector(x.value)
+                || x.value.X <= 0f || x.value.Y <= 0f || x.value.Z <= 0f
+                || Math.Abs(x.value.X) > maxScaleLimit || Math.Abs(x.value.Y) > maxScaleLimit || Math.Abs(x.value.Z) > maxScaleLimit))
+            {
+                scaleTracks.Remove(nodeIdx);
+            }
+        }
+
+        if (failIfAllTracksFiltered && posTracks.Count == 0 && rotTracks.Count == 0 && scaleTracks.Count == 0)
+        {
+            reason = "All extracted tracks were rejected by safety filters.";
+            return false;
+        }
+
+        if (sampleRate <= 0f || !float.IsFinite(sampleRate))
+        {
+            sampleRate = 30f;
+        }
+
+        resolvedSampleRate = sampleRate;
+        if (maxTime <= 0f || !float.IsFinite(maxTime))
+        {
+            maxTime = 1f;
+        }
+
+        var frameCount = useCeilingFrameCount
+            ? Math.Max(1, (int)Math.Ceiling(maxTime * sampleRate))
+            : Math.Max(1, (int)(maxTime * sampleRate));
+
+        allNodeFrames = new global::OpenTK.Mathematics.Vector3[frameCount][];
+        allNodeWorldMatrices = new global::OpenTK.Mathematics.Matrix4[frameCount][];
+
+        var hasPosMask = new bool[skelCount];
+        var hasRotMask = new bool[skelCount];
+        var hasScaleMask = new bool[skelCount];
+        foreach (var k in posTracks.Keys) if ((uint)k < (uint)skelCount) hasPosMask[k] = true;
+        foreach (var k in rotTracks.Keys) if ((uint)k < (uint)skelCount) hasRotMask[k] = true;
+        foreach (var k in scaleTracks.Keys) if ((uint)k < (uint)skelCount) hasScaleMask[k] = true;
+
+        var skelWorldCache = new global::OpenTK.Mathematics.Matrix4?[skelCount];
+        var visiting = new bool[skelCount];
+
+        for (var f = 0; f < frameCount; f++)
+        {
+            var t = f / sampleRate;
+            Array.Clear(skelWorldCache, 0, skelCount);
+            Array.Clear(visiting, 0, skelCount);
+
+            global::OpenTK.Mathematics.Matrix4 GetSkelModelMatrix(int sIdx)
+            {
+                if (skelWorldCache[sIdx] is global::OpenTK.Mathematics.Matrix4 cached)
+                {
+                    return cached;
+                }
+
+                if (visiting[sIdx])
+                {
+                    return skelRestLocals[sIdx];
+                }
+
+                visiting[sIdx] = true;
+                var localMat = skelRestLocals[sIdx];
+                var hasPos = hasPosMask[sIdx];
+                var hasRot = hasRotMask[sIdx];
+                var hasScale = hasScaleMask[sIdx];
+                if (hasPos || hasRot || hasScale)
+                {
+                    var pos = hasPos ? EvalPos(sIdx, t) : skelRestPos[sIdx];
+                    var rot = hasRot ? EvalRot(sIdx, t) : skelRestRot[sIdx];
+                    var scale = hasScale ? EvalScale(sIdx, t) : skelRestScale[sIdx];
+                    localMat = MeshPreviewSkeletonBuilder.CreateLocalMatrix(pos, rot, scale);
+                }
+
+                var p = sIdx < avatarParents.Length ? avatarParents[sIdx] : -1;
+                var worldMat = p >= 0 && p < skelCount && p != sIdx
+                    ? localMat * GetSkelModelMatrix(p)
+                    : localMat;
+
+                visiting[sIdx] = false;
+                skelWorldCache[sIdx] = worldMat;
+                return worldMat;
+            }
+
+            var framePositions = new global::OpenTK.Mathematics.Vector3[skelCount];
+            var frameMatrices = new global::OpenTK.Mathematics.Matrix4[skelCount];
+            for (var s = 0; s < skelCount; s++)
+            {
+                var mat = GetSkelModelMatrix(s);
+                frameMatrices[s] = mat;
+                framePositions[s] = mat.ExtractTranslation();
+            }
+
+            allNodeFrames[f] = framePositions;
+            allNodeWorldMatrices[f] = frameMatrices;
+        }
+
+        renderParentIndices = avatarParents.Take(skelCount).ToArray();
+        var hiddenRenderBones = new bool[skelCount];
+        var hasDeformMask = deformChainMask != null && deformChainMask.Length == skelCount;
+        var hasActiveMask = activeNodeMask != null && activeNodeMask.Length == skelCount;
+        for (var i = 0; i < skelCount; i++)
+        {
+            var boneName = i < skeleton.NodeNames.Length ? skeleton.NodeNames[i] : string.Empty;
+            var inDeformChain = !hasDeformMask || deformChainMask![i];
+            var isActive = hasActiveMask && activeNodeMask![i];
+            if (!inDeformChain || (!isActive && MeshPreviewSkeletonBuilder.IsAuxiliaryAnimationBone(boneName)))
+            {
+                hiddenRenderBones[i] = true;
+                renderParentIndices[i] = -1;
+            }
+        }
+
+        var maxRestEdge = 0f;
+        for (var i = 0; i < skelCount; i++)
+        {
+            var parentIdx = avatarParents[i];
+            if (parentIdx >= 0 && parentIdx < skelCount
+                && MeshPreviewSkeletonBuilder.IsFiniteVector(skelRestWorldPositions[i])
+                && MeshPreviewSkeletonBuilder.IsFiniteVector(skelRestWorldPositions[parentIdx]))
+            {
+                maxRestEdge = Math.Max(maxRestEdge, (skelRestWorldPositions[i] - skelRestWorldPositions[parentIdx]).Length);
+            }
+        }
+
+        var edgeLimit = Math.Max(Math.Max(maxRestEdge * 8f, restExtent * 1.5f), 0.5f);
+        for (var i = 0; i < skelCount; i++)
+        {
+            var parentIdx = avatarParents[i];
+            if (parentIdx < 0 || parentIdx >= skelCount)
+            {
+                continue;
+            }
+
+            foreach (var frame in allNodeFrames)
+            {
+                if (!MeshPreviewSkeletonBuilder.IsFiniteVector(frame[i])
+                    || !MeshPreviewSkeletonBuilder.IsFiniteVector(frame[parentIdx])
+                    || (frame[i] - frame[parentIdx]).Length > edgeLimit)
+                {
+                    hiddenRenderBones[i] = true;
+                    renderParentIndices[i] = -1;
+                    break;
+                }
+            }
+        }
+
+        for (var f = 0; f < allNodeFrames.Length; f++)
+        {
+            for (var i = 0; i < skelCount; i++)
+            {
+                if (!hiddenRenderBones[i])
+                {
+                    continue;
+                }
+
+                var parentIdx = avatarParents[i];
+                allNodeFrames[f][i] = parentIdx >= 0 && parentIdx < skelCount
+                    ? allNodeFrames[f][parentIdx]
+                    : skelRestWorldPositions[i];
+            }
+        }
+
+        return true;
+    }
 }

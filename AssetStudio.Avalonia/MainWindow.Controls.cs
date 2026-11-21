@@ -191,6 +191,112 @@ public partial class MainWindow
                 }
                 QueueAvatarPreviewSettingsSave();
                 break;
+
+            case nameof(MeshPreviewViewModel.ShowFullModelGroup):
+                OnShowFullModelGroupChanged();
+                break;
+        }
+    }
+
+    private void OnShowFullModelGroupChanged()
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var showFull = MeshPreview.ShowFullModelGroup;
+        var selectedCandidate = SelectedPreviewCandidate;
+        var selectedAsset = AssetListDataGrid?.SelectedItem as AssetItem;
+
+        // 1. AnimationClip preview
+        if (selectedCandidate?.AnimationClip != null)
+        {
+            PreviewAnimationClip(
+                selectedCandidate.AnimationClip,
+                selectedCandidate.Avatar,
+                selectedCandidate.Mesh,
+                selectedCandidate.AvatarId,
+                selectedCandidate.MeshId,
+                rebuildCandidateControls: false,
+                selectedCandidate: selectedCandidate);
+            return;
+        }
+
+        // 2. Avatar preview
+        if (currentPreviewAvatar != null)
+        {
+            var targetCandidate = showFull
+                ? (selectedCandidate?.IsModelGroup == true
+                    ? selectedCandidate
+                    : previewCandidateItems.FirstOrDefault(c => c.IsModelGroup) ?? selectedCandidate)
+                : selectedCandidate;
+            if (targetCandidate != null && PreviewCandidateSelector != null && !ReferenceEquals(PreviewCandidateSelector.SelectedItem, targetCandidate))
+            {
+                updatingPreviewCandidateControls = true;
+                try
+                {
+                    PreviewCandidateSelector.SelectedItem = targetCandidate;
+                    PreviewSession.SelectedPreviewCandidate = targetCandidate;
+                }
+                finally
+                {
+                    updatingPreviewCandidateControls = false;
+                }
+            }
+
+            PreviewAvatar(
+                currentPreviewAvatar,
+                targetCandidate?.Mesh,
+                targetCandidate?.MeshId,
+                targetCandidate);
+            return;
+        }
+
+        // 3. Mesh preview
+        if (selectedAsset != null && previewCandidateItems.Count > 0)
+        {
+            PreviewCandidateItem? target = null;
+            if (showFull)
+            {
+                target = previewCandidateItems.FirstOrDefault(c => c.IsModelGroup);
+            }
+            else
+            {
+                target = previewCandidateItems.FirstOrDefault(c => !c.IsModelGroup);
+            }
+
+            if (target == null)
+            {
+                return;
+            }
+
+            updatingPreviewCandidateControls = true;
+            try
+            {
+                if (PreviewCandidateSelector != null)
+                {
+                    PreviewCandidateSelector.SelectedItem = target;
+                }
+                PreviewSession.SelectedPreviewCandidate = target;
+            }
+            finally
+            {
+                updatingPreviewCandidateControls = false;
+            }
+
+            if (target.IsModelGroup)
+            {
+                QueuePreviewCandidateSelection(target);
+            }
+            else if (target.Mesh != null)
+            {
+                PreviewMesh(selectedAsset, target.Mesh, rebuildCandidateControls: false, selectedCandidate: target, preferModelGroup: false);
+            }
+            else
+            {
+                QueuePreviewCandidateSelection(target);
+            }
         }
     }
 
@@ -376,6 +482,7 @@ public partial class MainWindow
         previewCandidateSelectionCts?.Cancel();
         PreviewSession.ClearCandidates();
         MeshPreview.SetAvailableAnimations(null, null);
+        MeshPreview.ClearModelGroupContext();
         updatingPreviewCandidateControls = true;
         try
         {
@@ -506,6 +613,19 @@ public partial class MainWindow
             || candidate.Mesh != null
             || candidate.IsModelGroup)
         {
+            if (candidate.AnimationClip == null && MeshPreview.HasMultiPartModelGroup)
+            {
+                updatingAvatarPreviewControls = true;
+                try
+                {
+                    MeshPreview.ShowFullModelGroup = candidate.IsModelGroup;
+                }
+                finally
+                {
+                    updatingAvatarPreviewControls = false;
+                }
+            }
+
             QueuePreviewCandidateSelection(candidate);
         }
     }

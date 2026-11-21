@@ -21,12 +21,527 @@ internal sealed class AvatarMeshSkeletonData
     public int[] SkelNodeToMeshBone { get; init; } = Array.Empty<int>();
 }
 
+internal sealed class AvatarDefaultSkeletonData
+{
+    public required int NodeCount { get; init; }
+    public required int[] ParentIndices { get; init; }
+    public required string[] NodeNames { get; init; }
+    public required Dictionary<uint, int> NodeHashToIdx { get; init; }
+    public required Dictionary<string, int> NodePathToIdx { get; init; }
+    public required Dictionary<uint, int> DirectBindingPathToNodeIdx { get; init; }
+    public required global::OpenTK.Mathematics.Vector3[] RestLocalPositions { get; init; }
+    public required global::OpenTK.Mathematics.Quaternion[] RestLocalRotations { get; init; }
+    public required global::OpenTK.Mathematics.Vector3[] RestLocalScales { get; init; }
+    public required global::OpenTK.Mathematics.Matrix4[] RestLocalMatrices { get; init; }
+    public required global::OpenTK.Mathematics.Matrix4[] RestWorldMatrices { get; init; }
+    public required global::OpenTK.Mathematics.Vector3[] RestWorldPositions { get; init; }
+
+    public bool TryResolveBindingNode(Avatar? avatar, GenericBinding binding, out int nodeIdx)
+    {
+        if (DirectBindingPathToNodeIdx.TryGetValue(binding.path, out nodeIdx))
+        {
+            return nodeIdx >= 0;
+        }
+
+        if (avatar != null)
+        {
+            var path = avatar.FindBonePath(binding.path);
+            if (!string.IsNullOrEmpty(path)
+                && MeshPreviewSkeletonBuilder.TryResolvePathAlias(NodePathToIdx, path, out nodeIdx))
+            {
+                return true;
+            }
+        }
+
+        return NodeHashToIdx.TryGetValue(binding.path, out nodeIdx);
+    }
+
+    public bool TryResolvePathNode(string? path, out int nodeIdx)
+    {
+        return MeshPreviewSkeletonBuilder.TryResolvePathAlias(NodePathToIdx, path, out nodeIdx);
+    }
+}
+
 /// <summary>
 /// Pure stateless skeleton construction, bind-pose inversion, bone path alias indexing,
 /// and skin-weight mask utilities for 3D Avatar and AnimationClip previews.
 /// </summary>
 internal static class MeshPreviewSkeletonBuilder
 {
+    public static bool TryBuildAvatarSkeletonFromDefaultPose(
+        Avatar avatar,
+        out AvatarDefaultSkeletonData skeleton)
+    {
+        skeleton = null!;
+        var avatarConstant = avatar?.m_Avatar;
+        var nodes = avatarConstant?.m_AvatarSkeleton?.m_Node;
+        if (avatarConstant == null || nodes == null || nodes.Length == 0)
+        {
+            return false;
+        }
+
+        var pose = avatarConstant.m_DefaultPose?.m_X is { Length: > 0 } defaultPose
+            ? defaultPose
+            : avatarConstant.m_AvatarSkeletonPose?.m_X;
+        if (pose == null || pose.Length == 0)
+        {
+            return false;
+        }
+
+        var skelCount = nodes.Length;
+        var skelIds = avatarConstant.m_AvatarSkeleton.m_ID;
+        var tosByHash = new Dictionary<uint, string>(avatar!.m_TOS?.Length ?? 0);
+        if (avatar.m_TOS != null)
+        {
+            foreach (var pair in avatar.m_TOS)
+            {
+                if (pair.Key != 0 && !string.IsNullOrEmpty(pair.Value))
+                {
+                    tosByHash[pair.Key] = pair.Value;
+                }
+            }
+        }
+
+        var parentIndices = new int[skelCount];
+        var nodeNames = new string[skelCount];
+        var nodeHashToIdx = new Dictionary<uint, int>(skelCount);
+        for (var i = 0; i < skelCount; i++)
+        {
+            parentIndices[i] = nodes[i].m_ParentId;
+            if (skelIds != null && i < skelIds.Length)
+            {
+                var id = skelIds[i];
+                nodeHashToIdx[id] = i;
+                nodeNames[i] = tosByHash.TryGetValue(id, out var path) ? path : string.Empty;
+            }
+            else
+            {
+                nodeNames[i] = string.Empty;
+            }
+        }
+
+        var nodePathToIdx = BuildBonePathAliasMap(nodeNames, skelCount);
+        var directBindingPathToNodeIdx = new Dictionary<uint, int>(tosByHash.Count + nodeHashToIdx.Count);
+        foreach (var kvp in nodeHashToIdx)
+        {
+            directBindingPathToNodeIdx[kvp.Key] = kvp.Value;
+        }
+
+        foreach (var kvp in tosByHash)
+        {
+            if (directBindingPathToNodeIdx.ContainsKey(kvp.Key))
+            {
+                continue;
+            }
+
+            if (TryResolvePathAlias(nodePathToIdx, kvp.Value, out var resolvedIdx))
+            {
+                directBindingPathToNodeIdx[kvp.Key] = resolvedIdx;
+            }
+        }
+
+        var restLocalPositions = new global::OpenTK.Mathematics.Vector3[skelCount];
+        var restLocalRotations = new global::OpenTK.Mathematics.Quaternion[skelCount];
+        var restLocalScales = new global::OpenTK.Mathematics.Vector3[skelCount];
+        var restLocalMatrices = new global::OpenTK.Mathematics.Matrix4[skelCount];
+        for (var i = 0; i < skelCount; i++)
+        {
+            if (i < pose.Length && pose[i] != null)
+            {
+                var xf = pose[i];
+                var pos = ToOtkVector3(xf.t);
+                if (!IsFiniteVector(pos))
+                {
+                    pos = global::OpenTK.Mathematics.Vector3.Zero;
+                }
+
+                var rot = ToOtkQuaternion(xf.q);
+                if (!float.IsFinite(rot.X) || !float.IsFinite(rot.Y) || !float.IsFinite(rot.Z) || !float.IsFinite(rot.W) || rot.LengthSquared <= 0f)
+                {
+                    rot = global::OpenTK.Mathematics.Quaternion.Identity;
+                }
+
+                var scale = ToOtkVector3(xf.s);
+                if (!IsFiniteVector(scale))
+                {
+                    scale = global::OpenTK.Mathematics.Vector3.One;
+                }
+
+                restLocalPositions[i] = pos;
+                restLocalRotations[i] = rot;
+                restLocalScales[i] = scale;
+                restLocalMatrices[i] = CreateLocalMatrix(pos, rot, scale);
+            }
+            else
+            {
+                restLocalPositions[i] = global::OpenTK.Mathematics.Vector3.Zero;
+                restLocalRotations[i] = global::OpenTK.Mathematics.Quaternion.Identity;
+                restLocalScales[i] = global::OpenTK.Mathematics.Vector3.One;
+                restLocalMatrices[i] = global::OpenTK.Mathematics.Matrix4.Identity;
+            }
+        }
+
+        var cachedWorlds = new global::OpenTK.Mathematics.Matrix4?[skelCount];
+        var visiting = new bool[skelCount];
+        global::OpenTK.Mathematics.Matrix4 GetRestWorld(int idx)
+        {
+            if (cachedWorlds[idx] is global::OpenTK.Mathematics.Matrix4 cached)
+            {
+                return cached;
+            }
+
+            if (visiting[idx])
+            {
+                return restLocalMatrices[idx];
+            }
+
+            visiting[idx] = true;
+            var parent = parentIndices[idx];
+            var world = parent >= 0 && parent < skelCount && parent != idx
+                ? restLocalMatrices[idx] * GetRestWorld(parent)
+                : restLocalMatrices[idx];
+            visiting[idx] = false;
+            cachedWorlds[idx] = world;
+            return world;
+        }
+
+        var restWorldMatrices = new global::OpenTK.Mathematics.Matrix4[skelCount];
+        var restWorldPositions = new global::OpenTK.Mathematics.Vector3[skelCount];
+        var finiteCount = 0;
+        for (var i = 0; i < skelCount; i++)
+        {
+            var world = GetRestWorld(i);
+            restWorldMatrices[i] = world;
+            var pos = world.ExtractTranslation();
+            if (IsFiniteVector(pos))
+            {
+                restWorldPositions[i] = pos;
+                finiteCount++;
+            }
+            else
+            {
+                restWorldPositions[i] = global::OpenTK.Mathematics.Vector3.Zero;
+            }
+        }
+
+        if (finiteCount == 0)
+        {
+            return false;
+        }
+
+        skeleton = new AvatarDefaultSkeletonData
+        {
+            NodeCount = skelCount,
+            ParentIndices = parentIndices,
+            NodeNames = nodeNames,
+            NodeHashToIdx = nodeHashToIdx,
+            NodePathToIdx = nodePathToIdx,
+            DirectBindingPathToNodeIdx = directBindingPathToNodeIdx,
+            RestLocalPositions = restLocalPositions,
+            RestLocalRotations = restLocalRotations,
+            RestLocalScales = restLocalScales,
+            RestLocalMatrices = restLocalMatrices,
+            RestWorldMatrices = restWorldMatrices,
+            RestWorldPositions = restWorldPositions
+        };
+        return true;
+    }
+
+    public static bool TryConvertRowMajorTransformMatrix(
+        float[]? matrix,
+        out global::OpenTK.Mathematics.Matrix4 result)
+    {
+        result = global::OpenTK.Mathematics.Matrix4.Identity;
+        if (matrix == null || matrix.Length != 16)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < 16; i++)
+        {
+            if (!float.IsFinite(matrix[i]))
+            {
+                return false;
+            }
+        }
+
+        // ModelGroupMeshInfo.TransformMatrix stores column-vector row-major entries (translation in [3, 7, 11]).
+        // Transpose into OpenTK row-vector Matrix4 (translation in row 3 = M41, M42, M43).
+        result = new global::OpenTK.Mathematics.Matrix4(
+            matrix[0], matrix[4], matrix[8], matrix[12],
+            matrix[1], matrix[5], matrix[9], matrix[13],
+            matrix[2], matrix[6], matrix[10], matrix[14],
+            matrix[3], matrix[7], matrix[11], matrix[15]);
+        return true;
+    }
+
+    public static int[] MapSkinnedMeshBonesToAvatarNodes(
+        Mesh mesh,
+        Avatar? avatar,
+        AvatarDefaultSkeletonData avatarSkeleton,
+        IReadOnlyList<string?>? rendererBonePaths = null)
+    {
+        var boneCount = mesh.m_BindPose?.Length ?? 0;
+        if (boneCount <= 0)
+        {
+            return Array.Empty<int>();
+        }
+
+        var map = new int[boneCount];
+        Array.Fill(map, -1);
+
+        var hashes = mesh.m_BoneNameHashes;
+        for (var b = 0; b < boneCount; b++)
+        {
+            if (hashes != null && b < hashes.Length)
+            {
+                var hash = hashes[b];
+                if (avatarSkeleton.DirectBindingPathToNodeIdx.TryGetValue(hash, out var byDirect) && byDirect >= 0)
+                {
+                    map[b] = byDirect;
+                    continue;
+                }
+
+                if (avatarSkeleton.NodeHashToIdx.TryGetValue(hash, out var byHash) && byHash >= 0)
+                {
+                    map[b] = byHash;
+                    continue;
+                }
+
+                if (avatar != null)
+                {
+                    var bonePath = avatar.FindBonePath(hash);
+                    if (!string.IsNullOrEmpty(bonePath)
+                        && TryResolvePathAlias(avatarSkeleton.NodePathToIdx, bonePath, out var byTosAlias))
+                    {
+                        map[b] = byTosAlias;
+                        continue;
+                    }
+                }
+            }
+
+            if (rendererBonePaths != null && b < rendererBonePaths.Count)
+            {
+                var rendererPath = rendererBonePaths[b];
+                if (!string.IsNullOrWhiteSpace(rendererPath)
+                    && TryResolvePathAlias(avatarSkeleton.NodePathToIdx, rendererPath, out var byRendererPath))
+                {
+                    map[b] = byRendererPath;
+                }
+            }
+        }
+
+        return map;
+    }
+
+    public static bool TryResolveRigidPartAvatarNode(
+        AvatarDefaultSkeletonData avatarSkeleton,
+        string? relativeTransformPath,
+        string? gameObjectName,
+        string? meshName,
+        out int nodeIdx,
+        out bool isExactNodeMatch)
+    {
+        nodeIdx = -1;
+        isExactNodeMatch = false;
+
+        var normalizedRelative = NormalizeAnimationPath(relativeTransformPath);
+        if (!string.IsNullOrEmpty(normalizedRelative))
+        {
+            if (TryResolvePathAlias(avatarSkeleton.NodePathToIdx, normalizedRelative, out nodeIdx))
+            {
+                isExactNodeMatch = true;
+                return true;
+            }
+
+            // Walk ancestor prefixes (e.g. "Hips/Spine/Hand_R/SwordProp" -> "Hips/Spine/Hand_R")
+            var segments = normalizedRelative.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (var len = segments.Length - 1; len >= 1; len--)
+            {
+                var ancestorPath = string.Join("/", segments.Take(len));
+                if (TryResolvePathAlias(avatarSkeleton.NodePathToIdx, ancestorPath, out nodeIdx))
+                {
+                    isExactNodeMatch = false;
+                    return true;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(gameObjectName)
+            && TryResolvePathAlias(avatarSkeleton.NodePathToIdx, gameObjectName, out nodeIdx))
+        {
+            isExactNodeMatch = true;
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(meshName)
+            && TryResolvePathAlias(avatarSkeleton.NodePathToIdx, meshName, out nodeIdx))
+        {
+            isExactNodeMatch = true;
+            return true;
+        }
+
+        nodeIdx = -1;
+        isExactNodeMatch = false;
+        return false;
+    }
+
+    public static bool IsFiniteMatrix(in global::OpenTK.Mathematics.Matrix4 m)
+    {
+        return float.IsFinite(m.M11) && float.IsFinite(m.M12) && float.IsFinite(m.M13) && float.IsFinite(m.M14)
+            && float.IsFinite(m.M21) && float.IsFinite(m.M22) && float.IsFinite(m.M23) && float.IsFinite(m.M24)
+            && float.IsFinite(m.M31) && float.IsFinite(m.M32) && float.IsFinite(m.M33) && float.IsFinite(m.M34)
+            && float.IsFinite(m.M41) && float.IsFinite(m.M42) && float.IsFinite(m.M43) && float.IsFinite(m.M44);
+    }
+
+    public static global::OpenTK.Mathematics.Matrix4 ComputeRigidPartLocalOffset(
+        global::OpenTK.Mathematics.Matrix4? staticPartTransform,
+        int attachedNodeIdx,
+        bool isExactNodeMatch,
+        global::OpenTK.Mathematics.Matrix4[] restWorldMatrices,
+        global::OpenTK.Mathematics.Matrix4? explicitLocalToBoneOffset = null)
+    {
+        if (explicitLocalToBoneOffset.HasValue && IsFiniteMatrix(explicitLocalToBoneOffset.Value))
+        {
+            return explicitLocalToBoneOffset.Value;
+        }
+
+        if (attachedNodeIdx < 0 || attachedNodeIdx >= restWorldMatrices.Length)
+        {
+            return staticPartTransform.HasValue && IsFiniteMatrix(staticPartTransform.Value)
+                ? staticPartTransform.Value
+                : global::OpenTK.Mathematics.Matrix4.Identity;
+        }
+
+        // When the rigid MeshRenderer sits directly on the matched AvatarNode itself, its mesh vertices
+        // are already in that node's local space, so its local offset relative to the node is Identity.
+        if (isExactNodeMatch)
+        {
+            return global::OpenTK.Mathematics.Matrix4.Identity;
+        }
+
+        if (!staticPartTransform.HasValue || !IsFiniteMatrix(staticPartTransform.Value))
+        {
+            return global::OpenTK.Mathematics.Matrix4.Identity;
+        }
+
+        try
+        {
+            var invNodeRest = restWorldMatrices[attachedNodeIdx].Inverted();
+            var localOffset = staticPartTransform.Value * invNodeRest;
+            if (IsFiniteMatrix(localOffset))
+            {
+                return localOffset;
+            }
+        }
+        catch
+        {
+        }
+
+        return global::OpenTK.Mathematics.Matrix4.Identity;
+    }
+
+    public static void BuildCompositeAvatarDeformChainMasks(
+        AvatarDefaultSkeletonData avatarSkeleton,
+        IReadOnlyList<(Mesh Mesh, int[] BoneToNodeMap)> skinnedParts,
+        IReadOnlyList<int> rigidAttachNodeIndices,
+        out bool[] activeNodeMask,
+        out bool[] deformChainMask)
+    {
+        var nodeCount = avatarSkeleton.NodeCount;
+        activeNodeMask = new bool[nodeCount];
+        deformChainMask = new bool[nodeCount];
+        if (nodeCount <= 0)
+        {
+            return;
+        }
+
+        var hasAnyActive = false;
+
+        if (skinnedParts != null)
+        {
+            for (var p = 0; p < skinnedParts.Count; p++)
+            {
+                var (mesh, boneToNodeMap) = skinnedParts[p];
+                if (mesh?.m_Skin == null || boneToNodeMap == null || boneToNodeMap.Length == 0)
+                {
+                    continue;
+                }
+
+                var meshWeighted = new bool[boneToNodeMap.Length];
+                var anyWeightedOnPart = false;
+                foreach (var skin in mesh.m_Skin)
+                {
+                    if (skin?.boneIndex == null || skin.weight == null)
+                    {
+                        continue;
+                    }
+
+                    var count = Math.Min(skin.boneIndex.Length, skin.weight.Length);
+                    for (var i = 0; i < count; i++)
+                    {
+                        var bIdx = skin.boneIndex[i];
+                        if (skin.weight[i] > 0.0001f && bIdx >= 0 && bIdx < boneToNodeMap.Length)
+                        {
+                            meshWeighted[bIdx] = true;
+                            anyWeightedOnPart = true;
+                        }
+                    }
+                }
+
+                for (var b = 0; b < boneToNodeMap.Length; b++)
+                {
+                    if (anyWeightedOnPart && !meshWeighted[b])
+                    {
+                        continue;
+                    }
+
+                    var nodeIdx = boneToNodeMap[b];
+                    if (nodeIdx >= 0 && nodeIdx < nodeCount)
+                    {
+                        activeNodeMask[nodeIdx] = true;
+                        hasAnyActive = true;
+                    }
+                }
+            }
+        }
+
+        if (rigidAttachNodeIndices != null)
+        {
+            for (var i = 0; i < rigidAttachNodeIndices.Count; i++)
+            {
+                var nodeIdx = rigidAttachNodeIndices[i];
+                if (nodeIdx >= 0 && nodeIdx < nodeCount)
+                {
+                    activeNodeMask[nodeIdx] = true;
+                    hasAnyActive = true;
+                }
+            }
+        }
+
+        if (hasAnyActive)
+        {
+            for (var s = 0; s < nodeCount; s++)
+            {
+                if (!activeNodeMask[s])
+                {
+                    continue;
+                }
+
+                var current = s;
+                var guard = 0;
+                while (current >= 0 && current < nodeCount && !deformChainMask[current] && guard++ < nodeCount)
+                {
+                    deformChainMask[current] = true;
+                    current = current < avatarSkeleton.ParentIndices.Length ? avatarSkeleton.ParentIndices[current] : -1;
+                }
+            }
+        }
+        else
+        {
+            Array.Fill(deformChainMask, true);
+        }
+    }
     public static global::OpenTK.Mathematics.Vector3 GetBindPosePosition(AssetStudio.Matrix4x4 bindPose)
     {
         var otkMat = new global::OpenTK.Mathematics.Matrix4(

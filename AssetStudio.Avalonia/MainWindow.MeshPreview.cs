@@ -91,16 +91,24 @@ public partial class MainWindow
             materialsLoading: _activeMeshMaterialsLoading);
     }
 
+    internal sealed class CompositePreviewMaterialPart
+    {
+        public required Mesh Mesh { get; init; }
+        public string? RendererAssetId { get; init; }
+        public int ExpectedSubMeshCount { get; init; }
+    }
+
     private void PreviewMesh(
         AssetItem assetItem,
         Mesh m_Mesh,
         bool rebuildCandidateControls = true,
         PreviewCandidateItem? selectedCandidate = null,
-        bool preferModelGroup = true)
+        bool? preferModelGroup = null)
     {
+        var effectivePreferModelGroup = preferModelGroup ?? MeshPreview.ShowFullModelGroup;
         if (rebuildCandidateControls)
         {
-            QueueMeshPreviewCandidateBuild(assetItem, m_Mesh, selectedCandidate, preferModelGroup);
+            QueueMeshPreviewCandidateBuild(assetItem, m_Mesh, selectedCandidate, effectivePreferModelGroup);
             return;
         }
 
@@ -365,6 +373,33 @@ public partial class MainWindow
         long expectedPreviewId,
         AssetItem? expectedSelectedAsset)
     {
+        QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+            new[]
+            {
+                new CompositePreviewMaterialPart
+                {
+                    Mesh = m_Mesh,
+                    RendererAssetId = null,
+                    ExpectedSubMeshCount = Math.Max(1, m_Mesh.m_SubMeshes?.Length ?? 0)
+                }
+            },
+            m_Mesh,
+            expectedPreviewId,
+            expectedSelectedAsset);
+    }
+
+    private void QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+        IReadOnlyList<CompositePreviewMaterialPart> parts,
+        Mesh? expectedPrimaryMesh,
+        long expectedPreviewId,
+        AssetItem? expectedSelectedAsset)
+    {
+        if (parts == null || parts.Count == 0)
+        {
+            return;
+        }
+
+        var partsSnapshot = parts.ToArray();
         _ = Task.Run(() =>
         {
             try
@@ -374,67 +409,153 @@ public partial class MainWindow
                     return;
                 }
 
-                var resolvedSlots = TryLoadResolvedMeshMaterialsForPreview(m_Mesh);
-                if (expectedPreviewId != texturePreviewIdCounter)
+                var allSlotSpecs = new List<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)>();
+                var allSubMeshTextureIds = new List<string?>();
+                var fallbackTexturesBySlot = new Dictionary<int, Texture2D>();
+
+                for (var partIdx = 0; partIdx < partsSnapshot.Length; partIdx++)
                 {
-                    return;
-                }
-
-                List<byte[]?> uniqueTextures;
-                List<int> uniqueWidths;
-                List<int> uniqueHeights;
-                int[]? subMeshToTextureIndex;
-                List<string> loadedTextureFiles;
-                List<Material?>? fallbackMaterials = null;
-
-                if (resolvedSlots.Count > 0)
-                {
-                    var slotCount = Math.Max(m_Mesh.m_SubMeshes?.Length ?? 0, resolvedSlots.Max(s => s.SubMeshIndex) + 1);
-                    if (slotCount <= 0 && m_Mesh.m_Indices?.Count > 0)
-                    {
-                        slotCount = 1;
-                    }
-
-                    BuildDeduplicatedPreviewTexturesFromResolved(
-                        slotCount,
-                        resolvedSlots,
-                        () => expectedPreviewId != texturePreviewIdCounter,
-                        out uniqueTextures,
-                        out uniqueWidths,
-                        out uniqueHeights,
-                        out subMeshToTextureIndex,
-                        out loadedTextureFiles);
-                }
-                else
-                {
-                    var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
-                    if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
-                    {
-                        EnsureMeshPreviewDependenciesLoaded(m_Mesh);
-                        allMaterials = FindMaterialsForMeshPreview(m_Mesh);
-                    }
-
                     if (expectedPreviewId != texturePreviewIdCounter)
                     {
                         return;
                     }
 
-                    var slotCount = Math.Max(m_Mesh.m_SubMeshes?.Length ?? 0, allMaterials.Count);
-                    if (slotCount <= 0 && m_Mesh.m_Indices?.Count > 0)
+                    var part = partsSnapshot[partIdx];
+                    var mesh = part.Mesh;
+                    var resolvedPartSlots = TryLoadResolvedMeshMaterialsForPreview(mesh, part.RendererAssetId);
+                    if (expectedPreviewId != texturePreviewIdCounter)
                     {
-                        slotCount = 1;
+                        return;
                     }
 
-                    BuildDeduplicatedPreviewTexturesForMaterials(
-                        slotCount,
-                        allMaterials,
-                        () => expectedPreviewId != texturePreviewIdCounter,
-                        out uniqueTextures,
-                        out uniqueWidths,
-                        out uniqueHeights,
-                        out subMeshToTextureIndex,
-                        out loadedTextureFiles);
-                    fallbackMaterials = allMaterials;
+                    if (resolvedPartSlots.Count > 0)
+                    {
+                        var bySubMesh = new Dictionary<int, ResolvedMeshSubMeshMaterial>(resolvedPartSlots.Count);
+                        foreach (var slot in resolvedPartSlots)
+                        {
+                            if (slot.SubMeshIndex >= 0 && !bySubMesh.ContainsKey(slot.SubMeshIndex))
+                            {
+                                bySubMesh[slot.SubMeshIndex] = slot;
+                            }
+                        }
+
+                        var slotCount = part.ExpectedSubMeshCount > 0
+                            ? part.ExpectedSubMeshCount
+                            : Math.Max(mesh.m_SubMeshes?.Length ?? 0, resolvedPartSlots.Max(s => s.SubMeshIndex) + 1);
+                        if (slotCount <= 0 && mesh.m_Indices?.Count > 0)
+                        {
+                            slotCount = 1;
+                        }
+
+                        for (var s = 0; s < slotCount; s++)
+                        {
+                            if (bySubMesh.TryGetValue(s, out var resolved))
+                            {
+                                var matName = !string.IsNullOrWhiteSpace(resolved.MaterialName)
+                                    ? resolved.MaterialName
+                                    : !string.IsNullOrWhiteSpace(resolved.MaterialAssetId)
+                                        ? GetPreviewHandleName(resolved.MaterialAssetId, "Material")
+                                        : "No Material";
+                                allSlotSpecs.Add((matName, new global::OpenTK.Mathematics.Vector4(
+                                    ClampPreviewColor(resolved.BaseColorR),
+                                    ClampPreviewColor(resolved.BaseColorG),
+                                    ClampPreviewColor(resolved.BaseColorB),
+                                    ClampPreviewColor(resolved.BaseColorA))));
+                                allSubMeshTextureIds.Add(string.IsNullOrWhiteSpace(resolved.MainTextureAssetId)
+                                    ? null
+                                    : resolved.MainTextureAssetId);
+                            }
+                            else
+                            {
+                                allSlotSpecs.Add(("No Material", global::OpenTK.Mathematics.Vector4.One));
+                                allSubMeshTextureIds.Add(null);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        var materials = FindMaterialsForMeshPreview(mesh);
+                        if (materials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                        {
+                            EnsureMeshPreviewDependenciesLoaded(mesh);
+                            materials = FindMaterialsForMeshPreview(mesh);
+                        }
+
+                        if (expectedPreviewId != texturePreviewIdCounter)
+                        {
+                            return;
+                        }
+
+                        var slotCount = part.ExpectedSubMeshCount > 0
+                            ? part.ExpectedSubMeshCount
+                            : Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
+                        if (slotCount <= 0 && mesh.m_Indices?.Count > 0)
+                        {
+                            slotCount = 1;
+                        }
+
+                        for (var s = 0; s < slotCount; s++)
+                        {
+                            var mat = s < materials.Count ? materials[s] : null;
+                            var matName = string.IsNullOrEmpty(mat?.m_Name) ? "No Material" : mat!.m_Name;
+                            allSlotSpecs.Add((matName, GetMeshMaterialBaseColor(mat)));
+                            var tex = mat != null ? FindTextureForMaterial(mat) : null;
+                            var texKey = tex != null ? GetPreviewObjectKey(tex) : null;
+                            if (tex != null && !string.IsNullOrWhiteSpace(texKey))
+                            {
+                                fallbackTexturesBySlot[allSubMeshTextureIds.Count] = tex;
+                                allSubMeshTextureIds.Add(texKey);
+                            }
+                            else
+                            {
+                                allSubMeshTextureIds.Add(null);
+                            }
+                        }
+                    }
+                }
+
+                if (expectedPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                BuildDeduplicatedPreviewTexturesByAssetIds(
+                    allSubMeshTextureIds,
+                    () => expectedPreviewId != texturePreviewIdCounter,
+                    out var uniqueTextures,
+                    out var uniqueWidths,
+                    out var uniqueHeights,
+                    out var subMeshToTextureIndex,
+                    out var loadedTextureFiles);
+
+                if (fallbackTexturesBySlot.Count > 0)
+                {
+                    foreach (var kvp in fallbackTexturesBySlot)
+                    {
+                        if (expectedPreviewId != texturePreviewIdCounter)
+                        {
+                            return;
+                        }
+
+                        var mappedIdx = kvp.Key < subMeshToTextureIndex.Length ? subMeshToTextureIndex[kvp.Key] : -1;
+                        if (mappedIdx >= 0 && mappedIdx < uniqueTextures.Count && uniqueTextures[mappedIdx] == null)
+                        {
+                            try
+                            {
+                                using var previewImg = LoadTexturePreviewThumbnail(kvp.Value, MaxCachedPreviewTextureDimension);
+                                var rgba = ConvertPreviewImageToRgbaBytes(previewImg, out var tw, out var th);
+                                if (rgba != null)
+                                {
+                                    uniqueTextures[mappedIdx] = rgba;
+                                    uniqueWidths[mappedIdx] = tw;
+                                    uniqueHeights[mappedIdx] = th;
+                                }
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
                 }
 
                 if (expectedPreviewId != texturePreviewIdCounter)
@@ -447,11 +568,14 @@ public partial class MainWindow
                     AddActivePreviewDependencyFiles(loadedTextureFiles);
                 }
 
+                var hasAnyTexture = uniqueTextures.Any(t => t != null);
+                var hasAnyNamedMaterial = allSlotSpecs.Any(s => !string.Equals(s.MaterialName, "No Material", StringComparison.Ordinal));
+
                 Dispatcher.UIThread.Post(() =>
                 {
                     if (IsWindowClosingOrClosed
                         || expectedPreviewId != texturePreviewIdCounter
-                        || !ReferenceEquals(currentPreviewMesh, m_Mesh)
+                        || (expectedPrimaryMesh != null && !ReferenceEquals(currentPreviewMesh, expectedPrimaryMesh))
                         || (expectedSelectedAsset != null && !ReferenceEquals(AssetListDataGrid?.SelectedItem, expectedSelectedAsset)))
                     {
                         return;
@@ -462,18 +586,15 @@ public partial class MainWindow
                         return;
                     }
 
-                    if (uniqueTextures.Any(t => t != null))
+                    // Apply textures asynchronously without resetting animation playback frame/timer.
+                    if (hasAnyTexture)
                     {
-                        GLPreviewControl.ApplyMeshTextures(m_Mesh, uniqueTextures, uniqueWidths, uniqueHeights, subMeshToTextureIndex);
+                        GLPreviewControl.ApplyMeshTextures(expectedPrimaryMesh, uniqueTextures, uniqueWidths, uniqueHeights, subMeshToTextureIndex);
                     }
 
-                    if (resolvedSlots.Count > 0)
+                    if (allSlotSpecs.Count > 0 && (hasAnyTexture || hasAnyNamedMaterial))
                     {
-                        BuildMeshMaterialControlsFromResolved(m_Mesh, resolvedSlots);
-                    }
-                    else if (fallbackMaterials != null && fallbackMaterials.Count > 0)
-                    {
-                        BuildMeshMaterialControls(m_Mesh, fallbackMaterials);
+                        BuildMeshMaterialControlsFromSlotSpecs(allSlotSpecs);
                     }
                 });
             }

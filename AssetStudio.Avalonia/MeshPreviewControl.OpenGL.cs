@@ -446,6 +446,13 @@ void main()
 
         private void BindSolidAttribsAndEBO()
         {
+            if (vertexData == null || vertexData.Length == 0 || indiceData == null || indiceData.Length == 0)
+            {
+                vboPosition = 0;
+                vboNormal = 0;
+                return;
+            }
+
             if (vboPosition == 0)
             {
                 CreateVBO(out vboPosition, vertexData, LocationPosition, isAvatarMode ? BufferUsageHint.DynamicDraw : BufferUsageHint.StaticDraw);
