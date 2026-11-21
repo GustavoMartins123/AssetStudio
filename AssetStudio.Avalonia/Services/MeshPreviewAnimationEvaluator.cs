@@ -94,11 +94,8 @@ internal sealed class AnimationTrackSet
                 AddScale(meshBoneIdx, time, new global::OpenTK.Mathematics.Vector3(data[offset], data[offset + 1], data[offset + 2]));
                 break;
             case 4 when offset + 2 < data.Length:
-                var euler = new global::OpenTK.Mathematics.Vector3(
-                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(data[offset]),
-                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(data[offset + 1]),
-                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(data[offset + 2]));
-                AddRotation(meshBoneIdx, time, global::OpenTK.Mathematics.Quaternion.FromEulerAngles(euler));
+                var unityQuat = HumanoidMuscleDecoder.UnityEulerDegreesToQuaternion(data[offset], data[offset + 1], data[offset + 2], rotationOrder: 4);
+                AddRotation(meshBoneIdx, time, MeshPreviewSkeletonBuilder.ToOtkQuaternion(unityQuat));
                 break;
         }
     }
@@ -170,14 +167,11 @@ internal static class MeshPreviewAnimationEvaluator
                 continue;
             }
 
+            var rotOrder = curve.curve.m_RotationOrder;
             foreach (var key in curve.curve.m_Curve)
             {
-                var euler = MeshPreviewSkeletonBuilder.ToOtkVector3(key.value);
-                euler = new global::OpenTK.Mathematics.Vector3(
-                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(euler.X),
-                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(euler.Y),
-                    global::OpenTK.Mathematics.MathHelper.DegreesToRadians(euler.Z));
-                tracks.AddRotation(boneIdx, key.time, global::OpenTK.Mathematics.Quaternion.FromEulerAngles(euler));
+                var unityQuat = HumanoidMuscleDecoder.UnityEulerDegreesToQuaternion(key.value.X, key.value.Y, key.value.Z, rotOrder);
+                tracks.AddRotation(boneIdx, key.time, MeshPreviewSkeletonBuilder.ToOtkQuaternion(unityQuat));
             }
         }
 
@@ -440,13 +434,14 @@ internal static class MeshPreviewAnimationEvaluator
             }
         }
 
-        if (innerClip.m_DenseClip != null)
+        if (innerClip.m_DenseClip != null && innerClip.m_DenseClip.m_FrameCount > 0 && innerClip.m_DenseClip.m_CurveCount > 0)
         {
             var dense = innerClip.m_DenseClip;
             var streamCount = innerClip.m_StreamedClip?.curveCount ?? 0;
+            var denseSampleRate = dense.m_SampleRate > 0f && float.IsFinite(dense.m_SampleRate) ? dense.m_SampleRate : 30f;
             for (var frameIndex = 0; frameIndex < dense.m_FrameCount; frameIndex++)
             {
-                var time = dense.m_BeginTime + frameIndex / dense.m_SampleRate;
+                var time = dense.m_BeginTime + frameIndex / denseSampleRate;
                 var frameOffset = frameIndex * dense.m_CurveCount;
                 for (var cIdx = 0; cIdx < dense.m_CurveCount;)
                 {
@@ -455,22 +450,106 @@ internal static class MeshPreviewAnimationEvaluator
             }
         }
 
-        if (innerClip.m_ConstantClip != null)
+        if (innerClip.m_ConstantClip?.data != null && innerClip.m_ConstantClip.data.Length > 0)
         {
             var constant = innerClip.m_ConstantClip;
             var denseCount = innerClip.m_DenseClip?.m_CurveCount ?? 0;
             var streamCount = innerClip.m_StreamedClip?.curveCount ?? 0;
-            var time = 0.0f;
-            for (var i = 0; i < 2; i++)
+            var stopTime = constantStopTime is float s && float.IsFinite(s) && s > 1e-6f ? s : 0.0f;
+            var passes = stopTime > 1e-6f ? 2 : 1;
+            for (var i = 0; i < passes; i++)
             {
+                var time = i == 0 ? 0.0f : stopTime;
                 for (var cIdx = 0; cIdx < constant.data.Length;)
                 {
                     ProcessCurveData((int)(streamCount + denseCount + cIdx), time, constant.data, 0, ref cIdx);
                 }
-
-                time = constantStopTime ?? time;
             }
         }
+    }
+
+    public static int ExtractHumanoidMuscleTracks(
+        AnimationClip clip,
+        Avatar avatar,
+        AvatarMeshSkeletonData skeleton,
+        Dictionary<string, int> meshBonePathToIdx,
+        Func<int, bool> shouldUseBone,
+        AnimationTrackSet tracks)
+    {
+        if (clip == null || avatar?.m_Avatar?.m_AvatarSkeleton?.m_ID == null || skeleton == null)
+        {
+            return 0;
+        }
+
+        var decodedTracks = HumanoidMuscleDecoder.DecodeHumanoidClip(clip, avatar);
+        if (decodedTracks.Count == 0)
+        {
+            return 0;
+        }
+
+        var skelIds = avatar.m_Avatar.m_AvatarSkeleton.m_ID;
+        var skelNodeToMeshBone = new Dictionary<int, int>(skeleton.MeshBoneToSkelNode.Length);
+        for (var mb = 0; mb < skeleton.MeshBoneToSkelNode.Length; mb++)
+        {
+            var sn = skeleton.MeshBoneToSkelNode[mb];
+            if (sn >= 0)
+            {
+                skelNodeToMeshBone[sn] = mb;
+            }
+        }
+
+        var addedTracks = 0;
+        for (var i = 0; i < decodedTracks.Count; i++)
+        {
+            var decoded = decodedTracks[i];
+            int meshBoneIdx = -1;
+            if (!skelNodeToMeshBone.TryGetValue(decoded.AvatarNodeIndex, out meshBoneIdx))
+            {
+                if (decoded.AvatarNodeIndex >= 0 && decoded.AvatarNodeIndex < skelIds.Length
+                    && skeleton.MeshBoneHashToIdx.TryGetValue(skelIds[decoded.AvatarNodeIndex], out var byHash))
+                {
+                    meshBoneIdx = byHash;
+                }
+                else if (!string.IsNullOrEmpty(decoded.BonePath)
+                    && MeshPreviewSkeletonBuilder.TryResolvePathAlias(meshBonePathToIdx, decoded.BonePath, out var byPath))
+                {
+                    meshBoneIdx = byPath;
+                }
+            }
+
+            if (meshBoneIdx < 0 || !shouldUseBone(meshBoneIdx))
+            {
+                continue;
+            }
+
+            bool addedAny = false;
+            if (!tracks.PosTracks.ContainsKey(meshBoneIdx) && decoded.Translations.Count > 0)
+            {
+                for (var k = 0; k < decoded.Translations.Count; k++)
+                {
+                    var kf = decoded.Translations[k];
+                    tracks.AddPosition(meshBoneIdx, kf.time, MeshPreviewSkeletonBuilder.ToOtkVector3(kf.value));
+                }
+                addedAny = true;
+            }
+
+            if (!tracks.RotTracks.ContainsKey(meshBoneIdx) && decoded.Rotations.Count > 0)
+            {
+                for (var k = 0; k < decoded.Rotations.Count; k++)
+                {
+                    var kf = decoded.Rotations[k];
+                    tracks.AddRotation(meshBoneIdx, kf.time, MeshPreviewSkeletonBuilder.ToOtkQuaternion(kf.value));
+                }
+                addedAny = true;
+            }
+
+            if (addedAny)
+            {
+                addedTracks++;
+            }
+        }
+
+        return addedTracks;
     }
 
     public static bool EvaluateFramesFromTracks(

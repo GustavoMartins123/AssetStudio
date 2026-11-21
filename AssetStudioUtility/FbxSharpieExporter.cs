@@ -48,7 +48,9 @@ namespace AssetStudio
         private HashSet<string> _skinBonePathSet = new HashSet<string>();
         private HashSet<string> _meshPathSet = new HashSet<string>();
         private List<(string Name, long Start, long Stop)> _takes = new List<(string Name, long Start, long Stop)>();
-        private static readonly int[] DefaultKeyAttrFlags = { 24840 };
+        private const int SmoothKeyAttrFlag = 24840;
+        private const int SteppedKeyAttrFlag = 2; // FBX eInterpolationConstant | eConstantStandard
+        private static readonly int[] DefaultKeyAttrFlags = { SmoothKeyAttrFlag };
         private static readonly float[] DefaultKeyAttrDataFloat = { 0f, 0f, 9.419963E-30f, 0f };
         private int _exportedFrameCount;
         private int _exportedBoneCount;
@@ -218,6 +220,7 @@ namespace AssetStudio
                 zeroTransform ? 0 : (double)frame.LocalRotation.Z));
             props.AddNode(MakeP("Lcl Scaling", "Lcl Scaling", "", "A+",
                 (double)frame.LocalScale.X, (double)frame.LocalScale.Y, (double)frame.LocalScale.Z));
+            props.AddNode(MakeVisibilityP(1.0));
             model.AddNode(props);
 
             _objects.AddNode(model);
@@ -1378,7 +1381,7 @@ namespace AssetStudio
             if (anim.TrackList == null || anim.TrackList.Count == 0)
                 return;
 
-            var validTracks = new List<(ImportedAnimationKeyframedTrack Track, long ModelId, long BsChannelId)>(anim.TrackList.Count);
+            var validTracks = new List<(ImportedAnimationKeyframedTrack Track, long ModelId, List<(ImportedBlendShape BlendShape, long ChannelId)> MatchedBlendShapes)>(anim.TrackList.Count);
             var missingTrackCount = 0;
             float maxTime = 0;
 
@@ -1389,25 +1392,40 @@ namespace AssetStudio
 
                 long modelId = 0;
                 bool hasModel = TryGetFrameId(track.Path, out modelId);
-                long bsChannelId = 0;
-                if (track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)
+                var matchedBlendShapes = new List<(ImportedBlendShape BlendShape, long ChannelId)>();
+
+                if (track.BlendShapes != null && track.BlendShapes.Count > 0)
                 {
-                    var mapKey = track.Path + "::" + track.BlendShape.ChannelName;
-                    if (!_blendShapeChannelMap.TryGetValue(mapKey, out bsChannelId))
+                    var normTrackPath = NormalizeFramePath(track.Path);
+                    for (int b = 0; b < track.BlendShapes.Count; b++)
                     {
-                        var normTrackPath = NormalizeFramePath(track.Path);
-                        if (!string.IsNullOrEmpty(normTrackPath))
+                        var bs = track.BlendShapes[b];
+                        if (bs == null || bs.Keyframes == null || bs.Keyframes.Count == 0)
                         {
-                            _blendShapeChannelMap.TryGetValue(normTrackPath + "::" + track.BlendShape.ChannelName, out bsChannelId);
+                            continue;
+                        }
+
+                        if (TryResolveBlendShapeChannelId(track.Path, normTrackPath, bs.ChannelName, out var bsChannelId))
+                        {
+                            matchedBlendShapes.Add((bs, bsChannelId));
                         }
                     }
                 }
 
-                bool hasTrs = hasModel && (track.Translations.Count > 0 || track.Rotations.Count > 0 || track.Scalings.Count > 0);
-                bool hasBs = bsChannelId != 0 && track.BlendShape != null && track.BlendShape.Keyframes.Count > 0;
-                if (!hasTrs && !hasBs)
+                bool hasTrsOrVis = hasModel && (
+                    track.Translations.Count > 0
+                    || track.Rotations.Count > 0
+                    || track.Scalings.Count > 0
+                    || track.Visibilities.Count > 0);
+                bool hasBs = matchedBlendShapes.Count > 0;
+                if (!hasTrsOrVis && !hasBs)
                 {
-                    if (!hasModel && (track.Translations.Count > 0 || track.Rotations.Count > 0 || track.Scalings.Count > 0 || (track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)))
+                    bool hadAnyKeys = track.Translations.Count > 0
+                        || track.Rotations.Count > 0
+                        || track.Scalings.Count > 0
+                        || track.Visibilities.Count > 0
+                        || (track.BlendShapes != null && track.BlendShapes.Exists(bs => bs?.Keyframes?.Count > 0));
+                    if (!hasModel && hadAnyKeys)
                     {
                         missingTrackCount++;
                         _missingAnimationTrackCount++;
@@ -1430,9 +1448,14 @@ namespace AssetStudio
                     float t = (float)SanitizeFinite(track.Scalings[i].time);
                     if (t > maxTime) maxTime = t;
                 }
-                if (hasBs && track.BlendShape != null)
+                for (int i = 0; i < track.Visibilities.Count; i++)
                 {
-                    var bsKeys = track.BlendShape.Keyframes;
+                    float t = (float)SanitizeFinite(track.Visibilities[i].time);
+                    if (t > maxTime) maxTime = t;
+                }
+                for (int b = 0; b < matchedBlendShapes.Count; b++)
+                {
+                    var bsKeys = matchedBlendShapes[b].BlendShape.Keyframes;
                     for (int i = 0; i < bsKeys.Count; i++)
                     {
                         float t = (float)SanitizeFinite(bsKeys[i].time);
@@ -1440,7 +1463,7 @@ namespace AssetStudio
                     }
                 }
 
-                validTracks.Add((track, modelId, bsChannelId));
+                validTracks.Add((track, modelId, matchedBlendShapes));
             }
 
             if (validTracks.Count == 0)
@@ -1478,30 +1501,36 @@ namespace AssetStudio
             var exportedTrackCount = 0;
             for (int i = 0; i < validTracks.Count; i++)
             {
-                var (track, modelId, bsChannelId) = validTracks[i];
+                var (track, modelId, matchedBlendShapes) = validTracks[i];
                 var exportedTrack = false;
                 if (modelId != 0)
                 {
                     if (track.Translations.Count > 0)
                     {
-                        ExportCurveNode(layerId, modelId, "T", "Lcl Translation", track.Translations);
+                        ExportCurveNode(layerId, modelId, "T", "Lcl Translation", track.Translations, isRotation: false);
                         exportedTrack = true;
                     }
                     if (track.Rotations.Count > 0)
                     {
-                        ExportCurveNode(layerId, modelId, "R", "Lcl Rotation", track.Rotations);
+                        ExportCurveNode(layerId, modelId, "R", "Lcl Rotation", track.Rotations, isRotation: true);
                         exportedTrack = true;
                     }
                     if (track.Scalings.Count > 0)
                     {
-                        ExportCurveNode(layerId, modelId, "S", "Lcl Scaling", track.Scalings);
+                        ExportCurveNode(layerId, modelId, "S", "Lcl Scaling", track.Scalings, isRotation: false);
+                        exportedTrack = true;
+                    }
+                    if (track.Visibilities.Count > 0)
+                    {
+                        ExportCurveNode1D(layerId, modelId, "Visibility", "Visibility", track.Visibilities, forceStepped: true);
                         exportedTrack = true;
                     }
                 }
 
-                if (bsChannelId != 0 && track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)
+                for (int b = 0; b < matchedBlendShapes.Count; b++)
                 {
-                    ExportCurveNode1D(layerId, bsChannelId, track.BlendShape.ChannelName, "DeformPercent", track.BlendShape.Keyframes);
+                    var (bs, bsChannelId) = matchedBlendShapes[b];
+                    ExportCurveNode1D(layerId, bsChannelId, bs.ChannelName, "DeformPercent", bs.Keyframes, forceStepped: false);
                     exportedTrack = true;
                 }
 
@@ -1514,6 +1543,65 @@ namespace AssetStudio
 
             if (missingTrackCount > 0)
                 Logger.Warning($"Animation '{anim.Name}' exported {exportedTrackCount} tracks; {missingTrackCount} track paths did not match the exported frame hierarchy.");
+        }
+
+        private bool TryResolveBlendShapeChannelId(string rawTrackPath, string normTrackPath, string? rawChannelName, out long channelId)
+        {
+            channelId = 0;
+            if (string.IsNullOrEmpty(rawChannelName))
+            {
+                return false;
+            }
+
+            const string bsPrefix = "blendShape.";
+            string cleanName = rawChannelName.StartsWith(bsPrefix, StringComparison.OrdinalIgnoreCase)
+                ? rawChannelName.Substring(bsPrefix.Length)
+                : rawChannelName;
+
+            if (_blendShapeChannelMap.TryGetValue(rawTrackPath + "::" + cleanName, out channelId))
+                return true;
+            if (_blendShapeChannelMap.TryGetValue(rawTrackPath + "::" + rawChannelName, out channelId))
+                return true;
+
+            if (!string.IsNullOrEmpty(normTrackPath))
+            {
+                if (_blendShapeChannelMap.TryGetValue(normTrackPath + "::" + cleanName, out channelId))
+                    return true;
+                if (_blendShapeChannelMap.TryGetValue(normTrackPath + "::" + rawChannelName, out channelId))
+                    return true;
+
+                if (_frameUniqueSuffixMap.TryGetValue(normTrackPath, out var canonicalPath) && !string.IsNullOrEmpty(canonicalPath))
+                {
+                    if (_blendShapeChannelMap.TryGetValue(canonicalPath + "::" + cleanName, out channelId))
+                        return true;
+                }
+            }
+
+            // Unique channel-name fallback across exported morphs when track path was relative or unprefixed
+            string suffix = "::" + cleanName;
+            long uniqueMatch = 0;
+            foreach (var kv in _blendShapeChannelMap)
+            {
+                if (kv.Key.EndsWith(suffix, StringComparison.Ordinal))
+                {
+                    if (uniqueMatch == 0)
+                    {
+                        uniqueMatch = kv.Value;
+                    }
+                    else if (uniqueMatch != kv.Value)
+                    {
+                        uniqueMatch = 0;
+                        break; // ambiguous across multiple meshes
+                    }
+                }
+            }
+            if (uniqueMatch != 0)
+            {
+                channelId = uniqueMatch;
+                return true;
+            }
+
+            return false;
         }
 
         private bool TryGetFrameId(string path, out long modelId)
@@ -1760,8 +1848,9 @@ namespace AssetStudio
             return string.IsNullOrEmpty(path) ? string.Empty : path.Replace('\\', '/').Trim('/');
         }
 
-        private void ExportCurveNode1D(long layerId, long targetId, string channelName, string propName, List<ImportedKeyframe<float>> keyframes)
+        private void ExportCurveNode1D(long layerId, long targetId, string channelName, string propName, List<ImportedKeyframe<float>> keyframes, bool forceStepped = false)
         {
+            var sorted = PrepareSortedFloatKeyframes(keyframes);
             var curveNodeId = GenId();
             var curveNode = N("AnimationCurveNode");
             curveNode.AddProperty(new LongToken(curveNodeId));
@@ -1769,30 +1858,34 @@ namespace AssetStudio
             curveNode.AddProperty(new StringToken(""));
             string channelProp = $"d|{propName}";
             var props = N("Properties70");
-            props.AddNode(MakeNumberP(channelProp, keyframes.Count > 0 ? keyframes[0].value : 0));
+            props.AddNode(MakeNumberP(channelProp, sorted.Count > 0 ? sorted[0].value : 0));
             curveNode.AddNode(props);
             _objects.AddNode(curveNode);
 
             Connect(curveNodeId, layerId);
             ConnectProperty(curveNodeId, targetId, propName);
 
-            int keyCount = keyframes.Count;
+            int keyCount = sorted.Count;
             var timesArr = new long[keyCount];
             var valuesArr = new float[keyCount];
+            var steppedArr = new bool[keyCount];
             int writePos = 0;
             for (int i = 0; i < keyCount; i++)
             {
-                var k = keyframes[i];
+                var k = sorted[i];
                 long kTime = (long)Math.Round(SanitizeFinite(k.time) * 46186158000.0);
                 float val = (float)SanitizeDouble(k.value);
+                bool stepped = forceStepped || k.isStepped;
                 if (writePos > 0 && kTime == timesArr[writePos - 1])
                 {
                     valuesArr[writePos - 1] = val;
+                    steppedArr[writePos - 1] = stepped;
                 }
                 else
                 {
                     timesArr[writePos] = kTime;
                     valuesArr[writePos] = val;
+                    steppedArr[writePos] = stepped;
                     writePos++;
                 }
             }
@@ -1800,13 +1893,15 @@ namespace AssetStudio
             {
                 Array.Resize(ref timesArr, writePos);
                 Array.Resize(ref valuesArr, writePos);
+                Array.Resize(ref steppedArr, writePos);
             }
 
-            ExportCurve(curveNodeId, channelProp, timesArr, valuesArr);
+            ExportCurve(curveNodeId, channelProp, timesArr, valuesArr, steppedArr);
         }
 
-        private void ExportCurveNode(long layerId, long modelId, string channel, string propName, List<ImportedKeyframe<Vector3>> keyframes)
+        private void ExportCurveNode(long layerId, long modelId, string channel, string propName, List<ImportedKeyframe<Vector3>> keyframes, bool isRotation = false)
         {
+            var sorted = PrepareSortedVector3Keyframes(keyframes, isRotation);
             var curveNodeId = GenId();
             var curveNode = N("AnimationCurveNode");
             curveNode.AddProperty(new LongToken(curveNodeId));
@@ -1814,7 +1909,7 @@ namespace AssetStudio
             curveNode.AddProperty(new StringToken(""));
 
             var props = N("Properties70");
-            var defaultValue = keyframes.Count > 0 ? keyframes[0].value : Vector3.Zero;
+            var defaultValue = sorted.Count > 0 ? sorted[0].value : Vector3.Zero;
             props.AddNode(MakeCompoundP("d"));
             props.AddNode(MakeNumberP("d|X", defaultValue.X));
             props.AddNode(MakeNumberP("d|Y", defaultValue.Y));
@@ -1825,15 +1920,16 @@ namespace AssetStudio
             Connect(curveNodeId, layerId);
             ConnectProperty(curveNodeId, modelId, propName);
 
-            int keyCount = keyframes.Count;
+            int keyCount = sorted.Count;
             var timesArr = new long[keyCount];
             var xArr = new float[keyCount];
             var yArr = new float[keyCount];
             var zArr = new float[keyCount];
+            var steppedArr = new bool[keyCount];
             int writePos = 0;
             for (int i = 0; i < keyCount; i++)
             {
-                var k = keyframes[i];
+                var k = sorted[i];
                 long kTime = (long)Math.Round(SanitizeFinite(k.time) * 46186158000.0);
                 float vx = (float)SanitizeDouble(k.value.X);
                 float vy = (float)SanitizeDouble(k.value.Y);
@@ -1843,6 +1939,7 @@ namespace AssetStudio
                     xArr[writePos - 1] = vx;
                     yArr[writePos - 1] = vy;
                     zArr[writePos - 1] = vz;
+                    steppedArr[writePos - 1] = k.isStepped;
                 }
                 else
                 {
@@ -1850,6 +1947,7 @@ namespace AssetStudio
                     xArr[writePos] = vx;
                     yArr[writePos] = vy;
                     zArr[writePos] = vz;
+                    steppedArr[writePos] = k.isStepped;
                     writePos++;
                 }
             }
@@ -1859,14 +1957,76 @@ namespace AssetStudio
                 Array.Resize(ref xArr, writePos);
                 Array.Resize(ref yArr, writePos);
                 Array.Resize(ref zArr, writePos);
+                Array.Resize(ref steppedArr, writePos);
             }
 
-            ExportCurve(curveNodeId, "d|X", timesArr, xArr);
-            ExportCurve(curveNodeId, "d|Y", timesArr, yArr);
-            ExportCurve(curveNodeId, "d|Z", timesArr, zArr);
+            ExportCurve(curveNodeId, "d|X", timesArr, xArr, steppedArr);
+            ExportCurve(curveNodeId, "d|Y", timesArr, yArr, steppedArr);
+            ExportCurve(curveNodeId, "d|Z", timesArr, zArr, steppedArr);
         }
 
-        private void ExportCurve(long curveNodeId, string channel, long[] times, float[] floatValues)
+        private static List<ImportedKeyframe<float>> PrepareSortedFloatKeyframes(List<ImportedKeyframe<float>> keyframes)
+        {
+            bool needsSort = false;
+            for (int i = 1; i < keyframes.Count; i++)
+            {
+                if (keyframes[i].time < keyframes[i - 1].time)
+                {
+                    needsSort = true;
+                    break;
+                }
+            }
+            if (!needsSort)
+            {
+                return keyframes;
+            }
+            var copy = new List<ImportedKeyframe<float>>(keyframes);
+            copy.Sort((a, b) => a.time.CompareTo(b.time));
+            return copy;
+        }
+
+        private static List<ImportedKeyframe<Vector3>> PrepareSortedVector3Keyframes(List<ImportedKeyframe<Vector3>> keyframes, bool unwrapRotation)
+        {
+            bool needsSort = false;
+            bool needsUnwrap = false;
+            for (int i = 1; i < keyframes.Count; i++)
+            {
+                if (keyframes[i].time < keyframes[i - 1].time)
+                {
+                    needsSort = true;
+                }
+                if (unwrapRotation)
+                {
+                    var p = keyframes[i - 1].value;
+                    var c = keyframes[i].value;
+                    if (MathF.Abs(c.X - p.X) > 180f || MathF.Abs(c.Y - p.Y) > 180f || MathF.Abs(c.Z - p.Z) > 180f)
+                    {
+                        needsUnwrap = true;
+                    }
+                }
+            }
+            if (!needsSort && !needsUnwrap)
+            {
+                return keyframes;
+            }
+            var copy = new List<ImportedKeyframe<Vector3>>(keyframes.Count);
+            for (int i = 0; i < keyframes.Count; i++)
+            {
+                var k = keyframes[i];
+                copy.Add(new ImportedKeyframe<Vector3>(k.time, k.value, k.isStepped));
+            }
+            if (needsSort)
+            {
+                copy.Sort((a, b) => a.time.CompareTo(b.time));
+            }
+            if (unwrapRotation)
+            {
+                HumanoidMuscleDecoder.UnwrapEulerKeyframes(copy);
+            }
+            return copy;
+        }
+
+        private void ExportCurve(long curveNodeId, string channel, long[] times, float[] floatValues, bool[]? steppedFlags = null)
         {
             var curveId = GenId();
             _exportedAnimationCurveCount++;
@@ -1886,17 +2046,69 @@ namespace AssetStudio
             keyValueFloat.AddProperty(new FloatArrayToken(floatValues));
             curve.AddNode(keyValueFloat);
 
-            var keyAttrFlags = N("KeyAttrFlags");
-            keyAttrFlags.AddProperty(new IntegerArrayToken(DefaultKeyAttrFlags));
-            curve.AddNode(keyAttrFlags);
+            bool hasAnyStepped = false;
+            if (steppedFlags != null && steppedFlags.Length == floatValues.Length)
+            {
+                for (int i = 0; i < steppedFlags.Length; i++)
+                {
+                    if (steppedFlags[i])
+                    {
+                        hasAnyStepped = true;
+                        break;
+                    }
+                }
+            }
 
-            var keyAttrDataFloat = N("KeyAttrDataFloat");
-            keyAttrDataFloat.AddProperty(new FloatArrayToken(DefaultKeyAttrDataFloat));
-            curve.AddNode(keyAttrDataFloat);
+            if (!hasAnyStepped)
+            {
+                var keyAttrFlags = N("KeyAttrFlags");
+                keyAttrFlags.AddProperty(new IntegerArrayToken(DefaultKeyAttrFlags));
+                curve.AddNode(keyAttrFlags);
 
-            var keyAttrRefCount = N("KeyAttrRefCount");
-            keyAttrRefCount.AddProperty(new IntegerArrayToken(new[] { floatValues.Length }));
-            curve.AddNode(keyAttrRefCount);
+                var keyAttrDataFloat = N("KeyAttrDataFloat");
+                keyAttrDataFloat.AddProperty(new FloatArrayToken(DefaultKeyAttrDataFloat));
+                curve.AddNode(keyAttrDataFloat);
+
+                var keyAttrRefCount = N("KeyAttrRefCount");
+                keyAttrRefCount.AddProperty(new IntegerArrayToken(new[] { floatValues.Length }));
+                curve.AddNode(keyAttrRefCount);
+            }
+            else
+            {
+                // Run-length encode stepped (eInterpolationConstant = 2) vs smooth (24840) KeyAttr entries
+                var flagsList = new List<int>();
+                var dataList = new List<float>();
+                var refCountList = new List<int>();
+                for (int i = 0; i < steppedFlags!.Length; i++)
+                {
+                    int flag = steppedFlags[i] ? SteppedKeyAttrFlag : SmoothKeyAttrFlag;
+                    if (flagsList.Count > 0 && flagsList[^1] == flag)
+                    {
+                        refCountList[^1]++;
+                    }
+                    else
+                    {
+                        flagsList.Add(flag);
+                        dataList.Add(0f);
+                        dataList.Add(0f);
+                        dataList.Add(flag == SmoothKeyAttrFlag ? 9.419963E-30f : 0f);
+                        dataList.Add(0f);
+                        refCountList.Add(1);
+                    }
+                }
+
+                var keyAttrFlags = N("KeyAttrFlags");
+                keyAttrFlags.AddProperty(new IntegerArrayToken(flagsList.ToArray()));
+                curve.AddNode(keyAttrFlags);
+
+                var keyAttrDataFloat = N("KeyAttrDataFloat");
+                keyAttrDataFloat.AddProperty(new FloatArrayToken(dataList.ToArray()));
+                curve.AddNode(keyAttrDataFloat);
+
+                var keyAttrRefCount = N("KeyAttrRefCount");
+                keyAttrRefCount.AddProperty(new IntegerArrayToken(refCountList.ToArray()));
+                curve.AddNode(keyAttrRefCount);
+            }
 
             _objects.AddNode(curve);
             ConnectProperty(curveId, curveNodeId, channel);
@@ -2492,6 +2704,17 @@ namespace AssetStudio
             p.AddProperty(new StringToken("Compound"));
             p.AddProperty(new StringToken(""));
             p.AddProperty(new StringToken(""));
+            return p;
+        }
+
+        private FbxNode MakeVisibilityP(double value)
+        {
+            var p = N("P");
+            p.AddProperty(new StringToken("Visibility"));
+            p.AddProperty(new StringToken("Visibility"));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new StringToken("A"));
+            p.AddProperty(new DoubleToken(SanitizeDouble(value)));
             return p;
         }
 

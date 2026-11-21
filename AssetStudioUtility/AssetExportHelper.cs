@@ -402,10 +402,15 @@ namespace AssetStudio
 
         public static void WriteTextureMetaIfMissing(string texturePath)
         {
-            WriteTextureMetaIfMissing(texturePath, null);
+            WriteTextureMetaIfMissing(texturePath, null, false);
         }
 
         public static void WriteTextureMetaIfMissing(string texturePath, Object? obj)
+        {
+            WriteTextureMetaIfMissing(texturePath, obj, false);
+        }
+
+        public static void WriteTextureMetaIfMissing(string texturePath, Object? obj, bool isNormalMap)
         {
             var metaPath = texturePath + ".meta";
             if (File.Exists(metaPath))
@@ -413,7 +418,7 @@ namespace AssetStudio
                 return;
             }
 
-            File.WriteAllText(metaPath, BuildTextureMeta(GenerateStableGuid(obj)), Encoding.UTF8);
+            File.WriteAllText(metaPath, BuildTextureMeta(GenerateStableGuid(obj), obj, isNormalMap), Encoding.UTF8);
         }
 
         public static string GenerateStableGuid(Object? obj)
@@ -440,8 +445,90 @@ namespace AssetStudio
             return Convert.ToHexStringLower(bytes);
         }
 
-        private static string BuildTextureMeta(string guid)
+        private static bool IsLikelyNormalMapTexture(Texture2D tex)
         {
+            if (tex.m_TextureFormat == TextureFormat.BC5)
+            {
+                return true;
+            }
+
+            var name = tex.m_Name;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return false;
+            }
+
+            var lower = name.ToLowerInvariant();
+            return lower.EndsWith("_n", StringComparison.Ordinal)
+                || lower.EndsWith("_nrm", StringComparison.Ordinal)
+                || lower.EndsWith("_norm", StringComparison.Ordinal)
+                || lower.EndsWith("_normal", StringComparison.Ordinal)
+                || lower.EndsWith("_normalmap", StringComparison.Ordinal)
+                || lower.EndsWith("_bump", StringComparison.Ordinal)
+                || lower.EndsWith("_bumpmap", StringComparison.Ordinal)
+                || lower.Contains("normalmap", StringComparison.Ordinal)
+                || lower.Contains("_normal_", StringComparison.Ordinal);
+        }
+
+        private static string BuildTextureMeta(string guid, Object? obj = null, bool isNormalMap = false)
+        {
+            int enableMipMap = 1;
+            int sRGBTexture = 1;
+            int linearTexture = 0;
+            int filterMode = 1;
+            int aniso = 1;
+            float mipBias = 0f;
+            int wrapU = 0;
+            int wrapV = 0;
+            int wrapW = 0;
+            int textureType = 0;
+
+            if (obj is Sprite)
+            {
+                textureType = 8; // Sprite (2D and UI)
+            }
+            else if (obj is Texture2D tex)
+            {
+                bool normalMap = isNormalMap || IsLikelyNormalMapTexture(tex);
+                if (normalMap)
+                {
+                    textureType = 1; // Normal map
+                    sRGBTexture = 0;
+                    linearTexture = 1;
+                }
+                else
+                {
+                    // Unity Texture2D.m_ColorSpace: 0 = Linear, 1 = sRGB
+                    bool isLinear = tex.m_ColorSpace == 0;
+                    sRGBTexture = isLinear ? 0 : 1;
+                    linearTexture = isLinear ? 1 : 0;
+                }
+
+                if (tex.m_MipCount == 1)
+                {
+                    enableMipMap = 0;
+                }
+
+                if (tex.m_TextureSettings != null)
+                {
+                    if (tex.m_TextureSettings.m_FilterMode >= 0 && tex.m_TextureSettings.m_FilterMode <= 2)
+                        filterMode = tex.m_TextureSettings.m_FilterMode;
+                    if (tex.m_TextureSettings.m_Aniso >= 0)
+                        aniso = tex.m_TextureSettings.m_Aniso;
+                    if (float.IsFinite(tex.m_TextureSettings.m_MipBias))
+                        mipBias = tex.m_TextureSettings.m_MipBias;
+                    wrapU = tex.m_TextureSettings.m_WrapMode;
+                    wrapV = tex.m_TextureSettings.m_WrapMode;
+                    wrapW = tex.m_TextureSettings.m_WrapMode;
+                }
+            }
+            else if (isNormalMap)
+            {
+                textureType = 1;
+                sRGBTexture = 0;
+                linearTexture = 1;
+            }
+
             return $@"fileFormatVersion: 2
 guid: {guid}
 TextureImporter:
@@ -450,9 +537,9 @@ TextureImporter:
   serializedVersion: 13
   mipmaps:
     mipMapMode: 0
-    enableMipMap: 1
-    sRGBTexture: 1
-    linearTexture: 0
+    enableMipMap: {enableMipMap}
+    sRGBTexture: {sRGBTexture}
+    linearTexture: {linearTexture}
     fadeOut: 0
     borderMipMap: 0
     mipMapsPreserveCoverage: 0
@@ -461,13 +548,13 @@ TextureImporter:
     mipMapFadeDistanceEnd: 3
   textureSettings:
     serializedVersion: 2
-    filterMode: 1
-    aniso: 1
-    mipBias: 0
-    wrapU: 0
-    wrapV: 0
-    wrapW: 0
-  textureType: 0
+    filterMode: {filterMode}
+    aniso: {aniso}
+    mipBias: {F(mipBias)}
+    wrapU: {wrapU}
+    wrapV: {wrapV}
+    wrapW: {wrapW}
+  textureType: {textureType}
   textureShape: 1
   platformSettings: []
   spriteSheet:
@@ -694,17 +781,33 @@ TextureImporter:
                         {
                             if (!string.IsNullOrEmpty(channel.name))
                             {
-                                var blendShapeName = "blendShape." + channel.name;
-                                var crc = new SevenZip.CRC();
-                                var bytes = Encoding.UTF8.GetBytes(blendShapeName);
-                                crc.Update(bytes, 0, (uint)bytes.Length);
-                                morphChannelNames[crc.GetDigest()] = blendShapeName;
+                                var blendShapeName = channel.name.StartsWith("blendShape.", StringComparison.OrdinalIgnoreCase)
+                                    ? channel.name
+                                    : "blendShape." + channel.name;
+                                if (channel.nameHash != 0)
+                                {
+                                    morphChannelNames[channel.nameHash] = blendShapeName;
+                                }
+                                morphChannelNames[ComputeUnityCrc32(channel.name)] = blendShapeName;
+                                morphChannelNames[ComputeUnityCrc32(blendShapeName)] = blendShapeName;
                             }
                         }
                     }
                 }
             }
             return morphChannelNames;
+        }
+
+        private static uint ComputeUnityCrc32(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return 0;
+            }
+            var crc = new SevenZip.CRC();
+            var bytes = Encoding.UTF8.GetBytes(text);
+            crc.Update(bytes, 0, (uint)bytes.Length);
+            return crc.GetDigest();
         }
 
         public static bool ExportAnimationClip(AnimationClip clip, string fallbackName, string exportPath, Dictionary<uint, string> bonePathHash, Dictionary<uint, string> morphChannelNames)
@@ -866,6 +969,10 @@ TextureImporter:
 
                 string GetPath(uint hash)
                 {
+                    if (hash == 0)
+                    {
+                        return string.Empty;
+                    }
                     if (bonePathHash != null && bonePathHash.TryGetValue(hash, out var p))
                     {
                         return p;
@@ -882,13 +989,13 @@ TextureImporter:
                     return "blendShape.unknown_" + hash;
                 }
 
-                var trackDict = new Dictionary<string, (List<CustomKeyframe<Vector3>> pos, List<CustomKeyframe<Quaternion>> rot, List<CustomKeyframe<Vector3>> scale, Dictionary<string, List<CustomKeyframe<float>>> floats)>();
+                var trackDict = new Dictionary<string, (List<CustomKeyframe<Vector3>> pos, List<CustomKeyframe<Quaternion>> rot, List<CustomKeyframe<Vector3>> euler, List<CustomKeyframe<Vector3>> scale, Dictionary<string, List<CustomKeyframe<float>>> floats)>();
 
-                (List<CustomKeyframe<Vector3>> pos, List<CustomKeyframe<Quaternion>> rot, List<CustomKeyframe<Vector3>> scale, Dictionary<string, List<CustomKeyframe<float>>> floats) GetTrack(string path)
+                (List<CustomKeyframe<Vector3>> pos, List<CustomKeyframe<Quaternion>> rot, List<CustomKeyframe<Vector3>> euler, List<CustomKeyframe<Vector3>> scale, Dictionary<string, List<CustomKeyframe<float>>> floats) GetTrack(string path)
                 {
                     if (!trackDict.TryGetValue(path, out var t))
                     {
-                        t = (new List<CustomKeyframe<Vector3>>(), new List<CustomKeyframe<Quaternion>>(), new List<CustomKeyframe<Vector3>>(), new Dictionary<string, List<CustomKeyframe<float>>>());
+                        t = (new List<CustomKeyframe<Vector3>>(), new List<CustomKeyframe<Quaternion>>(), new List<CustomKeyframe<Vector3>>(), new List<CustomKeyframe<Vector3>>(), new Dictionary<string, List<CustomKeyframe<float>>>());
                         trackDict[path] = t;
                     }
                     return t;
@@ -911,38 +1018,65 @@ TextureImporter:
                         switch (binding.attribute)
                         {
                             case 1:
-                                track.pos.Add(new CustomKeyframe<Vector3>
+                                if ((uint)(curveIndex + 2 + offset) < (uint)data.Length)
                                 {
-                                    Time = time,
-                                    Value = new Vector3(
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset]
-                                    )
-                                });
+                                    track.pos.Add(new CustomKeyframe<Vector3>
+                                    {
+                                        Time = time,
+                                        Value = new Vector3(
+                                            data[curveIndex + offset],
+                                            data[curveIndex + 1 + offset],
+                                            data[curveIndex + 2 + offset]
+                                        )
+                                    });
+                                }
+                                curveIndex += 3;
                                 break;
                             case 2:
-                                track.rot.Add(new CustomKeyframe<Quaternion>
+                                if ((uint)(curveIndex + 3 + offset) < (uint)data.Length)
                                 {
-                                    Time = time,
-                                    Value = new Quaternion(
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset]
-                                    )
-                                });
+                                    track.rot.Add(new CustomKeyframe<Quaternion>
+                                    {
+                                        Time = time,
+                                        Value = new Quaternion(
+                                            data[curveIndex + offset],
+                                            data[curveIndex + 1 + offset],
+                                            data[curveIndex + 2 + offset],
+                                            data[curveIndex + 3 + offset]
+                                        )
+                                    });
+                                }
+                                curveIndex += 4;
                                 break;
                             case 3:
-                                track.scale.Add(new CustomKeyframe<Vector3>
+                                if ((uint)(curveIndex + 2 + offset) < (uint)data.Length)
                                 {
-                                    Time = time,
-                                    Value = new Vector3(
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset],
-                                        data[curveIndex++ + offset]
-                                    )
-                                });
+                                    track.scale.Add(new CustomKeyframe<Vector3>
+                                    {
+                                        Time = time,
+                                        Value = new Vector3(
+                                            data[curveIndex + offset],
+                                            data[curveIndex + 1 + offset],
+                                            data[curveIndex + 2 + offset]
+                                        )
+                                    });
+                                }
+                                curveIndex += 3;
+                                break;
+                            case 4:
+                                if ((uint)(curveIndex + 2 + offset) < (uint)data.Length)
+                                {
+                                    track.euler.Add(new CustomKeyframe<Vector3>
+                                    {
+                                        Time = time,
+                                        Value = new Vector3(
+                                            data[curveIndex + offset],
+                                            data[curveIndex + 1 + offset],
+                                            data[curveIndex + 2 + offset]
+                                        )
+                                    });
+                                }
+                                curveIndex += 3;
                                 break;
                             default:
                                 curveIndex++;
@@ -959,11 +1093,35 @@ TextureImporter:
                             list = new List<CustomKeyframe<float>>();
                             track.floats[attribute] = list;
                         }
-                        list.Add(new CustomKeyframe<float>
+                        int valIdx = curveIndex++ + offset;
+                        if ((uint)valIdx < (uint)data.Length)
                         {
-                            Time = time,
-                            Value = data[curveIndex++ + offset]
-                        });
+                            list.Add(new CustomKeyframe<float>
+                            {
+                                Time = time,
+                                Value = data[valIdx]
+                            });
+                        }
+                    }
+                    else if (binding.typeID == ClassIDType.GameObject && binding.attribute == 2086281974)
+                    {
+                        var path = GetPath(binding.path);
+                        var track = GetTrack(path);
+                        const string visAttr = "m_IsActive";
+                        if (!track.floats.TryGetValue(visAttr, out var list))
+                        {
+                            list = new List<CustomKeyframe<float>>();
+                            track.floats[visAttr] = list;
+                        }
+                        int valIdx = curveIndex++ + offset;
+                        if ((uint)valIdx < (uint)data.Length)
+                        {
+                            list.Add(new CustomKeyframe<float>
+                            {
+                                Time = time,
+                                Value = data[valIdx] >= 0.5f ? 1f : 0f
+                            });
+                        }
                     }
                     else
                     {
@@ -985,13 +1143,16 @@ TextureImporter:
                     }
                 }
 
-                if (m_Clip.m_DenseClip != null)
+                if (m_Clip.m_DenseClip != null && m_Clip.m_DenseClip.m_FrameCount > 0 && m_Clip.m_DenseClip.m_CurveCount > 0)
                 {
                     var m_DenseClip = m_Clip.m_DenseClip;
                     var streamCount = m_Clip.m_StreamedClip?.curveCount ?? 0;
+                    float denseRate = m_DenseClip.m_SampleRate > 0f && float.IsFinite(m_DenseClip.m_SampleRate)
+                        ? m_DenseClip.m_SampleRate
+                        : (clip.m_SampleRate > 0f && float.IsFinite(clip.m_SampleRate) ? clip.m_SampleRate : 30f);
                     for (int frameIndex = 0; frameIndex < m_DenseClip.m_FrameCount; frameIndex++)
                     {
-                        var time = m_DenseClip.m_BeginTime + frameIndex / m_DenseClip.m_SampleRate;
+                        var time = m_DenseClip.m_BeginTime + frameIndex / denseRate;
                         var frameOffset = frameIndex * m_DenseClip.m_CurveCount;
                         for (int curveIndex = 0; curveIndex < m_DenseClip.m_CurveCount;)
                         {
@@ -1001,21 +1162,26 @@ TextureImporter:
                     }
                 }
 
-                if (m_Clip.m_ConstantClip != null)
+                if (m_Clip.m_ConstantClip?.data != null && m_Clip.m_ConstantClip.data.Length > 0)
                 {
                     var m_ConstantClip = m_Clip.m_ConstantClip;
                     var denseCount = m_Clip.m_DenseClip?.m_CurveCount ?? 0;
                     var streamCount = m_Clip.m_StreamedClip?.curveCount ?? 0;
-                    var time2 = 0.0f;
-                    for (int i = 0; i < 2; i++)
+                    float constStartTime = clip.m_MuscleClip != null && float.IsFinite(clip.m_MuscleClip.m_StartTime) && clip.m_MuscleClip.m_StartTime > 0f
+                        ? clip.m_MuscleClip.m_StartTime
+                        : 0f;
+                    float constStopTime = clip.m_MuscleClip != null && float.IsFinite(clip.m_MuscleClip.m_StopTime) && clip.m_MuscleClip.m_StopTime > constStartTime
+                        ? clip.m_MuscleClip.m_StopTime
+                        : constStartTime;
+                    int passes = constStopTime > constStartTime + 1e-6f ? 2 : 1;
+                    for (int i = 0; i < passes; i++)
                     {
+                        float time2 = i == 0 ? constStartTime : constStopTime;
                         for (int curveIndex = 0; curveIndex < m_ConstantClip.data.Length;)
                         {
                             var index = streamCount + denseCount + curveIndex;
                             AddCurveData((int)index, time2, m_ConstantClip.data, 0, ref curveIndex);
                         }
-                        if (clip.m_MuscleClip != null)
-                            time2 = clip.m_MuscleClip.m_StopTime;
                     }
                 }
 
@@ -1031,6 +1197,10 @@ TextureImporter:
                     if (track.rot.Count > 0)
                     {
                         rotCurves.Add(new CustomCurve<Quaternion> { Path = path, Keyframes = track.rot });
+                    }
+                    if (track.euler.Count > 0)
+                    {
+                        eulerCurves.Add(new CustomCurve<Vector3> { Path = path, Keyframes = track.euler });
                     }
                     if (track.scale.Count > 0)
                     {
@@ -1963,324 +2133,352 @@ TextureImporter:
         #region Unity Model and Animation Helpers
         public static void WriteModelMetaIfMissing(string modelFbxPath, Object? obj = null)
         {
+            WriteModelMetaIfMissing(modelFbxPath, obj, imported: null, avatar: obj as Avatar);
+        }
+
+        public static void WriteModelMetaIfMissing(string modelFbxPath, Object? obj, IImported? imported, Avatar? avatar = null)
+        {
             var metaPath = modelFbxPath + ".meta";
             if (File.Exists(metaPath)) return;
             var guid = GenerateStableGuid(obj);
-            var metaContent = BuildModelHumanoidMeta(guid);
+            var resolvedAvatar = avatar ?? obj as Avatar ?? (imported as ModelConverter)?.SourceAvatar;
+            int animType = DetermineModelAnimationType(imported, resolvedAvatar, isAnimationClipFbx: false);
+            var metaContent = BuildModelMeta(guid, animType, importAnimation: imported?.AnimationList?.Count > 0, isAnimationClipFbx: false, resolvedAvatar);
             File.WriteAllText(metaPath, metaContent, Encoding.UTF8);
         }
 
         public static void WriteAnimationMetaIfMissing(string animFbxPath, Object? obj = null)
         {
+            WriteAnimationMetaIfMissing(animFbxPath, obj, imported: null, avatar: obj as Avatar);
+        }
+
+        public static void WriteAnimationMetaIfMissing(string animFbxPath, Object? obj, IImported? imported, Avatar? avatar = null)
+        {
             var metaPath = animFbxPath + ".meta";
             if (File.Exists(metaPath)) return;
             var guid = GenerateStableGuid(obj);
-            var metaContent = BuildAnimationHumanoidMeta(guid);
+            var resolvedAvatar = avatar ?? obj as Avatar ?? (imported as ModelConverter)?.SourceAvatar;
+            int animType = DetermineModelAnimationType(imported, resolvedAvatar, isAnimationClipFbx: true);
+            var metaContent = BuildModelMeta(guid, animType, importAnimation: true, isAnimationClipFbx: true, resolvedAvatar);
             File.WriteAllText(metaPath, metaContent, Encoding.UTF8);
         }
 
-        private static string BuildModelHumanoidMeta(string guid)
+        public static bool IsHumanoidAvatar(Avatar? avatar)
         {
-            return $@"fileFormatVersion: 2
-guid: {guid}
-ModelImporter:
-  serializedVersion: 24501
-  internalIDToNameTable: []
-  externalObjects: {{}}
-  materials:
-    materialImportMode: 2
-    materialName: 0
-    materialSearch: 1
-    materialLocation: 1
-    searchTexturesGlobally: 0
-  animations:
-    legacyGenerateAnimations: 4
-    bakeSimulation: 0
-    resampleCurves: 1
-    optimizeGameObjects: 0
-    removeConstantScaleCurves: 0
-    motionNodeName: 
-    animationImportErrors: 
-    animationImportWarnings: 
-    animationRetargetingWarnings: 
-    animationDoRetargetingWarnings: 0
-    importAnimatedCustomProperties: 0
-    importConstraints: 0
-    animationCompression: 3
-    animationRotationError: 0.5
-    animationPositionError: 0.5
-    animationScaleError: 0.5
-    animationWrapMode: 0
-    extraExposedTransformPaths: []
-    extraUserProperties: []
-    clipAnimations: []
-    isReadable: 0
-  meshes:
-    lODScreenPercentages: []
-    globalScale: 100
-    meshCompression: 0
-    addColliders: 0
-    useSRGBMaterialColor: 1
-    sortHierarchyByName: 1
-    importPhysicalCameras: 1
-    importVisibility: 1
-    importBlendShapes: 1
-    importCameras: 1
-    importLights: 1
-    nodeNameCollisionStrategy: 1
-    fileIdsGeneration: 2
-    swapUVChannels: 0
-    generateSecondaryUV: 0
-    useFileUnits: 1
-    keepQuads: 0
-    weldVertices: 1
-    bakeAxisConversion: 0
-    preserveHierarchy: 0
-    skinWeightsMode: 0
-    maxBonesPerVertex: 4
-    minBoneWeight: 0.001
-    optimizeBones: 1
-    generateMeshLods: 0
-    meshLodGenerationFlags: 0
-    maximumMeshLod: -1
-    importUVs: -1
-    importVertexColors: 1
-    meshOptimizationFlags: -1
-    indexFormat: 0
-    secondaryUVAngleDistortion: 8
-    secondaryUVAreaDistortion: 15.000001
-    secondaryUVHardAngle: 88
-    secondaryUVMarginMethod: 1
-    secondaryUVMinLightmapResolution: 40
-    secondaryUVMinObjectScale: 1
-    secondaryUVPackMargin: 4
-    useFileScale: 1
-    strictVertexDataChecks: 0
-  tangentSpace:
-    normalSmoothAngle: 60
-    normalImportMode: 0
-    tangentImportMode: 3
-    normalCalculationMode: 4
-    legacyComputeAllNormalsFromSmoothingGroupsWhenMeshHasBlendShapes: 0
-    blendShapeNormalImportMode: 1
-    normalSmoothingSource: 0
-    calculateBlendshapeNormalsDeltaFromImportedNormals: 0
-  referencedClips: []
-  importAnimation: 0
-  humanDescription:
-    serializedVersion: 3
-    human:
-    - boneName: Bip001 Pelvis
-      humanName: Hips
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L Thigh
-      humanName: LeftUpperLeg
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R Thigh
-      humanName: RightUpperLeg
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L Calf
-      humanName: LeftLowerLeg
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R Calf
-      humanName: RightLowerLeg
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L Foot
-      humanName: LeftFoot
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R Foot
-      humanName: RightFoot
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 Spine
-      humanName: Spine
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 Spine1
-      humanName: Chest
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 Spine2
-      humanName: UpperChest
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 Neck
-      humanName: Neck
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 Head
-      humanName: Head
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L Clavicle
-      humanName: LeftShoulder
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L UpperArm
-      humanName: LeftUpperArm
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L Forearm
-      humanName: LeftLowerArm
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 L Hand
-      humanName: LeftHand
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R Clavicle
-      humanName: RightShoulder
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R UpperArm
-      humanName: RightUpperArm
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R Forearm
-      humanName: RightLowerArm
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    - boneName: Bip001 R Hand
-      humanName: RightHand
-      limit: {{min: {{x: 0, y: 0, z: 0}}, max: {{x: 0, y: 0, z: 0}}, value: {{x: 0, y: 0, z: 0}}, length: 0, modified: 0}}
-    skeleton: []
-    armTwist: 0.5
-    foreArmTwist: 0.5
-    upperLegTwist: 0.5
-    legTwist: 0.5
-    armStretch: 0.05
-    legStretch: 0.05
-    feetSpacing: 0
-    globalScale: 1
-    rootMotionBoneName: 
-    hasTranslationDoF: 0
-    hasExtraRoot: 0
-    skeletonHasParents: 1
-  lastHumanDescriptionAvatarSource: {{instanceID: 0}}
-  autoGenerateAvatarMappingIfUnspecified: 1
-  animationType: 3
-  humanoidOversampling: 1
-  avatarSetup: 1
-  addHumanoidExtraRootOnlyWhenUsingAvatar: 1
-  importBlendShapeDeformPercent: 1
-  remapMaterialsIfMaterialImportModeIsNone: 0
-  additionalBone: 0
-  userData: 
-  assetBundleName: 
-  assetBundleVariant: 
-";
+            var human = avatar?.m_Avatar?.m_Human;
+            if (human?.m_HumanBoneIndex == null || human.m_HumanBoneIndex.Length == 0)
+            {
+                return false;
+            }
+            for (int i = 0; i < human.m_HumanBoneIndex.Length; i++)
+            {
+                if (human.m_HumanBoneIndex[i] >= 0)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        private static string BuildAnimationHumanoidMeta(string guid)
+        private static int DetermineModelAnimationType(IImported? imported, Avatar? avatar, bool isAnimationClipFbx)
         {
-            return $@"fileFormatVersion: 2
-guid: {guid}
-ModelImporter:
-  serializedVersion: 24501
-  internalIDToNameTable: []
-  externalObjects: {{}}
-  materials:
-    materialImportMode: 0
-    materialName: 0
-    materialSearch: 1
-    materialLocation: 1
-    searchTexturesGlobally: 0
-  animations:
-    legacyGenerateAnimations: 4
-    bakeSimulation: 0
-    resampleCurves: 1
-    optimizeGameObjects: 0
-    removeConstantScaleCurves: 0
-    motionNodeName: 
-    animationImportErrors: 
-    animationImportWarnings: 
-    animationRetargetingWarnings: 
-    animationDoRetargetingWarnings: 0
-    importAnimatedCustomProperties: 0
-    importConstraints: 0
-    animationCompression: 1
-    animationRotationError: 0.5
-    animationPositionError: 0.5
-    animationScaleError: 0.5
-    animationWrapMode: 0
-    extraExposedTransformPaths: []
-    extraUserProperties: []
-    clipAnimations: []
-    isReadable: 0
-  meshes:
-    lODScreenPercentages: []
-    globalScale: 1
-    meshCompression: 0
-    addColliders: 0
-    useSRGBMaterialColor: 1
-    sortHierarchyByName: 1
-    importPhysicalCameras: 1
-    importVisibility: 1
-    importBlendShapes: 1
-    importCameras: 1
-    importLights: 1
-    nodeNameCollisionStrategy: 1
-    fileIdsGeneration: 2
-    swapUVChannels: 0
-    generateSecondaryUV: 0
-    useFileUnits: 1
-    keepQuads: 0
-    weldVertices: 1
-    bakeAxisConversion: 0
-    preserveHierarchy: 0
-    skinWeightsMode: 0
-    maxBonesPerVertex: 4
-    minBoneWeight: 0.001
-    optimizeBones: 1
-    generateMeshLods: 0
-    meshLodGenerationFlags: 0
-    maximumMeshLod: -1
-    importUVs: -1
-    importVertexColors: 1
-    meshOptimizationFlags: -1
-    indexFormat: 0
-    secondaryUVAngleDistortion: 8
-    secondaryUVAreaDistortion: 15.000001
-    secondaryUVHardAngle: 88
-    secondaryUVMarginMethod: 1
-    secondaryUVMinLightmapResolution: 40
-    secondaryUVMinObjectScale: 1
-    secondaryUVPackMargin: 4
-    useFileScale: 1
-    strictVertexDataChecks: 0
-  tangentSpace:
-    normalSmoothAngle: 60
-    normalImportMode: 0
-    tangentImportMode: 3
-    normalCalculationMode: 4
-    legacyComputeAllNormalsFromSmoothingGroupsWhenMeshHasBlendShapes: 0
-    blendShapeNormalImportMode: 1
-    normalSmoothingSource: 0
-    calculateBlendshapeNormalsDeltaFromImportedNormals: 0
-  referencedClips: []
-  importAnimation: 1
-  humanDescription:
-    serializedVersion: 3
-    human: []
-    skeleton: []
-    armTwist: 0.5
-    foreArmTwist: 0.5
-    upperLegTwist: 0.5
-    legTwist: 0.5
-    armStretch: 0.05
-    legStretch: 0.05
-    feetSpacing: 0
-    globalScale: 1
-    rootMotionBoneName: 
-    hasTranslationDoF: 0
-    hasExtraRoot: 0
-    skeletonHasParents: 1
-  lastHumanDescriptionAvatarSource: {{instanceID: 0}}
-  autoGenerateAvatarMappingIfUnspecified: 1
-  animationType: 3
-  humanoidOversampling: 1
-  avatarSetup: 1
-  addHumanoidExtraRootOnlyWhenUsingAvatar: 1
-  importBlendShapeDeformPercent: 1
-  remapMaterialsIfMaterialImportModeIsNone: 0
-  additionalBone: 0
-  userData: 
-  assetBundleName: 
-  assetBundleVariant: 
-";
+            // 3 = Humanoid ONLY when a genuine Humanoid Avatar is present
+            if (IsHumanoidAvatar(avatar))
+            {
+                return 3;
+            }
+
+            if (isAnimationClipFbx || avatar != null)
+            {
+                return 2; // Generic
+            }
+
+            if (imported != null)
+            {
+                bool hasBones = imported.MeshList != null && imported.MeshList.Any(m => m?.BoneList != null && m.BoneList.Count > 0);
+                bool hasAnims = imported.AnimationList != null && imported.AnimationList.Count > 0;
+                if (hasBones || hasAnims)
+                {
+                    return 2; // Generic
+                }
+            }
+
+            return 0; // None (static mesh)
+        }
+
+        private static string BuildModelMeta(string guid, int animationType, bool importAnimation, bool isAnimationClipFbx, Avatar? avatar)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("fileFormatVersion: 2");
+            sb.AppendLine($"guid: {guid}");
+            sb.AppendLine("ModelImporter:");
+            sb.AppendLine("  serializedVersion: 24501");
+            sb.AppendLine("  internalIDToNameTable: []");
+            sb.AppendLine("  externalObjects: {}");
+            sb.AppendLine("  materials:");
+            sb.AppendLine($"    materialImportMode: {(isAnimationClipFbx ? 0 : 2)}");
+            sb.AppendLine("    materialName: 0");
+            sb.AppendLine("    materialSearch: 1");
+            sb.AppendLine("    materialLocation: 1");
+            sb.AppendLine("    searchTexturesGlobally: 0");
+            sb.AppendLine("  animations:");
+            sb.AppendLine("    legacyGenerateAnimations: 4");
+            sb.AppendLine("    bakeSimulation: 0");
+            sb.AppendLine("    resampleCurves: 1");
+            sb.AppendLine("    optimizeGameObjects: 0");
+            sb.AppendLine("    removeConstantScaleCurves: 0");
+            sb.AppendLine("    motionNodeName: ");
+            sb.AppendLine("    animationImportErrors: ");
+            sb.AppendLine("    animationImportWarnings: ");
+            sb.AppendLine("    animationRetargetingWarnings: ");
+            sb.AppendLine("    animationDoRetargetingWarnings: 0");
+            sb.AppendLine("    importAnimatedCustomProperties: 0");
+            sb.AppendLine("    importConstraints: 0");
+            sb.AppendLine($"    animationCompression: {(isAnimationClipFbx ? 1 : 3)}");
+            sb.AppendLine("    animationRotationError: 0.5");
+            sb.AppendLine("    animationPositionError: 0.5");
+            sb.AppendLine("    animationScaleError: 0.5");
+            sb.AppendLine("    animationWrapMode: 0");
+            sb.AppendLine("    extraExposedTransformPaths: []");
+            sb.AppendLine("    extraUserProperties: []");
+            sb.AppendLine("    clipAnimations: []");
+            sb.AppendLine("    isReadable: 0");
+            sb.AppendLine("  meshes:");
+            sb.AppendLine("    lODScreenPercentages: []");
+            sb.AppendLine("    globalScale: 1");
+            sb.AppendLine("    meshCompression: 0");
+            sb.AppendLine("    addColliders: 0");
+            sb.AppendLine("    useSRGBMaterialColor: 1");
+            sb.AppendLine("    sortHierarchyByName: 1");
+            sb.AppendLine("    importPhysicalCameras: 1");
+            sb.AppendLine("    importVisibility: 1");
+            sb.AppendLine("    importBlendShapes: 1");
+            sb.AppendLine("    importCameras: 1");
+            sb.AppendLine("    importLights: 1");
+            sb.AppendLine("    nodeNameCollisionStrategy: 1");
+            sb.AppendLine("    fileIdsGeneration: 2");
+            sb.AppendLine("    swapUVChannels: 0");
+            sb.AppendLine("    generateSecondaryUV: 0");
+            sb.AppendLine("    useFileUnits: 1");
+            sb.AppendLine("    keepQuads: 0");
+            sb.AppendLine("    weldVertices: 1");
+            sb.AppendLine("    bakeAxisConversion: 0");
+            sb.AppendLine("    preserveHierarchy: 0");
+            sb.AppendLine("    skinWeightsMode: 0");
+            sb.AppendLine("    maxBonesPerVertex: 4");
+            sb.AppendLine("    minBoneWeight: 0.001");
+            sb.AppendLine("    optimizeBones: 1");
+            sb.AppendLine("    generateMeshLods: 0");
+            sb.AppendLine("    meshLodGenerationFlags: 0");
+            sb.AppendLine("    maximumMeshLod: -1");
+            sb.AppendLine("    importUVs: -1");
+            sb.AppendLine("    importVertexColors: 1");
+            sb.AppendLine("    meshOptimizationFlags: -1");
+            sb.AppendLine("    indexFormat: 0");
+            sb.AppendLine("    secondaryUVAngleDistortion: 8");
+            sb.AppendLine("    secondaryUVAreaDistortion: 15.000001");
+            sb.AppendLine("    secondaryUVHardAngle: 88");
+            sb.AppendLine("    secondaryUVMarginMethod: 1");
+            sb.AppendLine("    secondaryUVMinLightmapResolution: 40");
+            sb.AppendLine("    secondaryUVMinObjectScale: 1");
+            sb.AppendLine("    secondaryUVPackMargin: 4");
+            sb.AppendLine("    useFileScale: 1");
+            sb.AppendLine("    strictVertexDataChecks: 0");
+            sb.AppendLine("  tangentSpace:");
+            sb.AppendLine("    normalSmoothAngle: 60");
+            sb.AppendLine("    normalImportMode: 0");
+            sb.AppendLine("    tangentImportMode: 3");
+            sb.AppendLine("    normalCalculationMode: 4");
+            sb.AppendLine("    legacyComputeAllNormalsFromSmoothingGroupsWhenMeshHasBlendShapes: 0");
+            sb.AppendLine("    blendShapeNormalImportMode: 1");
+            sb.AppendLine("    normalSmoothingSource: 0");
+            sb.AppendLine("    calculateBlendshapeNormalsDeltaFromImportedNormals: 0");
+            sb.AppendLine("  referencedClips: []");
+            sb.AppendLine($"  importAnimation: {(importAnimation ? 1 : 0)}");
+            sb.AppendLine("  humanDescription:");
+            sb.AppendLine("    serializedVersion: 3");
+            AppendHumanDescriptionYaml(sb, animationType == 3 ? avatar : null);
+            sb.AppendLine("  lastHumanDescriptionAvatarSource: {instanceID: 0}");
+            sb.AppendLine("  autoGenerateAvatarMappingIfUnspecified: 1");
+            sb.AppendLine($"  animationType: {animationType}");
+            sb.AppendLine("  humanoidOversampling: 1");
+            sb.AppendLine($"  avatarSetup: {(animationType == 0 ? 0 : 1)}");
+            sb.AppendLine("  addHumanoidExtraRootOnlyWhenUsingAvatar: 1");
+            sb.AppendLine("  importBlendShapeDeformPercent: 1");
+            sb.AppendLine("  remapMaterialsIfMaterialImportModeIsNone: 0");
+            sb.AppendLine("  additionalBone: 0");
+            sb.AppendLine("  userData: ");
+            sb.AppendLine("  assetBundleName: ");
+            sb.AppendLine("  assetBundleVariant: ");
+            return sb.ToString();
+        }
+
+        private static void AppendHumanDescriptionYaml(StringBuilder sb, Avatar? avatar)
+        {
+            var desc = avatar?.m_HumanDescription;
+            if (desc?.m_Human != null && desc.m_Human.Length > 0)
+            {
+                sb.AppendLine("    human:");
+                foreach (var hb in desc.m_Human)
+                {
+                    sb.AppendLine($"    - boneName: {YamlString(hb.m_BoneName)}");
+                    sb.AppendLine($"      humanName: {YamlString(hb.m_HumanName)}");
+                    var l = hb.m_Limit;
+                    if (l != null)
+                    {
+                        sb.AppendLine($"      limit: {{min: {{x: {F(l.m_Min.X)}, y: {F(l.m_Min.Y)}, z: {F(l.m_Min.Z)}}}, max: {{x: {F(l.m_Max.X)}, y: {F(l.m_Max.Y)}, z: {F(l.m_Max.Z)}}}, value: {{x: {F(l.m_Value.X)}, y: {F(l.m_Value.Y)}, z: {F(l.m_Value.Z)}}}, length: {F(l.m_Length)}, modified: {(l.m_Modified ? 1 : 0)}}}");
+                    }
+                    else
+                    {
+                        sb.AppendLine("      limit: {min: {x: 0, y: 0, z: 0}, max: {x: 0, y: 0, z: 0}, value: {x: 0, y: 0, z: 0}, length: 0, modified: 0}");
+                    }
+                }
+                sb.AppendLine("    skeleton: []");
+                sb.AppendLine($"    armTwist: {F(desc.m_ArmTwist)}");
+                sb.AppendLine($"    foreArmTwist: {F(desc.m_ForeArmTwist)}");
+                sb.AppendLine($"    upperLegTwist: {F(desc.m_UpperLegTwist)}");
+                sb.AppendLine($"    legTwist: {F(desc.m_LegTwist)}");
+                sb.AppendLine($"    armStretch: {F(desc.m_ArmStretch)}");
+                sb.AppendLine($"    legStretch: {F(desc.m_LegStretch)}");
+                sb.AppendLine($"    feetSpacing: {F(desc.m_FeetSpacing)}");
+                sb.AppendLine("    globalScale: 1");
+                sb.AppendLine($"    rootMotionBoneName: {YamlString(desc.m_RootMotionBoneName)}");
+                sb.AppendLine($"    hasTranslationDoF: {(desc.m_HasTranslationDoF ? 1 : 0)}");
+                sb.AppendLine($"    hasExtraRoot: {(desc.m_HasExtraRoot ? 1 : 0)}");
+                sb.AppendLine($"    skeletonHasParents: {(desc.m_SkeletonHasParents ? 1 : 0)}");
+                return;
+            }
+
+            var human = avatar?.m_Avatar?.m_Human;
+            var avSkel = avatar?.m_Avatar?.m_AvatarSkeleton;
+            var hIdxArr = avatar?.m_Avatar?.m_HumanSkeletonIndexArray;
+            var mappedBones = new List<(string BoneName, string HumanName)>();
+
+            if (avatar != null && human?.m_HumanBoneIndex != null && avSkel?.m_ID != null && hIdxArr != null)
+            {
+                string? ResolveLeafBoneName(int hSkelIdx)
+                {
+                    if (hSkelIdx < 0 || hSkelIdx >= hIdxArr.Length) return null;
+                    int avNode = hIdxArr[hSkelIdx];
+                    if (avNode < 0 || avNode >= avSkel.m_ID.Length) return null;
+                    var path = avatar.FindBonePath(avSkel.m_ID[avNode]);
+                    if (string.IsNullOrEmpty(path)) return null;
+                    int slash = path.LastIndexOf('/');
+                    return slash >= 0 ? path.Substring(slash + 1) : path;
+                }
+
+                // Hips
+                var hipsLeaf = ResolveLeafBoneName(human.m_HumanBoneIndex[0]);
+                if (!string.IsNullOrEmpty(hipsLeaf))
+                {
+                    mappedBones.Add((hipsLeaf, "Hips"));
+                }
+
+                bool isLegacy24 = human.m_HumanBoneIndex.Length < 25;
+                foreach (var def in HumanoidMuscleDecoder.BodyBoneDefs)
+                {
+                    int bodyIdx = isLegacy24 ? def.BodyIndexLegacy : def.BodyIndex56;
+                    if (bodyIdx < 0 || bodyIdx >= human.m_HumanBoneIndex.Length) continue;
+                    var leaf = ResolveLeafBoneName(human.m_HumanBoneIndex[bodyIdx]);
+                    if (!string.IsNullOrEmpty(leaf))
+                    {
+                        mappedBones.Add((leaf, def.UnityName));
+                    }
+                }
+
+                if (human.m_LeftHand?.m_HandBoneIndex != null)
+                {
+                    int count = Math.Min(human.m_LeftHand.m_HandBoneIndex.Length, HumanoidMuscleDecoder.LeftHandBoneNames.Length);
+                    for (int i = 0; i < count; i++)
+                    {
+                        var leaf = ResolveLeafBoneName(human.m_LeftHand.m_HandBoneIndex[i]);
+                        if (!string.IsNullOrEmpty(leaf))
+                        {
+                            mappedBones.Add((leaf, HumanoidMuscleDecoder.LeftHandBoneNames[i]));
+                        }
+                    }
+                }
+
+                if (human.m_RightHand?.m_HandBoneIndex != null)
+                {
+                    int count = Math.Min(human.m_RightHand.m_HandBoneIndex.Length, HumanoidMuscleDecoder.RightHandBoneNames.Length);
+                    for (int i = 0; i < count; i++)
+                    {
+                        var leaf = ResolveLeafBoneName(human.m_RightHand.m_HandBoneIndex[i]);
+                        if (!string.IsNullOrEmpty(leaf))
+                        {
+                            mappedBones.Add((leaf, HumanoidMuscleDecoder.RightHandBoneNames[i]));
+                        }
+                    }
+                }
+            }
+
+            if (mappedBones.Count == 0)
+            {
+                sb.AppendLine("    human: []");
+            }
+            else
+            {
+                sb.AppendLine("    human:");
+                foreach (var (boneName, humanName) in mappedBones)
+                {
+                    sb.AppendLine($"    - boneName: {YamlString(boneName)}");
+                    sb.AppendLine($"      humanName: {YamlString(humanName)}");
+                    sb.AppendLine("      limit: {min: {x: 0, y: 0, z: 0}, max: {x: 0, y: 0, z: 0}, value: {x: 0, y: 0, z: 0}, length: 0, modified: 0}");
+                }
+            }
+
+            sb.AppendLine("    skeleton: []");
+            sb.AppendLine($"    armTwist: {F(human?.m_ArmTwist ?? 0.5f)}");
+            sb.AppendLine($"    foreArmTwist: {F(human?.m_ForeArmTwist ?? 0.5f)}");
+            sb.AppendLine($"    upperLegTwist: {F(human?.m_UpperLegTwist ?? 0.5f)}");
+            sb.AppendLine($"    legTwist: {F(human?.m_LegTwist ?? 0.5f)}");
+            sb.AppendLine($"    armStretch: {F(human?.m_ArmStretch ?? 0.05f)}");
+            sb.AppendLine($"    legStretch: {F(human?.m_LegStretch ?? 0.05f)}");
+            sb.AppendLine($"    feetSpacing: {F(human?.m_FeetSpacing ?? 0f)}");
+            sb.AppendLine("    globalScale: 1");
+            sb.AppendLine("    rootMotionBoneName: ");
+            sb.AppendLine($"    hasTranslationDoF: {(human?.m_HasTDoF == true ? 1 : 0)}");
+            sb.AppendLine("    hasExtraRoot: 0");
+            sb.AppendLine("    skeletonHasParents: 1");
         }
 
         public static void ExportUnityAnimationClip(ImportedKeyframedAnimation anim, string outputPath)
         {
+            ExportUnityAnimationClip(anim, outputPath, rootFrameName: null);
+        }
+
+        public static void ExportUnityAnimationClip(ImportedKeyframedAnimation anim, string outputPath, string? rootFrameName)
+        {
             var inv = CultureInfo.InvariantCulture;
             var sb = new StringBuilder();
+
+            string? effectiveRootPrefix = !string.IsNullOrWhiteSpace(rootFrameName)
+                ? rootFrameName.Replace('\\', '/').Trim('/')
+                : InferCommonRootPrefix(anim.TrackList);
+
+            string ToUnityRelativePath(string? rawPath)
+            {
+                var p = (rawPath ?? string.Empty).Replace('\\', '/').Trim('/');
+                if (string.IsNullOrEmpty(p) || string.IsNullOrEmpty(effectiveRootPrefix))
+                {
+                    return p;
+                }
+                if (string.Equals(p, effectiveRootPrefix, StringComparison.Ordinal))
+                {
+                    return string.Empty;
+                }
+                if (p.StartsWith(effectiveRootPrefix + "/", StringComparison.Ordinal))
+                {
+                    return p.Substring(effectiveRootPrefix.Length + 1);
+                }
+                return p;
+            }
+
+            var genericBindings = new List<(uint PathHash, uint Attribute, int TypeId, int CustomType)>();
+            bool hasGenericRootTransform = false;
+            float maxStopTime = 0f;
+
             sb.AppendLine("%YAML 1.1");
             sb.AppendLine("%TAG !u! tag:unity3d.com,2011:");
             sb.AppendLine("--- !u!74 &7400000");
@@ -2294,53 +2492,87 @@ ModelImporter:
             sb.AppendLine("  m_Legacy: 0");
             sb.AppendLine("  m_Compressed: 0");
             sb.AppendLine("  m_UseHighQualityCurve: 1");
-            sb.AppendLine("  m_RotationCurves: []");
-            sb.AppendLine("  m_CompressedRotationCurves: []");
 
-            sb.AppendLine("  m_EulerCurves:");
-            if (anim.TrackList != null)
+            // Convert FBX right-handed eEulerXYZ rotations back into Unity left-handed quaternion m_RotationCurves
+            // (eliminates Euler-order and gimbal ambiguity completely in Unity!)
+            var rotTracks = anim.TrackList?.Where(t => t?.Rotations != null && t.Rotations.Count > 0).ToList();
+            if (rotTracks == null || rotTracks.Count == 0)
             {
-                foreach (var track in anim.TrackList)
+                sb.AppendLine("  m_RotationCurves: []");
+            }
+            else
+            {
+                sb.AppendLine("  m_RotationCurves:");
+                foreach (var track in rotTracks)
                 {
-                    if (track.Rotations == null || track.Rotations.Count == 0) continue;
-                    var path = track.Path?.Replace('\\', '/').Trim('/');
+                    var relPath = ToUnityRelativePath(track.Path);
+                    if (string.IsNullOrEmpty(relPath)) hasGenericRootTransform = true;
+                    genericBindings.Add((ComputeUnityCrc32(relPath), 2u, 4, 0));
+
                     sb.AppendLine("  - curve:");
                     sb.AppendLine("      serializedVersion: 2");
                     sb.AppendLine("      m_Curve:");
+                    Quaternion? prevQ = null;
                     foreach (var k in track.Rotations)
                     {
+                        if (k.time > maxStopTime) maxStopTime = k.time;
+                        var qU = HumanoidMuscleDecoder.FbxEulerXYZDegreesToUnityQuaternion(k.value);
+                        // Keep quaternion hemisphere continuous for smooth Unity SLERP/cubic interpolation
+                        if (prevQ.HasValue)
+                        {
+                            float dot = prevQ.Value.X * qU.X + prevQ.Value.Y * qU.Y + prevQ.Value.Z * qU.Z + prevQ.Value.W * qU.W;
+                            if (dot < 0f)
+                            {
+                                qU = new Quaternion(-qU.X, -qU.Y, -qU.Z, -qU.W);
+                            }
+                        }
+                        prevQ = qU;
                         sb.AppendLine("      - serializedVersion: 3");
                         sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
-                        sb.AppendLine($"        value: {{x: {k.value.X.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
-                        sb.AppendLine("        inSlope: {x: 0, y: 0, z: 0}");
-                        sb.AppendLine("        outSlope: {x: 0, y: 0, z: 0}");
+                        sb.AppendLine($"        value: {{x: {qU.X.ToString("0.######", inv)}, y: {qU.Y.ToString("0.######", inv)}, z: {qU.Z.ToString("0.######", inv)}, w: {qU.W.ToString("0.######", inv)}}}");
+                        sb.AppendLine("        inSlope: {x: 0, y: 0, z: 0, w: 0}");
+                        sb.AppendLine("        outSlope: {x: 0, y: 0, z: 0, w: 0}");
                         sb.AppendLine("        tangentMode: 0");
                         sb.AppendLine("        weightedMode: 0");
-                        sb.AppendLine("        inWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
-                        sb.AppendLine("        outWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}");
+                        sb.AppendLine("        inWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334, w: 0.33333334}");
+                        sb.AppendLine("        outWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334, w: 0.33333334}");
                     }
                     sb.AppendLine("      m_PreInfinity: 2");
                     sb.AppendLine("      m_PostInfinity: 2");
                     sb.AppendLine("      m_RotationOrder: 4");
-                    sb.AppendLine($"    path: {YamlString(path)}");
+                    sb.AppendLine($"    path: {YamlString(relPath)}");
                 }
             }
 
-            sb.AppendLine("  m_PositionCurves:");
-            if (anim.TrackList != null)
+            sb.AppendLine("  m_CompressedRotationCurves: []");
+            sb.AppendLine("  m_EulerCurves: []");
+
+            // Convert FBX RH positions back to Unity LH by negating X
+            var posTracks = anim.TrackList?.Where(t => t?.Translations != null && t.Translations.Count > 0).ToList();
+            if (posTracks == null || posTracks.Count == 0)
             {
-                foreach (var track in anim.TrackList)
+                sb.AppendLine("  m_PositionCurves: []");
+            }
+            else
+            {
+                sb.AppendLine("  m_PositionCurves:");
+                foreach (var track in posTracks)
                 {
-                    if (track.Translations == null || track.Translations.Count == 0) continue;
-                    var path = track.Path?.Replace('\\', '/').Trim('/');
+                    var relPath = ToUnityRelativePath(track.Path);
+                    if (string.IsNullOrEmpty(relPath)) hasGenericRootTransform = true;
+                    genericBindings.Add((ComputeUnityCrc32(relPath), 1u, 4, 0));
+
                     sb.AppendLine("  - curve:");
                     sb.AppendLine("      serializedVersion: 2");
                     sb.AppendLine("      m_Curve:");
                     foreach (var k in track.Translations)
                     {
+                        if (k.time > maxStopTime) maxStopTime = k.time;
+                        float ux = -k.value.X;
+                        if (MathF.Abs(ux) < 1e-12f) ux = 0f;
                         sb.AppendLine("      - serializedVersion: 3");
                         sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
-                        sb.AppendLine($"        value: {{x: {k.value.X.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
+                        sb.AppendLine($"        value: {{x: {ux.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
                         sb.AppendLine("        inSlope: {x: 0, y: 0, z: 0}");
                         sb.AppendLine("        outSlope: {x: 0, y: 0, z: 0}");
                         sb.AppendLine("        tangentMode: 0");
@@ -2351,22 +2583,30 @@ ModelImporter:
                     sb.AppendLine("      m_PreInfinity: 2");
                     sb.AppendLine("      m_PostInfinity: 2");
                     sb.AppendLine("      m_RotationOrder: 4");
-                    sb.AppendLine($"    path: {YamlString(path)}");
+                    sb.AppendLine($"    path: {YamlString(relPath)}");
                 }
             }
 
-            sb.AppendLine("  m_ScaleCurves:");
-            if (anim.TrackList != null)
+            var scaleTracks = anim.TrackList?.Where(t => t?.Scalings != null && t.Scalings.Count > 0).ToList();
+            if (scaleTracks == null || scaleTracks.Count == 0)
             {
-                foreach (var track in anim.TrackList)
+                sb.AppendLine("  m_ScaleCurves: []");
+            }
+            else
+            {
+                sb.AppendLine("  m_ScaleCurves:");
+                foreach (var track in scaleTracks)
                 {
-                    if (track.Scalings == null || track.Scalings.Count == 0) continue;
-                    var path = track.Path?.Replace('\\', '/').Trim('/');
+                    var relPath = ToUnityRelativePath(track.Path);
+                    if (string.IsNullOrEmpty(relPath)) hasGenericRootTransform = true;
+                    genericBindings.Add((ComputeUnityCrc32(relPath), 3u, 4, 0));
+
                     sb.AppendLine("  - curve:");
                     sb.AppendLine("      serializedVersion: 2");
                     sb.AppendLine("      m_Curve:");
                     foreach (var k in track.Scalings)
                     {
+                        if (k.time > maxStopTime) maxStopTime = k.time;
                         sb.AppendLine("      - serializedVersion: 3");
                         sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
                         sb.AppendLine($"        value: {{x: {k.value.X.ToString("0.######", inv)}, y: {k.value.Y.ToString("0.######", inv)}, z: {k.value.Z.ToString("0.######", inv)}}}");
@@ -2380,11 +2620,79 @@ ModelImporter:
                     sb.AppendLine("      m_PreInfinity: 2");
                     sb.AppendLine("      m_PostInfinity: 2");
                     sb.AppendLine("      m_RotationOrder: 4");
-                    sb.AppendLine($"    path: {YamlString(path)}");
+                    sb.AppendLine($"    path: {YamlString(relPath)}");
                 }
             }
 
-            sb.AppendLine("  m_FloatCurves: []");
+            // Export BlendShape & Visibility m_FloatCurves
+            var floatEntries = new List<(string RelPath, string Attribute, int ClassId, uint AttrHash, int CustomType, List<ImportedKeyframe<float>> Keys)>();
+            if (anim.TrackList != null)
+            {
+                foreach (var track in anim.TrackList)
+                {
+                    if (track == null) continue;
+                    var relPath = ToUnityRelativePath(track.Path);
+                    if (track.BlendShapes != null)
+                    {
+                        foreach (var bs in track.BlendShapes)
+                        {
+                            if (bs == null || bs.Keyframes == null || bs.Keyframes.Count == 0 || string.IsNullOrEmpty(bs.ChannelName))
+                            {
+                                continue;
+                            }
+                            const string bsPrefix = "blendShape.";
+                            string cleanChannel = bs.ChannelName.StartsWith(bsPrefix, StringComparison.OrdinalIgnoreCase)
+                                ? bs.ChannelName.Substring(bsPrefix.Length)
+                                : bs.ChannelName;
+                            floatEntries.Add((relPath, bsPrefix + cleanChannel, (int)ClassIDType.SkinnedMeshRenderer, ComputeUnityCrc32(cleanChannel), 20, bs.Keyframes));
+                        }
+                    }
+                    if (track.Visibilities != null && track.Visibilities.Count > 0)
+                    {
+                        floatEntries.Add((relPath, "m_IsActive", (int)ClassIDType.GameObject, 2086281974u, 0, track.Visibilities));
+                    }
+                }
+            }
+
+            if (floatEntries.Count == 0)
+            {
+                sb.AppendLine("  m_FloatCurves: []");
+            }
+            else
+            {
+                sb.AppendLine("  m_FloatCurves:");
+                foreach (var fe in floatEntries)
+                {
+                    genericBindings.Add((ComputeUnityCrc32(fe.RelPath), fe.AttrHash, fe.ClassId, fe.CustomType));
+                    sb.AppendLine("  - serializedVersion: 2");
+                    sb.AppendLine("    curve:");
+                    sb.AppendLine("      serializedVersion: 2");
+                    sb.AppendLine("      m_Curve:");
+                    foreach (var k in fe.Keys)
+                    {
+                        if (k.time > maxStopTime) maxStopTime = k.time;
+                        string slopeStr = k.isStepped ? "Infinity" : "0";
+                        sb.AppendLine("      - serializedVersion: 3");
+                        sb.AppendLine($"        time: {k.time.ToString("0.######", inv)}");
+                        sb.AppendLine($"        value: {k.value.ToString("0.######", inv)}");
+                        sb.AppendLine($"        inSlope: {slopeStr}");
+                        sb.AppendLine($"        outSlope: {slopeStr}");
+                        sb.AppendLine("        tangentMode: 0");
+                        sb.AppendLine("        weightedMode: 0");
+                        sb.AppendLine("        inWeight: 0.33333334");
+                        sb.AppendLine("        outWeight: 0.33333334");
+                    }
+                    sb.AppendLine("      m_PreInfinity: 2");
+                    sb.AppendLine("      m_PostInfinity: 2");
+                    sb.AppendLine("      m_RotationOrder: 4");
+                    sb.AppendLine($"    attribute: {YamlString(fe.Attribute)}");
+                    sb.AppendLine($"    path: {YamlString(fe.RelPath)}");
+                    sb.AppendLine($"    classID: {fe.ClassId}");
+                    sb.AppendLine("    script: {fileID: 0}");
+                    sb.AppendLine("    flags: 0");
+                }
+            }
+
             sb.AppendLine("  m_PPtrCurves: []");
             sb.AppendLine($"  m_SampleRate: {(anim.SampleRate > 0 ? anim.SampleRate.ToString("0.######", inv) : "30")}");
             sb.AppendLine("  m_WrapMode: 0");
@@ -2392,19 +2700,27 @@ ModelImporter:
             sb.AppendLine("    m_Center: {x: 0, y: 0, z: 0}");
             sb.AppendLine("    m_Extent: {x: 0, y: 0, z: 0}");
             sb.AppendLine("  m_ClipBindingConstant:");
-            sb.AppendLine("    genericBindings: []");
-            sb.AppendLine("    pptrCurveMapping: []");
-
-            float maxStopTime = 0f;
-            if (anim.TrackList != null)
+            if (genericBindings.Count == 0)
             {
-                foreach (var t in anim.TrackList)
+                sb.AppendLine("    genericBindings: []");
+            }
+            else
+            {
+                sb.AppendLine("    genericBindings:");
+                foreach (var gb in genericBindings)
                 {
-                    if (t.Rotations != null) foreach (var k in t.Rotations) if (k.time > maxStopTime) maxStopTime = k.time;
-                    if (t.Translations != null) foreach (var k in t.Translations) if (k.time > maxStopTime) maxStopTime = k.time;
-                    if (t.Scalings != null) foreach (var k in t.Scalings) if (k.time > maxStopTime) maxStopTime = k.time;
+                    sb.AppendLine("    - serializedVersion: 2");
+                    sb.AppendLine($"      path: {gb.PathHash}");
+                    sb.AppendLine($"      attribute: {gb.Attribute}");
+                    sb.AppendLine("      script: {fileID: 0}");
+                    sb.AppendLine($"      typeID: {gb.TypeId}");
+                    sb.AppendLine($"      customType: {gb.CustomType}");
+                    sb.AppendLine("      isPPtrCurve: 0");
+                    sb.AppendLine("      isIntCurve: 0");
+                    sb.AppendLine("      isSerializeReferenceCurve: 0");
                 }
             }
+            sb.AppendLine("    pptrCurveMapping: []");
 
             sb.AppendLine("  m_AnimationClipSettings:");
             sb.AppendLine("    serializedVersion: 2");
@@ -2428,12 +2744,40 @@ ModelImporter:
             sb.AppendLine("    m_Mirror: 0");
             sb.AppendLine("  m_EditorCurves: []");
             sb.AppendLine("  m_EulerEditorCurves: []");
-            sb.AppendLine("  m_HasGenericRootTransform: 0");
+            sb.AppendLine($"  m_HasGenericRootTransform: {(hasGenericRootTransform ? 1 : 0)}");
             sb.AppendLine("  m_HasMotionFloatCurves: 0");
             sb.AppendLine("  m_Events: []");
 
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
             File.WriteAllText(outputPath, sb.ToString(), Encoding.UTF8);
+        }
+
+        private static string? InferCommonRootPrefix(List<ImportedAnimationKeyframedTrack>? tracks)
+        {
+            if (tracks == null || tracks.Count < 2)
+            {
+                return null;
+            }
+            string? candidate = null;
+            foreach (var t in tracks)
+            {
+                var p = (t?.Path ?? string.Empty).Replace('\\', '/').Trim('/');
+                if (string.IsNullOrEmpty(p))
+                {
+                    return null; // Already has root-relative empty path
+                }
+                int slash = p.IndexOf('/');
+                string seg0 = slash >= 0 ? p.Substring(0, slash) : p;
+                if (candidate == null)
+                {
+                    candidate = seg0;
+                }
+                else if (!string.Equals(candidate, seg0, StringComparison.Ordinal))
+                {
+                    return null;
+                }
+            }
+            return candidate;
         }
         #endregion
     }

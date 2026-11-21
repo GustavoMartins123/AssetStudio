@@ -278,18 +278,56 @@ namespace AssetStudio
         public List<ImportedKeyframe<Vector3>> Scalings = new List<ImportedKeyframe<Vector3>>();
         public List<ImportedKeyframe<Vector3>> Rotations = new List<ImportedKeyframe<Vector3>>();
         public List<ImportedKeyframe<Vector3>> Translations = new List<ImportedKeyframe<Vector3>>();
-        public ImportedBlendShape? BlendShape;
+        public List<ImportedKeyframe<float>> Visibilities = new List<ImportedKeyframe<float>>();
+        public List<ImportedBlendShape> BlendShapes { get; set; } = new List<ImportedBlendShape>();
+
+        public ImportedBlendShape? BlendShape
+        {
+            get => BlendShapes.Count > 0 ? BlendShapes[0] : null;
+            set
+            {
+                if (value == null)
+                {
+                    BlendShapes.Clear();
+                }
+                else if (BlendShapes.Count == 0)
+                {
+                    BlendShapes.Add(value);
+                }
+                else
+                {
+                    BlendShapes[0] = value;
+                }
+            }
+        }
+
+        public ImportedBlendShape FindOrCreateBlendShape(string channelName)
+        {
+            for (int i = 0; i < BlendShapes.Count; i++)
+            {
+                if (string.Equals(BlendShapes[i].ChannelName, channelName, StringComparison.Ordinal))
+                {
+                    return BlendShapes[i];
+                }
+            }
+
+            var blendShape = new ImportedBlendShape { ChannelName = channelName };
+            BlendShapes.Add(blendShape);
+            return blendShape;
+        }
     }
 
     public class ImportedKeyframe<T>
     {
         public float time { get; set; }
         public T value { get; set; }
+        public bool isStepped { get; set; }
 
-        public ImportedKeyframe(float time, T value)
+        public ImportedKeyframe(float time, T value, bool isStepped = false)
         {
             this.time = time;
             this.value = value;
+            this.isStepped = isStepped;
         }
     }
 

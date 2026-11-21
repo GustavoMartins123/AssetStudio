@@ -1835,15 +1835,15 @@ namespace AssetStudio.Avalonia.Services
 
                 case Texture2D m_Texture2D:
                 {
+                    bool isKnownNormalMap = conversionContext.IsKnownNormalMap(m_Texture2D);
                     if (!exportOptions.ConvertTexture)
                     {
                         if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".tex", item, out var rawPath)) return false;
                         WriteBytesExport(rawPath, m_Texture2D.image_data.GetData());
-                        AssetExportHelper.WriteTextureMetaIfMissing(rawPath, m_Texture2D);
+                        AssetExportHelper.WriteTextureMetaIfMissing(rawPath, m_Texture2D, isKnownNormalMap);
                         return true;
                     }
 
-                    bool isKnownNormalMap = conversionContext.IsKnownNormalMap(m_Texture2D);
                     using var image = m_Texture2D.ConvertToImage(flip: true, unpackNormalMap: true, forceNormalMapUnpack: isKnownNormalMap);
                     if (image == null) return false;
                     var extension = "." + exportOptions.ConvertTextureFormat.ToString().ToLowerInvariant();
@@ -1858,7 +1858,7 @@ namespace AssetStudio.Avalonia.Services
                         TryDeletePartialExport(filePath);
                         throw;
                     }
-                    AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Texture2D);
+                    AssetExportHelper.WriteTextureMetaIfMissing(filePath, m_Texture2D, isKnownNormalMap);
                     return true;
                 }
 
@@ -2218,9 +2218,10 @@ namespace AssetStudio.Avalonia.Services
                     throw;
                 }
 
+                var sourceAvatar = (convert as ModelConverter)?.SourceAvatar;
                 if (exportOptions.ExportUnityMeta)
                 {
-                    AssetExportHelper.WriteModelMetaIfMissing(exportFile);
+                    AssetExportHelper.WriteModelMetaIfMissing(exportFile, obj: null, imported: mainConvert, avatar: sourceAvatar);
                 }
 
                 foreach (var anim in effectiveConvert.AnimationList)
@@ -2256,7 +2257,7 @@ namespace AssetStudio.Avalonia.Services
 
                     if (exportOptions.ExportUnityMeta)
                     {
-                        AssetExportHelper.WriteAnimationMetaIfMissing(animFile);
+                        AssetExportHelper.WriteAnimationMetaIfMissing(animFile, obj: null, imported: animConvert, avatar: sourceAvatar);
                     }
 
                     if (exportOptions.ExportUnityAnimClips)
@@ -2264,7 +2265,7 @@ namespace AssetStudio.Avalonia.Services
                         var animClipPath = Path.Combine(
                             Path.GetDirectoryName(exportFile)!,
                             $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.anim");
-                        AssetExportHelper.ExportUnityAnimationClip(anim, animClipPath);
+                        AssetExportHelper.ExportUnityAnimationClip(anim, animClipPath, effectiveConvert.RootFrame?.Name);
                     }
                 }
             }
@@ -2291,7 +2292,7 @@ namespace AssetStudio.Avalonia.Services
 
                 if (exportOptions.ExportUnityMeta)
                 {
-                    AssetExportHelper.WriteModelMetaIfMissing(exportFile);
+                    AssetExportHelper.WriteModelMetaIfMissing(exportFile, obj: null, imported: convert, avatar: (convert as ModelConverter)?.SourceAvatar);
                 }
             }
         }

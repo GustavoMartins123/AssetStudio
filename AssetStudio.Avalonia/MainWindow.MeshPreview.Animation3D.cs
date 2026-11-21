@@ -826,6 +826,17 @@ public partial class MainWindow
                     tracks,
                     updateMaxTimeBeforeBoundsCheck: true);
             }
+
+            if (AssetExportHelper.IsHumanoidAvatar(avatar) && muscleClip.m_IndexArray?.Length > HumanoidMuscleDecoder.RootSlotOffset)
+            {
+                MeshPreviewAnimationEvaluator.ExtractHumanoidMuscleTracks(
+                    clip,
+                    avatar,
+                    skeleton,
+                    rigData.MeshBonePathToIdx,
+                    rigData.ShouldUseBinding,
+                    tracks);
+            }
         }
 
         if (tracks.TotalTrackCount == 0)
