@@ -24,7 +24,7 @@ bool crunch_unpack_level(const uint8_t* data, uint32_t data_size, uint32_t level
 		return false;
 	}
 
-	if (level_index >= tex_info.m_levels)
+	if (tex_info.m_faces != 1 || level_index >= tex_info.m_levels)
 	{
 		return false;
 	}

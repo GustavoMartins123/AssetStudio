@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using AssetStudio.Avalonia.Services;
@@ -9,239 +10,159 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
 {
     private readonly Action<Action> _dispatchToUi;
     private readonly AsyncPreviewRequestCoordinator _requests = new();
-    private Shader? _shader;
-    private Material? _material;
-    private Func<CancellationToken, Shader>? _resolveShader;
-    private Func<Shader, Material?, CancellationToken, ShaderPreviewScene>? _prepareScene;
-    private Action? _onOpenMaterial;
+    private Func<CancellationToken, ShaderPreviewScene>? _prepare;
     private ShaderPreviewScene? _scene;
-    private ShaderPreviewCamera _camera = ShaderPreviewCamera.Default;
-    private bool _useMaterial, _isVisible, _isBusy, _isCode, _suspended, _refreshPending;
-    private string _status = "", _code = "";
+    private D3D11ShaderPreviewRenderer? _renderer;
+    private ShaderPreviewCamera _camera;
+    private float _time, _deltaTime;
+    private bool _active, _isAnimated, _busy, _suspended, _pending;
     private ShaderPreviewFrame? _frame;
+    private string? _status, _error, _passDetails;
 
-    internal ShaderPreviewViewModel(Action<Action> dispatchToUi)
+    internal ShaderPreviewViewModel(Action<Action> dispatchToUi) => _dispatchToUi = dispatchToUi;
+
+    public bool IsActive
     {
-        _dispatchToUi = dispatchToUi;
-        OpenMaterialCommand = new RelayCommand(OpenMaterial, () => CanOpenMaterial);
-        ShowRenderCommand = new RelayCommand(() => SelectCode(false));
-        ShowCodeCommand = new RelayCommand(() => SelectCode(true));
-        UseDefaultsCommand = new RelayCommand(() => SelectMaterial(false));
-        UseMaterialCommand = new RelayCommand(() => SelectMaterial(true));
-        MoveCameraCommand = new RelayCommand<string>(MoveCamera, _ => CanAdjustCamera);
-    }
-
-    public RelayCommand OpenMaterialCommand { get; }
-    public RelayCommand ShowRenderCommand { get; }
-    public RelayCommand ShowCodeCommand { get; }
-    public RelayCommand UseDefaultsCommand { get; }
-    public RelayCommand UseMaterialCommand { get; }
-    public RelayCommand<string> MoveCameraCommand { get; }
-
-    public bool IsVisible
-    {
-        get => _isVisible;
-        private set
-        {
-            if (SetProperty(ref _isVisible, value))
-            {
-                NotifyMaterial();
-            }
-        }
-    }
-
-    public bool IsCode
-    {
-        get => _isCode;
-        private set
-        {
-            if (SetProperty(ref _isCode, value))
-            {
-                NotifyCamera();
-            }
-        }
-    }
-
-    public bool IsBusy
-    {
-        get => _isBusy;
-        private set
-        {
-            if (SetProperty(ref _isBusy, value))
-            {
-                NotifyCamera();
-            }
-        }
+        get => _active;
+        private set => SetProperty(ref _active, value);
     }
 
     public ShaderPreviewFrame? Frame
     {
         get => _frame;
-        private set
-        {
-            if (SetProperty(ref _frame, value))
-            {
-                NotifyCamera();
-            }
-        }
+        private set => SetProperty(ref _frame, value);
     }
 
-    public string Status
+    internal bool IsAnimated => _isAnimated;
+    internal string? Status
     {
         get => _status;
         private set => SetProperty(ref _status, value);
     }
 
-    public string Code
+    internal string? Error
     {
-        get => _code;
-        private set => SetProperty(ref _code, value);
+        get => _error;
+        private set => SetProperty(ref _error, value);
     }
 
-    public bool HasMaterial => _material != null;
-    public bool CanOpenMaterial => HasMaterial && !IsVisible;
-    public bool CanAdjustCamera => Frame != null && !IsBusy && !IsCode;
-    public bool UsesMaterial => _useMaterial;
+    internal string? PassDetails => _passDetails;
 
-    internal void OpenShader(Shader shader, Func<Shader, Material?, CancellationToken, ShaderPreviewScene> prepareScene)
+    internal void Open(Func<CancellationToken, ShaderPreviewScene> prepare)
     {
-        _shader = shader;
-        _prepareScene = prepareScene;
-        IsVisible = true;
-        Refresh();
+        Clear();
+        _prepare = prepare;
+        _camera = ShaderPreviewCamera.Default;
+        IsActive = true;
+        QueueFrame();
     }
 
-    internal void SetMaterial(Material material, Func<CancellationToken, Shader> resolveShader,
-        Func<Shader, Material?, CancellationToken, ShaderPreviewScene> prepareScene, Action onOpenMaterial)
+    internal void UpdateCamera(ShaderPreviewCamera camera)
     {
-        _material = material;
-        _resolveShader = resolveShader;
-        _prepareScene = prepareScene;
-        _onOpenMaterial = onOpenMaterial;
-        NotifyMaterial();
-    }
-
-    private void OpenMaterial()
-    {
-        _onOpenMaterial?.Invoke();
-        _useMaterial = true;
-        OnPropertyChanged(nameof(UsesMaterial));
-        IsVisible = true;
-        Refresh();
-    }
-
-    private void SelectMaterial(bool useMaterial)
-    {
-        if (!HasMaterial || _useMaterial == useMaterial)
+        if (camera != _camera)
         {
-            return;
-        }
-        _useMaterial = useMaterial;
-        OnPropertyChanged(nameof(UsesMaterial));
-        _scene = null;
-        Frame = null;
-        Refresh();
-    }
-
-    private void SelectCode(bool showCode)
-    {
-        if (IsCode != showCode)
-        {
-            IsCode = showCode;
-            Refresh();
+            _camera = camera;
+            QueueFrame();
         }
     }
 
-    private void MoveCamera(string? direction)
+    internal void UpdateTime(int frame, float framesPerSecond)
     {
-        const float angle = MathF.PI / 12;
-        _camera = direction switch
-        {
-            "left" => _camera with { Yaw = _camera.Yaw - angle },
-            "right" => _camera with { Yaw = _camera.Yaw + angle },
-            "up" => _camera with { Pitch = Math.Min(_camera.Pitch + angle, 1.45f) },
-            "down" => _camera with { Pitch = Math.Max(_camera.Pitch - angle, -1.45f) },
-            "in" => _camera with { Distance = Math.Max(_camera.Distance * 0.85f, 1.45f) },
-            "out" => _camera with { Distance = Math.Min(_camera.Distance / 0.85f, 12f) },
-            "reset" => ShaderPreviewCamera.Default,
-            _ => _camera
-        };
-        Refresh();
+        _time = frame / framesPerSecond;
+        _deltaTime = 1 / framesPerSecond;
+        QueueFrame();
     }
 
-    private void Refresh()
+    private void QueueFrame()
     {
-        if (_suspended)
-        {
-            _refreshPending = true;
-            return;
-        }
-        if (!IsVisible || _prepareScene is not { } prepare)
+        _pending = true;
+        RenderPendingFrame();
+    }
+
+    private void RenderPendingFrame()
+    {
+        if (_busy || _suspended || !_pending || _prepare is not { } prepare)
         {
             return;
         }
 
-        CancellationToken token = _requests.BeginNewRequest(out long request);
-        Shader? shader = _shader;
-        var resolve = _resolveShader;
-        Material? material = _useMaterial ? _material : null;
+        _busy = true;
+        _pending = false;
         var scene = _scene;
+        var renderer = _renderer;
+        _renderer = null; // The request owns the renderer until its UI continuation completes.
         var camera = _camera;
-        bool showCode = IsCode;
-        IsBusy = true;
-        Status = showCode ? "Reading shader code…" : "Rendering shader…";
-        _ = CompleteAsync();
+        float time = _time, deltaTime = _deltaTime;
+        CancellationToken token = _requests.BeginNewRequest(out long request);
+        _ = RenderAsync();
 
-        async Task CompleteAsync()
+        async Task RenderAsync()
         {
-            string? code = null;
-            ShaderPreviewFrame? frame = null;
-            string status;
+            ShaderPreviewFrame frame;
             try
             {
-                await Task.Run(() =>
+                frame = await Task.Run(() =>
                 {
-                    shader ??= resolve?.Invoke(token) ?? throw new InvalidOperationException("The material's shader is unavailable.");
-                    if (showCode)
-                    {
-                        code = PreviewSessionViewModel.TruncatePreviewText(shader.Convert());
-                    }
-                    else
-                    {
-                        scene ??= prepare(shader, material, token);
-                        frame = D3D11ShaderPreviewRenderer.Render(scene, camera, token);
-                    }
+                    scene ??= prepare(token);
+                    renderer ??= new D3D11ShaderPreviewRenderer(scene);
+                    return renderer.Render(camera, token, time, deltaTime);
                 }, token).ConfigureAwait(false);
-                status = showCode
-                    ? shader!.m_Name
-                    : $"{scene!.Pass.ShaderName} · Unity 5.3 Built-in · Direct3D 11 · {material?.m_Name ?? "Shader defaults"}";
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
+                renderer?.Dispose();
                 return;
             }
             catch (Exception error)
             {
-                status = $"Shader preview unavailable. {error.Message}";
+                renderer?.Dispose();
+                _dispatchToUi(() =>
+                {
+                    if (!_requests.IsCurrent(request))
+                    {
+                        return;
+                    }
+                    _prepare = null;
+                    _pending = false;
+                    _busy = false;
+                    Frame = null;
+                    Error = $"Shader preview unavailable. {error.Message}";
+                });
+                return;
             }
+
             _dispatchToUi(() =>
             {
-                if (token.IsCancellationRequested || !_requests.IsCurrent(request))
+                if (!_requests.IsCurrent(request))
                 {
+                    renderer?.Dispose();
                     return;
                 }
-                _shader = shader;
+
+                _renderer = renderer;
+                bool first = _scene == null;
                 _scene = scene;
-                if (showCode)
+                if (first)
                 {
-                    Code = code ?? string.Empty;
+                    _isAnimated = scene!.IsAnimated;
+                    _passDetails = string.Join(Environment.NewLine, scene.Operations.Select(operation => operation switch
+                    {
+                        ShaderPreviewDraw draw => $"{draw.Pass.ShaderName} · {draw.Pass.PassName} {draw.Pass.LightMode} [{string.Join(", ", draw.Pass.Keywords)}]",
+                        ShaderPreviewGrab grab => $"GrabPass · {grab.TextureName}",
+                        _ => throw new InvalidOperationException("Unknown shader preview operation.")
+                    }));
+                    if (scene.UnusedMaterialKeywords.Count > 0)
+                    {
+                        _passDetails += Environment.NewLine + $"Keywords unused by this shader: {string.Join(", ", scene.UnusedMaterialKeywords)}";
+                    }
                 }
-                else
+                Frame = frame;
+                if (first)
                 {
-                    Frame = frame;
+                    Status = scene!.ShaderName;
                 }
-                Status = status;
-                IsBusy = false;
+                _busy = false;
+                RenderPendingFrame();
             });
         }
     }
@@ -249,53 +170,26 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
     internal void SetSuspended(bool suspended)
     {
         _suspended = suspended;
-        if (suspended && IsBusy)
-        {
-            _requests.CancelCurrent();
-            _refreshPending = true;
-            IsBusy = false;
-        }
-        else if (!suspended && _refreshPending)
-        {
-            _refreshPending = false;
-            Refresh();
-        }
+        RenderPendingFrame();
     }
 
     internal void Clear()
     {
         _requests.CancelCurrent();
-        _shader = null;
-        _material = null;
-        _resolveShader = null;
-        _prepareScene = null;
-        _onOpenMaterial = null;
+        _prepare = null;
         _scene = null;
-        _camera = ShaderPreviewCamera.Default;
-        _refreshPending = false;
-        _useMaterial = false;
-        IsVisible = false;
-        IsBusy = false;
-        IsCode = false;
+        _renderer?.Dispose();
+        _renderer = null;
+        _time = _deltaTime = 0;
+        _isAnimated = _pending = _busy = false;
         Frame = null;
-        Code = "";
-        Status = "";
-        NotifyMaterial();
-        OnPropertyChanged(nameof(UsesMaterial));
+        Status = Error = _passDetails = null;
+        IsActive = false;
     }
 
-    private void NotifyMaterial()
+    public void Dispose()
     {
-        OnPropertyChanged(nameof(HasMaterial));
-        OnPropertyChanged(nameof(CanOpenMaterial));
-        OpenMaterialCommand.NotifyCanExecuteChanged();
+        Clear();
+        _requests.Dispose();
     }
-
-    private void NotifyCamera()
-    {
-        OnPropertyChanged(nameof(CanAdjustCamera));
-        MoveCameraCommand.NotifyCanExecuteChanged();
-    }
-
-    public void Dispose() => Clear();
 }

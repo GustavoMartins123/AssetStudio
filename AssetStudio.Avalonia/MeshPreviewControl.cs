@@ -61,6 +61,7 @@ namespace AssetStudio.Avalonia
         private int animBoneLinesPerFrame;
         private int animJointPointsPerFrame;
         private float animFps = 30f;
+        private int materialShaderFrameCount;
         private global::Avalonia.Threading.DispatcherTimer? animTimer;
 
         // VBO / VAO state
@@ -279,7 +280,7 @@ namespace AssetStudio.Avalonia
 
         public bool IsPlaying => isAnimPlaying;
         public int AnimCurrentFrame => animCurrentFrame;
-        public int AnimTotalFrames => animationFrames?.Length ?? 0;
+        public int AnimTotalFrames => animationFrames?.Length ?? materialShaderFrameCount;
         public float AnimFps => animFps;
 
         public override void Render(DrawingContext context)

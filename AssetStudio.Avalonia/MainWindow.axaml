@@ -448,45 +448,14 @@
                         </Border>
                         <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
                         <Image x:Name="ImagePreviewBox" Stretch="Uniform" StretchDirection="DownOnly" VerticalAlignment="Center" HorizontalAlignment="Center" IsVisible="False" />
-                        <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True" />
+                        <local:MeshPreviewControl x:Name="GLPreviewControl" IsVisible="False" Focusable="True"
+                                                  IsMaterialShaderPreview="{Binding PreviewSession.ShaderPreview.IsActive}"
+                                                  MaterialShaderFrame="{Binding PreviewSession.ShaderPreview.Frame}" />
                         <local:TextureGLPreviewControl x:Name="TextureGLPreview" IsVisible="False" Focusable="True" />
-                        <Button Content="Preview shader" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="8"
-                                ZIndex="2" IsVisible="{Binding PreviewSession.ShaderPreview.CanOpenMaterial}"
-                                Command="{Binding PreviewSession.ShaderPreview.OpenMaterialCommand}" />
-                        <Border IsVisible="{Binding PreviewSession.ShaderPreview.IsVisible}" ZIndex="2"
-                                Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
-                            <Grid DataContext="{Binding PreviewSession.ShaderPreview}" x:DataType="vm:ShaderPreviewViewModel"
-                                  RowDefinitions="Auto,*,Auto" RowSpacing="8" Margin="10">
-                                <WrapPanel>
-                                    <Button Content="Render" Margin="0,0,4,0" Command="{Binding ShowRenderCommand}" IsEnabled="{Binding IsCode}" />
-                                    <Button Content="Code" Margin="0,0,8,0" Command="{Binding ShowCodeCommand}" IsEnabled="{Binding !IsCode}" />
-                                    <Button Content="Use material" Margin="0,0,4,0" Command="{Binding UseMaterialCommand}"
-                                            IsVisible="{Binding HasMaterial}" IsEnabled="{Binding !UsesMaterial}" />
-                                    <Button Content="Shader defaults" Command="{Binding UseDefaultsCommand}"
-                                            IsVisible="{Binding HasMaterial}" IsEnabled="{Binding UsesMaterial}" />
-                                </WrapPanel>
-                                <ffmpeg:ShaderPreviewImage Grid.Row="1" Frame="{Binding Frame}" IsVisible="{Binding !IsCode}"
-                                                           Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                <TextBox Grid.Row="1" IsVisible="{Binding IsCode}" Text="{Binding Code, Mode=OneWay}"
-                                         FontFamily="Monospace" AcceptsReturn="True" IsReadOnly="True" TextWrapping="Wrap" />
-                                <StackPanel Grid.Row="2" Spacing="6">
-                                    <WrapPanel IsVisible="{Binding !IsCode}" IsEnabled="{Binding CanAdjustCamera}">
-                                        <Button Content="←" ToolTip.Tip="Orbit left" Margin="0,0,4,0" Command="{Binding MoveCameraCommand}" CommandParameter="left" />
-                                        <Button Content="→" ToolTip.Tip="Orbit right" Margin="0,0,4,0" Command="{Binding MoveCameraCommand}" CommandParameter="right" />
-                                        <Button Content="↑" ToolTip.Tip="Orbit up" Margin="0,0,4,0" Command="{Binding MoveCameraCommand}" CommandParameter="up" />
-                                        <Button Content="↓" ToolTip.Tip="Orbit down" Margin="0,0,4,0" Command="{Binding MoveCameraCommand}" CommandParameter="down" />
-                                        <Button Content="−" ToolTip.Tip="Zoom out" Margin="0,0,4,0" Command="{Binding MoveCameraCommand}" CommandParameter="out" />
-                                        <Button Content="+" ToolTip.Tip="Zoom in" Margin="0,0,4,0" Command="{Binding MoveCameraCommand}" CommandParameter="in" />
-                                        <Button Content="Reset view" Command="{Binding MoveCameraCommand}" CommandParameter="reset" />
-                                    </WrapPanel>
-                                    <TextBlock Text="{Binding Status}" TextWrapping="Wrap" />
-                                </StackPanel>
-                            </Grid>
-                        </Border>
                         <Border x:Name="PreviewInfoBorder" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="{Binding PreviewSession.IsInfoOverlayVisible}">
                             <Grid RowDefinitions="Auto,*">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="8,4,8,4">
-                                    <TextBlock Text="Mesh Information" VerticalAlignment="Center" Foreground="#AAA" FontWeight="Bold" FontSize="11" />
+                                    <TextBlock Text="Preview Information" VerticalAlignment="Center" Foreground="#AAA" FontWeight="Bold" FontSize="11" />
                                     <Button Grid.Column="1" x:Name="TogglePreviewInfoBtn" Content="{Binding PreviewSession.InfoToggleGlyph}" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Command="{Binding TogglePreviewInfoCommand}" />
                                 </Grid>
                                 <ScrollViewer Grid.Row="1" x:Name="PreviewInfoScroll" IsVisible="{Binding PreviewSession.IsInfoExpanded}" MaxHeight="450" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">

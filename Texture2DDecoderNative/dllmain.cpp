@@ -118,7 +118,7 @@ T2D_API(void) DisposeBuffer(void** ppBuffer)
 	*ppBuffer = nullptr;
 }
 
-T2D_API(void) UnpackCrunch(const void* data, uint32_t dataSize, void** ppResult, uint32_t* pResultSize)
+T2D_API(void) UnpackCrunchLevel(const void* data, uint32_t dataSize, uint32_t level, void** ppResult, uint32_t* pResultSize)
 {
 	void* result;
 	uint32_t resultSize;
@@ -133,7 +133,7 @@ T2D_API(void) UnpackCrunch(const void* data, uint32_t dataSize, void** ppResult,
 		*pResultSize = 0;
 	}
 
-	if (!crunch_unpack_level(static_cast<const uint8_t*>(data), dataSize, 0, &result, &resultSize)) {
+	if (!crunch_unpack_level(static_cast<const uint8_t*>(data), dataSize, level, &result, &resultSize)) {
 		return;
 	}
 
@@ -146,6 +146,11 @@ T2D_API(void) UnpackCrunch(const void* data, uint32_t dataSize, void** ppResult,
 	{
 		*pResultSize = resultSize;
 	}
+}
+
+T2D_API(void) UnpackCrunch(const void* data, uint32_t dataSize, void** ppResult, uint32_t* pResultSize)
+{
+	UnpackCrunchLevel(data, dataSize, 0, ppResult, pResultSize);
 }
 
 T2D_API(void) UnpackUnityCrunch(const void* data, uint32_t dataSize, void** ppResult, uint32_t* pResultSize)

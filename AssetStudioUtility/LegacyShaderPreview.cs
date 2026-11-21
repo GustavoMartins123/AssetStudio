@@ -10,13 +10,20 @@ namespace AssetStudio
 {
     public sealed record ShaderPreviewParameter(string Name, int Type, int Rows, int Columns, bool IsMatrix, int ArraySize, int Offset);
     public sealed record ShaderPreviewBuffer(string Name, int Slot, int Size, ShaderPreviewParameter[] Parameters);
-    public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot);
+    public enum ShaderPreviewTextureDimension { Texture2D = 2, Cube = 4 }
+    public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot, ShaderPreviewTextureDimension Dimension);
     public sealed record ShaderPreviewStage(byte[] Bytecode, ShaderPreviewBuffer[] Buffers, ShaderPreviewTextureBinding[] Textures);
 
     public enum ShaderPreviewBlend { Zero, One, SrcColor, OneMinusSrcColor, DstColor, OneMinusDstColor, SrcAlpha, OneMinusSrcAlpha, DstAlpha, OneMinusDstAlpha, SrcAlphaSaturate }
     public enum ShaderPreviewBlendOp { Add, Sub, RevSub, Min, Max }
     public enum ShaderPreviewCull { Off = 1, Front, Back }
     public enum ShaderPreviewDepth { Never = 1, Less, Equal, LEqual, Greater, NotEqual, GEqual, Always, Off }
+    public enum ShaderPreviewStencilOp { Keep = 1, Zero, Replace, IncrSat, DecrSat, Invert, IncrWrap, DecrWrap }
+
+    public sealed record ShaderPreviewStencilFace(ShaderPreviewDepth Function, ShaderPreviewStencilOp Pass,
+        ShaderPreviewStencilOp Fail, ShaderPreviewStencilOp DepthFail);
+    public sealed record ShaderPreviewStencil(byte Reference, byte ReadMask, byte WriteMask,
+        ShaderPreviewStencilFace Front, ShaderPreviewStencilFace Back);
 
     public sealed record ShaderPreviewState
     {
@@ -33,41 +40,131 @@ namespace AssetStudio
         public byte ColorMask { get; init; } = 15;
         public float OffsetFactor { get; init; }
         public int OffsetUnits { get; init; }
+        public ShaderPreviewStencil? Stencil { get; init; }
+        public bool AlphaToMask { get; init; }
     }
 
+    public sealed record ShaderPreviewPassDefinition(PassType Type, string Name, string LightMode,
+        string RenderState, IReadOnlyList<int> VertexIndices, IReadOnlyList<int> FragmentIndices, bool CaptureOnce = false)
+    {
+        public bool HasDirect3D11 => VertexIndices.Count != 0 && FragmentIndices.Count != 0;
+        public string DisplayName => Name.Length == 0 ? LightMode : $"{Name} ({LightMode})";
+    }
+
+    public sealed record ShaderPreviewSubShader(IReadOnlyDictionary<string, string> Tags, string RenderState,
+        IReadOnlyList<ShaderPreviewPassDefinition> Passes);
+
     public sealed record LegacyShaderPreviewPass(
-        string ShaderName, string PassName, bool Plane, ShaderPreviewState State,
-        IReadOnlyDictionary<string, NumericsVector4> Values, IReadOnlyDictionary<string, string> TextureDefaults,
+        string ShaderName, string PassName, string LightMode, IReadOnlyList<string> Keywords, ShaderPreviewState State,
         ShaderPreviewStage Vertex, ShaderPreviewStage Fragment);
 
-    public static class LegacyShaderPreview
+    public sealed class LegacyShaderPreview
     {
         private const int MaxBlobBytes = 64 * 1024 * 1024;
         private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+        private readonly LegacyShaderLab _lab;
+        private readonly Shader _shader;
+        private readonly Dictionary<(int, bool), ProgramHeader> _headers = new();
+        private byte[]? _bytes;
+        private (int Offset, int Length)[]? _entries;
 
-        public static LegacyShaderPreviewPass Read(Shader shader, IReadOnlyCollection<string> keywords)
+        private LegacyShaderPreview(Shader shader, LegacyShaderLab lab)
+        {
+            _shader = shader;
+            _lab = lab;
+        }
+
+        public string Name => _lab.Name;
+        public IReadOnlyDictionary<string, NumericsVector4> Values => _lab.Values;
+        public IReadOnlyDictionary<string, string> TextureDefaults => _lab.TextureDefaults;
+        public IReadOnlySet<string> PropertyKeywords => _lab.PropertyKeywords;
+        public IReadOnlyList<ShaderPreviewSubShader> SubShaders => _lab.SubShaders;
+
+        public static LegacyShaderPreview Read(Shader shader)
         {
             ArgumentNullException.ThrowIfNull(shader);
-            ArgumentNullException.ThrowIfNull(keywords);
             if (shader.version.Length < 2 || shader.version[0] != 5 || shader.version[1] != 3)
             {
                 throw new NotSupportedException("Shader rendering currently supports Unity 5.3 Built-in shaders compiled for Direct3D 11.");
             }
             if (shader.m_Script is not { Length: > 0 and <= MaxBlobBytes } script ||
-                shader.m_SubProgramBlob is not { Length: > 0 } compressed ||
+                shader.m_SubProgramBlob is not { Length: > 0 } ||
                 shader.decompressedSize is 0 or > MaxBlobBytes)
             {
                 throw new InvalidDataException("The Unity 5.3 shader does not contain a valid program blob.");
             }
 
-            var lab = LegacyShaderLab.Parse(StrictUtf8.GetString(script));
-            if (lab.VertexIndices.Count == 0 || lab.FragmentIndices.Count == 0)
-            {
-                throw new NotSupportedException("The shader pass has no Direct3D 11 vertex/pixel program pair.");
-            }
+            return new LegacyShaderPreview(shader, LegacyShaderLab.Parse(StrictUtf8.GetString(script)));
+        }
 
-            var bytes = new byte[shader.decompressedSize];
-            if (LZ4Codec.Decode(compressed, bytes) != bytes.Length)
+        public static string ReadName(Shader shader)
+        {
+            if (shader.m_Script is not { Length: > 0 and <= MaxBlobBytes } script)
+            {
+                throw new InvalidDataException("The shader has no compiled ShaderLab header.");
+            }
+            return LegacyShaderLab.ReadShaderName(StrictUtf8.GetString(script));
+        }
+
+        public IEnumerable<string> GetKeywords(ShaderPreviewPassDefinition pass) =>
+            pass.VertexIndices.SelectMany(index => GetHeader(index, true).Keywords)
+                .Concat(pass.FragmentIndices.SelectMany(index => GetHeader(index, false).Keywords));
+
+        public IEnumerable<IReadOnlyList<string>> GetVariantKeywords(ShaderPreviewPassDefinition pass, bool vertex) =>
+            (vertex ? pass.VertexIndices : pass.FragmentIndices).Select(index => (IReadOnlyList<string>)GetHeader(index, vertex).Keywords);
+
+        public LegacyShaderPreviewPass PreparePass(ShaderPreviewSubShader subShader, ShaderPreviewPassDefinition pass,
+            IReadOnlySet<string> enabledKeywords, IReadOnlyDictionary<string, NumericsVector4> values)
+        {
+            if (!pass.HasDirect3D11)
+            {
+                throw new NotSupportedException($"Pass '{pass.DisplayName}' has no Direct3D 11 vertex/pixel program pair.");
+            }
+            ProgramHeader vertex = SelectStage(pass.VertexIndices, true);
+            ProgramHeader fragment = SelectStage(pass.FragmentIndices, false);
+            var keywords = vertex.Keywords.Concat(fragment.Keywords).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+            return new LegacyShaderPreviewPass(Name, pass.Name, pass.LightMode, keywords,
+                LegacyShaderLab.EvaluateState(subShader.RenderState, pass.RenderState, values),
+                ReadStage(_bytes!, vertex), ReadStage(_bytes!, fragment));
+
+            ProgramHeader SelectStage(IReadOnlyList<int> indices, bool isVertex)
+            {
+                var programs = indices.Select(i => GetHeader(i, isVertex)).ToArray();
+                var expected = new HashSet<string>(programs.SelectMany(p => p.Keywords), StringComparer.Ordinal);
+                expected.IntersectWith(enabledKeywords);
+                var matches = programs.Where(p => expected.SetEquals(p.Keywords)).Distinct().ToArray();
+                string stage = isVertex ? "vertex" : "pixel";
+                if (matches.Length == 0)
+                {
+                    throw new NotSupportedException($"Pass '{pass.DisplayName}' has no exact D3D11 {stage} variant for [{string.Join(", ", expected.Order(StringComparer.Ordinal))}].");
+                }
+                if (matches.Length > 1 && matches.Skip(1).Any(other =>
+                    !_bytes!.AsSpan(matches[0].Offset, matches[0].Length).SequenceEqual(_bytes.AsSpan(other.Offset, other.Length))))
+                {
+                    throw new NotSupportedException($"Pass '{pass.DisplayName}' has ambiguous D3D11 {stage} variants for [{string.Join(", ", expected.Order(StringComparer.Ordinal))}].");
+                }
+                return matches[0];
+            }
+        }
+
+        private ProgramHeader GetHeader(int index, bool vertex)
+        {
+            if (_entries == null)
+            {
+                ReadBlob();
+            }
+            if (!_headers.TryGetValue((index, vertex), out var header))
+            {
+                header = ReadHeader(_bytes!, _entries!, index, vertex);
+                _headers.Add((index, vertex), header);
+            }
+            return header;
+        }
+
+        private void ReadBlob()
+        {
+            var bytes = new byte[_shader.decompressedSize];
+            if (LZ4Codec.Decode(_shader.m_SubProgramBlob!, bytes) != bytes.Length)
             {
                 throw new InvalidDataException("The Unity shader program blob could not be decompressed.");
             }
@@ -85,36 +182,9 @@ namespace AssetStudio
                 entries[i] = (offset, length);
             }
 
-            var enabled = new HashSet<string>(keywords, StringComparer.Ordinal);
-            ProgramHeader vertex = SelectStage(lab.VertexIndices, true);
-            ProgramHeader fragment = SelectStage(lab.FragmentIndices, false);
-            if (!enabled.SetEquals(vertex.Keywords.Concat(fragment.Keywords)))
-            {
-                throw MissingVariant(enabled);
-            }
-            return new LegacyShaderPreviewPass(lab.Name, lab.PassName, lab.Plane, lab.State, lab.Values,
-                lab.TextureDefaults, ReadStage(bytes, vertex), ReadStage(bytes, fragment));
-
-            ProgramHeader SelectStage(IReadOnlyList<int> indices, bool isVertex)
-            {
-                var programs = indices.Select(i => ReadHeader(bytes, entries, i, isVertex)).ToArray();
-                var stageKeywords = new HashSet<string>(programs.SelectMany(p => p.Keywords), StringComparer.Ordinal);
-                stageKeywords.IntersectWith(enabled);
-                var matches = programs.Where(p => stageKeywords.SetEquals(p.Keywords)).ToArray();
-                if (matches.Length == 0)
-                {
-                    throw MissingVariant(enabled);
-                }
-                if (matches.Length > 1)
-                {
-                    throw new NotSupportedException("Multiple Direct3D 11 programs match the same stage and keyword set.");
-                }
-                return matches[0];
-            }
+            _bytes = bytes;
+            _entries = entries;
         }
-
-        private static NotSupportedException MissingVariant(HashSet<string> enabled) =>
-            new($"The exact Direct3D 11 variant is missing for keywords [{string.Join(", ", enabled.Order(StringComparer.Ordinal))}].");
 
         private sealed record ProgramHeader(int Offset, int Length, int CodePosition, string[] Keywords);
 
@@ -194,9 +264,11 @@ namespace AssetStudio
                 int kind = reader.ReadInt32();
                 int slot = reader.ReadInt32();
                 int extra = reader.ReadInt32();
-                if (kind == 0 && (extra & 0xff) == 2 && slot is >= 0 and < 128 && (extra >> 8) is >= 0 and < 16)
+                var dimension = (ShaderPreviewTextureDimension)(extra & 0xff);
+                if (kind == 0 && dimension is ShaderPreviewTextureDimension.Texture2D or ShaderPreviewTextureDimension.Cube
+                    && slot is >= 0 and < 128 && (extra >> 8) is >= -1 and < 16)
                 {
-                    textures.Add(new ShaderPreviewTextureBinding(name, slot, extra >> 8));
+                    textures.Add(new ShaderPreviewTextureBinding(name, slot, extra >> 8, dimension));
                 }
                 else if (kind == 1 && slot is >= 0 and < 14 && groups.Remove(name, out var group) && group.Size > 0)
                 {

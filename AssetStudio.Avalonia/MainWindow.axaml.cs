@@ -369,9 +369,11 @@ public partial class MainWindow : Window
         {
             GLPreviewControl.GpuErrorOccurred += _glGpuErrorHandler;
             GLPreviewControl.AnimationFrameChanged += _glAnimationFrameChangedHandler;
+            GLPreviewControl.MaterialShaderCameraChanged += PreviewSession.ShaderPreview.UpdateCamera;
             GLPreviewControl.MeshGeometryLoaded += OnMeshPreviewGeometryLoaded;
             GLPreviewControl.DisplayOptionsChanged += OnGlPreviewDisplayOptionsChanged;
         }
+        PreviewSession.ShaderPreview.PropertyChanged += OnMaterialShaderPreviewChanged;
 
         MeshPreview.PropertyChanged += OnMeshPreviewViewModelPropertyChanged;
         ApplyAvatarPreviewControlSettings();
@@ -2134,10 +2136,12 @@ public partial class MainWindow : Window
             TextureGLPreview.GpuErrorOccurred -= _textureGlGpuErrorHandler;
         }
         MeshPreview.PropertyChanged -= OnMeshPreviewViewModelPropertyChanged;
+        PreviewSession.ShaderPreview.PropertyChanged -= OnMaterialShaderPreviewChanged;
         if (GLPreviewControl != null)
         {
             GLPreviewControl.GpuErrorOccurred -= _glGpuErrorHandler;
             GLPreviewControl.AnimationFrameChanged -= _glAnimationFrameChangedHandler;
+            GLPreviewControl.MaterialShaderCameraChanged -= PreviewSession.ShaderPreview.UpdateCamera;
             GLPreviewControl.MeshGeometryLoaded -= OnMeshPreviewGeometryLoaded;
             GLPreviewControl.DisplayOptionsChanged -= OnGlPreviewDisplayOptionsChanged;
             GLPreviewControl.LoadMeshPreviewGeometryCache = null;

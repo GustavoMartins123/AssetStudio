@@ -423,7 +423,11 @@ namespace Texture2DDecoder
             return UnpackCrunch(new ReadOnlySpan<byte>(data));
         }
 
-        public static byte[]? UnpackCrunch(ReadOnlySpan<byte> data)
+        public static byte[]? UnpackCrunch(ReadOnlySpan<byte> data) => UnpackCrunch(data, mipLevel: null);
+
+        public static byte[]? UnpackCrunchMip(ReadOnlySpan<byte> data, uint mipLevel) => UnpackCrunch(data, mipLevel);
+
+        private static byte[]? UnpackCrunch(ReadOnlySpan<byte> data, uint? mipLevel)
         {
             if (data.IsEmpty)
             {
@@ -435,7 +439,14 @@ namespace Texture2DDecoder
 
             fixed (byte* pData = &MemoryMarshal.GetReference(data))
             {
-                UnpackCrunch(pData, (uint)data.Length, out pBuffer, out bufferSize);
+                if (mipLevel is uint level)
+                {
+                    UnpackCrunchLevel(pData, (uint)data.Length, level, out pBuffer, out bufferSize);
+                }
+                else
+                {
+                    UnpackCrunch(pData, (uint)data.Length, out pBuffer, out bufferSize);
+                }
             }
 
             if (pBuffer == null)

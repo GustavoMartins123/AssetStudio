@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.ViewModels;
 
 namespace AssetStudio.Avalonia;
@@ -85,6 +86,21 @@ public partial class MainWindow
                     && (cachedEntry == null || (string.IsNullOrWhiteSpace(cachedEntry.MainTextureAssetId) && previewData.PreviewTexture != null)))
                 {
                     EnqueueMaterialLazyBackfill(m_Material, previewData.PreviewTexture);
+                }
+
+                if (ShaderPreviewService.UsesShaderPreview(m_Material.version))
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (currentId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, assetItem))
+                        {
+                            return;
+                        }
+                        OpenMaterialShaderPreview(previewData.InfoText, token => PrepareShaderScene(
+                            ResolveShaderPreviewReference(m_Material.m_Shader, m_Material.assetsFile ??
+                                throw new InvalidOperationException("The material has no serialized source."), token), m_Material, token));
+                    });
+                    return;
                 }
 
                 if (previewData.PreviewTexture == null)

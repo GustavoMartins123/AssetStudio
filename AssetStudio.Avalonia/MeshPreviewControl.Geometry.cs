@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia
 {
@@ -503,52 +504,12 @@ namespace AssetStudio.Avalonia
 
         private void GenerateSphere(int latitudes, int longitudes)
         {
-            var vertices = new List<Vector3>();
-            var normals = new List<Vector3>();
-            var uvs = new List<Vector2>();
-            var indices = new List<int>();
-
-            for (int lat = 0; lat <= latitudes; lat++)
-            {
-                float theta = lat * (float)Math.PI / latitudes;
-                float sinTheta = (float)Math.Sin(theta);
-                float cosTheta = (float)Math.Cos(theta);
-
-                for (int lon = 0; lon <= longitudes; lon++)
-                {
-                    float phi = lon * 2 * (float)Math.PI / longitudes;
-                    float sinPhi = (float)Math.Sin(phi);
-                    float cosPhi = (float)Math.Cos(phi);
-
-                    Vector3 normal = new Vector3(cosPhi * sinTheta, cosTheta, sinPhi * sinTheta);
-                    vertices.Add(normal);
-                    normals.Add(normal);
-                    uvs.Add(new Vector2((float)lon / longitudes, 1f - (float)lat / latitudes));
-                }
-            }
-
-            for (int lat = 0; lat < latitudes; lat++)
-            {
-                for (int lon = 0; lon < longitudes; lon++)
-                {
-                    int first = (lat * (longitudes + 1)) + lon;
-                    int second = first + longitudes + 1;
-
-                    indices.Add(first);
-                    indices.Add(second);
-                    indices.Add(first + 1);
-
-                    indices.Add(second);
-                    indices.Add(second + 1);
-                    indices.Add(first + 1);
-                }
-            }
-
-            vertexData = vertices.ToArray();
-            normal2Data = normals.ToArray();
-            normalData = normals.ToArray();
-            uvData = uvs.ToArray();
-            indiceData = indices.ToArray();
+            var (positions, uvs, indices) = MaterialPreviewGeometry.CreateSphere(latitudes, longitudes);
+            vertexData = Array.ConvertAll(positions, position => new Vector3(position.X, position.Y, position.Z));
+            normal2Data = (Vector3[])vertexData.Clone();
+            normalData = (Vector3[])vertexData.Clone();
+            uvData = Array.ConvertAll(uvs, uv => new Vector2(uv.X, uv.Y));
+            indiceData = indices;
 
             colorData = new Vector4[vertexData.Length];
             Array.Fill(colorData, Vector4.One);

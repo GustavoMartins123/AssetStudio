@@ -1619,6 +1619,8 @@ namespace AssetStudio
                     return new TextAsset(objectReader);
                 case ClassIDType.Texture2D:
                     return new Texture2D(objectReader);
+                case ClassIDType.Cubemap when objectReader.version[0] == 5 && objectReader.version[1] == 3:
+                    return new Cubemap(objectReader);
                 case ClassIDType.Transform:
                     return new Transform(objectReader);
                 case ClassIDType.VideoClip:

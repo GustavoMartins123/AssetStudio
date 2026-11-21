@@ -88,6 +88,9 @@ namespace Texture2DDecoder
         private static extern void UnpackCrunch(void* data, uint dataSize, out void* result, out uint resultSize);
 
         [DllImport(T2DDll.DllName, CallingConvention = CallingConvention.Winapi)]
+        private static extern void UnpackCrunchLevel(void* data, uint dataSize, uint mipLevel, out void* result, out uint resultSize);
+
+        [DllImport(T2DDll.DllName, CallingConvention = CallingConvention.Winapi)]
         private static extern void UnpackUnityCrunch(void* data, uint dataSize, out void* result, out uint resultSize);
 
     }

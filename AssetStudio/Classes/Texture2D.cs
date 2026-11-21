@@ -75,6 +75,8 @@ namespace AssetStudio
         public TextureFormat m_TextureFormat;
         public bool m_MipMap;
         public int m_MipCount;
+        public int m_ImageCount;
+        public int m_TextureDimension;
         public bool m_IsReadable;
         public bool m_IsPreProcessed;
         public bool m_IgnoreMipmapLimit;
@@ -145,8 +147,8 @@ namespace AssetStudio
             {
                 m_StreamingMipmapsPriority = reader.ReadInt32();
             }
-            var m_ImageCount = reader.ReadInt32();
-            var m_TextureDimension = reader.ReadInt32();
+            m_ImageCount = reader.ReadInt32();
+            m_TextureDimension = reader.ReadInt32();
             m_TextureSettings = new GLTextureSettings(reader);
             if (version[0] >= 3) //3.0 and up
             {
@@ -252,6 +254,8 @@ namespace AssetStudio
                 bool hasFormat = false;
                 bool mipMap = false;
                 int mipCount = 0;
+                int imageCount = 0;
+                int textureDimension = 0;
                 bool isReadable = false;
                 bool isPreProcessed = false;
                 bool ignoreMipmapLimit = false;
@@ -292,6 +296,14 @@ namespace AssetStudio
                             break;
                         case "m_MipCount":
                             if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out mipCount))
+                                return false;
+                            break;
+                        case "m_ImageCount":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out imageCount))
+                                return false;
+                            break;
+                        case "m_TextureDimension":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out textureDimension))
                                 return false;
                             break;
                         case "m_IsReadable":
@@ -372,6 +384,8 @@ namespace AssetStudio
                 m_TextureFormat = (TextureFormat)format;
                 m_MipMap = mipMap;
                 m_MipCount = mipCount;
+                m_ImageCount = imageCount;
+                m_TextureDimension = textureDimension;
                 m_IsReadable = isReadable;
                 m_IsPreProcessed = isPreProcessed;
                 m_IgnoreMipmapLimit = ignoreMipmapLimit;

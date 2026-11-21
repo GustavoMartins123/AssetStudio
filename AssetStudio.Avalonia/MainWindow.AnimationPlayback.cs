@@ -30,6 +30,10 @@ public partial class MainWindow
     private void UpdateAnimationPlaybackFrame(int currentFrame, int totalFrames)
     {
         MeshPreview.SeekFrame(currentFrame, totalFrames);
+        if (GLPreviewControl?.IsMaterialShaderPreview == true && GLPreviewControl.AnimTotalFrames == totalFrames)
+        {
+            PreviewSession.ShaderPreview.UpdateTime(currentFrame, GLPreviewControl.AnimFps);
+        }
     }
 
     private void ExecuteToggleAnimationPlayPause()

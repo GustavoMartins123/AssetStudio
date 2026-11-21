@@ -34,15 +34,24 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     private static extern int D3D11CreateDevice(nint adapter, uint driverType, nint software, uint flags,
         uint* featureLevels, uint featureLevelCount, uint sdkVersion, nint* device, uint* featureLevel, nint* context);
 
-    internal nint CreateBuffer<T>(ReadOnlySpan<T> data, uint flags) where T : unmanaged
+    internal nint CreateBuffer<T>(ReadOnlySpan<T> data, uint flags, bool mutable = false) where T : unmanaged
     {
-        var desc = new BufferDesc { ByteWidth = checked((uint)(data.Length * sizeof(T))), Usage = 1, BindFlags = flags };
+        var desc = new BufferDesc { ByteWidth = checked((uint)(data.Length * sizeof(T))), Usage = mutable ? 0u : 1u, BindFlags = flags };
         nint buffer = 0;
         fixed (T* pixels = data)
         {
             var initialData = new SubresourceData { Data = pixels };
             var create = (delegate* unmanaged[Stdcall]<nint, BufferDesc*, SubresourceData*, nint*, int>)Slot(_device, 3);
             return Keep(create(_device, &desc, &initialData, &buffer), buffer, "create a buffer");
+        }
+    }
+
+    internal void UpdateBuffer<T>(nint buffer, ReadOnlySpan<T> data) where T : unmanaged
+    {
+        fixed (T* bytes = data)
+        {
+            ((delegate* unmanaged[Stdcall]<nint, nint, uint, void*, void*, uint, uint, void>)Slot(_context, 48))(
+                _context, buffer, 0, null, bytes, 0, 0);
         }
     }
 
@@ -54,14 +63,19 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     }
 
     internal nint CreateShaderView(nint texture) => CreateView(7, texture, "create a shader resource view");
+    internal nint CreateCubeView(nint texture, int format, int mips)
+    {
+        var desc = new ShaderViewDesc { Format = format, Dimension = 9, MipLevels = (uint)mips }; // D3D11_SRV_DIMENSION_TEXTURECUBE
+        return CreateView(7, texture, "create a cubemap shader resource view", &desc);
+    }
     internal nint CreateRenderView(nint texture) => CreateView(9, texture, "create the render target view");
     internal nint CreateDepthView(nint texture) => CreateView(10, texture, "create the depth view");
 
-    private nint CreateView(int slot, nint texture, string operation)
+    private nint CreateView(int slot, nint texture, string operation, void* desc = null)
     {
         nint view = 0;
         var create = (delegate* unmanaged[Stdcall]<nint, nint, void*, nint*, int>)Slot(_device, slot);
-        return Keep(create(_device, texture, null, &view), view, operation);
+        return Keep(create(_device, texture, desc, &view), view, operation);
     }
 
     internal nint CreateLayout(InputElement* elements, int count, byte[] vertexBytecode)
@@ -98,17 +112,64 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         return Keep(create(_device, desc, &state), state, operation);
     }
 
-    internal void SetFrame(nint surface, nint depth, nint blendState, nint depthState, nint rasterizerState, int size)
+    internal void ClearBindings() =>
+        ((delegate* unmanaged[Stdcall]<nint, void>)Slot(_context, 110))(_context);
+
+    internal void ClearFrame(nint surface, nint depth, int size, bool showBackgroundPattern)
+    {
+        float* clear = stackalloc float[] { 0.18f, 0.18f, 0.18f, 1f };
+        ((delegate* unmanaged[Stdcall]<nint, nint, float*, void>)Slot(_context, 50))(_context, surface, clear);
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(_context, depth, 3, 1f, 0);
+        if (showBackgroundPattern)
+        {
+            ClearBackgroundTiles(surface, size);
+        }
+    }
+
+    private void ClearBackgroundTiles(nint surface, int size)
+    {
+        Guid interfaceId = new("bb2c6faa-b5fb-4082-8e6b-388b8cfa90e1"); // ID3D11DeviceContext1
+        nint context1 = 0;
+        int result = ((delegate* unmanaged[Stdcall]<nint, Guid*, nint*, int>)Slot(_context, 0))(_context, &interfaceId, &context1);
+        Check(result, "get the Direct3D 11.1 context for the GrabPass preview background");
+        if (context1 == 0)
+        {
+            throw new InvalidOperationException("Direct3D 11.1 returned no context for the GrabPass preview background.");
+        }
+        try
+        {
+            const int tiles = 8;
+            var rects = stackalloc ClearRect[tiles * tiles / 2];
+            int count = 0;
+            for (int row = 0; row < tiles; row++)
+            {
+                for (int column = row % 2; column < tiles; column += 2)
+                {
+                    rects[count++] = new ClearRect
+                    {
+                        Left = column * size / tiles, Top = row * size / tiles,
+                        Right = (column + 1) * size / tiles, Bottom = (row + 1) * size / tiles
+                    };
+                }
+            }
+            float* color = stackalloc float[] { 0.32f, 0.35f, 0.40f, 1f };
+            ((delegate* unmanaged[Stdcall]<nint, nint, float*, ClearRect*, uint, void>)Slot(context1, 132))(
+                context1, surface, color, rects, (uint)count);
+        }
+        finally
+        {
+            Release(context1);
+        }
+    }
+
+    internal void SetPass(nint surface, nint depth, nint blendState, nint depthState, byte stencilReference, nint rasterizerState, int size)
     {
         ((delegate* unmanaged[Stdcall]<nint, uint, nint*, nint, void>)Slot(_context, 33))(_context, 1, &surface, depth);
         ((delegate* unmanaged[Stdcall]<nint, nint, float*, uint, void>)Slot(_context, 35))(_context, blendState, null, uint.MaxValue);
-        ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 36))(_context, depthState, 0);
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 36))(_context, depthState, stencilReference);
         ((delegate* unmanaged[Stdcall]<nint, nint, void>)Slot(_context, 43))(_context, rasterizerState);
         var viewport = new Viewport { Width = size, Height = size, MaxDepth = 1 };
         ((delegate* unmanaged[Stdcall]<nint, uint, Viewport*, void>)Slot(_context, 44))(_context, 1, &viewport);
-        float* clear = stackalloc float[] { 0.18f, 0.18f, 0.18f, 1f };
-        ((delegate* unmanaged[Stdcall]<nint, nint, float*, void>)Slot(_context, 50))(_context, surface, clear);
-        ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(_context, depth, 1, 1f, 0);
     }
 
     internal void SetGeometry(nint layout, nint vertices, nint indices, uint stride)
@@ -131,12 +192,36 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     private void Bind(nint resource, int slot, int method) =>
         ((delegate* unmanaged[Stdcall]<nint, uint, uint, nint*, void>)Slot(_context, method))(_context, (uint)slot, 1, &resource);
 
-    internal void Draw(int indexCount) =>
-        ((delegate* unmanaged[Stdcall]<nint, uint, uint, int, void>)Slot(_context, 12))(_context, (uint)indexCount, 0, 0);
+    internal void Draw(int indexCount, int startIndex = 0) =>
+        ((delegate* unmanaged[Stdcall]<nint, uint, uint, int, void>)Slot(_context, 12))(_context, (uint)indexCount, (uint)startIndex, 0);
 
-    internal byte[] ReadPixels(nint source, nint staging, int size)
+    internal void RequireMultisampling(int format, uint samples)
     {
-        ((delegate* unmanaged[Stdcall]<nint, nint, nint, void>)Slot(_context, 47))(_context, staging, source);
+        uint levels = 0;
+        int result = ((delegate* unmanaged[Stdcall]<nint, int, uint, uint*, int>)Slot(_device, 30))(_device, format, samples, &levels);
+        Check(result, "check multisampled support");
+        if (levels == 0)
+        {
+            throw new NotSupportedException($"D3D11 format {format} does not support {samples} samples for AlphaToMask.");
+        }
+    }
+
+    internal void CopyColor(nint source, nint destination, int format, bool multisampled)
+    {
+        if (multisampled)
+        {
+            ((delegate* unmanaged[Stdcall]<nint, nint, uint, nint, uint, int, void>)Slot(_context, 57))(
+                _context, destination, 0, source, 0, format);
+        }
+        else
+        {
+            ((delegate* unmanaged[Stdcall]<nint, nint, nint, void>)Slot(_context, 47))(_context, destination, source);
+        }
+    }
+
+    internal byte[] ReadPixels(nint source, nint staging, int format, int size)
+    {
+        CopyColor(source, staging, format, multisampled: false);
         MappedResource mapped = default;
         int hr = ((delegate* unmanaged[Stdcall]<nint, nint, uint, uint, uint, MappedResource*, int>)Slot(_context, 14))(
             _context, staging, 0, 1 /* read */, 0, &mapped);
@@ -227,6 +312,13 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct ShaderViewDesc
+    {
+        public int Format, Dimension;
+        public uint MostDetailedMip, MipLevels, Reserved0, Reserved1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct MappedResource
     {
         public void* Data;
@@ -237,6 +329,12 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     private struct Viewport
     {
         public float X, Y, Width, Height, MinDepth, MaxDepth;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ClearRect
+    {
+        public int Left, Top, Right, Bottom;
     }
 
     [StructLayout(LayoutKind.Sequential)]

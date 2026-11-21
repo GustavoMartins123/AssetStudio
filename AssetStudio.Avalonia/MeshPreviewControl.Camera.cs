@@ -12,6 +12,21 @@ namespace AssetStudio.Avalonia
         private const float PreviewFitScale = 1.6f;
         private const float PreviewDepthScale = 0.02f;
 
+        internal event Action<Services.ShaderPreviewCamera>? MaterialShaderCameraChanged;
+
+        private void InvalidatePreviewCamera()
+        {
+            if (IsMaterialShaderPreview)
+            {
+                Vector3 direction = viewMatrixData.Column2.Xyz;
+                float scale = Math.Max(direction.Length, 0.001f);
+                MaterialShaderCameraChanged?.Invoke(new Services.ShaderPreviewCamera(
+                    MathF.Atan2(direction.X, direction.Z), MathF.Asin(Math.Clamp(direction.Y / scale, -0.99f, 0.99f)),
+                    Math.Clamp(4 / scale, 1.45f, 12f), new System.Numerics.Vector2(viewMatrixData.Row3.X, viewMatrixData.Row3.Y) / scale));
+            }
+            RequestNextFrameRendering();
+        }
+
         // Pointer drag anchor
         private global::Avalonia.Point mpos;
 
@@ -29,7 +44,7 @@ namespace AssetStudio.Avalonia
                 initialViewMatrix = ResolveViewPresetMatrix();
                 viewMatrixData = initialViewMatrix;
                 modelMatrixData = initialModelMatrix;
-                RequestNextFrameRendering();
+                InvalidatePreviewCamera();
             }
         }
 
@@ -46,38 +61,38 @@ namespace AssetStudio.Avalonia
             }
 
             modelMatrixData = CreatePreviewModelMatrix(min, max);
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
         }
 
         public void ResetView()
         {
             viewMatrixData = initialViewMatrix;
             modelMatrixData = initialModelMatrix;
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
         }
 
         public void RotateLeft90()
         {
             viewMatrixData *= Matrix4.CreateRotationY((float)(Math.PI / 2));
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
         }
 
         public void RotateRight90()
         {
             viewMatrixData *= Matrix4.CreateRotationY((float)(-Math.PI / 2));
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
         }
 
         public void RotateUp90()
         {
             viewMatrixData *= Matrix4.CreateRotationX((float)(Math.PI / 2));
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
         }
 
         public void RotateDown90()
         {
             viewMatrixData *= Matrix4.CreateRotationX((float)(-Math.PI / 2));
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
         }
 
         private bool TryGetSubMeshBounds(int subMeshIndex, out Vector3 min, out Vector3 max)
@@ -234,7 +249,7 @@ namespace AssetStudio.Avalonia
                     viewMatrixData *= Matrix4.CreateTranslation(-dx, dy, 0);
                 }
 
-                RequestNextFrameRendering();
+                InvalidatePreviewCamera();
             }
             else
             {
@@ -249,7 +264,7 @@ namespace AssetStudio.Avalonia
             base.OnPointerWheelChanged(e);
             float delta = (float)e.Delta.Y;
             viewMatrixData *= Matrix4.CreateScale(1 + delta * 0.1f);
-            RequestNextFrameRendering();
+            InvalidatePreviewCamera();
             e.Handled = true;
         }
 
@@ -291,7 +306,7 @@ namespace AssetStudio.Avalonia
                 if (e.Key == Key.W)
                 {
                     wireFrameMode = (wireFrameMode + 1) % 3;
-                    RequestNextFrameRendering();
+                    InvalidatePreviewCamera();
                     DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }
@@ -305,7 +320,7 @@ namespace AssetStudio.Avalonia
                     {
                         shadeMode = shadeMode == 0 ? 1 : 0;
                     }
-                    RequestNextFrameRendering();
+                    InvalidatePreviewCamera();
                     DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }
@@ -313,14 +328,14 @@ namespace AssetStudio.Avalonia
                 {
                     normalMode = normalMode == 0 ? 1 : 0;
                     vao = 0;
-                    RequestNextFrameRendering();
+                    InvalidatePreviewCamera();
                     DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }
                 else if (e.Key == Key.B && isAvatarMode)
                 {
                     showSkeleton = !showSkeleton;
-                    RequestNextFrameRendering();
+                    InvalidatePreviewCamera();
                     DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }

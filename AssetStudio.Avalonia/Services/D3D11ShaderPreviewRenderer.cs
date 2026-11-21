@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -12,76 +13,199 @@ using NumericsVector4 = System.Numerics.Vector4;
 
 namespace AssetStudio.Avalonia.Services;
 
-internal static unsafe class D3D11ShaderPreviewRenderer
+internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 {
-    private const int FrameSize = 384;
+    private const int FrameSize = ShaderPreviewService.RenderSize;
     private const int Rgba8 = 28;
     private const uint BindVertexBuffer = 1, BindIndexBuffer = 2, BindConstantBuffer = 4,
         BindShaderResource = 8, BindRenderTarget = 32, BindDepthStencil = 64;
 
     private static readonly (Vertex[] Vertices, uint[] Indices) Plane = BuildPlane();
     private static readonly (Vertex[] Vertices, uint[] Indices) Sphere = BuildSphere();
+    private static readonly (Vertex[] Vertices, uint[] Indices) Skybox = BuildSkybox();
+    private const int ParticleCount = 8;
+    private static readonly uint[] ParticleIndices = BuildParticleIndices();
 
-    internal static ShaderPreviewFrame Render(ShaderPreviewScene scene, ShaderPreviewCamera camera, CancellationToken token)
+    private readonly ShaderPreviewScene _scene;
+    private readonly D3D11PreviewDevice _device;
+    private readonly nint _vertexBuffer, _indexBuffer, _target, _targetView, _depth, _resolved, _staging;
+    private readonly int _indexCount;
+    private readonly TextureDesc _colorCopy;
+    private readonly bool _multisampled, _showBackgroundPattern;
+    private readonly Dictionary<LegacyShaderPreviewPass, (nint Layout, nint Vertex, nint Pixel, nint Blend, nint Depth, nint Rasterizer)> _passes = new();
+    private readonly Dictionary<string, (nint View, nint Sampler)> _textures = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (nint Texture, nint View)> _grabs = new(StringComparer.Ordinal);
+    private readonly Dictionary<ShaderPreviewBuffer, nint> _constantBuffers = new();
+    private nint _grabSampler;
+
+    internal D3D11ShaderPreviewRenderer(ShaderPreviewScene scene)
     {
         if (!OperatingSystem.IsWindows())
         {
             throw new PlatformNotSupportedException("Unity 5.3 shader preview requires Direct3D 11 on Windows.");
         }
-        token.ThrowIfCancellationRequested();
 
-        LegacyShaderPreviewPass pass = scene.Pass;
-        ValidateStage(pass.Vertex, vertex: true);
-        ValidateStage(pass.Fragment, vertex: false);
+        _scene = scene;
+        _device = new D3D11PreviewDevice();
+        try
+        {
+            var (vertices, indices) = scene.Geometry switch
+            {
+                ShaderPreviewGeometry.Particles => (new Vertex[ParticleCount * 4], ParticleIndices),
+                ShaderPreviewGeometry.Plane => Plane,
+                ShaderPreviewGeometry.Skybox or ShaderPreviewGeometry.Volume => Skybox,
+                _ => Sphere
+            };
+            _vertexBuffer = _device.CreateBuffer<Vertex>(vertices, BindVertexBuffer, mutable: scene.Geometry == ShaderPreviewGeometry.Particles);
+            _indexBuffer = _device.CreateBuffer<uint>(indices, BindIndexBuffer);
+            _indexCount = indices.Length;
+
+            _multisampled = scene.Operations.OfType<ShaderPreviewDraw>().Any(draw => draw.Pass.State.AlphaToMask);
+            _showBackgroundPattern = scene.Operations.Any(operation => operation is ShaderPreviewGrab);
+            const int depthStencilFormat = 45; // D24_UNORM_S8_UINT
+            const uint sampleCount = 4;
+            if (_multisampled)
+            {
+                _device.RequireMultisampling(Rgba8, sampleCount);
+                _device.RequireMultisampling(depthStencilFormat, sampleCount);
+            }
+            var frame = new TextureDesc
+            {
+                Width = FrameSize, Height = FrameSize, MipLevels = 1, ArraySize = 1,
+                Format = Rgba8, SampleCount = _multisampled ? sampleCount : 1, BindFlags = BindRenderTarget
+            };
+            _target = _device.CreateTexture(frame);
+            _targetView = _device.CreateRenderView(_target);
+            frame.Format = depthStencilFormat;
+            frame.BindFlags = BindDepthStencil;
+            _depth = _device.CreateDepthView(_device.CreateTexture(frame));
+            frame.Format = Rgba8;
+            frame.SampleCount = 1;
+            frame.BindFlags = BindShaderResource;
+            _colorCopy = frame;
+            frame.BindFlags = 0;
+            _resolved = _multisampled ? _device.CreateTexture(frame) : _target;
+            frame.Usage = 3; // staging
+            frame.CpuAccess = 0x20000; // read
+            _staging = _device.CreateTexture(frame);
+        }
+        catch
+        {
+            _device.Dispose();
+            throw;
+        }
+    }
+
+    internal ShaderPreviewFrame Render(ShaderPreviewCamera camera, CancellationToken token, float time = 0, float deltaTime = 0)
+    {
+        token.ThrowIfCancellationRequested();
         var eye = new NumericsVector3(MathF.Sin(camera.Yaw) * MathF.Cos(camera.Pitch), MathF.Sin(camera.Pitch),
             MathF.Cos(camera.Yaw) * MathF.Cos(camera.Pitch)) * camera.Distance;
         NumericsMatrix4x4 view = NumericsMatrix4x4.CreateLookAt(eye, NumericsVector3.Zero, NumericsVector3.UnitY);
-        NumericsMatrix4x4 projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(35 * MathF.PI / 180, 1, 0.1f, 100);
-        var (vertices, indices) = pass.Plane ? Plane : Sphere;
-
-        using var device = new D3D11PreviewDevice();
-        nint layout = CreateInputLayout(device, pass.Vertex.Bytecode);
-        nint vertexShader = device.CreateShader(pass.Vertex.Bytecode, vertex: true);
-        nint fragmentShader = device.CreateShader(pass.Fragment.Bytecode, vertex: false);
-        nint vertexBuffer = device.CreateBuffer<Vertex>(vertices, BindVertexBuffer);
-        nint indexBuffer = device.CreateBuffer<uint>(indices, BindIndexBuffer);
-
-        var frame = new TextureDesc
+        NumericsMatrix4x4 projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(35 * MathF.PI / 180, 1,
+            ShaderPreviewCamera.Near, ShaderPreviewCamera.Far);
+        if (_scene.Geometry == ShaderPreviewGeometry.Skybox)
         {
-            Width = FrameSize, Height = FrameSize, MipLevels = 1, ArraySize = 1,
-            Format = Rgba8, SampleCount = 1, BindFlags = BindRenderTarget
-        };
-        nint target = device.CreateTexture(frame);
-        nint targetView = device.CreateRenderView(target);
-        frame.Format = 45; // D24_UNORM_S8_UINT
-        frame.BindFlags = BindDepthStencil;
-        nint depth = device.CreateDepthView(device.CreateTexture(frame));
-        frame.Format = Rgba8;
-        frame.BindFlags = 0;
-        frame.Usage = 3; // staging
-        frame.CpuAccess = 0x20000; // read
-        nint staging = device.CreateTexture(frame);
-
-        device.SetFrame(targetView, depth, CreateBlend(device, pass.State), CreateDepth(device, pass.State),
-            device.CreateRasterizerState(new RasterizerDesc
+            view.Translation = NumericsVector3.Zero;
+        }
+        else
+        {
+            var pan = new NumericsVector3(camera.Pan, 0);
+            eye -= NumericsVector3.TransformNormal(pan, NumericsMatrix4x4.Transpose(view));
+            view.Translation += pan;
+            if (_scene.Geometry == ShaderPreviewGeometry.Particles)
             {
-                FillMode = 3, CullMode = (int)pass.State.Cull, FrontCounterClockwise = 1,
-                DepthClipEnable = 1, DepthBias = pass.State.OffsetUnits, SlopeScaledDepthBias = pass.State.OffsetFactor
-            }), FrameSize);
-        device.SetGeometry(layout, vertexBuffer, indexBuffer, (uint)sizeof(Vertex));
-        device.SetShader(vertexShader, vertex: true);
-        device.SetShader(fragmentShader, vertex: false);
-
-        var textures = new Dictionary<string, (nint View, nint Sampler)>(StringComparer.Ordinal);
-        BindStage(pass.Vertex, vertex: true);
-        BindStage(pass.Fragment, vertex: false);
+                Span<Vertex> particles = stackalloc Vertex[ParticleCount * 4];
+                UpdateParticles(particles, view, time);
+                _device.UpdateBuffer<Vertex>(_vertexBuffer, particles);
+            }
+        }
+        _device.ClearFrame(_targetView, _depth, FrameSize, _showBackgroundPattern);
+        var capturedNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var operation in _scene.Operations)
+        {
+            token.ThrowIfCancellationRequested();
+            if (operation is ShaderPreviewGrab grab)
+            {
+                if (grab.Once && capturedNames.Contains(grab.TextureName))
+                {
+                    continue;
+                }
+                _device.ClearBindings();
+                if (!_grabs.TryGetValue(grab.TextureName, out var copy))
+                {
+                    nint texture = _device.CreateTexture(_colorCopy);
+                    copy = (texture, _device.CreateShaderView(texture));
+                    _grabs.Add(grab.TextureName, copy);
+                }
+                _device.CopyColor(_target, copy.Texture, Rgba8, _multisampled);
+                capturedNames.Add(grab.TextureName);
+                if (_grabSampler == 0)
+                {
+                    _grabSampler = CreateSampler(_device, filterMode: 1, wrapMode: 1, anisotropy: 1, bias: 0);
+                }
+                continue;
+            }
+            var draw = (ShaderPreviewDraw)operation;
+            try
+            {
+                DrawPass(draw);
+            }
+            catch (Exception error) when (error is NotSupportedException or InvalidOperationException or InvalidDataException)
+            {
+                throw new InvalidOperationException($"{draw.Pass.ShaderName} · {draw.Pass.LightMode} {draw.Pass.PassName}. {error.Message}", error);
+            }
+        }
+        _device.ClearBindings();
+        if (_multisampled)
+        {
+            _device.CopyColor(_target, _resolved, Rgba8, multisampled: true);
+        }
         token.ThrowIfCancellationRequested();
-        device.Draw(indices.Length);
-        var pixels = device.ReadPixels(target, staging, FrameSize);
+        var pixels = _device.ReadPixels(_resolved, _staging, Rgba8, FrameSize);
+        // The preview is already composited over its scene background.
+        for (int alpha = 3; alpha < pixels.Length; alpha += 4)
+        {
+            pixels[alpha] = 255;
+        }
         token.ThrowIfCancellationRequested();
         return new ShaderPreviewFrame(FrameSize, FrameSize, pixels);
 
-        void BindStage(ShaderPreviewStage stage, bool vertex)
+        void DrawPass(ShaderPreviewDraw draw)
+        {
+            LegacyShaderPreviewPass pass = draw.Pass;
+            if (!_passes.TryGetValue(pass, out var gpu))
+            {
+                ValidateStage(pass.Vertex, vertex: true);
+                ValidateStage(pass.Fragment, vertex: false);
+                gpu = (CreateInputLayout(_device, pass.Vertex.Bytecode), _device.CreateShader(pass.Vertex.Bytecode, vertex: true),
+                    _device.CreateShader(pass.Fragment.Bytecode, vertex: false), CreateBlend(_device, pass.State),
+                    CreateDepth(_device, pass.State), _device.CreateRasterizerState(new RasterizerDesc
+                    {
+                        FillMode = 3, CullMode = (int)pass.State.Cull, FrontCounterClockwise = 1,
+                        DepthClipEnable = 1, DepthBias = pass.State.OffsetUnits, SlopeScaledDepthBias = pass.State.OffsetFactor,
+                        MultisampleEnable = _multisampled ? 1 : 0
+                    }));
+                _passes.Add(pass, gpu);
+            }
+            _device.ClearBindings();
+            _device.SetPass(_targetView, _depth, gpu.Blend, gpu.Depth, pass.State.Stencil?.Reference ?? 0, gpu.Rasterizer, FrameSize);
+            _device.SetGeometry(gpu.Layout, _vertexBuffer, _indexBuffer, (uint)sizeof(Vertex));
+            _device.SetShader(gpu.Vertex, vertex: true);
+            _device.SetShader(gpu.Pixel, vertex: false);
+            BindStage(pass.Vertex, draw.Light, vertex: true);
+            BindStage(pass.Fragment, draw.Light, vertex: false);
+            if (draw.SkyboxSide >= 0)
+            {
+                _device.Draw(6, draw.SkyboxSide * 6);
+            }
+            else
+            {
+                _device.Draw(_indexCount);
+            }
+        }
+
+        void BindStage(ShaderPreviewStage stage, ShaderPreviewLight light, bool vertex)
         {
             var buffers = new HashSet<int>();
             foreach (var buffer in stage.Buffers)
@@ -91,40 +215,73 @@ internal static unsafe class D3D11ShaderPreviewRenderer
                 {
                     throw new InvalidDataException($"Duplicate constant buffer binding b{buffer.Slot}.");
                 }
-                var data = ShaderPreviewService.BindConstants(scene, buffer, view, projection, eye, FrameSize);
-                device.SetConstantBuffer(device.CreateBuffer<byte>(data, BindConstantBuffer), buffer.Slot, vertex);
+                var data = ShaderPreviewService.BindConstants(_scene, buffer, light, view, projection, eye, FrameSize, capturedNames, time, deltaTime);
+                if (_constantBuffers.TryGetValue(buffer, out nint gpuBuffer))
+                {
+                    _device.UpdateBuffer<byte>(gpuBuffer, data);
+                }
+                else
+                {
+                    gpuBuffer = _device.CreateBuffer<byte>(data, BindConstantBuffer, mutable: true);
+                    _constantBuffers.Add(buffer, gpuBuffer);
+                }
+                _device.SetConstantBuffer(gpuBuffer, buffer.Slot, vertex);
             }
             var slots = new HashSet<int>();
-            var samplers = new Dictionary<int, ShaderPreviewTexture>();
+            var samplers = new Dictionary<int, (int Filter, int Wrap, int Anisotropy, float Bias)>();
             foreach (var binding in stage.Textures)
             {
                 token.ThrowIfCancellationRequested();
-                ShaderPreviewTexture texture = scene.Textures[binding.Name];
-                if (!slots.Add(binding.Slot) || samplers.TryGetValue(binding.SamplerSlot, out var shared) &&
-                    (shared.Filter, shared.Wrap, shared.Anisotropy, shared.MipBias) != (texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias))
+                if (!slots.Add(binding.Slot))
                 {
-                    throw new NotSupportedException($"Conflicting texture or sampler bindings for '{binding.Name}'.");
+                    throw new InvalidDataException($"Duplicate texture register t{binding.Slot} for '{binding.Name}'.");
                 }
-                samplers[binding.SamplerSlot] = texture;
-                if (!textures.TryGetValue(binding.Name, out var gpu))
+                (nint View, nint Sampler) gpu;
+                (int Filter, int Wrap, int Anisotropy, float Bias) sampling;
+                if (capturedNames.Contains(binding.Name) && _grabs.TryGetValue(binding.Name, out var grab))
                 {
-                    gpu = UploadTexture(device, texture, binding.Name);
-                    textures.Add(binding.Name, gpu);
+                    gpu = (grab.View, _grabSampler);
+                    sampling = (1, 1, 1, 0);
                 }
-                device.SetTexture(gpu.View, binding.Slot, vertex);
-                device.SetSampler(gpu.Sampler, binding.SamplerSlot, vertex);
+                else
+                {
+                    if (!_scene.Textures.TryGetValue(binding.Name, out var texture))
+                    {
+                        throw new InvalidDataException($"Texture '{binding.Name}' is unavailable before this pass.");
+                    }
+                    sampling = (texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias);
+                    if (!_textures.TryGetValue(binding.Name, out gpu))
+                    {
+                        gpu = UploadTexture(_device, texture, binding.Name);
+                        _textures.Add(binding.Name, gpu);
+                    }
+                }
+                _device.SetTexture(gpu.View, binding.Slot, vertex);
+                if (binding.SamplerSlot >= 0)
+                {
+                    if (samplers.TryGetValue(binding.SamplerSlot, out var shared) && shared != sampling)
+                    {
+                        throw new NotSupportedException($"Conflicting sampler bindings for '{binding.Name}'.");
+                    }
+                    samplers[binding.SamplerSlot] = sampling;
+                    _device.SetSampler(gpu.Sampler, binding.SamplerSlot, vertex);
+                }
             }
         }
     }
 
+    public void Dispose() => _device.Dispose();
+
     private static (nint View, nint Sampler) UploadTexture(D3D11PreviewDevice device, ShaderPreviewTexture texture, string name)
     {
-        var levels = stackalloc SubresourceData[texture.MipCount];
+        int subresources = texture.MipCount * texture.Faces;
+        var levels = stackalloc SubresourceData[subresources];
         fixed (byte* data = texture.Pixels)
         {
             int consumed = 0;
-            for (int mip = 0; mip < texture.MipCount; mip++)
+            for (int index = 0; index < subresources; index++)
             {
+                int mip = index % texture.MipCount;
                 int width = Math.Max(1, texture.Width >> mip);
                 int height = Math.Max(1, texture.Height >> mip);
                 int columns = texture.BlockCompressed ? (width + 3) / 4 : width;
@@ -135,7 +292,7 @@ internal static unsafe class D3D11ShaderPreviewRenderer
                 {
                     throw new InvalidDataException($"Incomplete mip data for texture '{name}'.");
                 }
-                levels[mip] = new SubresourceData { Data = data + consumed, RowPitch = (uint)pitch, SlicePitch = (uint)length };
+                levels[index] = new SubresourceData { Data = data + consumed, RowPitch = (uint)pitch, SlicePitch = (uint)length };
                 consumed += length;
             }
             if (consumed != texture.Pixels.Length)
@@ -145,37 +302,54 @@ internal static unsafe class D3D11ShaderPreviewRenderer
             nint image = device.CreateTexture(new TextureDesc
             {
                 Width = (uint)texture.Width, Height = (uint)texture.Height, MipLevels = (uint)texture.MipCount,
-                ArraySize = 1, Format = texture.Format, SampleCount = 1, Usage = 1, BindFlags = BindShaderResource
+                ArraySize = (uint)texture.Faces, Format = texture.Format, SampleCount = 1, Usage = 1, BindFlags = BindShaderResource,
+                MiscFlags = texture.Faces == 6 ? 4u : 0u // D3D11_RESOURCE_MISC_TEXTURECUBE
             }, levels);
-            uint wrap = texture.Wrap switch { 0 => 1, 1 => 3, 2 => 2, 3 => 5, _ => throw new InvalidDataException("Invalid wrap mode.") };
-            uint filter = texture.Anisotropy > 1 ? 0x55u : texture.Filter switch
-            {
-                0 => 0, 1 => 0x14, 2 => 0x15, _ => throw new InvalidDataException("Invalid filter mode.")
-            };
-            nint sampler = device.CreateSamplerState(new SamplerDesc
-            {
-                Filter = filter, AddressU = wrap, AddressV = wrap, AddressW = wrap,
-                MaxAnisotropy = (uint)Math.Max(1, texture.Anisotropy), LodBias = texture.MipBias, Comparison = 8, MaxLod = float.MaxValue
-            });
-            return (device.CreateShaderView(image), sampler);
+            nint sampler = CreateSampler(device, texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias);
+            return (texture.Faces == 6 ? device.CreateCubeView(image, texture.Format, texture.MipCount) : device.CreateShaderView(image), sampler);
         }
+    }
+
+    private static nint CreateSampler(D3D11PreviewDevice device, int filterMode, int wrapMode, int anisotropy, float bias)
+    {
+        uint wrap = wrapMode switch { 0 => 1, 1 => 3, 2 => 2, 3 => 5, _ => throw new InvalidDataException("Invalid wrap mode.") };
+        uint filter = anisotropy > 1 ? 0x55u : filterMode switch
+        {
+            0 => 0, 1 => 0x14, 2 => 0x15, _ => throw new InvalidDataException("Invalid filter mode.")
+        };
+        return device.CreateSamplerState(new SamplerDesc
+        {
+            Filter = filter, AddressU = wrap, AddressV = wrap, AddressW = wrap,
+            MaxAnisotropy = (uint)Math.Max(1, anisotropy), LodBias = bias, Comparison = 8, MaxLod = float.MaxValue
+        });
     }
 
     private static nint CreateDepth(D3D11PreviewDevice device, ShaderPreviewState state)
     {
-        var stencil = new StencilFace { Fail = 1, DepthFail = 1, Pass = 1, Function = 8 };
+        var stencil = state.Stencil;
         return device.CreateDepthState(new DepthDesc
         {
             Enable = state.ZWrite || state.ZTest != ShaderPreviewDepth.Off ? 1 : 0,
             WriteMask = state.ZWrite ? 1 : 0,
             Function = state.ZTest == ShaderPreviewDepth.Off ? 8 : (int)state.ZTest,
-            StencilReadMask = 255, StencilWriteMask = 255, Front = stencil, Back = stencil
+            StencilEnable = stencil == null ? 0 : 1,
+            StencilReadMask = stencil?.ReadMask ?? 255, StencilWriteMask = stencil?.WriteMask ?? 255,
+            Front = MapFace(stencil?.Front), Back = MapFace(stencil?.Back)
         });
+
+        static StencilFace MapFace(ShaderPreviewStencilFace? face) => new()
+        {
+            Fail = (int)(face?.Fail ?? ShaderPreviewStencilOp.Keep),
+            DepthFail = (int)(face?.DepthFail ?? ShaderPreviewStencilOp.Keep),
+            Pass = (int)(face?.Pass ?? ShaderPreviewStencilOp.Keep),
+            Function = face == null || face.Function == ShaderPreviewDepth.Off ? 8 : (int)face.Function
+        };
     }
 
     private static nint CreateBlend(D3D11PreviewDevice device, ShaderPreviewState state) =>
         device.CreateBlendState(new BlendDesc
         {
+            AlphaToCoverage = state.AlphaToMask ? 1 : 0,
             Target = new BlendTarget
             {
                 Enabled = state.Blend ? 1 : 0, Source = BlendFactor(state.Source, alpha: false),
@@ -261,7 +435,8 @@ internal static unsafe class D3D11ShaderPreviewRenderer
                 uint flags = (token >> 11) & 0x1f;
                 bool bound = opcode switch
                 {
-                    declareTexture => flags == 3 && Array.Exists(stage.Textures, texture => texture.Slot == slot),
+                    declareTexture => Array.Exists(stage.Textures, texture => texture.Slot == slot &&
+                        flags == (texture.Dimension == ShaderPreviewTextureDimension.Cube ? 6u : 3u)),
                     declareSampler => flags == 0 && Array.Exists(stage.Textures, texture => texture.SamplerSlot == slot),
                     _ => ReadUInt(program, offset + 12) is var count && count is > 0 and <= 4096 &&
                          Array.Exists(stage.Buffers, buffer => buffer.Slot == slot && ((buffer.Size + 15) & ~15) >= count * 16)
@@ -297,7 +472,8 @@ internal static unsafe class D3D11ShaderPreviewRenderer
             {
                 continue;
             }
-            if (systemValue != 0 || semanticIndex != 0 || componentType != 3 /* float */)
+            bool uvChannel = semanticIndex <= 3 && name.Equals("TEXCOORD", StringComparison.OrdinalIgnoreCase);
+            if (systemValue != 0 || (semanticIndex != 0 && !uvChannel) || componentType != 3 /* float */)
             {
                 throw new NotSupportedException($"Unsupported DXBC vertex input '{name}{semanticIndex}'.");
             }
@@ -314,7 +490,7 @@ internal static unsafe class D3D11ShaderPreviewRenderer
             byte* semantic = names + elementCount * 16;
             int length = Encoding.ASCII.GetBytes(name, new Span<byte>(semantic, 15));
             semantic[length] = 0;
-            elements[elementCount++] = new InputElement { Semantic = semantic, Offset = offset, Format = format };
+            elements[elementCount++] = new InputElement { Semantic = semantic, SemanticIndex = semanticIndex, Offset = offset, Format = format };
         }
         return elementCount == 0 ? 0 : device.CreateLayout(elements, elementCount, bytecode);
     }
@@ -386,48 +562,102 @@ internal static unsafe class D3D11ShaderPreviewRenderer
         offset <= data.Length - 4 ? BinaryPrimitives.ReadUInt32LittleEndian(data[offset..]) : throw new EndOfStreamException("Truncated DXBC data.");
 
     [StructLayout(LayoutKind.Sequential)]
-    private readonly record struct Vertex(NumericsVector4 Position, NumericsVector4 Normal, NumericsVector4 Tangent, NumericsVector4 Color, NumericsVector4 Uv);
+    private readonly record struct Vertex(NumericsVector4 Position, NumericsVector4 Normal, NumericsVector4 Tangent,
+        NumericsVector4 Color, NumericsVector4 Uv);
 
     private static (Vertex[], uint[]) BuildPlane() =>
         ([PlaneVertex(-1, -1, 0, 0), PlaneVertex(1, -1, 1, 0), PlaneVertex(1, 1, 1, 1), PlaneVertex(-1, 1, 0, 1)],
          [0, 1, 2, 0, 2, 3]);
 
-    private static Vertex PlaneVertex(float x, float y, float u, float v) =>
-        new(new NumericsVector4(x, y, 0, 1), new NumericsVector4(0, 0, 1, 0), new NumericsVector4(1, 0, 0, 1), NumericsVector4.One, new NumericsVector4(u, v, 0, 0));
+    private static (Vertex[], uint[]) BuildSkybox()
+    {
+        (NumericsVector3 Forward, NumericsVector3 Right, NumericsVector3 Up)[] faces =
+        [
+            (NumericsVector3.UnitZ, -NumericsVector3.UnitX, NumericsVector3.UnitY),
+            (-NumericsVector3.UnitZ, NumericsVector3.UnitX, NumericsVector3.UnitY),
+            (NumericsVector3.UnitX, NumericsVector3.UnitZ, NumericsVector3.UnitY),
+            (-NumericsVector3.UnitX, -NumericsVector3.UnitZ, NumericsVector3.UnitY),
+            (NumericsVector3.UnitY, -NumericsVector3.UnitX, -NumericsVector3.UnitZ),
+            (-NumericsVector3.UnitY, -NumericsVector3.UnitX, NumericsVector3.UnitZ)
+        ];
+        var vertices = new Vertex[24];
+        var indices = new uint[36];
+        for (int face = 0; face < faces.Length; face++)
+        {
+            var (forward, right, up) = faces[face];
+            for (int i = 0; i < Plane.Vertices.Length; i++)
+            {
+                var vertex = Plane.Vertices[i];
+                var position = forward + vertex.Position.X * right + vertex.Position.Y * up;
+                vertices[face * 4 + i] = vertex with { Position = new NumericsVector4(position, 1), Normal = new NumericsVector4(-forward, 0) };
+            }
+            for (int i = 0; i < Plane.Indices.Length; i++)
+            {
+                indices[face * 6 + i] = (uint)(face * 4) + Plane.Indices[i];
+            }
+        }
+        return (vertices, indices);
+    }
+
+    private static uint[] BuildParticleIndices()
+    {
+        var indices = new uint[ParticleCount * 6];
+        for (int particle = 0; particle < ParticleCount; particle++)
+        {
+            for (int index = 0; index < Plane.Indices.Length; index++)
+            {
+                indices[particle * 6 + index] = (uint)(particle * 4) + Plane.Indices[index];
+            }
+        }
+        return indices;
+    }
+
+    private static void UpdateParticles(Span<Vertex> vertices, NumericsMatrix4x4 view, float time)
+    {
+        var right = new NumericsVector3(view.M11, view.M21, view.M31);
+        var up = new NumericsVector3(view.M12, view.M22, view.M32);
+        var normal = new NumericsVector4(NumericsVector3.Cross(right, up), 0);
+        var tangent = new NumericsVector4(right, 1);
+        for (int particle = 0; particle < ParticleCount; particle++)
+        {
+            float age = (time * 0.75f + (float)particle / ParticleCount) % 1;
+            float angle = particle * 2.39996f;
+            float radius = 0.22f + age * 0.28f;
+            float spread = 0.13f + 0.44f * age;
+            var center = new NumericsVector3(spread * MathF.Cos(angle), age * 1.4f - 0.65f, spread * MathF.Sin(angle));
+            var color = new NumericsVector4(1, 1, 1, MathF.Sin(age * MathF.PI) * 0.8f);
+            for (int corner = 0; corner < Plane.Vertices.Length; corner++)
+            {
+                var template = Plane.Vertices[corner];
+                var position = center + radius * (template.Position.X * right + template.Position.Y * up);
+                vertices[4 * particle + corner] = template with { Position = new NumericsVector4(position, 1), Normal = normal, Tangent = tangent, Color = color };
+            }
+        }
+    }
+
+    private static Vertex PlaneVertex(float x, float y, float u, float v)
+    {
+        var uv = new NumericsVector4(u, v, 0, 0);
+        return new Vertex(new NumericsVector4(x, y, 0, 1), new NumericsVector4(0, 0, 1, 0),
+            new NumericsVector4(1, 0, 0, 1), NumericsVector4.One, uv);
+    }
 
     private static (Vertex[], uint[]) BuildSphere()
     {
-        const int longitude = 32;
-        const int latitude = 24;
-        var vertices = new Vertex[(longitude + 1) * (latitude + 1)];
-        var indices = new uint[longitude * latitude * 6];
-        int written = 0;
-        for (int row = 0; row <= latitude; row++)
+        var (positions, uvs, triangles) = MaterialPreviewGeometry.CreateSphere(32, 32);
+        var vertices = new Vertex[positions.Length];
+        for (int i = 0; i < vertices.Length; i++)
         {
-            float v = (float)row / latitude;
-            float y = MathF.Cos(v * MathF.PI);
-            float radius = MathF.Sin(v * MathF.PI);
-            for (int column = 0; column <= longitude; column++)
-            {
-                float u = (float)column / longitude;
-                float x = MathF.Cos(u * MathF.Tau);
-                float z = MathF.Sin(u * MathF.Tau);
-                var position = new NumericsVector4(radius * x, y, radius * z, 1);
-                int index = row * (longitude + 1) + column;
-                vertices[index] = new Vertex(position, position with { W = 0 },
-                    new NumericsVector4(-z, 0, x, 1), NumericsVector4.One, new NumericsVector4(u, 1 - v, 0, 0));
-                if (row < latitude && column < longitude)
-                {
-                    uint top = (uint)index;
-                    uint bottom = top + longitude + 1;
-                    indices[written++] = top;
-                    indices[written++] = top + 1;
-                    indices[written++] = bottom;
-                    indices[written++] = top + 1;
-                    indices[written++] = bottom + 1;
-                    indices[written++] = bottom;
-                }
-            }
+            float phi = uvs[i].X * MathF.Tau;
+            vertices[i] = new Vertex(new NumericsVector4(positions[i], 1), new NumericsVector4(positions[i], 0),
+                new NumericsVector4(-MathF.Sin(phi), 0, MathF.Cos(phi), 1), NumericsVector4.One, new NumericsVector4(uvs[i], 0, 0));
+        }
+        var indices = new uint[triangles.Length];
+        for (int i = 0; i < indices.Length; i += 3)
+        {
+            indices[i] = (uint)triangles[i];
+            indices[i + 1] = (uint)triangles[i + 2];
+            indices[i + 2] = (uint)triangles[i + 1];
         }
         return (vertices, indices);
     }

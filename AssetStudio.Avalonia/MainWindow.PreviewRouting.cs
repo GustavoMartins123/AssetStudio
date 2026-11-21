@@ -741,7 +741,6 @@ public partial class MainWindow : Window
                     break;
                 case Material m_Material:
                     PreviewMaterial(assetItem, m_Material);
-                    OfferMaterialShaderPreview(assetItem, m_Material);
                     break;
                 case TextAsset m_TextAsset:
                     PreviewTextAsset(assetItem, m_TextAsset, fbxHeader);

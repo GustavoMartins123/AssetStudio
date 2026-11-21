@@ -273,6 +273,7 @@ void main()
         {
             try
             {
+                DeleteMaterialShaderFrame();
                 CleanupBuffers();
                 DeleteProgramIfCreated(ref pgmID);
                 DeleteProgramIfCreated(ref pgmColorID);

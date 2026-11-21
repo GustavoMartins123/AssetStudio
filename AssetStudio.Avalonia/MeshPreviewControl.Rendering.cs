@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Avalonia;
 using Avalonia.OpenGL;
+using AssetStudio.Avalonia.Services;
+using OpenTK.Mathematics;
 using OpenTK.Graphics.OpenGL;
 using SkiaSharp;
 
@@ -12,6 +15,52 @@ namespace AssetStudio.Avalonia
 
     public partial class MeshPreviewControl
     {
+        public static readonly StyledProperty<bool> IsMaterialShaderPreviewProperty =
+            AvaloniaProperty.Register<MeshPreviewControl, bool>(nameof(IsMaterialShaderPreview));
+
+        public static readonly StyledProperty<ShaderPreviewFrame?> MaterialShaderFrameProperty =
+            AvaloniaProperty.Register<MeshPreviewControl, ShaderPreviewFrame?>(nameof(MaterialShaderFrame));
+
+        private ShaderPreviewFrame? uploadedMaterialShaderFrame;
+        private int materialShaderTexture, materialShaderFramebuffer;
+
+        public bool IsMaterialShaderPreview
+        {
+            get => GetValue(IsMaterialShaderPreviewProperty);
+            set => SetValue(IsMaterialShaderPreviewProperty, value);
+        }
+
+        public ShaderPreviewFrame? MaterialShaderFrame
+        {
+            get => GetValue(MaterialShaderFrameProperty);
+            set => SetValue(MaterialShaderFrameProperty, value);
+        }
+
+        protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+        {
+            base.OnPropertyChanged(change);
+            if (change.Property == IsMaterialShaderPreviewProperty)
+            {
+                if (IsMaterialShaderPreview)
+                {
+                    ++meshLoadCounter;
+                    ClearAvatarPreviewState();
+                    ClearMeshPreviewSource();
+                    SetInitialPreviewFrame(Matrix4.Identity, Matrix4.Identity);
+                }
+                else
+                {
+                    StopAnimation();
+                    uploadedMaterialShaderFrame = null;
+                }
+                InvalidatePreviewCamera();
+            }
+            else if (change.Property == MaterialShaderFrameProperty)
+            {
+                RequestNextFrameRendering();
+            }
+        }
+
         public void SetMaterialOverrides(IReadOnlyList<Vector4>? materialTints)
         {
             materialTintOverrides = materialTints == null || materialTints.Count == 0
@@ -110,6 +159,11 @@ namespace AssetStudio.Avalonia
         {
             try
             {
+                if (IsMaterialShaderPreview)
+                {
+                    RenderMaterialShaderFrame(fb);
+                    return;
+                }
                 var indices = indiceData;
                 bool hasMeshGeometry = vertexData != null && vertexData.Length > 0 && indices != null && indices.Length > 0;
                 bool hasSkeletonGeometry = isAvatarMode && (boneLinesVertexCount > 0 || jointPointsVertexCount > 0 || pendingSkeletonVertices != null);
@@ -174,6 +228,61 @@ namespace AssetStudio.Avalonia
             catch (Exception ex)
             {
                 GpuErrorOccurred?.Invoke($"OpenGL rendering failed: {ex.Message}");
+            }
+        }
+
+        private void RenderMaterialShaderFrame(int framebuffer)
+        {
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
+            GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+            if (MaterialShaderFrame is not { } frame)
+            {
+                return;
+            }
+
+            if (materialShaderTexture == 0)
+            {
+                materialShaderTexture = GL.GenTexture();
+                materialShaderFramebuffer = GL.GenFramebuffer();
+                GL.BindTexture(TextureTarget.Texture2D, materialShaderTexture);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+            }
+            if (!ReferenceEquals(uploadedMaterialShaderFrame, frame))
+            {
+                GL.BindTexture(TextureTarget.Texture2D, materialShaderTexture);
+                if (uploadedMaterialShaderFrame is { } previous && previous.Width == frame.Width && previous.Height == frame.Height)
+                {
+                    GL.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, frame.Width, frame.Height, PixelFormat.Rgba, PixelType.UnsignedByte, frame.RgbaPixels);
+                }
+                else
+                {
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, frame.Width, frame.Height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, frame.RgbaPixels);
+                    GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, materialShaderFramebuffer);
+                    GL.FramebufferTexture2D(FramebufferTarget.ReadFramebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, materialShaderTexture, 0);
+                }
+                uploadedMaterialShaderFrame = frame;
+            }
+
+            double scale = global::Avalonia.Controls.TopLevel.GetTopLevel(this)?.RenderScaling ?? 1;
+            int width = Math.Max(1, (int)Math.Ceiling(Bounds.Width * scale));
+            int height = Math.Max(1, (int)Math.Ceiling(Bounds.Height * scale));
+            int size = Math.Min(width, height);
+            int x = (width - size) / 2, y = (height - size) / 2;
+            GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, materialShaderFramebuffer);
+            GL.BlitFramebuffer(0, frame.Height, frame.Width, 0, x, y, x + size, y + size, ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Linear);
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
+            GL.Flush();
+        }
+
+        private void DeleteMaterialShaderFrame()
+        {
+            if (materialShaderFramebuffer != 0)
+            {
+                GL.DeleteFramebuffer(materialShaderFramebuffer);
+                GL.DeleteTexture(materialShaderTexture);
+                materialShaderFramebuffer = materialShaderTexture = 0;
+                uploadedMaterialShaderFrame = null;
             }
         }
 

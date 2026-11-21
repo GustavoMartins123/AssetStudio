@@ -1155,13 +1155,7 @@ namespace AssetStudio.Avalonia
                 vao = 0;
                 RequestNextFrameRendering();
 
-                animTimer = new global::Avalonia.Threading.DispatcherTimer
-                {
-                    Interval = TimeSpan.FromMilliseconds(1000.0 / animFps)
-                };
-                animTimer.Tick += OnAnimationTick;
-                animTimer.Start();
-                isAnimPlaying = true;
+                StartAnimationTimer();
             }
             else
             {
@@ -1268,9 +1262,27 @@ namespace AssetStudio.Avalonia
             });
         }
 
+        private void StartAnimationTimer()
+        {
+            animTimer = new global::Avalonia.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(1000.0 / animFps)
+            };
+            animTimer.Tick += OnAnimationTick;
+            PlayAnimation();
+        }
+
+        internal void StartMaterialShaderAnimation(int frames, float fps)
+        {
+            StopAnimation();
+            materialShaderFrameCount = frames;
+            animFps = fps;
+            StartAnimationTimer();
+        }
+
         public void PlayAnimation()
         {
-            if (animationFrames == null || animTimer == null)
+            if (AnimTotalFrames == 0 || animTimer == null)
             {
                 return;
             }
@@ -1307,7 +1319,7 @@ namespace AssetStudio.Avalonia
             if (animPausedByHiddenTab)
             {
                 animPausedByHiddenTab = false;
-                if (animationFrames != null && animTimer != null && !isAnimPlaying)
+                if (AnimTotalFrames > 0 && animTimer != null && !isAnimPlaying)
                 {
                     animTimer.Start();
                     isAnimPlaying = true;
@@ -1322,6 +1334,13 @@ namespace AssetStudio.Avalonia
 
         public void RestartAnimation()
         {
+            if (materialShaderFrameCount > 0)
+            {
+                animCurrentFrame = 0;
+                AnimationFrameChanged?.Invoke(0, materialShaderFrameCount);
+                PlayAnimation();
+                return;
+            }
             if (animationFrames == null)
             {
                 return;
@@ -1345,6 +1364,7 @@ namespace AssetStudio.Avalonia
                 animTimer = null;
             }
             animationFrames = null;
+            materialShaderFrameCount = 0;
             animParentIndices = null;
             animCurrentFrame = 0;
             isAnimPlaying = false;
@@ -1928,6 +1948,12 @@ namespace AssetStudio.Avalonia
 
         private void OnAnimationTick(object? sender, EventArgs e)
         {
+            if (materialShaderFrameCount > 0)
+            {
+                animCurrentFrame = (animCurrentFrame + 1) % materialShaderFrameCount;
+                AnimationFrameChanged?.Invoke(animCurrentFrame, materialShaderFrameCount);
+                return;
+            }
             if (animationFrames == null || animParentIndices == null || animationFrames.Length == 0)
             {
                 return;
