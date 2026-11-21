@@ -1018,9 +1018,38 @@ namespace AssetStudio.Avalonia.Services
 
         public static string GetTextAssetExtension(AssetItem asset, ExportOptionsState options)
         {
-            if (options.RestoreExtensionName && !string.IsNullOrEmpty(asset.Container))
+            if (options.RestoreExtensionName)
             {
-                return SanitizeExtension(Path.GetExtension(asset.Container), ".txt");
+                if (!string.IsNullOrEmpty(asset.Container))
+                {
+                    var containerExt = Path.GetExtension(asset.Container);
+                    if (!string.IsNullOrWhiteSpace(containerExt))
+                    {
+                        return SanitizeExtension(containerExt, ".txt");
+                    }
+                }
+
+                if (asset.Asset is TextAsset textAsset && textAsset.m_Script is { Length: > 0 })
+                {
+                    var detected = TextAssetBinaryFormatDetector.Detect(
+                        textAsset.m_Script,
+                        asset.Name,
+                        asset.Container,
+                        inspectArchiveEntries: false);
+                    if (detected.IsBinaryFormat && !string.IsNullOrWhiteSpace(detected.RecommendedExtension))
+                    {
+                        return SanitizeExtension(detected.RecommendedExtension, ".txt");
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(asset.Name))
+                {
+                    var nameExt = Path.GetExtension(asset.Name);
+                    if (!string.IsNullOrWhiteSpace(nameExt))
+                    {
+                        return SanitizeExtension(nameExt, ".txt");
+                    }
+                }
             }
 
             return ".txt";
@@ -1903,7 +1932,14 @@ namespace AssetStudio.Avalonia.Services
                 case TextAsset m_TextAsset:
                 {
                     var extension = GetTextAssetExtension(item, exportOptions);
-                    if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, extension, item, out var filePath)) return false;
+                    var exportBaseName = fileName;
+                    if (!string.IsNullOrEmpty(extension)
+                        && exportBaseName.Length > extension.Length
+                        && exportBaseName.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exportBaseName = exportBaseName.Substring(0, exportBaseName.Length - extension.Length);
+                    }
+                    if (!conversionContext.TryGetAssetFilePath(exportPath, exportBaseName, extension, item, out var filePath)) return false;
                     WriteBytesExport(filePath, m_TextAsset.m_Script);
                     return true;
                 }

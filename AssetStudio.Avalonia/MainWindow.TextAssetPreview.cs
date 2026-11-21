@@ -239,9 +239,34 @@ public partial class MainWindow
 
     private void PreviewTextAsset(AssetItem assetItem, TextAsset m_TextAsset, string fbxHeader)
     {
+        var data = m_TextAsset.m_Script ?? Array.Empty<byte>();
+        if (data.Length > 0)
+        {
+            var detected = Services.TextAssetBinaryFormatDetector.Detect(
+                data,
+                assetItem.Name,
+                assetItem.Container,
+                inspectArchiveEntries: false);
+
+            if (TryPreviewTextAssetEmbeddedMedia(assetItem, m_TextAsset, data, detected, fbxHeader))
+            {
+                return;
+            }
+        }
+
+        PreviewTextAssetStandardAsync(assetItem, data, fbxHeader);
+    }
+
+    private void PreviewTextAssetStandardAsync(AssetItem assetItem, byte[] data, string fbxHeader)
+    {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
         bool isDark = ActualThemeVariant == global::Avalonia.Styling.ThemeVariant.Dark;
 
+        PreviewSession.ActivateSurface(
+            PreviewSurfaceKind.Text,
+            assetItem,
+            isLoading: true,
+            loadingStatusText: $"Loading TextAsset preview: {assetItem.Name}...");
         TextPreviewBox.FontFamily = TextAssetMonoFontFamily;
         TextPreviewBox.FontSize = 13;
         TextPreviewBox.Text = "Loading TextAsset preview...";
@@ -255,7 +280,6 @@ public partial class MainWindow
             try
             {
                 token.ThrowIfCancellationRequested();
-                var data = m_TextAsset.m_Script ?? Array.Empty<byte>();
                 var preview = TextAssetPreviewBuilder.BuildPreview(assetItem, data, fbxHeader);
                 token.ThrowIfCancellationRequested();
 
@@ -290,6 +314,7 @@ public partial class MainWindow
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(truncatedDetails, PreviewSurfaceKind.Text, assetItem, truncate: false);
                     TextPreviewBox.FontFamily = TextAssetMonoFontFamily;
                     TextPreviewBox.FontSize = 13;
                     TextPreviewBox.Text = truncatedDetails ?? string.Empty;
@@ -297,7 +322,14 @@ public partial class MainWindow
                     PreviewLabel.IsVisible = false;
                     ClearPreviewInfoOverlay();
 
-                    StatusStripUpdate($"TextAsset preview loaded ({data.Length:N0} bytes).");
+                    if (preview.DetectedFormat is { IsBinaryFormat: true } detectedBinary)
+                    {
+                        StatusStripUpdate($"TextAsset preview loaded: {detectedBinary.FormatName} ({data.Length:N0} bytes).");
+                    }
+                    else
+                    {
+                        StatusStripUpdate($"TextAsset preview loaded ({data.Length:N0} bytes).");
+                    }
                 });
             }
             catch (OperationCanceledException)
@@ -314,6 +346,7 @@ public partial class MainWindow
                         return;
                     }
 
+                    PreviewSession.ShowTextPreview(errorText, PreviewSurfaceKind.Text, assetItem, truncate: false);
                     TextPreviewBox.Text = errorText;
                     TextPreviewBox.IsVisible = true;
                     PreviewLabel.IsVisible = false;

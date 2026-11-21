@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia;
 
@@ -10,9 +11,11 @@ public static class TextAssetPreviewBuilder
 {
     private const int DecodeByteLimit = 1024 * 1024;
     private const int HexPreviewBytes = 4096;
+    private const int StructuredBinaryHexPreviewBytes = 1024;
     private const int SanitizedPreviewChars = 20000;
     private const int MaxReadableStrings = 240;
     private const int AmmoStringMaxLength = 4096;
+    private const int MaxAmmoInitialScanOffset = 4096;
     private const int MaxAmmoDialogueStrings = 180;
     private const int MaxAmmoCommandStrings = 120;
     private const int MaxAmmoTechnicalStrings = 260;
@@ -26,6 +29,8 @@ public static class TextAssetPreviewBuilder
 
     public static TextAssetPreviewResult BuildPreview(AssetItem assetItem, byte[] data, string fbxHeader)
     {
+        data ??= Array.Empty<byte>();
+
         if ((TryExtractAmmoEpisodeStringTable(data, out var ammoTable) ||
              TryExtractAmmoEpisodeStringTableLenient(data, out ammoTable)) &&
             IsAmmoEpisodeStringTable(ammoTable.Strings))
@@ -33,20 +38,112 @@ public static class TextAssetPreviewBuilder
             return BuildAmmoEpisodePreview(assetItem, data, fbxHeader, ammoTable);
         }
 
-        return BuildGenericPreview(assetItem, data, fbxHeader);
+        var detected = TextAssetBinaryFormatDetector.Detect(
+            data,
+            assetItem?.Name,
+            assetItem?.Container,
+            inspectArchiveEntries: true);
+
+        if (detected.IsBinaryFormat)
+        {
+            return BuildDetectedBinaryFormatPreview(assetItem, data, fbxHeader, detected);
+        }
+
+        if (detected.FormatId is "UTF-16LE" or "UTF-16BE")
+        {
+            int decodeBytes = Math.Min(data.Length, DecodeByteLimit);
+            var encoding = detected.FormatId == "UTF-16BE" ? Encoding.BigEndianUnicode : Encoding.Unicode;
+            int bomOffset = decodeBytes >= 2 ? 2 : 0;
+            int alignedCount = (decodeBytes - bomOffset) & ~1;
+            string decodedUtf16 = alignedCount > 0 ? encoding.GetString(data, bomOffset, alignedCount) : string.Empty;
+            return BuildPlainTextPreview(data, fbxHeader, decodedUtf16, decodeBytes, detected.FormatName, detected);
+        }
+
+        return BuildGenericPreview(assetItem, data, fbxHeader, detected);
     }
 
-    private static TextAssetPreviewResult BuildGenericPreview(AssetItem assetItem, byte[] data, string fbxHeader)
+    private static TextAssetPreviewResult BuildDetectedBinaryFormatPreview(
+        AssetItem? assetItem,
+        byte[] data,
+        string fbxHeader,
+        TextAssetFormatDetectionResult detected)
     {
-        CountBinaryMarkers(data, out var nullBytes, out var controlBytes, out var highBitBytes);
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(fbxHeader))
+        {
+            sb.Append(fbxHeader);
+        }
 
+        sb.AppendLine($"TextAsset: {assetItem?.Name ?? "Unknown"}");
+        sb.AppendLine($"Bytes: {data.Length:N0}");
+        sb.AppendLine($"Detected format: {detected.FormatName}");
+        sb.AppendLine($"Format ID: {detected.FormatId}");
+        sb.AppendLine($"Media kind: {detected.MediaKind}");
+        sb.AppendLine($"Recommended extension: {detected.RecommendedExtension}");
+        sb.AppendLine($"MIME type: {detected.MimeType}");
+
+        if (detected.MetadataFields.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Format metadata:");
+            sb.AppendLine("------------------------------------------------------------");
+            foreach (var field in detected.MetadataFields)
+            {
+                sb.Append("  ");
+                sb.Append(field.Key);
+                sb.Append(": ");
+                sb.AppendLine(field.Value);
+            }
+        }
+
+        if (detected.ArchiveEntries.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Archive entries (showing {detected.ArchiveEntries.Count:N0} of {detected.ArchiveEntryCount:N0}):");
+            sb.AppendLine("------------------------------------------------------------");
+            for (int i = 0; i < detected.ArchiveEntries.Count; i++)
+            {
+                sb.Append("  ");
+                sb.Append((i + 1).ToString("D3", CultureInfo.InvariantCulture));
+                sb.Append(": ");
+                sb.AppendLine(detected.ArchiveEntries[i]);
+            }
+        }
+
+        sb.AppendLine();
+        int hexBytes = Math.Min(data.Length, StructuredBinaryHexPreviewBytes);
+        sb.AppendLine($"Hex preview (first {hexBytes:N0} bytes):");
+        sb.AppendLine("------------------------------------------------------------");
+        sb.Append(BuildHexPreview(data, StructuredBinaryHexPreviewBytes));
+
+        var report = sb.ToString();
+        return new TextAssetPreviewResult(
+            report,
+            detected.FormatName,
+            0,
+            Array.Empty<TextAssetDialogueCard>(),
+            report,
+            detected);
+    }
+
+    private static TextAssetPreviewResult BuildGenericPreview(
+        AssetItem? assetItem,
+        byte[] data,
+        string fbxHeader,
+        TextAssetFormatDetectionResult? detected = null)
+    {
         int decodeBytes = Math.Min(data.Length, DecodeByteLimit);
+        CountBinaryMarkers(data, decodeBytes, out var nullBytes, out var controlBytes, out var highBitBytes);
+
         string decoded = decodeBytes > 0 ? Encoding.UTF8.GetString(data, 0, decodeBytes) : string.Empty;
         bool strictUtf8 = TryDecodeUtf8Strict(data, 0, decodeBytes, out _);
-        bool likelyBinary = nullBytes > 0 || controlBytes > Math.Max(8, data.Length / 100);
+        bool likelyBinary = nullBytes > 0 || controlBytes > Math.Max(8, decodeBytes / 100);
         if (strictUtf8 && !likelyBinary)
         {
-            return BuildPlainTextPreview(data, fbxHeader, decoded, decodeBytes);
+            string formatName = detected is { MediaKind: TextAssetEmbeddedMediaKind.Text } && !string.IsNullOrEmpty(detected.FormatName)
+                ? detected.FormatName
+                : "UTF-8 text";
+            return BuildPlainTextPreview(data, fbxHeader, decoded, decodeBytes, formatName, detected);
         }
 
         var sb = new StringBuilder();
@@ -105,10 +202,17 @@ public static class TextAssetPreviewBuilder
             "Generic TextAsset",
             0,
             Array.Empty<TextAssetDialogueCard>(),
-            sb.ToString());
+            sb.ToString(),
+            detected);
     }
 
-    private static TextAssetPreviewResult BuildPlainTextPreview(byte[] data, string fbxHeader, string decoded, int decodeBytes)
+    private static TextAssetPreviewResult BuildPlainTextPreview(
+        byte[] data,
+        string fbxHeader,
+        string decoded,
+        int decodeBytes,
+        string formatName = "UTF-8 text",
+        TextAssetFormatDetectionResult? detected = null)
     {
         var sb = new StringBuilder(decoded.Length + fbxHeader.Length + 128);
         if (!string.IsNullOrEmpty(fbxHeader))
@@ -125,10 +229,11 @@ public static class TextAssetPreviewBuilder
 
         return new TextAssetPreviewResult(
             sb.ToString(),
-            "UTF-8 text",
+            formatName,
             0,
             Array.Empty<TextAssetDialogueCard>(),
-            sb.ToString());
+            sb.ToString(),
+            detected);
     }
 
     private static TextAssetPreviewResult BuildAmmoEpisodePreview(
@@ -522,9 +627,15 @@ public static class TextAssetPreviewBuilder
         }
 
         int offset = data[2] == 0x0A ? 5 : 0;
-        while (offset + 3 <= data.Length && data[offset] != 0x0C)
+        int initialScanLimit = Math.Min(data.Length, MaxAmmoInitialScanOffset);
+        while (offset + 3 <= initialScanLimit && data[offset] != 0x0C)
         {
             offset++;
+        }
+
+        if (offset + 3 > initialScanLimit || data[offset] != 0x0C)
+        {
+            return false;
         }
 
         var strings = new List<BinaryStringEntry>();
@@ -1300,12 +1411,19 @@ public static class TextAssetPreviewBuilder
 
     private static void CountBinaryMarkers(byte[] data, out int nullBytes, out int controlBytes, out int highBitBytes)
     {
+        CountBinaryMarkers(data, Math.Min(data.Length, DecodeByteLimit), out nullBytes, out controlBytes, out highBitBytes);
+    }
+
+    private static void CountBinaryMarkers(byte[] data, int maxBytes, out int nullBytes, out int controlBytes, out int highBitBytes)
+    {
         nullBytes = 0;
         controlBytes = 0;
         highBitBytes = 0;
 
-        foreach (var value in data)
+        int limit = Math.Min(data.Length, maxBytes);
+        for (int i = 0; i < limit; i++)
         {
+            var value = data[i];
             if (value == 0)
             {
                 nullBytes++;
@@ -1890,13 +2008,15 @@ public sealed class TextAssetPreviewResult
         string formatName,
         int parsedStringCount,
         IReadOnlyList<TextAssetDialogueCard> dialogueCards,
-        string plainTextScript)
+        string plainTextScript,
+        TextAssetFormatDetectionResult? detectedFormat = null)
     {
         DetailsText = detailsText;
         FormatName = formatName;
         ParsedStringCount = parsedStringCount;
         DialogueCards = dialogueCards;
         PlainTextScript = plainTextScript;
+        DetectedFormat = detectedFormat;
     }
 
     public string DetailsText { get; }
@@ -1908,6 +2028,8 @@ public sealed class TextAssetPreviewResult
     public IReadOnlyList<TextAssetDialogueCard> DialogueCards { get; }
 
     public string PlainTextScript { get; }
+
+    public TextAssetFormatDetectionResult? DetectedFormat { get; }
 
     public bool HasDialogueCards => DialogueCards.Count > 0;
 }
