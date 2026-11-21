@@ -171,6 +171,7 @@ public partial class ProjectManagerWindow : Window
                 if (!app.NavigateToMainWindow(this, context))
                 {
                     _isLaunchingMainWindow = false;
+                    ViewModel.CancelLaunch();
                 }
                 return;
             }
@@ -191,6 +192,7 @@ public partial class ProjectManagerWindow : Window
         catch
         {
             _isLaunchingMainWindow = false;
+            ViewModel.CancelLaunch();
             throw;
         }
     }

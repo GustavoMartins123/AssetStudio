@@ -439,6 +439,106 @@ namespace AssetStudio.Tests
         }
 
         [Fact]
+        public async Task ProjectManagerViewModel_RejectedOrFailedLaunch_ResetsHasLaunchedAndReenablesCommands()
+        {
+            var tempRoot = Path.Combine(Path.GetTempPath(), "AssetStudioTests_ProjLaunchFail_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+            try
+            {
+                var storeDir = Path.Combine(tempRoot, "Store");
+                var alphaDir = Path.Combine(tempRoot, "Alpha");
+                Directory.CreateDirectory(alphaDir);
+
+                var store = new ProjectManagerStore(storeDir);
+                var alpha = new ManagedProject { Name = "Alpha", UseAutoName = false, ProjectRoot = alphaDir };
+                store.SaveProject(alpha);
+
+                var errors = new List<(string Message, string Title)>();
+                var requestCloseCount = 0;
+                var mode = "reject";
+                var successfulLaunches = 0;
+
+                ProjectManagerViewModel? vmRef = null;
+                using var vm = new ProjectManagerViewModel(
+                    store: store,
+                    dispatchToUi: action => action(),
+                    showError: (msg, title) => errors.Add((msg, title)),
+                    launchProject: _ =>
+                    {
+                        if (mode == "reject")
+                        {
+                            // Mirrors App.NavigateToMainWindow returning false.
+                            vmRef!.CancelLaunch();
+                            return;
+                        }
+
+                        if (mode == "throw")
+                        {
+                            throw new InvalidOperationException("Window creation failed");
+                        }
+
+                        successfulLaunches++;
+                    });
+                vmRef = vm;
+                vm.RequestClose += _ => requestCloseCount++;
+
+                await vm.RefreshProjectsAsync(selectProjectId: alpha.Id);
+                Assert.True(vm.CanOpen);
+                Assert.True(vm.CanOpenWithoutProject);
+
+                // 1) Rejected transition via CancelLaunch() must re-enable Open / OpenWithoutProject and NOT fire RequestClose.
+                await vm.OpenSelectedProjectAsync();
+                Assert.False(vm.HasLaunched);
+                Assert.Null(vm.OpenedLaunchContext);
+                Assert.True(vm.CanOpen);
+                Assert.True(vm.CanOpenWithoutProject);
+                Assert.Equal(0, requestCloseCount);
+                Assert.Empty(errors);
+
+                // 2) Exception thrown during launchProject on OpenSelectedProjectAsync must reset HasLaunched, report error, and stay usable.
+                mode = "throw";
+                await vm.OpenSelectedProjectAsync();
+                Assert.False(vm.HasLaunched);
+                Assert.Null(vm.OpenedLaunchContext);
+                Assert.True(vm.CanOpen);
+                Assert.True(vm.CanOpenWithoutProject);
+                Assert.Equal(0, requestCloseCount);
+                Assert.Single(errors);
+
+                // 3) Exception thrown during OpenWithoutProject must also reset HasLaunched cleanly.
+                Assert.Throws<InvalidOperationException>(() => vm.OpenWithoutProject());
+                Assert.False(vm.HasLaunched);
+                Assert.True(vm.CanOpen);
+                Assert.True(vm.CanOpenWithoutProject);
+                Assert.Equal(0, requestCloseCount);
+
+                // 4) Subsequent retry succeeds cleanly.
+                mode = "succeed";
+                await vm.OpenSelectedProjectAsync();
+                Assert.True(vm.HasLaunched);
+                Assert.NotNull(vm.OpenedLaunchContext);
+                Assert.False(vm.CanOpen);
+                Assert.False(vm.CanOpenWithoutProject);
+                Assert.Equal(1, successfulLaunches);
+                Assert.Equal(1, requestCloseCount);
+            }
+            finally
+            {
+                SqliteConnection.ClearAllPools();
+                try
+                {
+                    if (Directory.Exists(tempRoot))
+                    {
+                        Directory.Delete(tempRoot, recursive: true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        [Fact]
         public void MainWindow_BackToProjectsUi_UsesPureMvvmBindingsShortcutTopBarAndSafeStaticTeardown()
         {
             var repoRoot = LocateRepositoryRoot();

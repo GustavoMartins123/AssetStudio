@@ -770,8 +770,8 @@ namespace AssetStudio.Avalonia.ViewModels
 
                 var settings = await Task.Run(() => _store.LoadProjectSettings(project));
                 var context = new ProjectLaunchContext(_store, project, settings);
-                launched = true;
                 CompleteLaunch(context);
+                launched = HasLaunched;
             }
             catch (Exception ex)
             {
@@ -913,13 +913,38 @@ namespace AssetStudio.Avalonia.ViewModels
             _store.AnalysisService.AnalysisUpdated -= OnProjectAnalysisUpdated;
         }
 
+        public void CancelLaunch()
+        {
+            if (!HasLaunched && !_isOpeningProject && OpenedLaunchContext == null)
+            {
+                return;
+            }
+
+            OpenedLaunchContext = null;
+            HasLaunched = false;
+            _isOpeningProject = false;
+            NotifyStateAndCommandsChanged();
+        }
+
         private void CompleteLaunch(ProjectLaunchContext? context)
         {
             OpenedLaunchContext = context;
             HasLaunched = true;
             NotifyStateAndCommandsChanged();
-            LaunchProject?.Invoke(context);
-            RequestClose?.Invoke(true);
+            try
+            {
+                LaunchProject?.Invoke(context);
+            }
+            catch
+            {
+                CancelLaunch();
+                throw;
+            }
+
+            if (HasLaunched)
+            {
+                RequestClose?.Invoke(true);
+            }
         }
 
         private async Task CleanupRemovedProjectInBackgroundAsync(ProjectRemovalCleanup cleanup)

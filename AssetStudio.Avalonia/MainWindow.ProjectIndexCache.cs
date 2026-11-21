@@ -190,10 +190,16 @@ public partial class MainWindow : Window
 
     private async Task BuildLazyConnectionsAsync(string folderPath, ProjectScanResult scanResult)
     {
-        if (isBuildingLazyConnections)
+        if (isBuildingLazyConnections || IsWindowClosingOrClosed || _isReturningToProjectManager)
         {
             return;
         }
+
+        var connectionSessionId = lazyIndexingSessionId;
+        bool IsConnectionAborted() =>
+            IsWindowClosingOrClosed
+            || _isReturningToProjectManager
+            || connectionSessionId != lazyIndexingSessionId;
 
         isBuildingLazyConnections = true;
         ViewModel.IsIndexingActive = true;
@@ -212,6 +218,11 @@ public partial class MainWindow : Window
         {
             StatusStripUpdate("Preparing connection build...");
             sourcePaths = await Task.Run(GetLazyConnectionSourcePaths);
+            if (IsConnectionAborted())
+            {
+                return;
+            }
+
             if (sourcePaths.Count == 0)
             {
                 Logger.Warning("Unable to build lazy connections: no source files could be resolved from the project index.");
@@ -225,11 +236,21 @@ public partial class MainWindow : Window
 
             var signature = _sqliteCache.GetFolderSignature(scanResult);
             using var stagingSession = await Task.Run(() => _sqliteCache.BeginSemanticStagingSession(folderPath, signature));
+            if (IsConnectionAborted())
+            {
+                stagingSession.Abort();
+                return;
+            }
 
             var buildResult = await Task.Run(async () => await BuildLazySemanticRelationsForSourcesAsync(
                 sourcePaths,
                 (processedFiles, currentSourcePath) =>
                 {
+                    if (IsConnectionAborted())
+                    {
+                        return;
+                    }
+
                     lastSourcePath = currentSourcePath;
                     lastProcessedFiles = processedFiles;
                     PublishLazyConnectionProgress(
@@ -246,12 +267,22 @@ public partial class MainWindow : Window
                         : Math.Min(100, Math.Max(0, processedFiles * 100.0 / sourcePaths.Count));
                     Dispatcher.UIThread.Post(() =>
                     {
+                        if (IsConnectionAborted())
+                        {
+                            return;
+                        }
                         ViewModel.LoadingProgress = (int)percent;
                         StatusStripUpdate($"Building connections... {processedFiles:N0}/{sourcePaths.Count:N0} files ({percent:0.#}%)");
                     }, DispatcherPriority.Background);
                 },
                 stagingSession,
                 LazyConnectionStagingFlushRowThreshold));
+            if (IsConnectionAborted())
+            {
+                stagingSession.Abort();
+                return;
+            }
+
             var relations = buildResult.Relations;
             var diagnostics = buildResult.Diagnostics;
             var diagnosticSummary = SemanticGraphService.FormatLazyConnectionStatusSummary(sourcePaths.Count, diagnostics);
@@ -266,6 +297,11 @@ public partial class MainWindow : Window
             }
 
             var saved = await Task.Run(() => TryCommitSemanticStagingSession(folderPath, scanResult, stagingSession));
+            if (IsConnectionAborted())
+            {
+                return;
+            }
+
             if (!saved)
             {
                 stagingSession.Abort();
@@ -281,21 +317,32 @@ public partial class MainWindow : Window
         }
         catch (MemoryPressureException ex)
         {
+            if (IsConnectionAborted())
+            {
+                return;
+            }
             PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
             ShowMemoryPressureError(ex);
         }
         catch (Exception ex)
         {
+            if (IsConnectionAborted())
+            {
+                return;
+            }
             PublishLazyConnectionProgress(folderPath, scanResult, "connections_failed", lastProcessedFiles, sourcePaths.Count, string.Empty, lastSourcePath);
             Logger.Error($"Failed to build lazy asset connections: {ex}", ex);
             StatusStripUpdate("Connections build failed.");
         }
         finally
         {
-            ViewModel.IsIndexingActive = false;
-            ViewModel.IsPauseEnabled = false;
-            ViewModel.IsResumeEnabled = false;
-            ViewModel.IsStopEnabled = false;
+            if (!IsWindowClosingOrClosed)
+            {
+                ViewModel.IsIndexingActive = false;
+                ViewModel.IsPauseEnabled = false;
+                ViewModel.IsResumeEnabled = false;
+                ViewModel.IsStopEnabled = false;
+            }
             isBuildingLazyConnections = false;
         }
     }
@@ -307,7 +354,13 @@ public partial class MainWindow : Window
         int processedFiles,
         int totalFiles,
         string currentFile,
-        string lastReadFile) =>
+        string lastReadFile)
+    {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return;
+        }
+
         ProjectLoadingService.PublishLazyConnectionProgress(
             _sqliteCache,
             folderPath,
@@ -319,6 +372,7 @@ public partial class MainWindow : Window
             lastReadFile,
             ref lastConnectionDbWriteTicks,
             update => ShowIndexingProgressPanel(update));
+    }
 
     private void PublishStructureBuildProgress(
         string status,
@@ -326,7 +380,13 @@ public partial class MainWindow : Window
         int totalSteps,
         string currentStage,
         bool persist = true,
-        int percentDecimals = 1) =>
+        int percentDecimals = 1)
+    {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return;
+        }
+
         ProjectLoadingService.PublishStructureBuildProgress(
             _sqliteCache,
             GetCurrentCacheFolderPath(),
@@ -338,6 +398,7 @@ public partial class MainWindow : Window
             persist,
             percentDecimals,
             ShowIndexingProgressPanel);
+    }
 
     private List<string> GetLazyConnectionSourcePaths() =>
         SemanticGraphService.GetLazyConnectionSourcePaths(

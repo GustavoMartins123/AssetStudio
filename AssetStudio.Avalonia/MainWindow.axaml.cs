@@ -487,7 +487,10 @@ public partial class MainWindow : Window
 
     private async Task LoadFileCommandHandlerAsync()
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
         var files = await PickOpenFilesDialogAsync("Select Game File", true);
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
 
         if (files.Count > 0)
         {
@@ -506,22 +509,29 @@ public partial class MainWindow : Window
             }
             catch (MemoryPressureException ex)
             {
+                if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
                 ShowMemoryPressureError(ex);
                 return;
             }
             catch (Exception ex)
             {
+                if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
                 await ViewModel.DialogService.ShowErrorAsync("Load failed", $"Error loading files:\n{ex.Message}");
                 StatusStripUpdate("Load failed.");
                 return;
             }
+
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
             BuildAssetStructures();
         }
     }
 
     private async Task LoadFolderCommandHandlerAsync()
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
         var folderPath = await PickLoadFolderDialogAsync("Select Game Folder");
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
 
         if (!string.IsNullOrWhiteSpace(folderPath))
         {
@@ -531,7 +541,10 @@ public partial class MainWindow : Window
 
     private async Task LoadFolderEagerCommandHandlerAsync()
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
         var folderPath = await PickLoadFolderDialogAsync("Select Game Folder (Full / Scene Hierarchy)");
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
 
         if (!string.IsNullOrWhiteSpace(folderPath))
         {
@@ -541,7 +554,11 @@ public partial class MainWindow : Window
 
     private async Task LoadFolderEagerAsync(string folderPath)
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
         var choice = await ConfirmFolderLoadIfRisky(folderPath);
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
         if (choice == RiskyLoadChoice.Cancel)
         {
             StatusStripUpdate("Folder load cancelled.");
@@ -571,16 +588,19 @@ public partial class MainWindow : Window
         }
         catch (MemoryPressureException ex)
         {
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
             ShowMemoryPressureError(ex);
             return;
         }
         catch (Exception ex)
         {
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
             MessageBox.Show(this, $"Error loading folder:\n{ex.Message}", "Load failed");
             StatusStripUpdate("Folder load failed.");
             return;
         }
 
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
         await BuildAssetStructuresAsync();
     }
 
@@ -632,10 +652,12 @@ public partial class MainWindow : Window
         }
         catch (MemoryPressureException ex)
         {
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
             ShowMemoryPressureError(ex);
             return;
         }
 
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
         BuildAssetStructures();
     }
 
@@ -946,6 +968,11 @@ public partial class MainWindow : Window
                             StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.");
 
                             await BuildLazyConnectionsIfNeededAsync(paths);
+                            if (sessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                            {
+                                return;
+                            }
+
                             if (ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(paths))
                             {
                                 return;
@@ -967,10 +994,13 @@ public partial class MainWindow : Window
                         }
                         finally
                         {
-                            ViewModel.IsIndexingActive = false;
-                            ViewModel.IsPauseEnabled = false;
-                            ViewModel.IsResumeEnabled = false;
-                            ViewModel.IsStopEnabled = false;
+                            if (!IsWindowClosingOrClosed)
+                            {
+                                ViewModel.IsIndexingActive = false;
+                                ViewModel.IsPauseEnabled = false;
+                                ViewModel.IsResumeEnabled = false;
+                                ViewModel.IsStopEnabled = false;
+                            }
                         }
                     }
                 }
@@ -1106,10 +1136,18 @@ public partial class MainWindow : Window
             },
             (folderPath, scanResult) =>
             {
+                if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                {
+                    return;
+                }
                 SaveIndexCache(folderPath, scanResult);
             },
             update =>
             {
+                if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                {
+                    return;
+                }
                 TrySaveIndexingProgress(paths, update);
                 ShowIndexingProgressPanel(update);
             },
@@ -1117,7 +1155,7 @@ public partial class MainWindow : Window
             {
                 Dispatcher.UIThread.Post(async () =>
                 {
-                    if (indexingSessionId != lazyIndexingSessionId)
+                    if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
                     {
                         return;
                     }
@@ -1135,16 +1173,29 @@ public partial class MainWindow : Window
                         if (!wasCancelled)
                         {
                             await BuildLazyConnectionsIfNeededAsync(paths, force: true);
+                            if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                            {
+                                return;
+                            }
                             if (ShouldSkipLazyStructureBuildUntilConnectionsAreSaved(paths))
                             {
                                 return;
                             }
                         }
 
+                        if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                        {
+                            return;
+                        }
+
                         await BuildAssetStructuresAsync(incremental: true, showStructureProgress: !wasCancelled);
                     }
                     catch (Exception ex)
                     {
+                        if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                        {
+                            return;
+                        }
                         Logger.Error($"Failed to finish lazy indexing: {ex}", ex);
                         StatusStripUpdate("Lazy indexing finalization failed.");
                     }
@@ -1278,14 +1329,21 @@ public partial class MainWindow : Window
 
     private async Task BuildAssetStructuresAsync(bool incremental = false, bool showStructureProgress = false)
     {
-        if (isBuildingAssetStructures) return;
+        if (isBuildingAssetStructures || IsWindowClosingOrClosed || _isReturningToProjectManager) return;
         isBuildingAssetStructures = true;
-        var publishStructureProgress = showStructureProgress && assetsManager.LazyLoading && currentScanResult != null;
+        var structureSessionId = lazyIndexingSessionId;
+        var isLazyStructure = assetsManager.LazyLoading;
+        var publishStructureProgress = showStructureProgress && isLazyStructure && currentScanResult != null;
         const int structureBuildSteps = 6;
+
+        bool IsStructureAborted() =>
+            IsWindowClosingOrClosed
+            || _isReturningToProjectManager
+            || (isLazyStructure && structureSessionId != lazyIndexingSessionId);
 
         void PublishStructureStage(int processedSteps, string stage)
         {
-            if (publishStructureProgress)
+            if (publishStructureProgress && !IsStructureAborted())
             {
                 PublishStructureBuildProgress("building_structure", processedSteps, structureBuildSteps, stage);
             }
@@ -1417,7 +1475,9 @@ public partial class MainWindow : Window
                     AssetClassItems: localAssetClassItems);
             });
 
+            if (IsStructureAborted()) return;
             await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
+            if (IsStructureAborted()) return;
             PublishStructureStage(5, "Applying asset structure to UI");
 
             var previousExportableCount = ViewModel.AssetList.TotalAssetCount;
@@ -1438,6 +1498,7 @@ public partial class MainWindow : Window
             if (needsFullRefresh)
             {
                 await FilterAssetListAsync(CancellationToken.None);
+                if (IsStructureAborted()) return;
                 FilterAssetClasses();
             }
             else
@@ -1445,6 +1506,7 @@ public partial class MainWindow : Window
                 UpdateAssetClassesIncremental(lazyResult.AssetClassItems);
             }
 
+            if (IsStructureAborted()) return;
             var lazyLog = $"Finished loading {assetsManager.assetsFileList.Count} files with {ExportableAssetCount:N0} exportable assets";
             var lazyObjCount = assetsManager.ProjectIndex.Count;
             if (lazyObjCount > 0)
@@ -1465,6 +1527,7 @@ public partial class MainWindow : Window
             PublishStructureStage(6, "Saving project metadata");
             var finalExportableCount = ExportableAssetCount;
             await Task.Run(() => SaveCurrentProjectAfterLoad(null, lazyObjCount, finalExportableCount));
+            if (IsStructureAborted()) return;
 
             if (publishStructureProgress)
             {
@@ -1628,7 +1691,9 @@ public partial class MainWindow : Window
             };
         });
 
+        if (IsStructureAborted()) return;
         await WaitForUserInteractionPriorityToClearAsync(CancellationToken.None);
+        if (IsStructureAborted()) return;
         PublishStructureStage(5, "Applying asset structure to UI");
 
         // Apply results back on the UI thread
@@ -1707,7 +1772,9 @@ public partial class MainWindow : Window
         PublishStructureStage(6, "Saving project metadata");
         var eagerExportableCount = ExportableAssetCount;
         await Task.Run(() => SaveCurrentProjectAfterLoad(result.ProductName, m_ObjectsCount, eagerExportableCount));
+        if (IsStructureAborted()) return;
         await Task.Run(() => TrySaveSemanticRelations(result.SemanticRelations));
+        if (IsStructureAborted()) return;
         if (publishStructureProgress)
         {
             PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
@@ -1715,6 +1782,10 @@ public partial class MainWindow : Window
         }
         catch
         {
+            if (IsStructureAborted())
+            {
+                return;
+            }
             if (publishStructureProgress)
             {
                 PublishStructureBuildProgress("structure_failed", structureBuildSteps, structureBuildSteps, "Asset structure build failed");

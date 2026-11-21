@@ -16,7 +16,7 @@ public partial class MainWindow : Window
 {
     public void StartProjectIndexingOnOpen()
     {
-        if (projectContext == null || projectAutoIndexStarted)
+        if (projectContext == null || projectAutoIndexStarted || IsWindowClosingOrClosed || _isReturningToProjectManager)
         {
             return;
         }
@@ -27,6 +27,11 @@ public partial class MainWindow : Window
 
     private async Task StartProjectIndexingOnOpenAsync()
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return;
+        }
+
         var root = projectContext?.Project.ProjectRoot;
         if (string.IsNullOrWhiteSpace(root))
         {
