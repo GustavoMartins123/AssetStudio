@@ -133,6 +133,10 @@ namespace AssetStudio
             else if (version[0] >= 5 && version[0] < 2021) //5.0 ~ 2020.3
             {
                 var m_ShaderKeywords = reader.ReadAlignedString();
+                if (version[0] == 5 && version[1] == 3)
+                {
+                    m_ValidKeywords = m_ShaderKeywords.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                }
             }
 
             if (version[0] >= 5) //5.0 and up
@@ -204,6 +208,7 @@ namespace AssetStudio
 
                 PPtr<Shader>? shader = null;
                 PPtr<Material>? parent = null;
+                string[] shaderKeywords = Array.Empty<string>();
                 UnityPropertySheet? savedProperties = null;
 
                 for (int i = 1; i < nodes.Count; i++)
@@ -215,6 +220,13 @@ namespace AssetStudio
                             break;
                         case "m_Parent":
                             parent = ReadPPtrStreaming<Material>(nodes, nextSibling, reader, ref i, reader.assetsFile, depth: 0);
+                            break;
+                        case "m_ShaderKeywords" when version[0] == 5 && version[1] == 3:
+                            if (!TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref i, out string keywords, depth: 0))
+                            {
+                                throw new InvalidDataException("Invalid Material.m_ShaderKeywords node.");
+                            }
+                            shaderKeywords = keywords.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
                             break;
                         case "m_SavedProperties":
                             savedProperties = ReadUnityPropertySheetStreaming(nodes, nextSibling, reader, ref i, reader.assetsFile);
@@ -232,6 +244,7 @@ namespace AssetStudio
 
                 m_Shader = shader ?? new PPtr<Shader>(0, 0, reader.assetsFile);
                 m_Parent = parent ?? new PPtr<Material>(0, 0, reader.assetsFile);
+                m_ValidKeywords = shaderKeywords;
                 m_SavedProperties = savedProperties;
                 return true;
             }

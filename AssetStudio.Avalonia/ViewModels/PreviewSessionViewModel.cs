@@ -94,6 +94,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public PreviewSessionViewModel(Action<Action>? dispatchToUi = null)
         {
             _dispatchToUi = dispatchToUi ?? (static action => action());
+            ShaderPreview = new ShaderPreviewViewModel(_dispatchToUi);
             DialogueCards = new BulkObservableCollection<TextAssetDialogueCardViewModel>();
             PreviewCandidates = new BulkObservableCollection<PreviewCandidateItem>();
         }
@@ -121,6 +122,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public BulkObservableCollection<TextAssetDialogueCardViewModel> DialogueCards { get; }
 
         public BulkObservableCollection<PreviewCandidateItem> PreviewCandidates { get; }
+        public ShaderPreviewViewModel ShaderPreview { get; }
 
         public PreviewSurfaceKind ActiveKind
         {
@@ -142,7 +144,6 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public bool IsTextSurfaceVisible =>
             _activeKind is PreviewSurfaceKind.Text
-                or PreviewSurfaceKind.Shader
                 or PreviewSurfaceKind.MonoBehaviour
                 or PreviewSurfaceKind.AnimatorGraph
                 or PreviewSurfaceKind.Prefab
@@ -287,6 +288,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 if (SetProperty(ref _isDumpTabActive, value))
                 {
                     OnPropertyChanged(nameof(IsPreviewTabActive));
+                    ShaderPreview.SetSuspended(value);
                 }
             }
         }
@@ -1102,6 +1104,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public void Dispose()
         {
+            ShaderPreview.Dispose();
             _previewCoordinator.Dispose();
             _dumpCoordinator.Dispose();
             _animationCoordinator.Dispose();

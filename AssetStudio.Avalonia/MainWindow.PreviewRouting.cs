@@ -134,6 +134,10 @@ public partial class MainWindow : Window
         if (selectedItem is AssetItem assetItem)
         {
             var id = assetItem.Handle != null ? assetItem.Handle.UniqueID : assetItem.UniqueID;
+            if (!string.Equals(_currentlySelectedUniqueID, id, StringComparison.Ordinal))
+            {
+                PreviewSession.ShaderPreview.Clear();
+            }
             _currentlySelectedUniqueID = id;
 
             if (RightTabControl.SelectedIndex == 1)
@@ -500,67 +504,6 @@ public partial class MainWindow : Window
         }
     }
 
-    private void PreviewShaderAsync(AssetItem assetItem, Shader m_Shader, string fbxHeader)
-    {
-        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
-        PreviewSession.ActivateSurface(
-            PreviewSurfaceKind.Shader,
-            assetItem,
-            isLoading: true,
-            loadingStatusText: $"Loading shader preview: {assetItem.Name}...");
-        PreviewSession.TextContent = "Loading shader preview...";
-        TextPreviewBox.Text = PreviewSession.TextContent;
-        TextPreviewBox.IsVisible = true;
-        PreviewLabel.IsVisible = false;
-        StatusStripUpdate($"Loading shader preview: {assetItem.Name}...");
-
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                var converted = m_Shader.Convert() ?? "Serialized Shader can't be read";
-                token.ThrowIfCancellationRequested();
-                var truncated = TruncatePreviewText(fbxHeader + converted);
-
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
-                    {
-                        return;
-                    }
-
-                    PreviewSession.ShowTextPreview(truncated, PreviewSurfaceKind.Shader, assetItem, truncate: false);
-                    TextPreviewBox.Text = truncated;
-                    TextPreviewBox.IsVisible = true;
-                    PreviewLabel.IsVisible = false;
-                    StatusStripUpdate($"Shader preview loaded: {assetItem.Name}");
-                });
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                logger.Log(LoggerEvent.Error, $"Shader preview failed for {assetItem.Name}: {ex}");
-                var errorText = TruncatePreviewText($"Failed to preview shader {assetItem.Name}:{Environment.NewLine}{ex.Message}");
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
-                    {
-                        return;
-                    }
-
-                    PreviewSession.ShowTextPreview(errorText, PreviewSurfaceKind.Shader, assetItem, truncate: false);
-                    TextPreviewBox.Text = errorText;
-                    TextPreviewBox.IsVisible = true;
-                    PreviewLabel.IsVisible = false;
-                    StatusStripUpdate($"Shader preview error: {ex.Message}");
-                });
-            }
-        }, token);
-    }
-
     private void PreviewPrefabInstanceAsync(AssetItem assetItem, Object prefab, string fbxHeader)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
@@ -704,6 +647,7 @@ public partial class MainWindow : Window
     {
         _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
+        PreviewSession.ShaderPreview.Clear();
         Interlocked.Increment(ref texturePreviewIdCounter);
         _lastPreviewedAssetUniqueId = assetItem.Handle != null ? assetItem.Handle.UniqueID : assetItem.UniqueID;
         if (!ViewModel.Options.EnablePreview)
@@ -797,12 +741,13 @@ public partial class MainWindow : Window
                     break;
                 case Material m_Material:
                     PreviewMaterial(assetItem, m_Material);
+                    OfferMaterialShaderPreview(assetItem, m_Material);
                     break;
                 case TextAsset m_TextAsset:
                     PreviewTextAsset(assetItem, m_TextAsset, fbxHeader);
                     break;
                 case Shader m_Shader:
-                    PreviewShaderAsync(assetItem, m_Shader, fbxHeader);
+                    PreviewShader(assetItem, m_Shader);
                     break;
                 case MonoBehaviour m_MonoBehaviour:
                     PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader);

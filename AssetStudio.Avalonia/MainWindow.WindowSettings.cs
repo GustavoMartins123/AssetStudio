@@ -161,6 +161,7 @@ public partial class MainWindow
     private void ClearPreview(string message = "[Preview Panel]")
     {
         _lastPreviewedAssetUniqueId = null;
+        PreviewSession.ShaderPreview.Clear();
         Stop2DAnimation();
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;
