@@ -14,6 +14,19 @@ namespace AssetStudio.Avalonia;
 
 public partial class MainWindow
 {
+    private sealed class ActiveVideoPreviewSource
+    {
+        public required string AssetIdKey { get; init; }
+        public required string Title { get; init; }
+        public required string ExportBaseName { get; init; }
+        public required string Extension { get; init; }
+        public required string KindDisplayName { get; init; }
+        public VideoClip? VideoClip { get; init; }
+        public byte[]? RawVideoBytes { get; init; }
+        public long PathId { get; init; }
+    }
+
+    private ActiveVideoPreviewSource? _currentVideoPreviewSource;
     private string? _currentTempVideoPath;
     private string? _currentTempVideoAssetId;
     private CancellationTokenSource? _videoPreviewLoadCts;
@@ -35,6 +48,38 @@ public partial class MainWindow
     private static void DeleteTempVideoFileBackground(string? filePath)
     {
         MediaTempFiles.DeleteInBackground(filePath, attempts: 8, retryDelayMs: 50);
+    }
+
+    private bool IsVideoSourceCurrent(ActiveVideoPreviewSource source, long sessionId)
+    {
+        if (!ReferenceEquals(_currentVideoPreviewSource, source)
+            || sessionId != Volatile.Read(ref _videoSessionCounter))
+        {
+            return false;
+        }
+
+        if (source.VideoClip != null && !ReferenceEquals(currentPreviewVideoClip, source.VideoClip))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string FormatPrefixedVideoLabel(string prefix, string? rawText, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(rawText))
+        {
+            return fallback;
+        }
+
+        var trimmed = rawText.Trim();
+        if (trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed;
+        }
+
+        return prefix + trimmed;
     }
 
     private void SetInitialVideoAudioLabel(VideoClip videoClip)
@@ -69,6 +114,24 @@ public partial class MainWindow
             VideoAudioLabel.Text = "Audio: no playable track found";
             VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(global::Avalonia.Media.Color.Parse("#ff9800"));
         }
+    }
+
+    private void SetEmbeddedVideoAudioLabel(string? audioText)
+    {
+        if (VideoAudioLabel == null)
+        {
+            return;
+        }
+
+        var formatted = FormatPrefixedVideoLabel("Audio: ", audioText, "Audio: Probed by FFmpeg on load");
+        VideoAudioLabel.Text = formatted;
+
+        bool hasNoAudio = formatted.Contains("no embedded", StringComparison.OrdinalIgnoreCase)
+            || formatted.Contains("no playable", StringComparison.OrdinalIgnoreCase)
+            || formatted.EndsWith(": none", StringComparison.OrdinalIgnoreCase);
+
+        VideoAudioLabel.Foreground = new global::Avalonia.Media.SolidColorBrush(
+            global::Avalonia.Media.Color.Parse(hasNoAudio ? "#ff9800" : "#00e676"));
     }
 
     private void VideoStop()
@@ -107,6 +170,7 @@ public partial class MainWindow
     {
         CancelVideoPreviewLoad();
         Interlocked.Increment(ref _videoSessionCounter);
+        _currentVideoPreviewSource = null;
 
         try
         {
@@ -163,25 +227,203 @@ public partial class MainWindow
         var sessionId = Volatile.Read(ref _videoSessionCounter);
         currentPreviewVideoClip = m_VideoClip;
 
+        var ext = SanitizeExtension(Path.GetExtension(m_VideoClip.m_OriginalPath), ".mp4");
+        var source = new ActiveVideoPreviewSource
+        {
+            AssetIdKey = videoAssetId,
+            Title = m_VideoClip.m_Name,
+            ExportBaseName = m_VideoClip.m_Name,
+            Extension = ext,
+            KindDisplayName = "VideoClip",
+            VideoClip = m_VideoClip,
+            PathId = m_VideoClip.m_PathID
+        };
+        _currentVideoPreviewSource = source;
+
+        PreviewSession.ActivateSurface(PreviewSurfaceKind.Video, assetItem, title: m_VideoClip.m_Name);
         MediaPlayback.SelectVideo(m_VideoClip.m_Name, "Ready. Press Play to prepare embedded preview.");
         MediaPlayback.SetVideoVolume(MediaPlaybackViewModel.DefaultVolume);
 
-        VideoResolutionLabel.Text = $"Resolution: {m_VideoClip.m_Width}x{m_VideoClip.m_Height} (Proxy: {m_VideoClip.m_ProxyWidth}x{m_VideoClip.m_ProxyHeight})";
-        VideoFrameRateLabel.Text = $"Frame Rate: {m_VideoClip.m_FrameRate:F2} FPS | Frames: {m_VideoClip.m_FrameCount}";
-
-        var ext = SanitizeExtension(Path.GetExtension(m_VideoClip.m_OriginalPath), ".mp4");
-        VideoFormatLabel.Text = $"Format: {ext.ToUpperInvariant().TrimStart('.')}";
+        if (VideoResolutionLabel != null)
+        {
+            VideoResolutionLabel.Text = $"Resolution: {m_VideoClip.m_Width}x{m_VideoClip.m_Height} (Proxy: {m_VideoClip.m_ProxyWidth}x{m_VideoClip.m_ProxyHeight})";
+        }
+        if (VideoFrameRateLabel != null)
+        {
+            VideoFrameRateLabel.Text = $"Frame Rate: {m_VideoClip.m_FrameRate:F2} FPS | Frames: {m_VideoClip.m_FrameCount}";
+        }
+        if (VideoFormatLabel != null)
+        {
+            VideoFormatLabel.Text = $"Format: {ext.ToUpperInvariant().TrimStart('.')}";
+        }
 
         SetInitialVideoAudioLabel(m_VideoClip);
 
-        VideoPlayButton.IsEnabled = true;
-        VideoStopButton.IsEnabled = true;
-        VideoExportButton.IsEnabled = true;
-        VideoVolumeBar.Value = MediaPlayback.VideoVolume;
+        if (VideoPlayButton != null) VideoPlayButton.IsEnabled = true;
+        if (VideoStopButton != null) VideoStopButton.IsEnabled = true;
+        if (VideoExportButton != null) VideoExportButton.IsEnabled = true;
+        if (VideoVolumeBar != null) VideoVolumeBar.Value = MediaPlayback.VideoVolume;
 
-        PreviewLabel.IsVisible = false;
-        StartVideoThumbnailPreview(m_VideoClip, sessionId);
+        if (PreviewLabel != null) PreviewLabel.IsVisible = false;
+        StartVideoThumbnailPreview(source, sessionId);
         StatusStripUpdate($"Loaded video clip: {m_VideoClip.m_Name}");
+    }
+
+    private void PreviewMovieTexture(AssetItem assetItem, MovieTexture m_MovieTexture)
+    {
+        var metadata = MovieTexturePreviewService.Inspect(m_MovieTexture);
+        var movieBytes = m_MovieTexture.m_MovieData;
+
+        if (!metadata.HasMovieData || movieBytes == null || movieBytes.Length == 0)
+        {
+            VideoReset();
+            PreviewSession.ShowTextPreview(metadata.SummaryText, PreviewSurfaceKind.Text, assetItem, truncate: false);
+            if (TextPreviewBox != null)
+            {
+                TextPreviewBox.Text = metadata.SummaryText;
+                TextPreviewBox.IsVisible = true;
+            }
+            if (PreviewLabel != null)
+            {
+                PreviewLabel.IsVisible = false;
+            }
+            StatusStripUpdate($"MovieTexture '{metadata.AssetName}' contains no embedded video data.");
+            return;
+        }
+
+        var assetIdKey = GetPreviewAssetId(m_MovieTexture);
+        var title = !string.IsNullOrWhiteSpace(m_MovieTexture.m_Name)
+            ? m_MovieTexture.m_Name
+            : (!string.IsNullOrWhiteSpace(assetItem.Name) ? assetItem.Name : "MovieTexture");
+
+        PreviewEmbeddedVideoBytes(
+            assetItem: assetItem,
+            title: title,
+            videoBytes: movieBytes,
+            assetIdKey: assetIdKey,
+            extension: metadata.RecommendedExtension,
+            formatLabel: metadata.FormatLabelText,
+            resolutionText: metadata.ResolutionText,
+            frameRateText: metadata.FrameRateText,
+            audioText: metadata.AudioLabelText,
+            readyInfoText: metadata.ReadyInfoText,
+            defaultLoop: metadata.IsLooping);
+
+        StatusStripUpdate($"Loaded MovieTexture: {title} ({metadata.DetectedFormat}, {MovieTexturePreviewService.FormatByteSize(metadata.ByteSize)})");
+    }
+
+    internal void PreviewEmbeddedVideoBytes(
+        AssetItem assetItem,
+        string title,
+        byte[] videoBytes,
+        string assetIdKey,
+        string extension,
+        string formatLabel,
+        string resolutionText,
+        string frameRateText,
+        string audioText,
+        string? readyInfoText = null,
+        bool defaultLoop = false)
+    {
+        var resolvedTitle = !string.IsNullOrWhiteSpace(title)
+            ? title
+            : (!string.IsNullOrWhiteSpace(assetItem?.Name) ? assetItem.Name : "Embedded Video");
+
+        if (videoBytes == null || videoBytes.Length == 0)
+        {
+            VideoReset();
+            var fallback = $"Embedded video '{resolvedTitle}' contains no video data (0 bytes).";
+            PreviewSession.ShowTextPreview(fallback, PreviewSurfaceKind.Text, assetItem, truncate: false);
+            if (TextPreviewBox != null)
+            {
+                TextPreviewBox.Text = fallback;
+                TextPreviewBox.IsVisible = true;
+            }
+            if (PreviewLabel != null)
+            {
+                PreviewLabel.IsVisible = false;
+            }
+            StatusStripUpdate(fallback);
+            return;
+        }
+
+        var resolvedAssetId = !string.IsNullOrWhiteSpace(assetIdKey)
+            ? assetIdKey
+            : (!string.IsNullOrWhiteSpace(assetItem?.UniqueID) ? assetItem.UniqueID : resolvedTitle);
+
+        var ext = SanitizeExtension(extension, ".ogv");
+        var exportBaseName = !string.IsNullOrWhiteSpace(assetItem?.Name) ? assetItem.Name : resolvedTitle;
+        var kindDisplayName = assetItem?.Type == ClassIDType.MovieTexture
+            ? "MovieTexture"
+            : (!string.IsNullOrWhiteSpace(assetItem?.DisplayType) ? assetItem.DisplayType : "Video");
+
+        if (_currentTempVideoAssetId == resolvedAssetId)
+        {
+            VideoStop();
+            Interlocked.Increment(ref _videoSessionCounter);
+        }
+        else
+        {
+            VideoReset();
+        }
+
+        var sessionId = Volatile.Read(ref _videoSessionCounter);
+        currentPreviewVideoClip = null;
+
+        var source = new ActiveVideoPreviewSource
+        {
+            AssetIdKey = resolvedAssetId,
+            Title = resolvedTitle,
+            ExportBaseName = exportBaseName,
+            Extension = ext,
+            KindDisplayName = kindDisplayName,
+            RawVideoBytes = videoBytes,
+            PathId = assetItem?.PathID ?? 0
+        };
+        _currentVideoPreviewSource = source;
+
+        if (TextPreviewBox != null)
+        {
+            TextPreviewBox.IsVisible = false;
+        }
+        if (ImagePreviewBox != null)
+        {
+            ImagePreviewBox.IsVisible = false;
+        }
+
+        PreviewSession.ActivateSurface(PreviewSurfaceKind.Video, assetItem, title: resolvedTitle);
+
+        var infoText = !string.IsNullOrWhiteSpace(readyInfoText)
+            ? readyInfoText
+            : "Ready. Press Play to prepare embedded preview.";
+
+        MediaPlayback.SelectVideo(resolvedTitle, infoText);
+        MediaPlayback.SetVideoVolume(MediaPlaybackViewModel.DefaultVolume);
+        MediaPlayback.SetLooping(defaultLoop);
+
+        if (VideoResolutionLabel != null)
+        {
+            VideoResolutionLabel.Text = FormatPrefixedVideoLabel("Resolution: ", resolutionText, "Resolution: Probed by FFmpeg on load");
+        }
+        if (VideoFrameRateLabel != null)
+        {
+            VideoFrameRateLabel.Text = FormatPrefixedVideoLabel("Frame Rate: ", frameRateText, "Frame Rate: Probed by FFmpeg on load");
+        }
+        if (VideoFormatLabel != null)
+        {
+            VideoFormatLabel.Text = FormatPrefixedVideoLabel("Format: ", formatLabel, $"Format: {ext.ToUpperInvariant().TrimStart('.')}");
+        }
+
+        SetEmbeddedVideoAudioLabel(audioText);
+
+        if (VideoPlayButton != null) VideoPlayButton.IsEnabled = true;
+        if (VideoStopButton != null) VideoStopButton.IsEnabled = true;
+        if (VideoExportButton != null) VideoExportButton.IsEnabled = true;
+        if (VideoVolumeBar != null) VideoVolumeBar.Value = MediaPlayback.VideoVolume;
+        if (PreviewLabel != null) PreviewLabel.IsVisible = false;
+
+        StartVideoThumbnailPreview(source, sessionId);
+        StatusStripUpdate($"Loaded video preview: {resolvedTitle}");
     }
 
     private void PreviewVideoPlayer(AssetItem assetItem, VideoPlayer m_VideoPlayer)
@@ -273,8 +515,11 @@ public partial class MainWindow
 
     private async Task ExecuteVideoPlayPauseAsync()
     {
-        var videoClip = currentPreviewVideoClip;
-        if (videoClip == null) return;
+        var source = _currentVideoPreviewSource;
+        if (source == null)
+        {
+            return;
+        }
 
         var sessionId = Volatile.Read(ref _videoSessionCounter);
 
@@ -288,21 +533,19 @@ public partial class MainWindow
             }
             else
             {
-                var videoAssetId = GetPreviewAssetId(videoClip);
                 var hasLoadedFile = FfmpegVideoPlayer.HasMediaLoaded
-                    && _currentTempVideoAssetId == videoAssetId
+                    && _currentTempVideoAssetId == source.AssetIdKey
                     && !string.IsNullOrEmpty(_currentTempVideoPath)
                     && File.Exists(_currentTempVideoPath);
 
                 if (!hasLoadedFile)
                 {
-                    if (!await EnsureVideoPreviewFileAsync(videoClip, sessionId))
+                    if (!await EnsureVideoPreviewFileAsync(source, sessionId))
                     {
                         return;
                     }
 
-                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
-                        || sessionId != Volatile.Read(ref _videoSessionCounter))
+                    if (!IsVideoSourceCurrent(source, sessionId))
                     {
                         return;
                     }
@@ -326,16 +569,15 @@ public partial class MainWindow
                         }
                     });
 
-                    if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
-                        || sessionId != Volatile.Read(ref _videoSessionCounter))
+                    if (!IsVideoSourceCurrent(source, sessionId))
                     {
                         return;
                     }
 
                     if (!opened)
                     {
-                        MediaPlayback.SetError("FFmpeg could not open this VideoClip.", "Unsupported");
-                        StatusStripUpdate("Video preview could not open this VideoClip.");
+                        MediaPlayback.SetError($"FFmpeg could not open this {source.KindDisplayName}.", "Unsupported");
+                        StatusStripUpdate($"Video preview could not open this {source.KindDisplayName}.");
                         return;
                     }
 
@@ -362,10 +604,9 @@ public partial class MainWindow
         }
     }
 
-    private async Task<bool> EnsureVideoPreviewFileAsync(VideoClip videoClip, long sessionId)
+    private async Task<bool> EnsureVideoPreviewFileAsync(ActiveVideoPreviewSource source, long sessionId)
     {
-        var assetId = GetPreviewAssetId(videoClip);
-        if (_currentTempVideoAssetId == assetId
+        if (_currentTempVideoAssetId == source.AssetIdKey
             && !string.IsNullOrEmpty(_currentTempVideoPath)
             && File.Exists(_currentTempVideoPath))
         {
@@ -381,16 +622,15 @@ public partial class MainWindow
         try
         {
             MediaPlayback.BeginVideoLoad(null, "Preparing embedded preview...");
-            VideoPlayButton.IsEnabled = false;
-            VideoStopButton.IsEnabled = false;
-            StatusStripUpdate($"Preparing video preview: {videoClip.m_Name}");
+            if (VideoPlayButton != null) VideoPlayButton.IsEnabled = false;
+            if (VideoStopButton != null) VideoStopButton.IsEnabled = false;
+            StatusStripUpdate($"Preparing video preview: {source.Title}");
 
-            var tempPath = await Task.Run(() => PrepareVideoPreviewFile(videoClip, token), token);
+            var tempPath = await Task.Run(() => PrepareVideoPreviewFile(source, token), token);
             createdTempPath = tempPath;
             token.ThrowIfCancellationRequested();
 
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
-                || sessionId != Volatile.Read(ref _videoSessionCounter))
+            if (!IsVideoSourceCurrent(source, sessionId))
             {
                 DeleteTempVideoFileBackground(createdTempPath);
                 return false;
@@ -398,14 +638,14 @@ public partial class MainWindow
 
             if (string.IsNullOrEmpty(tempPath) || !File.Exists(tempPath))
             {
-                MediaPlayback.SetError("VideoClip data is empty or invalid.", "Missing");
+                MediaPlayback.SetError($"{source.KindDisplayName} data is empty or invalid.", "Missing");
                 StatusStripUpdate(MediaPlayback.ErrorMessage);
                 return false;
             }
 
             var oldPath = _currentTempVideoPath;
             _currentTempVideoPath = tempPath;
-            _currentTempVideoAssetId = assetId;
+            _currentTempVideoAssetId = source.AssetIdKey;
             createdTempPath = null; // Ownership transferred
             if (!string.IsNullOrEmpty(oldPath) && !string.Equals(oldPath, tempPath, StringComparison.OrdinalIgnoreCase))
             {
@@ -414,7 +654,7 @@ public partial class MainWindow
 
             _videoLengthMs = 0;
             MediaPlayback.SetMediaInfo("Embedded FFmpeg preview loaded.");
-            StatusStripUpdate($"Loaded video clip with FFmpeg backend: {videoClip.m_Name}");
+            StatusStripUpdate($"Loaded video with FFmpeg backend: {source.Title}");
             return true;
         }
         catch (OperationCanceledException)
@@ -425,8 +665,7 @@ public partial class MainWindow
         catch (Exception ex)
         {
             DeleteTempVideoFileBackground(createdTempPath);
-            if (ReferenceEquals(currentPreviewVideoClip, videoClip)
-                && sessionId == Volatile.Read(ref _videoSessionCounter))
+            if (IsVideoSourceCurrent(source, sessionId))
             {
                 MediaPlayback.SetError($"Failed to prepare preview: {ex.Message}", "Error");
                 StatusStripUpdate($"Failed to prepare video preview: {ex.Message}");
@@ -440,47 +679,62 @@ public partial class MainWindow
                 _videoPreviewLoadCts = null;
             }
             loadCts.Dispose();
-            if (ReferenceEquals(currentPreviewVideoClip, videoClip)
-                && sessionId == Volatile.Read(ref _videoSessionCounter))
+            if (IsVideoSourceCurrent(source, sessionId))
             {
-                VideoPlayButton.IsEnabled = true;
-                VideoStopButton.IsEnabled = true;
+                if (VideoPlayButton != null) VideoPlayButton.IsEnabled = true;
+                if (VideoStopButton != null) VideoStopButton.IsEnabled = true;
                 MediaPlayback.EndPreparing();
             }
         }
     }
 
-    private string? PrepareVideoPreviewFile(VideoClip videoClip, CancellationToken token)
+    private string? PrepareVideoPreviewFile(ActiveVideoPreviewSource source, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
 
-        if (videoClip.m_ExternalResources.m_Size <= 0)
+        if (source.VideoClip != null)
+        {
+            if (source.VideoClip.m_ExternalResources.m_Size <= 0)
+            {
+                return null;
+            }
+        }
+        else if (source.RawVideoBytes == null || source.RawVideoBytes.Length == 0)
         {
             return null;
         }
 
-        var ext = SanitizeExtension(Path.GetExtension(videoClip.m_OriginalPath), ".mp4");
-
+        var ext = SanitizeExtension(source.Extension, ".mp4");
         var tempDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "AssetStudio",
             "Temp");
-        Directory.CreateDirectory(tempDir);
 
         token.ThrowIfCancellationRequested();
-        var tempPath = Path.Combine(tempDir, $"temp_video_{FixFileName(videoClip.m_Name)}_{videoClip.m_PathID}_{Guid.NewGuid():N}{ext}");
+        var prefix = $"temp_video_{FixFileName(source.ExportBaseName)}_{source.PathId}_";
+        var tempPath = MediaTempFiles.CreateUniquePath(tempDir, prefix, ext);
+
         try
         {
-            videoClip.m_VideoData.WriteData(tempPath);
+            if (source.VideoClip != null)
+            {
+                source.VideoClip.m_VideoData.WriteData(tempPath);
+            }
+            else if (source.RawVideoBytes != null)
+            {
+                WriteRawVideoBytesToFile(tempPath, source.RawVideoBytes, token);
+            }
         }
         catch
         {
+            MediaTempFiles.TryDeleteNow(tempPath);
             TryDeletePartialExport(tempPath);
             throw;
         }
 
         if (token.IsCancellationRequested)
         {
+            MediaTempFiles.TryDeleteNow(tempPath);
             TryDeletePartialExport(tempPath);
             token.ThrowIfCancellationRequested();
         }
@@ -488,24 +742,37 @@ public partial class MainWindow
         return File.Exists(tempPath) && new FileInfo(tempPath).Length > 0 ? tempPath : null;
     }
 
-    private async void StartVideoThumbnailPreview(VideoClip videoClip, long sessionId)
+    private static void WriteRawVideoBytesToFile(string filePath, byte[] bytes, CancellationToken token)
+    {
+        const int chunkSize = 256 * 1024;
+        using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, chunkSize);
+        int offset = 0;
+        while (offset < bytes.Length)
+        {
+            token.ThrowIfCancellationRequested();
+            int count = Math.Min(chunkSize, bytes.Length - offset);
+            fs.Write(bytes, offset, count);
+            offset += count;
+        }
+        fs.Flush();
+    }
+
+    private async void StartVideoThumbnailPreview(ActiveVideoPreviewSource source, long sessionId)
     {
         try
         {
             await Task.Delay(120);
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
-                || sessionId != Volatile.Read(ref _videoSessionCounter))
+            if (!IsVideoSourceCurrent(source, sessionId))
             {
                 return;
             }
 
-            if (!await EnsureVideoPreviewFileAsync(videoClip, sessionId))
+            if (!await EnsureVideoPreviewFileAsync(source, sessionId))
             {
                 return;
             }
 
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
-                || sessionId != Volatile.Read(ref _videoSessionCounter)
+            if (!IsVideoSourceCurrent(source, sessionId)
                 || string.IsNullOrEmpty(_currentTempVideoPath)
                 || !File.Exists(_currentTempVideoPath))
             {
@@ -526,8 +793,7 @@ public partial class MainWindow
                 }
             });
 
-            if (!ReferenceEquals(currentPreviewVideoClip, videoClip)
-                || sessionId != Volatile.Read(ref _videoSessionCounter))
+            if (!IsVideoSourceCurrent(source, sessionId))
             {
                 return;
             }
@@ -537,20 +803,19 @@ public partial class MainWindow
                 var durationMs = Math.Max(0, FfmpegVideoPlayer.Duration);
                 _videoLengthMs = durationMs;
                 MediaPlayback.MarkVideoReady(durationMs / 1000.0, "FFmpeg", "Thumbnail ready. Press Play to start preview.");
-                if (!MediaPlayback.IsPlaying && !MediaPlayback.IsPaused)
+                if (!MediaPlayback.IsPlaying && !MediaPlayback.IsPaused && VideoProgressBar != null)
                 {
                     VideoProgressBar.Value = 0;
                 }
             }
             else
             {
-                MediaPlayback.SetError("FFmpeg could not open this VideoClip.", "Unsupported");
+                MediaPlayback.SetError($"FFmpeg could not open this {source.KindDisplayName}.", "Unsupported");
             }
         }
         catch (Exception ex)
         {
-            if (ReferenceEquals(currentPreviewVideoClip, videoClip)
-                && sessionId == Volatile.Read(ref _videoSessionCounter))
+            if (IsVideoSourceCurrent(source, sessionId))
             {
                 MediaPlayback.SetError($"Failed to load thumbnail: {ex.Message}", "Error");
             }
@@ -693,8 +958,11 @@ public partial class MainWindow
 
     private async Task ExecuteVideoExportAsync()
     {
-        var videoClip = currentPreviewVideoClip;
-        if (videoClip == null) return;
+        var source = _currentVideoPreviewSource;
+        if (source == null)
+        {
+            return;
+        }
 
         // Pause playback to prevent event loops and potential UI deadlocks while the modal dialog is open
         try
@@ -708,30 +976,47 @@ public partial class MainWindow
         }
         catch { }
 
-        var extension = SanitizeExtension(Path.GetExtension(videoClip.m_OriginalPath), ".mp4");
+        var extension = SanitizeExtension(source.Extension, ".mp4");
 
         var savePath = await PickExportFolderDialogAsync("Select the save folder");
         if (string.IsNullOrWhiteSpace(savePath)) return;
 
-        var fileName = FixFileName(videoClip.m_Name) + extension;
+        var fileName = FixFileName(source.ExportBaseName) + extension;
         var filePath = Path.Combine(savePath, fileName);
 
         try
         {
-            if (videoClip.m_ExternalResources.m_Size <= 0)
+            if (source.VideoClip != null)
             {
-                StatusStripUpdate("VideoClip data is empty or invalid.");
+                if (source.VideoClip.m_ExternalResources.m_Size <= 0)
+                {
+                    StatusStripUpdate("VideoClip data is empty or invalid.");
+                    return;
+                }
+
+                await Task.Run(() =>
+                {
+                    if (File.Exists(filePath))
+                    {
+                        File.Delete(filePath);
+                    }
+                    source.VideoClip.m_VideoData.WriteData(filePath);
+                });
+            }
+            else if (source.RawVideoBytes != null && source.RawVideoBytes.Length > 0)
+            {
+                var rawBytes = source.RawVideoBytes;
+                await Task.Run(() =>
+                {
+                    File.WriteAllBytes(filePath, rawBytes);
+                });
+            }
+            else
+            {
+                StatusStripUpdate($"{source.KindDisplayName} data is empty or invalid.");
                 return;
             }
 
-            await Task.Run(() =>
-            {
-                if (File.Exists(filePath))
-                {
-                    File.Delete(filePath);
-                }
-                videoClip.m_VideoData.WriteData(filePath);
-            });
             StatusStripUpdate($"Successfully exported video clip to: {filePath}");
         }
         catch (Exception ex)

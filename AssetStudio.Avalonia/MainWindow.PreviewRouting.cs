@@ -749,7 +749,7 @@ public partial class MainWindow : Window
         {
             AudioReset();
         }
-        if (asset is not VideoClip && asset is not VideoPlayer)
+        if (asset is not VideoClip && asset is not VideoPlayer && asset is not MovieTexture)
         {
             VideoReset();
         }
@@ -833,8 +833,8 @@ public partial class MainWindow : Window
                 case VideoPlayer m_VideoPlayer:
                     PreviewVideoPlayer(assetItem, m_VideoPlayer);
                     break;
-                case MovieTexture _:
-                    StatusStripUpdate("Only supported export.");
+                case MovieTexture m_MovieTexture:
+                    PreviewMovieTexture(assetItem, m_MovieTexture);
                     break;
                 case Animator m_Animator:
                     PreviewAnimatorGraph(m_Animator);
