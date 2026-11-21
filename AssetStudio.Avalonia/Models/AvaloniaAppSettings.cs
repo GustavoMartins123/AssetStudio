@@ -24,6 +24,11 @@ public sealed class AvaloniaAppSettings
     public double AvatarPreviewBoneScale { get; set; } = 1.0;
     public double AvatarPreviewMeshDensityPercent { get; set; } = 15.0;
     public string ModelPreviewViewPreset { get; set; } = nameof(MeshPreviewViewPreset.Auto);
+    public bool ModelPreviewShowMesh { get; set; } = true;
+    public bool ModelPreviewUseTextures { get; set; } = true;
+    public bool ModelPreviewShowSkeleton { get; set; } = true;
+    public bool ModelPreviewSkeletonXRay { get; set; } = true;
+    public int ModelPreviewWireframeMode { get; set; } = 0;
     public ExportOptionsState ExportOptions { get; set; } = new();
     [JsonIgnore]
     public bool CombineMeshes

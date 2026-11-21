@@ -76,6 +76,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public Action<int>? WireframeModeChanged { get; set; }
         public Action<int>? ShadeModeChanged { get; set; }
         public Action<int>? NormalModeChanged { get; set; }
+        public Action<bool>? ShowSkeletonChanged { get; set; }
         public Action<PreviewChannelMask>? TextureChannelToggled { get; set; }
 
         public void Clear()
@@ -147,6 +148,7 @@ namespace AssetStudio.Avalonia.ViewModels
             WireframeModeChanged = null;
             ShadeModeChanged = null;
             NormalModeChanged = null;
+            ShowSkeletonChanged = null;
             TextureChannelToggled = null;
         }
     }
@@ -280,6 +282,7 @@ namespace AssetStudio.Avalonia.ViewModels
             CycleWireframeModeCommand = new RelayCommand(ExecuteCycleWireframeMode);
             ToggleShadeModeCommand = new RelayCommand(ExecuteToggleShadeMode);
             ToggleNormalModeCommand = new RelayCommand(ExecuteToggleNormalMode);
+            ToggleShowSkeletonCommand = new RelayCommand(ExecuteToggleShowSkeleton);
             ToggleTextureChannelCommand = new RelayCommand<PreviewChannelMask>(ExecuteToggleTextureChannel);
         }
 
@@ -378,6 +381,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand CycleWireframeModeCommand { get; }
         public RelayCommand ToggleShadeModeCommand { get; }
         public RelayCommand ToggleNormalModeCommand { get; }
+        public RelayCommand ToggleShowSkeletonCommand { get; }
         public RelayCommand<PreviewChannelMask> ToggleTextureChannelCommand { get; }
 
         public string StatusText
@@ -1110,6 +1114,12 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             MeshPreview.ToggleNormals();
             CommandHandlers.NormalModeChanged?.Invoke(MeshPreview.NormalMode);
+        }
+
+        private void ExecuteToggleShowSkeleton()
+        {
+            var visible = MeshPreview.ToggleShowSkeleton();
+            CommandHandlers.ShowSkeletonChanged?.Invoke(visible);
         }
 
         private void ExecuteToggleTextureChannel(PreviewChannelMask channel)

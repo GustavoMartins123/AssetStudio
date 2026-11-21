@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.ViewModels;
 using Microsoft.Data.Sqlite;
 using Xunit;
 using Xunit.Abstractions;
@@ -1435,8 +1436,20 @@ namespace AssetStudio.Tests
 
                 Assert.NotNull(gl);
                 Assert.NotNull(gl!.AnimatedMeshVertices);
+                Assert.NotNull(gl.Uvs);
+                Assert.Equal(gl.ReferenceMesh.Vertices.Length, gl.Uvs!.Length);
+                Assert.NotNull(gl.SubMeshIndexCounts);
+                Assert.Equal(gl.ReferenceMesh.Indices.Length, gl.SubMeshIndexCounts!.Sum());
+                Assert.NotNull(gl.AnimatedMeshNormals);
                 int f = Math.Clamp(probeFrame, 0, gl.AnimatedMeshVertices!.Length - 1);
                 var verts = gl.AnimatedMeshVertices[f];
+                var norms = gl.AnimatedMeshNormals![f];
+                Assert.Equal(verts.Length, norms.Length);
+                Assert.All(norms, n =>
+                {
+                    Assert.True(float.IsFinite(n.X) && float.IsFinite(n.Y) && float.IsFinite(n.Z));
+                    Assert.InRange(n.Length, 0.99f, 1.01f);
+                });
                 var bones = frames[f];
                 var indices = gl.ReferenceMesh.Indices;
 
@@ -1485,6 +1498,214 @@ namespace AssetStudio.Tests
             {
                 VerifyClipRig("red-lady/chargebeam2", redLadyAvatar, redLadyMesh, chargeBeamClip, probeFrame: 30, minTracks: 100, maxAllowedTriEdge: 25f, maxBoundsMarginRatio: 0.35f);
             }
+        }
+
+        [Fact]
+        public void Unified3DPreview_AnimatedAndStaticAvatar_PreservesSurfaceAttributes_SkinsNormalsAccurately_AndSupportsDisplayToggles()
+        {
+            static AssetStudio.Matrix4x4 ToAssetMatrix(OpenTK.Mathematics.Matrix4 m) => new AssetStudio.Matrix4x4
+            {
+                M00 = m.M11, M01 = m.M12, M02 = m.M13, M03 = m.M14,
+                M10 = m.M21, M11 = m.M22, M12 = m.M23, M13 = m.M24,
+                M20 = m.M31, M21 = m.M32, M22 = m.M33, M23 = m.M34,
+                M30 = m.M41, M31 = m.M42, M32 = m.M43, M33 = m.M44
+            };
+
+            // Build a 2-submesh skinned mesh with explicit UVs, normals, colors, and 1 bone
+            var mesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            typeof(Mesh).GetField("m_ProcessLock", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(mesh, new object());
+            typeof(Mesh).GetField("m_DataProcessed", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.SetValue(mesh, true);
+            mesh.m_Name = "UnifiedHeroMesh";
+            mesh.m_PathID = 9501;
+            mesh.m_VertexCount = 6;
+            mesh.m_Vertices = new[]
+            {
+                // SubMesh 0: diagonal triangle in XY plane (tangent (1,1,0), normal (-1,1,0)/sqrt2)
+                0f, 0f, 0f,
+                1f, 1f, 0f,
+                0f, 0f, 1f,
+                // SubMesh 1: flat triangle in XZ plane (normal (0,1,0))
+                2f, 0f, 0f,
+                3f, 0f, 0f,
+                2f, 0f, 1f
+            };
+            float invSqrt2 = 1f / MathF.Sqrt(2f);
+            mesh.m_Normals = new[]
+            {
+                -invSqrt2, invSqrt2, 0f,
+                -invSqrt2, invSqrt2, 0f,
+                -invSqrt2, invSqrt2, 0f,
+                0f, 1f, 0f,
+                0f, 1f, 0f,
+                0f, 1f, 0f
+            };
+            mesh.m_UV0 = new[]
+            {
+                0f, 0f,  1f, 0f,  0f, 1f,
+                0.2f, 0.3f,  0.8f, 0.3f,  0.2f, 0.9f
+            };
+            mesh.m_Colors = new[]
+            {
+                1f, 0f, 0f, 1f,  1f, 0f, 0f, 1f,  1f, 0f, 0f, 1f,
+                0f, 0f, 1f, 1f,  0f, 0f, 1f, 1f,  0f, 0f, 1f, 1f
+            };
+            mesh.m_Indices = new List<uint> { 0, 1, 2, 3, 4, 5 };
+            var sm0 = (SubMesh)RuntimeHelpers.GetUninitializedObject(typeof(SubMesh));
+            sm0.firstByte = 0;
+            sm0.indexCount = 3;
+            sm0.firstVertex = 0;
+            sm0.vertexCount = 3;
+            var sm1 = (SubMesh)RuntimeHelpers.GetUninitializedObject(typeof(SubMesh));
+            sm1.firstByte = 6;
+            sm1.indexCount = 3;
+            sm1.firstVertex = 3;
+            sm1.vertexCount = 3;
+            mesh.m_SubMeshes = new[] { sm0, sm1 };
+            mesh.m_BoneNameHashes = new uint[] { 12345u };
+            mesh.m_BindPose = new[] { ToAssetMatrix(OpenTK.Mathematics.Matrix4.Identity) };
+            mesh.m_Skin = new BoneWeights4[6];
+            for (int v = 0; v < 6; v++)
+            {
+                var bw = (BoneWeights4)RuntimeHelpers.GetUninitializedObject(typeof(BoneWeights4));
+                bw.boneIndex = new[] { 0, 0, 0, 0 };
+                bw.weight = new[] { 1f, 0f, 0f, 0f };
+                mesh.m_Skin[v] = bw;
+            }
+
+            // Frame 0: Identity, Frame 1: Non-uniform scale (2, 0.5, 1) + 90 deg rotation around Y
+            var frame1Mat = OpenTK.Mathematics.Matrix4.CreateScale(2f, 0.5f, 1f)
+                * OpenTK.Mathematics.Matrix4.CreateRotationY(MathF.PI * 0.5f);
+            var frames = new[]
+            {
+                new[] { OpenTK.Mathematics.Vector3.Zero },
+                new[] { OpenTK.Mathematics.Vector3.Zero }
+            };
+            var boneMatrices = new[]
+            {
+                new[] { OpenTK.Mathematics.Matrix4.Identity },
+                new[] { frame1Mat }
+            };
+            var parents = new[] { -1 };
+            var names = new[] { "Root" };
+
+            var animGl = MeshPreviewControl.PrepareAnimatedAvatarGLData(
+                mesh, frames, boneMatrices, parents, 30f, names, 100f, 1.0f);
+            Assert.NotNull(animGl);
+            Assert.NotNull(animGl!.Uvs);
+            Assert.Equal(6, animGl.Uvs!.Length);
+            Assert.Equal(6, animGl.Colors.Length);
+            Assert.NotNull(animGl.SubMeshIndexCounts);
+            Assert.Equal(new[] { 3, 3 }, animGl.SubMeshIndexCounts);
+            Assert.NotNull(animGl.AnimatedMeshVertices);
+            Assert.NotNull(animGl.AnimatedMeshNormals);
+
+            // Verify inverse-transpose normal skinning keeps skinned normal strictly orthogonal to transformed tangent under non-uniform scale!
+            var v0F1 = animGl.AnimatedMeshVertices![1][0];
+            var v1F1 = animGl.AnimatedMeshVertices[1][1];
+            var v2F1 = animGl.AnimatedMeshVertices[1][2];
+            var n0F1 = animGl.AnimatedMeshNormals![1][0];
+            Assert.InRange(n0F1.Length, 0.999f, 1.001f);
+            Assert.True(MathF.Abs(OpenTK.Mathematics.Vector3.Dot(v1F1 - v0F1, n0F1)) < 1e-4f,
+                $"Normal {n0F1} is not orthogonal to non-uniformly scaled edge {v1F1 - v0F1}!");
+            Assert.True(MathF.Abs(OpenTK.Mathematics.Vector3.Dot(v2F1 - v0F1, n0F1)) < 1e-4f);
+
+            // Verify on-demand SkinFrameNormals matches precomputed AnimatedMeshNormals
+            var onDemandNormals = MeshPreviewControl.SkinFrameNormals(
+                mesh, animGl.SourceNormals!, animGl.ReferenceMesh.SourceVertexIndices, boneMatrices[1]);
+            Assert.NotNull(onDemandNormals);
+            for (int v = 0; v < onDemandNormals!.Length; v++)
+            {
+                Assert.True((onDemandNormals[v] - animGl.AnimatedMeshNormals[1][v]).Length < 1e-5f);
+            }
+
+            // Static Avatar GL prep also preserves UVs, Normals, Colors, and SubMeshIndexCounts
+            var staticGl = MeshPreviewControl.PrepareStaticAvatarGLData(
+                mesh, frames[0], parents, names, 100f, 1.0f);
+            Assert.NotNull(staticGl);
+            Assert.NotNull(staticGl!.Uvs);
+            Assert.Equal(6, staticGl.Uvs!.Length);
+            Assert.Equal(new[] { 3, 3 }, staticGl.SubMeshIndexCounts);
+            Assert.NotNull(staticGl.Normals);
+            Assert.Equal(6, staticGl.Normals!.Length);
+
+            // Pure-MVVM unified display toggles + commands + settings persistence defaults
+            using var vm = new MainWindowViewModel();
+            bool? lastSkeletonState = null;
+            vm.CommandHandlers.ShowSkeletonChanged = v => lastSkeletonState = v;
+
+            Assert.True(vm.MeshPreview.ShowMesh);
+            Assert.True(vm.MeshPreview.UseTextures);
+            Assert.True(vm.MeshPreview.ShowSkeleton);
+            Assert.True(vm.MeshPreview.SkeletonXRay);
+            Assert.Equal(0, vm.MeshPreview.WireframeMode);
+            Assert.False(vm.MeshPreview.IsBoneSizeVisible);
+
+            vm.MeshPreview.IsBoneControlsVisible = true;
+            Assert.True(vm.MeshPreview.IsBoneSizeVisible);
+
+            vm.ToggleShowSkeletonCommand.Execute();
+            Assert.False(vm.MeshPreview.ShowSkeleton);
+            Assert.False(vm.MeshPreview.IsBoneSizeVisible);
+            Assert.Equal(false, lastSkeletonState);
+
+            var settings = new AvaloniaAppSettings
+            {
+                ModelPreviewShowMesh = true,
+                ModelPreviewUseTextures = false,
+                ModelPreviewShowSkeleton = false,
+                ModelPreviewSkeletonXRay = false,
+                ModelPreviewWireframeMode = 2
+            };
+            var roundTripped = System.Text.Json.JsonSerializer.Deserialize<AvaloniaAppSettings>(
+                System.Text.Json.JsonSerializer.Serialize(settings));
+            Assert.NotNull(roundTripped);
+            Assert.True(roundTripped!.ModelPreviewShowMesh);
+            Assert.False(roundTripped.ModelPreviewUseTextures);
+            Assert.False(roundTripped.ModelPreviewShowSkeleton);
+            Assert.False(roundTripped.ModelPreviewSkeletonXRay);
+            Assert.Equal(2, roundTripped.ModelPreviewWireframeMode);
+        }
+
+        [Fact]
+        public void RightTabPanel_UsesPersistentNonDetachingTabStrip_AndPreviewSessionTracksDumpTabState()
+        {
+            // Regression guard: using TabControl around Preview/Dump detached OpenGlControlBase controls
+            // on every Dump switch and permanently killed preview rendering on Windows.
+            var repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+            var axamlPath = Path.Combine(repoRoot, "AssetStudio.Avalonia", "MainWindow.axaml");
+            var axaml = File.ReadAllText(axamlPath);
+
+            Assert.DoesNotContain("<TabControl x:Name=\"RightTabControl\"", axaml, StringComparison.Ordinal);
+            Assert.Contains("<TabStrip x:Name=\"RightTabControl\"", axaml, StringComparison.Ordinal);
+            Assert.Contains("x:Name=\"PreviewTabContent\"", axaml, StringComparison.Ordinal);
+            Assert.Contains("IsVisible=\"{Binding PreviewSession.IsPreviewTabActive}\"", axaml, StringComparison.Ordinal);
+            Assert.Contains("IsVisible=\"{Binding PreviewSession.IsDumpTabActive}\"", axaml, StringComparison.Ordinal);
+
+            // Also verify GL controls properly zero handles/viewport dimensions during OnOpenGlDeinit.
+            var texGlSrc = File.ReadAllText(Path.Combine(repoRoot, "AssetStudio.Avalonia", "TextureGLPreviewControl.cs"));
+            Assert.Contains("pgmID = 0;", texGlSrc, StringComparison.Ordinal);
+            Assert.Contains("glTextureId = 0;", texGlSrc, StringComparison.Ordinal);
+            Assert.Contains("hasTexture = false;", texGlSrc, StringComparison.Ordinal);
+
+            var meshGlSrc = File.ReadAllText(Path.Combine(repoRoot, "AssetStudio.Avalonia", "MeshPreviewControl.OpenGL.cs"));
+            Assert.Contains("lastWidth = 0;", meshGlSrc, StringComparison.Ordinal);
+            Assert.Contains("lastHeight = 0;", meshGlSrc, StringComparison.Ordinal);
+
+            using var session = new PreviewSessionViewModel();
+            Assert.False(session.IsDumpTabActive);
+            Assert.True(session.IsPreviewTabActive);
+
+            var changed = new List<string?>();
+            session.PropertyChanged += (_, e) => changed.Add(e.PropertyName);
+            session.IsDumpTabActive = true;
+            Assert.True(session.IsDumpTabActive);
+            Assert.False(session.IsPreviewTabActive);
+            Assert.Contains(nameof(PreviewSessionViewModel.IsDumpTabActive), changed);
+            Assert.Contains(nameof(PreviewSessionViewModel.IsPreviewTabActive), changed);
+
+            session.Reset();
+            Assert.False(session.IsDumpTabActive);
+            Assert.True(session.IsPreviewTabActive);
         }
 
         private static void SeedSyntheticV14Database(string dbPath, string projectDir, string signature, string sourcePath)

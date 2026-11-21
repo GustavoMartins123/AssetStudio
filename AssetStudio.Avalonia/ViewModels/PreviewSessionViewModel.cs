@@ -70,6 +70,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _textContent = string.Empty;
         private string _dumpTextContent = string.Empty;
         private bool _isDumpLoading;
+        private bool _isDumpTabActive;
         private bool _isDialogueCardsVisible;
         private bool _hasDialoguePreview;
         private TextAssetDisplayMode _dialogueDisplayMode = TextAssetDisplayMode.Cards;
@@ -277,6 +278,20 @@ namespace AssetStudio.Avalonia.ViewModels
             get => _isDumpLoading;
             set => SetProperty(ref _isDumpLoading, value);
         }
+
+        public bool IsDumpTabActive
+        {
+            get => _isDumpTabActive;
+            set
+            {
+                if (SetProperty(ref _isDumpTabActive, value))
+                {
+                    OnPropertyChanged(nameof(IsPreviewTabActive));
+                }
+            }
+        }
+
+        public bool IsPreviewTabActive => !_isDumpTabActive;
 
         public bool IsDialogueCardsVisible
         {
@@ -1063,6 +1078,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     TextContent = string.Empty;
                     DumpTextContent = string.Empty;
                     IsDumpLoading = false;
+                    IsDumpTabActive = false;
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
                     HasDialoguePreview = false;

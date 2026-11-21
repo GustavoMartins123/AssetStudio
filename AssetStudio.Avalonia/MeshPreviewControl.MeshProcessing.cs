@@ -261,7 +261,7 @@ namespace AssetStudio.Avalonia
             return remapped;
         }
 
-        private static int[]? BuildSubMeshIndexCounts(Mesh mesh, int indexCount)
+        internal static int[]? BuildSubMeshIndexCounts(Mesh mesh, int indexCount)
         {
             var subMeshes = mesh.m_SubMeshes;
             if (subMeshes == null || subMeshes.Length == 0 || indexCount <= 0)

@@ -185,6 +185,7 @@ namespace AssetStudio.Tests
                     Type t when t == typeof(Action<ClassIDType>) => (Action<ClassIDType>)(_ => { }),
                     Type t when t == typeof(Action<TextAssetDisplayMode>) => (Action<TextAssetDisplayMode>)(_ => { }),
                     Type t when t == typeof(Action<int>) => (Action<int>)(_ => { }),
+                    Type t when t == typeof(Action<bool>) => (Action<bool>)(_ => { }),
                     Type t when t == typeof(Action<PreviewChannelMask>) => (Action<PreviewChannelMask>)(_ => { }),
                     _ => throw new InvalidOperationException($"Unexpected command handler delegate type: {prop.PropertyType.FullName}")
                 };

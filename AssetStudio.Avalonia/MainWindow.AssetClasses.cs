@@ -160,7 +160,13 @@ public partial class MainWindow
 
     private void ShowAssetClassPreview(AssetClassItem item)
     {
-        RightTabControl.SelectedIndex = 0;
+        _lastPreviewedAssetUniqueId = null;
+        if (RightTabControl.SelectedIndex != 0)
+        {
+            _suppressNextRightTabSelectionPreview = true;
+            RightTabControl.SelectedIndex = 0;
+        }
+        PreviewSession.IsDumpTabActive = false;
         ClearTextAssetPreview();
         TextPreviewBox.Text = FormatAssetClass(item);
         TextPreviewBox.IsVisible = true;

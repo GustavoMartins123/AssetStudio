@@ -292,20 +292,21 @@ namespace AssetStudio.Avalonia
                 {
                     wireFrameMode = (wireFrameMode + 1) % 3;
                     RequestNextFrameRendering();
+                    DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }
                 else if (e.Key == Key.S)
                 {
-                    if (uvData != null && HasPreviewTexture())
+                    if (HasLoadedTextures)
                     {
-                        previewMaterialMode = !previewMaterialMode;
-                        vao = 0;
+                        useTextures = !useTextures;
                     }
                     else
                     {
                         shadeMode = shadeMode == 0 ? 1 : 0;
                     }
                     RequestNextFrameRendering();
+                    DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }
                 else if (e.Key == Key.N)
@@ -313,6 +314,14 @@ namespace AssetStudio.Avalonia
                     normalMode = normalMode == 0 ? 1 : 0;
                     vao = 0;
                     RequestNextFrameRendering();
+                    DisplayOptionsChanged?.Invoke();
+                    e.Handled = true;
+                }
+                else if (e.Key == Key.B && isAvatarMode)
+                {
+                    showSkeleton = !showSkeleton;
+                    RequestNextFrameRendering();
+                    DisplayOptionsChanged?.Invoke();
                     e.Handled = true;
                 }
             }

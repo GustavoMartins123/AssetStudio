@@ -337,9 +337,15 @@
 
             <GridSplitter Grid.Column="1" Background="{DynamicResource SystemControlBorderBackgroundBrush}" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
 
-            <TabControl x:Name="RightTabControl" Grid.Column="2" Margin="2" SelectionChanged="RightTabControl_SelectionChanged">
-                <TabItem Header="Preview">
-                    <Grid RowDefinitions="Auto,*" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}">
+            <Grid Grid.Column="2" RowDefinitions="Auto,*" Margin="2">
+                <TabStrip x:Name="RightTabControl" Grid.Row="0" SelectedIndex="0" SelectionChanged="RightTabControl_SelectionChanged">
+                    <TabStripItem Content="Preview" />
+                    <TabStripItem Content="Dump" />
+                </TabStrip>
+
+                <Panel Grid.Row="1">
+                    <!-- Persistent Preview container: stays attached to the visual tree across Preview/Dump tab switches so OpenGlControlBase surfaces never tear down. -->
+                    <Grid x:Name="PreviewTabContent" RowDefinitions="Auto,*" Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}" IsVisible="{Binding PreviewSession.IsPreviewTabActive}">
                         <Border x:Name="IndexingProgressPanel" Grid.Row="0" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="0,0,0,1" Padding="10,7" IsVisible="{Binding IndexingProgress.IsPanelVisible}">
                             <Grid RowDefinitions="Auto,4" ColumnDefinitions="*,Auto" RowSpacing="5" ColumnSpacing="12">
                                 <TextBlock x:Name="IndexingProgressText" Text="{Binding IndexingProgress.PrimaryStatusText}" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
@@ -576,7 +582,11 @@
                                         <Button Grid.Column="1" x:Name="ToggleMeshControlsBtn" Content="{Binding MeshPreview.ControlsToggleGlyph}" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Command="{Binding ToggleMeshControlsCommand}" />
                                     </Grid>
 
-                                    <StackPanel x:Name="MeshViewerControlsContent" IsVisible="{Binding MeshPreview.IsControlsExpanded}" Spacing="8" ClipToBounds="False">
+                                    <ScrollViewer MaxHeight="520"
+                                                  VerticalScrollBarVisibility="Auto"
+                                                  HorizontalScrollBarVisibility="Disabled"
+                                                  IsVisible="{Binding MeshPreview.IsControlsExpanded}">
+                                    <StackPanel x:Name="MeshViewerControlsContent" Spacing="8" ClipToBounds="False">
                                         <!-- Reset View Button -->
                                         <Button x:Name="ResetViewBtn" Content="Reset View" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ResetMeshViewCommand}" Height="28" FontSize="11" />
 
@@ -593,6 +603,53 @@
                                             <Button Grid.Column="3" x:Name="RotateDownBtn" Content="▼" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding RotateMeshDownCommand}" Height="26" FontSize="10" ToolTip.Tip="Rotate Down 90°" />
                                         </Grid>
 
+                                        <!-- Unified 3D Display Controls (Mesh, Avatar & AnimationClip) -->
+                                        <StackPanel x:Name="PreviewDisplayControlsContainer" Spacing="6" IsVisible="{Binding MeshPreview.IsGeometryControlsVisible}">
+                                            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                                                <TextBlock Text="Display" Foreground="White" FontSize="10" VerticalAlignment="Center" />
+                                                <ComboBox Grid.Column="1" x:Name="PreviewRenderModeSelector" MinHeight="28" SelectionChanged="PreviewRenderModeSelector_SelectionChanged" />
+                                            </Grid>
+
+                                            <Grid ColumnDefinitions="*,*" RowDefinitions="Auto,Auto" ColumnSpacing="6" RowSpacing="2">
+                                                <CheckBox Grid.Row="0" Grid.Column="0"
+                                                          x:Name="ShowMeshCheckBox"
+                                                          Content="Mesh"
+                                                          Foreground="White"
+                                                          FontSize="10"
+                                                          MinHeight="24"
+                                                          IsChecked="{Binding MeshPreview.ShowMesh, Mode=TwoWay}"
+                                                          ToolTip.Tip="Show or hide the 3D mesh surface" />
+                                                <CheckBox Grid.Row="0" Grid.Column="1"
+                                                          x:Name="UseTexturesCheckBox"
+                                                          Content="Textures"
+                                                          Foreground="White"
+                                                          FontSize="10"
+                                                          MinHeight="24"
+                                                          IsEnabled="{Binding MeshPreview.ShowMesh}"
+                                                          IsChecked="{Binding MeshPreview.UseTextures, Mode=TwoWay}"
+                                                          ToolTip.Tip="Toggle material textures (Ctrl+S)" />
+                                                <CheckBox Grid.Row="1" Grid.Column="0"
+                                                          x:Name="ShowBonesCheckBox"
+                                                          Content="Bones"
+                                                          Foreground="White"
+                                                          FontSize="10"
+                                                          MinHeight="24"
+                                                          IsVisible="{Binding MeshPreview.IsBoneControlsVisible}"
+                                                          IsChecked="{Binding MeshPreview.ShowSkeleton, Mode=TwoWay}"
+                                                          ToolTip.Tip="Show or hide skeleton bones (Ctrl+B)" />
+                                                <CheckBox Grid.Row="1" Grid.Column="1"
+                                                          x:Name="BonesXRayCheckBox"
+                                                          Content="X-Ray"
+                                                          Foreground="White"
+                                                          FontSize="10"
+                                                          MinHeight="24"
+                                                          IsVisible="{Binding MeshPreview.IsBoneControlsVisible}"
+                                                          IsEnabled="{Binding MeshPreview.ShowSkeleton}"
+                                                          IsChecked="{Binding MeshPreview.SkeletonXRay, Mode=TwoWay}"
+                                                          ToolTip.Tip="Render bones on top of the solid model" />
+                                            </Grid>
+                                        </StackPanel>
+
                                         <StackPanel x:Name="PreviewCandidateControlsContainer" Spacing="6" IsVisible="{Binding PreviewSession.HasCandidates}">
                                             <TextBlock x:Name="PreviewCandidateLabel" Text="{Binding PreviewSession.CandidateSelectorLabel}" Foreground="White" FontSize="10" VerticalAlignment="Center" />
                                             <ComboBox x:Name="PreviewCandidateSelector" MinHeight="28" MaxDropDownHeight="240" SelectionChanged="PreviewCandidateSelector_SelectionChanged" />
@@ -600,7 +657,7 @@
 
                                         <!-- Preview Geometry Controls -->
                                         <StackPanel x:Name="BoneSizeContainer" Spacing="6" IsVisible="{Binding MeshPreview.IsGeometryControlsVisible}">
-                                            <StackPanel x:Name="BoneSizeControls" Spacing="6" IsVisible="{Binding MeshPreview.IsBoneControlsVisible}">
+                                            <StackPanel x:Name="BoneSizeControls" Spacing="6" IsVisible="{Binding MeshPreview.IsBoneSizeVisible}">
                                                 <Grid ColumnDefinitions="*,Auto">
                                                     <TextBlock Text="Bone Size" Foreground="White" FontSize="10" VerticalAlignment="Center" />
                                                     <TextBlock x:Name="BoneSizeLabel" Grid.Column="1" Text="{Binding MeshPreview.FormattedBoneScaleText}" Foreground="#AAA" FontSize="10" VerticalAlignment="Center" />
@@ -648,16 +705,21 @@
                                             <Slider x:Name="MeshMaterialBlueSlider" Minimum="0" Maximum="100" Value="100" TickFrequency="1" Focusable="False" Height="28" Margin="8,0" ClipToBounds="False" ValueChanged="MeshMaterialSlider_ValueChanged" />
                                         </StackPanel>
                                     </StackPanel>
+                                    </ScrollViewer>
                                 </StackPanel>
                             </Border>
                         </Grid>
                         </Panel>
                     </Grid>
-                </TabItem>
-                <TabItem Header="Dump">
-                    <TextBox x:Name="DumpTextBox" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" FontFamily="Monospace" Text="{Binding PreviewSession.DumpTextContent, Mode=OneWay}" />
-                </TabItem>
-            </TabControl>
+                    <TextBox x:Name="DumpTextBox"
+                             AcceptsReturn="True"
+                             TextWrapping="Wrap"
+                             IsReadOnly="True"
+                             FontFamily="Monospace"
+                             IsVisible="{Binding PreviewSession.IsDumpTabActive}"
+                             Text="{Binding PreviewSession.DumpTextContent, Mode=OneWay}" />
+                </Panel>
+            </Grid>
 
         </Grid>
     </DockPanel>

@@ -360,6 +360,130 @@ public partial class MainWindow
         });
     }
 
+    private void QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+        Mesh m_Mesh,
+        long expectedPreviewId,
+        AssetItem? expectedSelectedAsset)
+    {
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (expectedPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                var resolvedSlots = TryLoadResolvedMeshMaterialsForPreview(m_Mesh);
+                if (expectedPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                List<byte[]?> uniqueTextures;
+                List<int> uniqueWidths;
+                List<int> uniqueHeights;
+                int[]? subMeshToTextureIndex;
+                List<string> loadedTextureFiles;
+                List<Material?>? fallbackMaterials = null;
+
+                if (resolvedSlots.Count > 0)
+                {
+                    var slotCount = Math.Max(m_Mesh.m_SubMeshes?.Length ?? 0, resolvedSlots.Max(s => s.SubMeshIndex) + 1);
+                    if (slotCount <= 0 && m_Mesh.m_Indices?.Count > 0)
+                    {
+                        slotCount = 1;
+                    }
+
+                    BuildDeduplicatedPreviewTexturesFromResolved(
+                        slotCount,
+                        resolvedSlots,
+                        () => expectedPreviewId != texturePreviewIdCounter,
+                        out uniqueTextures,
+                        out uniqueWidths,
+                        out uniqueHeights,
+                        out subMeshToTextureIndex,
+                        out loadedTextureFiles);
+                }
+                else
+                {
+                    var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                    if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    {
+                        EnsureMeshPreviewDependenciesLoaded(m_Mesh);
+                        allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                    }
+
+                    if (expectedPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    var slotCount = Math.Max(m_Mesh.m_SubMeshes?.Length ?? 0, allMaterials.Count);
+                    if (slotCount <= 0 && m_Mesh.m_Indices?.Count > 0)
+                    {
+                        slotCount = 1;
+                    }
+
+                    BuildDeduplicatedPreviewTexturesForMaterials(
+                        slotCount,
+                        allMaterials,
+                        () => expectedPreviewId != texturePreviewIdCounter,
+                        out uniqueTextures,
+                        out uniqueWidths,
+                        out uniqueHeights,
+                        out subMeshToTextureIndex,
+                        out loadedTextureFiles);
+                    fallbackMaterials = allMaterials;
+                }
+
+                if (expectedPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                if (loadedTextureFiles.Count > 0)
+                {
+                    AddActivePreviewDependencyFiles(loadedTextureFiles);
+                }
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsWindowClosingOrClosed
+                        || expectedPreviewId != texturePreviewIdCounter
+                        || !ReferenceEquals(currentPreviewMesh, m_Mesh)
+                        || (expectedSelectedAsset != null && !ReferenceEquals(AssetListDataGrid?.SelectedItem, expectedSelectedAsset)))
+                    {
+                        return;
+                    }
+
+                    if (GLPreviewControl == null)
+                    {
+                        return;
+                    }
+
+                    if (uniqueTextures.Any(t => t != null))
+                    {
+                        GLPreviewControl.ApplyMeshTextures(m_Mesh, uniqueTextures, uniqueWidths, uniqueHeights, subMeshToTextureIndex);
+                    }
+
+                    if (resolvedSlots.Count > 0)
+                    {
+                        BuildMeshMaterialControlsFromResolved(m_Mesh, resolvedSlots);
+                    }
+                    else if (fallbackMaterials != null && fallbackMaterials.Count > 0)
+                    {
+                        BuildMeshMaterialControls(m_Mesh, fallbackMaterials);
+                    }
+                });
+            }
+            catch
+            {
+                // Best-effort material/texture enrichment for Avatar and AnimationClip previews.
+            }
+        });
+    }
+
     private static string GetPreviewObjectKey(AssetStudio.Object? asset)
     {
         return asset?.assetsFile != null

@@ -32,13 +32,20 @@ namespace AssetStudio.Avalonia
         private Vector3[]? pendingSkeletonVertices;
         private readonly object skeletonLock = new object();
         private bool isAnimPlaying;
+        private bool animPausedByHiddenTab;
         private int vboPosition;
+        private int vboNormal;
         private Vector3[][]? animatedMeshVertices;
+        private Vector3[][]? animatedMeshNormals;
         private Vector3[]? pendingMeshVertices;
+        private Vector3[]? pendingMeshNormals;
+        private Vector3[]? dynamicSkinNormalsScratch;
         private readonly object meshLock = new object();
         private float previewMeshDensityPercent = PreviewMeshSimplifier.DefaultDensityPercent;
         private Mesh? avatarReferenceMeshSource;
         private Vector3[]? avatarReferenceSourceVertices;
+        private Vector3[]? avatarReferenceSourceNormals;
+        private int[]? avatarReferenceSourceVertexIndices;
         private List<uint>? avatarReferenceSourceIndices;
         private Vector3 avatarReferenceMin;
         private Vector3 avatarReferenceMax;
@@ -83,6 +90,10 @@ namespace AssetStudio.Avalonia
         private int wireFrameMode;
         private int shadeMode;
         private int normalMode;
+        private bool showMesh = true;
+        private bool useTextures = true;
+        private bool showSkeleton = true;
+        private bool skeletonXRay = true;
         private bool previewMaterialMode;
         private int previewTextureId;
         private Vector4[]? materialTintOverrides;
@@ -126,6 +137,7 @@ namespace AssetStudio.Avalonia
 
         public event Action<string>? GpuErrorOccurred;
         public event Action<int, int>? AnimationFrameChanged;
+        public event Action? DisplayOptionsChanged;
         internal event Action<bool>? MeshGeometryLoaded;
 
         internal Func<Mesh, float, MeshPreviewGeometryCache?>? LoadMeshPreviewGeometryCache { get; set; }
@@ -200,6 +212,68 @@ namespace AssetStudio.Avalonia
                 RequestNextFrameRendering();
             }
         }
+
+        public bool ShowMesh
+        {
+            get => showMesh;
+            set
+            {
+                if (showMesh == value)
+                {
+                    return;
+                }
+
+                showMesh = value;
+                RequestNextFrameRendering();
+            }
+        }
+
+        public bool UseTextures
+        {
+            get => useTextures;
+            set
+            {
+                if (useTextures == value)
+                {
+                    return;
+                }
+
+                useTextures = value;
+                RequestNextFrameRendering();
+            }
+        }
+
+        public bool ShowSkeleton
+        {
+            get => showSkeleton;
+            set
+            {
+                if (showSkeleton == value)
+                {
+                    return;
+                }
+
+                showSkeleton = value;
+                RequestNextFrameRendering();
+            }
+        }
+
+        public bool SkeletonXRay
+        {
+            get => skeletonXRay;
+            set
+            {
+                if (skeletonXRay == value)
+                {
+                    return;
+                }
+
+                skeletonXRay = value;
+                RequestNextFrameRendering();
+            }
+        }
+
+        public bool HasLoadedTextures => uvData != null && HasPreviewTexture();
 
         public bool IsPlaying => isAnimPlaying;
         public int AnimCurrentFrame => animCurrentFrame;

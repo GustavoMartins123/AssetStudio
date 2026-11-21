@@ -2,6 +2,7 @@ using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Threading;
+using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -94,6 +95,141 @@ public partial class MainWindow
         GLPreviewControl?.RotateDown90();
     }
 
+    private static readonly string[] PreviewRenderModeLabels =
+    {
+        "Solid",
+        "Wireframe",
+        "Solid + Wire"
+    };
+
+    private void PreviewRenderModeSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (updatingAvatarPreviewControls || PreviewRenderModeSelector == null)
+        {
+            return;
+        }
+
+        var idx = PreviewRenderModeSelector.SelectedIndex;
+        if (idx < 0 || idx >= PreviewRenderModeLabels.Length)
+        {
+            return;
+        }
+
+        ApplyUnifiedDisplayWireframeMode(idx, saveSettings: true);
+    }
+
+    private void ApplyUnifiedDisplayWireframeMode(int mode, bool saveSettings)
+    {
+        var normalized = ((mode % PreviewRenderModeLabels.Length) + PreviewRenderModeLabels.Length) % PreviewRenderModeLabels.Length;
+        updatingAvatarPreviewControls = true;
+        try
+        {
+            MeshPreview.WireframeMode = normalized;
+            if (PreviewRenderModeSelector != null && PreviewRenderModeSelector.SelectedIndex != normalized)
+            {
+                PreviewRenderModeSelector.SelectedIndex = normalized;
+            }
+        }
+        finally
+        {
+            updatingAvatarPreviewControls = false;
+        }
+
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.WireframeMode = normalized;
+        }
+
+        appSettings.ModelPreviewWireframeMode = normalized;
+        if (saveSettings)
+        {
+            QueueAvatarPreviewSettingsSave();
+        }
+    }
+
+    private void OnMeshPreviewViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (updatingAvatarPreviewControls || IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        switch (e.PropertyName)
+        {
+            case nameof(MeshPreviewViewModel.ShowMesh):
+                appSettings.ModelPreviewShowMesh = MeshPreview.ShowMesh;
+                if (GLPreviewControl != null)
+                {
+                    GLPreviewControl.ShowMesh = MeshPreview.ShowMesh;
+                }
+                QueueAvatarPreviewSettingsSave();
+                break;
+
+            case nameof(MeshPreviewViewModel.UseTextures):
+                appSettings.ModelPreviewUseTextures = MeshPreview.UseTextures;
+                if (GLPreviewControl != null)
+                {
+                    GLPreviewControl.UseTextures = MeshPreview.UseTextures;
+                }
+                QueueAvatarPreviewSettingsSave();
+                break;
+
+            case nameof(MeshPreviewViewModel.ShowSkeleton):
+                appSettings.ModelPreviewShowSkeleton = MeshPreview.ShowSkeleton;
+                if (GLPreviewControl != null)
+                {
+                    GLPreviewControl.ShowSkeleton = MeshPreview.ShowSkeleton;
+                }
+                QueueAvatarPreviewSettingsSave();
+                break;
+
+            case nameof(MeshPreviewViewModel.SkeletonXRay):
+                appSettings.ModelPreviewSkeletonXRay = MeshPreview.SkeletonXRay;
+                if (GLPreviewControl != null)
+                {
+                    GLPreviewControl.SkeletonXRay = MeshPreview.SkeletonXRay;
+                }
+                QueueAvatarPreviewSettingsSave();
+                break;
+        }
+    }
+
+    private void OnGlPreviewDisplayOptionsChanged()
+    {
+        if (IsWindowClosingOrClosed || GLPreviewControl == null)
+        {
+            return;
+        }
+
+        updatingAvatarPreviewControls = true;
+        try
+        {
+            var wf = ((GLPreviewControl.WireframeMode % PreviewRenderModeLabels.Length) + PreviewRenderModeLabels.Length) % PreviewRenderModeLabels.Length;
+            MeshPreview.WireframeMode = wf;
+            MeshPreview.ShadeMode = GLPreviewControl.ShadeMode;
+            MeshPreview.NormalMode = GLPreviewControl.NormalMode;
+            MeshPreview.ShowMesh = GLPreviewControl.ShowMesh;
+            MeshPreview.UseTextures = GLPreviewControl.UseTextures;
+            MeshPreview.ShowSkeleton = GLPreviewControl.ShowSkeleton;
+            MeshPreview.SkeletonXRay = GLPreviewControl.SkeletonXRay;
+            if (PreviewRenderModeSelector != null && PreviewRenderModeSelector.SelectedIndex != wf)
+            {
+                PreviewRenderModeSelector.SelectedIndex = wf;
+            }
+        }
+        finally
+        {
+            updatingAvatarPreviewControls = false;
+        }
+
+        appSettings.ModelPreviewWireframeMode = MeshPreview.WireframeMode;
+        appSettings.ModelPreviewShowMesh = MeshPreview.ShowMesh;
+        appSettings.ModelPreviewUseTextures = MeshPreview.UseTextures;
+        appSettings.ModelPreviewShowSkeleton = MeshPreview.ShowSkeleton;
+        appSettings.ModelPreviewSkeletonXRay = MeshPreview.SkeletonXRay;
+        QueueAvatarPreviewSettingsSave();
+    }
+
     private void PreviewViewPresetSelector_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         if (updatingAvatarPreviewControls
@@ -145,10 +281,16 @@ public partial class MainWindow
             && Enum.IsDefined(parsedViewPreset)
                 ? parsedViewPreset
                 : MeshPreviewViewPreset.Auto;
+        var wireframeMode = ((appSettings.ModelPreviewWireframeMode % PreviewRenderModeLabels.Length) + PreviewRenderModeLabels.Length) % PreviewRenderModeLabels.Length;
+        var showMesh = appSettings.ModelPreviewShowMesh;
+        var useTextures = appSettings.ModelPreviewUseTextures;
+        var showSkeleton = appSettings.ModelPreviewShowSkeleton;
+        var skeletonXRay = appSettings.ModelPreviewSkeletonXRay;
 
         appSettings.AvatarPreviewBoneScale = boneScale;
         appSettings.AvatarPreviewMeshDensityPercent = densityPercent;
         appSettings.ModelPreviewViewPreset = viewPreset.ToString();
+        appSettings.ModelPreviewWireframeMode = wireframeMode;
 
         updatingAvatarPreviewControls = true;
         try
@@ -166,6 +308,17 @@ public partial class MainWindow
                 PreviewViewPresetSelector.ItemsSource ??= Enum.GetValues<MeshPreviewViewPreset>();
                 PreviewViewPresetSelector.SelectedItem = viewPreset;
             }
+            if (PreviewRenderModeSelector != null)
+            {
+                PreviewRenderModeSelector.ItemsSource ??= PreviewRenderModeLabels;
+                PreviewRenderModeSelector.SelectedIndex = wireframeMode;
+            }
+
+            MeshPreview.WireframeMode = wireframeMode;
+            MeshPreview.ShowMesh = showMesh;
+            MeshPreview.UseTextures = useTextures;
+            MeshPreview.ShowSkeleton = showSkeleton;
+            MeshPreview.SkeletonXRay = skeletonXRay;
         }
         finally
         {
@@ -178,6 +331,11 @@ public partial class MainWindow
         if (GLPreviewControl != null)
         {
             GLPreviewControl.ViewPreset = viewPreset;
+            GLPreviewControl.WireframeMode = wireframeMode;
+            GLPreviewControl.ShowMesh = showMesh;
+            GLPreviewControl.UseTextures = useTextures;
+            GLPreviewControl.ShowSkeleton = showSkeleton;
+            GLPreviewControl.SkeletonXRay = skeletonXRay;
         }
     }
 

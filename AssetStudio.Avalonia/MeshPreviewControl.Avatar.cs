@@ -4,12 +4,16 @@ using System.Linq;
 
 namespace AssetStudio.Avalonia
 {
+    using Vector2 = OpenTK.Mathematics.Vector2;
     using Vector3 = OpenTK.Mathematics.Vector3;
     using Vector4 = OpenTK.Mathematics.Vector4;
+    using Matrix3 = OpenTK.Mathematics.Matrix3;
     using Matrix4 = OpenTK.Mathematics.Matrix4;
 
     public partial class MeshPreviewControl
     {
+        private const long MaxPrecomputedNormalVertexFrames = 8_000_000;
+
         internal sealed class PreparedAvatarPreviewGLData
         {
             public required Mesh Mesh { get; init; }
@@ -18,6 +22,12 @@ namespace AssetStudio.Avalonia
             public required Vector3 SourceMeshMin { get; init; }
             public required Vector3 SourceMeshMax { get; init; }
             public required PreviewMeshGeometry ReferenceMesh { get; init; }
+            public Vector3[]? SourceNormals { get; init; }
+            public Vector3[]? Normals { get; init; }
+            public Vector3[] CalculatedNormals { get; init; } = Array.Empty<Vector3>();
+            public Vector4[] Colors { get; init; } = Array.Empty<Vector4>();
+            public Vector2[]? Uvs { get; init; }
+            public int[]? SubMeshIndexCounts { get; init; }
             public required Vector3[] SkeletonVertices { get; init; }
             public required int BoneLinesCount { get; init; }
             public required int JointPointsCount { get; init; }
@@ -28,8 +38,28 @@ namespace AssetStudio.Avalonia
             public Vector3[][]? AnimationFrames { get; init; }
             public Matrix4[][]? BoneMatrices { get; init; }
             public Vector3[][]? AnimatedMeshVertices { get; init; }
+            public Vector3[][]? AnimatedMeshNormals { get; init; }
             public float Fps { get; init; } = 30f;
             public bool IsAnimated => AnimationFrames != null && AnimationFrames.Length > 0;
+        }
+
+        private static void BuildReferenceSurfaceAttributes(
+            Mesh m_Mesh,
+            PreviewMeshGeometry referenceMesh,
+            Vector3[]? initialVertices,
+            out Vector3[]? sourceNormals,
+            out Vector3[]? normals,
+            out Vector3[] calculatedNormals,
+            out Vector4[] colors,
+            out Vector2[]? uvs)
+        {
+            sourceNormals = ExtractMeshNormals(m_Mesh.m_Normals, m_Mesh.m_VertexCount);
+            normals = RemapVector3Data(sourceNormals, referenceMesh.SourceVertexIndices);
+            var sourceColors = ExtractMeshColors(m_Mesh.m_Colors, m_Mesh.m_VertexCount);
+            colors = RemapVector4Data(sourceColors, referenceMesh.SourceVertexIndices) ?? sourceColors;
+            var sourceUvs = BuildPreviewUvData(m_Mesh.m_UV0, m_Mesh.m_VertexCount);
+            uvs = RemapVector2Data(sourceUvs, referenceMesh.SourceVertexIndices);
+            calculatedNormals = BuildCalculatedNormals(initialVertices ?? referenceMesh.Vertices, referenceMesh.Indices);
         }
 
         internal static PreparedAvatarPreviewGLData? PrepareStaticAvatarGLData(
@@ -67,8 +97,18 @@ namespace AssetStudio.Avalonia
             var sourceMeshMin = min;
             var sourceMeshMax = max;
             var m_Indices = m_Mesh.m_Indices ?? new List<uint>();
+            var subMeshIndexCounts = BuildSubMeshIndexCounts(m_Mesh, m_Indices.Count);
             var referenceMesh = precomputedReferenceMesh
-                ?? PreviewMeshSimplifier.Build(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, densityPercent);
+                ?? PreviewMeshSimplifier.Build(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, densityPercent, subMeshIndexCounts);
+            BuildReferenceSurfaceAttributes(
+                m_Mesh,
+                referenceMesh,
+                referenceMesh.Vertices,
+                out var sourceNormals,
+                out var normals,
+                out var calculatedNormals,
+                out var colors,
+                out var uvs);
 
             int boneLinesCount = 0;
             int jointPointsCount = 0;
@@ -96,6 +136,12 @@ namespace AssetStudio.Avalonia
                 SourceMeshMin = sourceMeshMin,
                 SourceMeshMax = sourceMeshMax,
                 ReferenceMesh = referenceMesh,
+                SourceNormals = sourceNormals,
+                Normals = normals,
+                CalculatedNormals = calculatedNormals,
+                Colors = colors,
+                Uvs = uvs,
+                SubMeshIndexCounts = referenceMesh.SubMeshIndexCounts ?? subMeshIndexCounts,
                 SkeletonVertices = skeletonVerts,
                 BoneLinesCount = boneLinesCount,
                 JointPointsCount = jointPointsCount,
@@ -146,20 +192,24 @@ namespace AssetStudio.Avalonia
             var sourceMeshMin = min;
             var sourceMeshMax = max;
             var m_Indices = m_Mesh.m_Indices ?? new List<uint>();
+            var subMeshIndexCounts = BuildSubMeshIndexCounts(m_Mesh, m_Indices.Count);
             var referenceMesh = precomputedReferenceMesh
-                ?? PreviewMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, densityPercent);
+                ?? PreviewMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, densityPercent, subMeshIndexCounts);
+            var sourceNormals = ExtractMeshNormals(m_Mesh.m_Normals, m_Mesh.m_VertexCount);
 
             var animMin = new Vector3(float.MaxValue);
             var animMax = new Vector3(float.MinValue);
-            Vector3[][]? localAnimatedMeshVerts = BuildAnimatedAvatarReferenceVertices(
+            Vector3[][]? localAnimatedMeshVerts = BuildAnimatedAvatarReferenceVerticesAndNormals(
                 m_Mesh,
                 sourceVertexData,
+                sourceNormals,
                 referenceMesh,
                 boneMatrices,
                 parentIndices,
                 ref animMin,
                 ref animMax,
-                expandBounds: true);
+                expandBounds: true,
+                out var localAnimatedMeshNormals);
 
             var firstFrameBones = frames[0];
             foreach (var frame in frames)
@@ -182,6 +232,29 @@ namespace AssetStudio.Avalonia
                 animMax = sourceMeshMax;
             }
 
+            var frame0Vertices = localAnimatedMeshVerts != null && localAnimatedMeshVerts.Length > 0
+                ? localAnimatedMeshVerts[0]
+                : referenceMesh.Vertices;
+            BuildReferenceSurfaceAttributes(
+                m_Mesh,
+                referenceMesh,
+                frame0Vertices,
+                out _,
+                out var remappedNormals,
+                out var calculatedNormals,
+                out var colors,
+                out var uvs);
+
+            Vector3[]? initialSkinnedNormals = null;
+            if (localAnimatedMeshNormals != null && localAnimatedMeshNormals.Length > 0)
+            {
+                initialSkinnedNormals = localAnimatedMeshNormals[0];
+            }
+            else if (sourceNormals != null && boneMatrices.Length > 0 && localAnimatedMeshVerts != null)
+            {
+                initialSkinnedNormals = SkinFrameNormals(m_Mesh, sourceNormals, referenceMesh.SourceVertexIndices, boneMatrices[0]);
+            }
+
             var skeletonVerts = BuildSkeletonVerticesStatic(firstFrameBones, parentIndices, boneScale, out int boneLines, out int jointPoints);
             var localModelMatrixData = CreatePreviewModelMatrix(animMin, animMax);
             var autoViewMatrix = CreateAvatarInitialViewMatrix(firstFrameBones, boneNames);
@@ -194,6 +267,12 @@ namespace AssetStudio.Avalonia
                 SourceMeshMin = sourceMeshMin,
                 SourceMeshMax = sourceMeshMax,
                 ReferenceMesh = referenceMesh,
+                SourceNormals = sourceNormals,
+                Normals = initialSkinnedNormals ?? remappedNormals,
+                CalculatedNormals = initialSkinnedNormals ?? calculatedNormals,
+                Colors = colors,
+                Uvs = uvs,
+                SubMeshIndexCounts = referenceMesh.SubMeshIndexCounts ?? subMeshIndexCounts,
                 SkeletonVertices = skeletonVerts,
                 BoneLinesCount = boneLines,
                 JointPointsCount = jointPoints,
@@ -203,6 +282,7 @@ namespace AssetStudio.Avalonia
                 AnimationFrames = frames,
                 BoneMatrices = boneMatrices,
                 AnimatedMeshVertices = localAnimatedMeshVerts,
+                AnimatedMeshNormals = localAnimatedMeshNormals,
                 Fps = fps > 0 ? fps : 30f
             };
         }
@@ -212,11 +292,15 @@ namespace AssetStudio.Avalonia
             isAvatarMode = true;
             ClearMeshPreviewSource();
             StopAnimation();
-            previewMaterialMode = false;
+            ApplyMaterialResetState(resetMaterialOverrides: true);
             ++meshLoadCounter;
 
+            meshPreviewSource = prepared.Mesh;
+            meshPreviewSourceUvs = prepared.Uvs;
             avatarReferenceMeshSource = prepared.Mesh;
             avatarReferenceSourceVertices = prepared.SourceVertexData;
+            avatarReferenceSourceNormals = prepared.SourceNormals;
+            avatarReferenceSourceVertexIndices = prepared.ReferenceMesh.SourceVertexIndices;
             avatarReferenceSourceIndices = prepared.SourceIndices;
             avatarReferenceMin = prepared.SourceMeshMin;
             avatarReferenceMax = prepared.SourceMeshMax;
@@ -225,10 +309,15 @@ namespace AssetStudio.Avalonia
                 : prepared.ReferenceMesh.Vertices;
             SetInitialPreviewFrame(prepared.AutoViewMatrix, prepared.ModelMatrixData);
             indiceData = prepared.ReferenceMesh.Indices;
-            normalData = null;
-            normal2Data = null;
-            colorData = null;
-            uvData = null;
+            normalData = prepared.Normals;
+            normal2Data = prepared.CalculatedNormals.Length == vertexData.Length
+                ? prepared.CalculatedNormals
+                : BuildCalculatedNormals(vertexData, indiceData);
+            colorData = prepared.Colors.Length == vertexData.Length
+                ? prepared.Colors
+                : ExtractMeshColors(null, vertexData.Length);
+            uvData = prepared.Uvs;
+            previewSubMeshIndexCounts = prepared.SubMeshIndexCounts;
 
             boneLinesVertexCount = prepared.BoneLinesCount;
             jointPointsVertexCount = prepared.JointPointsCount;
@@ -244,6 +333,8 @@ namespace AssetStudio.Avalonia
                 animBoneLinesPerFrame = prepared.BoneLinesCount;
                 animJointPointsPerFrame = prepared.JointPointsCount;
                 animatedMeshVertices = prepared.AnimatedMeshVertices;
+                animatedMeshNormals = prepared.AnimatedMeshNormals;
+                dynamicSkinNormalsScratch = null;
 
                 lock (skeletonLock)
                 {
@@ -268,6 +359,8 @@ namespace AssetStudio.Avalonia
                 avatarReferenceBoneMatrices = null;
                 avatarReferenceParentIndices = null;
                 animatedMeshVertices = null;
+                animatedMeshNormals = null;
+                dynamicSkinNormalsScratch = null;
 
                 lock (skeletonLock)
                 {
@@ -283,51 +376,30 @@ namespace AssetStudio.Avalonia
             isAvatarMode = true;
             ClearMeshPreviewSource();
             StopAnimation();
-            previewMaterialMode = false;
+            ApplyMaterialResetState(resetMaterialOverrides: true);
             m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0)
             {
                 return;
             }
 
-            staticBonePositions = bonePositions;
-            staticParentIndices = parentIndices;
-
             int currentLoadId = ++meshLoadCounter;
-            var avatarBonePositions = bonePositions;
-            var m_Vertices = m_Mesh.m_Vertices;
-            var m_VertexCount = m_Mesh.m_VertexCount;
-            var m_Indices = m_Mesh.m_Indices;
+            var density = previewMeshDensityPercent;
+            var scale = boneScale;
 
             System.Threading.Tasks.Task.Run(() =>
             {
-                if (m_Vertices == null || m_Vertices.Length == 0)
+                var prepared = PrepareStaticAvatarGLData(
+                    m_Mesh,
+                    bonePositions,
+                    parentIndices,
+                    boneNames,
+                    density,
+                    scale);
+                if (prepared == null)
                 {
                     return;
                 }
-
-                var localVertexData = ExtractMeshVertices(m_Vertices, m_VertexCount, out var min, out var max);
-                var sourceMeshMin = min;
-                var sourceMeshMax = max;
-                var referenceMesh = PreviewMeshSimplifier.Build(localVertexData, m_Indices, sourceMeshMin, sourceMeshMax, previewMeshDensityPercent);
-                var localIndiceData = referenceMesh.Indices;
-
-                var skeletonVerts = new List<Vector3>();
-                int boneLinesCount = 0;
-                int jointPointsCount = 0;
-
-                if (bonePositions != null && parentIndices != null)
-                {
-                    for (int i = 0; i < bonePositions.Length; i++)
-                    {
-                        ExpandBounds(bonePositions[i], ref min, ref max);
-                    }
-
-                    var verts = BuildSkeletonVertices(bonePositions, parentIndices, out boneLinesCount, out jointPointsCount);
-                    skeletonVerts.AddRange(verts);
-                }
-
-                var localModelMatrixData = CreatePreviewModelMatrix(min, max);
 
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -336,31 +408,7 @@ namespace AssetStudio.Avalonia
                         return;
                     }
 
-                    var autoViewMatrix = CreateAvatarInitialViewMatrix(avatarBonePositions, boneNames);
-                    avatarReferenceMeshSource = m_Mesh;
-                    avatarReferenceSourceVertices = localVertexData;
-                    avatarReferenceSourceIndices = m_Indices;
-                    avatarReferenceMin = sourceMeshMin;
-                    avatarReferenceMax = sourceMeshMax;
-                    avatarReferenceBoneMatrices = null;
-                    avatarReferenceParentIndices = null;
-                    vertexData = referenceMesh.Vertices;
-                    SetInitialPreviewFrame(autoViewMatrix, localModelMatrixData);
-                    indiceData = localIndiceData;
-                    normalData = null;
-                    normal2Data = null;
-                    colorData = null;
-                    uvData = null;
-
-                    boneLinesVertexCount = boneLinesCount;
-                    jointPointsVertexCount = jointPointsCount;
-
-                    lock (skeletonLock)
-                    {
-                        pendingSkeletonVertices = skeletonVerts.ToArray();
-                    }
-                    vao = 0;
-                    RequestNextFrameRendering();
+                    ApplyPreparedAvatarPreview(prepared);
                 });
             });
         }
@@ -370,65 +418,32 @@ namespace AssetStudio.Avalonia
             isAvatarMode = true;
             ClearMeshPreviewSource();
             StopAnimation();
-            previewMaterialMode = false;
+            ApplyMaterialResetState(resetMaterialOverrides: true);
             m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0 || frames.Length == 0)
             {
                 return;
             }
 
-            animationFrames = frames;
-            animParentIndices = parentIndices;
-            animCurrentFrame = 0;
-            animFps = fps > 0 ? fps : 30f;
-
             int currentLoadId = ++meshLoadCounter;
-            var m_Vertices = m_Mesh.m_Vertices;
-            var m_VertexCount = m_Mesh.m_VertexCount;
-            var m_Indices = m_Mesh.m_Indices;
+            var density = previewMeshDensityPercent;
+            var scale = boneScale;
 
             System.Threading.Tasks.Task.Run(() =>
             {
-                if (m_Vertices == null || m_Vertices.Length == 0)
+                var prepared = PrepareAnimatedAvatarGLData(
+                    m_Mesh,
+                    frames,
+                    boneMatrices,
+                    parentIndices,
+                    fps,
+                    boneNames,
+                    density,
+                    scale);
+                if (prepared == null)
                 {
                     return;
                 }
-
-                var sourceVertexData = ExtractMeshVertices(m_Vertices, m_VertexCount, out var min, out var max);
-                var sourceMeshMin = min;
-                var sourceMeshMax = max;
-                var referenceMesh = PreviewMeshSimplifier.Build(sourceVertexData, m_Indices, sourceMeshMin, sourceMeshMax, previewMeshDensityPercent);
-                var localVertexData = referenceMesh.Vertices;
-                var localIndiceData = referenceMesh.Indices;
-
-                // Compute skinned mesh vertices for all frames of the animation
-                var animMin = new Vector3(float.MaxValue);
-                var animMax = new Vector3(float.MinValue);
-                Vector3[][]? localAnimatedMeshVerts = BuildAnimatedAvatarReferenceVertices(m_Mesh, sourceVertexData, referenceMesh, boneMatrices, parentIndices, ref animMin, ref animMax, true);
-
-                var firstFrameBones = frames[0];
-                foreach (var frame in frames)
-                {
-                    foreach (var bonePosition in frame)
-                    {
-                        ExpandBounds(bonePosition, ref animMin, ref animMax);
-                    }
-                }
-
-                if (localAnimatedMeshVerts == null || !IsFinitePoint(animMin) || !IsFinitePoint(animMax) || animMin.X > animMax.X)
-                {
-                    ExpandBounds(sourceMeshMin, ref animMin, ref animMax);
-                    ExpandBounds(sourceMeshMax, ref animMin, ref animMax);
-                }
-
-                if (!IsFinitePoint(animMin) || !IsFinitePoint(animMax) || animMin.X > animMax.X)
-                {
-                    animMin = sourceMeshMin;
-                    animMax = sourceMeshMax;
-                }
-
-                var skeletonVerts = BuildSkeletonVertices(firstFrameBones, parentIndices, out int boneLines, out int jointPoints);
-                var localModelMatrixData = CreatePreviewModelMatrix(animMin, animMax);
 
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -437,45 +452,7 @@ namespace AssetStudio.Avalonia
                         return;
                     }
 
-                    var autoViewMatrix = CreateAvatarInitialViewMatrix(frames[0], boneNames);
-                    avatarReferenceMeshSource = m_Mesh;
-                    avatarReferenceSourceVertices = sourceVertexData;
-                    avatarReferenceSourceIndices = m_Indices;
-                    avatarReferenceMin = sourceMeshMin;
-                    avatarReferenceMax = sourceMeshMax;
-                    avatarReferenceBoneMatrices = boneMatrices;
-                    avatarReferenceParentIndices = parentIndices;
-                    vertexData = localAnimatedMeshVerts != null && localAnimatedMeshVerts.Length > 0
-                        ? localAnimatedMeshVerts[0]
-                        : localVertexData;
-                    SetInitialPreviewFrame(autoViewMatrix, localModelMatrixData);
-                    indiceData = localIndiceData;
-                    normalData = null;
-                    normal2Data = null;
-                    colorData = null;
-                    uvData = null;
-
-                    animBoneLinesPerFrame = boneLines;
-                    animJointPointsPerFrame = jointPoints;
-                    boneLinesVertexCount = boneLines;
-                    jointPointsVertexCount = jointPoints;
-
-                    animatedMeshVertices = localAnimatedMeshVerts;
-
-                    lock (skeletonLock)
-                    {
-                        pendingSkeletonVertices = skeletonVerts;
-                    }
-                    vao = 0;
-                    RequestNextFrameRendering();
-
-                    animTimer = new global::Avalonia.Threading.DispatcherTimer
-                    {
-                        Interval = TimeSpan.FromMilliseconds(1000.0 / animFps)
-                    };
-                    animTimer.Tick += OnAnimationTick;
-                    animTimer.Start();
-                    isAnimPlaying = true;
+                    ApplyPreparedAvatarPreview(prepared);
                 });
             });
         }
@@ -496,10 +473,39 @@ namespace AssetStudio.Avalonia
 
         public void PauseAnimation()
         {
+            animPausedByHiddenTab = false;
             if (animTimer != null && isAnimPlaying)
             {
                 animTimer.Stop();
                 isAnimPlaying = false;
+            }
+        }
+
+        public void SuspendForHiddenTab()
+        {
+            if (animTimer != null && isAnimPlaying)
+            {
+                animTimer.Stop();
+                isAnimPlaying = false;
+                animPausedByHiddenTab = true;
+            }
+        }
+
+        public void ResumeAfterHiddenTab()
+        {
+            if (animPausedByHiddenTab)
+            {
+                animPausedByHiddenTab = false;
+                if (animationFrames != null && animTimer != null && !isAnimPlaying)
+                {
+                    animTimer.Start();
+                    isAnimPlaying = true;
+                }
+            }
+
+            if (IsVisible)
+            {
+                RequestNextFrameRendering();
             }
         }
 
@@ -531,7 +537,10 @@ namespace AssetStudio.Avalonia
             animParentIndices = null;
             animCurrentFrame = 0;
             isAnimPlaying = false;
+            animPausedByHiddenTab = false;
             animatedMeshVertices = null;
+            animatedMeshNormals = null;
+            dynamicSkinNormalsScratch = null;
             staticBonePositions = null;
             staticParentIndices = null;
             avatarReferenceBoneMatrices = null;
@@ -540,6 +549,7 @@ namespace AssetStudio.Avalonia
             lock (meshLock)
             {
                 pendingMeshVertices = null;
+                pendingMeshNormals = null;
             }
 
             lock (skeletonLock)
@@ -553,8 +563,12 @@ namespace AssetStudio.Avalonia
             isAvatarMode = false;
             StopAnimation();
             animatedMeshVertices = null;
+            animatedMeshNormals = null;
+            dynamicSkinNormalsScratch = null;
             avatarReferenceMeshSource = null;
             avatarReferenceSourceVertices = null;
+            avatarReferenceSourceNormals = null;
+            avatarReferenceSourceVertexIndices = null;
             avatarReferenceSourceIndices = null;
             avatarReferenceBoneMatrices = null;
             avatarReferenceParentIndices = null;
@@ -571,11 +585,143 @@ namespace AssetStudio.Avalonia
             lock (meshLock)
             {
                 pendingMeshVertices = null;
+                pendingMeshNormals = null;
             }
         }
 
         private static Vector3[][]? BuildAnimatedAvatarReferenceVertices(Mesh mesh, Vector3[] sourceVertexData, PreviewMeshGeometry referenceMesh, Matrix4[][] boneMatrices, int[] parentIndices, ref Vector3 min, ref Vector3 max, bool expandBounds)
         {
+            return BuildAnimatedAvatarReferenceVerticesAndNormals(
+                mesh,
+                sourceVertexData,
+                null,
+                referenceMesh,
+                boneMatrices,
+                parentIndices,
+                ref min,
+                ref max,
+                expandBounds,
+                out _);
+        }
+
+        private static Matrix3 ComputeNormalMatrix(in Matrix4 skinningMatrix)
+        {
+            var upper = new Matrix3(
+                skinningMatrix.M11, skinningMatrix.M12, skinningMatrix.M13,
+                skinningMatrix.M21, skinningMatrix.M22, skinningMatrix.M23,
+                skinningMatrix.M31, skinningMatrix.M32, skinningMatrix.M33);
+            try
+            {
+                var det = upper.Determinant;
+                if (float.IsFinite(det) && Math.Abs(det) > 1e-8f)
+                {
+                    return Matrix3.Transpose(upper.Inverted());
+                }
+            }
+            catch
+            {
+            }
+
+            return upper;
+        }
+
+        internal static Vector3[]? SkinFrameNormals(
+            Mesh mesh,
+            Vector3[] sourceNormalData,
+            int[] sourceVertexIndices,
+            Matrix4[] frameMatrices,
+            Vector3[]? destination = null)
+        {
+            if (sourceVertexIndices.Length == 0
+                || mesh.m_Skin == null
+                || mesh.m_Skin.Length < sourceNormalData.Length
+                || mesh.m_BindPose == null
+                || frameMatrices.Length == 0)
+            {
+                return null;
+            }
+
+            var normalMatrices = new Matrix3[frameMatrices.Length];
+            for (int b = 0; b < frameMatrices.Length; b++)
+            {
+                if (b < mesh.m_BindPose.Length)
+                {
+                    var bp = mesh.m_BindPose[b];
+                    var otkMat = new Matrix4(
+                        bp.M00, bp.M01, bp.M02, bp.M03,
+                        bp.M10, bp.M11, bp.M12, bp.M13,
+                        bp.M20, bp.M21, bp.M22, bp.M23,
+                        bp.M30, bp.M31, bp.M32, bp.M33);
+                    normalMatrices[b] = ComputeNormalMatrix(otkMat * frameMatrices[b]);
+                }
+                else
+                {
+                    normalMatrices[b] = Matrix3.Identity;
+                }
+            }
+
+            var result = destination != null && destination.Length == sourceVertexIndices.Length
+                ? destination
+                : new Vector3[sourceVertexIndices.Length];
+
+            for (int v = 0; v < sourceVertexIndices.Length; v++)
+            {
+                int sourceVertexIndex = sourceVertexIndices[v];
+                var sourceNormal = sourceVertexIndex >= 0 && sourceVertexIndex < sourceNormalData.Length
+                    ? sourceNormalData[sourceVertexIndex]
+                    : Vector3.UnitY;
+                var skin = mesh.m_Skin[sourceVertexIndex];
+                var skinnedNormal = Vector3.Zero;
+                var weights = skin?.weight;
+                var boneIndices = skin?.boneIndex;
+                int influenceCount = weights != null && boneIndices != null
+                    ? Math.Min(weights.Length, boneIndices.Length)
+                    : 0;
+                for (int j = 0; j < influenceCount; j++)
+                {
+                    float w = weights![j];
+                    if (w <= 0f)
+                    {
+                        continue;
+                    }
+
+                    int bIdx = boneIndices![j];
+                    if (bIdx >= 0 && bIdx < normalMatrices.Length)
+                    {
+                        skinnedNormal += Vector3.TransformRow(sourceNormal, normalMatrices[bIdx]) * w;
+                    }
+                }
+
+                if (IsFinitePoint(skinnedNormal) && skinnedNormal.LengthSquared > 1e-10f)
+                {
+                    result[v] = Vector3.Normalize(skinnedNormal);
+                }
+                else if (IsFinitePoint(sourceNormal) && sourceNormal.LengthSquared > 1e-10f)
+                {
+                    result[v] = Vector3.Normalize(sourceNormal);
+                }
+                else
+                {
+                    result[v] = Vector3.UnitY;
+                }
+            }
+
+            return result;
+        }
+
+        private static Vector3[][]? BuildAnimatedAvatarReferenceVerticesAndNormals(
+            Mesh mesh,
+            Vector3[] sourceVertexData,
+            Vector3[]? sourceNormalData,
+            PreviewMeshGeometry referenceMesh,
+            Matrix4[][] boneMatrices,
+            int[] parentIndices,
+            ref Vector3 min,
+            ref Vector3 max,
+            bool expandBounds,
+            out Vector3[][]? animatedNormals)
+        {
+            animatedNormals = null;
             if (referenceMesh.SourceVertexIndices.Length == 0
                 || mesh.m_Skin == null
                 || mesh.m_Skin.Length < sourceVertexData.Length
@@ -586,12 +732,20 @@ namespace AssetStudio.Avalonia
                 return null;
             }
 
+            bool precomputeNormals = sourceNormalData != null
+                && sourceNormalData.Length >= sourceVertexData.Length
+                && (long)boneMatrices.Length * referenceMesh.SourceVertexIndices.Length <= MaxPrecomputedNormalVertexFrames;
+
             var localAnimatedMeshVerts = new Vector3[boneMatrices.Length][];
+            var localAnimatedMeshNormals = precomputeNormals ? new Vector3[boneMatrices.Length][] : null;
+
             for (int f = 0; f < boneMatrices.Length; f++)
             {
                 var frameVerts = new Vector3[referenceMesh.SourceVertexIndices.Length];
+                var frameNormals = precomputeNormals ? new Vector3[referenceMesh.SourceVertexIndices.Length] : null;
                 var frameMatrices = boneMatrices[f];
                 var skinningMatrices = new Matrix4[frameMatrices.Length];
+                var normalMatrices = precomputeNormals ? new Matrix3[frameMatrices.Length] : null;
 
                 for (int b = 0; b < frameMatrices.Length; b++)
                 {
@@ -604,11 +758,20 @@ namespace AssetStudio.Avalonia
                             bp.M20, bp.M21, bp.M22, bp.M23,
                             bp.M30, bp.M31, bp.M32, bp.M33
                         );
-                        skinningMatrices[b] = otkMat * frameMatrices[b];
+                        var skinMat = otkMat * frameMatrices[b];
+                        skinningMatrices[b] = skinMat;
+                        if (normalMatrices != null)
+                        {
+                            normalMatrices[b] = ComputeNormalMatrix(skinMat);
+                        }
                     }
                     else
                     {
                         skinningMatrices[b] = Matrix4.Identity;
+                        if (normalMatrices != null)
+                        {
+                            normalMatrices[b] = Matrix3.Identity;
+                        }
                     }
                 }
 
@@ -616,8 +779,10 @@ namespace AssetStudio.Avalonia
                 {
                     int sourceVertexIndex = referenceMesh.SourceVertexIndices[v];
                     var sourceVertex = sourceVertexData[sourceVertexIndex];
+                    var sourceNormal = frameNormals != null ? sourceNormalData![sourceVertexIndex] : Vector3.UnitY;
                     var skin = mesh.m_Skin[sourceVertexIndex];
                     Vector3 skinnedPos = Vector3.Zero;
+                    Vector3 skinnedNormal = Vector3.Zero;
                     float totalWeight = 0f;
 
                     var weights = skin?.weight;
@@ -638,11 +803,31 @@ namespace AssetStudio.Avalonia
                         {
                             var posB = Vector3.TransformPosition(sourceVertex, skinningMatrices[bIdx]);
                             skinnedPos += posB * w;
+                            if (normalMatrices != null)
+                            {
+                                skinnedNormal += Vector3.TransformRow(sourceNormal, normalMatrices[bIdx]) * w;
+                            }
                             totalWeight += w;
                         }
                     }
 
                     frameVerts[v] = totalWeight > 0f ? skinnedPos / totalWeight : sourceVertex;
+                    if (frameNormals != null)
+                    {
+                        if (IsFinitePoint(skinnedNormal) && skinnedNormal.LengthSquared > 1e-10f)
+                        {
+                            frameNormals[v] = Vector3.Normalize(skinnedNormal);
+                        }
+                        else if (IsFinitePoint(sourceNormal) && sourceNormal.LengthSquared > 1e-10f)
+                        {
+                            frameNormals[v] = Vector3.Normalize(sourceNormal);
+                        }
+                        else
+                        {
+                            frameNormals[v] = Vector3.UnitY;
+                        }
+                    }
+
                     if (expandBounds)
                     {
                         ExpandBounds(frameVerts[v], ref min, ref max);
@@ -650,8 +835,13 @@ namespace AssetStudio.Avalonia
                 }
 
                 localAnimatedMeshVerts[f] = frameVerts;
+                if (localAnimatedMeshNormals != null && frameNormals != null)
+                {
+                    localAnimatedMeshNormals[f] = frameNormals;
+                }
             }
 
+            animatedNormals = localAnimatedMeshNormals;
             return localAnimatedMeshVerts;
         }
 
@@ -664,6 +854,7 @@ namespace AssetStudio.Avalonia
 
             int currentLoadId = ++meshLoadCounter;
             var sourceVertices = avatarReferenceSourceVertices;
+            var sourceNormals = avatarReferenceSourceNormals;
             var sourceIndices = avatarReferenceSourceIndices;
             var sourceMesh = avatarReferenceMeshSource;
             var boneMatrices = avatarReferenceBoneMatrices;
@@ -674,14 +865,48 @@ namespace AssetStudio.Avalonia
 
             System.Threading.Tasks.Task.Run(() =>
             {
-                var referenceMesh = PreviewMeshSimplifier.Build(sourceVertices, sourceIndices, min, max, densityPercent);
+                var subMeshIndexCounts = sourceMesh != null
+                    ? BuildSubMeshIndexCounts(sourceMesh, sourceIndices.Count)
+                    : null;
+                var referenceMesh = PreviewMeshSimplifier.Build(sourceVertices, sourceIndices, min, max, densityPercent, subMeshIndexCounts);
                 Vector3[][]? rebuiltAnimatedVertices = null;
+                Vector3[][]? rebuiltAnimatedNormals = null;
 
                 if (sourceMesh != null && boneMatrices != null && parentIndices != null)
                 {
                     var ignoredMin = min;
                     var ignoredMax = max;
-                    rebuiltAnimatedVertices = BuildAnimatedAvatarReferenceVertices(sourceMesh, sourceVertices, referenceMesh, boneMatrices, parentIndices, ref ignoredMin, ref ignoredMax, false);
+                    rebuiltAnimatedVertices = BuildAnimatedAvatarReferenceVerticesAndNormals(
+                        sourceMesh,
+                        sourceVertices,
+                        sourceNormals,
+                        referenceMesh,
+                        boneMatrices,
+                        parentIndices,
+                        ref ignoredMin,
+                        ref ignoredMax,
+                        false,
+                        out rebuiltAnimatedNormals);
+                }
+
+                Vector3[]? rebuiltNormals = null;
+                Vector3[]? rebuiltCalcNormals = null;
+                Vector4[]? rebuiltColors = null;
+                Vector2[]? rebuiltUvs = null;
+                if (sourceMesh != null)
+                {
+                    var initialVerts = rebuiltAnimatedVertices != null && rebuiltAnimatedVertices.Length > 0
+                        ? rebuiltAnimatedVertices[0]
+                        : referenceMesh.Vertices;
+                    BuildReferenceSurfaceAttributes(
+                        sourceMesh,
+                        referenceMesh,
+                        initialVerts,
+                        out _,
+                        out rebuiltNormals,
+                        out rebuiltCalcNormals,
+                        out rebuiltColors,
+                        out rebuiltUvs);
                 }
 
                 global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
@@ -691,17 +916,35 @@ namespace AssetStudio.Avalonia
                         return;
                     }
 
-                    vertexData = rebuiltAnimatedVertices != null && animCurrentFrame < rebuiltAnimatedVertices.Length
-                        ? rebuiltAnimatedVertices[animCurrentFrame]
+                    int activeFrame = animCurrentFrame;
+                    Vector3[] activeVertices = rebuiltAnimatedVertices != null && activeFrame < rebuiltAnimatedVertices.Length
+                        ? rebuiltAnimatedVertices[activeFrame]
                         : referenceMesh.Vertices;
+                    Vector3[]? activeNormals = rebuiltAnimatedNormals != null && activeFrame < rebuiltAnimatedNormals.Length
+                        ? rebuiltAnimatedNormals[activeFrame]
+                        : (sourceMesh != null && sourceNormals != null && boneMatrices != null && activeFrame < boneMatrices.Length
+                            ? SkinFrameNormals(sourceMesh, sourceNormals, referenceMesh.SourceVertexIndices, boneMatrices[activeFrame])
+                            : rebuiltNormals);
+
+                    keepExistingTextures = true;
+                    avatarReferenceSourceVertexIndices = referenceMesh.SourceVertexIndices;
+                    vertexData = activeVertices;
                     indiceData = referenceMesh.Indices;
+                    normalData = activeNormals ?? rebuiltNormals;
+                    normal2Data = activeNormals ?? rebuiltCalcNormals ?? BuildCalculatedNormals(activeVertices, referenceMesh.Indices);
+                    colorData = rebuiltColors ?? ExtractMeshColors(null, activeVertices.Length);
+                    uvData = rebuiltUvs;
+                    previewSubMeshIndexCounts = referenceMesh.SubMeshIndexCounts ?? subMeshIndexCounts;
                     animatedMeshVertices = rebuiltAnimatedVertices;
+                    animatedMeshNormals = rebuiltAnimatedNormals;
+                    dynamicSkinNormalsScratch = null;
 
                     lock (meshLock)
                     {
-                        pendingMeshVertices = rebuiltAnimatedVertices != null && animCurrentFrame < rebuiltAnimatedVertices.Length
-                            ? rebuiltAnimatedVertices[animCurrentFrame]
+                        pendingMeshVertices = rebuiltAnimatedVertices != null && activeFrame < rebuiltAnimatedVertices.Length
+                            ? rebuiltAnimatedVertices[activeFrame]
                             : null;
+                        pendingMeshNormals = activeNormals;
                     }
 
                     vao = 0;
@@ -731,9 +974,33 @@ namespace AssetStudio.Avalonia
 
             if (animatedMeshVertices != null && animCurrentFrame < animatedMeshVertices.Length)
             {
+                Vector3[]? frameNormals = null;
+                if (animatedMeshNormals != null && animCurrentFrame < animatedMeshNormals.Length)
+                {
+                    frameNormals = animatedMeshNormals[animCurrentFrame];
+                }
+                else if (avatarReferenceMeshSource != null
+                    && avatarReferenceSourceNormals != null
+                    && avatarReferenceSourceVertexIndices != null
+                    && avatarReferenceBoneMatrices != null
+                    && animCurrentFrame < avatarReferenceBoneMatrices.Length)
+                {
+                    dynamicSkinNormalsScratch = SkinFrameNormals(
+                        avatarReferenceMeshSource,
+                        avatarReferenceSourceNormals,
+                        avatarReferenceSourceVertexIndices,
+                        avatarReferenceBoneMatrices[animCurrentFrame],
+                        dynamicSkinNormalsScratch);
+                    frameNormals = dynamicSkinNormalsScratch;
+                }
+
                 lock (meshLock)
                 {
                     pendingMeshVertices = animatedMeshVertices[animCurrentFrame];
+                    if (frameNormals != null)
+                    {
+                        pendingMeshNormals = frameNormals;
+                    }
                 }
             }
 

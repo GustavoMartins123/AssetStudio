@@ -103,6 +103,8 @@ public partial class MainWindow : Window
     private AsyncPreviewRequestCoordinator _previewRequestCoordinator => PreviewSession.PreviewCoordinator;
     private AsyncPreviewRequestCoordinator _dumpRequestCoordinator => PreviewSession.DumpCoordinator;
     private readonly SemaphoreSlim _assemblyLoaderGate = new(1, 1);
+    private string? _lastPreviewedAssetUniqueId;
+    private bool _suppressNextRightTabSelectionPreview;
 
     private CancellationToken BeginAsyncPreviewRequest(out long requestId, out long previewVersion)
     {
@@ -162,13 +164,35 @@ public partial class MainWindow : Window
             PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
             if (RightTabControl.SelectedIndex == 1)
             {
+                PreviewSession.IsDumpTabActive = true;
+                if (PreviewSession.IsLoading)
+                {
+                    _lastPreviewedAssetUniqueId = null;
+                }
                 CancelPendingPreview();
+                GLPreviewControl?.SuspendForHiddenTab();
                 await UpdateDumpForSelectedAsset();
             }
             else if (RightTabControl.SelectedIndex == 0)
             {
+                PreviewSession.IsDumpTabActive = false;
                 _dumpRequestCoordinator.CancelCurrent();
-                PreviewSelectedAssetImmediately();
+                if (_suppressNextRightTabSelectionPreview)
+                {
+                    _suppressNextRightTabSelectionPreview = false;
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(_currentlySelectedUniqueID)
+                    && string.Equals(_lastPreviewedAssetUniqueId, _currentlySelectedUniqueID, StringComparison.Ordinal))
+                {
+                    GLPreviewControl?.ResumeAfterHiddenTab();
+                    TextureGLPreview?.RequestNextFrameRendering();
+                }
+                else
+                {
+                    PreviewSelectedAssetImmediately();
+                }
             }
         }
     }
@@ -681,6 +705,7 @@ public partial class MainWindow : Window
         _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         Interlocked.Increment(ref texturePreviewIdCounter);
+        _lastPreviewedAssetUniqueId = assetItem.Handle != null ? assetItem.Handle.UniqueID : assetItem.UniqueID;
         if (!ViewModel.Options.EnablePreview)
         {
             ClearPreview("Preview disabled");

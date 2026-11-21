@@ -370,8 +370,10 @@ public partial class MainWindow : Window
             GLPreviewControl.GpuErrorOccurred += _glGpuErrorHandler;
             GLPreviewControl.AnimationFrameChanged += _glAnimationFrameChangedHandler;
             GLPreviewControl.MeshGeometryLoaded += OnMeshPreviewGeometryLoaded;
+            GLPreviewControl.DisplayOptionsChanged += OnGlPreviewDisplayOptionsChanged;
         }
 
+        MeshPreview.PropertyChanged += OnMeshPreviewViewModelPropertyChanged;
         ApplyAvatarPreviewControlSettings();
     }
 
@@ -443,10 +445,7 @@ public partial class MainWindow : Window
 
         handlers.WireframeModeChanged = mode =>
         {
-            if (GLPreviewControl != null)
-            {
-                GLPreviewControl.WireframeMode = mode;
-            }
+            ApplyUnifiedDisplayWireframeMode(mode, saveSettings: true);
         };
         handlers.ShadeModeChanged = mode =>
         {
@@ -461,6 +460,15 @@ public partial class MainWindow : Window
             {
                 GLPreviewControl.NormalMode = mode;
             }
+        };
+        handlers.ShowSkeletonChanged = visible =>
+        {
+            appSettings.ModelPreviewShowSkeleton = visible;
+            if (GLPreviewControl != null)
+            {
+                GLPreviewControl.ShowSkeleton = visible;
+            }
+            QueueAvatarPreviewSettingsSave();
         };
         handlers.TextureChannelToggled = _ =>
         {
@@ -2125,11 +2133,13 @@ public partial class MainWindow : Window
         {
             TextureGLPreview.GpuErrorOccurred -= _textureGlGpuErrorHandler;
         }
+        MeshPreview.PropertyChanged -= OnMeshPreviewViewModelPropertyChanged;
         if (GLPreviewControl != null)
         {
             GLPreviewControl.GpuErrorOccurred -= _glGpuErrorHandler;
             GLPreviewControl.AnimationFrameChanged -= _glAnimationFrameChangedHandler;
             GLPreviewControl.MeshGeometryLoaded -= OnMeshPreviewGeometryLoaded;
+            GLPreviewControl.DisplayOptionsChanged -= OnGlPreviewDisplayOptionsChanged;
             GLPreviewControl.LoadMeshPreviewGeometryCache = null;
             GLPreviewControl.SaveMeshPreviewGeometryCache = null;
         }

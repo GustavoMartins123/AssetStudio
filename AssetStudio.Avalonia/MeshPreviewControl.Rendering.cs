@@ -64,7 +64,6 @@ namespace AssetStudio.Avalonia
 
             keepExistingTextures = true;
             previewMaterialMode = true;
-            vao = 0;
 
             lock (textureLock)
             {
@@ -144,20 +143,27 @@ namespace AssetStudio.Avalonia
 
                 if (isAvatarMode)
                 {
-                    RenderAvatarFrame(indices);
-                    return;
+                    UploadPendingDynamicGeometry();
                 }
 
-                GL.BindVertexArray(vao);
-
-                if (wireFrameMode == 0 || wireFrameMode == 2)
+                if (showMesh)
                 {
-                    RenderMeshSolidPass(indices);
+                    GL.BindVertexArray(vao);
+
+                    if (wireFrameMode == 0 || wireFrameMode == 2)
+                    {
+                        RenderMeshSolidPass(indices);
+                    }
+
+                    if (wireFrameMode == 1 || wireFrameMode == 2)
+                    {
+                        RenderWireframeOverlay(indices, useGreenWireframe: isAvatarMode && wireFrameMode == 1);
+                    }
                 }
 
-                if (wireFrameMode == 1 || wireFrameMode == 2)
+                if (isAvatarMode && showSkeleton && vaoSkeleton != 0 && (boneLinesVertexCount > 0 || jointPointsVertexCount > 0))
                 {
-                    RenderWireframeOverlay(indices);
+                    RenderSkeletonOverlay();
                 }
 
                 GL.BindVertexArray(0);
@@ -238,7 +244,7 @@ namespace AssetStudio.Avalonia
             return true;
         }
 
-        private void RenderAvatarFrame(int[] indices)
+        private void UploadPendingDynamicGeometry()
         {
             Vector3[]? localSkeletonVerts = null;
             lock (skeletonLock)
@@ -258,12 +264,18 @@ namespace AssetStudio.Avalonia
             }
 
             Vector3[]? localMeshVerts = null;
+            Vector3[]? localMeshNormals = null;
             lock (meshLock)
             {
                 if (pendingMeshVertices != null)
                 {
                     localMeshVerts = pendingMeshVertices;
                     pendingMeshVertices = null;
+                }
+                if (pendingMeshNormals != null)
+                {
+                    localMeshNormals = pendingMeshNormals;
+                    pendingMeshNormals = null;
                 }
             }
 
@@ -274,49 +286,45 @@ namespace AssetStudio.Avalonia
                 GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
             }
 
-            EnsureWireframeVAO();
-            if (vaoWireframe != 0)
+            if (localMeshNormals != null && vboNormal != 0)
             {
-                GL.UseProgram(pgmGreenID);
-                GL.UniformMatrix4(uniformModelMatrixGreen, false, ref modelMatrixData);
-                GL.UniformMatrix4(uniformViewMatrixGreen, false, ref viewMatrixData);
-                GL.UniformMatrix4(uniformProjMatrixGreen, false, ref projMatrixData);
-                GL.BindVertexArray(vaoWireframe);
-                int lineCount = (indices.Length / 3) * 6;
-                if (lineCount > 0)
-                {
-                    GL.DrawElements(BeginMode.Lines, lineCount, DrawElementsType.UnsignedInt, 0);
-                }
+                GL.BindBuffer(BufferTarget.ArrayBuffer, vboNormal);
+                GL.BufferData(BufferTarget.ArrayBuffer, (IntPtr)(localMeshNormals.Length * 12), localMeshNormals, BufferUsageHint.DynamicDraw);
+                GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
             }
+        }
 
-            if (vaoSkeleton != 0 && (boneLinesVertexCount > 0 || jointPointsVertexCount > 0))
+        private void RenderSkeletonOverlay()
+        {
+            if (skeletonXRay)
             {
                 GL.Disable(EnableCap.DepthTest);
-                GL.BindVertexArray(vaoSkeleton);
-
-                if (boneLinesVertexCount > 0)
-                {
-                    GL.UseProgram(pgmYellowID);
-                    GL.UniformMatrix4(uniformModelMatrixYellow, false, ref modelMatrixData);
-                    GL.UniformMatrix4(uniformViewMatrixYellow, false, ref viewMatrixData);
-                    GL.UniformMatrix4(uniformProjMatrixYellow, false, ref projMatrixData);
-                    GL.DrawArrays(PrimitiveType.Lines, 0, boneLinesVertexCount);
-                }
-
-                if (jointPointsVertexCount > 0)
-                {
-                    GL.UseProgram(pgmRedID);
-                    GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
-                    GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
-                    GL.UniformMatrix4(uniformProjMatrixRed, false, ref projMatrixData);
-                    GL.DrawArrays(PrimitiveType.Lines, boneLinesVertexCount, jointPointsVertexCount);
-                }
-
-                GL.Enable(EnableCap.DepthTest);
             }
 
-            GL.BindVertexArray(0);
-            GL.Flush();
+            GL.BindVertexArray(vaoSkeleton);
+
+            if (boneLinesVertexCount > 0)
+            {
+                GL.UseProgram(pgmYellowID);
+                GL.UniformMatrix4(uniformModelMatrixYellow, false, ref modelMatrixData);
+                GL.UniformMatrix4(uniformViewMatrixYellow, false, ref viewMatrixData);
+                GL.UniformMatrix4(uniformProjMatrixYellow, false, ref projMatrixData);
+                GL.DrawArrays(PrimitiveType.Lines, 0, boneLinesVertexCount);
+            }
+
+            if (jointPointsVertexCount > 0)
+            {
+                GL.UseProgram(pgmRedID);
+                GL.UniformMatrix4(uniformModelMatrixRed, false, ref modelMatrixData);
+                GL.UniformMatrix4(uniformViewMatrixRed, false, ref viewMatrixData);
+                GL.UniformMatrix4(uniformProjMatrixRed, false, ref projMatrixData);
+                GL.DrawArrays(PrimitiveType.Lines, boneLinesVertexCount, jointPointsVertexCount);
+            }
+
+            if (skeletonXRay)
+            {
+                GL.Enable(EnableCap.DepthTest);
+            }
         }
 
         private void RenderMeshSolidPass(int[] indices)
@@ -329,10 +337,10 @@ namespace AssetStudio.Avalonia
             var localTextureIds = previewTextureIds;
             var localMaterialTints = materialTintOverrides;
             var localSubMeshIndexCounts = previewSubMeshIndexCounts;
+            bool effectiveTextures = useTextures && previewMaterialMode;
             bool drawBySubMesh = localSubMeshIndexCounts != null
                 && localSubMeshIndexCounts.Length > 0
-                && !isAvatarMode
-                && ((previewMaterialMode && localTextureIds != null) || (localMaterialTints != null && localMaterialTints.Length > 0));
+                && ((effectiveTextures && localTextureIds != null) || (localMaterialTints != null && localMaterialTints.Length > 0));
 
             if (drawBySubMesh && localSubMeshIndexCounts != null)
             {
@@ -370,7 +378,7 @@ namespace AssetStudio.Avalonia
 
         private void BindMeshShaderProgram(int textureId, Vector4 tint)
         {
-            if (previewMaterialMode && textureId != 0)
+            if (useTextures && previewMaterialMode && textureId != 0 && uvData != null)
             {
                 GL.UseProgram(pgmTexID);
                 GL.ActiveTexture(TextureUnit.Texture0);
@@ -401,7 +409,7 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private void RenderWireframeOverlay(int[] indices)
+        private void RenderWireframeOverlay(int[] indices, bool useGreenWireframe = false)
         {
             EnsureWireframeVAO();
             if (vaoWireframe == 0)
@@ -415,10 +423,21 @@ namespace AssetStudio.Avalonia
                 GL.PolygonOffset(-1.0f, -1.0f);
             }
 
-            GL.UseProgram(pgmBlackID);
-            GL.UniformMatrix4(uniformModelMatrixBlack, false, ref modelMatrixData);
-            GL.UniformMatrix4(uniformViewMatrixBlack, false, ref viewMatrixData);
-            GL.UniformMatrix4(uniformProjMatrixBlack, false, ref projMatrixData);
+            if (useGreenWireframe)
+            {
+                GL.UseProgram(pgmGreenID);
+                GL.UniformMatrix4(uniformModelMatrixGreen, false, ref modelMatrixData);
+                GL.UniformMatrix4(uniformViewMatrixGreen, false, ref viewMatrixData);
+                GL.UniformMatrix4(uniformProjMatrixGreen, false, ref projMatrixData);
+            }
+            else
+            {
+                GL.UseProgram(pgmBlackID);
+                GL.UniformMatrix4(uniformModelMatrixBlack, false, ref modelMatrixData);
+                GL.UniformMatrix4(uniformViewMatrixBlack, false, ref viewMatrixData);
+                GL.UniformMatrix4(uniformProjMatrixBlack, false, ref projMatrixData);
+            }
+
             GL.BindVertexArray(vaoWireframe);
 
             int lineCount = (indices.Length / 3) * 6;

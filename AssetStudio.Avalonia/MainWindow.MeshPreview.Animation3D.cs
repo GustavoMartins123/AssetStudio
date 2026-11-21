@@ -199,12 +199,14 @@ internal sealed class PreparedAnimationRigData
                 return _cachedReferenceMesh;
             }
 
+            var subMeshCounts = MeshPreviewControl.BuildSubMeshIndexCounts(Mesh, Mesh.m_Indices?.Count ?? 0);
             var built = PreviewMeshSimplifier.Build(
                 SourceVertexData,
-                Mesh.m_Indices,
+                Mesh.m_Indices ?? new List<uint>(),
                 SourceMeshMin,
                 SourceMeshMax,
-                densityPercent);
+                densityPercent,
+                subMeshCounts);
             _cachedReferenceMesh = built;
             _cachedDensityPercent = densityPercent;
             return built;
@@ -682,10 +684,18 @@ public partial class MainWindow
         {
             currentPreviewAvatar = outcome.Avatar;
             currentPreviewMesh = outcome.Mesh;
+            ClearMeshMaterialControls();
             GLPreviewControl.ApplyPreparedAvatarPreview(outcome.GlData);
             GLPreviewControl.IsVisible = true;
             ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
+            if (outcome.Mesh != null)
+            {
+                QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+                    outcome.Mesh,
+                    texturePreviewIdCounter,
+                    AssetListDataGrid?.SelectedItem as AssetItem);
+            }
             if (TextPreviewBox != null)
             {
                 TextPreviewBox.IsVisible = false;

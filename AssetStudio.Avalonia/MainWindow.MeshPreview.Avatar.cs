@@ -351,10 +351,15 @@ public partial class MainWindow
 
         if (avatarMesh != null && preparedGl != null && GLPreviewControl != null)
         {
+            ClearMeshMaterialControls();
             GLPreviewControl.ApplyPreparedAvatarPreview(preparedGl);
             GLPreviewControl.IsVisible = true;
             ShowPreviewGeometryControls(showBoneControls: true);
             GLPreviewControl.Focus();
+            QueueLoadMaterialsForUnifiedMeshPreviewAsync(
+                avatarMesh,
+                texturePreviewIdCounter,
+                AssetListDataGrid?.SelectedItem as AssetItem);
             TextPreviewBox.IsVisible = false;
             PreviewLabel.IsVisible = false;
             StatusStripUpdate($"OpenGL Avatar Preview | Mesh: {avatarMesh.m_Name} | Related meshes: {avatarCandidates.Count} | Skeleton Joints: {boneJointCount}");

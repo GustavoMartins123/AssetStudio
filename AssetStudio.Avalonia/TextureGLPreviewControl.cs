@@ -184,6 +184,7 @@ void main()
         // Pending texture upload data
         private readonly object textureLock = new object();
         private PreparedGpuTexturePayload? pendingPreparedPayload;
+        private PreparedGpuTexturePayload? lastUploadedPreparedPayload;
         private byte[]? pendingTextureData;
         private int pendingWidth;
         private int pendingHeight;
@@ -535,6 +536,7 @@ void main()
             lock (textureLock)
             {
                 pendingPreparedPayload = payload;
+                lastUploadedPreparedPayload = payload;
                 currentTexture = payload.SourceTextureForFallback;
                 pendingTextureData = null;
                 pendingWidth = payload.Width;
@@ -557,6 +559,7 @@ void main()
             lock (textureLock)
             {
                 pendingPreparedPayload = null;
+                lastUploadedPreparedPayload = null;
                 currentTexture = texture;
                 pendingWidth = texture.m_Width;
                 pendingHeight = texture.m_Height;
@@ -638,6 +641,31 @@ void main()
                 uniformChannelMask = GL.GetUniformLocation(pgmID, "channelMask");
                 uniformIsAlphaOnly = GL.GetUniformLocation(pgmID, "isAlphaOnly");
                 uniformYFlip = GL.GetUniformLocation(pgmID, "yFlip");
+
+                bool shouldRequestFrame = false;
+                lock (textureLock)
+                {
+                    if (!hasPendingTexture && lastUploadedPreparedPayload != null)
+                    {
+                        pendingPreparedPayload = lastUploadedPreparedPayload;
+                        pendingWidth = lastUploadedPreparedPayload.Width;
+                        pendingHeight = lastUploadedPreparedPayload.Height;
+                        pendingFormat = lastUploadedPreparedPayload.UploadFormat;
+                        pendingNeedsYFlip = lastUploadedPreparedPayload.NeedsYFlip;
+                        hasPendingTexture = true;
+                        hasTexture = true;
+                        shouldRequestFrame = true;
+                    }
+                    else if (hasPendingTexture)
+                    {
+                        shouldRequestFrame = true;
+                    }
+                }
+
+                if (shouldRequestFrame)
+                {
+                    RequestNextFrameRendering();
+                }
             }
             catch (Exception ex)
             {
@@ -647,9 +675,24 @@ void main()
 
         protected override void OnOpenGlDeinit(GlInterface gl)
         {
-            CleanupBuffers();
-            if (pgmID != 0) GL.DeleteProgram(pgmID);
-            if (glTextureId != 0) GL.DeleteTexture(glTextureId);
+            try
+            {
+                CleanupBuffers();
+                if (pgmID != 0)
+                {
+                    GL.DeleteProgram(pgmID);
+                    pgmID = 0;
+                }
+                if (glTextureId != 0)
+                {
+                    GL.DeleteTexture(glTextureId);
+                    glTextureId = 0;
+                }
+                hasTexture = false;
+            }
+            catch
+            {
+            }
         }
 
         protected override void OnOpenGlRender(GlInterface gl, int fb)

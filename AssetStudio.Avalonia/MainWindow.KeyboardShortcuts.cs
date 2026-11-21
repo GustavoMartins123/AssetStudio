@@ -19,12 +19,26 @@ public partial class MainWindow
                     handled = true;
                     break;
                 case Key.S:
-                    ViewModel.ToggleShadeModeCommand.Execute();
+                    if (GLPreviewControl.HasLoadedTextures)
+                    {
+                        MeshPreview.UseTextures = !MeshPreview.UseTextures;
+                    }
+                    else
+                    {
+                        ViewModel.ToggleShadeModeCommand.Execute();
+                    }
                     handled = true;
                     break;
                 case Key.N:
                     ViewModel.ToggleNormalModeCommand.Execute();
                     handled = true;
+                    break;
+                case Key.B:
+                    if (MeshPreview.IsBoneControlsVisible)
+                    {
+                        ViewModel.ToggleShowSkeletonCommand.Execute();
+                        handled = true;
+                    }
                     break;
             }
             if (handled)

@@ -29,7 +29,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private int _normalMode;
         private bool _showNormals;
         private bool _showAxes = true;
+        private bool _showMesh = true;
         private bool _showSkeleton = true;
+        private bool _skeletonXRay = true;
         private bool _showMaterials = true;
         private bool _useTextures = true;
         private MeshPreviewViewPreset _viewPreset = MeshPreviewViewPreset.Auto;
@@ -127,10 +129,46 @@ namespace AssetStudio.Avalonia.ViewModels
             set => SetProperty(ref _showAxes, value);
         }
 
+        public bool ShowMesh
+        {
+            get => _showMesh;
+            set => SetProperty(ref _showMesh, value);
+        }
+
         public bool ShowSkeleton
         {
             get => _showSkeleton;
-            set => SetProperty(ref _showSkeleton, value);
+            set
+            {
+                if (SetProperty(ref _showSkeleton, value))
+                {
+                    OnPropertyChanged(nameof(IsBoneSizeVisible));
+                }
+            }
+        }
+
+        public bool SkeletonXRay
+        {
+            get => _skeletonXRay;
+            set => SetProperty(ref _skeletonXRay, value);
+        }
+
+        public bool ToggleShowSkeleton()
+        {
+            ShowSkeleton = !_showSkeleton;
+            return _showSkeleton;
+        }
+
+        public bool ToggleShowMesh()
+        {
+            ShowMesh = !_showMesh;
+            return _showMesh;
+        }
+
+        public bool ToggleSkeletonXRay()
+        {
+            SkeletonXRay = !_skeletonXRay;
+            return _skeletonXRay;
         }
 
         public bool ShowMaterials
@@ -198,8 +236,16 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsBoneControlsVisible
         {
             get => _isBoneControlsVisible;
-            set => SetProperty(ref _isBoneControlsVisible, value);
+            set
+            {
+                if (SetProperty(ref _isBoneControlsVisible, value))
+                {
+                    OnPropertyChanged(nameof(IsBoneSizeVisible));
+                }
+            }
         }
+
+        public bool IsBoneSizeVisible => _isBoneControlsVisible && _showSkeleton;
 
         public bool IsControlsExpanded
         {
@@ -843,7 +889,9 @@ namespace AssetStudio.Avalonia.ViewModels
                     ShadeMode = 0;
                     ShowNormals = false;
                     ShowAxes = true;
+                    ShowMesh = true;
                     ShowSkeleton = true;
+                    SkeletonXRay = true;
                     ShowMaterials = true;
                     UseTextures = true;
                     ViewPreset = MeshPreviewViewPreset.Auto;

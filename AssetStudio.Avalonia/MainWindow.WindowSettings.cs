@@ -160,6 +160,7 @@ public partial class MainWindow
 
     private void ClearPreview(string message = "[Preview Panel]")
     {
+        _lastPreviewedAssetUniqueId = null;
         Stop2DAnimation();
         TextPreviewBox.Text = string.Empty;
         TextPreviewBox.IsVisible = false;

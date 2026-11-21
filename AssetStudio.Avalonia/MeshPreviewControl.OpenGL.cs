@@ -229,6 +229,39 @@ void main()
                 uniformModelMatrixRed = GL.GetUniformLocation(pgmRedID, "modelMatrix");
                 uniformViewMatrixRed = GL.GetUniformLocation(pgmRedID, "viewMatrix");
                 uniformProjMatrixRed = GL.GetUniformLocation(pgmRedID, "projMatrix");
+
+                // Force clean viewport & GPU buffer/texture re-upload if the GL context was re-initialized while geometry is loaded.
+                lastWidth = 0;
+                lastHeight = 0;
+                vao = 0;
+                if (isAvatarMode)
+                {
+                    UpdateSkeletonVertices();
+                }
+
+                var cachedTextures = meshGroupPreviewSourceSubMeshTextures ?? meshPreviewSourceSubMeshTextures;
+                var cachedWidths = meshGroupPreviewSourceSubMeshTexWidths ?? meshPreviewSourceSubMeshTexWidths;
+                var cachedHeights = meshGroupPreviewSourceSubMeshTexHeights ?? meshPreviewSourceSubMeshTexHeights;
+                var cachedMap = meshGroupPreviewSourceSubMeshTextureMap ?? meshPreviewSourceSubMeshTextureMap;
+                if (previewMaterialMode && cachedTextures != null && cachedTextures.Any(t => t != null))
+                {
+                    lock (textureLock)
+                    {
+                        if (!hasPendingSubMeshTextures)
+                        {
+                            pendingSubMeshTextures = cachedTextures;
+                            pendingSubMeshTexWidths = cachedWidths;
+                            pendingSubMeshTexHeights = cachedHeights;
+                            pendingSubMeshTextureMap = cachedMap;
+                            hasPendingSubMeshTextures = true;
+                        }
+                    }
+                }
+
+                if (vertexData != null)
+                {
+                    RequestNextFrameRendering();
+                }
             }
             catch (Exception ex)
             {
@@ -249,6 +282,8 @@ void main()
                 DeleteProgramIfCreated(ref pgmYellowID);
                 DeleteProgramIfCreated(ref pgmRedID);
                 DeletePreviewTextures();
+                lastWidth = 0;
+                lastHeight = 0;
             }
             catch
             {
@@ -422,22 +457,26 @@ void main()
                 GL.EnableVertexAttribArray(LocationPosition);
             }
 
-            if (normalMode == 0)
+            var activeNormals = (normalMode == 1 && normalData != null)
+                ? normalData
+                : (normal2Data ?? normalData);
+            if (activeNormals != null)
             {
-                CreateVBO(out _, normal2Data, LocationNormal);
-            }
-            else if (normalData != null)
-            {
-                CreateVBO(out _, normalData, LocationNormal);
-            }
-
-            if (previewMaterialMode && uvData != null)
-            {
-                CreateVBO(out _, uvData, LocationTexCoord);
+                CreateVBO(out vboNormal, activeNormals, LocationNormal, isAvatarMode ? BufferUsageHint.DynamicDraw : BufferUsageHint.StaticDraw);
             }
             else
             {
+                vboNormal = 0;
+            }
+
+            if (colorData != null)
+            {
                 CreateVBO(out _, colorData, LocationColor);
+            }
+
+            if (uvData != null)
+            {
+                CreateVBO(out _, uvData, LocationTexCoord);
             }
 
             CreateEBO(out _, indiceData);
@@ -578,6 +617,7 @@ void main()
                 }
             }
             vboPosition = 0;
+            vboNormal = 0;
         }
 
         private sealed class AvaloniaBindingsContext : IBindingsContext
