@@ -19,8 +19,11 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private const int Rgba8 = 28;
     private const uint BindVertexBuffer = 1, BindIndexBuffer = 2, BindConstantBuffer = 4,
         BindShaderResource = 8, BindRenderTarget = 32, BindDepthStencil = 64;
+    private static readonly NumericsMatrix4x4 Projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(35 * MathF.PI / 180, 1,
+        ShaderPreviewCamera.Near, ShaderPreviewCamera.Far);
 
     private static readonly (Vertex[] Vertices, uint[] Indices) Plane = BuildPlane();
+    private static readonly (Vertex[] Vertices, uint[] Indices) ScreenQuad = BuildScreenQuad();
     private static readonly (Vertex[] Vertices, uint[] Indices) Sphere = BuildSphere();
     private static readonly (Vertex[] Vertices, uint[] Indices) Skybox = BuildSkybox();
     private const int ParticleCount = 8;
@@ -28,12 +31,14 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     private readonly ShaderPreviewScene _scene;
     private readonly D3D11PreviewDevice _device;
+    private readonly BuiltInLightingPreview? _lighting;
+    private ShaderPreviewCamera? _lightingCamera;
     private readonly nint _vertexBuffer, _indexBuffer, _target, _targetView, _depth, _resolved, _staging;
     private readonly int _indexCount;
     private readonly TextureDesc _colorCopy;
     private readonly bool _multisampled, _showBackgroundPattern;
     private readonly Dictionary<LegacyShaderPreviewPass, (nint Layout, nint Vertex, nint Pixel, nint Blend, nint Depth, nint Rasterizer)> _passes = new();
-    private readonly Dictionary<string, (nint View, nint Sampler)> _textures = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, GpuTexture> _textures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (nint Texture, nint View)> _grabs = new(StringComparer.Ordinal);
     private readonly Dictionary<ShaderPreviewBuffer, nint> _constantBuffers = new();
     private nint _grabSampler;
@@ -53,6 +58,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             {
                 ShaderPreviewGeometry.Particles => (new Vertex[ParticleCount * 4], ParticleIndices),
                 ShaderPreviewGeometry.Plane => Plane,
+                ShaderPreviewGeometry.ScreenQuad => ScreenQuad,
                 ShaderPreviewGeometry.Skybox or ShaderPreviewGeometry.Volume => Skybox,
                 _ => Sphere
             };
@@ -88,6 +94,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             frame.Usage = 3; // staging
             frame.CpuAccess = 0x20000; // read
             _staging = _device.CreateTexture(frame);
+            if (scene.LightingPass != BuiltInLightingPass.None)
+            {
+                _lighting = new BuiltInLightingPreview(scene.LightingPass, scene.Lights[0], FrameSize);
+            }
         }
         catch
         {
@@ -102,11 +112,26 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         var eye = new NumericsVector3(MathF.Sin(camera.Yaw) * MathF.Cos(camera.Pitch), MathF.Sin(camera.Pitch),
             MathF.Cos(camera.Yaw) * MathF.Cos(camera.Pitch)) * camera.Distance;
         NumericsMatrix4x4 view = NumericsMatrix4x4.CreateLookAt(eye, NumericsVector3.Zero, NumericsVector3.UnitY);
-        NumericsMatrix4x4 projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(35 * MathF.PI / 180, 1,
-            ShaderPreviewCamera.Near, ShaderPreviewCamera.Far);
         if (_scene.Geometry == ShaderPreviewGeometry.Skybox)
         {
             view.Translation = NumericsVector3.Zero;
+        }
+        if (_lighting is { } lighting && _lightingCamera != camera)
+        {
+            lighting.RenderInputs(view, Projection, eye, token);
+            _device.ClearBindings();
+            foreach (var (name, texture) in lighting.Textures)
+            {
+                if (!_textures.TryGetValue(name, out var gpu))
+                {
+                    _textures.Add(name, UploadTexture(_device, texture, name, mutable: !texture.Comparison));
+                }
+                else if (!texture.Comparison)
+                {
+                    _device.UpdateTexture2D(gpu.Image, texture.Pixels, (uint)(texture.Width * texture.BytesPerBlock));
+                }
+            }
+            _lightingCamera = camera;
         }
         else
         {
@@ -215,7 +240,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 {
                     throw new InvalidDataException($"Duplicate constant buffer binding b{buffer.Slot}.");
                 }
-                var data = ShaderPreviewService.BindConstants(_scene, buffer, light, view, projection, eye, FrameSize, capturedNames, time, deltaTime);
+                var data = ShaderPreviewService.BindConstants(_scene, buffer, light, view, Projection, eye, FrameSize, capturedNames, time, deltaTime, _lighting);
                 if (_constantBuffers.TryGetValue(buffer, out nint gpuBuffer))
                 {
                     _device.UpdateBuffer<byte>(gpuBuffer, data);
@@ -228,7 +253,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 _device.SetConstantBuffer(gpuBuffer, buffer.Slot, vertex);
             }
             var slots = new HashSet<int>();
-            var samplers = new Dictionary<int, (int Filter, int Wrap, int Anisotropy, float Bias)>();
+            var samplers = new Dictionary<int, (int Filter, int Wrap, int Anisotropy, float Bias, bool Comparison)>();
             foreach (var binding in stage.Textures)
             {
                 token.ThrowIfCancellationRequested();
@@ -236,20 +261,21 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 {
                     throw new InvalidDataException($"Duplicate texture register t{binding.Slot} for '{binding.Name}'.");
                 }
-                (nint View, nint Sampler) gpu;
-                (int Filter, int Wrap, int Anisotropy, float Bias) sampling;
+                GpuTexture gpu;
+                (int Filter, int Wrap, int Anisotropy, float Bias, bool Comparison) sampling;
                 if (capturedNames.Contains(binding.Name) && _grabs.TryGetValue(binding.Name, out var grab))
                 {
-                    gpu = (grab.View, _grabSampler);
-                    sampling = (1, 1, 1, 0);
+                    gpu = new GpuTexture(grab.Texture, grab.View, _grabSampler);
+                    sampling = (1, 1, 1, 0, false);
                 }
                 else
                 {
-                    if (!_scene.Textures.TryGetValue(binding.Name, out var texture))
+                    var resources = BuiltInLightingPreview.ProvidesTexture(_scene.LightingPass, binding.Name) ? _lighting!.Textures : _scene.Textures;
+                    if (!resources.TryGetValue(binding.Name, out var texture))
                     {
                         throw new InvalidDataException($"Texture '{binding.Name}' is unavailable before this pass.");
                     }
-                    sampling = (texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias);
+                    sampling = (texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias, texture.Comparison);
                     if (!_textures.TryGetValue(binding.Name, out gpu))
                     {
                         gpu = UploadTexture(_device, texture, binding.Name);
@@ -272,7 +298,9 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     public void Dispose() => _device.Dispose();
 
-    private static (nint View, nint Sampler) UploadTexture(D3D11PreviewDevice device, ShaderPreviewTexture texture, string name)
+    private readonly record struct GpuTexture(nint Image, nint View, nint Sampler);
+
+    private static GpuTexture UploadTexture(D3D11PreviewDevice device, ShaderPreviewTexture texture, string name, bool mutable = false)
     {
         int subresources = texture.MipCount * texture.Faces;
         var levels = stackalloc SubresourceData[subresources];
@@ -302,15 +330,16 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             nint image = device.CreateTexture(new TextureDesc
             {
                 Width = (uint)texture.Width, Height = (uint)texture.Height, MipLevels = (uint)texture.MipCount,
-                ArraySize = (uint)texture.Faces, Format = texture.Format, SampleCount = 1, Usage = 1, BindFlags = BindShaderResource,
+                ArraySize = (uint)texture.Faces, Format = texture.Format, SampleCount = 1, Usage = mutable ? 0u : 1u, BindFlags = BindShaderResource,
                 MiscFlags = texture.Faces == 6 ? 4u : 0u // D3D11_RESOURCE_MISC_TEXTURECUBE
             }, levels);
-            nint sampler = CreateSampler(device, texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias);
-            return (texture.Faces == 6 ? device.CreateCubeView(image, texture.Format, texture.MipCount) : device.CreateShaderView(image), sampler);
+            nint sampler = CreateSampler(device, texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias, texture.Comparison);
+            var view = texture.Faces == 6 ? device.CreateCubeView(image, texture.Format, texture.MipCount) : device.CreateShaderView(image);
+            return new GpuTexture(image, view, sampler);
         }
     }
 
-    private static nint CreateSampler(D3D11PreviewDevice device, int filterMode, int wrapMode, int anisotropy, float bias)
+    private static nint CreateSampler(D3D11PreviewDevice device, int filterMode, int wrapMode, int anisotropy, float bias, bool comparison = false)
     {
         uint wrap = wrapMode switch { 0 => 1, 1 => 3, 2 => 2, 3 => 5, _ => throw new InvalidDataException("Invalid wrap mode.") };
         uint filter = anisotropy > 1 ? 0x55u : filterMode switch
@@ -319,8 +348,9 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         };
         return device.CreateSamplerState(new SamplerDesc
         {
-            Filter = filter, AddressU = wrap, AddressV = wrap, AddressW = wrap,
-            MaxAnisotropy = (uint)Math.Max(1, anisotropy), LodBias = bias, Comparison = 8, MaxLod = float.MaxValue
+            Filter = comparison ? filter | 0x80u : filter, AddressU = wrap, AddressV = wrap, AddressW = wrap,
+            MaxAnisotropy = (uint)Math.Max(1, anisotropy), LodBias = bias,
+            Comparison = (uint)(comparison ? ShaderPreviewDepth.LEqual : ShaderPreviewDepth.Always), MaxLod = float.MaxValue
         });
     }
 
@@ -375,7 +405,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         _ => throw new NotSupportedException($"Unsupported blend factor {factor}.")
     };
 
-    private static void ValidateStage(ShaderPreviewStage stage, bool vertex)
+    private void ValidateStage(ShaderPreviewStage stage, bool vertex)
     {
         byte[] bytecode = stage.Bytecode;
         ReadOnlySpan<byte> program = FindChunk(bytecode, "SHDR"u8, "SHEX"u8);
@@ -404,7 +434,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         }
     }
 
-    private static void ValidateResources(ReadOnlySpan<byte> program, ShaderPreviewStage stage)
+    private void ValidateResources(ReadOnlySpan<byte> program, ShaderPreviewStage stage)
     {
         // The Unity 5.3 DXBC can omit RDEF. Compare the actual SM4/5 resource declarations with Unity's metadata.
         const uint customData = 53, declareTexture = 88, declareBuffer = 89, declareSampler = 90;
@@ -437,7 +467,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 {
                     declareTexture => Array.Exists(stage.Textures, texture => texture.Slot == slot &&
                         flags == (texture.Dimension == ShaderPreviewTextureDimension.Cube ? 6u : 3u)),
-                    declareSampler => flags == 0 && Array.Exists(stage.Textures, texture => texture.SamplerSlot == slot),
+                    declareSampler => Array.Exists(stage.Textures, texture => texture.SamplerSlot == slot && flags ==
+                        (_lighting?.Textures.TryGetValue(texture.Name, out var lightingTexture) == true && lightingTexture.Comparison ? 1u : 0u)),
                     _ => ReadUInt(program, offset + 12) is var count && count is > 0 and <= 4096 &&
                          Array.Exists(stage.Buffers, buffer => buffer.Slot == slot && ((buffer.Size + 15) & ~15) >= count * 16)
                 };
@@ -568,6 +599,17 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private static (Vertex[], uint[]) BuildPlane() =>
         ([PlaneVertex(-1, -1, 0, 0), PlaneVertex(1, -1, 1, 0), PlaneVertex(1, 1, 1, 1), PlaneVertex(-1, 1, 0, 1)],
          [0, 1, 2, 0, 2, 3]);
+
+    private static (Vertex[], uint[]) BuildScreenQuad()
+    {
+        const float far = ShaderPreviewCamera.Far;
+        return (Array.ConvertAll(Plane.Vertices, vertex => vertex with
+        {
+            // Unity stores the perspective ray in NORMAL on its internal full-screen quad.
+            Normal = new NumericsVector4(vertex.Position.X * far / Projection.M11, vertex.Position.Y * far / Projection.M22, far, 0),
+            Uv = vertex.Uv with { Y = 1 - vertex.Uv.Y }
+        }), Plane.Indices);
+    }
 
     private static (Vertex[], uint[]) BuildSkybox()
     {

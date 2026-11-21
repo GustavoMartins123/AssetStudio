@@ -50,10 +50,21 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     {
         fixed (T* bytes = data)
         {
-            ((delegate* unmanaged[Stdcall]<nint, nint, uint, void*, void*, uint, uint, void>)Slot(_context, 48))(
-                _context, buffer, 0, null, bytes, 0, 0);
+            UpdateResource(buffer, bytes, 0);
         }
     }
+
+    internal void UpdateTexture2D(nint texture, ReadOnlySpan<byte> pixels, uint rowPitch)
+    {
+        fixed (byte* bytes = pixels)
+        {
+            UpdateResource(texture, bytes, rowPitch);
+        }
+    }
+
+    private void UpdateResource(nint resource, void* data, uint rowPitch) =>
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, void*, void*, uint, uint, void>)Slot(_context, 48))(
+            _context, resource, 0, null, data, rowPitch, 0);
 
     internal nint CreateTexture(TextureDesc desc, SubresourceData* initialData = null)
     {

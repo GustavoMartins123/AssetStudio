@@ -20,17 +20,18 @@ internal abstract record ShaderPreviewOperation;
 internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPreviewLight Light, int SkyboxSide = -1) : ShaderPreviewOperation;
 internal sealed record ShaderPreviewGrab(string TextureName, bool Once) : ShaderPreviewOperation;
 internal readonly record struct ShaderPreviewLight(NumericsVector3 Direction, NumericsVector3 Color);
-internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles }
+internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad }
 
 internal sealed record ShaderPreviewScene(
     string ShaderName, ShaderPreviewGeometry Geometry, bool IsAnimated, IReadOnlyList<ShaderPreviewOperation> Operations,
     NumericsVector3 AmbientLinear, IReadOnlyList<ShaderPreviewLight> Lights,
     IReadOnlyDictionary<string, NumericsVector4> Values,
-    IReadOnlyDictionary<string, ShaderPreviewTexture> Textures, IReadOnlyList<string> UnusedMaterialKeywords);
+    IReadOnlyDictionary<string, ShaderPreviewTexture> Textures, IReadOnlyList<string> UnusedMaterialKeywords,
+    BuiltInLightingPass LightingPass);
 
 internal sealed record ShaderPreviewTexture(
     int Width, int Height, int MipCount, int Format, int BytesPerBlock, bool BlockCompressed, byte[] Pixels,
-    int Filter, int Wrap, int Anisotropy, float MipBias, int Faces = 1);
+    int Filter, int Wrap, int Anisotropy, float MipBias, int Faces = 1, bool Comparison = false);
 
 internal readonly record struct ShaderPreviewCamera(float Yaw, float Pitch, float Distance, System.Numerics.Vector2 Pan = default)
 {
@@ -128,15 +129,26 @@ internal static class ShaderPreviewService
         }
         foreach (string name in reader.TextureDefaults.Keys.Concat(textureSlots.Keys).Distinct(StringComparer.Ordinal))
         {
-            values[name + "_ST"] = textureSlots.TryGetValue(name, out var slot)
+            // These compiled Dissolve programs read the _DissolveSrc transform from this uniform.
+            string uniform = name == "_DissolveSrc" && reader.Name.StartsWith("Dissolve/", StringComparison.Ordinal)
+                ? "DissolveSrc_ST" : name + "_ST";
+            values[uniform] = textureSlots.TryGetValue(name, out var slot)
                 ? new NumericsVector4(slot.m_Scale.X, slot.m_Scale.Y, slot.m_Offset.X, slot.m_Offset.Y)
                 : new NumericsVector4(1, 1, 0, 0);
         }
 
+        var lightingPass = reader.Name switch
+        {
+            "Hidden/Internal-PrePassCollectShadows" => BuiltInLightingPass.CollectShadows,
+            "Hidden/Internal-DeferredShading" => BuiltInLightingPass.DeferredLighting,
+            _ => BuiltInLightingPass.None
+        };
         var subShader = reader.SubShaders.FirstOrDefault(sub => IsBuiltIn(sub) &&
+            (lightingPass != BuiltInLightingPass.CollectShadows || sub.Tags.GetValueOrDefault("ShadowmapFilter") == "PCF_5x5") &&
             sub.Passes.Any(pass => pass.Type == PassType.Use || pass.HasDirect3D11))
-            ?? throw new NotSupportedException($"'{reader.Name}' has no Built-in SubShader with a D3D11 color pass.");
-        var geometry = subShader.Tags.GetValueOrDefault("PreviewType", "sphere").ToLowerInvariant() switch
+            ?? throw new NotSupportedException($"'{reader.Name}' has no D3D11 SubShader for the Built-in preview scene.");
+        var geometry = lightingPass != BuiltInLightingPass.None ? ShaderPreviewGeometry.ScreenQuad :
+            subShader.Tags.GetValueOrDefault("PreviewType", "sphere").ToLowerInvariant() switch
         {
             "sphere" when reader.Name.StartsWith("Particles/", StringComparison.OrdinalIgnoreCase) => ShaderPreviewGeometry.Particles,
             "sphere" when reader.Name.Equals("Hidden/FogVolume", StringComparison.Ordinal) => ShaderPreviewGeometry.Volume,
@@ -148,11 +160,22 @@ internal static class ShaderPreviewService
         };
         // Screen-space preview geometry is independent from the game's depth ordering.
         values.TryAdd("unity_GUIZTestMode", new NumericsVector4(8, 0, 0, 0));
-        var passes = ExpandPasses(shader, reader, subShader, resolveShader, cancellationToken).ToArray();
+        var passes = ExpandPasses(shader, reader, subShader, resolveShader, cancellationToken)
+            .Select(item => (item.Reader, item.Sub, Pass: ResolvePassLightMode(item.Reader, item.Pass)))
+            .ToArray();
         bool forward = passes.Any(item => IsMode(item.Pass, "ForwardBase"));
         var materialKeywords = new HashSet<string>(material?.m_ValidKeywords ?? [], StringComparer.Ordinal);
         var enabled = new HashSet<string>(materialKeywords, StringComparer.Ordinal);
         enabled.UnionWith(PreviewKeywords);
+        if (lightingPass == BuiltInLightingPass.CollectShadows)
+        {
+            enabled.Remove("SHADOWS_OFF");
+            enabled.UnionWith(["SHADOWS_NATIVE", "SHADOWS_SINGLE_CASCADE"]);
+        }
+        else if (lightingPass == BuiltInLightingPass.DeferredLighting)
+        {
+            enabled.Add("UNITY_HDR_ON");
+        }
         if (subShader.Tags.TryGetValue("WaterMode", out string? waterMode) && !enabled.Overlaps(["WATER_REFRACTIVE", "WATER_REFLECTIVE", "WATER_SIMPLE"]))
         {
             enabled.Add("WATER_" + waterMode.ToUpperInvariant());
@@ -185,7 +208,8 @@ internal static class ShaderPreviewService
             }
             bool additive = IsMode(definition, "ForwardAdd");
             if (!IsColorPass(definition) || (forward && IsMode(definition, "Vertex")) || (additive && lights.Count == 1)
-                || IsShadowOnly(owner, definition))
+                || IsShadowOnly(owner, definition) || (lightingPass == BuiltInLightingPass.DeferredLighting &&
+                    !owner.GetKeywords(definition).Contains("UNITY_HDR_ON", StringComparer.Ordinal)))
             {
                 continue;
             }
@@ -230,12 +254,21 @@ internal static class ShaderPreviewService
         bool animated = geometry == ShaderPreviewGeometry.Particles || operations.OfType<ShaderPreviewDraw>().Any(draw =>
             draw.Pass.Vertex.Buffers.Concat(draw.Pass.Fragment.Buffers).SelectMany(buffer => buffer.Parameters)
                 .Any(parameter => parameter.Name is "_Time" or "_SinTime" or "_CosTime" or "unity_DeltaTime" or "_WaveOffset"));
-        return new ShaderPreviewScene(reader.Name, geometry, animated, operations, PreviewAmbientLinear, lights, values, textures, unusedKeywords);
+        return new ShaderPreviewScene(reader.Name, geometry, animated, operations, PreviewAmbientLinear, lights, values, textures,
+            unusedKeywords, lightingPass);
 
         void PrepareTexture(string name, ShaderPreviewTextureDimension dimension)
         {
             cancellationToken.ThrowIfCancellationRequested();
             bool cube = dimension == ShaderPreviewTextureDimension.Cube;
+            if (BuiltInLightingPreview.ProvidesTexture(lightingPass, name))
+            {
+                if (cube)
+                {
+                    throw new InvalidDataException($"Lighting buffer '{name}' requires a 2D binding.");
+                }
+                return;
+            }
             if (captures.Contains(name))
             {
                 if (cube)
@@ -289,6 +322,28 @@ internal static class ShaderPreviewService
 
     private static bool IsMode(ShaderPreviewPassDefinition pass, string mode) =>
         pass.LightMode.Equals(mode, StringComparison.OrdinalIgnoreCase);
+
+    private static ShaderPreviewPassDefinition ResolvePassLightMode(LegacyShaderPreview reader, ShaderPreviewPassDefinition pass)
+    {
+        if (!IsMode(pass, "ShadowCaster") || !pass.HasDirect3D11 || !pass.Name.Equals("FORWARD", StringComparison.OrdinalIgnoreCase))
+        {
+            return pass;
+        }
+
+        // Some serialized shaders tag compiled Forward programs as ShadowCaster.
+        var variants = reader.GetVariantKeywords(pass, vertex: true).ToArray();
+        if (variants.Any(keywords => keywords.Contains("DIRECTIONAL") && keywords.Contains("LIGHTMAP_OFF")) &&
+            reader.GetVariantKeywords(pass, vertex: false).Any(keywords => keywords.Contains("DIRECTIONAL") && keywords.Contains("LIGHTMAP_OFF")))
+        {
+            return pass with { LightMode = "ForwardBase" };
+        }
+        if (variants.Any(keywords => keywords.Contains("DIRECTIONAL")) && variants.Any(keywords => keywords.Contains("POINT")) &&
+            reader.GetVariantKeywords(pass, vertex: false).Any(keywords => keywords.Contains("DIRECTIONAL")))
+        {
+            return pass with { LightMode = "ForwardAdd" };
+        }
+        return pass;
+    }
 
     private static bool IsColorPass(ShaderPreviewPassDefinition pass) =>
         pass.Type == PassType.Normal && (IsMode(pass, "Always") || IsMode(pass, "ForwardBase")
@@ -536,7 +591,7 @@ internal static class ShaderPreviewService
 
     internal static byte[] BindConstants(ShaderPreviewScene scene, ShaderPreviewBuffer buffer, ShaderPreviewLight light,
         NumericsMatrix4x4 view, NumericsMatrix4x4 projection, NumericsVector3 eye, int size, IReadOnlySet<string> captures,
-        float time, float deltaTime)
+        float time, float deltaTime, BuiltInLightingPreview? lighting)
     {
         var data = new byte[(buffer.Size + 15) & ~15];
         foreach (var parameter in buffer.Parameters)
@@ -554,11 +609,16 @@ internal static class ShaderPreviewService
                 }
                 NumericsMatrix4x4 matrix = parameter.Name switch
                 {
+                    "glstate_matrix_mvp" when lighting != null => NumericsMatrix4x4.Identity,
                     "glstate_matrix_mvp" or "unity_MatrixMVP" or "unity_MatrixVP" => view * projection,
                     "glstate_matrix_modelview0" or "unity_MatrixV" or "unity_MatrixMV" => view,
                     "glstate_matrix_projection" or "unity_MatrixP" => projection,
                     "glstate_matrix_invtrans_modelview0" or "unity_MatrixITMV" => NumericsMatrix4x4.Transpose(Inverse(view)),
+                    "_CameraToWorld" when lighting != null => NumericsMatrix4x4.CreateScale(1, 1, -1) * Inverse(view),
                     "unity_MatrixInvV" or "_CameraToWorld" => Inverse(view),
+                    "unity_CameraInvProjection" when lighting != null => Inverse(projection),
+                    "unity_World2Shadow0" when lighting != null => lighting.WorldToShadow,
+                    "unity_World2Shadow1" or "unity_World2Shadow2" or "unity_World2Shadow3" when lighting != null => default,
                     "_GUIClipTextureMatrix" => NumericsMatrix4x4.CreateScale(0.5f, 0.5f, 1) * NumericsMatrix4x4.CreateTranslation(0.5f, 0.5f, 0),
                     "_TerrainEngineBendTree" => NumericsMatrix4x4.CreateRotationZ(0.08f * MathF.Sin(time)),
                     "_Object2World" or "_World2Object" or "unity_ObjectToWorld" or "unity_WorldToObject" => NumericsMatrix4x4.Identity,
@@ -622,7 +682,8 @@ internal static class ShaderPreviewService
                 {
                     return new NumericsVector4(1f / size, 1f / size, size, size);
                 }
-                if (scene.Textures.TryGetValue(textureName, out var texture))
+                var resources = BuiltInLightingPreview.ProvidesTexture(scene.LightingPass, textureName) ? lighting!.Textures : scene.Textures;
+                if (resources.TryGetValue(textureName, out var texture))
                 {
                     return new NumericsVector4(1f / texture.Width, 1f / texture.Height, texture.Width, texture.Height);
                 }
@@ -666,8 +727,13 @@ internal static class ShaderPreviewService
                 "_TreeBillboardCameraPos" => new NumericsVector4(eye, MathF.Abs(view.M23)),
                 "_TreeBillboardDistances" => new NumericsVector4(detailDistanceSquared, 0, 0, 0),
                 "_WaveAndDistance" => new NumericsVector4(time * 0.45f, 1, 0.22f, detailDistanceSquared),
-                "_ProjectionParams" => new NumericsVector4(1, near, far, 1f / far),
+                "_ProjectionParams" => new NumericsVector4(lighting != null ? -1 : 1, near, far, 1f / far),
                 "_ZBufferParams" => new NumericsVector4(1 - far / near, far / near, (1 - far / near) / far, 1f / near),
+                "unity_OrthoParams" when lighting != null => NumericsVector4.Zero,
+                "_LightShadowData" when lighting != null => new NumericsVector4(0.25f, 0, 0.25f, -3),
+                "_LightAsQuad" when lighting != null => new NumericsVector4(1, 0, 0, 0),
+                "_LightDir" when lighting != null => new NumericsVector4(-light.Direction, 0),
+                "_LightColor" when lighting != null => new NumericsVector4(light.Color, 1),
                 "_Time" => new NumericsVector4(time / 20, time, time * 2, time * 3),
                 "_SinTime" => new NumericsVector4(MathF.Sin(time / 8), MathF.Sin(time / 4), MathF.Sin(time / 2), MathF.Sin(time)),
                 "_CosTime" => new NumericsVector4(MathF.Cos(time / 8), MathF.Cos(time / 4), MathF.Cos(time / 2), MathF.Cos(time)),
