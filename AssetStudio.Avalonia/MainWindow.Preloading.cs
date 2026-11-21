@@ -27,6 +27,10 @@ public partial class MainWindow
             preloaderLock,
             preloadedUniqueIds,
             ref preloaderCts,
-            EnsureLazyAssetReadyForPreview,
-            AssetPreloadWindowSize);
+            EnsureLazyAssetReadyForPreload,
+            AssetPreloadWindowSize,
+            shouldPausePreload: () => isBuildingLazyConnections
+                || Volatile.Read(ref foregroundLazyLoadCount) > 0
+                || _activeMeshMaterialsLoading
+                || ShouldPauseBackgroundWork());
 }

@@ -384,7 +384,7 @@ namespace AssetStudio.Tests
                 using (var verCmd = conn.CreateCommand())
                 {
                     verCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("14", verCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("15", verCmd.ExecuteScalar()?.ToString());
                 }
 
                 using (var ddlCmd = conn.CreateCommand())

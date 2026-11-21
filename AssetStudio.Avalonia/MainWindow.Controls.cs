@@ -33,12 +33,14 @@ public sealed class PreviewCandidateItem
     public string MeshId { get; init; } = string.Empty;
     public string ModelGroupId { get; init; } = string.Empty;
     public string ModelGroupName { get; init; } = string.Empty;
+    public string ModelGroupKind { get; init; } = string.Empty;
     public IReadOnlyList<string> ModelGroupMeshIds { get; init; } = Array.Empty<string>();
     internal IReadOnlyList<ModelGroupMeshInfo> ModelGroupMeshInfos { get; init; } = Array.Empty<ModelGroupMeshInfo>();
     public IReadOnlyList<AssetStudio.Mesh> ModelGroupMeshes { get; init; } = Array.Empty<AssetStudio.Mesh>();
     public IReadOnlyList<float[]?> ModelGroupTransforms { get; init; } = Array.Empty<float[]?>();
     public int ModelGroupMeshCount { get; init; }
     public int ModelGroupConfidence { get; init; }
+    public bool IsCurrentPreviewFallback { get; init; }
     public string Label { get; init; } = string.Empty;
 
     public bool IsModelGroup => !string.IsNullOrWhiteSpace(ModelGroupId);
@@ -427,12 +429,14 @@ public partial class MainWindow
                 MeshId = !string.IsNullOrWhiteSpace(resolvedCandidate.MeshId) ? resolvedCandidate.MeshId : GetPreviewObjectKey(mesh),
                 ModelGroupId = resolvedCandidate.ModelGroupId,
                 ModelGroupName = resolvedCandidate.ModelGroupName,
+                ModelGroupKind = resolvedCandidate.ModelGroupKind,
                 ModelGroupMeshIds = resolvedCandidate.ModelGroupMeshIds,
                 ModelGroupMeshInfos = resolvedCandidate.ModelGroupMeshInfos,
                 ModelGroupMeshes = groupMeshes,
                 ModelGroupTransforms = ResolveModelGroupTransformsForPreview(resolvedCandidate, groupMeshes.Count),
                 ModelGroupMeshCount = resolvedCandidate.ModelGroupMeshCount,
                 ModelGroupConfidence = resolvedCandidate.ModelGroupConfidence,
+                IsCurrentPreviewFallback = resolvedCandidate.IsCurrentPreviewFallback,
                 Label = resolvedCandidate.Label
             };
         }
@@ -463,12 +467,14 @@ public partial class MainWindow
                 MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
                 ModelGroupId = candidate.ModelGroupId,
                 ModelGroupName = candidate.ModelGroupName,
+                ModelGroupKind = candidate.ModelGroupKind,
                 ModelGroupMeshIds = candidate.ModelGroupMeshIds,
                 ModelGroupMeshInfos = candidate.ModelGroupMeshInfos,
                 ModelGroupMeshes = groupMeshes,
                 ModelGroupTransforms = ResolveModelGroupTransformsForPreview(candidate, groupMeshes.Count),
                 ModelGroupMeshCount = candidate.ModelGroupMeshCount,
                 ModelGroupConfidence = candidate.ModelGroupConfidence,
+                IsCurrentPreviewFallback = candidate.IsCurrentPreviewFallback,
                 Label = candidate.Label
             };
         }
@@ -500,12 +506,14 @@ public partial class MainWindow
                 MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
                 ModelGroupId = candidate.ModelGroupId,
                 ModelGroupName = candidate.ModelGroupName,
+                ModelGroupKind = candidate.ModelGroupKind,
                 ModelGroupMeshIds = candidate.ModelGroupMeshIds,
                 ModelGroupMeshInfos = candidate.ModelGroupMeshInfos,
                 ModelGroupMeshes = groupMeshes,
                 ModelGroupTransforms = ResolveModelGroupTransformsForPreview(candidate, groupMeshes.Count),
                 ModelGroupMeshCount = candidate.ModelGroupMeshCount,
                 ModelGroupConfidence = candidate.ModelGroupConfidence,
+                IsCurrentPreviewFallback = candidate.IsCurrentPreviewFallback,
                 Label = candidate.Label
             };
         }
@@ -617,6 +625,91 @@ public partial class MainWindow
                     MaterialName = string.IsNullOrEmpty(material?.m_Name) ? "No Material" : material!.m_Name,
                     BaseColor = baseColor,
                     CurrentColor = baseColor
+                });
+            }
+
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.SelectedIndex = meshMaterialPreviewSlots.Count > 0 ? 0 : -1;
+            }
+        }
+        finally
+        {
+            updatingMeshMaterialControls = false;
+        }
+
+        MeshPreview.SetMaterialSlots(meshMaterialPreviewSlots.ToArray(), selectedIndex: 0);
+        UpdateMeshMaterialControlValues();
+        ApplyMeshMaterialOverrides();
+    }
+
+    private void BuildMeshMaterialControlsFromResolved(
+        AssetStudio.Mesh mesh,
+        IReadOnlyList<ResolvedMeshSubMeshMaterial> resolvedSlots)
+    {
+        var maxResolvedIndex = resolvedSlots.Count > 0 ? resolvedSlots.Max(s => s.SubMeshIndex) + 1 : 0;
+        var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, maxResolvedIndex);
+        var bySubMesh = new Dictionary<int, ResolvedMeshSubMeshMaterial>(resolvedSlots.Count);
+        foreach (var slot in resolvedSlots)
+        {
+            if (slot.SubMeshIndex >= 0 && !bySubMesh.ContainsKey(slot.SubMeshIndex))
+            {
+                bySubMesh[slot.SubMeshIndex] = slot;
+            }
+        }
+
+        var specs = new List<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)>(slotCount);
+        for (int i = 0; i < slotCount; i++)
+        {
+            if (bySubMesh.TryGetValue(i, out var resolved))
+            {
+                var name = !string.IsNullOrWhiteSpace(resolved.MaterialName)
+                    ? resolved.MaterialName
+                    : !string.IsNullOrWhiteSpace(resolved.MaterialAssetId)
+                        ? GetPreviewHandleName(resolved.MaterialAssetId, "Material")
+                        : "No Material";
+                var baseColor = new global::OpenTK.Mathematics.Vector4(
+                    ClampPreviewColor(resolved.BaseColorR),
+                    ClampPreviewColor(resolved.BaseColorG),
+                    ClampPreviewColor(resolved.BaseColorB),
+                    ClampPreviewColor(resolved.BaseColorA));
+                specs.Add((name, baseColor));
+            }
+            else
+            {
+                specs.Add(("No Material", global::OpenTK.Mathematics.Vector4.One));
+            }
+        }
+
+        BuildMeshMaterialControlsFromSlotSpecs(specs);
+    }
+
+    private void BuildMeshMaterialControlsFromSlotSpecs(
+        IReadOnlyList<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)> slots)
+    {
+        updatingMeshMaterialControls = true;
+        try
+        {
+            if (MeshMaterialSelector != null)
+            {
+                MeshMaterialSelector.SelectedItem = null;
+                MeshMaterialSelector.SelectedIndex = -1;
+                if (MeshMaterialSelector.ItemsSource != meshMaterialPreviewSlots)
+                {
+                    MeshMaterialSelector.ItemsSource = meshMaterialPreviewSlots;
+                }
+            }
+
+            meshMaterialPreviewSlots.Clear();
+            for (int i = 0; i < slots.Count; i++)
+            {
+                var slot = slots[i];
+                meshMaterialPreviewSlots.Add(new MeshMaterialPreviewSlot
+                {
+                    SlotIndex = i,
+                    MaterialName = string.IsNullOrEmpty(slot.MaterialName) ? "No Material" : slot.MaterialName,
+                    BaseColor = slot.BaseColor,
+                    CurrentColor = slot.BaseColor
                 });
             }
 

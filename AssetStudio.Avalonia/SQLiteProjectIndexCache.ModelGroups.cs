@@ -276,6 +276,92 @@ namespace AssetStudio.Avalonia
             return result;
         }
 
+        internal Dictionary<string, List<ModelGroupMeshInfo>> LoadModelGroupMeshesByGroupIds(
+            string folderPath,
+            string signature,
+            IReadOnlyList<string> groupAssetIds)
+        {
+            var result = new Dictionary<string, List<ModelGroupMeshInfo>>(StringComparer.Ordinal);
+            if (groupAssetIds == null || groupAssetIds.Count == 0)
+            {
+                return result;
+            }
+
+            var uniqueIds = new List<string>(groupAssetIds.Count);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            for (var i = 0; i < groupAssetIds.Count; i++)
+            {
+                var id = groupAssetIds[i];
+                if (!string.IsNullOrWhiteSpace(id) && seen.Add(id))
+                {
+                    uniqueIds.Add(id);
+                }
+            }
+
+            if (uniqueIds.Count == 0)
+            {
+                return result;
+            }
+
+            ExecuteProjectReadQuery(folderPath, signature, "model group meshes batch", (conn, transaction, projectId) =>
+            {
+                const int chunkSize = 400;
+                for (var offset = 0; offset < uniqueIds.Count; offset += chunkSize)
+                {
+                    var chunkCount = Math.Min(chunkSize, uniqueIds.Count - offset);
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = transaction;
+                    var placeholders = new string[chunkCount];
+                    for (var i = 0; i < chunkCount; i++)
+                    {
+                        var paramName = "@gid" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        placeholders[i] = paramName;
+                        cmd.Parameters.AddWithValue(paramName, uniqueIds[offset + i]);
+                    }
+
+                    cmd.CommandText = $@"
+                        SELECT
+                            mgm.GroupAssetUniqueID,
+                            mgm.MeshAssetUniqueID,
+                            mgm.RendererAssetUniqueID,
+                            mgm.RendererType,
+                            mgm.GameObjectAssetUniqueID,
+                            mgm.GameObjectName,
+                            mgm.SlotIndex,
+                            mgm.Confidence,
+                            mgm.ConfidenceReason,
+                            mgm.TransformMatrix,
+                            COALESCE(mesh.Name, ''),
+                            COALESCE(mesh.PathID, 0),
+                            COALESCE(mesh.ByteSize, 0),
+                            COALESCE(mesh.Type, 0)
+                        FROM ModelGroupMeshes mgm
+                        LEFT JOIN Assets mesh
+                          ON mesh.ProjectId = mgm.ProjectId
+                         AND mesh.UniqueID = mgm.MeshAssetUniqueID
+                        WHERE mgm.ProjectId = @projectId
+                          AND mgm.GroupAssetUniqueID IN ({string.Join(",", placeholders)})
+                        ORDER BY mgm.GroupAssetUniqueID, mgm.SlotIndex, mgm.GameObjectName, mesh.Name, mgm.MeshAssetUniqueID";
+                    cmd.Parameters.AddWithValue("@projectId", projectId);
+
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var groupId = reader.GetString(0);
+                        if (!result.TryGetValue(groupId, out var list))
+                        {
+                            list = new List<ModelGroupMeshInfo>();
+                            result[groupId] = list;
+                        }
+
+                        list.Add(ReadModelGroupMeshInfo(reader, groupId, meshStartOrdinal: 1));
+                    }
+                }
+            });
+
+            return result;
+        }
+
         private static ModelGroupInfo ReadModelGroupInfo(SqliteDataReader reader)
         {
             return new ModelGroupInfo(

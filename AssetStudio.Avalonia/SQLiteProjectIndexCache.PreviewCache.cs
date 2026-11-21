@@ -164,7 +164,7 @@ namespace AssetStudio.Avalonia
             var lockTaken = false;
             try
             {
-                Monitor.TryEnter(WriteGate, TimeSpan.FromSeconds(2), ref lockTaken);
+                Monitor.TryEnter(WriteGate, TimeSpan.Zero, ref lockTaken);
                 if (!lockTaken)
                 {
                     return;
@@ -345,6 +345,370 @@ namespace AssetStudio.Avalonia
             }
 
             return false;
+        }
+
+        public bool TryLoadLatestPreviewCacheBytesByAssetId(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parametersPrefix,
+            out byte[]? payloadBytes,
+            out PreviewCacheEntry? entry)
+        {
+            payloadBytes = null;
+            entry = null;
+            if (string.IsNullOrWhiteSpace(assetUniqueId) || string.IsNullOrWhiteSpace(previewKind))
+            {
+                return false;
+            }
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            try
+            {
+                long? hitEntryId = null;
+                using (var lease = RentReadConnection(dbPath))
+                {
+                    var conn = lease.Connection;
+                    try
+                    {
+                        var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
+                        if (projectId == null)
+                        {
+                            return false;
+                        }
+
+                        entry = QueryLatestPreviewCacheEntryByPrefix(
+                            conn,
+                            projectId.Value,
+                            assetUniqueId,
+                            previewKind,
+                            algorithmVersion,
+                            parametersPrefix,
+                            out hitEntryId);
+                        if (entry == null && fromCache)
+                        {
+                            var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                            if (verifiedProjectId.HasValue && verifiedProjectId.Value != projectId.Value)
+                            {
+                                entry = QueryLatestPreviewCacheEntryByPrefix(
+                                    conn,
+                                    verifiedProjectId.Value,
+                                    assetUniqueId,
+                                    previewKind,
+                                    algorithmVersion,
+                                    parametersPrefix,
+                                    out hitEntryId);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        lease.MarkUnhealthy();
+                        throw;
+                    }
+                }
+
+                if (entry == null)
+                {
+                    return false;
+                }
+
+                if (hitEntryId.HasValue)
+                {
+                    TryTouchPreviewCacheEntryLastAccessed(folderPath, hitEntryId.Value);
+                }
+
+                if (entry.PayloadBlob != null && entry.PayloadBlob.Length > 0)
+                {
+                    if (entry.PayloadCompression == PreviewPayloadCompressionLz4Pickler)
+                    {
+                        payloadBytes = LZ4Pickler.Unpickle(entry.PayloadBlob);
+                    }
+                    else if (entry.PayloadCompression == PreviewPayloadCompressionNone)
+                    {
+                        payloadBytes = entry.PayloadBlob;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+
+                    return payloadBytes != null;
+                }
+
+                if (!string.IsNullOrWhiteSpace(entry.PayloadPath) && File.Exists(entry.PayloadPath))
+                {
+                    payloadBytes = File.ReadAllBytes(entry.PayloadPath);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load latest preview cache entry by asset ID from SQLite: {ex.Message}");
+                payloadBytes = null;
+            }
+
+            return false;
+        }
+
+        private static PreviewCacheEntry? QueryLatestPreviewCacheEntryByPrefix(
+            SqliteConnection conn,
+            long projectId,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parametersPrefix,
+            out long? hitEntryId)
+        {
+            hitEntryId = null;
+            var hasBlobColumns = HasPreviewCacheBlobColumns(conn);
+            var prefix = parametersPrefix ?? string.Empty;
+            var prefixUpper = prefix.Length > 0
+                ? prefix.Substring(0, prefix.Length - 1) + (char)(prefix[^1] + 1)
+                : string.Empty;
+
+            using var cmd = conn.CreateCommand();
+            var rangeFilter = prefix.Length > 0
+                ? " AND Parameters >= @paramStart AND Parameters < @paramEnd"
+                : string.Empty;
+            cmd.CommandText = hasBlobColumns
+                ? $@"
+                SELECT Id, PayloadHash, PayloadPath, ByteSize, PayloadBlob, PayloadCompression, UncompressedByteSize
+                FROM PreviewCacheEntries
+                WHERE ProjectId = @projectId
+                  AND AssetUniqueID = @assetUniqueId
+                  AND PreviewKind = @previewKind
+                  AND AlgorithmVersion = @algorithmVersion
+                  {rangeFilter}
+                ORDER BY LastAccessedUtc DESC, Id DESC
+                LIMIT 1"
+                : $@"
+                SELECT Id, PayloadHash, PayloadPath, ByteSize
+                FROM PreviewCacheEntries
+                WHERE ProjectId = @projectId
+                  AND AssetUniqueID = @assetUniqueId
+                  AND PreviewKind = @previewKind
+                  AND AlgorithmVersion = @algorithmVersion
+                  {rangeFilter}
+                ORDER BY LastAccessedUtc DESC, Id DESC
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            cmd.Parameters.AddWithValue("@assetUniqueId", assetUniqueId);
+            cmd.Parameters.AddWithValue("@previewKind", previewKind);
+            cmd.Parameters.AddWithValue("@algorithmVersion", algorithmVersion);
+            if (prefix.Length > 0)
+            {
+                cmd.Parameters.AddWithValue("@paramStart", prefix);
+                cmd.Parameters.AddWithValue("@paramEnd", prefixUpper);
+            }
+
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            hitEntryId = reader.GetInt64(0);
+            var payloadHash = reader.GetString(1);
+            var payloadPath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+            var byteSize = reader.GetInt64(3);
+            if (!hasBlobColumns)
+            {
+                return new PreviewCacheEntry(payloadHash, payloadPath, byteSize);
+            }
+
+            var payloadBlob = reader.IsDBNull(4) ? null : (byte[])reader.GetValue(4);
+            var payloadCompression = reader.IsDBNull(5) ? PreviewPayloadCompressionNone : reader.GetInt32(5);
+            var uncompressedByteSize = reader.IsDBNull(6) ? byteSize : reader.GetInt64(6);
+            return new PreviewCacheEntry(
+                payloadHash,
+                payloadPath,
+                byteSize,
+                payloadBlob,
+                payloadCompression,
+                uncompressedByteSize);
+        }
+
+        public void EnqueuePreviewCachePayload(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            string payloadHash,
+            byte[] payloadBytes,
+            string? externalFilePathFallback = null)
+        {
+            EnqueuePreviewCachePayload(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters,
+                payloadBytes,
+                externalFilePathFallback,
+                payloadHash);
+        }
+
+        public void EnqueuePreviewCachePayload(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            byte[] payloadBytes,
+            string? externalFilePathFallback = null,
+            string? payloadHash = null)
+        {
+            if (Volatile.Read(ref _disposed) != 0
+                || string.IsNullOrWhiteSpace(folderPath)
+                || string.IsNullOrWhiteSpace(signature)
+                || string.IsNullOrWhiteSpace(assetUniqueId)
+                || string.IsNullOrWhiteSpace(previewKind)
+                || payloadBytes == null
+                || payloadBytes.Length == 0)
+            {
+                return;
+            }
+
+            var key = string.Join("\u001f", folderPath, signature, assetUniqueId, previewKind, algorithmVersion.ToString(CultureInfo.InvariantCulture), parameters ?? string.Empty);
+            var item = new PendingPreviewCacheWrite(
+                key,
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters ?? string.Empty,
+                payloadBytes,
+                externalFilePathFallback,
+                payloadHash);
+
+            lock (_bgWriteLock)
+            {
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    return;
+                }
+
+                if (_pendingPreviewCacheWritesByKey.ContainsKey(key))
+                {
+                    _pendingPreviewCacheWritesByKey[key] = item;
+                }
+                else
+                {
+                    while (_pendingPreviewCacheWrites.Count >= MaxPendingPreviewCacheWrites)
+                    {
+                        var dropped = _pendingPreviewCacheWrites.Dequeue();
+                        _pendingPreviewCacheWritesByKey.Remove(dropped.Key);
+                    }
+
+                    _pendingPreviewCacheWrites.Enqueue(item);
+                    _pendingPreviewCacheWritesByKey[key] = item;
+                }
+
+                EnsureBackgroundWriterRunningLocked();
+            }
+        }
+
+        private bool TrySavePreviewCachePayloadNonBlocking(PendingPreviewCacheWrite item)
+        {
+            var effectiveHash = string.IsNullOrWhiteSpace(item.PayloadHash)
+                ? Convert.ToHexStringLower(SHA256.HashData(item.PayloadBytes))
+                : item.PayloadHash;
+            var inlineLimit = Math.Max(0, PreviewCacheInlineBlobMaxBytes);
+            var uncompressedByteSize = item.PayloadBytes.LongLength;
+
+            if (item.PayloadBytes.Length <= inlineLimit)
+            {
+                var pickled = LZ4Pickler.Pickle(item.PayloadBytes);
+                byte[] storedBytes;
+                int compression;
+                if (pickled != null && pickled.Length > 0 && pickled.Length < item.PayloadBytes.Length)
+                {
+                    storedBytes = pickled;
+                    compression = PreviewPayloadCompressionLz4Pickler;
+                }
+                else
+                {
+                    storedBytes = item.PayloadBytes;
+                    compression = PreviewPayloadCompressionNone;
+                }
+
+                return TryUpsertPreviewCacheEntryCore(
+                    item.FolderPath,
+                    item.Signature,
+                    item.AssetUniqueId,
+                    item.PreviewKind,
+                    item.AlgorithmVersion,
+                    item.Parameters,
+                    effectiveHash,
+                    payloadPath: string.Empty,
+                    payloadBlob: storedBytes,
+                    payloadCompression: compression,
+                    byteSize: storedBytes.LongLength,
+                    uncompressedByteSize: uncompressedByteSize,
+                    lockTimeout: TimeSpan.Zero);
+            }
+
+            var targetFilePath = string.IsNullOrWhiteSpace(item.ExternalFilePathFallback)
+                ? GetDefaultExternalPreviewPayloadPath(item.FolderPath, effectiveHash, item.PreviewKind)
+                : item.ExternalFilePathFallback;
+
+            try
+            {
+                var directory = Path.GetDirectoryName(targetFilePath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                var tempPath = targetFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllBytes(tempPath, item.PayloadBytes);
+                    File.Move(tempPath, targetFilePath, overwrite: true);
+                }
+                finally
+                {
+                    try
+                    {
+                        if (File.Exists(tempPath))
+                        {
+                            File.Delete(tempPath);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to write external preview cache payload file '{targetFilePath}': {ex.Message}");
+                return true;
+            }
+
+            return TryUpsertPreviewCacheEntryCore(
+                item.FolderPath,
+                item.Signature,
+                item.AssetUniqueId,
+                item.PreviewKind,
+                item.AlgorithmVersion,
+                item.Parameters,
+                effectiveHash,
+                payloadPath: targetFilePath,
+                payloadBlob: null,
+                payloadCompression: PreviewPayloadCompressionNone,
+                byteSize: uncompressedByteSize,
+                uncompressedByteSize: uncompressedByteSize,
+                lockTimeout: TimeSpan.Zero);
         }
 
         private static PreviewCacheEntry? QueryPreviewCacheEntry(
@@ -601,14 +965,59 @@ namespace AssetStudio.Avalonia
             long byteSize,
             long uncompressedByteSize)
         {
+            TryUpsertPreviewCacheEntryCore(
+                folderPath,
+                signature,
+                assetUniqueId,
+                previewKind,
+                algorithmVersion,
+                parameters,
+                payloadHash,
+                payloadPath,
+                payloadBlob,
+                payloadCompression,
+                byteSize,
+                uncompressedByteSize,
+                lockTimeout: Timeout.InfiniteTimeSpan);
+        }
+
+        private bool TryUpsertPreviewCacheEntryCore(
+            string folderPath,
+            string signature,
+            string assetUniqueId,
+            string previewKind,
+            int algorithmVersion,
+            string parameters,
+            string payloadHash,
+            string payloadPath,
+            byte[]? payloadBlob,
+            int payloadCompression,
+            long byteSize,
+            long uncompressedByteSize,
+            TimeSpan lockTimeout)
+        {
             EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
             var nowUtc = NextMonotonicUtcTimestamp();
             List<string>? filesToDelete = null;
+            var lockTaken = false;
 
             try
             {
-                lock (WriteGate)
+                if (lockTimeout == Timeout.InfiniteTimeSpan)
+                {
+                    Monitor.Enter(WriteGate, ref lockTaken);
+                }
+                else
+                {
+                    Monitor.TryEnter(WriteGate, lockTimeout, ref lockTaken);
+                    if (!lockTaken)
+                    {
+                        return false;
+                    }
+                }
+
+                try
                 {
                     using var conn = CreateConnectionByDbPath(dbPath);
                     using var transaction = conn.BeginTransaction();
@@ -618,7 +1027,7 @@ namespace AssetStudio.Avalonia
                     if (projectId == null)
                     {
                         EvictProjectIdCacheEntry(dbPath, folderPath, signature);
-                        return;
+                        return true;
                     }
 
                     CacheProjectId(dbPath, folderPath, signature, projectId.Value);
@@ -700,15 +1109,25 @@ namespace AssetStudio.Avalonia
 
                     transaction.Commit();
                 }
+                finally
+                {
+                    if (lockTaken)
+                    {
+                        Monitor.Exit(WriteGate);
+                    }
+                }
 
                 if (filesToDelete != null && filesToDelete.Count > 0)
                 {
                     DeleteEvictedPreviewFiles(filesToDelete, out _, out _);
                 }
+
+                return true;
             }
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to save preview cache entry to SQLite: {ex.Message}");
+                return true;
             }
         }
 
@@ -1065,7 +1484,7 @@ namespace AssetStudio.Avalonia
             var lockTaken = false;
             try
             {
-                Monitor.TryEnter(WriteGate, TimeSpan.FromSeconds(2), ref lockTaken);
+                Monitor.TryEnter(WriteGate, TimeSpan.Zero, ref lockTaken);
                 if (!lockTaken)
                 {
                     return;

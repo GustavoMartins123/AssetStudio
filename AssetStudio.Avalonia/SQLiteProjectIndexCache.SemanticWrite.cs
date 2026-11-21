@@ -85,6 +85,9 @@ namespace AssetStudio.Avalonia
             public int StagedMeshRenderersCount { get; private set; }
             public int StagedMeshMaterialsCount { get; private set; }
             public int StagedMaterialTexturesCount { get; private set; }
+            public int StagedMaterialCachesCount { get; private set; }
+            public int StagedCompositeAssetsCount { get; private set; }
+            public int StagedCompositeAssetPartsCount { get; private set; }
             public int StagedAnimationClipTargetsCount { get; private set; }
             public int StagedRigBoneHashesCount { get; private set; }
             public int StagedClipBoneHashesCount { get; private set; }
@@ -97,6 +100,9 @@ namespace AssetStudio.Avalonia
                 + StagedMeshRenderersCount
                 + StagedMeshMaterialsCount
                 + StagedMaterialTexturesCount
+                + StagedMaterialCachesCount
+                + StagedCompositeAssetsCount
+                + StagedCompositeAssetPartsCount
                 + StagedAnimationClipTargetsCount
                 + StagedRigBoneHashesCount
                 + StagedClipBoneHashesCount;
@@ -108,6 +114,9 @@ namespace AssetStudio.Avalonia
                 || StagedMeshRenderersCount > 0
                 || StagedMeshMaterialsCount > 0
                 || StagedMaterialTexturesCount > 0
+                || StagedMaterialCachesCount > 0
+                || StagedCompositeAssetsCount > 0
+                || StagedCompositeAssetPartsCount > 0
                 || StagedAnimationClipTargetsCount > 0
                 || StagedRigBoneHashesCount > 0
                 || StagedClipBoneHashesCount > 0;
@@ -116,6 +125,9 @@ namespace AssetStudio.Avalonia
                 StagedAssetEdgesCount > 0
                 || StagedMeshMaterialsCount > 0
                 || StagedMaterialTexturesCount > 0
+                || StagedMaterialCachesCount > 0
+                || StagedCompositeAssetsCount > 0
+                || StagedCompositeAssetPartsCount > 0
                 || StagedAnimationClipTargetsCount > 0
                 || StagedRigBoneHashesCount > 0
                 || StagedClipBoneHashesCount > 0;
@@ -141,7 +153,10 @@ namespace AssetStudio.Avalonia
                     clearLists: clearBatch,
                     animationClipTargets: batch.AnimationClipTargets,
                     rigBoneHashes: batch.RigBoneHashes,
-                    clipBoneHashes: batch.ClipBoneHashes);
+                    clipBoneHashes: batch.ClipBoneHashes,
+                    materialCaches: batch.MaterialCaches,
+                    compositeAssets: batch.CompositeAssets,
+                    compositeAssetParts: batch.CompositeAssetParts);
             }
 
             public void FlushBatch(
@@ -155,7 +170,10 @@ namespace AssetStudio.Avalonia
                 bool clearLists = true,
                 IReadOnlyList<SemanticAnimationClipTargetRelation>? animationClipTargets = null,
                 IReadOnlyList<SemanticRigBoneHashEntry>? rigBoneHashes = null,
-                IReadOnlyList<SemanticClipBoneHashEntry>? clipBoneHashes = null)
+                IReadOnlyList<SemanticClipBoneHashEntry>? clipBoneHashes = null,
+                IReadOnlyList<SemanticMaterialCacheEntry>? materialCaches = null,
+                IReadOnlyList<SemanticCompositeAssetRelation>? compositeAssets = null,
+                IReadOnlyList<SemanticCompositeAssetPartRelation>? compositeAssetParts = null)
             {
                 EnsureActive();
 
@@ -166,10 +184,13 @@ namespace AssetStudio.Avalonia
                 var rendererCount = meshRenderers?.Count ?? 0;
                 var materialCount = meshMaterials?.Count ?? 0;
                 var textureCount = materialTextures?.Count ?? 0;
+                var materialCacheCount = materialCaches?.Count ?? 0;
+                var compositeCount = compositeAssets?.Count ?? 0;
+                var compositePartCount = compositeAssetParts?.Count ?? 0;
                 var animTargetCount = animationClipTargets?.Count ?? 0;
                 var rigHashCount = rigBoneHashes?.Count ?? 0;
                 var clipHashCount = clipBoneHashes?.Count ?? 0;
-                var batchTotal = sourceFileCount + edgeCount + groupCount + groupMeshCount + rendererCount + materialCount + textureCount + animTargetCount + rigHashCount + clipHashCount;
+                var batchTotal = sourceFileCount + edgeCount + groupCount + groupMeshCount + rendererCount + materialCount + textureCount + materialCacheCount + compositeCount + compositePartCount + animTargetCount + rigHashCount + clipHashCount;
                 if (batchTotal == 0)
                 {
                     return;
@@ -207,6 +228,18 @@ namespace AssetStudio.Avalonia
                     {
                         InsertStagedMaterialTextures(conn, transaction, _projectId, materialTextures);
                     }
+                    if (materialCaches != null && materialCacheCount > 0)
+                    {
+                        InsertStagedMaterialCaches(conn, transaction, _projectId, materialCaches);
+                    }
+                    if (compositeAssets != null && compositeCount > 0)
+                    {
+                        InsertStagedCompositeAssets(conn, transaction, _projectId, compositeAssets);
+                    }
+                    if (compositeAssetParts != null && compositePartCount > 0)
+                    {
+                        InsertStagedCompositeAssetParts(conn, transaction, _projectId, compositeAssetParts);
+                    }
                     if (animationClipTargets != null && animTargetCount > 0)
                     {
                         InsertStagedAnimationClipTargets(conn, transaction, _projectId, animationClipTargets);
@@ -230,6 +263,9 @@ namespace AssetStudio.Avalonia
                 StagedMeshRenderersCount += rendererCount;
                 StagedMeshMaterialsCount += materialCount;
                 StagedMaterialTexturesCount += textureCount;
+                StagedMaterialCachesCount += materialCacheCount;
+                StagedCompositeAssetsCount += compositeCount;
+                StagedCompositeAssetPartsCount += compositePartCount;
                 StagedAnimationClipTargetsCount += animTargetCount;
                 StagedRigBoneHashesCount += rigHashCount;
                 StagedClipBoneHashesCount += clipHashCount;
@@ -243,6 +279,9 @@ namespace AssetStudio.Avalonia
                     ClearIfMutableList(meshRenderers);
                     ClearIfMutableList(meshMaterials);
                     ClearIfMutableList(materialTextures);
+                    ClearIfMutableList(materialCaches);
+                    ClearIfMutableList(compositeAssets);
+                    ClearIfMutableList(compositeAssetParts);
                     ClearIfMutableList(animationClipTargets);
                     ClearIfMutableList(rigBoneHashes);
                     ClearIfMutableList(clipBoneHashes);
@@ -267,7 +306,9 @@ namespace AssetStudio.Avalonia
 
                 try
                 {
-                    const int totalWork = 16;
+                    // 11 clear steps + 10 staged promotion steps + 1 pre-anim index build + 1 derived cache backfill
+                    // + 4 animation promotion sub-steps + 1 post-anim index build + 1 staging cleanup = 29 steps
+                    const int totalWork = 29;
                     var reporter = new ThrottledProgressReporter(totalWork, progress);
                     reporter.Report("Waiting for SQLite writer", force: true);
 
@@ -313,7 +354,7 @@ namespace AssetStudio.Avalonia
 
                             PromoteStagedSemanticRelationsToLive(conn, transaction, projectId, reporter.Advance);
 
-                            reporter.Report("Rebuilding semantic relation indexes", force: true);
+                            reporter.Report("Rebuilding remaining semantic relation indexes", force: true);
                             CreateSemanticBulkSecondaryIndexes(conn, transaction);
                             reporter.Advance("Rebuilt semantic relation indexes");
 
@@ -339,6 +380,7 @@ namespace AssetStudio.Avalonia
                             SetSynchronousMode(conn, "NORMAL");
                         }
 
+                        _owner.NotifyDatabaseMutated(_dbPath);
                         reporter.Report("Analyzing SQLite statistics", force: true);
                         TryAnalyzeDatabase(conn, "staged semantic relations");
                         _owner.InvalidateReadConnectionPool(_dbPath);
@@ -452,7 +494,7 @@ namespace AssetStudio.Avalonia
             var dbPath = GetDbPath(folderPath);
             try
             {
-                var clearWork = replaceExisting ? 7 : 0;
+                var clearWork = replaceExisting ? 11 : 0;
                 var totalWork = Math.Max(1,
                     relations.SourceFiles.Count
                     + relations.AssetEdges.Count
@@ -461,11 +503,14 @@ namespace AssetStudio.Avalonia
                     + relations.MeshRenderers.Count
                     + relations.MeshMaterials.Count
                     + relations.MaterialTextures.Count
+                    + relations.MaterialCaches.Count
+                    + relations.CompositeAssets.Count
+                    + relations.CompositeAssetParts.Count
                     + relations.AnimationClipTargets.Count
                     + relations.RigBoneHashes.Count
                     + relations.ClipBoneHashes.Count
                     + clearWork
-                    + 4);
+                    + 8);
                 var reporter = new ThrottledProgressReporter(totalWork, progress);
 
                 reporter.Report("Waiting for SQLite writer", force: true);
@@ -496,6 +541,7 @@ namespace AssetStudio.Avalonia
                         SaveSemanticRelationsIncremental(conn, projectId, relations, reporter);
                     }
 
+                    NotifyDatabaseMutated(dbPath);
                     reporter.Report("Checkpointing SQLite WAL", force: true);
                     TryCheckpointWal(conn, "semantic relations");
                     reporter.Report("Semantic relations saved", force: true);
@@ -541,6 +587,13 @@ namespace AssetStudio.Avalonia
                 InsertMeshRenderers(conn, transaction, projectId, relations.MeshRenderers, 0, relations.MeshRenderers.Count, reporter.Advance);
                 InsertMeshMaterials(conn, transaction, projectId, relations.MeshMaterials, 0, relations.MeshMaterials.Count, reporter.Advance);
                 InsertMaterialTextures(conn, transaction, projectId, relations.MaterialTextures, 0, relations.MaterialTextures.Count, reporter.Advance);
+                InsertMaterialCaches(conn, transaction, projectId, relations.MaterialCaches, 0, relations.MaterialCaches.Count, reporter.Advance);
+                InsertCompositeAssets(conn, transaction, projectId, relations.CompositeAssets, 0, relations.CompositeAssets.Count, reporter.Advance);
+                InsertCompositeAssetParts(conn, transaction, projectId, relations.CompositeAssetParts, 0, relations.CompositeAssetParts.Count, reporter.Advance);
+
+                reporter.Report("Building pre-animation relation indexes", force: true);
+                CreateSemanticPreAnimationIndexes(conn, transaction);
+                BackfillV15DerivedCachesForProject(conn, transaction, projectId);
                 StageAndPromoteAnimationRelations(conn, transaction, projectId, relations, reporter.Advance);
 
                 reporter.Report("Rebuilding semantic relation indexes", force: true);
@@ -632,9 +685,25 @@ namespace AssetStudio.Avalonia
                 relations.MaterialTextures.Count,
                 (c, tx, offset, count) => InsertMaterialTextures(c, tx, projectId, relations.MaterialTextures, offset, count, reporter.Advance),
                 SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.MaterialCaches.Count,
+                (c, tx, offset, count) => InsertMaterialCaches(c, tx, projectId, relations.MaterialCaches, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.CompositeAssets.Count,
+                (c, tx, offset, count) => InsertCompositeAssets(c, tx, projectId, relations.CompositeAssets, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
+            ExecuteInCommitChunks(
+                conn,
+                relations.CompositeAssetParts.Count,
+                (c, tx, offset, count) => InsertCompositeAssetParts(c, tx, projectId, relations.CompositeAssetParts, offset, count, reporter.Advance),
+                SaveProgressCheckpoint);
 
             using (var transaction = conn.BeginTransaction())
             {
+                BackfillV15DerivedCachesForProject(conn, transaction, projectId);
                 StageAndPromoteAnimationRelations(conn, transaction, projectId, relations, reporter.Advance);
                 SaveProgressCheckpoint(conn, transaction);
                 transaction.Commit();
@@ -694,6 +763,7 @@ namespace AssetStudio.Avalonia
 
                     ClearSemanticRelationTablesForProject(conn, transaction, projectId.Value);
                     transaction.Commit();
+                    NotifyDatabaseMutated(dbPath);
                 }
             }
             catch (Exception ex)
@@ -711,6 +781,10 @@ namespace AssetStudio.Avalonia
             var tables = new[]
             {
                 "AnimationClipTargets",
+                "CompositeAssetParts",
+                "CompositeAssets",
+                "MeshMaterialResolvedCache",
+                "MaterialCache",
                 "MaterialTextures",
                 "MeshMaterials",
                 "MeshRenderers",
@@ -1140,14 +1214,21 @@ namespace AssetStudio.Avalonia
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 INSERT INTO MaterialTextures (
-                    ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture)
+                    ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture,
+                    ScaleX, ScaleY, OffsetX, OffsetY, ResolutionSource)
                 VALUES (
-                    @projectId, @materialAssetId, @previewMaterialAssetId, @slotName, @slotIndex, @textureAssetId, @textureFileId, @texturePathId, @isResolved, @isMainTexture)
+                    @projectId, @materialAssetId, @previewMaterialAssetId, @slotName, @slotIndex, @textureAssetId, @textureFileId, @texturePathId, @isResolved, @isMainTexture,
+                    @scaleX, @scaleY, @offsetX, @offsetY, @resolutionSource)
                 ON CONFLICT(ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID)
                 DO UPDATE SET
                     PreviewMaterialAssetUniqueID = excluded.PreviewMaterialAssetUniqueID,
                     IsResolved = excluded.IsResolved,
-                    IsMainTexture = excluded.IsMainTexture";
+                    IsMainTexture = excluded.IsMainTexture,
+                    ScaleX = excluded.ScaleX,
+                    ScaleY = excluded.ScaleY,
+                    OffsetX = excluded.OffsetX,
+                    OffsetY = excluded.OffsetY,
+                    ResolutionSource = excluded.ResolutionSource";
 
             var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
             var pMaterialAssetId = cmd.Parameters.Add("@materialAssetId", SqliteType.Text);
@@ -1159,6 +1240,11 @@ namespace AssetStudio.Avalonia
             var pTexturePathId = cmd.Parameters.Add("@texturePathId", SqliteType.Integer);
             var pIsResolved = cmd.Parameters.Add("@isResolved", SqliteType.Integer);
             var pIsMainTexture = cmd.Parameters.Add("@isMainTexture", SqliteType.Integer);
+            var pScaleX = cmd.Parameters.Add("@scaleX", SqliteType.Real);
+            var pScaleY = cmd.Parameters.Add("@scaleY", SqliteType.Real);
+            var pOffsetX = cmd.Parameters.Add("@offsetX", SqliteType.Real);
+            var pOffsetY = cmd.Parameters.Add("@offsetY", SqliteType.Real);
+            var pResolutionSource = cmd.Parameters.Add("@resolutionSource", SqliteType.Text);
 
             pProjectId.Value = projectId;
             var endIndex = Math.Min(textures.Count, startIndex + count);
@@ -1174,8 +1260,251 @@ namespace AssetStudio.Avalonia
                 pTexturePathId.Value = texture.TexturePathId;
                 pIsResolved.Value = texture.IsResolved ? 1 : 0;
                 pIsMainTexture.Value = texture.IsMainTexture ? 1 : 0;
+                pScaleX.Value = texture.ScaleX;
+                pScaleY.Value = texture.ScaleY;
+                pOffsetX.Value = texture.OffsetX;
+                pOffsetY.Value = texture.OffsetY;
+                pResolutionSource.Value = texture.ResolutionSource;
                 cmd.ExecuteNonQuery();
                 advanceProgress?.Invoke($"Saving material textures: {i + 1:N0}/{textures.Count:N0}");
+            }
+        }
+
+        private static void InsertMaterialCaches(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticMaterialCacheEntry> entries,
+            int startIndex,
+            int count,
+            Action<string>? advanceProgress = null)
+        {
+            if (entries.Count == 0 || count <= 0)
+            {
+                return;
+            }
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO MaterialCache (
+                    ProjectId, MaterialAssetUniqueID, MaterialName, ParentMaterialAssetUniqueID,
+                    MainTextureAssetUniqueID, MainTextureSlotName,
+                    BaseColorR, BaseColorG, BaseColorB, BaseColorA,
+                    ShaderName, TextureSlotCount, ResolutionSource)
+                VALUES (
+                    @projectId, @materialAssetId, @materialName, @parentMaterialAssetId,
+                    @mainTextureAssetId, @mainTextureSlotName,
+                    @baseColorR, @baseColorG, @baseColorB, @baseColorA,
+                    @shaderName, @textureSlotCount, @resolutionSource)
+                ON CONFLICT(ProjectId, MaterialAssetUniqueID)
+                DO UPDATE SET
+                    MaterialName = CASE WHEN excluded.MaterialName <> '' THEN excluded.MaterialName ELSE MaterialCache.MaterialName END,
+                    ParentMaterialAssetUniqueID = CASE WHEN excluded.ParentMaterialAssetUniqueID <> '' THEN excluded.ParentMaterialAssetUniqueID ELSE MaterialCache.ParentMaterialAssetUniqueID END,
+                    MainTextureAssetUniqueID = CASE WHEN excluded.MainTextureAssetUniqueID <> '' THEN excluded.MainTextureAssetUniqueID ELSE MaterialCache.MainTextureAssetUniqueID END,
+                    MainTextureSlotName = CASE WHEN excluded.MainTextureSlotName <> '' THEN excluded.MainTextureSlotName ELSE MaterialCache.MainTextureSlotName END,
+                    BaseColorR = excluded.BaseColorR,
+                    BaseColorG = excluded.BaseColorG,
+                    BaseColorB = excluded.BaseColorB,
+                    BaseColorA = excluded.BaseColorA,
+                    ShaderName = CASE WHEN excluded.ShaderName <> '' THEN excluded.ShaderName ELSE MaterialCache.ShaderName END,
+                    TextureSlotCount = MAX(MaterialCache.TextureSlotCount, excluded.TextureSlotCount),
+                    ResolutionSource = excluded.ResolutionSource";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pMaterialAssetId = cmd.Parameters.Add("@materialAssetId", SqliteType.Text);
+            var pMaterialName = cmd.Parameters.Add("@materialName", SqliteType.Text);
+            var pParentMaterialAssetId = cmd.Parameters.Add("@parentMaterialAssetId", SqliteType.Text);
+            var pMainTextureAssetId = cmd.Parameters.Add("@mainTextureAssetId", SqliteType.Text);
+            var pMainTextureSlotName = cmd.Parameters.Add("@mainTextureSlotName", SqliteType.Text);
+            var pBaseColorR = cmd.Parameters.Add("@baseColorR", SqliteType.Real);
+            var pBaseColorG = cmd.Parameters.Add("@baseColorG", SqliteType.Real);
+            var pBaseColorB = cmd.Parameters.Add("@baseColorB", SqliteType.Real);
+            var pBaseColorA = cmd.Parameters.Add("@baseColorA", SqliteType.Real);
+            var pShaderName = cmd.Parameters.Add("@shaderName", SqliteType.Text);
+            var pTextureSlotCount = cmd.Parameters.Add("@textureSlotCount", SqliteType.Integer);
+            var pResolutionSource = cmd.Parameters.Add("@resolutionSource", SqliteType.Text);
+
+            pProjectId.Value = projectId;
+            var endIndex = Math.Min(entries.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
+            {
+                var entry = entries[i];
+                if (string.IsNullOrEmpty(entry.MaterialAssetId))
+                {
+                    continue;
+                }
+
+                pMaterialAssetId.Value = entry.MaterialAssetId;
+                pMaterialName.Value = entry.MaterialName;
+                pParentMaterialAssetId.Value = entry.ParentMaterialAssetId;
+                pMainTextureAssetId.Value = entry.MainTextureAssetId;
+                pMainTextureSlotName.Value = entry.MainTextureSlotName;
+                pBaseColorR.Value = entry.BaseColorR;
+                pBaseColorG.Value = entry.BaseColorG;
+                pBaseColorB.Value = entry.BaseColorB;
+                pBaseColorA.Value = entry.BaseColorA;
+                pShaderName.Value = entry.ShaderName;
+                pTextureSlotCount.Value = entry.TextureSlotCount;
+                pResolutionSource.Value = entry.ResolutionSource;
+                cmd.ExecuteNonQuery();
+                advanceProgress?.Invoke($"Saving material cache: {i + 1:N0}/{entries.Count:N0}");
+            }
+        }
+
+        private static void InsertCompositeAssets(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticCompositeAssetRelation> composites,
+            int startIndex,
+            int count,
+            Action<string>? advanceProgress = null)
+        {
+            if (composites.Count == 0 || count <= 0)
+            {
+                return;
+            }
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO CompositeAssets (
+                    ProjectId, CompositeAssetUniqueID, CompositeKind, DisplayName,
+                    RootGameObjectAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID, ControllerAssetUniqueID,
+                    SourceFileName, MeshPartCount, DistinctMeshCount, DistinctMaterialCount, Confidence, ResolutionSource)
+                VALUES (
+                    @projectId, @compositeId, @compositeKind, @displayName,
+                    @rootGameObjectId, @animatorId, @avatarId, @controllerId,
+                    @sourceFileName, @meshPartCount, @distinctMeshCount, @distinctMaterialCount, @confidence, @resolutionSource)
+                ON CONFLICT(ProjectId, CompositeAssetUniqueID)
+                DO UPDATE SET
+                    CompositeKind = excluded.CompositeKind,
+                    DisplayName = excluded.DisplayName,
+                    RootGameObjectAssetUniqueID = excluded.RootGameObjectAssetUniqueID,
+                    AnimatorAssetUniqueID = excluded.AnimatorAssetUniqueID,
+                    AvatarAssetUniqueID = excluded.AvatarAssetUniqueID,
+                    ControllerAssetUniqueID = excluded.ControllerAssetUniqueID,
+                    SourceFileName = excluded.SourceFileName,
+                    MeshPartCount = excluded.MeshPartCount,
+                    DistinctMeshCount = excluded.DistinctMeshCount,
+                    DistinctMaterialCount = excluded.DistinctMaterialCount,
+                    Confidence = excluded.Confidence,
+                    ResolutionSource = excluded.ResolutionSource";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pCompositeId = cmd.Parameters.Add("@compositeId", SqliteType.Text);
+            var pCompositeKind = cmd.Parameters.Add("@compositeKind", SqliteType.Text);
+            var pDisplayName = cmd.Parameters.Add("@displayName", SqliteType.Text);
+            var pRootGameObjectId = cmd.Parameters.Add("@rootGameObjectId", SqliteType.Text);
+            var pAnimatorId = cmd.Parameters.Add("@animatorId", SqliteType.Text);
+            var pAvatarId = cmd.Parameters.Add("@avatarId", SqliteType.Text);
+            var pControllerId = cmd.Parameters.Add("@controllerId", SqliteType.Text);
+            var pSourceFileName = cmd.Parameters.Add("@sourceFileName", SqliteType.Text);
+            var pMeshPartCount = cmd.Parameters.Add("@meshPartCount", SqliteType.Integer);
+            var pDistinctMeshCount = cmd.Parameters.Add("@distinctMeshCount", SqliteType.Integer);
+            var pDistinctMaterialCount = cmd.Parameters.Add("@distinctMaterialCount", SqliteType.Integer);
+            var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
+            var pResolutionSource = cmd.Parameters.Add("@resolutionSource", SqliteType.Text);
+
+            pProjectId.Value = projectId;
+            var endIndex = Math.Min(composites.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
+            {
+                var comp = composites[i];
+                if (string.IsNullOrEmpty(comp.CompositeAssetId))
+                {
+                    continue;
+                }
+
+                pCompositeId.Value = comp.CompositeAssetId;
+                pCompositeKind.Value = comp.CompositeKind;
+                pDisplayName.Value = comp.DisplayName;
+                pRootGameObjectId.Value = comp.RootGameObjectAssetId;
+                pAnimatorId.Value = comp.AnimatorAssetId;
+                pAvatarId.Value = comp.AvatarAssetId;
+                pControllerId.Value = comp.ControllerAssetId;
+                pSourceFileName.Value = comp.SourceFileName;
+                pMeshPartCount.Value = comp.MeshPartCount;
+                pDistinctMeshCount.Value = comp.DistinctMeshCount;
+                pDistinctMaterialCount.Value = comp.DistinctMaterialCount;
+                pConfidence.Value = comp.Confidence;
+                pResolutionSource.Value = comp.ResolutionSource;
+                cmd.ExecuteNonQuery();
+                advanceProgress?.Invoke($"Saving composite assets: {i + 1:N0}/{composites.Count:N0}");
+            }
+        }
+
+        private static void InsertCompositeAssetParts(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticCompositeAssetPartRelation> parts,
+            int startIndex,
+            int count,
+            Action<string>? advanceProgress = null)
+        {
+            if (parts.Count == 0 || count <= 0)
+            {
+                return;
+            }
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO CompositeAssetParts (
+                    ProjectId, CompositeAssetUniqueID, PartIndex, MeshAssetUniqueID,
+                    RendererAssetUniqueID, RendererType, GameObjectAssetUniqueID, GameObjectName,
+                    TransformMatrix, PrimaryMaterialAssetUniqueID, Confidence)
+                VALUES (
+                    @projectId, @compositeId, @partIndex, @meshAssetId,
+                    @rendererAssetId, @rendererType, @gameObjectAssetId, @gameObjectName,
+                    @transformMatrix, @primaryMaterialAssetId, @confidence)
+                ON CONFLICT(ProjectId, CompositeAssetUniqueID, PartIndex)
+                DO UPDATE SET
+                    MeshAssetUniqueID = excluded.MeshAssetUniqueID,
+                    RendererAssetUniqueID = excluded.RendererAssetUniqueID,
+                    RendererType = excluded.RendererType,
+                    GameObjectAssetUniqueID = excluded.GameObjectAssetUniqueID,
+                    GameObjectName = excluded.GameObjectName,
+                    TransformMatrix = excluded.TransformMatrix,
+                    PrimaryMaterialAssetUniqueID = excluded.PrimaryMaterialAssetUniqueID,
+                    Confidence = excluded.Confidence";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pCompositeId = cmd.Parameters.Add("@compositeId", SqliteType.Text);
+            var pPartIndex = cmd.Parameters.Add("@partIndex", SqliteType.Integer);
+            var pMeshAssetId = cmd.Parameters.Add("@meshAssetId", SqliteType.Text);
+            var pRendererAssetId = cmd.Parameters.Add("@rendererAssetId", SqliteType.Text);
+            var pRendererType = cmd.Parameters.Add("@rendererType", SqliteType.Text);
+            var pGameObjectAssetId = cmd.Parameters.Add("@gameObjectAssetId", SqliteType.Text);
+            var pGameObjectName = cmd.Parameters.Add("@gameObjectName", SqliteType.Text);
+            var pTransformMatrix = cmd.Parameters.Add("@transformMatrix", SqliteType.Blob);
+            var pPrimaryMaterialAssetId = cmd.Parameters.Add("@primaryMaterialAssetId", SqliteType.Text);
+            var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
+
+            pProjectId.Value = projectId;
+            var endIndex = Math.Min(parts.Count, startIndex + count);
+            for (var i = startIndex; i < endIndex; i++)
+            {
+                var part = parts[i];
+                if (string.IsNullOrEmpty(part.CompositeAssetId) || string.IsNullOrEmpty(part.MeshAssetId))
+                {
+                    continue;
+                }
+
+                pCompositeId.Value = part.CompositeAssetId;
+                pPartIndex.Value = part.PartIndex;
+                pMeshAssetId.Value = part.MeshAssetId;
+                pRendererAssetId.Value = part.RendererAssetId;
+                pRendererType.Value = part.RendererType;
+                pGameObjectAssetId.Value = part.GameObjectAssetId;
+                pGameObjectName.Value = part.GameObjectName;
+                pTransformMatrix.Value = (object?)SerializeTransformMatrix(part.LocalToWorldMatrix) ?? DBNull.Value;
+                pPrimaryMaterialAssetId.Value = part.PrimaryMaterialAssetId;
+                pConfidence.Value = part.Confidence;
+                cmd.ExecuteNonQuery();
+                advanceProgress?.Invoke($"Saving composite asset parts: {i + 1:N0}/{parts.Count:N0}");
             }
         }
 
@@ -1438,9 +1767,11 @@ namespace AssetStudio.Avalonia
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 INSERT INTO Stage_MaterialTextures (
-                    ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture)
+                    ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture,
+                    ScaleX, ScaleY, OffsetX, OffsetY, ResolutionSource)
                 VALUES (
-                    @projectId, @materialAssetId, @previewMaterialAssetId, @slotName, @slotIndex, @textureAssetId, @textureFileId, @texturePathId, @isResolved, @isMainTexture);";
+                    @projectId, @materialAssetId, @previewMaterialAssetId, @slotName, @slotIndex, @textureAssetId, @textureFileId, @texturePathId, @isResolved, @isMainTexture,
+                    @scaleX, @scaleY, @offsetX, @offsetY, @resolutionSource);";
 
             var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
             var pMaterialAssetId = cmd.Parameters.Add("@materialAssetId", SqliteType.Text);
@@ -1452,6 +1783,11 @@ namespace AssetStudio.Avalonia
             var pTexturePathId = cmd.Parameters.Add("@texturePathId", SqliteType.Integer);
             var pIsResolved = cmd.Parameters.Add("@isResolved", SqliteType.Integer);
             var pIsMainTexture = cmd.Parameters.Add("@isMainTexture", SqliteType.Integer);
+            var pScaleX = cmd.Parameters.Add("@scaleX", SqliteType.Real);
+            var pScaleY = cmd.Parameters.Add("@scaleY", SqliteType.Real);
+            var pOffsetX = cmd.Parameters.Add("@offsetX", SqliteType.Real);
+            var pOffsetY = cmd.Parameters.Add("@offsetY", SqliteType.Real);
+            var pResolutionSource = cmd.Parameters.Add("@resolutionSource", SqliteType.Text);
 
             pProjectId.Value = projectId;
             for (var i = 0; i < textures.Count; i++)
@@ -1466,6 +1802,182 @@ namespace AssetStudio.Avalonia
                 pTexturePathId.Value = texture.TexturePathId;
                 pIsResolved.Value = texture.IsResolved ? 1 : 0;
                 pIsMainTexture.Value = texture.IsMainTexture ? 1 : 0;
+                pScaleX.Value = texture.ScaleX;
+                pScaleY.Value = texture.ScaleY;
+                pOffsetX.Value = texture.OffsetX;
+                pOffsetY.Value = texture.OffsetY;
+                pResolutionSource.Value = texture.ResolutionSource;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void InsertStagedMaterialCaches(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticMaterialCacheEntry> entries)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO Stage_MaterialCache (
+                    ProjectId, MaterialAssetUniqueID, MaterialName, ParentMaterialAssetUniqueID,
+                    MainTextureAssetUniqueID, MainTextureSlotName,
+                    BaseColorR, BaseColorG, BaseColorB, BaseColorA,
+                    ShaderName, TextureSlotCount, ResolutionSource)
+                VALUES (
+                    @projectId, @materialAssetId, @materialName, @parentMaterialAssetId,
+                    @mainTextureAssetId, @mainTextureSlotName,
+                    @baseColorR, @baseColorG, @baseColorB, @baseColorA,
+                    @shaderName, @textureSlotCount, @resolutionSource);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pMaterialAssetId = cmd.Parameters.Add("@materialAssetId", SqliteType.Text);
+            var pMaterialName = cmd.Parameters.Add("@materialName", SqliteType.Text);
+            var pParentMaterialAssetId = cmd.Parameters.Add("@parentMaterialAssetId", SqliteType.Text);
+            var pMainTextureAssetId = cmd.Parameters.Add("@mainTextureAssetId", SqliteType.Text);
+            var pMainTextureSlotName = cmd.Parameters.Add("@mainTextureSlotName", SqliteType.Text);
+            var pBaseColorR = cmd.Parameters.Add("@baseColorR", SqliteType.Real);
+            var pBaseColorG = cmd.Parameters.Add("@baseColorG", SqliteType.Real);
+            var pBaseColorB = cmd.Parameters.Add("@baseColorB", SqliteType.Real);
+            var pBaseColorA = cmd.Parameters.Add("@baseColorA", SqliteType.Real);
+            var pShaderName = cmd.Parameters.Add("@shaderName", SqliteType.Text);
+            var pTextureSlotCount = cmd.Parameters.Add("@textureSlotCount", SqliteType.Integer);
+            var pResolutionSource = cmd.Parameters.Add("@resolutionSource", SqliteType.Text);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                if (string.IsNullOrEmpty(entry.MaterialAssetId))
+                {
+                    continue;
+                }
+
+                pMaterialAssetId.Value = entry.MaterialAssetId;
+                pMaterialName.Value = entry.MaterialName;
+                pParentMaterialAssetId.Value = entry.ParentMaterialAssetId;
+                pMainTextureAssetId.Value = entry.MainTextureAssetId;
+                pMainTextureSlotName.Value = entry.MainTextureSlotName;
+                pBaseColorR.Value = entry.BaseColorR;
+                pBaseColorG.Value = entry.BaseColorG;
+                pBaseColorB.Value = entry.BaseColorB;
+                pBaseColorA.Value = entry.BaseColorA;
+                pShaderName.Value = entry.ShaderName;
+                pTextureSlotCount.Value = entry.TextureSlotCount;
+                pResolutionSource.Value = entry.ResolutionSource;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void InsertStagedCompositeAssets(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticCompositeAssetRelation> composites)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO Stage_CompositeAssets (
+                    ProjectId, CompositeAssetUniqueID, CompositeKind, DisplayName,
+                    RootGameObjectAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID, ControllerAssetUniqueID,
+                    SourceFileName, MeshPartCount, DistinctMeshCount, DistinctMaterialCount, Confidence, ResolutionSource)
+                VALUES (
+                    @projectId, @compositeId, @compositeKind, @displayName,
+                    @rootGameObjectId, @animatorId, @avatarId, @controllerId,
+                    @sourceFileName, @meshPartCount, @distinctMeshCount, @distinctMaterialCount, @confidence, @resolutionSource);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pCompositeId = cmd.Parameters.Add("@compositeId", SqliteType.Text);
+            var pCompositeKind = cmd.Parameters.Add("@compositeKind", SqliteType.Text);
+            var pDisplayName = cmd.Parameters.Add("@displayName", SqliteType.Text);
+            var pRootGameObjectId = cmd.Parameters.Add("@rootGameObjectId", SqliteType.Text);
+            var pAnimatorId = cmd.Parameters.Add("@animatorId", SqliteType.Text);
+            var pAvatarId = cmd.Parameters.Add("@avatarId", SqliteType.Text);
+            var pControllerId = cmd.Parameters.Add("@controllerId", SqliteType.Text);
+            var pSourceFileName = cmd.Parameters.Add("@sourceFileName", SqliteType.Text);
+            var pMeshPartCount = cmd.Parameters.Add("@meshPartCount", SqliteType.Integer);
+            var pDistinctMeshCount = cmd.Parameters.Add("@distinctMeshCount", SqliteType.Integer);
+            var pDistinctMaterialCount = cmd.Parameters.Add("@distinctMaterialCount", SqliteType.Integer);
+            var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
+            var pResolutionSource = cmd.Parameters.Add("@resolutionSource", SqliteType.Text);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < composites.Count; i++)
+            {
+                var comp = composites[i];
+                if (string.IsNullOrEmpty(comp.CompositeAssetId))
+                {
+                    continue;
+                }
+
+                pCompositeId.Value = comp.CompositeAssetId;
+                pCompositeKind.Value = comp.CompositeKind;
+                pDisplayName.Value = comp.DisplayName;
+                pRootGameObjectId.Value = comp.RootGameObjectAssetId;
+                pAnimatorId.Value = comp.AnimatorAssetId;
+                pAvatarId.Value = comp.AvatarAssetId;
+                pControllerId.Value = comp.ControllerAssetId;
+                pSourceFileName.Value = comp.SourceFileName;
+                pMeshPartCount.Value = comp.MeshPartCount;
+                pDistinctMeshCount.Value = comp.DistinctMeshCount;
+                pDistinctMaterialCount.Value = comp.DistinctMaterialCount;
+                pConfidence.Value = comp.Confidence;
+                pResolutionSource.Value = comp.ResolutionSource;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void InsertStagedCompositeAssetParts(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticCompositeAssetPartRelation> parts)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO Stage_CompositeAssetParts (
+                    ProjectId, CompositeAssetUniqueID, PartIndex, MeshAssetUniqueID,
+                    RendererAssetUniqueID, RendererType, GameObjectAssetUniqueID, GameObjectName,
+                    TransformMatrix, PrimaryMaterialAssetUniqueID, Confidence)
+                VALUES (
+                    @projectId, @compositeId, @partIndex, @meshAssetId,
+                    @rendererAssetId, @rendererType, @gameObjectAssetId, @gameObjectName,
+                    @transformMatrix, @primaryMaterialAssetId, @confidence);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pCompositeId = cmd.Parameters.Add("@compositeId", SqliteType.Text);
+            var pPartIndex = cmd.Parameters.Add("@partIndex", SqliteType.Integer);
+            var pMeshAssetId = cmd.Parameters.Add("@meshAssetId", SqliteType.Text);
+            var pRendererAssetId = cmd.Parameters.Add("@rendererAssetId", SqliteType.Text);
+            var pRendererType = cmd.Parameters.Add("@rendererType", SqliteType.Text);
+            var pGameObjectAssetId = cmd.Parameters.Add("@gameObjectAssetId", SqliteType.Text);
+            var pGameObjectName = cmd.Parameters.Add("@gameObjectName", SqliteType.Text);
+            var pTransformMatrix = cmd.Parameters.Add("@transformMatrix", SqliteType.Blob);
+            var pPrimaryMaterialAssetId = cmd.Parameters.Add("@primaryMaterialAssetId", SqliteType.Text);
+            var pConfidence = cmd.Parameters.Add("@confidence", SqliteType.Integer);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < parts.Count; i++)
+            {
+                var part = parts[i];
+                if (string.IsNullOrEmpty(part.CompositeAssetId) || string.IsNullOrEmpty(part.MeshAssetId))
+                {
+                    continue;
+                }
+
+                pCompositeId.Value = part.CompositeAssetId;
+                pPartIndex.Value = part.PartIndex;
+                pMeshAssetId.Value = part.MeshAssetId;
+                pRendererAssetId.Value = part.RendererAssetId;
+                pRendererType.Value = part.RendererType;
+                pGameObjectAssetId.Value = part.GameObjectAssetId;
+                pGameObjectName.Value = part.GameObjectName;
+                pTransformMatrix.Value = (object?)SerializeTransformMatrix(part.LocalToWorldMatrix) ?? DBNull.Value;
+                pPrimaryMaterialAssetId.Value = part.PrimaryMaterialAssetId;
+                pConfidence.Value = part.Confidence;
                 cmd.ExecuteNonQuery();
             }
         }
@@ -1614,9 +2126,11 @@ namespace AssetStudio.Avalonia
                     "Promoting staged material textures",
                     @"
                     INSERT INTO MaterialTextures (
-                        ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture)
+                        ProjectId, MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex, TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture,
+                        ScaleX, ScaleY, OffsetX, OffsetY, ResolutionSource)
                     SELECT
-                        @projectId, s.MaterialAssetUniqueID, s.PreviewMaterialAssetUniqueID, s.SlotName, s.SlotIndex, s.TextureAssetUniqueID, s.TextureFileId, s.TexturePathID, s.IsResolved, s.IsMainTexture
+                        @projectId, s.MaterialAssetUniqueID, s.PreviewMaterialAssetUniqueID, s.SlotName, s.SlotIndex, s.TextureAssetUniqueID, s.TextureFileId, s.TexturePathID, s.IsResolved, s.IsMainTexture,
+                        s.ScaleX, s.ScaleY, s.OffsetX, s.OffsetY, s.ResolutionSource
                     FROM Stage_MaterialTextures s
                     WHERE true
                     ORDER BY s.rowid ASC
@@ -1624,7 +2138,96 @@ namespace AssetStudio.Avalonia
                     DO UPDATE SET
                         PreviewMaterialAssetUniqueID = excluded.PreviewMaterialAssetUniqueID,
                         IsResolved = excluded.IsResolved,
-                        IsMainTexture = excluded.IsMainTexture;"
+                        IsMainTexture = excluded.IsMainTexture,
+                        ScaleX = excluded.ScaleX,
+                        ScaleY = excluded.ScaleY,
+                        OffsetX = excluded.OffsetX,
+                        OffsetY = excluded.OffsetY,
+                        ResolutionSource = excluded.ResolutionSource;"
+                ),
+                (
+                    "Promoting staged material cache",
+                    @"
+                    INSERT INTO MaterialCache (
+                        ProjectId, MaterialAssetUniqueID, MaterialName, ParentMaterialAssetUniqueID,
+                        MainTextureAssetUniqueID, MainTextureSlotName,
+                        BaseColorR, BaseColorG, BaseColorB, BaseColorA,
+                        ShaderName, TextureSlotCount, ResolutionSource)
+                    SELECT
+                        @projectId, s.MaterialAssetUniqueID, s.MaterialName, s.ParentMaterialAssetUniqueID,
+                        s.MainTextureAssetUniqueID, s.MainTextureSlotName,
+                        s.BaseColorR, s.BaseColorG, s.BaseColorB, s.BaseColorA,
+                        s.ShaderName, s.TextureSlotCount, s.ResolutionSource
+                    FROM Stage_MaterialCache s
+                    WHERE s.MaterialAssetUniqueID <> ''
+                    ORDER BY s.rowid ASC
+                    ON CONFLICT(ProjectId, MaterialAssetUniqueID)
+                    DO UPDATE SET
+                        MaterialName = CASE WHEN excluded.MaterialName <> '' THEN excluded.MaterialName ELSE MaterialCache.MaterialName END,
+                        ParentMaterialAssetUniqueID = CASE WHEN excluded.ParentMaterialAssetUniqueID <> '' THEN excluded.ParentMaterialAssetUniqueID ELSE MaterialCache.ParentMaterialAssetUniqueID END,
+                        MainTextureAssetUniqueID = CASE WHEN excluded.MainTextureAssetUniqueID <> '' THEN excluded.MainTextureAssetUniqueID ELSE MaterialCache.MainTextureAssetUniqueID END,
+                        MainTextureSlotName = CASE WHEN excluded.MainTextureSlotName <> '' THEN excluded.MainTextureSlotName ELSE MaterialCache.MainTextureSlotName END,
+                        BaseColorR = excluded.BaseColorR,
+                        BaseColorG = excluded.BaseColorG,
+                        BaseColorB = excluded.BaseColorB,
+                        BaseColorA = excluded.BaseColorA,
+                        ShaderName = CASE WHEN excluded.ShaderName <> '' THEN excluded.ShaderName ELSE MaterialCache.ShaderName END,
+                        TextureSlotCount = MAX(MaterialCache.TextureSlotCount, excluded.TextureSlotCount),
+                        ResolutionSource = excluded.ResolutionSource;"
+                ),
+                (
+                    "Promoting staged composite assets",
+                    @"
+                    INSERT INTO CompositeAssets (
+                        ProjectId, CompositeAssetUniqueID, CompositeKind, DisplayName,
+                        RootGameObjectAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID, ControllerAssetUniqueID,
+                        SourceFileName, MeshPartCount, DistinctMeshCount, DistinctMaterialCount, Confidence, ResolutionSource)
+                    SELECT
+                        @projectId, s.CompositeAssetUniqueID, s.CompositeKind, s.DisplayName,
+                        s.RootGameObjectAssetUniqueID, s.AnimatorAssetUniqueID, s.AvatarAssetUniqueID, s.ControllerAssetUniqueID,
+                        s.SourceFileName, s.MeshPartCount, s.DistinctMeshCount, s.DistinctMaterialCount, s.Confidence, s.ResolutionSource
+                    FROM Stage_CompositeAssets s
+                    WHERE s.CompositeAssetUniqueID <> ''
+                    ORDER BY s.rowid ASC
+                    ON CONFLICT(ProjectId, CompositeAssetUniqueID)
+                    DO UPDATE SET
+                        CompositeKind = excluded.CompositeKind,
+                        DisplayName = excluded.DisplayName,
+                        RootGameObjectAssetUniqueID = excluded.RootGameObjectAssetUniqueID,
+                        AnimatorAssetUniqueID = excluded.AnimatorAssetUniqueID,
+                        AvatarAssetUniqueID = excluded.AvatarAssetUniqueID,
+                        ControllerAssetUniqueID = excluded.ControllerAssetUniqueID,
+                        SourceFileName = excluded.SourceFileName,
+                        MeshPartCount = excluded.MeshPartCount,
+                        DistinctMeshCount = excluded.DistinctMeshCount,
+                        DistinctMaterialCount = excluded.DistinctMaterialCount,
+                        Confidence = excluded.Confidence,
+                        ResolutionSource = excluded.ResolutionSource;"
+                ),
+                (
+                    "Promoting staged composite asset parts",
+                    @"
+                    INSERT INTO CompositeAssetParts (
+                        ProjectId, CompositeAssetUniqueID, PartIndex, MeshAssetUniqueID,
+                        RendererAssetUniqueID, RendererType, GameObjectAssetUniqueID, GameObjectName,
+                        TransformMatrix, PrimaryMaterialAssetUniqueID, Confidence)
+                    SELECT
+                        @projectId, s.CompositeAssetUniqueID, s.PartIndex, s.MeshAssetUniqueID,
+                        s.RendererAssetUniqueID, s.RendererType, s.GameObjectAssetUniqueID, s.GameObjectName,
+                        s.TransformMatrix, s.PrimaryMaterialAssetUniqueID, s.Confidence
+                    FROM Stage_CompositeAssetParts s
+                    WHERE s.CompositeAssetUniqueID <> '' AND s.MeshAssetUniqueID <> ''
+                    ORDER BY s.rowid ASC
+                    ON CONFLICT(ProjectId, CompositeAssetUniqueID, PartIndex)
+                    DO UPDATE SET
+                        MeshAssetUniqueID = excluded.MeshAssetUniqueID,
+                        RendererAssetUniqueID = excluded.RendererAssetUniqueID,
+                        RendererType = excluded.RendererType,
+                        GameObjectAssetUniqueID = excluded.GameObjectAssetUniqueID,
+                        GameObjectName = excluded.GameObjectName,
+                        TransformMatrix = excluded.TransformMatrix,
+                        PrimaryMaterialAssetUniqueID = CASE WHEN excluded.PrimaryMaterialAssetUniqueID <> '' THEN excluded.PrimaryMaterialAssetUniqueID ELSE CompositeAssetParts.PrimaryMaterialAssetUniqueID END,
+                        Confidence = excluded.Confidence;"
                 )
             };
 
@@ -1637,6 +2240,14 @@ namespace AssetStudio.Avalonia
                 cmd.ExecuteNonQuery();
                 advanceProgress?.Invoke(step.StageMessage);
             }
+
+            // CRITICAL: Recreate indexes required by PromoteStagedAnimationRelationsToLive and derived cache
+            // materialization BEFORE running them (prevents 364M-row full-table scans on ModelGroups/AssetEdges!).
+            CreateSemanticPreAnimationIndexes(conn, transaction);
+            advanceProgress?.Invoke("Built pre-animation relation indexes");
+
+            BackfillV15DerivedCachesForProject(conn, transaction, projectId);
+            advanceProgress?.Invoke("Materialized resolved material and composite caches");
 
             PromoteStagedAnimationRelationsToLive(conn, transaction, projectId, advanceProgress);
         }
@@ -1860,7 +2471,7 @@ namespace AssetStudio.Avalonia
                         s.TotalClipBoneCount
                     FROM Stage_AnimationClipTargets s
                     WHERE s.ClipAssetUniqueID <> ''
-                      AND (s.AvatarAssetUniqueID <> '' OR s.MeshAssetUniqueID <> '' OR s.ModelGroupId <> '' OR s.AnimatorAssetUniqueID <> '')
+                      AND (s.AvatarAssetUniqueID <> '' OR s.MeshAssetUniqueID <> '' OR s.ModelGroupId <> '')
                     ORDER BY s.rowid ASC
                     ON CONFLICT(ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
                     DO UPDATE SET
@@ -1870,70 +2481,37 @@ namespace AssetStudio.Avalonia
                 directCmd.Parameters.AddWithValue("@projectId", projectId);
                 directCmd.ExecuteNonQuery();
             }
+            advanceProgress?.Invoke("Promoted direct animation clip targets");
 
-            // 2. Cross-bundle direct relations synthesized from AssetEdges + ModelGroups + ModelGroupMeshes
+            // 2. Cross-bundle direct relations synthesized from AssetEdges + ModelGroups + ModelGroupMeshes (100% covering-index seeks, 0 Cartesian fan-out)
             using (var edgeSynthCmd = conn.CreateCommand())
             {
                 edgeSynthCmd.Transaction = transaction;
                 edgeSynthCmd.CommandText = @"
-                    WITH GroupRepresentativeMesh AS (
-                        SELECT
-                            mgm.GroupAssetUniqueID,
-                            mgm.MeshAssetUniqueID,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY mgm.GroupAssetUniqueID
-                                ORDER BY mgm.Confidence DESC, COALESCE(meshAsset.ByteSize, 0) DESC, mgm.SlotIndex ASC, mgm.MeshAssetUniqueID ASC
-                            ) AS RepRank
-                        FROM ModelGroupMeshes mgm
-                        LEFT JOIN Assets meshAsset
-                          ON meshAsset.ProjectId = mgm.ProjectId
-                         AND meshAsset.UniqueID = mgm.MeshAssetUniqueID
-                        WHERE mgm.ProjectId = @projectId
-                          AND mgm.MeshAssetUniqueID <> ''
-                    ),
-                    ControllerHierarchy AS (
-                        SELECT
-                            ae.SourceAssetUniqueID AS DerivedControllerId,
-                            ae.TargetAssetUniqueID AS BaseControllerId
-                        FROM AssetEdges ae
-                        WHERE ae.ProjectId = @projectId
-                          AND ae.EdgeKind = 'AnimatorController'
-                          AND ae.SlotName = 'm_Controller'
-                          AND ae.SourceAssetUniqueID <> ''
-                          AND ae.TargetAssetUniqueID <> ''
-                    ),
-                    ControllerClips AS (
-                        SELECT
-                            clipEdge.SourceAssetUniqueID AS ControllerId,
-                            clipEdge.TargetAssetUniqueID AS ClipId,
-                            clipEdge.SlotIndex AS SlotIndex,
-                            'AnimatorController' AS Kind,
-                            10000 AS BaseScore
-                        FROM AssetEdges clipEdge
-                        WHERE clipEdge.ProjectId = @projectId
-                          AND clipEdge.EdgeKind = 'AnimationClip'
-                          AND clipEdge.TargetAssetUniqueID <> ''
-                        UNION ALL
-                        SELECT
-                            ch.DerivedControllerId AS ControllerId,
-                            clipEdge.TargetAssetUniqueID AS ClipId,
-                            clipEdge.SlotIndex AS SlotIndex,
-                            'AnimatorOverrideController' AS Kind,
-                            9800 AS BaseScore
-                        FROM ControllerHierarchy ch
-                        INNER JOIN AssetEdges clipEdge
-                          ON clipEdge.ProjectId = @projectId
-                         AND clipEdge.SourceAssetUniqueID = ch.BaseControllerId
-                         AND clipEdge.EdgeKind = 'AnimationClip'
-                         AND clipEdge.TargetAssetUniqueID <> ''
-                    ),
-                    DirectEdges AS (
+                    WITH DirectEdges AS (
                         -- (a) Clip -> Avatar edge (AnimatorAvatar / CompatibleAvatar) joined with ModelGroups or Avatar->Mesh edges
                         SELECT
                             ca.SourceAssetUniqueID AS ClipId,
                             COALESCE(mg.AnimatorAssetUniqueID, '') AS AnimatorId,
                             ca.TargetAssetUniqueID AS AvatarId,
-                            COALESCE(rep.MeshAssetUniqueID, meshEdge.TargetAssetUniqueID, '') AS MeshId,
+                            COALESCE(
+                                (SELECT mgm.MeshAssetUniqueID
+                                 FROM ModelGroupMeshes mgm
+                                 WHERE mgm.ProjectId = @projectId
+                                   AND mgm.GroupAssetUniqueID = mg.GroupAssetUniqueID
+                                   AND mgm.MeshAssetUniqueID <> ''
+                                 ORDER BY mgm.SlotIndex ASC, mgm.MeshAssetUniqueID ASC
+                                 LIMIT 1),
+                                (SELECT me.TargetAssetUniqueID
+                                 FROM AssetEdges me
+                                 WHERE me.ProjectId = @projectId
+                                   AND me.SourceAssetUniqueID = ca.TargetAssetUniqueID
+                                   AND me.EdgeKind = 'Mesh'
+                                   AND me.TargetAssetUniqueID <> ''
+                                 ORDER BY me.SlotName ASC, me.SlotIndex ASC
+                                 LIMIT 1),
+                                ''
+                            ) AS MeshId,
                             COALESCE(mg.GroupAssetUniqueID, '') AS GroupId,
                             CASE WHEN ca.SlotName = 'CompatibleAvatar' THEN 'CompatibleAvatar' ELSE 'AnimatorAvatar' END AS RelationKind,
                             (CASE WHEN ca.SlotName = 'CompatibleAvatar' THEN 8500 ELSE 9500 END)
@@ -1944,15 +2522,6 @@ namespace AssetStudio.Avalonia
                         LEFT JOIN ModelGroups mg
                           ON mg.ProjectId = ca.ProjectId
                          AND mg.AvatarAssetUniqueID = ca.TargetAssetUniqueID
-                        LEFT JOIN GroupRepresentativeMesh rep
-                          ON rep.GroupAssetUniqueID = mg.GroupAssetUniqueID
-                         AND rep.RepRank = 1
-                        LEFT JOIN AssetEdges meshEdge
-                          ON meshEdge.ProjectId = ca.ProjectId
-                         AND meshEdge.SourceAssetUniqueID = ca.TargetAssetUniqueID
-                         AND meshEdge.EdgeKind = 'Mesh'
-                         AND meshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
-                         AND meshEdge.TargetAssetUniqueID <> ''
                         WHERE ca.ProjectId = @projectId
                           AND ca.EdgeKind = 'Avatar'
                           AND ca.SlotName IN ('AnimatorAvatar', 'CompatibleAvatar')
@@ -1961,83 +2530,173 @@ namespace AssetStudio.Avalonia
 
                         UNION ALL
 
-                        -- (b) ModelGroups linked via ControllerAssetUniqueID -> ControllerClips
+                        -- (b1) ModelGroups linked directly via ControllerAssetUniqueID -> AnimationClip edges
                         SELECT
-                            cc.ClipId AS ClipId,
+                            clipEdge.TargetAssetUniqueID AS ClipId,
                             mg.AnimatorAssetUniqueID AS AnimatorId,
                             mg.AvatarAssetUniqueID AS AvatarId,
-                            COALESCE(rep.MeshAssetUniqueID, '') AS MeshId,
+                            COALESCE(
+                                (SELECT mgm.MeshAssetUniqueID
+                                 FROM ModelGroupMeshes mgm
+                                 WHERE mgm.ProjectId = @projectId
+                                   AND mgm.GroupAssetUniqueID = mg.GroupAssetUniqueID
+                                   AND mgm.MeshAssetUniqueID <> ''
+                                 ORDER BY mgm.SlotIndex ASC, mgm.MeshAssetUniqueID ASC
+                                 LIMIT 1),
+                                ''
+                            ) AS MeshId,
                             mg.GroupAssetUniqueID AS GroupId,
-                            cc.Kind AS RelationKind,
-                            cc.BaseScore + COALESCE(mg.Confidence, 0) + 150 - MIN(MAX(cc.SlotIndex, 0), 100) AS Score
+                            'AnimatorController' AS RelationKind,
+                            10000 + COALESCE(mg.Confidence, 0) + 150 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
                         FROM ModelGroups mg
-                        INNER JOIN ControllerClips cc
-                          ON cc.ControllerId = mg.ControllerAssetUniqueID
-                        LEFT JOIN GroupRepresentativeMesh rep
-                          ON rep.GroupAssetUniqueID = mg.GroupAssetUniqueID
-                         AND rep.RepRank = 1
+                        INNER JOIN AssetEdges clipEdge
+                          ON clipEdge.ProjectId = @projectId
+                         AND clipEdge.EdgeKind = 'AnimationClip'
+                         AND clipEdge.SourceAssetUniqueID = mg.ControllerAssetUniqueID
+                         AND clipEdge.TargetAssetUniqueID <> ''
                         WHERE mg.ProjectId = @projectId
                           AND mg.ControllerAssetUniqueID <> ''
 
                         UNION ALL
 
-                        -- (c) Animator / Avatar / Controller source directly holding AnimationClip edge + Avatar/Mesh edges
+                        -- (b2) ModelGroups linked via AnimatorOverrideController -> base AnimatorController -> AnimationClip edges
+                        SELECT
+                            clipEdge.TargetAssetUniqueID AS ClipId,
+                            mg.AnimatorAssetUniqueID AS AnimatorId,
+                            mg.AvatarAssetUniqueID AS AvatarId,
+                            COALESCE(
+                                (SELECT mgm.MeshAssetUniqueID
+                                 FROM ModelGroupMeshes mgm
+                                 WHERE mgm.ProjectId = @projectId
+                                   AND mgm.GroupAssetUniqueID = mg.GroupAssetUniqueID
+                                   AND mgm.MeshAssetUniqueID <> ''
+                                 ORDER BY mgm.SlotIndex ASC, mgm.MeshAssetUniqueID ASC
+                                 LIMIT 1),
+                                ''
+                            ) AS MeshId,
+                            mg.GroupAssetUniqueID AS GroupId,
+                            'AnimatorOverrideController' AS RelationKind,
+                            9800 + COALESCE(mg.Confidence, 0) + 150 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
+                        FROM ModelGroups mg
+                        INNER JOIN AssetEdges ctrlEdge
+                          ON ctrlEdge.ProjectId = @projectId
+                         AND ctrlEdge.EdgeKind = 'AnimatorController'
+                         AND ctrlEdge.SourceAssetUniqueID = mg.ControllerAssetUniqueID
+                         AND ctrlEdge.SlotName = 'm_Controller'
+                         AND ctrlEdge.TargetAssetUniqueID <> ''
+                        INNER JOIN AssetEdges clipEdge
+                          ON clipEdge.ProjectId = @projectId
+                         AND clipEdge.EdgeKind = 'AnimationClip'
+                         AND clipEdge.SourceAssetUniqueID = ctrlEdge.TargetAssetUniqueID
+                         AND clipEdge.TargetAssetUniqueID <> ''
+                        WHERE mg.ProjectId = @projectId
+                          AND mg.ControllerAssetUniqueID <> ''
+
+                        UNION ALL
+
+                        -- (c1) Animator / Avatar / Animation source directly holding AnimationClip edge + Avatar/Mesh edges
                         SELECT
                             clipEdge.TargetAssetUniqueID AS ClipId,
                             CASE WHEN srcAsset.Type IN (@animatorType, @animationType) THEN clipEdge.SourceAssetUniqueID ELSE '' END AS AnimatorId,
                             COALESCE(
-                                avatarEdge.TargetAssetUniqueID,
+                                (SELECT ae.TargetAssetUniqueID
+                                 FROM AssetEdges ae
+                                 WHERE ae.ProjectId = @projectId
+                                   AND ae.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
+                                   AND ae.EdgeKind = 'Avatar'
+                                   AND ae.TargetAssetUniqueID <> ''
+                                 ORDER BY ae.SlotName ASC, ae.SlotIndex ASC
+                                 LIMIT 1),
                                 CASE WHEN srcAsset.Type = @avatarType THEN clipEdge.SourceAssetUniqueID ELSE '' END,
                                 ''
                             ) AS AvatarId,
-                            COALESCE(meshEdge.TargetAssetUniqueID, avatarMeshEdge.TargetAssetUniqueID, '') AS MeshId,
-                            COALESCE(mg.GroupAssetUniqueID, '') AS GroupId,
+                            COALESCE(
+                                (SELECT me.TargetAssetUniqueID
+                                 FROM AssetEdges me
+                                 WHERE me.ProjectId = @projectId
+                                   AND me.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
+                                   AND me.EdgeKind = 'Mesh'
+                                   AND me.TargetAssetUniqueID <> ''
+                                 ORDER BY me.SlotName ASC, me.SlotIndex ASC
+                                 LIMIT 1),
+                                ''
+                            ) AS MeshId,
+                            COALESCE(
+                                (SELECT mgAnim.GroupAssetUniqueID
+                                 FROM ModelGroups mgAnim
+                                 WHERE mgAnim.ProjectId = @projectId
+                                   AND mgAnim.AnimatorAssetUniqueID = clipEdge.SourceAssetUniqueID
+                                 LIMIT 1),
+                                ''
+                            ) AS GroupId,
                             CASE
                                 WHEN clipEdge.SlotName = 'LegacyAnimationClip' THEN 'LegacyAnimation'
                                 ELSE 'AnimatorController'
                             END AS RelationKind,
-                            9600 + COALESCE(mg.Confidence, 0) - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
+                            9600 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
                         FROM AssetEdges clipEdge
                         LEFT JOIN Assets srcAsset
                           ON srcAsset.ProjectId = clipEdge.ProjectId
                          AND srcAsset.UniqueID = clipEdge.SourceAssetUniqueID
-                        LEFT JOIN AssetEdges avatarEdge
-                          ON avatarEdge.ProjectId = clipEdge.ProjectId
-                         AND avatarEdge.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
-                         AND avatarEdge.EdgeKind = 'Avatar'
-                         AND avatarEdge.TargetAssetUniqueID <> ''
-                        LEFT JOIN AssetEdges meshEdge
-                          ON meshEdge.ProjectId = clipEdge.ProjectId
-                         AND meshEdge.SourceAssetUniqueID = clipEdge.SourceAssetUniqueID
-                         AND meshEdge.EdgeKind = 'Mesh'
-                         AND meshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
-                         AND meshEdge.TargetAssetUniqueID <> ''
-                        LEFT JOIN AssetEdges avatarMeshEdge
-                          ON avatarMeshEdge.ProjectId = clipEdge.ProjectId
-                         AND avatarMeshEdge.SourceAssetUniqueID = COALESCE(
-                                avatarEdge.TargetAssetUniqueID,
-                                CASE WHEN srcAsset.Type = @avatarType THEN clipEdge.SourceAssetUniqueID ELSE '' END)
-                         AND avatarMeshEdge.EdgeKind = 'Mesh'
-                         AND avatarMeshEdge.SlotName IN ('AnimatorMesh', 'AvatarMesh')
-                         AND avatarMeshEdge.TargetAssetUniqueID <> ''
-                        LEFT JOIN ModelGroups mg
-                          ON mg.ProjectId = clipEdge.ProjectId
-                         AND (
-                             (mg.AnimatorAssetUniqueID <> '' AND mg.AnimatorAssetUniqueID = clipEdge.SourceAssetUniqueID)
-                             OR (mg.AvatarAssetUniqueID <> '' AND mg.AvatarAssetUniqueID = COALESCE(
-                                    avatarEdge.TargetAssetUniqueID,
-                                    CASE WHEN srcAsset.Type = @avatarType THEN clipEdge.SourceAssetUniqueID ELSE '' END))
-                         )
                         WHERE clipEdge.ProjectId = @projectId
                           AND clipEdge.EdgeKind = 'AnimationClip'
                           AND clipEdge.TargetAssetUniqueID <> ''
-                          AND (
-                              COALESCE(avatarEdge.TargetAssetUniqueID, '') <> ''
-                              OR COALESCE(meshEdge.TargetAssetUniqueID, '') <> ''
-                              OR COALESCE(avatarMeshEdge.TargetAssetUniqueID, '') <> ''
-                              OR COALESCE(mg.GroupAssetUniqueID, '') <> ''
-                              OR srcAsset.Type IN (@animatorType, @avatarType, @animationType)
-                          )
+                          AND srcAsset.Type IN (@animatorType, @avatarType, @animationType)
+
+                        UNION ALL
+
+                        -- (c2) Animator -> AnimatorController edge -> AnimationClip edge
+                        SELECT
+                            clipEdge.TargetAssetUniqueID AS ClipId,
+                            ctrlEdge.SourceAssetUniqueID AS AnimatorId,
+                            COALESCE(
+                                (SELECT ae.TargetAssetUniqueID
+                                 FROM AssetEdges ae
+                                 WHERE ae.ProjectId = @projectId
+                                   AND ae.SourceAssetUniqueID = ctrlEdge.SourceAssetUniqueID
+                                   AND ae.EdgeKind = 'Avatar'
+                                   AND ae.TargetAssetUniqueID <> ''
+                                 ORDER BY ae.SlotName ASC, ae.SlotIndex ASC
+                                 LIMIT 1),
+                                (SELECT mgAnim.AvatarAssetUniqueID
+                                 FROM ModelGroups mgAnim
+                                 WHERE mgAnim.ProjectId = @projectId
+                                   AND mgAnim.AnimatorAssetUniqueID = ctrlEdge.SourceAssetUniqueID
+                                 LIMIT 1),
+                                ''
+                            ) AS AvatarId,
+                            COALESCE(
+                                (SELECT me.TargetAssetUniqueID
+                                 FROM AssetEdges me
+                                 WHERE me.ProjectId = @projectId
+                                   AND me.SourceAssetUniqueID = ctrlEdge.SourceAssetUniqueID
+                                   AND me.EdgeKind = 'Mesh'
+                                   AND me.TargetAssetUniqueID <> ''
+                                 ORDER BY me.SlotName ASC, me.SlotIndex ASC
+                                 LIMIT 1),
+                                ''
+                            ) AS MeshId,
+                            COALESCE(
+                                (SELECT mgAnim.GroupAssetUniqueID
+                                 FROM ModelGroups mgAnim
+                                 WHERE mgAnim.ProjectId = @projectId
+                                   AND mgAnim.AnimatorAssetUniqueID = ctrlEdge.SourceAssetUniqueID
+                                 LIMIT 1),
+                                ''
+                            ) AS GroupId,
+                            'AnimatorController' AS RelationKind,
+                            10000 - MIN(MAX(clipEdge.SlotIndex, 0), 100) AS Score
+                        FROM AssetEdges ctrlEdge
+                        INNER JOIN AssetEdges clipEdge
+                          ON clipEdge.ProjectId = @projectId
+                         AND clipEdge.EdgeKind = 'AnimationClip'
+                         AND clipEdge.SourceAssetUniqueID = ctrlEdge.TargetAssetUniqueID
+                         AND clipEdge.TargetAssetUniqueID <> ''
+                        WHERE ctrlEdge.ProjectId = @projectId
+                          AND ctrlEdge.EdgeKind = 'AnimatorController'
+                          AND ctrlEdge.SlotName = 'm_Controller'
+                          AND ctrlEdge.SourceAssetUniqueID <> ''
+                          AND ctrlEdge.TargetAssetUniqueID <> ''
                     )
                     INSERT INTO AnimationClipTargets (
                         ProjectId, ClipAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID,
@@ -2055,16 +2714,7 @@ namespace AssetStudio.Avalonia
                         0
                     FROM DirectEdges d
                     WHERE d.ClipId <> ''
-                      AND (d.AvatarId <> '' OR d.MeshId <> '' OR d.GroupId <> '' OR d.AnimatorId <> '')
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM AnimationClipTargets existing
-                          WHERE existing.ProjectId = @projectId
-                            AND existing.ClipAssetUniqueID = d.ClipId
-                            AND existing.RelationKind = d.RelationKind
-                            AND (existing.MeshAssetUniqueID = d.MeshId OR d.MeshId = '')
-                            AND existing.MatchScore >= d.Score - 1000
-                      )
+                      AND (d.AvatarId <> '' OR d.MeshId <> '' OR d.GroupId <> '')
                     GROUP BY d.ClipId, d.AvatarId, d.MeshId, d.GroupId, d.AnimatorId, d.RelationKind
                     ON CONFLICT(ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
                     DO UPDATE SET
@@ -2075,6 +2725,7 @@ namespace AssetStudio.Avalonia
                 edgeSynthCmd.Parameters.AddWithValue("@animationType", (int)ClassIDType.Animation);
                 edgeSynthCmd.ExecuteNonQuery();
             }
+            advanceProgress?.Invoke("Synthesized cross-bundle animation targets");
 
             // 3. Cross-bundle structural bone-hash matching (Stage_ClipBoneHashes ⋈ Stage_RigBoneHashes)
             long clipBoneRowCount;
@@ -2330,9 +2981,648 @@ namespace AssetStudio.Avalonia
                     compatEdgeCmd.Parameters.AddWithValue("@projectId", projectId);
                     compatEdgeCmd.ExecuteNonQuery();
                 }
+
+                advanceProgress?.Invoke("Matched cross-bundle rig bone hashes");
+            }
+            else
+            {
+                advanceProgress?.Invoke("Skipped bone-hash matching (no staged hashes)");
             }
 
             advanceProgress?.Invoke("Promoted animation clip targets");
+        }
+
+        // --- Non-blocking Lazy Semantic Backfill & Background Writer ---
+
+        internal void EnqueueLazySemanticUpsert(string folderPath, string signature, SemanticAssetRelations? delta)
+        {
+            if (Volatile.Read(ref _disposed) != 0
+                || delta == null
+                || !delta.HasRelations
+                || string.IsNullOrWhiteSpace(folderPath)
+                || string.IsNullOrWhiteSpace(signature))
+            {
+                return;
+            }
+
+            var key = $"{NormalizeProjectPathForCache(folderPath)}\u001f{signature}";
+            lock (_bgWriteLock)
+            {
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    return;
+                }
+
+                if (_pendingLazySemanticWritesByKey.TryGetValue(key, out var existing))
+                {
+                    existing.Delta.Merge(delta);
+                }
+                else
+                {
+                    while (_pendingLazySemanticWrites.Count >= MaxPendingLazySemanticWrites)
+                    {
+                        var dropped = _pendingLazySemanticWrites.Dequeue();
+                        _pendingLazySemanticWritesByKey.Remove(dropped.Key);
+                    }
+
+                    var merged = new SemanticAssetRelations();
+                    merged.Merge(delta);
+                    var entry = new PendingLazySemanticWrite(key, folderPath, signature, merged);
+                    _pendingLazySemanticWrites.Enqueue(entry);
+                    _pendingLazySemanticWritesByKey[key] = entry;
+                }
+
+                EnsureBackgroundWriterRunningLocked();
+            }
+        }
+
+        internal bool TryUpsertMaterialAndMeshCache(
+            string folderPath,
+            string signature,
+            SemanticAssetRelations? delta,
+            bool waitForLock = true)
+        {
+            if (delta == null
+                || !delta.HasRelations
+                || string.IsNullOrWhiteSpace(folderPath)
+                || string.IsNullOrWhiteSpace(signature))
+            {
+                return false;
+            }
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            var lockTaken = false;
+            try
+            {
+                if (waitForLock)
+                {
+                    Monitor.Enter(WriteGate, ref lockTaken);
+                }
+                else
+                {
+                    Monitor.TryEnter(WriteGate, TimeSpan.Zero, ref lockTaken);
+                    if (!lockTaken)
+                    {
+                        return false;
+                    }
+                }
+
+                using var conn = CreateConnectionByDbPath(dbPath);
+                using var transaction = conn.BeginTransaction();
+                var projectId = FindProjectId(conn, transaction, folderPath, signature);
+                if (projectId == null)
+                {
+                    return true;
+                }
+
+                var pid = projectId.Value;
+                if (delta.SourceFiles.Count > 0)
+                {
+                    InsertSemanticSourceFiles(conn, transaction, pid, delta.SourceFiles);
+                }
+
+                if (delta.AssetEdges.Count > 0)
+                {
+                    InsertAssetEdges(conn, transaction, pid, delta.AssetEdges, 0, delta.AssetEdges.Count, new Dictionary<string, long>(StringComparer.Ordinal));
+                }
+
+                if (delta.MeshRenderers.Count > 0)
+                {
+                    InsertMeshRenderers(conn, transaction, pid, delta.MeshRenderers, 0, delta.MeshRenderers.Count);
+                }
+
+                if (delta.MeshMaterials.Count > 0)
+                {
+                    InsertMeshMaterials(conn, transaction, pid, delta.MeshMaterials, 0, delta.MeshMaterials.Count);
+                }
+
+                if (delta.MaterialTextures.Count > 0)
+                {
+                    InsertMaterialTextures(conn, transaction, pid, delta.MaterialTextures, 0, delta.MaterialTextures.Count);
+                }
+
+                if (delta.MaterialCaches.Count > 0)
+                {
+                    InsertMaterialCaches(conn, transaction, pid, delta.MaterialCaches, 0, delta.MaterialCaches.Count);
+                }
+
+                if (delta.CompositeAssets.Count > 0)
+                {
+                    InsertCompositeAssets(conn, transaction, pid, delta.CompositeAssets, 0, delta.CompositeAssets.Count);
+                }
+
+                if (delta.CompositeAssetParts.Count > 0)
+                {
+                    InsertCompositeAssetParts(conn, transaction, pid, delta.CompositeAssetParts, 0, delta.CompositeAssetParts.Count);
+                }
+
+                if (delta.AnimationClipTargets.Count > 0)
+                {
+                    UpsertDirectAnimationClipTargets(conn, transaction, pid, delta.AnimationClipTargets);
+                }
+
+                // Refresh MeshMaterialResolvedCache ONLY for affected meshes and propagate newly resolved MaterialCache
+                // entries into any already-cached meshes via idx_mesh_mat_resolved_material (O(1) indexed update!).
+                var affectedMeshIds = new HashSet<string>(StringComparer.Ordinal);
+                for (var i = 0; i < delta.MeshMaterials.Count; i++)
+                {
+                    var mid = delta.MeshMaterials[i].MeshAssetId;
+                    if (!string.IsNullOrEmpty(mid))
+                    {
+                        affectedMeshIds.Add(mid);
+                    }
+                }
+
+                var affectedMaterialIds = new HashSet<string>(StringComparer.Ordinal);
+                for (var i = 0; i < delta.MaterialCaches.Count; i++)
+                {
+                    var matId = delta.MaterialCaches[i].MaterialAssetId;
+                    if (!string.IsNullOrEmpty(matId))
+                    {
+                        affectedMaterialIds.Add(matId);
+                    }
+                }
+                for (var i = 0; i < delta.MaterialTextures.Count; i++)
+                {
+                    var matId = delta.MaterialTextures[i].MaterialAssetId;
+                    if (!string.IsNullOrEmpty(matId))
+                    {
+                        affectedMaterialIds.Add(matId);
+                    }
+                }
+
+                if (affectedMaterialIds.Count > 0)
+                {
+                    RefreshMaterialCacheFromTexturesForMaterials(conn, transaction, pid, affectedMaterialIds);
+                    PropagateMaterialCacheToResolvedMeshes(conn, transaction, pid, affectedMaterialIds);
+                }
+
+                if (affectedMeshIds.Count > 0)
+                {
+                    RefreshResolvedMeshMaterialCacheForMeshes(conn, transaction, pid, affectedMeshIds);
+                }
+
+                transaction.Commit();
+                NotifyDatabaseMutated(dbPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to lazily upsert semantic cache entries: {ex.Message}");
+                return true;
+            }
+            finally
+            {
+                if (lockTaken)
+                {
+                    Monitor.Exit(WriteGate);
+                }
+            }
+        }
+
+        private static void UpsertDirectAnimationClipTargets(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyList<SemanticAnimationClipTargetRelation> targets)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                INSERT INTO AnimationClipTargets (
+                    ProjectId, ClipAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID,
+                    MeshAssetUniqueID, ModelGroupId, RelationKind, MatchScore, MatchedBoneCount, TotalClipBoneCount)
+                VALUES (
+                    @projectId, @clipId, @animatorId, @avatarId,
+                    @meshId, @groupId, @relationKind, @matchScore, @matchedBones, @totalClipBones)
+                ON CONFLICT(ProjectId, ClipAssetUniqueID, AvatarAssetUniqueID, MeshAssetUniqueID, ModelGroupId, AnimatorAssetUniqueID, RelationKind)
+                DO UPDATE SET
+                    MatchScore = MAX(AnimationClipTargets.MatchScore, excluded.MatchScore),
+                    MatchedBoneCount = MAX(AnimationClipTargets.MatchedBoneCount, excluded.MatchedBoneCount),
+                    TotalClipBoneCount = MAX(AnimationClipTargets.TotalClipBoneCount, excluded.TotalClipBoneCount);";
+
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pClipId = cmd.Parameters.Add("@clipId", SqliteType.Text);
+            var pAnimatorId = cmd.Parameters.Add("@animatorId", SqliteType.Text);
+            var pAvatarId = cmd.Parameters.Add("@avatarId", SqliteType.Text);
+            var pMeshId = cmd.Parameters.Add("@meshId", SqliteType.Text);
+            var pGroupId = cmd.Parameters.Add("@groupId", SqliteType.Text);
+            var pRelationKind = cmd.Parameters.Add("@relationKind", SqliteType.Text);
+            var pMatchScore = cmd.Parameters.Add("@matchScore", SqliteType.Integer);
+            var pMatchedBones = cmd.Parameters.Add("@matchedBones", SqliteType.Integer);
+            var pTotalClipBones = cmd.Parameters.Add("@totalClipBones", SqliteType.Integer);
+
+            pProjectId.Value = projectId;
+            for (var i = 0; i < targets.Count; i++)
+            {
+                var target = targets[i];
+                if (string.IsNullOrEmpty(target.ClipAssetId)
+                    || (string.IsNullOrEmpty(target.AvatarAssetId)
+                        && string.IsNullOrEmpty(target.MeshAssetId)
+                        && string.IsNullOrEmpty(target.ModelGroupId)))
+                {
+                    continue;
+                }
+
+                pClipId.Value = target.ClipAssetId;
+                pAnimatorId.Value = target.AnimatorAssetId;
+                pAvatarId.Value = target.AvatarAssetId;
+                pMeshId.Value = target.MeshAssetId;
+                pGroupId.Value = target.ModelGroupId;
+                pRelationKind.Value = target.RelationKind;
+                pMatchScore.Value = target.MatchScore;
+                pMatchedBones.Value = target.MatchedBoneCount;
+                pTotalClipBones.Value = target.TotalClipBoneCount;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void RefreshMaterialCacheFromTexturesForMaterials(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IEnumerable<string> materialIds)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                WITH RankedMainTex AS (
+                    SELECT
+                        mt.TextureAssetUniqueID,
+                        mt.SlotName,
+                        mt.PreviewMaterialAssetUniqueID,
+                        mt.ResolutionSource,
+                        ROW_NUMBER() OVER (
+                            ORDER BY
+                                mt.IsMainTexture DESC,
+                                CASE mt.SlotName
+                                    WHEN '_BaseMap' THEN 0
+                                    WHEN '_MainTex' THEN 1
+                                    WHEN 'texture' THEN 2
+                                    WHEN 'Texture' THEN 3
+                                    WHEN '_Texture' THEN 4
+                                    WHEN '_BaseColorMap' THEN 5
+                                    WHEN '_BaseColorTexture' THEN 6
+                                    WHEN '_Diffuse' THEN 7
+                                    WHEN '_AlbedoMap' THEN 8
+                                    WHEN '_Albedo' THEN 9
+                                    ELSE 20
+                                END,
+                                mt.SlotIndex ASC,
+                                mt.TextureAssetUniqueID ASC
+                        ) AS RowNum
+                    FROM MaterialTextures mt
+                    WHERE mt.ProjectId = @projectId
+                      AND mt.MaterialAssetUniqueID = @materialId
+                      AND mt.TextureAssetUniqueID <> ''
+                )
+                INSERT INTO MaterialCache (
+                    ProjectId, MaterialAssetUniqueID, MaterialName, ParentMaterialAssetUniqueID,
+                    MainTextureAssetUniqueID, MainTextureSlotName,
+                    BaseColorR, BaseColorG, BaseColorB, BaseColorA,
+                    ShaderName, TextureSlotCount, ResolutionSource)
+                SELECT
+                    @projectId,
+                    @materialId,
+                    COALESCE((SELECT Name FROM Assets WHERE ProjectId = @projectId AND UniqueID = @materialId LIMIT 1), ''),
+                    CASE WHEN COALESCE(rmt.PreviewMaterialAssetUniqueID, '') <> '' AND rmt.PreviewMaterialAssetUniqueID <> @materialId
+                         THEN rmt.PreviewMaterialAssetUniqueID ELSE '' END,
+                    COALESCE(rmt.TextureAssetUniqueID, ''),
+                    COALESCE(rmt.SlotName, ''),
+                    1.0, 1.0, 1.0, 1.0,
+                    '',
+                    (SELECT COUNT(*) FROM MaterialTextures WHERE ProjectId = @projectId AND MaterialAssetUniqueID = @materialId),
+                    COALESCE(NULLIF(rmt.ResolutionSource, ''), 'lazy_backfill')
+                FROM RankedMainTex rmt
+                WHERE rmt.RowNum = 1
+                ON CONFLICT(ProjectId, MaterialAssetUniqueID)
+                DO UPDATE SET
+                    MaterialName = CASE WHEN MaterialCache.MaterialName = '' THEN excluded.MaterialName ELSE MaterialCache.MaterialName END,
+                    ParentMaterialAssetUniqueID = CASE WHEN MaterialCache.ParentMaterialAssetUniqueID = '' THEN excluded.ParentMaterialAssetUniqueID ELSE MaterialCache.ParentMaterialAssetUniqueID END,
+                    MainTextureAssetUniqueID = CASE WHEN excluded.MainTextureAssetUniqueID <> '' THEN excluded.MainTextureAssetUniqueID ELSE MaterialCache.MainTextureAssetUniqueID END,
+                    MainTextureSlotName = CASE WHEN excluded.MainTextureSlotName <> '' THEN excluded.MainTextureSlotName ELSE MaterialCache.MainTextureSlotName END,
+                    TextureSlotCount = MAX(MaterialCache.TextureSlotCount, excluded.TextureSlotCount);";
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pMaterialId = cmd.Parameters.Add("@materialId", SqliteType.Text);
+            pProjectId.Value = projectId;
+
+            foreach (var materialId in materialIds)
+            {
+                pMaterialId.Value = materialId;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void PropagateMaterialCacheToResolvedMeshes(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IEnumerable<string> materialIds)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                UPDATE MeshMaterialResolvedCache
+                SET
+                    MaterialName = COALESCE(NULLIF((SELECT mc.MaterialName FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), ''), MaterialName),
+                    MainTextureAssetUniqueID = COALESCE(NULLIF((SELECT mc.MainTextureAssetUniqueID FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), ''), MainTextureAssetUniqueID),
+                    MainTextureSlotName = COALESCE(NULLIF((SELECT mc.MainTextureSlotName FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), ''), MainTextureSlotName),
+                    BaseColorR = COALESCE((SELECT mc.BaseColorR FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), BaseColorR),
+                    BaseColorG = COALESCE((SELECT mc.BaseColorG FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), BaseColorG),
+                    BaseColorB = COALESCE((SELECT mc.BaseColorB FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), BaseColorB),
+                    BaseColorA = COALESCE((SELECT mc.BaseColorA FROM MaterialCache mc WHERE mc.ProjectId = @projectId AND mc.MaterialAssetUniqueID = @materialId LIMIT 1), BaseColorA)
+                WHERE ProjectId = @projectId
+                  AND MaterialAssetUniqueID = @materialId;";
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pMaterialId = cmd.Parameters.Add("@materialId", SqliteType.Text);
+            pProjectId.Value = projectId;
+
+            foreach (var materialId in materialIds)
+            {
+                pMaterialId.Value = materialId;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void RefreshResolvedMeshMaterialCacheForMeshes(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IEnumerable<string> meshIds)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                WITH MeshSource AS (
+                    SELECT SourceFileId
+                    FROM Assets
+                    WHERE ProjectId = @projectId
+                      AND UniqueID = @meshAssetId
+                    LIMIT 1
+                ),
+                CandidateMaterials AS (
+                    SELECT DISTINCT MaterialAssetUniqueID
+                    FROM MeshMaterials
+                    WHERE ProjectId = @projectId
+                      AND MeshAssetUniqueID = @meshAssetId
+                      AND MaterialAssetUniqueID <> ''
+                ),
+                MaterialStats AS (
+                    SELECT
+                        c.MaterialAssetUniqueID,
+                        MAX(CASE WHEN (mt.TextureAssetUniqueID <> '' AND mt.IsMainTexture <> 0) OR COALESCE(mc.MainTextureAssetUniqueID, '') <> '' THEN 1 ELSE 0 END) AS HasMainTexture,
+                        MAX(CASE WHEN mt.TextureAssetUniqueID <> '' OR COALESCE(mc.MainTextureAssetUniqueID, '') <> '' THEN 1 ELSE 0 END) AS HasTexture
+                    FROM CandidateMaterials c
+                    LEFT JOIN MaterialTextures mt
+                      ON mt.ProjectId = @projectId
+                     AND mt.MaterialAssetUniqueID = c.MaterialAssetUniqueID
+                    LEFT JOIN MaterialCache mc
+                      ON mc.ProjectId = @projectId
+                     AND mc.MaterialAssetUniqueID = c.MaterialAssetUniqueID
+                    GROUP BY c.MaterialAssetUniqueID
+                ),
+                RendererStats AS (
+                    SELECT
+                        mm.RendererAssetUniqueID,
+                        MAX(CASE WHEN mm.RendererType <> 'Container' THEN 1 ELSE 0 END) AS RendererScore,
+                        SUM(CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) AS MaterialCount,
+                        COUNT(*) AS RelationCount,
+                        MAX(mm.MaterialScore) AS MaterialScore,
+                        MAX(CASE WHEN materialAsset.SourceFileId IS NOT NULL AND materialAsset.SourceFileId = (SELECT SourceFileId FROM MeshSource) THEN 1 ELSE 0 END) AS SameSourceScore,
+                        SUM(COALESCE(ms.HasMainTexture, 0)) AS MainTextureCount,
+                        SUM(COALESCE(ms.HasTexture, 0)) AS TextureCount
+                    FROM MeshMaterials mm
+                    LEFT JOIN Assets materialAsset
+                      ON materialAsset.ProjectId = mm.ProjectId
+                     AND materialAsset.UniqueID = mm.MaterialAssetUniqueID
+                    LEFT JOIN MaterialStats ms
+                      ON ms.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                    WHERE mm.ProjectId = @projectId
+                      AND mm.MeshAssetUniqueID = @meshAssetId
+                    GROUP BY mm.RendererAssetUniqueID
+                ),
+                Ranked AS (
+                    SELECT
+                        mm.MeshAssetUniqueID,
+                        mm.SubMeshIndex,
+                        mm.MaterialAssetUniqueID,
+                        mm.RendererAssetUniqueID,
+                        mm.RendererType,
+                        COALESCE(NULLIF(mc.MaterialName, ''), matAsset.Name, '') AS MaterialName,
+                        COALESCE(mc.MainTextureAssetUniqueID, '') AS MainTextureAssetUniqueID,
+                        COALESCE(mc.MainTextureSlotName, '') AS MainTextureSlotName,
+                        COALESCE(mc.BaseColorR, 1.0) AS BaseColorR,
+                        COALESCE(mc.BaseColorG, 1.0) AS BaseColorG,
+                        COALESCE(mc.BaseColorB, 1.0) AS BaseColorB,
+                        COALESCE(mc.BaseColorA, 1.0) AS BaseColorA,
+                        COALESCE(NULLIF(mc.ResolutionSource, ''), 'lazy_backfill') AS ResolutionSource,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mm.SubMeshIndex
+                            ORDER BY
+                                CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                CASE WHEN COALESCE(ms.HasMainTexture, 0) <> 0 THEN 0 ELSE 1 END,
+                                CASE WHEN COALESCE(ms.HasTexture, 0) <> 0 THEN 0 ELSE 1 END,
+                                COALESCE(rs.RendererScore, 0) DESC,
+                                COALESCE(rs.SameSourceScore, 0) DESC,
+                                COALESCE(rs.MainTextureCount, 0) DESC,
+                                COALESCE(rs.TextureCount, 0) DESC,
+                                mm.MaterialScore DESC,
+                                COALESCE(rs.MaterialCount, 0) DESC,
+                                COALESCE(rs.RelationCount, 0) DESC,
+                                mm.MaterialSlotIndex,
+                                mm.RendererAssetUniqueID,
+                                mm.MaterialAssetUniqueID
+                        ) AS RowNum
+                    FROM MeshMaterials mm
+                    LEFT JOIN RendererStats rs
+                      ON rs.RendererAssetUniqueID = mm.RendererAssetUniqueID
+                    LEFT JOIN MaterialStats ms
+                      ON ms.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                    LEFT JOIN MaterialCache mc
+                      ON mc.ProjectId = mm.ProjectId
+                     AND mc.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                    LEFT JOIN Assets matAsset
+                      ON matAsset.ProjectId = mm.ProjectId
+                     AND mm.MaterialAssetUniqueID <> ''
+                     AND matAsset.UniqueID = mm.MaterialAssetUniqueID
+                    WHERE mm.ProjectId = @projectId
+                      AND mm.MeshAssetUniqueID = @meshAssetId
+                )
+                INSERT INTO MeshMaterialResolvedCache (
+                    ProjectId, MeshAssetUniqueID, SubMeshIndex, MaterialAssetUniqueID,
+                    RendererAssetUniqueID, RendererType, MaterialName,
+                    MainTextureAssetUniqueID, MainTextureSlotName,
+                    BaseColorR, BaseColorG, BaseColorB, BaseColorA, ResolutionSource)
+                SELECT
+                    @projectId,
+                    r.MeshAssetUniqueID,
+                    r.SubMeshIndex,
+                    r.MaterialAssetUniqueID,
+                    r.RendererAssetUniqueID,
+                    r.RendererType,
+                    r.MaterialName,
+                    r.MainTextureAssetUniqueID,
+                    r.MainTextureSlotName,
+                    r.BaseColorR,
+                    r.BaseColorG,
+                    r.BaseColorB,
+                    r.BaseColorA,
+                    r.ResolutionSource
+                FROM Ranked r
+                WHERE r.RowNum = 1
+                ON CONFLICT(ProjectId, MeshAssetUniqueID, SubMeshIndex)
+                DO UPDATE SET
+                    MaterialAssetUniqueID = excluded.MaterialAssetUniqueID,
+                    RendererAssetUniqueID = excluded.RendererAssetUniqueID,
+                    RendererType = excluded.RendererType,
+                    MaterialName = excluded.MaterialName,
+                    MainTextureAssetUniqueID = excluded.MainTextureAssetUniqueID,
+                    MainTextureSlotName = excluded.MainTextureSlotName,
+                    BaseColorR = excluded.BaseColorR,
+                    BaseColorG = excluded.BaseColorG,
+                    BaseColorB = excluded.BaseColorB,
+                    BaseColorA = excluded.BaseColorA,
+                    ResolutionSource = excluded.ResolutionSource;";
+            var pProjectId = cmd.Parameters.Add("@projectId", SqliteType.Integer);
+            var pMeshAssetId = cmd.Parameters.Add("@meshAssetId", SqliteType.Text);
+            pProjectId.Value = projectId;
+
+            foreach (var meshId in meshIds)
+            {
+                pMeshAssetId.Value = meshId;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private void EnsureBackgroundWriterRunningLocked()
+        {
+            if (_bgWriterActive || Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            _bgWriterActive = true;
+            _bgWriterIdleEvent.Reset();
+            _ = Task.Run(DrainBackgroundWritesLoopAsync);
+        }
+
+        private async Task DrainBackgroundWritesLoopAsync()
+        {
+            var busyRetries = 0;
+            const int maxBusyRetries = 40;
+            try
+            {
+                while (Volatile.Read(ref _disposed) == 0)
+                {
+                    PendingLazySemanticWrite? semanticWork = null;
+                    PendingPreviewCacheWrite? previewWork = null;
+
+                    lock (_bgWriteLock)
+                    {
+                        if (_pendingLazySemanticWrites.Count > 0)
+                        {
+                            var head = _pendingLazySemanticWrites.Dequeue();
+                            if (_pendingLazySemanticWritesByKey.Remove(head.Key, out var latest))
+                            {
+                                semanticWork = latest;
+                            }
+                        }
+                        else if (_pendingPreviewCacheWrites.Count > 0)
+                        {
+                            var head = _pendingPreviewCacheWrites.Dequeue();
+                            if (_pendingPreviewCacheWritesByKey.Remove(head.Key, out var latest))
+                            {
+                                previewWork = latest;
+                            }
+                        }
+                        else
+                        {
+                            _bgWriterActive = false;
+                            _bgWriterIdleEvent.Set();
+                            return;
+                        }
+                    }
+
+                    if (semanticWork != null)
+                    {
+                        var completed = TryUpsertMaterialAndMeshCache(
+                            semanticWork.FolderPath,
+                            semanticWork.Signature,
+                            semanticWork.Delta,
+                            waitForLock: false);
+                        if (!completed)
+                        {
+                            busyRetries++;
+                            if (busyRetries < maxBusyRetries && Volatile.Read(ref _disposed) == 0)
+                            {
+                                lock (_bgWriteLock)
+                                {
+                                    if (!_pendingLazySemanticWritesByKey.TryGetValue(semanticWork.Key, out var newer))
+                                    {
+                                        _pendingLazySemanticWrites.Enqueue(semanticWork);
+                                        _pendingLazySemanticWritesByKey[semanticWork.Key] = semanticWork;
+                                    }
+                                    else
+                                    {
+                                        var combined = new SemanticAssetRelations();
+                                        combined.Merge(semanticWork.Delta);
+                                        combined.Merge(newer.Delta);
+                                        _pendingLazySemanticWritesByKey[semanticWork.Key] =
+                                            new PendingLazySemanticWrite(semanticWork.Key, semanticWork.FolderPath, semanticWork.Signature, combined);
+                                    }
+                                }
+
+                                await Task.Delay(50).ConfigureAwait(false);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            busyRetries = 0;
+                        }
+                    }
+                    else if (previewWork != null)
+                    {
+                        var completed = TrySavePreviewCachePayloadNonBlocking(previewWork);
+                        if (!completed)
+                        {
+                            busyRetries++;
+                            if (busyRetries < maxBusyRetries && Volatile.Read(ref _disposed) == 0)
+                            {
+                                lock (_bgWriteLock)
+                                {
+                                    if (!_pendingPreviewCacheWritesByKey.ContainsKey(previewWork.Key)
+                                        && _pendingPreviewCacheWrites.Count < MaxPendingPreviewCacheWrites)
+                                    {
+                                        _pendingPreviewCacheWrites.Enqueue(previewWork);
+                                        _pendingPreviewCacheWritesByKey[previewWork.Key] = previewWork;
+                                    }
+                                }
+
+                                await Task.Delay(50).ConfigureAwait(false);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            busyRetries = 0;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Background SQLite cache writer stopped: {ex.Message}");
+            }
+            finally
+            {
+                lock (_bgWriteLock)
+                {
+                    _bgWriterActive = false;
+                    _bgWriterIdleEvent.Set();
+                }
+            }
         }
     }
 }

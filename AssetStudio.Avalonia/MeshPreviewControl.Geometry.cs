@@ -26,7 +26,7 @@ namespace AssetStudio.Avalonia
             SetMeshGroup(meshes, uvs, transforms, subMeshTextures, subMeshTexWidths, subMeshTexHeights, resetMaterialOverrides: true);
         }
 
-        private void SetMesh(Mesh m_Mesh, Vector2[]? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
+        private void SetMesh(Mesh m_Mesh, Vector2[]? uvs, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides, int[]? subMeshTextureMap = null)
         {
             ClearAvatarPreviewState();
             meshGroupPreviewSources = null;
@@ -35,6 +35,7 @@ namespace AssetStudio.Avalonia
             meshGroupPreviewSourceSubMeshTextures = null;
             meshGroupPreviewSourceSubMeshTexWidths = null;
             meshGroupPreviewSourceSubMeshTexHeights = null;
+            meshGroupPreviewSourceSubMeshTextureMap = null;
             ApplyMaterialResetState(resetMaterialOverrides);
 
             meshPreviewSource = m_Mesh;
@@ -42,6 +43,7 @@ namespace AssetStudio.Avalonia
             meshPreviewSourceSubMeshTextures = subMeshTextures;
             meshPreviewSourceSubMeshTexWidths = subMeshTexWidths;
             meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+            meshPreviewSourceSubMeshTextureMap = subMeshTextureMap;
             m_Mesh.EnsureProcessed();
             if (m_Mesh.m_VertexCount <= 0)
             {
@@ -71,6 +73,7 @@ namespace AssetStudio.Avalonia
                 Vector2[]? localUvData;
                 int[]? localPreviewSubMeshIndexCounts;
                 Matrix4 localModelMatrixData;
+                MeshPreviewGeometryCache? cacheToPersist = null;
 
                 var cachedGeometry = LoadMeshPreviewGeometryCache?.Invoke(m_Mesh, densityPercent);
                 if (cachedGeometry != null)
@@ -111,22 +114,26 @@ namespace AssetStudio.Avalonia
                     GetRobustMeshPreviewGeometryBounds(localVertexData, out var previewMin, out var previewMax);
                     localModelMatrixData = CreatePreviewModelMatrix(previewMin, previewMax);
 
-                    SaveMeshPreviewGeometryCache?.Invoke(m_Mesh, densityPercent, new MeshPreviewGeometryCache
+                    if (SaveMeshPreviewGeometryCache != null)
                     {
-                        ModelMatrix = localModelMatrixData,
-                        Vertices = localVertexData,
-                        Indices = localIndiceData,
-                        Normals = localNormalData,
-                        CalculatedNormals = localNormal2Data,
-                        Colors = localColorData,
-                        Uvs = localUvData,
-                        SubMeshIndexCounts = localPreviewSubMeshIndexCounts
-                    });
+                        cacheToPersist = new MeshPreviewGeometryCache
+                        {
+                            ModelMatrix = localModelMatrixData,
+                            Vertices = localVertexData,
+                            Indices = localIndiceData,
+                            Normals = localNormalData,
+                            CalculatedNormals = localNormal2Data,
+                            Colors = localColorData,
+                            Uvs = localUvData,
+                            SubMeshIndexCounts = localPreviewSubMeshIndexCounts
+                        };
+                    }
                 }
 
                 bool loadedFromCache = cachedGeometry != null;
-                bool hasSubMeshTextures = QueueSubMeshTexturesIfNeeded(resetMaterialOverrides, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                bool hasSubMeshTextures = QueueSubMeshTexturesIfNeeded(resetMaterialOverrides, subMeshTextures, subMeshTexWidths, subMeshTexHeights, subMeshTextureMap);
 
+                // Post geometry to UI/GL FIRST so rendering is never stalled by cache persistence or WriteGate.
                 PostLoadedMeshGeometry(
                     currentLoadId,
                     resetMaterialOverrides,
@@ -140,10 +147,27 @@ namespace AssetStudio.Avalonia
                     localPreviewSubMeshIndexCounts,
                     hasSubMeshTextures,
                     loadedFromCache);
+
+                if (cacheToPersist != null && currentLoadId == meshLoadCounter)
+                {
+                    var saveCallback = SaveMeshPreviewGeometryCache;
+                    var cacheSnapshot = cacheToPersist;
+                    _ = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try
+                        {
+                            saveCallback?.Invoke(m_Mesh, densityPercent, cacheSnapshot);
+                        }
+                        catch
+                        {
+                            // Best-effort background geometry cache persistence.
+                        }
+                    });
+                }
             });
         }
 
-        private void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs, IReadOnlyList<float[]?>? transforms, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides)
+        private void SetMeshGroup(IReadOnlyList<Mesh> meshes, IReadOnlyList<Vector2[]?>? uvs, IReadOnlyList<float[]?>? transforms, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, bool resetMaterialOverrides, int[]? subMeshTextureMap = null)
         {
             ClearAvatarPreviewState();
             meshPreviewSource = null;
@@ -151,6 +175,7 @@ namespace AssetStudio.Avalonia
             meshPreviewSourceSubMeshTextures = null;
             meshPreviewSourceSubMeshTexWidths = null;
             meshPreviewSourceSubMeshTexHeights = null;
+            meshPreviewSourceSubMeshTextureMap = null;
 
             var meshSources = meshes
                 .Where(mesh => mesh != null)
@@ -161,6 +186,7 @@ namespace AssetStudio.Avalonia
             meshGroupPreviewSourceSubMeshTextures = subMeshTextures;
             meshGroupPreviewSourceSubMeshTexWidths = subMeshTexWidths;
             meshGroupPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+            meshGroupPreviewSourceSubMeshTextureMap = subMeshTextureMap;
             ApplyMaterialResetState(resetMaterialOverrides);
 
             if (meshSources.Length == 0)
@@ -176,6 +202,9 @@ namespace AssetStudio.Avalonia
             System.Threading.Tasks.Task.Run(() =>
             {
                 var parts = new List<MeshPreviewPartGeometry>();
+                var pendingCacheSaves = SaveMeshPreviewGeometryCache != null
+                    ? new List<(Mesh Mesh, MeshPreviewGeometryCache Cache)>()
+                    : null;
                 var combinedSubMeshCounts = new List<int>();
                 var totalVertexCount = 0;
                 var totalIndexCount = 0;
@@ -185,6 +214,11 @@ namespace AssetStudio.Avalonia
 
                 for (var meshIndex = 0; meshIndex < meshSources.Length; meshIndex++)
                 {
+                    if (currentLoadId != meshLoadCounter)
+                    {
+                        return;
+                    }
+
                     var mesh = meshSources[meshIndex];
                     mesh.EnsureProcessed();
                     if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0 || mesh.m_Indices == null || mesh.m_Indices.Count == 0)
@@ -193,7 +227,12 @@ namespace AssetStudio.Avalonia
                     }
 
                     var meshUvs = uvSources != null && meshIndex < uvSources.Length ? uvSources[meshIndex] : null;
-                    var part = BuildMeshPreviewPartGeometry(mesh, meshUvs, densityPercent);
+                    var part = BuildMeshPreviewPartGeometry(mesh, meshUvs, densityPercent, out var cacheToSave);
+                    if (cacheToSave != null)
+                    {
+                        pendingCacheSaves?.Add((mesh, cacheToSave));
+                    }
+
                     var partTransform = transformSources != null && meshIndex < transformSources.Length ? transformSources[meshIndex] : null;
                     if (partTransform != null && partTransform.Length == 16)
                     {
@@ -278,8 +317,9 @@ namespace AssetStudio.Avalonia
                     : null;
                 var localModelMatrixData = CreatePreviewModelMatrix(previewMin, previewMax);
                 bool loadedFromCache = parts.Count > 0 && parts.All(part => part.FromCache);
-                bool hasSubMeshTextures = QueueSubMeshTexturesIfNeeded(resetMaterialOverrides, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                bool hasSubMeshTextures = QueueSubMeshTexturesIfNeeded(resetMaterialOverrides, subMeshTextures, subMeshTexWidths, subMeshTexHeights, subMeshTextureMap);
 
+                // Post geometry to UI/GL FIRST before dispatching async cache writes.
                 PostLoadedMeshGeometry(
                     currentLoadId,
                     resetMaterialOverrides,
@@ -293,6 +333,26 @@ namespace AssetStudio.Avalonia
                     localPreviewSubMeshIndexCounts,
                     hasSubMeshTextures,
                     loadedFromCache);
+
+                if (pendingCacheSaves != null && pendingCacheSaves.Count > 0 && currentLoadId == meshLoadCounter)
+                {
+                    var saveCallback = SaveMeshPreviewGeometryCache;
+                    var savesSnapshot = pendingCacheSaves;
+                    _ = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        foreach (var item in savesSnapshot)
+                        {
+                            try
+                            {
+                                saveCallback?.Invoke(item.Mesh, densityPercent, item.Cache);
+                            }
+                            catch
+                            {
+                                // Best-effort background geometry cache persistence.
+                            }
+                        }
+                    });
+                }
             });
         }
 
@@ -311,7 +371,7 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private bool QueueSubMeshTexturesIfNeeded(bool resetMaterialOverrides, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
+        private bool QueueSubMeshTexturesIfNeeded(bool resetMaterialOverrides, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, int[]? subMeshTextureMap = null)
         {
             bool hasSubMeshTextures = resetMaterialOverrides && subMeshTextures != null && subMeshTextures.Any(t => t != null);
             if (hasSubMeshTextures)
@@ -321,6 +381,7 @@ namespace AssetStudio.Avalonia
                     pendingSubMeshTextures = subMeshTextures;
                     pendingSubMeshTexWidths = subMeshTexWidths;
                     pendingSubMeshTexHeights = subMeshTexHeights;
+                    pendingSubMeshTextureMap = subMeshTextureMap;
                     hasPendingSubMeshTextures = true;
                 }
             }
@@ -371,8 +432,9 @@ namespace AssetStudio.Avalonia
             });
         }
 
-        private MeshPreviewPartGeometry BuildMeshPreviewPartGeometry(Mesh mesh, Vector2[]? uvs, float densityPercent)
+        private MeshPreviewPartGeometry BuildMeshPreviewPartGeometry(Mesh mesh, Vector2[]? uvs, float densityPercent, out MeshPreviewGeometryCache? cacheToPersist)
         {
+            cacheToPersist = null;
             var cachedGeometry = LoadMeshPreviewGeometryCache?.Invoke(mesh, densityPercent);
             if (cachedGeometry != null)
             {
@@ -413,17 +475,20 @@ namespace AssetStudio.Avalonia
             GetRobustMeshPreviewGeometryBounds(localVertexData, out min, out max);
 
             var localNormal2Data = BuildCalculatedNormals(localVertexData, localIndiceData);
-            SaveMeshPreviewGeometryCache?.Invoke(mesh, densityPercent, new MeshPreviewGeometryCache
+            if (SaveMeshPreviewGeometryCache != null)
             {
-                ModelMatrix = CreatePreviewModelMatrix(min, max),
-                Vertices = localVertexData,
-                Indices = localIndiceData,
-                Normals = localNormalData,
-                CalculatedNormals = localNormal2Data,
-                Colors = localColorData,
-                Uvs = localUvData,
-                SubMeshIndexCounts = localPreviewSubMeshIndexCounts
-            });
+                cacheToPersist = new MeshPreviewGeometryCache
+                {
+                    ModelMatrix = CreatePreviewModelMatrix(min, max),
+                    Vertices = localVertexData,
+                    Indices = localIndiceData,
+                    Normals = localNormalData,
+                    CalculatedNormals = localNormal2Data,
+                    Colors = localColorData,
+                    Uvs = localUvData,
+                    SubMeshIndexCounts = localPreviewSubMeshIndexCounts
+                };
+            }
 
             return new MeshPreviewPartGeometry(
                 localVertexData,

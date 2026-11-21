@@ -11,6 +11,9 @@ internal sealed class SemanticAssetRelations
     public List<SemanticMeshRendererRelation> MeshRenderers { get; } = new();
     public List<SemanticMeshMaterialRelation> MeshMaterials { get; } = new();
     public List<SemanticMaterialTextureRelation> MaterialTextures { get; } = new();
+    public List<SemanticMaterialCacheEntry> MaterialCaches { get; } = new();
+    public List<SemanticCompositeAssetRelation> CompositeAssets { get; } = new();
+    public List<SemanticCompositeAssetPartRelation> CompositeAssetParts { get; } = new();
     public List<SemanticAnimationClipTargetRelation> AnimationClipTargets { get; } = new();
     public List<SemanticRigBoneHashEntry> RigBoneHashes { get; } = new();
     public List<SemanticClipBoneHashEntry> ClipBoneHashes { get; } = new();
@@ -22,6 +25,9 @@ internal sealed class SemanticAssetRelations
         MeshRenderers.Count > 0 ||
         MeshMaterials.Count > 0 ||
         MaterialTextures.Count > 0 ||
+        MaterialCaches.Count > 0 ||
+        CompositeAssets.Count > 0 ||
+        CompositeAssetParts.Count > 0 ||
         AnimationClipTargets.Count > 0 ||
         RigBoneHashes.Count > 0 ||
         ClipBoneHashes.Count > 0;
@@ -30,6 +36,9 @@ internal sealed class SemanticAssetRelations
         AssetEdges.Count > 0 ||
         MeshMaterials.Count > 0 ||
         MaterialTextures.Count > 0 ||
+        MaterialCaches.Count > 0 ||
+        CompositeAssets.Count > 0 ||
+        CompositeAssetParts.Count > 0 ||
         AnimationClipTargets.Count > 0 ||
         RigBoneHashes.Count > 0 ||
         ClipBoneHashes.Count > 0;
@@ -48,6 +57,9 @@ internal sealed class SemanticAssetRelations
         MeshRenderers.AddRange(other.MeshRenderers);
         MeshMaterials.AddRange(other.MeshMaterials);
         MaterialTextures.AddRange(other.MaterialTextures);
+        MaterialCaches.AddRange(other.MaterialCaches);
+        CompositeAssets.AddRange(other.CompositeAssets);
+        CompositeAssetParts.AddRange(other.CompositeAssetParts);
         AnimationClipTargets.AddRange(other.AnimationClipTargets);
         RigBoneHashes.AddRange(other.RigBoneHashes);
         ClipBoneHashes.AddRange(other.ClipBoneHashes);
@@ -328,7 +340,12 @@ internal sealed class SemanticMaterialTextureRelation
         int textureFileId,
         long texturePathId,
         bool isResolved,
-        bool isMainTexture)
+        bool isMainTexture,
+        float scaleX = 1f,
+        float scaleY = 1f,
+        float offsetX = 0f,
+        float offsetY = 0f,
+        string resolutionSource = "preparation")
     {
         MaterialAssetId = materialAssetId;
         PreviewMaterialAssetId = previewMaterialAssetId;
@@ -339,6 +356,11 @@ internal sealed class SemanticMaterialTextureRelation
         TexturePathId = texturePathId;
         IsResolved = isResolved;
         IsMainTexture = isMainTexture;
+        ScaleX = float.IsFinite(scaleX) ? scaleX : 1f;
+        ScaleY = float.IsFinite(scaleY) ? scaleY : 1f;
+        OffsetX = float.IsFinite(offsetX) ? offsetX : 0f;
+        OffsetY = float.IsFinite(offsetY) ? offsetY : 0f;
+        ResolutionSource = string.IsNullOrWhiteSpace(resolutionSource) ? "preparation" : resolutionSource;
     }
 
     public string MaterialAssetId { get; }
@@ -350,4 +372,138 @@ internal sealed class SemanticMaterialTextureRelation
     public long TexturePathId { get; }
     public bool IsResolved { get; }
     public bool IsMainTexture { get; }
+    public float ScaleX { get; }
+    public float ScaleY { get; }
+    public float OffsetX { get; }
+    public float OffsetY { get; }
+    public string ResolutionSource { get; }
+}
+
+internal sealed class SemanticMaterialCacheEntry
+{
+    public SemanticMaterialCacheEntry(
+        string materialAssetId,
+        string materialName,
+        string parentMaterialAssetId,
+        string mainTextureAssetId,
+        string mainTextureSlotName,
+        float baseColorR = 1f,
+        float baseColorG = 1f,
+        float baseColorB = 1f,
+        float baseColorA = 1f,
+        string shaderName = "",
+        int textureSlotCount = 0,
+        string resolutionSource = "preparation")
+    {
+        MaterialAssetId = materialAssetId ?? string.Empty;
+        MaterialName = materialName ?? string.Empty;
+        ParentMaterialAssetId = parentMaterialAssetId ?? string.Empty;
+        MainTextureAssetId = mainTextureAssetId ?? string.Empty;
+        MainTextureSlotName = mainTextureSlotName ?? string.Empty;
+        BaseColorR = float.IsFinite(baseColorR) ? baseColorR : 1f;
+        BaseColorG = float.IsFinite(baseColorG) ? baseColorG : 1f;
+        BaseColorB = float.IsFinite(baseColorB) ? baseColorB : 1f;
+        BaseColorA = float.IsFinite(baseColorA) ? baseColorA : 1f;
+        ShaderName = shaderName ?? string.Empty;
+        TextureSlotCount = textureSlotCount;
+        ResolutionSource = string.IsNullOrWhiteSpace(resolutionSource) ? "preparation" : resolutionSource;
+    }
+
+    public string MaterialAssetId { get; }
+    public string MaterialName { get; }
+    public string ParentMaterialAssetId { get; }
+    public string MainTextureAssetId { get; }
+    public string MainTextureSlotName { get; }
+    public float BaseColorR { get; }
+    public float BaseColorG { get; }
+    public float BaseColorB { get; }
+    public float BaseColorA { get; }
+    public string ShaderName { get; }
+    public int TextureSlotCount { get; }
+    public string ResolutionSource { get; }
+}
+
+internal sealed class SemanticCompositeAssetRelation
+{
+    public SemanticCompositeAssetRelation(
+        string compositeAssetId,
+        string compositeKind,
+        string displayName,
+        string rootGameObjectAssetId,
+        string animatorAssetId,
+        string avatarAssetId,
+        string controllerAssetId,
+        string sourceFileName,
+        int meshPartCount,
+        int distinctMeshCount,
+        int distinctMaterialCount,
+        int confidence,
+        string resolutionSource = "preparation")
+    {
+        CompositeAssetId = compositeAssetId ?? string.Empty;
+        CompositeKind = compositeKind ?? string.Empty;
+        DisplayName = displayName ?? string.Empty;
+        RootGameObjectAssetId = rootGameObjectAssetId ?? string.Empty;
+        AnimatorAssetId = animatorAssetId ?? string.Empty;
+        AvatarAssetId = avatarAssetId ?? string.Empty;
+        ControllerAssetId = controllerAssetId ?? string.Empty;
+        SourceFileName = sourceFileName ?? string.Empty;
+        MeshPartCount = meshPartCount;
+        DistinctMeshCount = distinctMeshCount;
+        DistinctMaterialCount = distinctMaterialCount;
+        Confidence = confidence;
+        ResolutionSource = string.IsNullOrWhiteSpace(resolutionSource) ? "preparation" : resolutionSource;
+    }
+
+    public string CompositeAssetId { get; }
+    public string CompositeKind { get; }
+    public string DisplayName { get; }
+    public string RootGameObjectAssetId { get; }
+    public string AnimatorAssetId { get; }
+    public string AvatarAssetId { get; }
+    public string ControllerAssetId { get; }
+    public string SourceFileName { get; }
+    public int MeshPartCount { get; }
+    public int DistinctMeshCount { get; }
+    public int DistinctMaterialCount { get; }
+    public int Confidence { get; }
+    public string ResolutionSource { get; }
+}
+
+internal sealed class SemanticCompositeAssetPartRelation
+{
+    public SemanticCompositeAssetPartRelation(
+        string compositeAssetId,
+        int partIndex,
+        string meshAssetId,
+        string rendererAssetId,
+        string rendererType,
+        string gameObjectAssetId,
+        string gameObjectName,
+        float[]? localToWorldMatrix,
+        string primaryMaterialAssetId,
+        int confidence)
+    {
+        CompositeAssetId = compositeAssetId ?? string.Empty;
+        PartIndex = partIndex;
+        MeshAssetId = meshAssetId ?? string.Empty;
+        RendererAssetId = rendererAssetId ?? string.Empty;
+        RendererType = rendererType ?? string.Empty;
+        GameObjectAssetId = gameObjectAssetId ?? string.Empty;
+        GameObjectName = gameObjectName ?? string.Empty;
+        LocalToWorldMatrix = localToWorldMatrix;
+        PrimaryMaterialAssetId = primaryMaterialAssetId ?? string.Empty;
+        Confidence = confidence;
+    }
+
+    public string CompositeAssetId { get; }
+    public int PartIndex { get; }
+    public string MeshAssetId { get; }
+    public string RendererAssetId { get; }
+    public string RendererType { get; }
+    public string GameObjectAssetId { get; }
+    public string GameObjectName { get; }
+    public float[]? LocalToWorldMatrix { get; }
+    public string PrimaryMaterialAssetId { get; }
+    public int Confidence { get; }
 }

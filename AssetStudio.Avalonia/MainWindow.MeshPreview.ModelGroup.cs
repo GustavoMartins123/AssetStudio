@@ -91,15 +91,33 @@ public partial class MainWindow
 
         var seenGroups = new HashSet<string>(StringComparer.Ordinal);
         var seenGroupPartSignatures = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var groupCandidate in LoadModelGroupCandidatesForMeshAssetIdForPreview(meshId))
+
+        // Prefer v15 pre-computed CompositeAssets / CompositeAssetParts (fast WAL lookup).
+        var composites = LoadCompositeAssetsForMeshForPreview(meshId);
+        foreach (var composite in composites)
         {
-            var group = groupCandidate.Group;
-            if (string.IsNullOrWhiteSpace(group.GroupId) || !seenGroups.Add(group.GroupId))
+            if (string.IsNullOrWhiteSpace(composite.CompositeAssetId) || !seenGroups.Add(composite.CompositeAssetId))
             {
                 continue;
             }
 
-            var groupMeshes = groupCandidate.Meshes;
+            var groupMeshes = composite.Parts
+                .Select(p => new ModelGroupMeshInfo(
+                    composite.CompositeAssetId,
+                    p.MeshAssetId,
+                    p.RendererAssetId,
+                    p.RendererType,
+                    p.GameObjectAssetId,
+                    p.GameObjectName,
+                    p.PartIndex,
+                    p.Confidence,
+                    string.Empty,
+                    p.TransformMatrix,
+                    p.MeshName,
+                    p.MeshPathId,
+                    p.MeshByteSize,
+                    (int)ClassIDType.Mesh))
+                .ToList();
             var meshIds = groupMeshes
                 .Select(item => item.MeshAssetId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
@@ -117,11 +135,9 @@ public partial class MainWindow
 
             var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
             var representativeMeshId = representative?.MeshAssetId ?? meshId;
-            var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
-                ? group.GroupName
-                : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
-                    ? group.RootGameObjectName
-                    : GetPreviewHandleName(representativeMeshId, "Model");
+            var groupName = !string.IsNullOrWhiteSpace(composite.DisplayName)
+                ? composite.DisplayName
+                : GetPreviewHandleName(representativeMeshId, "Model");
             var representativeName = !string.IsNullOrWhiteSpace(representative?.MeshName)
                 ? representative!.MeshName
                 : GetPreviewHandleName(representativeMeshId, "Mesh");
@@ -130,15 +146,70 @@ public partial class MainWindow
             {
                 Mesh = string.Equals(representativeMeshId, meshId, StringComparison.Ordinal) ? mesh : null,
                 MeshId = representativeMeshId,
-                ModelGroupId = group.GroupId,
+                ModelGroupId = composite.CompositeAssetId,
                 ModelGroupName = groupName,
+                ModelGroupKind = composite.CompositeKind,
                 ModelGroupMeshIds = meshIds,
                 ModelGroupMeshInfos = groupMeshes.ToArray(),
                 ModelGroupTransforms = groupMeshes.Select(part => part.TransformMatrix).ToArray(),
                 ModelGroupMeshCount = meshIds.Length,
-                ModelGroupConfidence = group.Confidence,
+                ModelGroupConfidence = composite.Confidence,
                 Label = $"Model group: {groupName} ({meshIds.Length:N0} parts) -> {representativeName}"
             });
+        }
+
+        if (composites.Count == 0)
+        {
+            foreach (var groupCandidate in LoadModelGroupCandidatesForMeshAssetIdForPreview(meshId))
+            {
+                var group = groupCandidate.Group;
+                if (string.IsNullOrWhiteSpace(group.GroupId) || !seenGroups.Add(group.GroupId))
+                {
+                    continue;
+                }
+
+                var groupMeshes = groupCandidate.Meshes;
+                var meshIds = groupMeshes
+                    .Select(item => item.MeshAssetId)
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .ToArray();
+                if (meshIds.Length < 2)
+                {
+                    continue;
+                }
+
+                var partSignature = string.Join("\u001f", groupMeshes.Select(part => $"{part.MeshAssetId}:{part.RendererAssetId}:{part.SlotIndex}"));
+                if (!seenGroupPartSignatures.Add(partSignature))
+                {
+                    continue;
+                }
+
+                var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+                var representativeMeshId = representative?.MeshAssetId ?? meshId;
+                var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+                    ? group.GroupName
+                    : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                        ? group.RootGameObjectName
+                        : GetPreviewHandleName(representativeMeshId, "Model");
+                var representativeName = !string.IsNullOrWhiteSpace(representative?.MeshName)
+                    ? representative!.MeshName
+                    : GetPreviewHandleName(representativeMeshId, "Mesh");
+
+                candidates.Add(new PreviewCandidateItem
+                {
+                    Mesh = string.Equals(representativeMeshId, meshId, StringComparison.Ordinal) ? mesh : null,
+                    MeshId = representativeMeshId,
+                    ModelGroupId = group.GroupId,
+                    ModelGroupName = groupName,
+                    ModelGroupKind = group.GroupKind,
+                    ModelGroupMeshIds = meshIds,
+                    ModelGroupMeshInfos = groupMeshes.ToArray(),
+                    ModelGroupTransforms = groupMeshes.Select(part => part.TransformMatrix).ToArray(),
+                    ModelGroupMeshCount = meshIds.Length,
+                    ModelGroupConfidence = group.Confidence,
+                    Label = $"Model group: {groupName} ({meshIds.Length:N0} parts) -> {representativeName}"
+                });
+            }
         }
 
         return candidates;
@@ -150,23 +221,46 @@ public partial class MainWindow
         PreviewCandidateItem? selectedCandidate,
         bool preferModelGroup)
     {
+        return SelectBestMeshPreviewCandidate(mesh, candidates, selectedCandidate, preferModelGroup);
+    }
+
+    internal static PreviewCandidateItem? SelectBestMeshPreviewCandidate(
+        Mesh mesh,
+        IReadOnlyList<PreviewCandidateItem> candidates,
+        PreviewCandidateItem? selectedCandidate,
+        bool preferModelGroup)
+    {
         if (selectedCandidate != null)
         {
             var selected = candidates.FirstOrDefault(candidate =>
-                (!string.IsNullOrWhiteSpace(selectedCandidate.ModelGroupId)
-                    && string.Equals(candidate.ModelGroupId, selectedCandidate.ModelGroupId, StringComparison.Ordinal))
-                || AreSamePreviewObject(candidate.Mesh, selectedCandidate.Mesh)
-                || (!string.IsNullOrWhiteSpace(selectedCandidate.MeshId)
-                    && string.Equals(candidate.MeshId, selectedCandidate.MeshId, StringComparison.Ordinal)));
+                selectedCandidate.IsModelGroup
+                    ? string.Equals(candidate.ModelGroupId, selectedCandidate.ModelGroupId, StringComparison.Ordinal)
+                    : !candidate.IsModelGroup
+                        && (AreSamePreviewObject(candidate.Mesh, selectedCandidate.Mesh)
+                            || (!string.IsNullOrWhiteSpace(selectedCandidate.MeshId)
+                                && string.Equals(candidate.MeshId, selectedCandidate.MeshId, StringComparison.Ordinal))));
             if (selected != null)
             {
                 return selected;
             }
         }
 
-        if (preferModelGroup)
+        // Only auto-switch to compact high-confidence Animator character groups (<= 16 parts).
+        // Never hijack a single selected mesh or huge scene Combined Mesh into a 100-part SceneObject group;
+        // SceneObject groups stay selectable in the Model Group dropdown.
+        var isCombinedSceneMesh = mesh?.m_Name != null
+            && mesh.m_Name.StartsWith("Combined Mesh", StringComparison.OrdinalIgnoreCase);
+        if (preferModelGroup && !isCombinedSceneMesh)
         {
-            var group = candidates.FirstOrDefault(candidate => candidate.IsModelGroup && candidate.ModelGroupMeshIds.Count > 1);
+            var group = candidates.FirstOrDefault(candidate =>
+                candidate.IsModelGroup
+                && candidate.ModelGroupMeshIds.Count > 1
+                && candidate.ModelGroupMeshCount <= 16
+                && candidate.ModelGroupConfidence >= 80
+                && (string.Equals(candidate.ModelGroupKind, "Animator", StringComparison.OrdinalIgnoreCase)
+                    || (!string.IsNullOrWhiteSpace(candidate.ModelGroupId)
+                        && !candidate.ModelGroupId.Contains(":sceneobject:", StringComparison.OrdinalIgnoreCase)
+                        && string.IsNullOrEmpty(candidate.ModelGroupKind))));
             if (group != null)
             {
                 return group;
@@ -175,6 +269,23 @@ public partial class MainWindow
 
         return candidates.FirstOrDefault(candidate => AreSamePreviewObject(candidate.Mesh, mesh))
             ?? candidates.FirstOrDefault();
+    }
+
+    private List<CompositeAssetInfo> LoadCompositeAssetsForMeshForPreview(string meshId)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || string.IsNullOrWhiteSpace(meshId))
+        {
+            return new List<CompositeAssetInfo>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return new List<CompositeAssetInfo>();
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadCompositeAssetsForMesh(folderPath, signature, meshId);
     }
 
     private List<ModelGroupCandidateInfo> LoadModelGroupCandidatesForMeshAssetIdForPreview(string meshId)
@@ -269,17 +380,46 @@ public partial class MainWindow
                 .ToArray();
         }
 
-        var result = new List<Mesh>();
-        foreach (var meshId in meshIds)
+        // Batch-resolve distinct mesh IDs grouped by source file path so each .assets file loads once.
+        var resolvedById = new Dictionary<string, Mesh>(StringComparer.Ordinal);
+        var handlesToResolve = new List<(string MeshId, AssetHandle Handle, string SourceKey)>();
+        foreach (var distinctId in meshIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal))
         {
-            token.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(meshId))
+            var handle = assetsManager.ProjectIndex.GetHandle(distinctId);
+            if (handle == null)
             {
                 continue;
             }
 
-            var mesh = ResolveMeshPreviewCandidate(meshId);
-            if (mesh != null)
+            if (handle.RealObject is Mesh existingMesh)
+            {
+                resolvedById[distinctId] = existingMesh;
+            }
+            else
+            {
+                var sourceKey = ResolveLazyHandleSourcePath(handle) ?? handle.SerializedFileName ?? string.Empty;
+                handlesToResolve.Add((distinctId, handle, sourceKey));
+            }
+        }
+
+        foreach (var group in handlesToResolve.GroupBy(x => x.SourceKey, StringComparer.OrdinalIgnoreCase))
+        {
+            token.ThrowIfCancellationRequested();
+            foreach (var item in group)
+            {
+                token.ThrowIfCancellationRequested();
+                if (ResolveSemanticRelationHandleForPreview(item.Handle) is Mesh mesh)
+                {
+                    resolvedById[item.MeshId] = mesh;
+                }
+            }
+        }
+
+        var result = new List<Mesh>(meshIds.Count);
+        foreach (var meshId in meshIds)
+        {
+            token.ThrowIfCancellationRequested();
+            if (!string.IsNullOrWhiteSpace(meshId) && resolvedById.TryGetValue(meshId, out var mesh))
             {
                 result.Add(mesh);
             }
@@ -385,42 +525,166 @@ public partial class MainWindow
                     StatusStripUpdate($"OpenGL Preview | Model group loaded ({meshes.Count:N0} parts) | Loading materials...");
                 });
 
-                var allMaterials = new List<Material?>();
-                var subMeshTextures = new List<byte[]?>();
-                var subMeshTexWidths = new List<int>();
-                var subMeshTexHeights = new List<int>();
-                foreach (var mesh in meshes)
+                // Resolve materials per part using v15 cache (with per-renderer disambiguation) and deduplicate textures across ALL parts.
+                var allSlotSpecs = new List<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)>();
+                var allSubMeshTextureIds = new List<string?>();
+                var fallbackTexturesBySlot = new Dictionary<int, Texture2D>();
+                var allMaterialNames = new List<string>();
+                for (var partIdx = 0; partIdx < meshes.Count; partIdx++)
                 {
                     if (meshPreviewId != texturePreviewIdCounter)
                     {
                         return;
                     }
 
-                    var materials = FindMaterialsForMeshPreview(mesh);
-                    if (materials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    var mesh = meshes[partIdx];
+                    var partRendererId = partIdx < candidate.ModelGroupMeshInfos.Count
+                        ? candidate.ModelGroupMeshInfos[partIdx].RendererAssetId
+                        : null;
+                    var resolvedPartSlots = TryLoadResolvedMeshMaterialsForPreview(mesh, partRendererId);
+
+                    if (resolvedPartSlots.Count > 0)
                     {
-                        EnsureMeshPreviewDependenciesLoaded(mesh);
-                        materials = FindMaterialsForMeshPreview(mesh);
+                        var bySubMesh = new Dictionary<int, ResolvedMeshSubMeshMaterial>(resolvedPartSlots.Count);
+                        foreach (var slot in resolvedPartSlots)
+                        {
+                            if (slot.SubMeshIndex >= 0 && !bySubMesh.ContainsKey(slot.SubMeshIndex))
+                            {
+                                bySubMesh[slot.SubMeshIndex] = slot;
+                            }
+                        }
+
+                        var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, resolvedPartSlots.Max(s => s.SubMeshIndex) + 1);
+                        if (slotCount <= 0 && mesh.m_Indices?.Count > 0)
+                        {
+                            slotCount = 1;
+                        }
+
+                        for (var s = 0; s < slotCount; s++)
+                        {
+                            if (bySubMesh.TryGetValue(s, out var resolved))
+                            {
+                                var matName = !string.IsNullOrWhiteSpace(resolved.MaterialName)
+                                    ? resolved.MaterialName
+                                    : !string.IsNullOrWhiteSpace(resolved.MaterialAssetId)
+                                        ? GetPreviewHandleName(resolved.MaterialAssetId, "Material")
+                                        : "No Material";
+                                allSlotSpecs.Add((matName, new global::OpenTK.Mathematics.Vector4(
+                                    ClampPreviewColor(resolved.BaseColorR),
+                                    ClampPreviewColor(resolved.BaseColorG),
+                                    ClampPreviewColor(resolved.BaseColorB),
+                                    ClampPreviewColor(resolved.BaseColorA))));
+                                allSubMeshTextureIds.Add(string.IsNullOrWhiteSpace(resolved.MainTextureAssetId) ? null : resolved.MainTextureAssetId);
+                                if (!string.IsNullOrWhiteSpace(resolved.MaterialAssetId))
+                                {
+                                    allMaterialNames.Add(matName);
+                                }
+                            }
+                            else
+                            {
+                                allSlotSpecs.Add(("No Material", global::OpenTK.Mathematics.Vector4.One));
+                                allSubMeshTextureIds.Add(null);
+                            }
+                        }
                     }
-
-                    var slotCountBefore = subMeshTextures.Count;
-                    AddPreviewTextureSlotsForMesh(
-                        mesh,
-                        materials,
-                        subMeshTextures,
-                        subMeshTexWidths,
-                        subMeshTexHeights);
-
-                    var slotCount = subMeshTextures.Count - slotCountBefore;
-                    for (var i = 0; i < slotCount; i++)
+                    else
                     {
-                        allMaterials.Add(i < materials.Count ? materials[i] : null);
+                        var materials = FindMaterialsForMeshPreview(mesh);
+                        if (materials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                        {
+                            EnsureMeshPreviewDependenciesLoaded(mesh);
+                            materials = FindMaterialsForMeshPreview(mesh);
+                        }
+
+                        var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
+                        if (slotCount <= 0 && mesh.m_Indices?.Count > 0)
+                        {
+                            slotCount = 1;
+                        }
+
+                        for (var s = 0; s < slotCount; s++)
+                        {
+                            var mat = s < materials.Count ? materials[s] : null;
+                            var matName = string.IsNullOrEmpty(mat?.m_Name) ? "No Material" : mat!.m_Name;
+                            allSlotSpecs.Add((matName, GetMeshMaterialBaseColor(mat)));
+                            var tex = mat != null ? FindTextureForMaterial(mat) : null;
+                            var texKey = tex != null ? GetPreviewObjectKey(tex) : null;
+                            if (tex != null && !string.IsNullOrWhiteSpace(texKey))
+                            {
+                                fallbackTexturesBySlot[allSubMeshTextureIds.Count] = tex;
+                                allSubMeshTextureIds.Add(texKey);
+                            }
+                            else
+                            {
+                                allSubMeshTextureIds.Add(null);
+                            }
+                            if (mat != null)
+                            {
+                                allMaterialNames.Add(matName);
+                            }
+                        }
                     }
                 }
 
-                var hasTextures = subMeshTextures.Any(t => t != null);
+                if (meshPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                BuildDeduplicatedPreviewTexturesByAssetIds(
+                    allSubMeshTextureIds,
+                    () => meshPreviewId != texturePreviewIdCounter,
+                    out var uniqueTextures,
+                    out var uniqueWidths,
+                    out var uniqueHeights,
+                    out var subMeshToTextureIndex,
+                    out var loadedTextureFiles);
+
+                // Decode any non-indexed eager fallback textures that weren't in ProjectIndex.
+                if (fallbackTexturesBySlot.Count > 0)
+                {
+                    foreach (var kvp in fallbackTexturesBySlot)
+                    {
+                        if (meshPreviewId != texturePreviewIdCounter)
+                        {
+                            return;
+                        }
+
+                        var mappedIdx = kvp.Key < subMeshToTextureIndex.Length ? subMeshToTextureIndex[kvp.Key] : -1;
+                        if (mappedIdx >= 0 && mappedIdx < uniqueTextures.Count && uniqueTextures[mappedIdx] == null)
+                        {
+                            try
+                            {
+                                using var previewImg = LoadTexturePreviewThumbnail(kvp.Value, MaxCachedPreviewTextureDimension);
+                                var rgba = ConvertPreviewImageToRgbaBytes(previewImg, out var tw, out var th);
+                                if (rgba != null)
+                                {
+                                    uniqueTextures[mappedIdx] = rgba;
+                                    uniqueWidths[mappedIdx] = tw;
+                                    uniqueHeights[mappedIdx] = th;
+                                }
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
+                }
+
+                if (meshPreviewId != texturePreviewIdCounter)
+                {
+                    return;
+                }
+
+                SetActivePreviewDependencyFiles(meshes.Cast<AssetStudio.Object?>().ToArray());
+                if (loadedTextureFiles.Count > 0)
+                {
+                    AddActivePreviewDependencyFiles(loadedTextureFiles);
+                }
+
+                var hasTextures = uniqueTextures.Any(t => t != null);
                 var infoText = includeMeshInfo
-                    ? FormatModelGroupPreviewSummary(candidate, meshes, localAssetItem, allMaterials)
+                    ? FormatModelGroupPreviewSummaryWithNames(candidate, meshes, localAssetItem, allMaterialNames)
                     : string.Empty;
 
                 Dispatcher.UIThread.Post(() =>
@@ -432,9 +696,9 @@ public partial class MainWindow
 
                     if (GLPreviewControl != null)
                     {
-                        GLPreviewControl.ApplyMeshTextures(subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                        GLPreviewControl.ApplyMeshTextures(uniqueTextures, uniqueWidths, uniqueHeights, subMeshToTextureIndex);
                         GLPreviewControl.IsVisible = true;
-                        BuildMeshMaterialControlsForSlots(allMaterials);
+                        BuildMeshMaterialControlsFromSlotSpecs(allSlotSpecs);
                         ShowPreviewGeometryControls(showBoneControls: false);
                         GLPreviewControl.Focus();
                     }
@@ -469,6 +733,55 @@ public partial class MainWindow
                 });
             }
         });
+    }
+
+    private string FormatModelGroupPreviewSummaryWithNames(
+        PreviewCandidateItem candidate,
+        IReadOnlyList<Mesh> meshes,
+        AssetItem? item,
+        IReadOnlyList<string> materialNames)
+    {
+        var sb = new StringBuilder();
+        var groupName = !string.IsNullOrWhiteSpace(candidate.ModelGroupName)
+            ? candidate.ModelGroupName
+            : "Model group";
+        sb.AppendLine($"Model Group: {groupName}");
+        sb.AppendLine("==================================================");
+        if (item != null)
+        {
+            sb.AppendLine($"Selected Asset: {item.Name} (PathID: {item.PathID})");
+        }
+        var kind = !string.IsNullOrWhiteSpace(candidate.ModelGroupKind)
+            ? candidate.ModelGroupKind
+            : (candidate.ModelGroupId.Contains(":sceneobject:", StringComparison.OrdinalIgnoreCase) ? "SceneObject" : "Animator");
+        sb.AppendLine($"Group Kind: {kind}");
+        sb.AppendLine($"Parts: {meshes.Count}");
+        sb.AppendLine($"Confidence: {candidate.ModelGroupConfidence}");
+
+        var vertexTotal = meshes.Sum(mesh => Math.Max(0, mesh.m_VertexCount));
+        var indexTotal = meshes.Sum(mesh => mesh.m_Indices?.Count ?? 0);
+        sb.AppendLine($"Vertex Count: {vertexTotal:N0}");
+        sb.AppendLine($"Index Count: {indexTotal:N0}");
+
+        var distinctNames = materialNames.Where(n => !string.IsNullOrWhiteSpace(n)).Distinct(StringComparer.Ordinal).ToList();
+        sb.AppendLine($"Material Slots: {materialNames.Count} ({distinctNames.Count} unique)");
+        foreach (var matName in distinctNames.Take(16))
+        {
+            sb.AppendLine($"  - {matName}");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("Mesh Parts:");
+        foreach (var mesh in meshes.Take(24))
+        {
+            sb.AppendLine($"  - {mesh.m_Name} (PathID: {mesh.m_PathID}, Submeshes: {mesh.m_SubMeshes?.Length ?? 0})");
+        }
+        if (meshes.Count > 24)
+        {
+            sb.AppendLine($"  ... {meshes.Count - 24:N0} more");
+        }
+
+        return sb.ToString();
     }
 
     private string FormatModelGroupPreviewSummary(

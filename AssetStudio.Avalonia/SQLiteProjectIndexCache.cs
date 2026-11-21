@@ -20,12 +20,24 @@ namespace AssetStudio.Avalonia
         private const long ConnectionMmapSizeBytes = 268435456;
         internal static readonly int MaxIdleReadConnectionsPerDatabase = Math.Clamp(Environment.ProcessorCount, 4, 16);
         private static readonly object WriteGate = new object();
+        private static readonly ConcurrentDictionary<string, long> s_dbWriteGenerations =
+            new(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
         private readonly string _cacheDir;
         private readonly HashSet<string> _initializedDbs = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _initLock = new object();
         private readonly ConcurrentDictionary<string, long> _projectIdCache = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, CachedSemanticCacheStatus> _semanticStatusCache = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, ReadConnectionPoolBucket> _readConnectionPools =
             new(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+        private readonly object _bgWriteLock = new object();
+        private readonly Queue<PendingLazySemanticWrite> _pendingLazySemanticWrites = new();
+        private readonly Dictionary<string, PendingLazySemanticWrite> _pendingLazySemanticWritesByKey = new(StringComparer.Ordinal);
+        private readonly Queue<PendingPreviewCacheWrite> _pendingPreviewCacheWrites = new();
+        private readonly Dictionary<string, PendingPreviewCacheWrite> _pendingPreviewCacheWritesByKey = new(StringComparer.Ordinal);
+        private bool _bgWriterActive;
+        private readonly ManualResetEventSlim _bgWriterIdleEvent = new(initialState: true);
+        private const int MaxPendingLazySemanticWrites = 256;
+        private const int MaxPendingPreviewCacheWrites = 128;
         private long _physicalReadConnectionsOpened;
         private long _readPoolHits;
         private int _disposed;
@@ -83,6 +95,7 @@ namespace AssetStudio.Avalonia
                     InvalidateReadConnectionPool(dbPath);
                     ClearConnectionPoolsForDb(dbPath);
                     InvalidateProjectIdCacheForDb(dbPath);
+                    NotifyDatabaseMutated(dbPath);
                     MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
 
                     if (File.Exists(dbPath))
@@ -189,6 +202,111 @@ namespace AssetStudio.Avalonia
                     _projectIdCache.TryRemove(key, out _);
                 }
             }
+
+            InvalidateSemanticStatusCacheForDb(dbPath);
+        }
+
+        private void InvalidateSemanticStatusCacheForDb(string dbPath)
+        {
+            var prefix = dbPath + "\u001f";
+            foreach (var key in _semanticStatusCache.Keys)
+            {
+                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    _semanticStatusCache.TryRemove(key, out _);
+                }
+            }
+        }
+
+        private void NotifyDatabaseMutated(string dbPath)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath))
+            {
+                return;
+            }
+
+            var normalized = NormalizeDbPath(dbPath);
+            s_dbWriteGenerations.AddOrUpdate(normalized, 1L, static (_, current) => current + 1L);
+            InvalidateSemanticStatusCacheForDb(dbPath);
+        }
+
+        private static long GetDatabaseWriteGeneration(string dbPath)
+        {
+            if (string.IsNullOrWhiteSpace(dbPath))
+            {
+                return 0L;
+            }
+
+            var normalized = NormalizeDbPath(dbPath);
+            return s_dbWriteGenerations.TryGetValue(normalized, out var gen) ? gen : 0L;
+        }
+
+        internal readonly struct CachedSemanticCacheStatus
+        {
+            public CachedSemanticCacheStatus(string indexingStatus, bool hasRelations, long writeGeneration)
+            {
+                IndexingStatus = indexingStatus ?? string.Empty;
+                HasRelations = hasRelations;
+                WriteGeneration = writeGeneration;
+            }
+
+            public string IndexingStatus { get; }
+            public bool HasRelations { get; }
+            public long WriteGeneration { get; }
+        }
+
+        private sealed class PendingLazySemanticWrite
+        {
+            public PendingLazySemanticWrite(string key, string folderPath, string signature, SemanticAssetRelations delta)
+            {
+                Key = key;
+                FolderPath = folderPath;
+                Signature = signature;
+                Delta = delta;
+            }
+
+            public string Key { get; }
+            public string FolderPath { get; }
+            public string Signature { get; }
+            public SemanticAssetRelations Delta { get; }
+        }
+
+        private sealed class PendingPreviewCacheWrite
+        {
+            public PendingPreviewCacheWrite(
+                string key,
+                string folderPath,
+                string signature,
+                string assetUniqueId,
+                string previewKind,
+                int algorithmVersion,
+                string parameters,
+                byte[] payloadBytes,
+                string? externalFilePathFallback,
+                string? payloadHash)
+            {
+                Key = key;
+                FolderPath = folderPath;
+                Signature = signature;
+                AssetUniqueId = assetUniqueId;
+                PreviewKind = previewKind;
+                AlgorithmVersion = algorithmVersion;
+                Parameters = parameters;
+                PayloadBytes = payloadBytes;
+                ExternalFilePathFallback = externalFilePathFallback;
+                PayloadHash = payloadHash;
+            }
+
+            public string Key { get; }
+            public string FolderPath { get; }
+            public string Signature { get; }
+            public string AssetUniqueId { get; }
+            public string PreviewKind { get; }
+            public int AlgorithmVersion { get; }
+            public string Parameters { get; }
+            public byte[] PayloadBytes { get; }
+            public string? ExternalFilePathFallback { get; }
+            public string? PayloadHash { get; }
         }
 
         private long? TryGetOrResolveProjectId(
@@ -548,8 +666,42 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
+            lock (_bgWriteLock)
+            {
+                _pendingLazySemanticWrites.Clear();
+                _pendingLazySemanticWritesByKey.Clear();
+                _pendingPreviewCacheWrites.Clear();
+                _pendingPreviewCacheWritesByKey.Clear();
+            }
+
+            try
+            {
+                _bgWriterIdleEvent.Wait(TimeSpan.FromSeconds(3));
+            }
+            catch
+            {
+            }
+
+            _bgWriterIdleEvent.Dispose();
             InvalidateReadConnectionPool(dbPath: null);
             GC.SuppressFinalize(this);
+        }
+
+        internal bool WaitForBackgroundWritesIdle(TimeSpan timeout)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return true;
+            }
+
+            try
+            {
+                return _bgWriterIdleEvent.Wait(timeout);
+            }
+            catch
+            {
+                return true;
+            }
         }
 
         private static void DisposeQuietly(SqliteConnection conn)
@@ -648,6 +800,7 @@ namespace AssetStudio.Avalonia
                         if (TryUpgradeOrRebuildSchema(conn))
                         {
                             InvalidateProjectIdCacheForDb(dbPath);
+                            NotifyDatabaseMutated(dbPath);
                             InvalidateReadConnectionPool(dbPath);
                             MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
                         }

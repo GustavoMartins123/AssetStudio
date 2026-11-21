@@ -19,12 +19,334 @@ public partial class MainWindow
         "_Cubemap", "_ReflectionTex", "_ShadowMap"
     };
 
+    internal static void BuildSubMeshTextureDeduplicationPlan(
+        int slotCount,
+        IReadOnlyList<string?> subMeshTextureKeys,
+        out List<string> uniqueKeys,
+        out int[] subMeshToUniqueIndex)
+    {
+        uniqueKeys = new List<string>();
+        var safeCount = Math.Max(0, slotCount);
+        subMeshToUniqueIndex = new int[safeCount];
+        Array.Fill(subMeshToUniqueIndex, -1);
+
+        var keyToIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < safeCount; i++)
+        {
+            var key = i < subMeshTextureKeys.Count ? subMeshTextureKeys[i] : null;
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                continue;
+            }
+
+            if (!keyToIndex.TryGetValue(key, out var uniqueIdx))
+            {
+                uniqueIdx = uniqueKeys.Count;
+                uniqueKeys.Add(key);
+                keyToIndex[key] = uniqueIdx;
+            }
+
+            subMeshToUniqueIndex[i] = uniqueIdx;
+        }
+    }
+
+    private List<ResolvedMeshSubMeshMaterial> TryLoadResolvedMeshMaterialsForPreview(Mesh mesh, string? rendererAssetId = null)
+    {
+        if (!assetsManager.LazyLoading || mesh.assetsFile == null || currentScanResult == null)
+        {
+            return new List<ResolvedMeshSubMeshMaterial>();
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return new List<ResolvedMeshSubMeshMaterial>();
+        }
+
+        var meshAssetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+        if (string.IsNullOrWhiteSpace(meshAssetId))
+        {
+            return new List<ResolvedMeshSubMeshMaterial>();
+        }
+
+        // Read directly via WAL without blocking on full connections_completed so lazy_backfill and partial caches work immediately.
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadResolvedMeshMaterials(folderPath, signature, meshAssetId, rendererAssetId);
+    }
+
+    private static byte[]? ConvertPreviewImageToRgbaBytes(TexturePreviewImageResult? previewImage, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        var image = previewImage?.Image;
+        if (image == null || image.Width <= 0 || image.Height <= 0)
+        {
+            return null;
+        }
+
+        width = image.Width;
+        height = image.Height;
+        var rgba = new byte[width * height * 4];
+        image.CopyBgraPixelsTo(rgba);
+        for (int p = 0; p < rgba.Length; p += 4)
+        {
+            byte temp = rgba[p];
+            rgba[p] = rgba[p + 2];
+            rgba[p + 2] = temp;
+            rgba[p + 3] = byte.MaxValue;
+        }
+
+        return rgba;
+    }
+
+    private void BuildDeduplicatedPreviewTexturesFromResolved(
+        int slotCount,
+        IReadOnlyList<ResolvedMeshSubMeshMaterial> resolvedSlots,
+        Func<bool>? isCancelled,
+        out List<byte[]?> uniqueTextures,
+        out List<int> uniqueWidths,
+        out List<int> uniqueHeights,
+        out int[] subMeshToTextureIndex,
+        out List<string> loadedTextureFileNames)
+    {
+        var bySubMesh = new Dictionary<int, string?>(resolvedSlots.Count);
+        foreach (var slot in resolvedSlots)
+        {
+            if (slot.SubMeshIndex >= 0 && !bySubMesh.ContainsKey(slot.SubMeshIndex))
+            {
+                bySubMesh[slot.SubMeshIndex] = string.IsNullOrWhiteSpace(slot.MainTextureAssetId)
+                    ? null
+                    : slot.MainTextureAssetId;
+            }
+        }
+
+        var subMeshTexKeys = new string?[Math.Max(0, slotCount)];
+        for (int i = 0; i < subMeshTexKeys.Length; i++)
+        {
+            if (bySubMesh.TryGetValue(i, out var texId))
+            {
+                subMeshTexKeys[i] = texId;
+            }
+        }
+
+        BuildDeduplicatedPreviewTexturesByAssetIds(
+            subMeshTexKeys,
+            isCancelled,
+            out uniqueTextures,
+            out uniqueWidths,
+            out uniqueHeights,
+            out subMeshToTextureIndex,
+            out loadedTextureFileNames);
+    }
+
+    private void BuildDeduplicatedPreviewTexturesByAssetIds(
+        IReadOnlyList<string?> subMeshTextureIds,
+        Func<bool>? isCancelled,
+        out List<byte[]?> uniqueTextures,
+        out List<int> uniqueWidths,
+        out List<int> uniqueHeights,
+        out int[] subMeshToTextureIndex,
+        out List<string> loadedTextureFileNames)
+    {
+        loadedTextureFileNames = new List<string>();
+        BuildSubMeshTextureDeduplicationPlan(subMeshTextureIds.Count, subMeshTextureIds, out var uniqueTexIds, out subMeshToTextureIndex);
+
+        uniqueTextures = new List<byte[]?>(uniqueTexIds.Count);
+        uniqueWidths = new List<int>(uniqueTexIds.Count);
+        uniqueHeights = new List<int>(uniqueTexIds.Count);
+        for (int i = 0; i < uniqueTexIds.Count; i++)
+        {
+            uniqueTextures.Add(null);
+            uniqueWidths.Add(0);
+            uniqueHeights.Add(0);
+        }
+
+        if (uniqueTexIds.Count == 0)
+        {
+            return;
+        }
+
+        var coldMisses = new List<(int UniqueIndex, string TexId, AssetHandle Handle, string SourceKey)>();
+
+        // Pass 1: warm PNG thumbnail cache hits (0 .assets files loaded!)
+        for (int i = 0; i < uniqueTexIds.Count; i++)
+        {
+            if (isCancelled?.Invoke() == true)
+            {
+                return;
+            }
+
+            var texId = uniqueTexIds[i];
+            try
+            {
+                using var cachedThumb = TryLoadCachedTexturePreviewThumbnailByAssetId(texId, MaxCachedPreviewTextureDimension);
+                var rgba = ConvertPreviewImageToRgbaBytes(cachedThumb, out var tw, out var th);
+                if (rgba != null)
+                {
+                    uniqueTextures[i] = rgba;
+                    uniqueWidths[i] = tw;
+                    uniqueHeights[i] = th;
+                    continue;
+                }
+            }
+            catch
+            {
+            }
+
+            var handle = assetsManager.ProjectIndex.GetHandle(texId);
+            if (handle != null)
+            {
+                var sourceKey = ResolveLazyHandleSourcePath(handle) ?? handle.SerializedFileName ?? string.Empty;
+                coldMisses.Add((i, texId, handle, sourceKey));
+            }
+        }
+
+        if (coldMisses.Count == 0)
+        {
+            return;
+        }
+
+        // Pass 2: group cold texture misses by source file so each .assets file loads at most once.
+        var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in coldMisses.GroupBy(item => item.SourceKey, StringComparer.OrdinalIgnoreCase))
+        {
+            if (isCancelled?.Invoke() == true)
+            {
+                return;
+            }
+
+            foreach (var item in group)
+            {
+                if (isCancelled?.Invoke() == true)
+                {
+                    return;
+                }
+
+                try
+                {
+                    var obj = ResolveSemanticRelationHandleForPreview(item.Handle);
+                    if (obj is Texture2D tex)
+                    {
+                        var fileName = tex.assetsFile?.fileName;
+                        if (!string.IsNullOrWhiteSpace(fileName) && seenFileNames.Add(fileName))
+                        {
+                            loadedTextureFileNames.Add(fileName);
+                        }
+
+                        using var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension);
+                        var rgba = ConvertPreviewImageToRgbaBytes(previewImage, out var tw, out var th);
+                        if (rgba != null)
+                        {
+                            uniqueTextures[item.UniqueIndex] = rgba;
+                            uniqueWidths[item.UniqueIndex] = tw;
+                            uniqueHeights[item.UniqueIndex] = th;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+    }
+
+    private void BuildDeduplicatedPreviewTexturesForMaterials(
+        int slotCount,
+        IReadOnlyList<Material?> materials,
+        Func<bool>? isCancelled,
+        out List<byte[]?> uniqueTextures,
+        out List<int> uniqueWidths,
+        out List<int> uniqueHeights,
+        out int[] subMeshToTextureIndex,
+        out List<string> loadedTextureFileNames)
+    {
+        loadedTextureFileNames = new List<string>();
+        var safeCount = Math.Max(0, slotCount);
+        var resolvedTexByMaterial = new Dictionary<Material, Texture2D?>();
+        var subMeshTexKeys = new string?[safeCount];
+        var texByKey = new Dictionary<string, Texture2D>(StringComparer.Ordinal);
+
+        for (int i = 0; i < safeCount; i++)
+        {
+            if (isCancelled?.Invoke() == true)
+            {
+                uniqueTextures = new List<byte[]?>();
+                uniqueWidths = new List<int>();
+                uniqueHeights = new List<int>();
+                subMeshToTextureIndex = Array.Empty<int>();
+                return;
+            }
+
+            var mat = i < materials.Count ? materials[i] : null;
+            if (mat == null)
+            {
+                continue;
+            }
+
+            if (!resolvedTexByMaterial.TryGetValue(mat, out var tex))
+            {
+                tex = FindTextureForMaterial(mat);
+                resolvedTexByMaterial[mat] = tex;
+            }
+
+            if (tex != null)
+            {
+                var key = GetPreviewObjectKey(tex);
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    subMeshTexKeys[i] = key;
+                    texByKey.TryAdd(key, tex);
+                }
+            }
+        }
+
+        BuildSubMeshTextureDeduplicationPlan(safeCount, subMeshTexKeys, out var uniqueKeys, out subMeshToTextureIndex);
+
+        uniqueTextures = new List<byte[]?>(uniqueKeys.Count);
+        uniqueWidths = new List<int>(uniqueKeys.Count);
+        uniqueHeights = new List<int>(uniqueKeys.Count);
+        var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        for (int i = 0; i < uniqueKeys.Count; i++)
+        {
+            if (isCancelled?.Invoke() == true)
+            {
+                return;
+            }
+
+            byte[]? tb = null;
+            int tw = 0, th = 0;
+            if (texByKey.TryGetValue(uniqueKeys[i], out var tex))
+            {
+                var fileName = tex.assetsFile?.fileName;
+                if (!string.IsNullOrWhiteSpace(fileName) && seenFileNames.Add(fileName))
+                {
+                    loadedTextureFileNames.Add(fileName);
+                }
+
+                try
+                {
+                    using var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension);
+                    tb = ConvertPreviewImageToRgbaBytes(previewImage, out tw, out th);
+                }
+                catch
+                {
+                }
+            }
+
+            uniqueTextures.Add(tb);
+            uniqueWidths.Add(tw);
+            uniqueHeights.Add(th);
+        }
+    }
+
     private void AddPreviewTextureSlotsForMesh(
         Mesh mesh,
         IReadOnlyList<Material?> materials,
         List<byte[]?> subMeshTextures,
         List<int> subMeshTexWidths,
-        List<int> subMeshTexHeights)
+        List<int> subMeshTexHeights,
+        Func<bool>? isCancelled = null)
     {
         var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
         if (slotCount <= 0 && mesh.m_Indices?.Count > 0)
@@ -32,46 +354,31 @@ public partial class MainWindow
             slotCount = 1;
         }
 
+        BuildDeduplicatedPreviewTexturesForMaterials(
+            slotCount,
+            materials,
+            isCancelled,
+            out var uniqueTextures,
+            out var uniqueWidths,
+            out var uniqueHeights,
+            out var subMeshMap,
+            out _);
+
         for (int i = 0; i < slotCount; i++)
         {
-            byte[]? tb = null;
-            int tw = 0, th = 0;
-
-            if (i < materials.Count && materials[i] != null)
+            var mapped = i < subMeshMap.Length ? subMeshMap[i] : -1;
+            if (mapped >= 0 && mapped < uniqueTextures.Count)
             {
-                var tex = FindTextureForMaterial(materials[i]!);
-                if (tex != null)
-                {
-                    try
-                    {
-                        using (var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension))
-                        {
-                            var image = previewImage?.Image;
-                            if (image != null)
-                            {
-                                tw = image.Width;
-                                th = image.Height;
-                                tb = new byte[tw * th * 4];
-                                image.CopyBgraPixelsTo(tb);
-                                for (int p = 0; p < tb.Length; p += 4)
-                                {
-                                    byte temp = tb[p];
-                                    tb[p] = tb[p + 2];
-                                    tb[p + 2] = temp;
-                                    tb[p + 3] = byte.MaxValue;
-                                }
-                            }
-                        }
-                    }
-                    catch
-                    {
-                    }
-                }
+                subMeshTextures.Add(uniqueTextures[mapped]);
+                subMeshTexWidths.Add(uniqueWidths[mapped]);
+                subMeshTexHeights.Add(uniqueHeights[mapped]);
             }
-
-            subMeshTextures.Add(tb);
-            subMeshTexWidths.Add(tw);
-            subMeshTexHeights.Add(th);
+            else
+            {
+                subMeshTextures.Add(null);
+                subMeshTexWidths.Add(0);
+                subMeshTexHeights.Add(0);
+            }
         }
     }
 
@@ -114,17 +421,12 @@ public partial class MainWindow
             return new List<Material?>();
         }
 
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
-        {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
-        }
-
-        if (filesSnapshot.Count > 0)
+        // Bounded local-file fallback: inspect only mesh.assetsFile (never re-index all 50 preloaded files).
+        if (mesh.assetsFile != null)
         {
             using (assetsManager.LruCache.SuspendEviction())
             {
-                BuildLazyPreviewReferenceIndexes(filesSnapshot);
+                BuildLazyPreviewReferenceIndexes(new List<SerializedFile> { mesh.assetsFile });
             }
 
             if (meshToMaterialsCache != null && meshToMaterialsCache.TryGetValue(mesh, out cachedList))
@@ -171,7 +473,7 @@ public partial class MainWindow
         }
 
         var folderPath = GetCurrentCacheFolderPath();
-        if (!CanUseLazySemanticRelationCache(folderPath))
+        if (string.IsNullOrWhiteSpace(folderPath))
         {
             return materials;
         }
@@ -184,6 +486,8 @@ public partial class MainWindow
             return materials;
         }
 
+        // Deduplicate material handles before resolving so repeated submesh slots resolve each Material once.
+        var resolvedById = new Dictionary<string, Material?>(StringComparer.Ordinal);
         foreach (var materialId in materialIds)
         {
             if (string.IsNullOrWhiteSpace(materialId))
@@ -192,22 +496,14 @@ public partial class MainWindow
                 continue;
             }
 
-            var handle = assetsManager.ProjectIndex.GetHandle(materialId);
-            if (handle == null)
+            if (!resolvedById.TryGetValue(materialId, out var resolvedMat))
             {
-                materials.Add(null);
-                continue;
+                var handle = assetsManager.ProjectIndex.GetHandle(materialId);
+                resolvedMat = handle != null ? ResolveSemanticRelationHandleForPreview(handle) as Material : null;
+                resolvedById[materialId] = resolvedMat;
             }
 
-            var asset = ResolveSemanticRelationHandleForPreview(handle);
-            if (asset is Material material)
-            {
-                materials.Add(material);
-            }
-            else
-            {
-                materials.Add(null);
-            }
+            materials.Add(resolvedMat);
         }
 
         if (materials.Any(material => material != null))
@@ -279,13 +575,30 @@ public partial class MainWindow
         }
 
         var folderPath = GetCurrentCacheFolderPath();
-        if (!CanUseLazySemanticRelationCache(folderPath))
+        if (string.IsNullOrWhiteSpace(folderPath))
         {
             return null;
         }
 
         var materialAssetId = AssetHandle.BuildUniqueID(material.assetsFile, material.m_PathID);
         var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+
+        // Fast v15 O(1) MaterialCache PK lookup when looking for main texture (works via WAL even during connections build).
+        if (string.IsNullOrEmpty(slotName))
+        {
+            var cachedEntry = _sqliteCache.LoadMaterialCacheEntry(folderPath, signature, materialAssetId);
+            if (cachedEntry != null && !string.IsNullOrWhiteSpace(cachedEntry.MainTextureAssetId))
+            {
+                var mainHandle = assetsManager.ProjectIndex.GetHandle(cachedEntry.MainTextureAssetId);
+                if (mainHandle != null && ResolveSemanticRelationHandleForPreview(mainHandle) is Texture2D mainTex)
+                {
+                    materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
+                    materialMainTextureCache[material] = mainTex;
+                    return mainTex;
+                }
+            }
+        }
+
         var texture = TryResolveTextureIdsForMaterialFromSemanticCache(folderPath, signature, material, materialAssetId, slotName);
         if (texture != null)
         {

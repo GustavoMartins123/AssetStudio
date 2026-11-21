@@ -15,53 +15,466 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            EnsureInitialized(folderPath);
-            var dbPath = GetDbPath(folderPath);
-            try
+            return GetOrResolveSemanticCacheStatus(folderPath, signature).HasRelations;
+        }
+
+        internal List<ResolvedMeshSubMeshMaterial> LoadResolvedMeshMaterials(
+            string folderPath,
+            string signature,
+            string meshAssetId,
+            string? rendererAssetId = null)
+        {
+            var result = new List<ResolvedMeshSubMeshMaterial>();
+            if (string.IsNullOrWhiteSpace(meshAssetId))
             {
-                using var lease = RentReadConnection(dbPath);
-                var conn = lease.Connection;
-                try
+                return result;
+            }
+
+            ExecuteProjectReadQuery(folderPath, signature, "resolved mesh materials", (conn, transaction, projectId) =>
+            {
+                if (!string.IsNullOrWhiteSpace(rendererAssetId))
                 {
-                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
-                    if (projectId == null)
+                    using var rendererCmd = conn.CreateCommand();
+                    rendererCmd.Transaction = transaction;
+                    rendererCmd.CommandText = @"
+                        WITH RankedBySubMesh AS (
+                            SELECT
+                                mm.MeshAssetUniqueID,
+                                mm.SubMeshIndex,
+                                mm.MaterialAssetUniqueID,
+                                mm.RendererAssetUniqueID,
+                                mm.RendererType,
+                                COALESCE(NULLIF(mc.MaterialName, ''), matAsset.Name, '') AS MaterialName,
+                                COALESCE(mc.MainTextureAssetUniqueID, '') AS MainTextureAssetUniqueID,
+                                COALESCE(mc.MainTextureSlotName, '') AS MainTextureSlotName,
+                                COALESCE(mc.BaseColorR, 1.0) AS BaseColorR,
+                                COALESCE(mc.BaseColorG, 1.0) AS BaseColorG,
+                                COALESCE(mc.BaseColorB, 1.0) AS BaseColorB,
+                                COALESCE(mc.BaseColorA, 1.0) AS BaseColorA,
+                                COALESCE(NULLIF(mc.ResolutionSource, ''), 'preparation') AS ResolutionSource,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY mm.SubMeshIndex
+                                    ORDER BY
+                                        CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                        mm.MaterialSlotIndex ASC,
+                                        mm.MaterialAssetUniqueID ASC
+                                ) AS RowNum
+                            FROM MeshMaterials mm
+                            LEFT JOIN MaterialCache mc
+                              ON mc.ProjectId = mm.ProjectId
+                             AND mc.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                            LEFT JOIN Assets matAsset
+                              ON matAsset.ProjectId = mm.ProjectId
+                             AND mm.MaterialAssetUniqueID <> ''
+                             AND matAsset.UniqueID = mm.MaterialAssetUniqueID
+                            WHERE mm.ProjectId = @projectId
+                              AND mm.MeshAssetUniqueID = @meshAssetId
+                              AND mm.RendererAssetUniqueID = @rendererAssetId
+                        )
+                        SELECT
+                            MeshAssetUniqueID, SubMeshIndex, MaterialAssetUniqueID,
+                            RendererAssetUniqueID, RendererType, MaterialName,
+                            MainTextureAssetUniqueID, MainTextureSlotName,
+                            BaseColorR, BaseColorG, BaseColorB, BaseColorA, ResolutionSource
+                        FROM RankedBySubMesh
+                        WHERE RowNum = 1
+                        ORDER BY SubMeshIndex";
+                    rendererCmd.Parameters.AddWithValue("@projectId", projectId);
+                    rendererCmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                    rendererCmd.Parameters.AddWithValue("@rendererAssetId", rendererAssetId);
+                    using var reader = rendererCmd.ExecuteReader();
+                    while (reader.Read())
                     {
-                        return false;
+                        result.Add(ReadResolvedMeshSubMeshMaterial(reader));
                     }
 
-                    var count = CountMaterialSemanticRelations(conn, null, projectId.Value);
-                    if (count == 0 && fromCache)
+                    if (result.Count > 0)
                     {
-                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                        if (verifiedProjectId == null)
-                        {
-                            return false;
-                        }
-
-                        if (verifiedProjectId.Value != projectId.Value)
-                        {
-                            count = CountMaterialSemanticRelations(conn, null, verifiedProjectId.Value);
-                        }
+                        return;
                     }
+                }
 
-                    return count > 0;
-                }
-                catch
+                // O(1) PK range scan on MeshMaterialResolvedCache
+                using (var cacheCmd = conn.CreateCommand())
                 {
-                    lease.MarkUnhealthy();
-                    throw;
+                    cacheCmd.Transaction = transaction;
+                    cacheCmd.CommandText = @"
+                        SELECT
+                            MeshAssetUniqueID, SubMeshIndex, MaterialAssetUniqueID,
+                            RendererAssetUniqueID, RendererType, MaterialName,
+                            MainTextureAssetUniqueID, MainTextureSlotName,
+                            BaseColorR, BaseColorG, BaseColorB, BaseColorA, ResolutionSource
+                        FROM MeshMaterialResolvedCache
+                        WHERE ProjectId = @projectId
+                          AND MeshAssetUniqueID = @meshAssetId
+                        ORDER BY SubMeshIndex";
+                    cacheCmd.Parameters.AddWithValue("@projectId", projectId);
+                    cacheCmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                    using var reader = cacheCmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        result.Add(ReadResolvedMeshSubMeshMaterial(reader));
+                    }
+                }
+            });
+
+            return result;
+        }
+
+        private static ResolvedMeshSubMeshMaterial ReadResolvedMeshSubMeshMaterial(SqliteDataReader reader)
+        {
+            return new ResolvedMeshSubMeshMaterial(
+                reader.GetString(0),
+                reader.GetInt32(1),
+                reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+                reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+                reader.IsDBNull(7) ? string.Empty : reader.GetString(7),
+                reader.IsDBNull(8) ? 1f : (float)reader.GetDouble(8),
+                reader.IsDBNull(9) ? 1f : (float)reader.GetDouble(9),
+                reader.IsDBNull(10) ? 1f : (float)reader.GetDouble(10),
+                reader.IsDBNull(11) ? 1f : (float)reader.GetDouble(11),
+                reader.IsDBNull(12) ? "preparation" : reader.GetString(12));
+        }
+
+        internal MaterialCacheEntryInfo? LoadMaterialCacheEntry(string folderPath, string signature, string materialAssetId)
+        {
+            if (string.IsNullOrWhiteSpace(materialAssetId))
+            {
+                return null;
+            }
+
+            MaterialCacheEntryInfo? result = null;
+            ExecuteProjectReadQuery(folderPath, signature, "material cache entry", (conn, transaction, projectId) =>
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        MaterialAssetUniqueID, MaterialName, ParentMaterialAssetUniqueID,
+                        MainTextureAssetUniqueID, MainTextureSlotName,
+                        BaseColorR, BaseColorG, BaseColorB, BaseColorA,
+                        ShaderName, TextureSlotCount, ResolutionSource
+                    FROM MaterialCache
+                    WHERE ProjectId = @projectId
+                      AND MaterialAssetUniqueID = @materialAssetId
+                    LIMIT 1";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                cmd.Parameters.AddWithValue("@materialAssetId", materialAssetId);
+                using var reader = cmd.ExecuteReader();
+                if (reader.Read())
+                {
+                    result = new MaterialCacheEntryInfo(
+                        reader.GetString(0),
+                        reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                        reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+                        reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                        reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                        reader.IsDBNull(5) ? 1f : (float)reader.GetDouble(5),
+                        reader.IsDBNull(6) ? 1f : (float)reader.GetDouble(6),
+                        reader.IsDBNull(7) ? 1f : (float)reader.GetDouble(7),
+                        reader.IsDBNull(8) ? 1f : (float)reader.GetDouble(8),
+                        reader.IsDBNull(9) ? string.Empty : reader.GetString(9),
+                        reader.IsDBNull(10) ? 0 : reader.GetInt32(10),
+                        reader.IsDBNull(11) ? "preparation" : reader.GetString(11));
+                }
+            });
+
+            return result;
+        }
+
+        internal List<MaterialTextureSlotInfo> LoadMaterialTextureSlots(string folderPath, string signature, string materialAssetId)
+        {
+            var result = new List<MaterialTextureSlotInfo>();
+            if (string.IsNullOrWhiteSpace(materialAssetId))
+            {
+                return result;
+            }
+
+            ExecuteProjectReadQuery(folderPath, signature, "material texture slots", (conn, transaction, projectId) =>
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    SELECT
+                        MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex,
+                        TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture,
+                        ScaleX, ScaleY, OffsetX, OffsetY, ResolutionSource
+                    FROM (
+                        SELECT
+                            MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex,
+                            TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture,
+                            ScaleX, ScaleY, OffsetX, OffsetY, ResolutionSource, 0 AS SourceRank
+                        FROM MaterialTextures
+                        WHERE ProjectId = @projectId
+                          AND MaterialAssetUniqueID = @materialAssetId
+                        UNION ALL
+                        SELECT
+                            MaterialAssetUniqueID, PreviewMaterialAssetUniqueID, SlotName, SlotIndex,
+                            TextureAssetUniqueID, TextureFileId, TexturePathID, IsResolved, IsMainTexture,
+                            ScaleX, ScaleY, OffsetX, OffsetY, ResolutionSource, 1 AS SourceRank
+                        FROM MaterialTextures
+                        WHERE ProjectId = @projectId
+                          AND PreviewMaterialAssetUniqueID = @materialAssetId
+                          AND PreviewMaterialAssetUniqueID <> MaterialAssetUniqueID
+                    )
+                    ORDER BY SourceRank ASC, IsMainTexture DESC, SlotIndex ASC, SlotName ASC";
+                cmd.Parameters.AddWithValue("@projectId", projectId);
+                cmd.Parameters.AddWithValue("@materialAssetId", materialAssetId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(new MaterialTextureSlotInfo(
+                        reader.GetString(0),
+                        reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetInt32(3),
+                        reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                        reader.GetInt32(5),
+                        reader.GetInt64(6),
+                        reader.GetInt32(7) != 0,
+                        reader.GetInt32(8) != 0,
+                        reader.IsDBNull(9) ? 1f : (float)reader.GetDouble(9),
+                        reader.IsDBNull(10) ? 1f : (float)reader.GetDouble(10),
+                        reader.IsDBNull(11) ? 0f : (float)reader.GetDouble(11),
+                        reader.IsDBNull(12) ? 0f : (float)reader.GetDouble(12),
+                        reader.IsDBNull(13) ? "preparation" : reader.GetString(13)));
+                }
+            });
+
+            return result;
+        }
+
+        internal CompositeAssetInfo? LoadCompositeAssetWithParts(string folderPath, string signature, string compositeOrMemberAssetId)
+        {
+            if (string.IsNullOrWhiteSpace(compositeOrMemberAssetId))
+            {
+                return null;
+            }
+
+            CompositeAssetInfo? result = null;
+            ExecuteProjectReadQuery(folderPath, signature, "composite asset with parts", (conn, transaction, projectId) =>
+            {
+                var compositeId = string.Empty;
+                using (var findCmd = conn.CreateCommand())
+                {
+                    findCmd.Transaction = transaction;
+                    findCmd.CommandText = @"
+                        SELECT CompositeAssetUniqueID
+                        FROM CompositeAssets
+                        WHERE ProjectId = @projectId
+                          AND CompositeAssetUniqueID = @id
+                        LIMIT 1";
+                    findCmd.Parameters.AddWithValue("@projectId", projectId);
+                    findCmd.Parameters.AddWithValue("@id", compositeOrMemberAssetId);
+                    compositeId = findCmd.ExecuteScalar()?.ToString() ?? string.Empty;
+                }
+
+                if (string.IsNullOrEmpty(compositeId))
+                {
+                    using var memberCmd = conn.CreateCommand();
+                    memberCmd.Transaction = transaction;
+                    memberCmd.CommandText = @"
+                        SELECT ca.CompositeAssetUniqueID
+                        FROM CompositeAssetParts cap
+                        INNER JOIN CompositeAssets ca
+                          ON ca.ProjectId = cap.ProjectId
+                         AND ca.CompositeAssetUniqueID = cap.CompositeAssetUniqueID
+                        WHERE cap.ProjectId = @projectId
+                          AND cap.MeshAssetUniqueID = @id
+                        ORDER BY
+                            CASE WHEN ca.CompositeKind = 'Animator' THEN 0 ELSE 1 END,
+                            ca.Confidence DESC,
+                            ca.MeshPartCount ASC,
+                            ca.CompositeAssetUniqueID ASC
+                        LIMIT 1";
+                    memberCmd.Parameters.AddWithValue("@projectId", projectId);
+                    memberCmd.Parameters.AddWithValue("@id", compositeOrMemberAssetId);
+                    compositeId = memberCmd.ExecuteScalar()?.ToString() ?? string.Empty;
+                }
+
+                if (string.IsNullOrEmpty(compositeId))
+                {
+                    return;
+                }
+
+                result = LoadSingleCompositeAssetWithPartsCore(conn, transaction, projectId, compositeId);
+            });
+
+            return result;
+        }
+
+        internal List<CompositeAssetInfo> LoadCompositeAssetsForMesh(string folderPath, string signature, string meshAssetId)
+        {
+            var result = new List<CompositeAssetInfo>();
+            if (string.IsNullOrWhiteSpace(meshAssetId))
+            {
+                return result;
+            }
+
+            ExecuteProjectReadQuery(folderPath, signature, "composite assets for mesh", (conn, transaction, projectId) =>
+            {
+                var compositeIds = new List<string>();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = @"
+                        SELECT DISTINCT ca.CompositeAssetUniqueID
+                        FROM CompositeAssetParts cap
+                        INNER JOIN CompositeAssets ca
+                          ON ca.ProjectId = cap.ProjectId
+                         AND ca.CompositeAssetUniqueID = cap.CompositeAssetUniqueID
+                        WHERE cap.ProjectId = @projectId
+                          AND cap.MeshAssetUniqueID = @meshAssetId
+                        ORDER BY
+                            CASE WHEN ca.CompositeKind = 'Animator' THEN 0 ELSE 1 END,
+                            ca.Confidence DESC,
+                            ca.MeshPartCount ASC,
+                            ca.DisplayName ASC,
+                            ca.CompositeAssetUniqueID ASC";
+                    cmd.Parameters.AddWithValue("@projectId", projectId);
+                    cmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        compositeIds.Add(reader.GetString(0));
+                    }
+                }
+
+                foreach (var cid in compositeIds)
+                {
+                    var info = LoadSingleCompositeAssetWithPartsCore(conn, transaction, projectId, cid);
+                    if (info != null)
+                    {
+                        result.Add(info);
+                    }
+                }
+            });
+
+            return result;
+        }
+
+        private static CompositeAssetInfo? LoadSingleCompositeAssetWithPartsCore(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            string compositeId)
+        {
+            CompositeAssetInfo? info = null;
+            using (var headerCmd = conn.CreateCommand())
+            {
+                headerCmd.Transaction = transaction;
+                headerCmd.CommandText = @"
+                    SELECT
+                        CompositeAssetUniqueID, CompositeKind, DisplayName,
+                        RootGameObjectAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID, ControllerAssetUniqueID,
+                        SourceFileName, MeshPartCount, DistinctMeshCount, DistinctMaterialCount, Confidence, ResolutionSource
+                    FROM CompositeAssets
+                    WHERE ProjectId = @projectId
+                      AND CompositeAssetUniqueID = @compositeId
+                    LIMIT 1";
+                headerCmd.Parameters.AddWithValue("@projectId", projectId);
+                headerCmd.Parameters.AddWithValue("@compositeId", compositeId);
+                using var reader = headerCmd.ExecuteReader();
+                if (reader.Read())
+                {
+                    info = new CompositeAssetInfo(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetString(3),
+                        reader.GetString(4),
+                        reader.GetString(5),
+                        reader.GetString(6),
+                        reader.GetString(7),
+                        reader.GetInt32(8),
+                        reader.GetInt32(9),
+                        reader.GetInt32(10),
+                        reader.GetInt32(11),
+                        reader.GetString(12));
                 }
             }
-            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+
+            if (info == null)
             {
-                return false;
+                return null;
             }
-            catch (Exception ex)
+
+            var seenMeshes = new HashSet<string>(StringComparer.Ordinal);
+            var seenMaterials = new HashSet<string>(StringComparer.Ordinal);
+            var seenTextures = new HashSet<string>(StringComparer.Ordinal);
+
+            using (var partsCmd = conn.CreateCommand())
             {
-                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
-                Logger.Warning($"Failed to inspect semantic asset relations: {ex.Message}");
-                return false;
+                partsCmd.Transaction = transaction;
+                partsCmd.CommandText = @"
+                    SELECT
+                        cap.CompositeAssetUniqueID,
+                        cap.PartIndex,
+                        cap.MeshAssetUniqueID,
+                        cap.RendererAssetUniqueID,
+                        cap.RendererType,
+                        cap.GameObjectAssetUniqueID,
+                        cap.GameObjectName,
+                        cap.TransformMatrix,
+                        cap.PrimaryMaterialAssetUniqueID,
+                        cap.Confidence,
+                        COALESCE(mesh.Name, ''),
+                        COALESCE(mesh.PathID, 0),
+                        COALESCE(mesh.ByteSize, 0),
+                        COALESCE(mc.MainTextureAssetUniqueID, '')
+                    FROM CompositeAssetParts cap
+                    LEFT JOIN Assets mesh
+                      ON mesh.ProjectId = cap.ProjectId
+                     AND mesh.UniqueID = cap.MeshAssetUniqueID
+                    LEFT JOIN MaterialCache mc
+                      ON mc.ProjectId = cap.ProjectId
+                     AND cap.PrimaryMaterialAssetUniqueID <> ''
+                     AND mc.MaterialAssetUniqueID = cap.PrimaryMaterialAssetUniqueID
+                    WHERE cap.ProjectId = @projectId
+                      AND cap.CompositeAssetUniqueID = @compositeId
+                    ORDER BY cap.PartIndex ASC";
+                partsCmd.Parameters.AddWithValue("@projectId", projectId);
+                partsCmd.Parameters.AddWithValue("@compositeId", compositeId);
+                using var reader = partsCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var meshId = reader.GetString(2);
+                    var matId = reader.IsDBNull(8) ? string.Empty : reader.GetString(8);
+                    var texId = reader.IsDBNull(13) ? string.Empty : reader.GetString(13);
+                    info.Parts.Add(new CompositeAssetPartInfo(
+                        reader.GetString(0),
+                        reader.GetInt32(1),
+                        meshId,
+                        reader.GetString(3),
+                        reader.GetString(4),
+                        reader.GetString(5),
+                        reader.GetString(6),
+                        ReadTransformMatrix(reader, 7),
+                        matId,
+                        reader.GetInt32(9),
+                        reader.GetString(10),
+                        reader.GetInt64(11),
+                        reader.GetInt64(12)));
+
+                    if (!string.IsNullOrEmpty(meshId) && seenMeshes.Add(meshId))
+                    {
+                        info.DistinctMeshIds.Add(meshId);
+                    }
+                    if (!string.IsNullOrEmpty(matId) && seenMaterials.Add(matId))
+                    {
+                        info.DistinctMaterialIds.Add(matId);
+                    }
+                    if (!string.IsNullOrEmpty(texId) && seenTextures.Add(texId))
+                    {
+                        info.DistinctTextureIds.Add(texId);
+                    }
+                }
             }
+
+            return info;
         }
 
         internal List<string?> LoadMeshMaterialAssetIds(string folderPath, string signature, string meshAssetId)
@@ -74,6 +487,37 @@ namespace AssetStudio.Avalonia
 
             ExecuteProjectReadQuery(folderPath, signature, "mesh material relations", (conn, transaction, projectId) =>
             {
+                // Fast v15 path: single PK range scan on pre-ranked MeshMaterialResolvedCache (<0.2ms)
+                using (var fastCmd = conn.CreateCommand())
+                {
+                    fastCmd.Transaction = transaction;
+                    fastCmd.CommandText = @"
+                        SELECT SubMeshIndex, MaterialAssetUniqueID
+                        FROM MeshMaterialResolvedCache
+                        WHERE ProjectId = @projectId
+                          AND MeshAssetUniqueID = @meshAssetId
+                        ORDER BY SubMeshIndex";
+                    fastCmd.Parameters.AddWithValue("@projectId", projectId);
+                    fastCmd.Parameters.AddWithValue("@meshAssetId", meshAssetId);
+                    using var fastReader = fastCmd.ExecuteReader();
+                    while (fastReader.Read())
+                    {
+                        var subMeshIndex = fastReader.GetInt32(0);
+                        var materialAssetId = fastReader.IsDBNull(1) ? string.Empty : fastReader.GetString(1);
+                        while (result.Count < subMeshIndex)
+                        {
+                            result.Add(null);
+                        }
+
+                        result.Add(string.IsNullOrWhiteSpace(materialAssetId) ? null : materialAssetId);
+                    }
+                }
+
+                if (result.Count > 0)
+                {
+                    return;
+                }
+
                 using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
                 cmd.CommandText = @"
@@ -480,11 +924,17 @@ namespace AssetStudio.Avalonia
                      AND mg.GroupAssetUniqueID = t.ModelGroupId
                     WHERE t.ProjectId = @projectId
                       AND t.ClipAssetUniqueID = @clipAssetId
+                      AND (t.AvatarAssetUniqueID <> '' OR t.MeshAssetUniqueID <> '' OR t.ModelGroupId <> '')
                     ORDER BY
+                        CASE
+                            WHEN t.AvatarAssetUniqueID <> '' AND t.MeshAssetUniqueID <> '' THEN 0
+                            WHEN t.ModelGroupId <> '' THEN 1
+                            WHEN t.MeshAssetUniqueID <> '' THEN 2
+                            ELSE 3
+                        END,
                         t.MatchScore DESC,
                         t.MatchedBoneCount DESC,
                         CASE WHEN t.ModelGroupId <> '' THEN 0 ELSE 1 END,
-                        CASE WHEN t.AvatarAssetUniqueID <> '' AND t.MeshAssetUniqueID <> '' THEN 0 ELSE 1 END,
                         t.AvatarAssetUniqueID,
                         t.MeshAssetUniqueID,
                         t.ModelGroupId

@@ -8,11 +8,12 @@ namespace AssetStudio.Avalonia
     public partial class SQLiteProjectIndexCache
     {
         /// <summary>
-        /// v14: adds pre-indexed <c>AnimationClipTargets</c> (WITHOUT ROWID) and bone-hash staging tables
-        /// (<c>Stage_AnimationClipTargets</c>, <c>Stage_RigBoneHashes</c>, <c>Stage_ClipBoneHashes</c>)
-        /// for O(1) &lt; 1 ms <c>AnimationClip</c> ↔ <c>Animator</c>/<c>Avatar</c>/<c>Mesh</c>/<c>ModelGroup</c> resolution.
+        /// v15: adds persistent reusable <c>MaterialCache</c>, <c>MeshMaterialResolvedCache</c>,
+        /// <c>CompositeAssets</c>, and <c>CompositeAssetParts</c> tables (all WITHOUT ROWID),
+        /// extends <c>MaterialTextures</c> with scale/offset/source metadata, and adds
+        /// <c>idx_model_groups_animator</c> to eliminate full-table scans during Commit().
         /// </summary>
-        internal const int SemanticSchemaVersion = 14;
+        internal const int SemanticSchemaVersion = 15;
 
         private const string AssetHandlesCompatibilityViewSql = @"
             CREATE VIEW IF NOT EXISTS AssetHandles AS
@@ -41,13 +42,21 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            if ((existingVersion == 11 || existingVersion == 12 || existingVersion == 13) && CanPreserveV11ProjectsAndPreviewCache(conn))
+            if ((existingVersion == 11 || existingVersion == 12 || existingVersion == 13 || existingVersion == 14)
+                && CanPreserveV11ProjectsAndPreviewCache(conn))
             {
-                if ((existingVersion == 12 || existingVersion == 13) && CanPreserveV12UnifiedAssets(conn))
+                if (existingVersion == 14 && CanPreserveV12UnifiedAssets(conn))
+                {
+                    // v14 -> v15 in-place upgrade preserves Projects/SourceFiles/Assets/PreviewCacheEntries
+                    // and all v14 semantic tables + valid structure_completed/connections_completed state,
+                    // while backfilling MaterialCache, MeshMaterialResolvedCache, and CompositeAssets in SQL (<1s).
+                    UpgradeV14ToV15InPlace(conn);
+                }
+                else if ((existingVersion == 12 || existingVersion == 13) && CanPreserveV12UnifiedAssets(conn))
                 {
                     // v12/v13 Assets already holds every handle column (paths via SourceFiles): keep the
-                    // whole index cache and preview cache in place and add v14 animation relation tables.
-                    UpgradeV12OrV13ToV14InPlace(conn);
+                    // whole index cache and preview cache in place and add v14/v15 semantic relation tables.
+                    UpgradeV12OrV13ToV15InPlace(conn);
                 }
                 else
                 {
@@ -115,10 +124,11 @@ namespace AssetStudio.Avalonia
                 && previewColumns.Contains("ByteSize");
         }
 
-        private static HashSet<string> GetTableColumnNames(SqliteConnection conn, string tableName)
+        private static HashSet<string> GetTableColumnNames(SqliteConnection conn, string tableName, SqliteTransaction? transaction = null)
         {
             var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             using var infoCmd = conn.CreateCommand();
+            infoCmd.Transaction = transaction;
             infoCmd.CommandText = $"PRAGMA table_info({tableName});";
             using var reader = infoCmd.ExecuteReader();
             while (reader.Read())
@@ -178,7 +188,7 @@ namespace AssetStudio.Avalonia
             return Convert.ToInt64(orphanCmd.ExecuteScalar()) == 0;
         }
 
-        private static void UpgradeV12OrV13ToV14InPlace(SqliteConnection conn)
+        private static void UpgradeV12OrV13ToV15InPlace(SqliteConnection conn)
         {
             DropAssetHandlesSchemaObject(conn);
             using var cmd = conn.CreateCommand();
@@ -187,15 +197,485 @@ namespace AssetStudio.Avalonia
                 DROP INDEX IF EXISTS idx_projects_path;";
             cmd.ExecuteNonQuery();
 
+            EnsureMaterialTexturesV15Columns(conn, transaction: null);
+
             if (GetTableColumnNames(conn, "ProjectIndexingState").Contains("Status"))
             {
                 using var statusCmd = conn.CreateCommand();
                 statusCmd.CommandText = @"
                     UPDATE ProjectIndexingState
                     SET Status = 'completed',
-                        CurrentFile = 'Schema upgraded to v14; connections ready to rebuild'
+                        CurrentFile = 'Schema upgraded to v15; connections ready to rebuild'
                     WHERE Status IN ('connections_completed', 'structure_completed', 'building_structure');";
                 statusCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void UpgradeV14ToV15InPlace(SqliteConnection conn)
+        {
+            using var transaction = conn.BeginTransaction();
+            EnsureMaterialTexturesV15Columns(conn, transaction);
+            EnsureV15DerivedCacheTablesAndIndexes(conn, transaction);
+
+            // Clean any empty v14 AnimationClipTargets rows where Avatar, Mesh, and ModelGroupId are all empty.
+            if (GetTableColumnNames(conn, "AnimationClipTargets", transaction).Contains("ClipAssetUniqueID"))
+            {
+                using var cleanCmd = conn.CreateCommand();
+                cleanCmd.Transaction = transaction;
+                cleanCmd.CommandText = @"
+                    DELETE FROM AnimationClipTargets
+                    WHERE AvatarAssetUniqueID = ''
+                      AND MeshAssetUniqueID = ''
+                      AND ModelGroupId = '';";
+                cleanCmd.ExecuteNonQuery();
+            }
+
+            // Fast set-based SQL backfill of MaterialCache, MeshMaterialResolvedCache, CompositeAssets, and CompositeAssetParts
+            // for every existing project without resetting valid structure_completed / connections_completed status.
+            var projectIds = new List<long>();
+            using (var projCmd = conn.CreateCommand())
+            {
+                projCmd.Transaction = transaction;
+                projCmd.CommandText = "SELECT Id FROM Projects;";
+                using var reader = projCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    projectIds.Add(reader.GetInt64(0));
+                }
+            }
+
+            foreach (var projectId in projectIds)
+            {
+                BackfillV15DerivedCachesForProject(conn, transaction, projectId);
+            }
+
+            transaction.Commit();
+        }
+
+        private static void EnsureMaterialTexturesV15Columns(SqliteConnection conn, SqliteTransaction? transaction)
+        {
+            var mtColumns = GetTableColumnNames(conn, "MaterialTextures", transaction);
+            if (mtColumns.Count == 0)
+            {
+                return;
+            }
+
+            var additions = new (string Name, string Ddl)[]
+            {
+                ("ScaleX", "ALTER TABLE MaterialTextures ADD COLUMN ScaleX REAL NOT NULL DEFAULT 1.0;"),
+                ("ScaleY", "ALTER TABLE MaterialTextures ADD COLUMN ScaleY REAL NOT NULL DEFAULT 1.0;"),
+                ("OffsetX", "ALTER TABLE MaterialTextures ADD COLUMN OffsetX REAL NOT NULL DEFAULT 0.0;"),
+                ("OffsetY", "ALTER TABLE MaterialTextures ADD COLUMN OffsetY REAL NOT NULL DEFAULT 0.0;"),
+                ("ResolutionSource", "ALTER TABLE MaterialTextures ADD COLUMN ResolutionSource TEXT NOT NULL DEFAULT 'preparation';")
+            };
+
+            foreach (var (name, ddl) in additions)
+            {
+                if (!mtColumns.Contains(name))
+                {
+                    using var alterCmd = conn.CreateCommand();
+                    alterCmd.Transaction = transaction;
+                    alterCmd.CommandText = ddl;
+                    alterCmd.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private static void EnsureV15DerivedCacheTablesAndIndexes(SqliteConnection conn, SqliteTransaction? transaction)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                CREATE TABLE IF NOT EXISTS MaterialCache (
+                    ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                    MaterialAssetUniqueID TEXT NOT NULL,
+                    MaterialName TEXT NOT NULL DEFAULT '',
+                    ParentMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                    BaseColorR REAL NOT NULL DEFAULT 1.0,
+                    BaseColorG REAL NOT NULL DEFAULT 1.0,
+                    BaseColorB REAL NOT NULL DEFAULT 1.0,
+                    BaseColorA REAL NOT NULL DEFAULT 1.0,
+                    ShaderName TEXT NOT NULL DEFAULT '',
+                    TextureSlotCount INTEGER NOT NULL DEFAULT 0,
+                    ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                    PRIMARY KEY (ProjectId, MaterialAssetUniqueID)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS MeshMaterialResolvedCache (
+                    ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                    MeshAssetUniqueID TEXT NOT NULL,
+                    SubMeshIndex INTEGER NOT NULL,
+                    MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RendererType TEXT NOT NULL DEFAULT '',
+                    MaterialName TEXT NOT NULL DEFAULT '',
+                    MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                    BaseColorR REAL NOT NULL DEFAULT 1.0,
+                    BaseColorG REAL NOT NULL DEFAULT 1.0,
+                    BaseColorB REAL NOT NULL DEFAULT 1.0,
+                    BaseColorA REAL NOT NULL DEFAULT 1.0,
+                    ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                    PRIMARY KEY (ProjectId, MeshAssetUniqueID, SubMeshIndex)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS CompositeAssets (
+                    ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                    CompositeAssetUniqueID TEXT NOT NULL,
+                    CompositeKind TEXT NOT NULL,
+                    DisplayName TEXT NOT NULL DEFAULT '',
+                    RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    SourceFileName TEXT NOT NULL DEFAULT '',
+                    MeshPartCount INTEGER NOT NULL DEFAULT 0,
+                    DistinctMeshCount INTEGER NOT NULL DEFAULT 0,
+                    DistinctMaterialCount INTEGER NOT NULL DEFAULT 0,
+                    Confidence INTEGER NOT NULL DEFAULT 0,
+                    ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                    PRIMARY KEY (ProjectId, CompositeAssetUniqueID)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS CompositeAssetParts (
+                    ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                    CompositeAssetUniqueID TEXT NOT NULL,
+                    PartIndex INTEGER NOT NULL,
+                    MeshAssetUniqueID TEXT NOT NULL,
+                    RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RendererType TEXT NOT NULL DEFAULT '',
+                    GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    GameObjectName TEXT NOT NULL DEFAULT '',
+                    TransformMatrix BLOB,
+                    PrimaryMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    Confidence INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (ProjectId, CompositeAssetUniqueID, PartIndex)
+                ) WITHOUT ROWID;
+
+                CREATE INDEX IF NOT EXISTS idx_asset_edges_kind_source ON AssetEdges(ProjectId, EdgeKind, SourceAssetUniqueID, SlotName, TargetAssetUniqueID, SlotIndex);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_material_cache_main_tex ON MaterialCache(ProjectId, MainTextureAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_mesh_mat_resolved_material ON MeshMaterialResolvedCache(ProjectId, MaterialAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_assets_root_go ON CompositeAssets(ProjectId, RootGameObjectAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_assets_avatar ON CompositeAssets(ProjectId, AvatarAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_assets_animator ON CompositeAssets(ProjectId, AnimatorAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_parts_mesh ON CompositeAssetParts(ProjectId, MeshAssetUniqueID, CompositeAssetUniqueID);";
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void BackfillV15DerivedCachesForProject(SqliteConnection conn, SqliteTransaction transaction, long projectId)
+        {
+            // 1. Backfill MaterialCache from MaterialTextures + MeshMaterials + Assets using streaming PK window pass (0 unindexed CTE joins)
+            var mtCols = GetTableColumnNames(conn, "MaterialTextures", transaction);
+            var mmCols = GetTableColumnNames(conn, "MeshMaterials", transaction);
+            if (mtCols.Contains("MaterialAssetUniqueID"))
+            {
+                using var matCmd = conn.CreateCommand();
+                matCmd.Transaction = transaction;
+                matCmd.CommandText = @"
+                    WITH RankedMainTex AS (
+                        SELECT
+                            mt.MaterialAssetUniqueID,
+                            mt.TextureAssetUniqueID,
+                            mt.SlotName,
+                            mt.PreviewMaterialAssetUniqueID,
+                            COUNT(*) OVER (PARTITION BY mt.MaterialAssetUniqueID) AS SlotCount,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY mt.MaterialAssetUniqueID
+                                ORDER BY
+                                    CASE WHEN mt.TextureAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                    mt.IsMainTexture DESC,
+                                    CASE mt.SlotName
+                                        WHEN '_BaseMap' THEN 0
+                                        WHEN '_MainTex' THEN 1
+                                        WHEN 'texture' THEN 2
+                                        WHEN 'Texture' THEN 3
+                                        WHEN '_Texture' THEN 4
+                                        WHEN '_BaseColorMap' THEN 5
+                                        WHEN '_BaseColorTexture' THEN 6
+                                        WHEN '_Diffuse' THEN 7
+                                        WHEN '_AlbedoMap' THEN 8
+                                        WHEN '_Albedo' THEN 9
+                                        ELSE 20
+                                    END,
+                                    mt.SlotIndex ASC,
+                                    mt.TextureAssetUniqueID ASC
+                            ) AS RowNum
+                        FROM MaterialTextures mt
+                        WHERE mt.ProjectId = @projectId
+                          AND mt.MaterialAssetUniqueID <> ''
+                    )
+                    INSERT INTO MaterialCache (
+                        ProjectId, MaterialAssetUniqueID, MaterialName, ParentMaterialAssetUniqueID,
+                        MainTextureAssetUniqueID, MainTextureSlotName,
+                        BaseColorR, BaseColorG, BaseColorB, BaseColorA,
+                        ShaderName, TextureSlotCount, ResolutionSource)
+                    SELECT
+                        @projectId,
+                        rmt.MaterialAssetUniqueID,
+                        COALESCE(a.Name, ''),
+                        CASE WHEN COALESCE(rmt.PreviewMaterialAssetUniqueID, '') <> '' AND rmt.PreviewMaterialAssetUniqueID <> rmt.MaterialAssetUniqueID
+                             THEN rmt.PreviewMaterialAssetUniqueID ELSE '' END,
+                        COALESCE(rmt.TextureAssetUniqueID, ''),
+                        CASE WHEN COALESCE(rmt.TextureAssetUniqueID, '') <> '' THEN COALESCE(rmt.SlotName, '') ELSE '' END,
+                        1.0, 1.0, 1.0, 1.0,
+                        '',
+                        COALESCE(rmt.SlotCount, 0),
+                        'preparation'
+                    FROM RankedMainTex rmt
+                    LEFT JOIN Assets a
+                      ON a.ProjectId = @projectId
+                     AND a.UniqueID = rmt.MaterialAssetUniqueID
+                    WHERE rmt.RowNum = 1
+                    ON CONFLICT(ProjectId, MaterialAssetUniqueID)
+                    DO UPDATE SET
+                        MaterialName = CASE WHEN MaterialCache.MaterialName = '' THEN excluded.MaterialName ELSE MaterialCache.MaterialName END,
+                        ParentMaterialAssetUniqueID = CASE WHEN MaterialCache.ParentMaterialAssetUniqueID = '' THEN excluded.ParentMaterialAssetUniqueID ELSE MaterialCache.ParentMaterialAssetUniqueID END,
+                        MainTextureAssetUniqueID = CASE WHEN MaterialCache.MainTextureAssetUniqueID = '' THEN excluded.MainTextureAssetUniqueID ELSE MaterialCache.MainTextureAssetUniqueID END,
+                        MainTextureSlotName = CASE WHEN MaterialCache.MainTextureSlotName = '' THEN excluded.MainTextureSlotName ELSE MaterialCache.MainTextureSlotName END,
+                        TextureSlotCount = MAX(MaterialCache.TextureSlotCount, excluded.TextureSlotCount);";
+                matCmd.Parameters.AddWithValue("@projectId", projectId);
+                matCmd.ExecuteNonQuery();
+            }
+
+            if (mmCols.Contains("MaterialAssetUniqueID"))
+            {
+                using var matFromMeshCmd = conn.CreateCommand();
+                matFromMeshCmd.Transaction = transaction;
+                matFromMeshCmd.CommandText = @"
+                    INSERT OR IGNORE INTO MaterialCache (
+                        ProjectId, MaterialAssetUniqueID, MaterialName, ResolutionSource)
+                    SELECT DISTINCT
+                        @projectId,
+                        mm.MaterialAssetUniqueID,
+                        COALESCE(a.Name, ''),
+                        'preparation'
+                    FROM MeshMaterials mm
+                    LEFT JOIN Assets a
+                      ON a.ProjectId = @projectId
+                     AND a.UniqueID = mm.MaterialAssetUniqueID
+                    WHERE mm.ProjectId = @projectId
+                      AND mm.MaterialAssetUniqueID <> '';";
+                matFromMeshCmd.Parameters.AddWithValue("@projectId", projectId);
+                matFromMeshCmd.ExecuteNonQuery();
+            }
+
+            // 2. Backfill MeshMaterialResolvedCache using streaming window pass over MeshMaterials + PK join into MaterialCache
+            if (mmCols.Contains("MeshAssetUniqueID"))
+            {
+                using var meshMatCmd = conn.CreateCommand();
+                meshMatCmd.Transaction = transaction;
+                meshMatCmd.CommandText = @"
+                    WITH WithRendererStats AS (
+                        SELECT
+                            mm.MeshAssetUniqueID,
+                            mm.SubMeshIndex,
+                            mm.MaterialAssetUniqueID,
+                            mm.RendererAssetUniqueID,
+                            mm.RendererType,
+                            mm.MaterialScore,
+                            mm.MaterialSlotIndex,
+                            COALESCE(mc.MaterialName, '') AS MaterialName,
+                            COALESCE(mc.MainTextureAssetUniqueID, '') AS MainTextureAssetUniqueID,
+                            COALESCE(mc.MainTextureSlotName, '') AS MainTextureSlotName,
+                            COALESCE(mc.BaseColorR, 1.0) AS BaseColorR,
+                            COALESCE(mc.BaseColorG, 1.0) AS BaseColorG,
+                            COALESCE(mc.BaseColorB, 1.0) AS BaseColorB,
+                            COALESCE(mc.BaseColorA, 1.0) AS BaseColorA,
+                            COALESCE(NULLIF(mc.ResolutionSource, ''), 'preparation') AS ResolutionSource,
+                            CASE WHEN COALESCE(mc.MainTextureAssetUniqueID, '') <> '' THEN 1 ELSE 0 END AS HasMainTexture,
+                            CASE WHEN COALESCE(mc.TextureSlotCount, 0) > 0 OR COALESCE(mc.MainTextureAssetUniqueID, '') <> '' THEN 1 ELSE 0 END AS HasTexture,
+                            MAX(CASE WHEN mm.RendererType <> 'Container' THEN 1 ELSE 0 END) OVER (PARTITION BY mm.MeshAssetUniqueID, mm.RendererAssetUniqueID) AS RendererScore,
+                            SUM(CASE WHEN mm.MaterialAssetUniqueID <> '' THEN 1 ELSE 0 END) OVER (PARTITION BY mm.MeshAssetUniqueID, mm.RendererAssetUniqueID) AS MaterialCount,
+                            COUNT(*) OVER (PARTITION BY mm.MeshAssetUniqueID, mm.RendererAssetUniqueID) AS RelationCount,
+                            SUM(CASE WHEN COALESCE(mc.MainTextureAssetUniqueID, '') <> '' THEN 1 ELSE 0 END) OVER (PARTITION BY mm.MeshAssetUniqueID, mm.RendererAssetUniqueID) AS MainTextureCount,
+                            SUM(CASE WHEN COALESCE(mc.TextureSlotCount, 0) > 0 OR COALESCE(mc.MainTextureAssetUniqueID, '') <> '' THEN 1 ELSE 0 END) OVER (PARTITION BY mm.MeshAssetUniqueID, mm.RendererAssetUniqueID) AS TextureCount
+                        FROM MeshMaterials mm
+                        LEFT JOIN MaterialCache mc
+                          ON mc.ProjectId = mm.ProjectId
+                         AND mc.MaterialAssetUniqueID = mm.MaterialAssetUniqueID
+                        WHERE mm.ProjectId = @projectId
+                    ),
+                    Ranked AS (
+                        SELECT
+                            w.MeshAssetUniqueID,
+                            w.SubMeshIndex,
+                            w.MaterialAssetUniqueID,
+                            w.RendererAssetUniqueID,
+                            w.RendererType,
+                            w.MaterialName,
+                            w.MainTextureAssetUniqueID,
+                            w.MainTextureSlotName,
+                            w.BaseColorR,
+                            w.BaseColorG,
+                            w.BaseColorB,
+                            w.BaseColorA,
+                            w.ResolutionSource,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY w.MeshAssetUniqueID, w.SubMeshIndex
+                                ORDER BY
+                                    CASE WHEN w.MaterialAssetUniqueID <> '' THEN 0 ELSE 1 END,
+                                    CASE WHEN w.HasMainTexture <> 0 THEN 0 ELSE 1 END,
+                                    CASE WHEN w.HasTexture <> 0 THEN 0 ELSE 1 END,
+                                    w.RendererScore DESC,
+                                    w.MainTextureCount DESC,
+                                    w.TextureCount DESC,
+                                    w.MaterialScore DESC,
+                                    w.MaterialCount DESC,
+                                    w.RelationCount DESC,
+                                    w.MaterialSlotIndex,
+                                    w.RendererAssetUniqueID,
+                                    w.MaterialAssetUniqueID
+                            ) AS RowNum
+                        FROM WithRendererStats w
+                    )
+                    INSERT INTO MeshMaterialResolvedCache (
+                        ProjectId, MeshAssetUniqueID, SubMeshIndex, MaterialAssetUniqueID,
+                        RendererAssetUniqueID, RendererType, MaterialName,
+                        MainTextureAssetUniqueID, MainTextureSlotName,
+                        BaseColorR, BaseColorG, BaseColorB, BaseColorA, ResolutionSource)
+                    SELECT
+                        @projectId,
+                        r.MeshAssetUniqueID,
+                        r.SubMeshIndex,
+                        r.MaterialAssetUniqueID,
+                        r.RendererAssetUniqueID,
+                        r.RendererType,
+                        r.MaterialName,
+                        r.MainTextureAssetUniqueID,
+                        r.MainTextureSlotName,
+                        r.BaseColorR,
+                        r.BaseColorG,
+                        r.BaseColorB,
+                        r.BaseColorA,
+                        r.ResolutionSource
+                    FROM Ranked r
+                    WHERE r.RowNum = 1
+                    ON CONFLICT(ProjectId, MeshAssetUniqueID, SubMeshIndex)
+                    DO UPDATE SET
+                        MaterialAssetUniqueID = excluded.MaterialAssetUniqueID,
+                        RendererAssetUniqueID = excluded.RendererAssetUniqueID,
+                        RendererType = excluded.RendererType,
+                        MaterialName = excluded.MaterialName,
+                        MainTextureAssetUniqueID = excluded.MainTextureAssetUniqueID,
+                        MainTextureSlotName = excluded.MainTextureSlotName,
+                        BaseColorR = excluded.BaseColorR,
+                        BaseColorG = excluded.BaseColorG,
+                        BaseColorB = excluded.BaseColorB,
+                        BaseColorA = excluded.BaseColorA,
+                        ResolutionSource = excluded.ResolutionSource;";
+                meshMatCmd.Parameters.AddWithValue("@projectId", projectId);
+                meshMatCmd.ExecuteNonQuery();
+            }
+
+            // 3. Backfill CompositeAssets & CompositeAssetParts from ModelGroups & ModelGroupMeshes using PK lookups
+            var mgCols = GetTableColumnNames(conn, "ModelGroups", transaction);
+            if (mgCols.Contains("GroupAssetUniqueID"))
+            {
+                using var compCmd = conn.CreateCommand();
+                compCmd.Transaction = transaction;
+                compCmd.CommandText = @"
+                    WITH GroupPartRows AS (
+                        SELECT
+                            mgm.GroupAssetUniqueID,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY mgm.GroupAssetUniqueID
+                                ORDER BY mgm.SlotIndex ASC, mgm.Id ASC
+                            ) - 1 AS PartIdx,
+                            mgm.MeshAssetUniqueID,
+                            mgm.RendererAssetUniqueID,
+                            mgm.RendererType,
+                            mgm.GameObjectAssetUniqueID,
+                            mgm.GameObjectName,
+                            mgm.TransformMatrix,
+                            COALESCE(mrc.MaterialAssetUniqueID, '') AS PrimaryMaterialAssetUniqueID,
+                            mgm.Confidence
+                        FROM ModelGroupMeshes mgm
+                        LEFT JOIN MeshMaterialResolvedCache mrc
+                          ON mrc.ProjectId = @projectId
+                         AND mrc.MeshAssetUniqueID = mgm.MeshAssetUniqueID
+                         AND mrc.SubMeshIndex = 0
+                        WHERE mgm.ProjectId = @projectId
+                          AND mgm.MeshAssetUniqueID <> ''
+                    )
+                    INSERT INTO CompositeAssetParts (
+                        ProjectId, CompositeAssetUniqueID, PartIndex, MeshAssetUniqueID,
+                        RendererAssetUniqueID, RendererType, GameObjectAssetUniqueID, GameObjectName,
+                        TransformMatrix, PrimaryMaterialAssetUniqueID, Confidence)
+                    SELECT
+                        @projectId,
+                        gpr.GroupAssetUniqueID,
+                        gpr.PartIdx,
+                        gpr.MeshAssetUniqueID,
+                        gpr.RendererAssetUniqueID,
+                        gpr.RendererType,
+                        gpr.GameObjectAssetUniqueID,
+                        gpr.GameObjectName,
+                        gpr.TransformMatrix,
+                        gpr.PrimaryMaterialAssetUniqueID,
+                        gpr.Confidence
+                    FROM GroupPartRows gpr
+                    WHERE true
+                    ON CONFLICT(ProjectId, CompositeAssetUniqueID, PartIndex)
+                    DO UPDATE SET
+                        MeshAssetUniqueID = excluded.MeshAssetUniqueID,
+                        RendererAssetUniqueID = excluded.RendererAssetUniqueID,
+                        RendererType = excluded.RendererType,
+                        GameObjectAssetUniqueID = excluded.GameObjectAssetUniqueID,
+                        GameObjectName = excluded.GameObjectName,
+                        TransformMatrix = excluded.TransformMatrix,
+                        PrimaryMaterialAssetUniqueID = CASE WHEN excluded.PrimaryMaterialAssetUniqueID <> '' THEN excluded.PrimaryMaterialAssetUniqueID ELSE CompositeAssetParts.PrimaryMaterialAssetUniqueID END,
+                        Confidence = excluded.Confidence;
+
+                    INSERT INTO CompositeAssets (
+                        ProjectId, CompositeAssetUniqueID, CompositeKind, DisplayName,
+                        RootGameObjectAssetUniqueID, AnimatorAssetUniqueID, AvatarAssetUniqueID, ControllerAssetUniqueID,
+                        SourceFileName, MeshPartCount, DistinctMeshCount, DistinctMaterialCount, Confidence, ResolutionSource)
+                    SELECT
+                        @projectId,
+                        mg.GroupAssetUniqueID,
+                        CASE WHEN mg.GroupKind <> '' THEN mg.GroupKind ELSE 'ModelGroup' END,
+                        COALESCE(NULLIF(mg.GroupName, ''), NULLIF(mg.RootGameObjectName, ''), mg.GroupAssetUniqueID),
+                        mg.RootGameObjectAssetUniqueID,
+                        mg.AnimatorAssetUniqueID,
+                        mg.AvatarAssetUniqueID,
+                        mg.ControllerAssetUniqueID,
+                        mg.SourceFileName,
+                        COALESCE(gs.MeshPartCount, 0),
+                        COALESCE(gs.DistinctMeshCount, 0),
+                        COALESCE(gs.DistinctMaterialCount, 0),
+                        mg.Confidence,
+                        'preparation'
+                    FROM ModelGroups mg
+                    LEFT JOIN (
+                        SELECT
+                            cap.CompositeAssetUniqueID,
+                            COUNT(*) AS MeshPartCount,
+                            COUNT(DISTINCT cap.MeshAssetUniqueID) AS DistinctMeshCount,
+                            COUNT(DISTINCT CASE WHEN cap.PrimaryMaterialAssetUniqueID <> '' THEN cap.PrimaryMaterialAssetUniqueID END) AS DistinctMaterialCount
+                        FROM CompositeAssetParts cap
+                        WHERE cap.ProjectId = @projectId
+                        GROUP BY cap.CompositeAssetUniqueID
+                    ) gs
+                      ON gs.CompositeAssetUniqueID = mg.GroupAssetUniqueID
+                    WHERE mg.ProjectId = @projectId
+                    ON CONFLICT(ProjectId, CompositeAssetUniqueID)
+                    DO UPDATE SET
+                        CompositeKind = excluded.CompositeKind,
+                        DisplayName = excluded.DisplayName,
+                        RootGameObjectAssetUniqueID = excluded.RootGameObjectAssetUniqueID,
+                        AnimatorAssetUniqueID = excluded.AnimatorAssetUniqueID,
+                        AvatarAssetUniqueID = excluded.AvatarAssetUniqueID,
+                        ControllerAssetUniqueID = excluded.ControllerAssetUniqueID,
+                        SourceFileName = excluded.SourceFileName,
+                        MeshPartCount = excluded.MeshPartCount,
+                        DistinctMeshCount = excluded.DistinctMeshCount,
+                        DistinctMaterialCount = excluded.DistinctMaterialCount,
+                        Confidence = excluded.Confidence;";
+                compCmd.Parameters.AddWithValue("@projectId", projectId);
+                compCmd.ExecuteNonQuery();
             }
         }
 
@@ -208,6 +688,10 @@ namespace AssetStudio.Avalonia
                 DROP TABLE IF EXISTS IndexingReadFiles;
                 DROP TABLE IF EXISTS ProjectIndexingState;
                 DROP TABLE IF EXISTS AnimationClipTargets;
+                DROP TABLE IF EXISTS CompositeAssetParts;
+                DROP TABLE IF EXISTS CompositeAssets;
+                DROP TABLE IF EXISTS MeshMaterialResolvedCache;
+                DROP TABLE IF EXISTS MaterialCache;
                 DROP TABLE IF EXISTS MaterialTextures;
                 DROP TABLE IF EXISTS MeshMaterials;
                 DROP TABLE IF EXISTS MeshRenderers;
@@ -232,6 +716,10 @@ namespace AssetStudio.Avalonia
                     DROP TABLE IF EXISTS ProjectIndexingState;
                     DROP TABLE IF EXISTS PreviewCacheEntries;
                     DROP TABLE IF EXISTS AnimationClipTargets;
+                    DROP TABLE IF EXISTS CompositeAssetParts;
+                    DROP TABLE IF EXISTS CompositeAssets;
+                    DROP TABLE IF EXISTS MeshMaterialResolvedCache;
+                    DROP TABLE IF EXISTS MaterialCache;
                     DROP TABLE IF EXISTS MaterialTextures;
                     DROP TABLE IF EXISTS MeshMaterials;
                     DROP TABLE IF EXISTS MeshRenderers;
@@ -397,7 +885,80 @@ namespace AssetStudio.Avalonia
                                 PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
                                 IsResolved INTEGER NOT NULL DEFAULT 0,
                                 IsMainTexture INTEGER NOT NULL DEFAULT 0,
+                                ScaleX REAL NOT NULL DEFAULT 1.0,
+                                ScaleY REAL NOT NULL DEFAULT 1.0,
+                                OffsetX REAL NOT NULL DEFAULT 0.0,
+                                OffsetY REAL NOT NULL DEFAULT 0.0,
+                                ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
                                 PRIMARY KEY (ProjectId, MaterialAssetUniqueID, SlotName, SlotIndex, TextureFileId, TexturePathID, TextureAssetUniqueID)
+                            ) WITHOUT ROWID;
+
+                            CREATE TABLE IF NOT EXISTS MaterialCache (
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                MaterialAssetUniqueID TEXT NOT NULL,
+                                MaterialName TEXT NOT NULL DEFAULT '',
+                                ParentMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                                BaseColorR REAL NOT NULL DEFAULT 1.0,
+                                BaseColorG REAL NOT NULL DEFAULT 1.0,
+                                BaseColorB REAL NOT NULL DEFAULT 1.0,
+                                BaseColorA REAL NOT NULL DEFAULT 1.0,
+                                ShaderName TEXT NOT NULL DEFAULT '',
+                                TextureSlotCount INTEGER NOT NULL DEFAULT 0,
+                                ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                                PRIMARY KEY (ProjectId, MaterialAssetUniqueID)
+                            ) WITHOUT ROWID;
+
+                            CREATE TABLE IF NOT EXISTS MeshMaterialResolvedCache (
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                MeshAssetUniqueID TEXT NOT NULL,
+                                SubMeshIndex INTEGER NOT NULL,
+                                MaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                RendererType TEXT NOT NULL DEFAULT '',
+                                MaterialName TEXT NOT NULL DEFAULT '',
+                                MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                                BaseColorR REAL NOT NULL DEFAULT 1.0,
+                                BaseColorG REAL NOT NULL DEFAULT 1.0,
+                                BaseColorB REAL NOT NULL DEFAULT 1.0,
+                                BaseColorA REAL NOT NULL DEFAULT 1.0,
+                                ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                                PRIMARY KEY (ProjectId, MeshAssetUniqueID, SubMeshIndex)
+                            ) WITHOUT ROWID;
+
+                            CREATE TABLE IF NOT EXISTS CompositeAssets (
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                CompositeAssetUniqueID TEXT NOT NULL,
+                                CompositeKind TEXT NOT NULL,
+                                DisplayName TEXT NOT NULL DEFAULT '',
+                                RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                SourceFileName TEXT NOT NULL DEFAULT '',
+                                MeshPartCount INTEGER NOT NULL DEFAULT 0,
+                                DistinctMeshCount INTEGER NOT NULL DEFAULT 0,
+                                DistinctMaterialCount INTEGER NOT NULL DEFAULT 0,
+                                Confidence INTEGER NOT NULL DEFAULT 0,
+                                ResolutionSource TEXT NOT NULL DEFAULT 'preparation',
+                                PRIMARY KEY (ProjectId, CompositeAssetUniqueID)
+                            ) WITHOUT ROWID;
+
+                            CREATE TABLE IF NOT EXISTS CompositeAssetParts (
+                                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                                CompositeAssetUniqueID TEXT NOT NULL,
+                                PartIndex INTEGER NOT NULL,
+                                MeshAssetUniqueID TEXT NOT NULL,
+                                RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                RendererType TEXT NOT NULL DEFAULT '',
+                                GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                GameObjectName TEXT NOT NULL DEFAULT '',
+                                TransformMatrix BLOB,
+                                PrimaryMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                                Confidence INTEGER NOT NULL DEFAULT 0,
+                                PRIMARY KEY (ProjectId, CompositeAssetUniqueID, PartIndex)
                             ) WITHOUT ROWID;
 
                             CREATE TABLE IF NOT EXISTS AnimationClipTargets (
@@ -469,10 +1030,18 @@ namespace AssetStudio.Avalonia
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SlotName, SourceAssetUniqueID, SlotIndex);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_groups_unique ON ModelGroups(ProjectId, GroupAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_asset_edges_kind_source ON AssetEdges(ProjectId, EdgeKind, SourceAssetUniqueID, SlotName, TargetAssetUniqueID, SlotIndex);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_group_meshes_unique ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_material_cache_main_tex ON MaterialCache(ProjectId, MainTextureAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_mesh_mat_resolved_material ON MeshMaterialResolvedCache(ProjectId, MaterialAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_composite_assets_root_go ON CompositeAssets(ProjectId, RootGameObjectAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_composite_assets_avatar ON CompositeAssets(ProjectId, AvatarAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_composite_assets_animator ON CompositeAssets(ProjectId, AnimatorAssetUniqueID);
+                            CREATE INDEX IF NOT EXISTS idx_composite_parts_mesh ON CompositeAssetParts(ProjectId, MeshAssetUniqueID, CompositeAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_clip_score ON AnimationClipTargets(ProjectId, ClipAssetUniqueID, MatchScore DESC, MatchedBoneCount DESC);
                             CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_mesh ON AnimationClipTargets(ProjectId, MeshAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_avatar ON AnimationClipTargets(ProjectId, AvatarAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);
@@ -489,6 +1058,7 @@ namespace AssetStudio.Avalonia
                 viewCmd.ExecuteNonQuery();
             }
 
+            EnsureMaterialTexturesV15Columns(conn, transaction: null);
             EnsurePreviewCacheSchemaUpgrades(conn);
         }
 
@@ -498,26 +1068,51 @@ namespace AssetStudio.Avalonia
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 DROP INDEX IF EXISTS idx_asset_edges_target_kind;
+                DROP INDEX IF EXISTS idx_asset_edges_kind_source;
                 DROP INDEX IF EXISTS idx_model_groups_avatar;
+                DROP INDEX IF EXISTS idx_model_groups_animator;
                 DROP INDEX IF EXISTS idx_model_group_meshes_group;
                 DROP INDEX IF EXISTS idx_model_group_meshes_candidate;
                 DROP INDEX IF EXISTS idx_material_textures_preview_lookup;
+                DROP INDEX IF EXISTS idx_material_cache_main_tex;
+                DROP INDEX IF EXISTS idx_mesh_mat_resolved_material;
+                DROP INDEX IF EXISTS idx_composite_assets_root_go;
+                DROP INDEX IF EXISTS idx_composite_assets_avatar;
+                DROP INDEX IF EXISTS idx_composite_assets_animator;
+                DROP INDEX IF EXISTS idx_composite_parts_mesh;
                 DROP INDEX IF EXISTS idx_anim_clip_targets_clip_score;
                 DROP INDEX IF EXISTS idx_anim_clip_targets_mesh;
                 DROP INDEX IF EXISTS idx_anim_clip_targets_avatar;";
             cmd.ExecuteNonQuery();
         }
 
-        private static void CreateSemanticBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
+        private static void CreateSemanticPreAnimationIndexes(SqliteConnection conn, SqliteTransaction transaction)
         {
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 CREATE INDEX IF NOT EXISTS idx_asset_edges_target_kind ON AssetEdges(ProjectId, TargetAssetUniqueID, EdgeKind, SlotName, SourceAssetUniqueID, SlotIndex);
                 CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_asset_edges_kind_source ON AssetEdges(ProjectId, EdgeKind, SourceAssetUniqueID, SlotName, TargetAssetUniqueID, SlotIndex);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_material_cache_main_tex ON MaterialCache(ProjectId, MainTextureAssetUniqueID);";
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void CreateSemanticBulkSecondaryIndexes(SqliteConnection conn, SqliteTransaction transaction)
+        {
+            CreateSemanticPreAnimationIndexes(conn, transaction);
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                CREATE INDEX IF NOT EXISTS idx_mesh_mat_resolved_material ON MeshMaterialResolvedCache(ProjectId, MaterialAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_assets_root_go ON CompositeAssets(ProjectId, RootGameObjectAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_assets_avatar ON CompositeAssets(ProjectId, AvatarAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_assets_animator ON CompositeAssets(ProjectId, AnimatorAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_composite_parts_mesh ON CompositeAssetParts(ProjectId, MeshAssetUniqueID, CompositeAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_clip_score ON AnimationClipTargets(ProjectId, ClipAssetUniqueID, MatchScore DESC, MatchedBoneCount DESC);
                 CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_mesh ON AnimationClipTargets(ProjectId, MeshAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_anim_clip_targets_avatar ON AnimationClipTargets(ProjectId, AvatarAssetUniqueID, MatchScore DESC, ClipAssetUniqueID);";
@@ -533,6 +1128,9 @@ namespace AssetStudio.Avalonia
             "Stage_MeshRenderers",
             "Stage_MeshMaterials",
             "Stage_MaterialTextures",
+            "Stage_MaterialCache",
+            "Stage_CompositeAssets",
+            "Stage_CompositeAssetParts",
             "Stage_AnimationClipTargets",
             "Stage_RigBoneHashes",
             "Stage_ClipBoneHashes"
@@ -664,7 +1262,59 @@ namespace AssetStudio.Avalonia
                     TextureAssetUniqueID TEXT NOT NULL DEFAULT '',
                     PreviewMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
                     IsResolved INTEGER NOT NULL DEFAULT 0,
-                    IsMainTexture INTEGER NOT NULL DEFAULT 0
+                    IsMainTexture INTEGER NOT NULL DEFAULT 0,
+                    ScaleX REAL NOT NULL DEFAULT 1.0,
+                    ScaleY REAL NOT NULL DEFAULT 1.0,
+                    OffsetX REAL NOT NULL DEFAULT 0.0,
+                    OffsetY REAL NOT NULL DEFAULT 0.0,
+                    ResolutionSource TEXT NOT NULL DEFAULT 'preparation'
+                );
+
+                CREATE TABLE Stage_MaterialCache (
+                    ProjectId INTEGER NOT NULL,
+                    MaterialAssetUniqueID TEXT NOT NULL,
+                    MaterialName TEXT NOT NULL DEFAULT '',
+                    ParentMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MainTextureAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    MainTextureSlotName TEXT NOT NULL DEFAULT '',
+                    BaseColorR REAL NOT NULL DEFAULT 1.0,
+                    BaseColorG REAL NOT NULL DEFAULT 1.0,
+                    BaseColorB REAL NOT NULL DEFAULT 1.0,
+                    BaseColorA REAL NOT NULL DEFAULT 1.0,
+                    ShaderName TEXT NOT NULL DEFAULT '',
+                    TextureSlotCount INTEGER NOT NULL DEFAULT 0,
+                    ResolutionSource TEXT NOT NULL DEFAULT 'preparation'
+                );
+
+                CREATE TABLE Stage_CompositeAssets (
+                    ProjectId INTEGER NOT NULL,
+                    CompositeAssetUniqueID TEXT NOT NULL,
+                    CompositeKind TEXT NOT NULL,
+                    DisplayName TEXT NOT NULL DEFAULT '',
+                    RootGameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AnimatorAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    AvatarAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    ControllerAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    SourceFileName TEXT NOT NULL DEFAULT '',
+                    MeshPartCount INTEGER NOT NULL DEFAULT 0,
+                    DistinctMeshCount INTEGER NOT NULL DEFAULT 0,
+                    DistinctMaterialCount INTEGER NOT NULL DEFAULT 0,
+                    Confidence INTEGER NOT NULL DEFAULT 0,
+                    ResolutionSource TEXT NOT NULL DEFAULT 'preparation'
+                );
+
+                CREATE TABLE Stage_CompositeAssetParts (
+                    ProjectId INTEGER NOT NULL,
+                    CompositeAssetUniqueID TEXT NOT NULL,
+                    PartIndex INTEGER NOT NULL,
+                    MeshAssetUniqueID TEXT NOT NULL,
+                    RendererAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    RendererType TEXT NOT NULL DEFAULT '',
+                    GameObjectAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    GameObjectName TEXT NOT NULL DEFAULT '',
+                    TransformMatrix BLOB,
+                    PrimaryMaterialAssetUniqueID TEXT NOT NULL DEFAULT '',
+                    Confidence INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE Stage_AnimationClipTargets (

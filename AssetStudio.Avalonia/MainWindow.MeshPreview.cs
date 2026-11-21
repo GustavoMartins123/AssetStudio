@@ -17,6 +17,61 @@ public partial class MainWindow
     private string? _activeMeshBadgeSourceKind;
     private bool _activeMeshGeometryFromCache;
     private bool _activeMeshMaterialsLoading;
+    private readonly HashSet<string> _activePreviewDependencyFileNames = new(StringComparer.OrdinalIgnoreCase);
+    private volatile bool _activePreviewNeedsConnectionRefresh;
+
+    private void SetActivePreviewDependencyFiles(params AssetStudio.Object?[] assets)
+    {
+        lock (preloaderLock)
+        {
+            _activePreviewDependencyFileNames.Clear();
+            foreach (var asset in assets)
+            {
+                var fileName = asset?.assetsFile?.fileName;
+                if (!string.IsNullOrWhiteSpace(fileName))
+                {
+                    _activePreviewDependencyFileNames.Add(fileName);
+                }
+            }
+        }
+    }
+
+    private void AddActivePreviewDependencyFiles(IEnumerable<string?> fileNames)
+    {
+        lock (preloaderLock)
+        {
+            foreach (var fileName in fileNames)
+            {
+                if (!string.IsNullOrWhiteSpace(fileName))
+                {
+                    _activePreviewDependencyFileNames.Add(fileName);
+                }
+            }
+        }
+    }
+
+    private void TriggerAutoRefreshActivePreviewIfNeeded()
+    {
+        if (!_activePreviewNeedsConnectionRefresh)
+        {
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!_activePreviewNeedsConnectionRefresh)
+            {
+                return;
+            }
+
+            if (AssetListDataGrid?.SelectedItem is AssetItem selectedAsset
+                && selectedAsset.Type is ClassIDType.AnimationClip or ClassIDType.Avatar or ClassIDType.Mesh)
+            {
+                _activePreviewNeedsConnectionRefresh = false;
+                QueuePreviewAsset(selectedAsset, immediate: true);
+            }
+        });
+    }
 
     private void OnMeshPreviewGeometryLoaded(bool fromCache)
     {
@@ -117,31 +172,133 @@ public partial class MainWindow
                     return;
                 }
 
-                var subMeshTextures = new List<byte[]?>();
-                var subMeshTexWidths = new List<int>();
-                var subMeshTexHeights = new List<int>();
-                var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
-                if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                SetActivePreviewDependencyFiles(m_Mesh);
+
+                // Cache-first O(1) lookup via v15 MeshMaterialResolvedCache (WAL read works even during Saving connections).
+                var resolvedSlots = TryLoadResolvedMeshMaterialsForPreview(m_Mesh);
+                if (meshPreviewId != texturePreviewIdCounter)
                 {
-                    EnsureMeshPreviewDependenciesLoaded(m_Mesh);
-                    allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                    return;
                 }
 
-                AddPreviewTextureSlotsForMesh(
-                    m_Mesh,
-                    allMaterials,
-                    subMeshTextures,
-                    subMeshTexWidths,
-                    subMeshTexHeights);
+                List<byte[]?> uniqueTextures;
+                List<int> uniqueWidths;
+                List<int> uniqueHeights;
+                int[]? subMeshToTextureIndex;
+                List<string> loadedTextureFiles;
+                List<Material?>? fallbackMaterials = null;
+                string infoText;
+                string materialsSummary;
+                bool hasAnyMaterial;
 
-                var infoText = includeMeshInfo
-                    ? assetsManager.LazyLoading
-                        ? FormatLazyMeshPreview(m_Mesh, localAssetItem, allMaterials)
-                        : FormatMeshPreview(m_Mesh, localAssetItem)
-                    : string.Empty;
-                var materialsSummary = $"Associated Materials ({allMaterials.Count(m => m != null)}): " +
-                    string.Join(", ", allMaterials.Where(m => m != null).Select(m => m!.m_Name));
-                var hasTextures = subMeshTextures.Any(t => t != null);
+                if (resolvedSlots.Count > 0)
+                {
+                    var slotCount = Math.Max(m_Mesh.m_SubMeshes?.Length ?? 0, resolvedSlots.Max(s => s.SubMeshIndex) + 1);
+                    if (slotCount <= 0 && m_Mesh.m_Indices?.Count > 0)
+                    {
+                        slotCount = 1;
+                    }
+
+                    BuildDeduplicatedPreviewTexturesFromResolved(
+                        slotCount,
+                        resolvedSlots,
+                        () => meshPreviewId != texturePreviewIdCounter,
+                        out uniqueTextures,
+                        out uniqueWidths,
+                        out uniqueHeights,
+                        out subMeshToTextureIndex,
+                        out loadedTextureFiles);
+
+                    if (meshPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    if (loadedTextureFiles.Count > 0)
+                    {
+                        AddActivePreviewDependencyFiles(loadedTextureFiles);
+                    }
+
+                    var distinctNames = resolvedSlots
+                        .Where(s => !string.IsNullOrWhiteSpace(s.MaterialAssetId))
+                        .Select(s => !string.IsNullOrWhiteSpace(s.MaterialName)
+                            ? s.MaterialName
+                            : GetPreviewHandleName(s.MaterialAssetId, "Material"))
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+                    hasAnyMaterial = distinctNames.Count > 0;
+                    materialsSummary = $"Associated Materials ({distinctNames.Count}): {string.Join(", ", distinctNames.Take(20))}"
+                        + (distinctNames.Count > 20 ? $" (+{distinctNames.Count - 20} more)" : string.Empty);
+                    infoText = includeMeshInfo
+                        ? FormatLazyMeshPreviewFromResolved(m_Mesh, localAssetItem, resolvedSlots)
+                        : string.Empty;
+                    _activePreviewNeedsConnectionRefresh = false;
+                }
+                else
+                {
+                    var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                    if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    {
+                        EnsureMeshPreviewDependenciesLoaded(m_Mesh);
+                        allMaterials = FindMaterialsForMeshPreview(m_Mesh);
+                    }
+
+                    if (meshPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    var slotCount = Math.Max(m_Mesh.m_SubMeshes?.Length ?? 0, allMaterials.Count);
+                    if (slotCount <= 0 && m_Mesh.m_Indices?.Count > 0)
+                    {
+                        slotCount = 1;
+                    }
+
+                    BuildDeduplicatedPreviewTexturesForMaterials(
+                        slotCount,
+                        allMaterials,
+                        () => meshPreviewId != texturePreviewIdCounter,
+                        out uniqueTextures,
+                        out uniqueWidths,
+                        out uniqueHeights,
+                        out subMeshToTextureIndex,
+                        out loadedTextureFiles);
+
+                    if (meshPreviewId != texturePreviewIdCounter)
+                    {
+                        return;
+                    }
+
+                    if (loadedTextureFiles.Count > 0)
+                    {
+                        AddActivePreviewDependencyFiles(loadedTextureFiles);
+                    }
+
+                    fallbackMaterials = allMaterials;
+                    hasAnyMaterial = allMaterials.Any(m => m != null);
+                    infoText = includeMeshInfo
+                        ? assetsManager.LazyLoading
+                            ? FormatLazyMeshPreview(m_Mesh, localAssetItem, allMaterials)
+                            : FormatMeshPreview(m_Mesh, localAssetItem)
+                        : string.Empty;
+                    var distinctMatNames = allMaterials
+                        .Where(m => m != null)
+                        .Select(m => m!.m_Name)
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+                    materialsSummary = $"Associated Materials ({distinctMatNames.Count}): {string.Join(", ", distinctMatNames.Take(20))}"
+                        + (distinctMatNames.Count > 20 ? $" (+{distinctMatNames.Count - 20} more)" : string.Empty);
+                    if (!hasAnyMaterial && assetsManager.LazyLoading && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    {
+                        _activePreviewNeedsConnectionRefresh = true;
+                    }
+                    else
+                    {
+                        _activePreviewNeedsConnectionRefresh = false;
+                    }
+                }
+
+                var hasTextures = uniqueTextures.Any(t => t != null);
 
                 Dispatcher.UIThread.Post(() =>
                 {
@@ -160,9 +317,16 @@ public partial class MainWindow
                     if (GLPreviewControl != null)
                     {
                         currentPreviewMesh = m_Mesh;
-                        GLPreviewControl.ApplyMeshTextures(m_Mesh, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+                        GLPreviewControl.ApplyMeshTextures(m_Mesh, uniqueTextures, uniqueWidths, uniqueHeights, subMeshToTextureIndex);
                         GLPreviewControl.IsVisible = true;
-                        BuildMeshMaterialControls(m_Mesh, allMaterials);
+                        if (resolvedSlots.Count > 0)
+                        {
+                            BuildMeshMaterialControlsFromResolved(m_Mesh, resolvedSlots);
+                        }
+                        else if (fallbackMaterials != null)
+                        {
+                            BuildMeshMaterialControls(m_Mesh, fallbackMaterials);
+                        }
                         ShowPreviewGeometryControls(showBoneControls: false);
                         GLPreviewControl.Focus();
                     }
@@ -377,6 +541,39 @@ public partial class MainWindow
             {
                 sb.AppendLine(dump);
             }
+        }
+
+        return sb.ToString();
+    }
+
+    private string FormatLazyMeshPreviewFromResolved(
+        Mesh mesh,
+        AssetItem item,
+        IReadOnlyList<ResolvedMeshSubMeshMaterial> resolvedSlots)
+    {
+        var sb = new StringBuilder();
+        sb.Append(FormatMeshPreviewSummary(mesh, item));
+
+        var folderPath = GetCurrentCacheFolderPath();
+        var connectionsReady = CanUseLazySemanticRelationCache(folderPath);
+        sb.AppendLine($"Connections: {(connectionsReady ? "Complete" : "Cached (lazy backfill)")}");
+
+        var distinctMaterials = resolvedSlots
+            .Where(s => !string.IsNullOrWhiteSpace(s.MaterialAssetId))
+            .GroupBy(s => s.MaterialAssetId, StringComparer.Ordinal)
+            .Select(g => g.First())
+            .ToList();
+        sb.AppendLine($"Associated Materials ({distinctMaterials.Count} unique across {resolvedSlots.Count} submesh slots):");
+        foreach (var mat in distinctMaterials.Take(32))
+        {
+            var matName = !string.IsNullOrWhiteSpace(mat.MaterialName)
+                ? mat.MaterialName
+                : GetPreviewHandleName(mat.MaterialAssetId, "Material");
+            sb.AppendLine($"  - {matName}");
+        }
+        if (distinctMaterials.Count > 32)
+        {
+            sb.AppendLine($"  ... {distinctMaterials.Count - 32:N0} more");
         }
 
         return sb.ToString();

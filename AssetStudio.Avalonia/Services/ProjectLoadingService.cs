@@ -945,6 +945,107 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
+        internal static void EnqueueSaveMeshPreviewGeometryCache(
+            SQLiteProjectIndexCache sqliteCache,
+            string folderPath,
+            ProjectScanResult? currentScanResult,
+            Mesh mesh,
+            float densityPercent,
+            MeshPreviewGeometryCache cache)
+        {
+            if (sqliteCache == null || mesh?.assetsFile == null || currentScanResult == null || cache == null)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+            {
+                return;
+            }
+
+            try
+            {
+                var bytes = MeshPreviewGeometryCacheSerializer.Serialize(cache);
+                var hash = ComputeSha256Hex(bytes);
+                var payloadPath = GetPreviewCachePayloadPath(folderPath, hash);
+                var assetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+                var signature = sqliteCache.GetFolderSignature(currentScanResult);
+                sqliteCache.EnqueuePreviewCachePayload(
+                    folderPath,
+                    signature,
+                    assetId,
+                    "mesh-geometry",
+                    MeshPreviewGeometryCache.AlgorithmVersion,
+                    BuildMeshPreviewCacheParameters(mesh, densityPercent),
+                    hash,
+                    bytes,
+                    payloadPath);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to enqueue mesh preview geometry cache: {ex.Message}");
+            }
+        }
+
+        internal static TexturePreviewImageResult? TryLoadCachedTexturePreviewThumbnailByAssetId(
+            SQLiteProjectIndexCache sqliteCache,
+            string folderPath,
+            ProjectScanResult? currentScanResult,
+            string textureAssetId,
+            int maxDimension,
+            int algorithmVersion)
+        {
+            if (sqliteCache == null
+                || string.IsNullOrWhiteSpace(textureAssetId)
+                || currentScanResult == null
+                || string.IsNullOrWhiteSpace(folderPath)
+                || !Directory.Exists(folderPath))
+            {
+                return null;
+            }
+
+            try
+            {
+                var signature = sqliteCache.GetFolderSignature(currentScanResult);
+                var parametersPrefix = "max=" + maxDimension.ToString(CultureInfo.InvariantCulture) + "|";
+                if (sqliteCache.TryLoadLatestPreviewCacheBytesByAssetId(
+                    folderPath,
+                    signature,
+                    textureAssetId,
+                    "texture-thumbnail-png",
+                    algorithmVersion,
+                    parametersPrefix,
+                    out var bytes,
+                    out var entry)
+                    && bytes != null
+                    && entry != null
+                    && (entry.IsInlineBlob
+                        || (!string.IsNullOrWhiteSpace(entry.PayloadPath)
+                            && IsPathInsideDirectory(GetPreviewCacheRoot(folderPath), entry.PayloadPath))))
+                {
+                    if (string.Equals(ComputeSha256Hex(bytes), entry.PayloadHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var cachedImage = ImageExtensions.DecodeBgraUnpremul(bytes);
+                        if (cachedImage != null)
+                        {
+                            return new TexturePreviewImageResult(
+                                cachedImage,
+                                fromCache: true,
+                                downscaled: false,
+                                cachedImage.Width,
+                                cachedImage.Height);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to load cached texture thumbnail by asset id: {ex.Message}");
+            }
+
+            return null;
+        }
+
         internal static TexturePreviewImageResult? LoadTexturePreviewThumbnail(
             SQLiteProjectIndexCache sqliteCache,
             string folderPath,
@@ -1019,29 +1120,41 @@ namespace AssetStudio.Avalonia.Services
             var downscaled = limitPreviewImage != null && limitPreviewImage(ref image, maxDimension);
             if (canUsePersistentCache)
             {
-                try
+                // Persist PNG thumbnail asynchronously so rendering never blocks on PNG encoding or SQLite WriteGate.
+                var snapshotForCache = image.Copy();
+                if (snapshotForCache != null)
                 {
-                    using var stream = new MemoryStream();
-                    image.WriteToStream(stream, ImageFormat.Png);
-                    var bytes = stream.ToArray();
-                    var hash = ComputeSha256Hex(bytes);
-                    var payloadPath = GetPreviewCachePayloadPath(folderPath, hash, ".texturepreview.png");
                     var assetId = AssetHandle.BuildUniqueID(texture.assetsFile!, texture.m_PathID);
                     var signature = sqliteCache!.GetFolderSignature(currentScanResult!);
-                    sqliteCache.SavePreviewCachePayload(
-                        folderPath,
-                        signature,
-                        assetId,
-                        "texture-thumbnail-png",
-                        algorithmVersion,
-                        BuildTexturePreviewCacheParameters(texture, maxDimension),
-                        hash,
-                        bytes,
-                        payloadPath);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to save texture thumbnail cache: {ex.Message}");
+                    var parameters = BuildTexturePreviewCacheParameters(texture, maxDimension);
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            using (snapshotForCache)
+                            {
+                                using var stream = new MemoryStream();
+                                snapshotForCache.WriteToStream(stream, ImageFormat.Png);
+                                var bytes = stream.ToArray();
+                                var hash = ComputeSha256Hex(bytes);
+                                var payloadPath = GetPreviewCachePayloadPath(folderPath, hash, ".texturepreview.png");
+                                sqliteCache.EnqueuePreviewCachePayload(
+                                    folderPath,
+                                    signature,
+                                    assetId,
+                                    "texture-thumbnail-png",
+                                    algorithmVersion,
+                                    parameters,
+                                    hash,
+                                    bytes,
+                                    payloadPath);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"Failed to save texture thumbnail cache: {ex.Message}");
+                        }
+                    });
                 }
             }
 
@@ -1472,13 +1585,21 @@ namespace AssetStudio.Avalonia.Services
             string folderPath,
             ProjectScanResult? scanResult)
         {
-            var state = TryLoadIndexingProgress(sqliteCache, folderPath, scanResult);
-            if (state == null || !IsConnectionReadyStatus(state.Status))
+            if (sqliteCache == null || scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
             {
                 return false;
             }
 
-            return HasSavedSemanticRelations(sqliteCache, folderPath, scanResult);
+            try
+            {
+                var signature = sqliteCache.GetFolderSignature(scanResult);
+                return sqliteCache.CanUseSemanticRelationCache(folderPath, signature);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to inspect lazy connection build state: {ex.Message}");
+                return false;
+            }
         }
 
         public static bool HasCompletedLazyStructureBuild(
@@ -1486,9 +1607,21 @@ namespace AssetStudio.Avalonia.Services
             string folderPath,
             ProjectScanResult? scanResult)
         {
-            var state = TryLoadIndexingProgress(sqliteCache, folderPath, scanResult);
-            return string.Equals(state?.Status, "structure_completed", StringComparison.OrdinalIgnoreCase)
-                && HasSavedSemanticRelations(sqliteCache, folderPath, scanResult);
+            if (sqliteCache == null || scanResult == null || string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+            {
+                return false;
+            }
+
+            try
+            {
+                var signature = sqliteCache.GetFolderSignature(scanResult);
+                return sqliteCache.HasCompletedLazyStructureStatus(folderPath, signature);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to inspect lazy structure build state: {ex.Message}");
+                return false;
+            }
         }
 
         public static bool HasSavedSemanticRelations(
@@ -1806,7 +1939,8 @@ namespace AssetStudio.Avalonia.Services
             ref CancellationTokenSource? preloaderCts,
             Action<AssetItem> ensureLazyAssetReadyForPreview,
             int maxWindowSize = AssetPreloadWindowSize,
-            int delayMilliseconds = 15)
+            int delayMilliseconds = 15,
+            Func<bool>? shouldPausePreload = null)
         {
             if (assetsManager == null || !assetsManager.LazyLoading || isProgressiveIndexingActive || currentItem == null)
             {
@@ -1817,6 +1951,12 @@ namespace AssetStudio.Avalonia.Services
             {
                 preloaderCts?.Cancel();
                 preloaderCts?.Dispose();
+                if (shouldPausePreload?.Invoke() == true)
+                {
+                    preloaderCts = null;
+                    return;
+                }
+
                 preloaderCts = new CancellationTokenSource();
                 var token = preloaderCts.Token;
 
@@ -1845,6 +1985,13 @@ namespace AssetStudio.Avalonia.Services
                 {
                     foreach (var item in sortedItemsToLoad)
                     {
+                        if (token.IsCancellationRequested) break;
+
+                        while (!token.IsCancellationRequested && shouldPausePreload?.Invoke() == true)
+                        {
+                            await Task.Delay(Math.Max(50, delayMilliseconds), token);
+                        }
+
                         if (token.IsCancellationRequested) break;
 
                         try

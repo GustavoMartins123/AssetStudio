@@ -86,6 +86,7 @@ namespace AssetStudio.Avalonia
 
                     transaction.Commit();
                     CacheProjectId(dbPath, folderPath, signature, projectId);
+                    NotifyDatabaseMutated(dbPath);
                 }
             }
             catch (Exception ex)
@@ -105,29 +106,38 @@ namespace AssetStudio.Avalonia
             var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnectionByDbPath(dbPath);
-                var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
-                if (projectId == null)
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
                 {
-                    return null;
-                }
-
-                var state = LoadIndexingState(conn, null, projectId.Value);
-                if (state == null && fromCache)
-                {
-                    var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
-                    if (verifiedProjectId == null)
+                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
+                    if (projectId == null)
                     {
                         return null;
                     }
 
-                    if (verifiedProjectId.Value != projectId.Value)
+                    var state = LoadIndexingState(conn, null, projectId.Value);
+                    if (state == null && fromCache)
                     {
-                        state = LoadIndexingState(conn, null, verifiedProjectId.Value);
-                    }
-                }
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId == null)
+                        {
+                            return null;
+                        }
 
-                return state;
+                        if (verifiedProjectId.Value != projectId.Value)
+                        {
+                            state = LoadIndexingState(conn, null, verifiedProjectId.Value);
+                        }
+                    }
+
+                    return state;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
             {
@@ -149,16 +159,26 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
             try
             {
-                using var conn = CreateReadConnection(folderPath);
-                var projectId = FindLatestProjectId(conn, null, folderPath);
-                if (projectId == null)
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
                 {
-                    return null;
-                }
+                    var projectId = FindLatestProjectId(conn, null, folderPath);
+                    if (projectId == null)
+                    {
+                        return null;
+                    }
 
-                return LoadIndexingState(conn, null, projectId.Value);
+                    return LoadIndexingState(conn, null, projectId.Value);
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
             }
             catch (SqliteException ex) when (IsDatabaseBusy(ex))
             {
@@ -209,7 +229,7 @@ namespace AssetStudio.Avalonia
             }
 
             if (IsSemanticReadyStatus(state.Status)
-                && CountMaterialSemanticRelations(conn, transaction, projectId) == 0)
+                && !HasAnyMaterialSemanticRelations(conn, transaction, projectId))
             {
                 state = new ProjectIndexingState
                 {
@@ -253,20 +273,121 @@ namespace AssetStudio.Avalonia
                 || string.Equals(status, "structure_failed", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static long CountMaterialSemanticRelations(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
+        internal bool CanUseSemanticRelationCache(string folderPath, string signature)
+        {
+            var status = GetOrResolveSemanticCacheStatus(folderPath, signature);
+            return status.HasRelations && IsSemanticReadyStatus(status.IndexingStatus);
+        }
+
+        internal bool HasCompletedLazyStructureStatus(string folderPath, string signature)
+        {
+            var status = GetOrResolveSemanticCacheStatus(folderPath, signature);
+            return status.HasRelations
+                && string.Equals(status.IndexingStatus, "structure_completed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal CachedSemanticCacheStatus GetOrResolveSemanticCacheStatus(string folderPath, string signature)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath) || string.IsNullOrWhiteSpace(signature))
+            {
+                return default;
+            }
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            var cacheKey = BuildProjectIdCacheKey(dbPath, folderPath, signature);
+            var currentGen = GetDatabaseWriteGeneration(dbPath);
+            if (_semanticStatusCache.TryGetValue(cacheKey, out var cached)
+                && cached.WriteGeneration == currentGen)
+            {
+                return cached;
+            }
+
+            try
+            {
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
+                {
+                    var projectId = TryGetOrResolveProjectId(conn, null, dbPath, folderPath, signature, out var fromCache);
+                    if (projectId == null)
+                    {
+                        var empty = new CachedSemanticCacheStatus(string.Empty, false, currentGen);
+                        _semanticStatusCache[cacheKey] = empty;
+                        return empty;
+                    }
+
+                    var indexingStatus = LoadProjectIndexingStatusFast(conn, null, projectId.Value);
+                    var hasRelations = HasAnyMaterialSemanticRelations(conn, null, projectId.Value);
+                    if (!hasRelations && string.IsNullOrEmpty(indexingStatus) && fromCache)
+                    {
+                        var verifiedProjectId = ReverifyProjectId(conn, null, dbPath, folderPath, signature);
+                        if (verifiedProjectId == null)
+                        {
+                            var empty = new CachedSemanticCacheStatus(string.Empty, false, currentGen);
+                            _semanticStatusCache[cacheKey] = empty;
+                            return empty;
+                        }
+
+                        if (verifiedProjectId.Value != projectId.Value)
+                        {
+                            indexingStatus = LoadProjectIndexingStatusFast(conn, null, verifiedProjectId.Value);
+                            hasRelations = HasAnyMaterialSemanticRelations(conn, null, verifiedProjectId.Value);
+                        }
+                    }
+
+                    var resolved = new CachedSemanticCacheStatus(indexingStatus, hasRelations, GetDatabaseWriteGeneration(dbPath));
+                    _semanticStatusCache[cacheKey] = resolved;
+                    return resolved;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
+            }
+            catch (SqliteException ex) when (IsDatabaseBusy(ex))
+            {
+                return default;
+            }
+            catch (Exception ex)
+            {
+                EvictProjectIdCacheEntry(dbPath, folderPath, signature);
+                _semanticStatusCache.TryRemove(cacheKey, out _);
+                Logger.Warning($"Failed to inspect semantic relation cache status: {ex.Message}");
+                return default;
+            }
+        }
+
+        private static string LoadProjectIndexingStatusFast(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = "SELECT Status FROM ProjectIndexingState WHERE ProjectId = @projectId LIMIT 1";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            return cmd.ExecuteScalar()?.ToString() ?? string.Empty;
+        }
+
+        private static bool HasAnyMaterialSemanticRelations(SqliteConnection conn, SqliteTransaction? transaction, long projectId)
         {
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 SELECT
-                    (SELECT COUNT(1) FROM AssetEdges WHERE ProjectId = @projectId) +
-                    (SELECT COUNT(1) FROM ModelGroups WHERE ProjectId = @projectId) +
-                    (SELECT COUNT(1) FROM ModelGroupMeshes WHERE ProjectId = @projectId) +
-                    (SELECT COUNT(1) FROM MeshMaterials WHERE ProjectId = @projectId) +
-                    (SELECT COUNT(1) FROM MaterialTextures WHERE ProjectId = @projectId) +
-                    (SELECT COUNT(1) FROM AnimationClipTargets WHERE ProjectId = @projectId)";
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM MeshMaterialResolvedCache WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM MeshMaterials WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM MaterialCache WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM MaterialTextures WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM AnimationClipTargets WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM ModelGroups WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM ModelGroupMeshes WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM CompositeAssets WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        WHEN EXISTS (SELECT 1 FROM AssetEdges WHERE ProjectId = @projectId LIMIT 1) THEN 1
+                        ELSE 0
+                    END";
             cmd.Parameters.AddWithValue("@projectId", projectId);
-            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0) != 0;
         }
 
         private static void SaveProjectIndexingState(

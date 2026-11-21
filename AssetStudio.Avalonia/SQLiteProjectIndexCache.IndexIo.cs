@@ -472,6 +472,7 @@ namespace AssetStudio.Avalonia
                         }
 
                         CacheProjectId(dbPath, folderPath, signature, committedProjectId);
+                        NotifyDatabaseMutated(dbPath);
                         reporter.Report("Writing mmap .idx sidecar cache", force: true);
                         MmapProjectIndexSidecar.TryWriteSidecar(
                             MmapProjectIndexSidecar.GetSidecarPath(dbPath),
@@ -597,6 +598,10 @@ namespace AssetStudio.Avalonia
                 : new[]
                 {
                     "AnimationClipTargets",
+                    "CompositeAssetParts",
+                    "CompositeAssets",
+                    "MeshMaterialResolvedCache",
+                    "MaterialCache",
                     "MaterialTextures",
                     "MeshMaterials",
                     "MeshRenderers",

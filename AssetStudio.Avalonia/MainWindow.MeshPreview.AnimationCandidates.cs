@@ -18,14 +18,32 @@ public partial class MainWindow
         }
 
         var folderPath = GetCurrentCacheFolderPath();
-        if (!CanUseLazySemanticRelationCache(folderPath))
+        if (string.IsNullOrWhiteSpace(folderPath))
         {
             return new List<AnimationClipTargetInfo>();
         }
 
+        // Read directly via WAL without blocking on full connections_completed so lazy_backfill and partial caches work immediately.
         var clipAssetId = AssetHandle.BuildUniqueID(clip.assetsFile, clip.m_PathID);
         var signature = _sqliteCache.GetFolderSignature(currentScanResult);
         return _sqliteCache.LoadAnimationClipTargets(folderPath, signature, clipAssetId);
+    }
+
+    private Dictionary<string, List<ModelGroupMeshInfo>> LoadModelGroupMeshesByGroupIdsForPreview(IReadOnlyList<string> groupIds)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || groupIds.Count == 0)
+        {
+            return new Dictionary<string, List<ModelGroupMeshInfo>>(StringComparer.Ordinal);
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return new Dictionary<string, List<ModelGroupMeshInfo>>(StringComparer.Ordinal);
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadModelGroupMeshesByGroupIds(folderPath, signature, groupIds);
     }
 
     private List<string> LoadAnimationClipAvatarAssetIdsForPreview(AnimationClip clip)
@@ -90,7 +108,8 @@ public partial class MainWindow
             string? modelGroupName = null,
             IReadOnlyList<string>? modelGroupMeshIds = null,
             IReadOnlyList<ModelGroupMeshInfo>? modelGroupMeshInfos = null,
-            int modelGroupConfidence = 0)
+            int modelGroupConfidence = 0,
+            bool isCurrentPreviewFallback = false)
         {
             avatarId = !string.IsNullOrWhiteSpace(avatarId) ? avatarId : GetPreviewObjectKey(avatar);
             meshId = !string.IsNullOrWhiteSpace(meshId) ? meshId : GetPreviewObjectKey(mesh);
@@ -171,6 +190,7 @@ public partial class MainWindow
                 ModelGroupTransforms = modelGroupMeshInfos?.Select(mesh => mesh.TransformMatrix).ToArray() ?? Array.Empty<float[]?>(),
                 ModelGroupMeshCount = modelGroupMeshIds?.Count ?? 0,
                 ModelGroupConfidence = modelGroupConfidence,
+                IsCurrentPreviewFallback = isCurrentPreviewFallback,
                 Label = label
             });
         }
@@ -185,7 +205,13 @@ public partial class MainWindow
 
         if (activePreviewMesh != null)
         {
-            AddCandidate(activePreviewAvatar, activePreviewMesh, null, null, activePreviewAvatar != null ? "Current" : "Current mesh");
+            AddCandidate(
+                activePreviewAvatar,
+                activePreviewMesh,
+                null,
+                null,
+                activePreviewAvatar != null ? "Current" : "Current mesh",
+                isCurrentPreviewFallback: true);
         }
 
         if (activePreviewAvatar != null)
@@ -210,20 +236,20 @@ public partial class MainWindow
             {
                 foreach (var mesh in currentMeshes)
                 {
-                    AddCandidate(activePreviewAvatar, mesh, null, null, "Current avatar");
+                    AddCandidate(activePreviewAvatar, mesh, null, null, "Current avatar", isCurrentPreviewFallback: true);
                     addedCurrentMesh = true;
                 }
             }
 
             if (!addedCurrentMesh && cachedMesh != null)
             {
-                AddCandidate(activePreviewAvatar, cachedMesh, null, null, "Current avatar");
+                AddCandidate(activePreviewAvatar, cachedMesh, null, null, "Current avatar", isCurrentPreviewFallback: true);
                 addedCurrentMesh = true;
             }
 
             if (!addedCurrentMesh)
             {
-                AddCandidate(activePreviewAvatar, null, null, null, "Current avatar");
+                AddCandidate(activePreviewAvatar, null, null, null, "Current avatar", isCurrentPreviewFallback: true);
             }
         }
 
@@ -234,13 +260,25 @@ public partial class MainWindow
             var meshIdsCoveredByAvatar = new HashSet<string>(StringComparer.Ordinal);
             var meshIdsCoveredByModelGroup = new HashSet<string>(StringComparer.Ordinal);
 
-            // Fast v14 pre-indexed single-query lookup from AnimationClipTargets
+            // Fast v15 pre-indexed single-query lookup from AnimationClipTargets + batched ModelGroupMeshes lookup.
             var preIndexedTargets = LoadAnimationClipTargetsForPreview(clip);
+            var groupIdsToBatch = preIndexedTargets
+                .Where(t => !string.IsNullOrWhiteSpace(t.ModelGroupId))
+                .Select(t => t.ModelGroupId)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var batchedGroupMeshes = groupIdsToBatch.Count > 0
+                ? LoadModelGroupMeshesByGroupIdsForPreview(groupIdsToBatch)
+                : new Dictionary<string, List<ModelGroupMeshInfo>>(StringComparer.Ordinal);
+
+            var hasCompletePreIndexedTarget = false;
+            var addedClipLinkedCandidate = false;
             foreach (var target in preIndexedTargets)
             {
                 if (!string.IsNullOrWhiteSpace(target.ModelGroupId))
                 {
-                    var groupMeshes = LoadModelGroupMeshesForPreview(target.ModelGroupId);
+                    batchedGroupMeshes.TryGetValue(target.ModelGroupId, out var groupMeshes);
+                    groupMeshes ??= new List<ModelGroupMeshInfo>();
                     var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
                     var repMeshId = representative?.MeshAssetId ?? target.MeshAssetId;
                     if (!string.IsNullOrWhiteSpace(repMeshId))
@@ -288,8 +326,15 @@ public partial class MainWindow
                             meshIds,
                             groupMeshes,
                             target.ModelGroupConfidence);
+                        addedClipLinkedCandidate = true;
+                        hasCompletePreIndexedTarget = true;
                         continue;
                     }
+                }
+
+                if (string.IsNullOrWhiteSpace(target.AvatarAssetId) && string.IsNullOrWhiteSpace(target.MeshAssetId))
+                {
+                    continue;
                 }
 
                 var relationSource = target.RelationKind switch
@@ -304,6 +349,7 @@ public partial class MainWindow
                 {
                     avatarIdsCoveredByMesh.Add(target.AvatarAssetId);
                     meshIdsCoveredByAvatar.Add(target.MeshAssetId);
+                    hasCompletePreIndexedTarget = true;
                 }
 
                 AddCandidate(
@@ -314,103 +360,138 @@ public partial class MainWindow
                     relationSource,
                     !string.IsNullOrWhiteSpace(target.AvatarName) ? target.AvatarName : null,
                     !string.IsNullOrWhiteSpace(target.MeshName) ? target.MeshName : null);
+                addedClipLinkedCandidate = true;
             }
 
-            var avatarIds = LoadAnimationClipAvatarAssetIdsForPreview(clip);
-            var avatarMeshIdsByAvatarId = LoadAvatarMeshAssetIdsByAvatarIdsForPreview(avatarIds);
-            var modelGroupsByAvatarId = LoadModelGroupsByAvatarIdsForPreview(avatarIds);
-
-            foreach (var avatarId in avatarIds)
+            // Only run legacy multi-query fallback when AnimationClipTargets did not already provide a complete target.
+            if (!hasCompletePreIndexedTarget && CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
             {
-                if (modelGroupsByAvatarId.TryGetValue(avatarId, out var modelGroups) && modelGroups.Count > 0)
+                var avatarIds = LoadAnimationClipAvatarAssetIdsForPreview(clip);
+                var avatarMeshIdsByAvatarId = LoadAvatarMeshAssetIdsByAvatarIdsForPreview(avatarIds);
+                var modelGroupsByAvatarId = LoadModelGroupsByAvatarIdsForPreview(avatarIds);
+
+                var legacyGroupIds = modelGroupsByAvatarId.Values
+                    .SelectMany(list => list.Select(g => g.GroupId))
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                var legacyBatchedGroupMeshes = legacyGroupIds.Count > 0
+                    ? LoadModelGroupMeshesByGroupIdsForPreview(legacyGroupIds)
+                    : new Dictionary<string, List<ModelGroupMeshInfo>>(StringComparer.Ordinal);
+
+                foreach (var avatarId in avatarIds)
                 {
-                    foreach (var group in modelGroups)
+                    if (modelGroupsByAvatarId.TryGetValue(avatarId, out var modelGroups) && modelGroups.Count > 0)
                     {
-                        var groupMeshes = LoadModelGroupMeshesForPreview(group.GroupId);
-                        var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
-                        if (representative == null)
+                        foreach (var group in modelGroups)
+                        {
+                            legacyBatchedGroupMeshes.TryGetValue(group.GroupId, out var groupMeshes);
+                            groupMeshes ??= new List<ModelGroupMeshInfo>();
+                            var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+                            if (representative == null)
+                            {
+                                continue;
+                            }
+
+                            var meshIds = groupMeshes
+                                .Select(mesh => mesh.MeshAssetId)
+                                .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
+                                .ToArray();
+                            foreach (var meshId in meshIds)
+                            {
+                                meshIdsCoveredByModelGroup.Add(meshId);
+                            }
+
+                            avatarIdsCoveredByModelGroup.Add(avatarId);
+                            avatarIdsCoveredByMesh.Add(avatarId);
+                            meshIdsCoveredByAvatar.Add(representative.MeshAssetId);
+
+                            var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+                                ? group.GroupName
+                                : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                                    ? group.RootGameObjectName
+                                    : GetPreviewHandleName(representative.MeshAssetId, "Model");
+                            var meshName = !string.IsNullOrWhiteSpace(representative.MeshName)
+                                ? representative.MeshName
+                                : GetPreviewHandleName(representative.MeshAssetId, "Mesh");
+
+                            AddCandidate(
+                                null,
+                                null,
+                                avatarId,
+                                representative.MeshAssetId,
+                                "Model group",
+                                GetPreviewHandleName(avatarId, "Avatar"),
+                                meshName,
+                                group.GroupId,
+                                groupName,
+                                meshIds,
+                                groupMeshes,
+                                group.Confidence);
+                            addedClipLinkedCandidate = true;
+                        }
+
+                        if (avatarIdsCoveredByModelGroup.Contains(avatarId))
                         {
                             continue;
                         }
-
-                        var meshIds = groupMeshes
-                            .Select(mesh => mesh.MeshAssetId)
-                            .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
-                            .ToArray();
-                        foreach (var meshId in meshIds)
-                        {
-                            meshIdsCoveredByModelGroup.Add(meshId);
-                        }
-
-                        avatarIdsCoveredByModelGroup.Add(avatarId);
-                        avatarIdsCoveredByMesh.Add(avatarId);
-                        meshIdsCoveredByAvatar.Add(representative.MeshAssetId);
-
-                        var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
-                            ? group.GroupName
-                            : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
-                                ? group.RootGameObjectName
-                                : GetPreviewHandleName(representative.MeshAssetId, "Model");
-                        var meshName = !string.IsNullOrWhiteSpace(representative.MeshName)
-                            ? representative.MeshName
-                            : GetPreviewHandleName(representative.MeshAssetId, "Mesh");
-
-                        AddCandidate(
-                            null,
-                            null,
-                            avatarId,
-                            representative.MeshAssetId,
-                            "Model group",
-                            GetPreviewHandleName(avatarId, "Avatar"),
-                            meshName,
-                            group.GroupId,
-                            groupName,
-                            meshIds,
-                            groupMeshes,
-                            group.Confidence);
                     }
 
-                    if (avatarIdsCoveredByModelGroup.Contains(avatarId))
+                    if (avatarMeshIdsByAvatarId.TryGetValue(avatarId, out var avatarMeshIds) && avatarMeshIds.Count > 0)
+                    {
+                        foreach (var meshId in avatarMeshIds)
+                        {
+                            if (string.IsNullOrWhiteSpace(meshId))
+                            {
+                                continue;
+                            }
+
+                            meshIdsCoveredByAvatar.Add(meshId);
+                            avatarIdsCoveredByMesh.Add(avatarId);
+                            AddCandidate(
+                                null,
+                                null,
+                                avatarId,
+                                meshId,
+                                "Avatar relation",
+                                GetPreviewHandleName(avatarId, "Avatar"),
+                                GetPreviewHandleName(meshId, "Mesh"));
+                            addedClipLinkedCandidate = true;
+                        }
+
+                        continue;
+                    }
+
+                    AddCandidate(null, null, avatarId, null, "Avatar relation", GetPreviewHandleName(avatarId, "Avatar"));
+                    addedClipLinkedCandidate = true;
+                }
+
+                foreach (var meshId in LoadAnimationClipMeshAssetIdsForPreview(clip))
+                {
+                    if (meshIdsCoveredByAvatar.Contains(meshId) || meshIdsCoveredByModelGroup.Contains(meshId))
                     {
                         continue;
                     }
+
+                    AddCandidate(null, null, null, meshId, "Animator mesh", meshName: GetPreviewHandleName(meshId, "Mesh"));
+                    addedClipLinkedCandidate = true;
                 }
-
-                if (avatarMeshIdsByAvatarId.TryGetValue(avatarId, out var avatarMeshIds) && avatarMeshIds.Count > 0)
-                {
-                    foreach (var meshId in avatarMeshIds)
-                    {
-                        if (string.IsNullOrWhiteSpace(meshId))
-                        {
-                            continue;
-                        }
-
-                        meshIdsCoveredByAvatar.Add(meshId);
-                        avatarIdsCoveredByMesh.Add(avatarId);
-                        AddCandidate(
-                            null,
-                            null,
-                            avatarId,
-                            meshId,
-                            "Avatar relation",
-                            GetPreviewHandleName(avatarId, "Avatar"),
-                            GetPreviewHandleName(meshId, "Mesh"));
-                    }
-
-                    continue;
-                }
-
-                AddCandidate(null, null, avatarId, null, "Avatar relation", GetPreviewHandleName(avatarId, "Avatar"));
             }
 
-            foreach (var meshId in LoadAnimationClipMeshAssetIdsForPreview(clip))
+            // On-demand local-file fallback when connections are not built yet or SQLite returned 0 usable targets.
+            if (!addedClipLinkedCandidate)
             {
-                if (meshIdsCoveredByAvatar.Contains(meshId) || meshIdsCoveredByModelGroup.Contains(meshId))
-                {
-                    continue;
-                }
-
-                AddCandidate(null, null, null, meshId, "Animator mesh", meshName: GetPreviewHandleName(meshId, "Mesh"));
+                TryAddLocalFallbackAnimationClipCandidates(
+                    clip,
+                    (avatar, mesh, avatarId, meshId, source) =>
+                    {
+                        AddCandidate(avatar, mesh, avatarId, meshId, source);
+                        if (!string.IsNullOrWhiteSpace(avatarId) && !string.IsNullOrWhiteSpace(meshId))
+                        {
+                            avatarIdsCoveredByMesh.Add(avatarId);
+                            meshIdsCoveredByAvatar.Add(meshId);
+                        }
+                    });
             }
 
             if (meshIdsCoveredByAvatar.Count > 0)
@@ -454,6 +535,196 @@ public partial class MainWindow
         return candidates;
     }
 
+    private void TryAddLocalFallbackAnimationClipCandidates(
+        AnimationClip clip,
+        Action<Avatar?, Mesh?, string?, string?, string> addCandidate)
+    {
+        if (clip.assetsFile == null)
+        {
+            return;
+        }
+
+        try
+        {
+            using (assetsManager.LruCache.SuspendEviction())
+            {
+                MaterializeReferenceObjects(clip.assetsFile, AnimationLocalFallbackReferenceTypes);
+            }
+
+            var filesToInspect = new List<SerializedFile> { clip.assetsFile };
+            var seenFiles = new HashSet<SerializedFile> { clip.assetsFile };
+            foreach (var loadedFile in GetLoadedFilesSnapshot())
+            {
+                if (loadedFile != null && seenFiles.Add(loadedFile))
+                {
+                    filesToInspect.Add(loadedFile);
+                }
+            }
+
+            var clipId = GetPreviewObjectKey(clip);
+            var backfill = new SemanticAssetRelations();
+            var discoveredAny = false;
+
+            // 1. Run SemanticGraphService locally on clip.assetsFile (and loaded files) to catch same-file Controller -> Animator -> Avatar + Mesh and Legacy Animation -> Mesh.
+            var localRelations = new SemanticAssetRelations();
+            Services.SemanticGraphService.BuildSemanticRelationsForFilesBackground(
+                new[] { clip.assetsFile },
+                localRelations,
+                maxDegreeOfParallelism: 1);
+
+            foreach (var target in localRelations.AnimationClipTargets)
+            {
+                if (!string.Equals(target.ClipAssetId, clipId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(target.AvatarAssetId)
+                    && string.IsNullOrWhiteSpace(target.MeshAssetId)
+                    && string.IsNullOrWhiteSpace(target.ModelGroupId))
+                {
+                    continue;
+                }
+
+                addCandidate(null, null, target.AvatarAssetId, target.MeshAssetId, "Local rig");
+                backfill.AnimationClipTargets.Add(target);
+                discoveredAny = true;
+            }
+
+            // 2. Also link Controller -> Animator -> Avatar + Mesh when Controller and Animator are across already-loaded files or via AssetEdges in clip.assetsFile.
+            if (!discoveredAny)
+            {
+                var controllersForClip = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var edge in localRelations.AssetEdges)
+                {
+                    if (string.Equals(edge.EdgeKind, "AnimationClip", StringComparison.Ordinal)
+                        && string.Equals(edge.TargetAssetId, clipId, StringComparison.Ordinal)
+                        && !string.IsNullOrWhiteSpace(edge.SourceAssetId))
+                    {
+                        controllersForClip.Add(edge.SourceAssetId);
+                    }
+                }
+
+                if (controllersForClip.Count > 0)
+                {
+                    foreach (var file in filesToInspect)
+                    {
+                        var rels = ReferenceEquals(file, clip.assetsFile)
+                            ? localRelations
+                            : Services.SemanticGraphService.BuildAssetReferenceIndexForFile(file).SemanticRelations;
+                        foreach (var ctrlEdge in rels.AssetEdges)
+                        {
+                            if (!string.Equals(ctrlEdge.EdgeKind, "AnimatorController", StringComparison.Ordinal)
+                                || !controllersForClip.Contains(ctrlEdge.TargetAssetId))
+                            {
+                                continue;
+                            }
+
+                            var animatorId = ctrlEdge.SourceAssetId;
+                            var avatarId = rels.AssetEdges
+                                .FirstOrDefault(e => string.Equals(e.SourceAssetId, animatorId, StringComparison.Ordinal)
+                                    && string.Equals(e.EdgeKind, "Avatar", StringComparison.Ordinal)
+                                    && !string.IsNullOrWhiteSpace(e.TargetAssetId))
+                                ?.TargetAssetId ?? string.Empty;
+                            var meshId = rels.AssetEdges
+                                .FirstOrDefault(e => string.Equals(e.SourceAssetId, animatorId, StringComparison.Ordinal)
+                                    && string.Equals(e.EdgeKind, "Mesh", StringComparison.Ordinal)
+                                    && !string.IsNullOrWhiteSpace(e.TargetAssetId))
+                                ?.TargetAssetId ?? string.Empty;
+                            if (!string.IsNullOrWhiteSpace(avatarId) || !string.IsNullOrWhiteSpace(meshId))
+                            {
+                                addCandidate(null, null, avatarId, meshId, "Local controller");
+                                backfill.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
+                                    clipId,
+                                    animatorId,
+                                    avatarId,
+                                    meshId,
+                                    string.Empty,
+                                    "AnimatorController",
+                                    9500));
+                                discoveredAny = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. On-demand bone-hash match against Avatar.m_TOS / m_AvatarSkeleton in clip.assetsFile + loaded files.
+            var clipBindings = GetTransformBindingPathsBackground(clip);
+            if (clipBindings.Count > 0)
+            {
+                var scoredAvatars = new List<(Avatar Avatar, int Overlap, bool SameFile)>();
+                foreach (var file in filesToInspect)
+                {
+                    AssetStudio.Object[] objs;
+                    lock (file)
+                    {
+                        objs = file.Objects.ToArray();
+                    }
+
+                    foreach (var avatar in objs.OfType<Avatar>())
+                    {
+                        var rigHashes = Services.SemanticGraphService.ExtractAvatarRigBoneHashes(avatar);
+                        if (rigHashes.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        var overlap = clipBindings.Count(rigHashes.Contains);
+                        if (IsStrongAnimationAvatarMatch(clipBindings.Count, overlap))
+                        {
+                            scoredAvatars.Add((avatar, overlap, ReferenceEquals(file, clip.assetsFile)));
+                        }
+                    }
+                }
+
+                foreach (var match in scoredAvatars
+                    .OrderByDescending(m => m.Overlap)
+                    .ThenByDescending(m => m.SameFile)
+                    .Take(4))
+                {
+                    var avatar = match.Avatar;
+                    var avatarId = GetPreviewObjectKey(avatar);
+                    var avatarMeshId = string.Empty;
+
+                    // Check same-file AvatarMesh/AnimatorMesh edges first, then SkinnedMeshRenderer bone overlap.
+                    if (avatar.assetsFile != null)
+                    {
+                        var avatarFileRels = ReferenceEquals(avatar.assetsFile, clip.assetsFile)
+                            ? localRelations
+                            : Services.SemanticGraphService.BuildAssetReferenceIndexForFile(avatar.assetsFile).SemanticRelations;
+                        avatarMeshId = avatarFileRels.AssetEdges
+                            .FirstOrDefault(e => string.Equals(e.SourceAssetId, avatarId, StringComparison.Ordinal)
+                                && string.Equals(e.EdgeKind, "Mesh", StringComparison.Ordinal)
+                                && !string.IsNullOrWhiteSpace(e.TargetAssetId))
+                            ?.TargetAssetId ?? string.Empty;
+                    }
+
+                    addCandidate(avatar, null, avatarId, avatarMeshId, "Local bone match");
+                    backfill.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
+                        clipId,
+                        string.Empty,
+                        avatarId,
+                        avatarMeshId,
+                        string.Empty,
+                        "BoneHashMatch",
+                        match.Overlap * 100,
+                        match.Overlap,
+                        clipBindings.Count));
+                }
+            }
+
+            if (backfill.HasRelations)
+            {
+                EnqueueLazySemanticRelationsBackfill(backfill);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Local animation fallback failed for {clip.m_Name}: {ex.Message}");
+        }
+    }
+
     private PreviewCandidateItem? SelectAnimationClipPreviewCandidate(
         AnimationClip clip,
         IReadOnlyList<PreviewCandidateItem> candidates,
@@ -462,6 +733,31 @@ public partial class MainWindow
         string? preferredAvatarId = null,
         string? preferredMeshId = null)
     {
+        return SelectBestAnimationClipCandidate(
+            clip,
+            candidates,
+            preferredAvatar,
+            preferredMesh,
+            preferredAvatarId,
+            preferredMeshId,
+            IsAnimationClipCompatibleWithAvatar);
+    }
+
+    internal static PreviewCandidateItem? SelectBestAnimationClipCandidate(
+        AnimationClip clip,
+        IReadOnlyList<PreviewCandidateItem> candidates,
+        Avatar? preferredAvatar,
+        Mesh? preferredMesh,
+        string? preferredAvatarId,
+        string? preferredMeshId,
+        Func<AnimationClip, Avatar, bool>? isCompatibleWithAvatar = null)
+    {
+        if (candidates == null || candidates.Count == 0)
+        {
+            return null;
+        }
+
+        // 1. Explicit user/preferred match
         if (preferredAvatar != null
             || preferredMesh != null
             || !string.IsNullOrWhiteSpace(preferredAvatarId)
@@ -478,45 +774,71 @@ public partial class MainWindow
             }
         }
 
-        var compatibleAvatar = candidates.FirstOrDefault(candidate =>
-            candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
-            && candidate.Mesh != null
-            && IsAnimationClipCompatibleWithAvatar(clip, candidate.Avatar));
-        if (compatibleAvatar != null)
+        static bool HasAvatar(PreviewCandidateItem c) =>
+            c.Avatar != null || !string.IsNullOrWhiteSpace(c.AvatarId);
+        static bool HasMesh(PreviewCandidateItem c) =>
+            c.Mesh != null || !string.IsNullOrWhiteSpace(c.MeshId);
+
+        // 2. Clip-linked ModelGroup with Avatar + Mesh (lazy IDs or loaded objects)
+        var linkedModelGroupWithAvatar = candidates.FirstOrDefault(c =>
+            !c.IsCurrentPreviewFallback && c.IsModelGroup && HasAvatar(c) && HasMesh(c));
+        if (linkedModelGroupWithAvatar != null)
         {
-            return compatibleAvatar;
+            return linkedModelGroupWithAvatar;
         }
 
-        if (assetsManager.LazyLoading)
+        // 3. Clip-linked Avatar + Mesh (lazy IDs or loaded objects)
+        var linkedAvatarAndMesh = candidates.FirstOrDefault(c =>
+            !c.IsCurrentPreviewFallback && HasAvatar(c) && HasMesh(c));
+        if (linkedAvatarAndMesh != null)
         {
-            var lazyModelGroup = candidates.FirstOrDefault(candidate =>
-                candidate.IsModelGroup
-                && (!string.IsNullOrWhiteSpace(candidate.MeshId) || candidate.Mesh != null));
-            if (lazyModelGroup != null)
+            return linkedAvatarAndMesh;
+        }
+
+        // 4. Clip-linked ModelGroup with Mesh
+        var linkedModelGroup = candidates.FirstOrDefault(c =>
+            !c.IsCurrentPreviewFallback && c.IsModelGroup && HasMesh(c));
+        if (linkedModelGroup != null)
+        {
+            return linkedModelGroup;
+        }
+
+        // 5. Clip-linked Mesh-only
+        var linkedMeshOnly = candidates.FirstOrDefault(c =>
+            !c.IsCurrentPreviewFallback && HasMesh(c));
+        if (linkedMeshOnly != null)
+        {
+            return linkedMeshOnly;
+        }
+
+        // 6. Current preview Avatar + Mesh ONLY if bone-compatible with clip
+        if (isCompatibleWithAvatar != null)
+        {
+            var compatibleCurrent = candidates.FirstOrDefault(c =>
+                c.IsCurrentPreviewFallback
+                && c.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
+                && c.Mesh != null
+                && isCompatibleWithAvatar(clip, c.Avatar));
+            if (compatibleCurrent != null)
             {
-                return lazyModelGroup;
-            }
-
-            var lazyAvatar = candidates.FirstOrDefault(candidate =>
-                candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null
-                && candidate.Mesh != null);
-            if (lazyAvatar != null)
-            {
-                return lazyAvatar;
+                return compatibleCurrent;
             }
         }
 
-        var animatorMesh = candidates.FirstOrDefault(candidate =>
-            candidate.Avatar == null
-            && candidate.Mesh != null
-            && candidate.Label.StartsWith("Animator mesh:", StringComparison.Ordinal));
-        if (animatorMesh != null)
+        // 7. Clip-linked Avatar-only (lazy ID or loaded object)
+        var linkedAvatarOnly = candidates.FirstOrDefault(c =>
+            !c.IsCurrentPreviewFallback && HasAvatar(c));
+        if (linkedAvatarOnly != null)
         {
-            return animatorMesh;
+            return linkedAvatarOnly;
         }
 
-        return candidates.FirstOrDefault(candidate => candidate.Mesh != null)
-            ?? candidates.FirstOrDefault(candidate => candidate.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null)
+        // 8. Remaining non-Current fallback, then compatible Current avatar, then first available
+        return candidates.FirstOrDefault(c => !c.IsCurrentPreviewFallback)
+            ?? (isCompatibleWithAvatar != null
+                ? candidates.FirstOrDefault(c => c.Avatar?.m_Avatar?.m_AvatarSkeleton?.m_Node != null && isCompatibleWithAvatar(clip, c.Avatar))
+                : null)
+            ?? candidates.FirstOrDefault(c => c.Mesh != null)
             ?? candidates.FirstOrDefault();
     }
 
@@ -558,12 +880,14 @@ public partial class MainWindow
             MeshId = !string.IsNullOrWhiteSpace(candidate.MeshId) ? candidate.MeshId : GetPreviewObjectKey(mesh),
             ModelGroupId = candidate.ModelGroupId,
             ModelGroupName = candidate.ModelGroupName,
+            ModelGroupKind = candidate.ModelGroupKind,
             ModelGroupMeshIds = candidate.ModelGroupMeshIds,
             ModelGroupMeshInfos = candidate.ModelGroupMeshInfos,
             ModelGroupMeshes = candidate.ModelGroupMeshes,
             ModelGroupTransforms = candidate.ModelGroupTransforms,
             ModelGroupMeshCount = candidate.ModelGroupMeshCount,
             ModelGroupConfidence = candidate.ModelGroupConfidence,
+            IsCurrentPreviewFallback = candidate.IsCurrentPreviewFallback,
             Label = candidate.Label
         };
     }

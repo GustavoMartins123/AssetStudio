@@ -44,19 +44,47 @@ public partial class MainWindow
             TexturePreviewImageResult? previewImage = null;
             try
             {
-                try
+                // Cache-first lookup via v15 MaterialCache / MaterialTextures (WAL read works even during connections build).
+                MaterialCacheEntryInfo? cachedEntry = null;
+                var folderPath = GetCurrentCacheFolderPath();
+                var materialAssetId = m_Material.assetsFile != null
+                    ? AssetHandle.BuildUniqueID(m_Material.assetsFile, m_Material.m_PathID)
+                    : string.Empty;
+                if (assetsManager.LazyLoading
+                    && currentScanResult != null
+                    && !string.IsNullOrWhiteSpace(materialAssetId)
+                    && !string.IsNullOrWhiteSpace(folderPath))
                 {
-                    EnsureMaterialPreviewDependenciesLoaded(m_Material);
+                    var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+                    cachedEntry = _sqliteCache.LoadMaterialCacheEntry(folderPath, signature, materialAssetId);
                 }
-                catch (Exception ex)
+
+                // Only materialize local material file references on cache miss; never scan all 50 preloaded files.
+                if (cachedEntry == null || string.IsNullOrWhiteSpace(cachedEntry.MainTextureAssetId))
                 {
-                    Logger.Warning($"Failed to prepare material preview dependencies for {m_Material.m_Name}: {ex.Message}");
+                    try
+                    {
+                        EnsureMaterialPreviewDependenciesLoaded(m_Material);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Failed to prepare material preview dependencies for {m_Material.m_Name}: {ex.Message}");
+                    }
                 }
 
                 var previewData = BuildMaterialPreviewData(m_Material);
                 if (currentId != texturePreviewIdCounter)
                 {
                     return;
+                }
+
+                // Lazy backfill into v15 MaterialCache + MaterialTextures on cache miss so future material & mesh previews reuse it in O(1).
+                if (assetsManager.LazyLoading
+                    && currentScanResult != null
+                    && !string.IsNullOrWhiteSpace(materialAssetId)
+                    && (cachedEntry == null || (string.IsNullOrWhiteSpace(cachedEntry.MainTextureAssetId) && previewData.PreviewTexture != null)))
+                {
+                    EnqueueMaterialLazyBackfill(m_Material, previewData.PreviewTexture);
                 }
 
                 if (previewData.PreviewTexture == null)
@@ -79,7 +107,15 @@ public partial class MainWindow
                     return;
                 }
 
-                previewImage = LoadTexturePreviewThumbnail(previewData.PreviewTexture, MaxCachedPreviewTextureDimension);
+                SetActivePreviewDependencyFiles(m_Material, previewData.PreviewTexture);
+
+                var cachedTexId = previewData.PreviewTexture.assetsFile != null
+                    ? AssetHandle.BuildUniqueID(previewData.PreviewTexture.assetsFile, previewData.PreviewTexture.m_PathID)
+                    : cachedEntry?.MainTextureAssetId ?? string.Empty;
+                previewImage = !string.IsNullOrWhiteSpace(cachedTexId)
+                    ? TryLoadCachedTexturePreviewThumbnailByAssetId(cachedTexId, MaxCachedPreviewTextureDimension)
+                    : null;
+                previewImage ??= LoadTexturePreviewThumbnail(previewData.PreviewTexture, MaxCachedPreviewTextureDimension);
                 var loadedPreviewImage = previewImage;
                 var image = loadedPreviewImage?.Image;
                 if (image == null)
@@ -216,5 +252,87 @@ public partial class MainWindow
             ResolveMaterialForPreview,
             GetMaterialTextureSlot,
             FindTextureForMaterial).Build(material);
+    }
+
+    private void EnqueueMaterialLazyBackfill(Material material, Texture2D? resolvedMainTexture)
+    {
+        if (material.assetsFile == null || currentScanResult == null)
+        {
+            return;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return;
+        }
+
+        var materialId = AssetHandle.BuildUniqueID(material.assetsFile, material.m_PathID);
+        var displayMaterial = ResolveMaterialForPreview(material) ?? material;
+        var previewMaterialId = displayMaterial.assetsFile != null
+            ? AssetHandle.BuildUniqueID(displayMaterial.assetsFile, displayMaterial.m_PathID)
+            : materialId;
+        var mainSlotName = Services.SemanticGraphService.SelectMainTextureSlotNameForRelations(displayMaterial) ?? string.Empty;
+        var mainTexId = resolvedMainTexture?.assetsFile != null
+            ? AssetHandle.BuildUniqueID(resolvedMainTexture.assetsFile, resolvedMainTexture.m_PathID)
+            : string.Empty;
+
+        var backfill = new SemanticAssetRelations();
+        var slotIndex = 0;
+        foreach (var texEnv in displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<System.Collections.Generic.KeyValuePair<string, UnityTexEnv>>())
+        {
+            var texRef = texEnv.Value?.m_Texture;
+            var texHandle = texRef != null && !texRef.IsNull
+                ? FindTextureHandleForPPtr(displayMaterial, texRef)
+                : null;
+            var texId = texHandle?.UniqueID ?? string.Empty;
+            var isMain = string.Equals(texEnv.Key, mainSlotName, StringComparison.OrdinalIgnoreCase);
+            if (isMain && string.IsNullOrEmpty(mainTexId) && !string.IsNullOrEmpty(texId))
+            {
+                mainTexId = texId;
+            }
+
+            var scale = texEnv.Value?.m_Scale ?? new Vector2(1f, 1f);
+            var offset = texEnv.Value?.m_Offset ?? new Vector2(0f, 0f);
+            backfill.MaterialTextures.Add(new SemanticMaterialTextureRelation(
+                materialId,
+                previewMaterialId,
+                texEnv.Key,
+                slotIndex++,
+                texId,
+                texRef?.m_FileID ?? 0,
+                texRef?.m_PathID ?? 0,
+                !string.IsNullOrEmpty(texId),
+                isMain,
+                float.IsFinite(scale.X) ? scale.X : 1f,
+                float.IsFinite(scale.Y) ? scale.Y : 1f,
+                float.IsFinite(offset.X) ? offset.X : 0f,
+                float.IsFinite(offset.Y) ? offset.Y : 0f,
+                "lazy_backfill"));
+        }
+
+        var (r, g, b, a) = Services.SemanticGraphService.ExtractMaterialBaseColor(displayMaterial);
+        var shaderName = displayMaterial.m_Shader != null && displayMaterial.m_Shader.TryGet(out var sh) && sh != null
+            ? (sh.m_ParsedForm?.m_Name ?? sh.m_Name ?? string.Empty)
+            : string.Empty;
+        var parentId = !string.Equals(previewMaterialId, materialId, StringComparison.Ordinal)
+            ? previewMaterialId
+            : GetMaterialParentAssetIdForSemanticCache(material);
+
+        backfill.MaterialCaches.Add(new SemanticMaterialCacheEntry(
+            materialId,
+            material.m_Name ?? string.Empty,
+            parentId,
+            mainTexId,
+            mainSlotName,
+            r,
+            g,
+            b,
+            a,
+            shaderName,
+            slotIndex,
+            "lazy_backfill"));
+
+        EnqueueLazySemanticRelationsBackfill(backfill);
     }
 }

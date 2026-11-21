@@ -697,6 +697,110 @@ public partial class MainWindow
         }
 
         token.ThrowIfCancellationRequested();
+
+        // Build bounded ordered attempt list (primary activeCandidate + up to 5 distinct alternate (AvatarId, MeshId) pairs).
+        var attempts = new List<PreviewCandidateItem>();
+        var seenPairs = new HashSet<string>(StringComparer.Ordinal);
+        void TryAddAttempt(PreviewCandidateItem? item)
+        {
+            if (item == null)
+            {
+                return;
+            }
+
+            var pairKey = $"{item.AvatarId}|{item.MeshId}";
+            if (seenPairs.Add(pairKey))
+            {
+                attempts.Add(item);
+            }
+        }
+
+        TryAddAttempt(activeCandidate);
+        if (rebuildCandidateControls && candidates != null)
+        {
+            foreach (var candidate in candidates.Where(c => !c.IsCurrentPreviewFallback))
+            {
+                if (attempts.Count >= 6)
+                {
+                    break;
+                }
+
+                TryAddAttempt(candidate);
+            }
+
+            foreach (var candidate in candidates.Where(c => c.IsCurrentPreviewFallback))
+            {
+                if (attempts.Count >= 6)
+                {
+                    break;
+                }
+
+                TryAddAttempt(candidate);
+            }
+        }
+
+        PreparedAnimationClipPreviewOutcome? bestStaticFallback = null;
+        PreparedAnimationClipPreviewOutcome? lastOutcome = null;
+
+        for (var attemptIndex = 0; attemptIndex < attempts.Count; attemptIndex++)
+        {
+            token.ThrowIfCancellationRequested();
+            var candidateToTry = attempts[attemptIndex];
+            var outcome = PrepareSingleAnimationClipCandidateBackground(
+                clip,
+                candidateToTry,
+                candidates,
+                preferredMesh,
+                preferredMeshId,
+                currentMeshSnapshot,
+                densityPercent,
+                boneScale,
+                allowMeshFallbackWithoutAvatar: attemptIndex == attempts.Count - 1,
+                token);
+
+            if (outcome.FrameCount > 0 && outcome.GlData != null)
+            {
+                SetActivePreviewDependencyFiles(clip, outcome.Avatar, outcome.Mesh);
+                _activePreviewNeedsConnectionRefresh = false;
+                return outcome;
+            }
+
+            if (bestStaticFallback == null && outcome.GlData != null)
+            {
+                bestStaticFallback = outcome;
+            }
+
+            lastOutcome = outcome;
+        }
+
+        var finalOutcome = bestStaticFallback
+            ?? lastOutcome
+            ?? new PreparedAnimationClipPreviewOutcome
+            {
+                Candidates = candidates,
+                SelectedCandidate = activeCandidate,
+                StatusMessage = $"AnimationClip: No compatible Avatar or mesh target found for {clip.m_Name}."
+            };
+
+        SetActivePreviewDependencyFiles(clip, finalOutcome.Avatar, finalOutcome.Mesh);
+        _activePreviewNeedsConnectionRefresh = assetsManager.LazyLoading
+            && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath());
+        return finalOutcome;
+    }
+
+    private PreparedAnimationClipPreviewOutcome PrepareSingleAnimationClipCandidateBackground(
+        AnimationClip clip,
+        PreviewCandidateItem activeCandidate,
+        IReadOnlyList<PreviewCandidateItem>? candidates,
+        Mesh? preferredMesh,
+        string? preferredMeshId,
+        Mesh? currentMeshSnapshot,
+        float densityPercent,
+        float boneScale,
+        bool allowMeshFallbackWithoutAvatar,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
         var resolvedCandidate = ResolveAnimationClipPreviewCandidate(activeCandidate);
         token.ThrowIfCancellationRequested();
 
@@ -730,7 +834,8 @@ public partial class MainWindow
 
         if (avatar == null)
         {
-            if (TryPrepareAnimationClipWithRendererSkeletonBackground(
+            if (allowMeshFallbackWithoutAvatar
+                && TryPrepareAnimationClipWithRendererSkeletonBackground(
                     clip,
                     preferredMesh,
                     preferredMeshId,

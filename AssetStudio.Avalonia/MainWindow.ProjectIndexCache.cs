@@ -69,7 +69,16 @@ public partial class MainWindow : Window
         ProjectLoadingService.LoadMeshPreviewGeometryCache(_sqliteCache, GetCurrentCacheFolderPath(), currentScanResult, mesh, densityPercent);
 
     private void SaveMeshPreviewGeometryCache(Mesh mesh, float densityPercent, MeshPreviewGeometryCache cache) =>
-        ProjectLoadingService.SaveMeshPreviewGeometryCache(_sqliteCache, GetCurrentCacheFolderPath(), currentScanResult, mesh, densityPercent, cache);
+        ProjectLoadingService.EnqueueSaveMeshPreviewGeometryCache(_sqliteCache, GetCurrentCacheFolderPath(), currentScanResult, mesh, densityPercent, cache);
+
+    private TexturePreviewImageResult? TryLoadCachedTexturePreviewThumbnailByAssetId(string textureAssetId, int maxDimension) =>
+        ProjectLoadingService.TryLoadCachedTexturePreviewThumbnailByAssetId(
+            _sqliteCache,
+            GetCurrentCacheFolderPath(),
+            currentScanResult,
+            textureAssetId,
+            maxDimension,
+            TexturePreviewThumbnailAlgorithmVersion);
 
     private TexturePreviewImageResult? LoadTexturePreviewThumbnail(Texture2D texture, int maxDimension) =>
         ProjectLoadingService.LoadTexturePreviewThumbnail(
@@ -314,6 +323,7 @@ public partial class MainWindow : Window
             ViewModel.LoadingProgress = 100;
             StatusStripUpdate(
                 $"Connections complete. Model groups: {diagnostics.ModelGroups:N0}, group meshes: {diagnostics.ModelGroupMeshes:N0}, edges: {diagnostics.AssetEdges:N0}, mesh materials: {diagnostics.MeshMaterials:N0}, material textures: {diagnostics.MaterialTextures:N0}.");
+            TriggerAutoRefreshActivePreviewIfNeeded();
         }
         catch (MemoryPressureException ex)
         {

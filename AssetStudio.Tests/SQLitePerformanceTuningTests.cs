@@ -32,7 +32,6 @@ namespace AssetStudio.Tests
             "idx_asset_edges_source",
             "idx_asset_edges_target",
             "idx_asset_edges_source_kind",
-            "idx_model_groups_animator",
             "idx_model_group_meshes_mesh",
             "idx_mesh_renderers_unique",
             "idx_mesh_renderers_mesh",
@@ -56,6 +55,7 @@ namespace AssetStudio.Tests
             "idx_asset_edges_target_kind",
             "idx_model_groups_unique",
             "idx_model_groups_avatar",
+            "idx_model_groups_animator",
             "idx_model_group_meshes_unique",
             "idx_model_group_meshes_group",
             "idx_model_group_meshes_candidate",
@@ -116,7 +116,7 @@ namespace AssetStudio.Tests
                 using (var versionCmd = conn.CreateCommand())
                 {
                     versionCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("14", versionCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("15", versionCmd.ExecuteScalar()?.ToString());
                 }
 
                 var tableDdl = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -377,7 +377,9 @@ namespace AssetStudio.Tests
                         cmd.Parameters.AddWithValue("@avatarAssetId", sampleIds.AvatarId);
                         cmd.Parameters.AddWithValue("@meshType", (int)ClassIDType.Mesh);
                     });
-                Assert.Contains(avatarMeshPlan, line => line.Contains("SEARCH ae USING PRIMARY KEY", StringComparison.OrdinalIgnoreCase));
+                Assert.Contains(avatarMeshPlan, line =>
+                    line.Contains("SEARCH ae USING PRIMARY KEY", StringComparison.OrdinalIgnoreCase)
+                    || line.Contains("SEARCH ae USING COVERING INDEX idx_asset_edges_kind_source", StringComparison.OrdinalIgnoreCase));
 
                 // 5. LoadMeshAvatarAssetIds
                 var meshAvatarPlan = AssertQueryPlanUsesSearchWithoutPhysicalScans(
@@ -775,7 +777,7 @@ namespace AssetStudio.Tests
                 {
                     using var versionCmd = conn.CreateCommand();
                     versionCmd.CommandText = "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;";
-                    Assert.Equal("14", versionCmd.ExecuteScalar()?.ToString());
+                    Assert.Equal("15", versionCmd.ExecuteScalar()?.ToString());
 
                     foreach (var table in ClusteredWithoutRowIdTables)
                     {

@@ -97,8 +97,10 @@ namespace AssetStudio.Avalonia
         private List<byte[]?>? pendingSubMeshTextures;
         private List<int>? pendingSubMeshTexWidths;
         private List<int>? pendingSubMeshTexHeights;
+        private int[]? pendingSubMeshTextureMap;
         private bool hasPendingSubMeshTextures;
         private int[]? previewTextureIds;
+        private int[]? previewSubMeshTextureMap;
 
         // Source mesh & mesh-group references for density rebuilds
         private Mesh? meshPreviewSource;
@@ -106,12 +108,14 @@ namespace AssetStudio.Avalonia
         private List<byte[]?>? meshPreviewSourceSubMeshTextures;
         private List<int>? meshPreviewSourceSubMeshTexWidths;
         private List<int>? meshPreviewSourceSubMeshTexHeights;
+        private int[]? meshPreviewSourceSubMeshTextureMap;
         private IReadOnlyList<Mesh>? meshGroupPreviewSources;
         private IReadOnlyList<Vector2[]?>? meshGroupPreviewSourceUvs;
         private IReadOnlyList<float[]?>? meshGroupPreviewSourceTransforms;
         private List<byte[]?>? meshGroupPreviewSourceSubMeshTextures;
         private List<int>? meshGroupPreviewSourceSubMeshTexWidths;
         private List<int>? meshGroupPreviewSourceSubMeshTexHeights;
+        private int[]? meshGroupPreviewSourceSubMeshTextureMap;
         private int[]? previewSubMeshIndexCounts;
         private int meshLoadCounter;
 
@@ -224,7 +228,8 @@ namespace AssetStudio.Avalonia
                     meshPreviewSourceSubMeshTextures,
                     meshPreviewSourceSubMeshTexWidths,
                     meshPreviewSourceSubMeshTexHeights,
-                    resetMaterialOverrides: false);
+                    resetMaterialOverrides: false,
+                    subMeshTextureMap: meshPreviewSourceSubMeshTextureMap);
             }
             else if (meshGroupPreviewSources != null && meshGroupPreviewSources.Count > 0)
             {
@@ -235,7 +240,8 @@ namespace AssetStudio.Avalonia
                     meshGroupPreviewSourceSubMeshTextures,
                     meshGroupPreviewSourceSubMeshTexWidths,
                     meshGroupPreviewSourceSubMeshTexHeights,
-                    resetMaterialOverrides: false);
+                    resetMaterialOverrides: false,
+                    subMeshTextureMap: meshGroupPreviewSourceSubMeshTextureMap);
             }
         }
 
@@ -246,12 +252,14 @@ namespace AssetStudio.Avalonia
             meshPreviewSourceSubMeshTextures = null;
             meshPreviewSourceSubMeshTexWidths = null;
             meshPreviewSourceSubMeshTexHeights = null;
+            meshPreviewSourceSubMeshTextureMap = null;
             meshGroupPreviewSources = null;
             meshGroupPreviewSourceUvs = null;
             meshGroupPreviewSourceTransforms = null;
             meshGroupPreviewSourceSubMeshTextures = null;
             meshGroupPreviewSourceSubMeshTexWidths = null;
             meshGroupPreviewSourceSubMeshTexHeights = null;
+            meshGroupPreviewSourceSubMeshTextureMap = null;
             previewSubMeshIndexCounts = null;
             keepExistingTextures = false;
             ClearPendingTextureUploads();

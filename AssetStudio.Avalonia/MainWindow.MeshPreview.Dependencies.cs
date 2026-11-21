@@ -57,6 +57,24 @@ public partial class MainWindow
         ClassIDType.AnimationClip,
         ClassIDType.AnimatorController,
         ClassIDType.AnimatorOverrideController,
+        ClassIDType.RuntimeAnimatorController,
+        ClassIDType.AssetBundle,
+        ClassIDType.ResourceManager
+    };
+
+    private static readonly HashSet<ClassIDType> AnimationLocalFallbackReferenceTypes = new()
+    {
+        ClassIDType.GameObject,
+        ClassIDType.Transform,
+        ClassIDType.RectTransform,
+        ClassIDType.MeshFilter,
+        ClassIDType.MeshRenderer,
+        ClassIDType.SkinnedMeshRenderer,
+        ClassIDType.Avatar,
+        ClassIDType.Animator,
+        ClassIDType.Animation,
+        ClassIDType.AnimatorController,
+        ClassIDType.AnimatorOverrideController,
         ClassIDType.RuntimeAnimatorController
     };
 
@@ -67,22 +85,10 @@ public partial class MainWindow
             return;
         }
 
+        // Bounded local-file fallback: inspect ONLY mesh.assetsFile (never crawl/materialize all 50 preloaded files).
         using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
-        EnsureIndexedExternalSourcesLoaded(mesh.assetsFile);
         MaterializeReferenceObjects(mesh.assetsFile, MeshPreviewReferenceTypes);
-
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
-        {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
-        }
-
-        foreach (var file in filesSnapshot)
-        {
-            MaterializeReferenceObjects(file, MeshPreviewReferenceTypes);
-        }
-
-        BuildLazyPreviewReferenceIndexes(filesSnapshot);
+        BuildLazyPreviewReferenceIndexes(new List<SerializedFile> { mesh.assetsFile });
     }
 
     private void EnsureMaterialPreviewDependenciesLoaded(Material material)
@@ -92,18 +98,7 @@ public partial class MainWindow
             return;
         }
 
-        EnsureIndexedExternalSourcesLoaded(material.assetsFile);
-
-        List<SerializedFile> filesSnapshot;
-        lock (assetsManager.loadLock)
-        {
-            filesSnapshot = assetsManager.assetsFileList.ToList();
-        }
-
-        foreach (var file in filesSnapshot)
-        {
-            MaterializeReferenceObjects(file, MaterialPreviewReferenceTypes);
-        }
+        MaterializeReferenceObjects(material.assetsFile, MaterialPreviewReferenceTypes);
     }
 
     private void EnsureSpritePreviewDependenciesLoaded(Sprite sprite, CancellationToken cancellationToken = default)
@@ -498,16 +493,122 @@ public partial class MainWindow
             out var localMaterialMainTextureCache,
             out var localMaterialPreviewMaterialCache,
             out var localMaterialTextureSlotsCache,
-            out _);
+            out var localSemanticRelations);
 
+        // Merge into existing RAM caches rather than wiping previously resolved entries.
         lock (previewCacheLock)
         {
-            meshToMaterialsCache = localMeshToMaterialsCache;
-            meshAssociatedRenderersCache = localMeshAssociatedRenderersCache;
-            meshSourceTypesCache = localMeshSourceTypesCache;
-            materialMainTextureCache = localMaterialMainTextureCache;
-            materialPreviewMaterialCache = localMaterialPreviewMaterialCache;
-            materialTextureSlotsCache = localMaterialTextureSlotsCache;
+            meshToMaterialsCache ??= new Dictionary<Mesh, List<Material?>>();
+            foreach (var entry in localMeshToMaterialsCache)
+            {
+                meshToMaterialsCache[entry.Key] = entry.Value;
+            }
+
+            meshAssociatedRenderersCache ??= new Dictionary<Mesh, List<string>>();
+            foreach (var entry in localMeshAssociatedRenderersCache)
+            {
+                meshAssociatedRenderersCache[entry.Key] = entry.Value;
+            }
+
+            meshSourceTypesCache ??= new Dictionary<Mesh, HashSet<string>>();
+            foreach (var entry in localMeshSourceTypesCache)
+            {
+                meshSourceTypesCache[entry.Key] = entry.Value;
+            }
+
+            materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
+            foreach (var entry in localMaterialMainTextureCache)
+            {
+                materialMainTextureCache[entry.Key] = entry.Value;
+            }
+
+            materialPreviewMaterialCache ??= new Dictionary<Material, Material?>();
+            foreach (var entry in localMaterialPreviewMaterialCache)
+            {
+                materialPreviewMaterialCache[entry.Key] = entry.Value;
+            }
+
+            materialTextureSlotsCache ??= new Dictionary<Material, Dictionary<string, Texture2D?>>();
+            foreach (var entry in localMaterialTextureSlotsCache)
+            {
+                materialTextureSlotsCache[entry.Key] = entry.Value;
+            }
+        }
+
+        EnqueueLazySemanticRelationsBackfill(localSemanticRelations);
+    }
+
+    private void EnqueueLazySemanticRelationsBackfill(SemanticAssetRelations? relations)
+    {
+        if (relations == null || !relations.HasRelations || currentScanResult == null)
+        {
+            return;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+            var backfill = new SemanticAssetRelations();
+            backfill.MeshRenderers.AddRange(relations.MeshRenderers);
+            backfill.MeshMaterials.AddRange(relations.MeshMaterials);
+            foreach (var mt in relations.MaterialTextures)
+            {
+                backfill.MaterialTextures.Add(new SemanticMaterialTextureRelation(
+                    mt.MaterialAssetId,
+                    mt.PreviewMaterialAssetId,
+                    mt.SlotName,
+                    mt.SlotIndex,
+                    mt.TextureAssetId,
+                    mt.TextureFileId,
+                    mt.TexturePathId,
+                    mt.IsResolved,
+                    mt.IsMainTexture,
+                    mt.ScaleX,
+                    mt.ScaleY,
+                    mt.OffsetX,
+                    mt.OffsetY,
+                    "lazy_backfill"));
+            }
+            foreach (var mc in relations.MaterialCaches)
+            {
+                backfill.MaterialCaches.Add(new SemanticMaterialCacheEntry(
+                    mc.MaterialAssetId,
+                    mc.MaterialName,
+                    mc.ParentMaterialAssetId,
+                    mc.MainTextureAssetId,
+                    mc.MainTextureSlotName,
+                    mc.BaseColorR,
+                    mc.BaseColorG,
+                    mc.BaseColorB,
+                    mc.BaseColorA,
+                    mc.ShaderName,
+                    mc.TextureSlotCount,
+                    "lazy_backfill"));
+            }
+            foreach (var target in relations.AnimationClipTargets)
+            {
+                if (!string.IsNullOrEmpty(target.AvatarAssetId)
+                    || !string.IsNullOrEmpty(target.MeshAssetId)
+                    || !string.IsNullOrEmpty(target.ModelGroupId))
+                {
+                    backfill.AnimationClipTargets.Add(target);
+                }
+            }
+
+            if (backfill.HasRelations)
+            {
+                _sqliteCache.EnqueueLazySemanticUpsert(folderPath, signature, backfill);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to enqueue lazy semantic backfill: {ex.Message}");
         }
     }
 

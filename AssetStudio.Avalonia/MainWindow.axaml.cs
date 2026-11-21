@@ -224,8 +224,9 @@ public partial class MainWindow : Window
         {
             lock (preloaderLock)
             {
-                return preloadedUniqueIds.Any(uid => uid.StartsWith(fileName + "#")) 
-                    || (_currentlySelectedUniqueID != null && _currentlySelectedUniqueID.StartsWith(fileName + "#"));
+                return preloadedUniqueIds.Any(uid => uid.StartsWith(fileName + "#"))
+                    || (_currentlySelectedUniqueID != null && _currentlySelectedUniqueID.StartsWith(fileName + "#"))
+                    || _activePreviewDependencyFileNames.Contains(fileName);
             }
         };
         _progressReporter = new Progress<int>(SetProgressBarValue);
@@ -1535,6 +1536,7 @@ public partial class MainWindow : Window
                 if (currentScanResult != null && HasSavedSemanticRelations(folderPath, currentScanResult))
                 {
                     PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
+                    TriggerAutoRefreshActivePreviewIfNeeded();
                 }
                 else
                 {
@@ -1778,6 +1780,7 @@ public partial class MainWindow : Window
         if (publishStructureProgress)
         {
             PublishStructureBuildProgress("structure_completed", structureBuildSteps, structureBuildSteps, "Asset structure ready");
+            TriggerAutoRefreshActivePreviewIfNeeded();
         }
         }
         catch

@@ -22,10 +22,20 @@ namespace AssetStudio.Avalonia
 
         public void ApplyMeshTextures(List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
         {
-            ApplyMeshTextures(null, subMeshTextures, subMeshTexWidths, subMeshTexHeights);
+            ApplyMeshTextures(null, subMeshTextures, subMeshTexWidths, subMeshTexHeights, null);
+        }
+
+        public void ApplyMeshTextures(List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, int[]? subMeshToTextureIndex)
+        {
+            ApplyMeshTextures(null, subMeshTextures, subMeshTexWidths, subMeshTexHeights, subMeshToTextureIndex);
         }
 
         public void ApplyMeshTextures(Mesh? expectedMesh, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights)
+        {
+            ApplyMeshTextures(expectedMesh, subMeshTextures, subMeshTexWidths, subMeshTexHeights, null);
+        }
+
+        public void ApplyMeshTextures(Mesh? expectedMesh, List<byte[]?>? subMeshTextures, List<int>? subMeshTexWidths, List<int>? subMeshTexHeights, int[]? subMeshToTextureIndex)
         {
             if (subMeshTextures == null || !subMeshTextures.Any(t => t != null))
             {
@@ -42,12 +52,14 @@ namespace AssetStudio.Avalonia
                 meshGroupPreviewSourceSubMeshTextures = subMeshTextures;
                 meshGroupPreviewSourceSubMeshTexWidths = subMeshTexWidths;
                 meshGroupPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+                meshGroupPreviewSourceSubMeshTextureMap = subMeshToTextureIndex;
             }
             else
             {
                 meshPreviewSourceSubMeshTextures = subMeshTextures;
                 meshPreviewSourceSubMeshTexWidths = subMeshTexWidths;
                 meshPreviewSourceSubMeshTexHeights = subMeshTexHeights;
+                meshPreviewSourceSubMeshTextureMap = subMeshToTextureIndex;
             }
 
             keepExistingTextures = true;
@@ -59,6 +71,7 @@ namespace AssetStudio.Avalonia
                 pendingSubMeshTextures = subMeshTextures;
                 pendingSubMeshTexWidths = subMeshTexWidths;
                 pendingSubMeshTexHeights = subMeshTexHeights;
+                pendingSubMeshTextureMap = subMeshToTextureIndex;
                 hasPendingSubMeshTextures = true;
             }
 
@@ -162,6 +175,7 @@ namespace AssetStudio.Avalonia
             List<byte[]?>? subTexBytes = null;
             List<int>? subTexW = null;
             List<int>? subTexH = null;
+            int[]? subTexMap = null;
 
             lock (textureLock)
             {
@@ -171,10 +185,12 @@ namespace AssetStudio.Avalonia
                     subTexBytes = pendingSubMeshTextures;
                     subTexW = pendingSubMeshTexWidths;
                     subTexH = pendingSubMeshTexHeights;
+                    subTexMap = pendingSubMeshTextureMap;
                     hasPendingSubMeshTextures = false;
                     pendingSubMeshTextures = null;
                     pendingSubMeshTexWidths = null;
                     pendingSubMeshTexHeights = null;
+                    pendingSubMeshTextureMap = null;
                 }
                 else if (hasPendingTexture)
                 {
@@ -183,6 +199,7 @@ namespace AssetStudio.Avalonia
                     subTexBytes = new List<byte[]?> { pendingTextureData };
                     subTexW = new List<int> { pendingTextureWidth };
                     subTexH = new List<int> { pendingTextureHeight };
+                    subTexMap = null;
                     pendingTextureData = null;
                 }
             }
@@ -195,6 +212,7 @@ namespace AssetStudio.Avalonia
             DeletePreviewTextures();
 
             previewTextureIds = new int[subTexBytes.Count];
+            previewSubMeshTextureMap = subTexMap;
             for (int i = 0; i < subTexBytes.Count; i++)
             {
                 var tBytes = subTexBytes[i];
@@ -333,8 +351,7 @@ namespace AssetStudio.Avalonia
                     }
 
                     indexCount = Math.Min(indexCount, indices.Length - flatOffsetElements);
-                    int texIndex = localTextureIds != null && i < localTextureIds.Length ? i : 0;
-                    int texId = localTextureIds != null && texIndex < localTextureIds.Length ? localTextureIds[texIndex] : 0;
+                    int texId = ResolveSubMeshTextureId(localTextureIds, previewSubMeshTextureMap, i);
                     var tint = GetMaterialTint(i);
 
                     BindMeshShaderProgram(texId, tint);
@@ -416,6 +433,28 @@ namespace AssetStudio.Avalonia
             }
         }
 
+        internal static int ResolveSubMeshTextureId(int[]? textureIds, int[]? subMeshTextureMap, int subMeshIndex)
+        {
+            if (textureIds == null || textureIds.Length == 0 || subMeshIndex < 0)
+            {
+                return 0;
+            }
+
+            if (subMeshTextureMap != null)
+            {
+                if (subMeshIndex >= subMeshTextureMap.Length)
+                {
+                    return 0;
+                }
+
+                var mappedIndex = subMeshTextureMap[subMeshIndex];
+                return mappedIndex >= 0 && mappedIndex < textureIds.Length ? textureIds[mappedIndex] : 0;
+            }
+
+            int directIndex = subMeshIndex < textureIds.Length ? subMeshIndex : 0;
+            return textureIds[directIndex];
+        }
+
         private void ClearPendingTextureUploads()
         {
             lock (textureLock)
@@ -427,6 +466,7 @@ namespace AssetStudio.Avalonia
                 pendingSubMeshTextures = null;
                 pendingSubMeshTexWidths = null;
                 pendingSubMeshTexHeights = null;
+                pendingSubMeshTextureMap = null;
                 hasPendingSubMeshTextures = false;
             }
         }
@@ -455,6 +495,8 @@ namespace AssetStudio.Avalonia
                 }
                 previewTextureIds = null;
             }
+
+            previewSubMeshTextureMap = null;
         }
 
         private Vector4 GetMaterialTint(int materialIndex)

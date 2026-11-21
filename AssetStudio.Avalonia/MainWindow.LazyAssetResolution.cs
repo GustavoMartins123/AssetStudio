@@ -23,25 +23,9 @@ public partial class MainWindow
             (evt, msg) => logger.Log(evt, msg),
             sourcePath =>
             {
-                var preserveSemanticPreviewCaches = CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath());
+                // Preserve semantic preview RAM caches across lazy file loads; only clear full-project unload/Clear Project Cache.
                 lock (previewCacheLock)
                 {
-                    if (!preserveSemanticPreviewCaches)
-                    {
-                        meshToMaterialsCache = null;
-                        materialMainTextureCache = null;
-                        materialPreviewMaterialCache = null;
-                        materialTextureSlotsCache = null;
-                        animationClipAvatarCache = null;
-                        avatarMeshCache = null;
-                        avatarMeshesCache = null;
-                        meshAvatarCache = null;
-                        meshSkinnedRenderersCache = null;
-                        animationClipTransformBindingsCache = null;
-                    }
-
-                    meshAssociatedRenderersCache = null;
-                    meshSourceTypesCache = null;
                     objectToAssetItemCache = null;
                 }
 
@@ -56,11 +40,30 @@ public partial class MainWindow
             });
     }
 
+    private void EnsureLazyAssetReadyForPreload(AssetItem assetItem)
+    {
+        // Background preloading must never overwrite the foreground status bar or wipe preview RAM caches.
+        LazyAssetResolutionService.EnsureLazyAssetReadyForPreview(
+            assetsManager,
+            assetItem,
+            lazySourcePathBySerializedFile,
+            lazySourceFileSearchCache,
+            resolvedSourcePathCache,
+            ViewModel.LoadingService.PendingFilesToIndex,
+            RemovePendingFileFromProgressiveQueue,
+            notifyLoadingSource: null,
+            logWarning: null,
+            onSourceLoaded: _ =>
+            {
+                global::Avalonia.Threading.Dispatcher.UIThread.Post(() => AppendNewLazyAssetsFromProjectIndex());
+            });
+    }
+
     private AssetStudio.Object? ResolveSemanticRelationHandleForPreview(AssetHandle handle) =>
         LazyAssetResolutionService.ResolveSemanticRelationHandleForPreview(
             assetsManager,
             handle,
-            EnsureLazyAssetReadyForPreview,
+            EnsureLazyAssetReadyForPreload,
             ResolveLazyHandleSourcePath,
             TryAttachLoadedSourceFile,
             RemovePendingFileFromProgressiveQueue);

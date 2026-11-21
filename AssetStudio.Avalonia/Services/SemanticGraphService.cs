@@ -40,7 +40,9 @@ namespace AssetStudio.Avalonia.Services
             ClassIDType.AnimationClip,
             ClassIDType.AnimatorController,
             ClassIDType.AnimatorOverrideController,
-            ClassIDType.RuntimeAnimatorController
+            ClassIDType.RuntimeAnimatorController,
+            ClassIDType.AssetBundle,
+            ClassIDType.ResourceManager
         };
 
         internal static int CountBufferedSemanticRelationRows(SemanticAssetRelations? relations)
@@ -57,6 +59,9 @@ namespace AssetStudio.Avalonia.Services
                 + relations.MeshRenderers.Count
                 + relations.MeshMaterials.Count
                 + relations.MaterialTextures.Count
+                + relations.MaterialCaches.Count
+                + relations.CompositeAssets.Count
+                + relations.CompositeAssetParts.Count
                 + relations.AnimationClipTargets.Count
                 + relations.RigBoneHashes.Count
                 + relations.ClipBoneHashes.Count;
@@ -299,6 +304,7 @@ namespace AssetStudio.Avalonia.Services
                         file,
                         animator,
                         skinnedMeshBindings,
+                        meshRendererBindings,
                         animatorCount,
                         result.SemanticRelations);
                 }
@@ -315,6 +321,7 @@ namespace AssetStudio.Avalonia.Services
                         file,
                         legacyAnimation,
                         skinnedMeshBindings,
+                        meshRendererBindings,
                         animatorCount,
                         result.SemanticRelations);
                 }
@@ -949,6 +956,37 @@ namespace AssetStudio.Avalonia.Services
             return handle?.UniqueID ?? string.Empty;
         }
 
+        public static bool IsCompatibleSemanticClassId(ClassIDType actual, ClassIDType expected)
+        {
+            if (actual == expected)
+            {
+                return true;
+            }
+
+            return expected switch
+            {
+                ClassIDType.RuntimeAnimatorController =>
+                    actual == ClassIDType.AnimatorController
+                    || actual == ClassIDType.AnimatorOverrideController,
+                ClassIDType.Transform =>
+                    actual == ClassIDType.RectTransform,
+                ClassIDType.Texture =>
+                    actual == ClassIDType.Texture2D
+                    || actual == ClassIDType.Texture3D
+                    || actual == ClassIDType.Cubemap
+                    || actual == ClassIDType.RenderTexture
+                    || actual == ClassIDType.Texture2DArray,
+                ClassIDType.Renderer =>
+                    actual == ClassIDType.MeshRenderer
+                    || actual == ClassIDType.SkinnedMeshRenderer
+                    || actual == ClassIDType.SpriteRenderer
+                    || actual == ClassIDType.ParticleSystemRenderer
+                    || actual == ClassIDType.TrailRenderer
+                    || actual == ClassIDType.LineRenderer,
+                _ => false
+            };
+        }
+
         public static AssetHandle? FindSemanticHandleForPPtr(SerializedFile sourceFile, int fileId, long pathId, ClassIDType? expectedType)
         {
             if (sourceFile?.assetsManager?.ProjectIndex == null
@@ -971,7 +1009,8 @@ namespace AssetStudio.Avalonia.Services
 
             return candidates
                 .SelectMany(fileName => sourceFile.assetsManager.ProjectIndex.GetHandlesForFile(fileName))
-                .Where(candidate => candidate.PathID == pathId && (expectedType == null || candidate.Type == expectedType.Value))
+                .Where(candidate => candidate.PathID == pathId
+                    && (expectedType == null || IsCompatibleSemanticClassId(candidate.Type, expectedType.Value)))
                 .GroupBy(candidate => candidate.UniqueID, StringComparer.Ordinal)
                 .Select(group => group.First())
                 .OrderByDescending(candidate => ScoreSemanticHandleMatch(candidate, external, sourceFile))
@@ -1294,6 +1333,61 @@ namespace AssetStudio.Avalonia.Services
             return materialIds.Count(id => !string.IsNullOrEmpty(id));
         }
 
+        internal static (float R, float G, float B, float A) ExtractMaterialBaseColor(Material? material)
+        {
+            var colors = material?.m_SavedProperties?.m_Colors;
+            if (colors == null || colors.Length == 0)
+            {
+                return (1f, 1f, 1f, 1f);
+            }
+
+            static (float R, float G, float B, float A) ClampColor(Color color)
+            {
+                static float Clamp(float value) => float.IsFinite(value) ? Math.Clamp(value, 0f, 1f) : 1f;
+                return (Clamp(color.R), Clamp(color.G), Clamp(color.B), Clamp(color.A));
+            }
+
+            string[] preferredNames = { "_BaseColor", "_Color", "_TintColor", "_MainColor", "Color" };
+            foreach (var preferred in preferredNames)
+            {
+                foreach (var entry in colors)
+                {
+                    if (string.Equals(entry.Key, preferred, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return ClampColor(entry.Value);
+                    }
+                }
+            }
+
+            foreach (var entry in colors)
+            {
+                if (!string.IsNullOrEmpty(entry.Key)
+                    && entry.Key.Contains("color", StringComparison.OrdinalIgnoreCase)
+                    && !entry.Key.Contains("emission", StringComparison.OrdinalIgnoreCase)
+                    && !entry.Key.Contains("spec", StringComparison.OrdinalIgnoreCase))
+                {
+                    return ClampColor(entry.Value);
+                }
+            }
+
+            return (1f, 1f, 1f, 1f);
+        }
+
+        private static string ExtractMaterialShaderName(Material material)
+        {
+            if (material.m_Shader == null || material.m_Shader.IsNull)
+            {
+                return string.Empty;
+            }
+
+            if (material.m_Shader.TryGet(out var shader) && shader != null)
+            {
+                return shader.m_ParsedForm?.m_Name ?? shader.m_Name ?? string.Empty;
+            }
+
+            return string.Empty;
+        }
+
         private static void AddMaterialTextureRelations(
             SemanticAssetRelations relations,
             Material material,
@@ -1318,6 +1412,9 @@ namespace AssetStudio.Avalonia.Services
 
             var previewMaterialId = GetSemanticAssetId(previewMaterial);
             var mainTextureSlotName = SelectMainTextureSlotNameForRelations(previewMaterial);
+            var mainTextureAssetId = string.Empty;
+            var fallbackTextureAssetId = string.Empty;
+            var fallbackTextureSlotName = string.Empty;
             var slotIndex = 0;
             foreach (var texEnv in previewMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
             {
@@ -1329,6 +1426,27 @@ namespace AssetStudio.Avalonia.Services
                     textureId = GetSemanticTextureAssetIdFromPPtr(previewMaterial, textureRef);
                 }
 
+                var isMainTexture = string.Equals(texEnv.Key, mainTextureSlotName, StringComparison.OrdinalIgnoreCase);
+                if (!string.IsNullOrEmpty(textureId))
+                {
+                    if (isMainTexture && string.IsNullOrEmpty(mainTextureAssetId))
+                    {
+                        mainTextureAssetId = textureId;
+                    }
+                    else if (string.IsNullOrEmpty(fallbackTextureAssetId) && !NonDiffuseSlots.Contains(texEnv.Key))
+                    {
+                        fallbackTextureAssetId = textureId;
+                        fallbackTextureSlotName = texEnv.Key;
+                    }
+                }
+
+                var scale = texEnv.Value?.m_Scale ?? new Vector2(1f, 1f);
+                var offset = texEnv.Value?.m_Offset ?? new Vector2(0f, 0f);
+                var scaleX = float.IsFinite(scale.X) ? scale.X : 1f;
+                var scaleY = float.IsFinite(scale.Y) ? scale.Y : 1f;
+                var offsetX = float.IsFinite(offset.X) ? offset.X : 0f;
+                var offsetY = float.IsFinite(offset.Y) ? offset.Y : 0f;
+
                 relations.MaterialTextures.Add(new SemanticMaterialTextureRelation(
                     materialId,
                     previewMaterialId,
@@ -1338,7 +1456,12 @@ namespace AssetStudio.Avalonia.Services
                     textureRef?.m_FileID ?? 0,
                     textureRef?.m_PathID ?? 0,
                     !string.IsNullOrEmpty(textureId),
-                    string.Equals(texEnv.Key, mainTextureSlotName, StringComparison.OrdinalIgnoreCase)));
+                    isMainTexture,
+                    scaleX,
+                    scaleY,
+                    offsetX,
+                    offsetY,
+                    "preparation"));
 
                 if (textureRef != null && !textureRef.IsNull)
                 {
@@ -1357,6 +1480,33 @@ namespace AssetStudio.Avalonia.Services
 
                 slotIndex++;
             }
+
+            if (string.IsNullOrEmpty(mainTextureAssetId) && !string.IsNullOrEmpty(fallbackTextureAssetId))
+            {
+                mainTextureAssetId = fallbackTextureAssetId;
+                mainTextureSlotName = fallbackTextureSlotName;
+            }
+
+            var parentMaterialId = !string.Equals(previewMaterialId, materialId, StringComparison.Ordinal)
+                ? previewMaterialId
+                : (material.assetsFile != null && material.m_Parent != null && !material.m_Parent.IsNull
+                    ? GetSemanticAssetIdFromPPtr(material.assetsFile, material.m_Parent, ClassIDType.Material)
+                    : string.Empty);
+
+            var (baseR, baseG, baseB, baseA) = ExtractMaterialBaseColor(previewMaterial);
+            relations.MaterialCaches.Add(new SemanticMaterialCacheEntry(
+                materialId,
+                material.m_Name ?? string.Empty,
+                parentMaterialId,
+                mainTextureAssetId,
+                mainTextureSlotName ?? string.Empty,
+                baseR,
+                baseG,
+                baseB,
+                baseA,
+                ExtractMaterialShaderName(previewMaterial),
+                slotIndex,
+                "preparation"));
         }
 
         public static string? SelectMainTextureSlotNameForRelations(Material displayMaterial)
@@ -1402,7 +1552,7 @@ namespace AssetStudio.Avalonia.Services
                 return string.Empty;
             }
 
-            return GetSemanticAssetIdFromPPtr(material.assetsFile, textureRef, ClassIDType.Texture2D);
+            return GetSemanticAssetIdFromPPtr(material.assetsFile, textureRef, ClassIDType.Texture);
         }
 
         public static void IndexMaterialTexturesBackground(
@@ -2051,6 +2201,7 @@ namespace AssetStudio.Avalonia.Services
             SerializedFile sourceFile,
             Animator animator,
             List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
+            List<RendererMeshSemanticBinding> meshRendererBindings,
             int animatorCount,
             SemanticAssetRelations relations)
         {
@@ -2113,7 +2264,7 @@ namespace AssetStudio.Avalonia.Services
                     animator.m_Controller.m_PathID);
             }
 
-            var meshMatches = FindSkinnedMeshesForAnimator(sourceFile, animatorGameObject, skinnedMeshBindings, animatorCount).ToList();
+            var meshMatches = FindRendererMeshesForAnimator(sourceFile, animatorGameObject, skinnedMeshBindings, meshRendererBindings, animatorCount).ToList();
             var groupId = AddAnimatorModelGroupRelations(
                 sourceFile,
                 relations,
@@ -2128,9 +2279,8 @@ namespace AssetStudio.Avalonia.Services
             var meshSlotIndex = 0;
             var primaryMeshId = string.Empty;
             var seenMeshes = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var match in meshMatches)
+            foreach (var binding in meshMatches)
             {
-                var binding = match.Binding;
                 if (string.IsNullOrEmpty(binding.MeshId) || !seenMeshes.Add(binding.MeshId))
                 {
                     continue;
@@ -2196,7 +2346,7 @@ namespace AssetStudio.Avalonia.Services
             string rootGameObjectId,
             string avatarId,
             string controllerId,
-            IReadOnlyList<SkinnedMeshSemanticMatch> meshMatches)
+            IReadOnlyList<RendererMeshSemanticBinding> meshMatches)
         {
             if (meshMatches.Count == 0)
             {
@@ -2232,10 +2382,11 @@ namespace AssetStudio.Avalonia.Services
 
             var slotIndex = 0;
             var seenParts = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var match in meshMatches)
+            foreach (var binding in meshMatches)
             {
-                var binding = match.Binding;
-                var rendererId = GetSemanticAssetId(binding.Renderer);
+                var rendererId = !string.IsNullOrEmpty(binding.RendererId)
+                    ? binding.RendererId
+                    : GetSemanticAssetId(binding.Renderer);
                 if (string.IsNullOrEmpty(binding.MeshId) || string.IsNullOrEmpty(rendererId))
                 {
                     continue;
@@ -2254,13 +2405,13 @@ namespace AssetStudio.Avalonia.Services
                     groupId,
                     binding.MeshId,
                     rendererId,
-                    "SkinnedMeshRenderer",
+                    string.IsNullOrEmpty(binding.RendererType) ? "SkinnedMeshRenderer" : binding.RendererType,
                     gameObjectId,
                     binding.GameObject?.m_Name ?? string.Empty,
                     slotIndex,
                     BuildLocalToGroupRootMatrix(sourceFile, binding.GameObject, rootGameObjectId),
-                    match.Confidence,
-                    match.ConfidenceReason));
+                    binding.Confidence,
+                    binding.ConfidenceReason));
                 slotIndex++;
             }
 
@@ -2295,31 +2446,68 @@ namespace AssetStudio.Avalonia.Services
                 : $"modelgroup:fallback:{fallbackId}:{animator.m_PathID}";
         }
 
-        private static IEnumerable<SkinnedMeshSemanticMatch> FindSkinnedMeshesForAnimator(
+        private static IEnumerable<RendererMeshSemanticBinding> FindRendererMeshesForAnimator(
             SerializedFile sourceFile,
             GameObject? animatorGameObject,
             List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
+            List<RendererMeshSemanticBinding> meshRendererBindings,
             int animatorCount)
         {
-            if (skinnedMeshBindings.Count == 0)
+            if (skinnedMeshBindings.Count == 0 && meshRendererBindings.Count == 0)
             {
                 yield break;
             }
 
             if (animatorGameObject != null)
             {
-                var matchedAny = false;
+                var matchedAnySkinned = false;
                 foreach (var binding in skinnedMeshBindings)
                 {
                     if (binding.GameObject != null
                         && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
                     {
-                        matchedAny = true;
-                        yield return new SkinnedMeshSemanticMatch(binding, 100, "Animator hierarchy descendant");
+                        matchedAnySkinned = true;
+                        yield return new RendererMeshSemanticBinding(
+                            binding.Renderer,
+                            GetSemanticAssetId(binding.Renderer),
+                            "SkinnedMeshRenderer",
+                            binding.Mesh,
+                            binding.MeshId,
+                            binding.GameObject,
+                            binding.MeshFileId,
+                            binding.MeshPathId,
+                            100,
+                            "Animator hierarchy descendant");
                     }
                 }
 
-                if (matchedAny)
+                if (matchedAnySkinned)
+                {
+                    yield break;
+                }
+
+                var matchedAnyStatic = false;
+                foreach (var binding in meshRendererBindings)
+                {
+                    if (binding.GameObject != null
+                        && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
+                    {
+                        matchedAnyStatic = true;
+                        yield return new RendererMeshSemanticBinding(
+                            binding.Renderer,
+                            binding.RendererId,
+                            "MeshRenderer",
+                            binding.Mesh,
+                            binding.MeshId,
+                            binding.GameObject,
+                            binding.MeshFileId,
+                            binding.MeshPathId,
+                            80,
+                            "Animator MeshRenderer descendant");
+                    }
+                }
+
+                if (matchedAnyStatic)
                 {
                     yield break;
                 }
@@ -2327,9 +2515,39 @@ namespace AssetStudio.Avalonia.Services
 
             if (animatorCount == 1)
             {
-                foreach (var binding in skinnedMeshBindings)
+                if (skinnedMeshBindings.Count > 0)
                 {
-                    yield return new SkinnedMeshSemanticMatch(binding, 20, "Single animator file fallback");
+                    foreach (var binding in skinnedMeshBindings)
+                    {
+                        yield return new RendererMeshSemanticBinding(
+                            binding.Renderer,
+                            GetSemanticAssetId(binding.Renderer),
+                            "SkinnedMeshRenderer",
+                            binding.Mesh,
+                            binding.MeshId,
+                            binding.GameObject,
+                            binding.MeshFileId,
+                            binding.MeshPathId,
+                            20,
+                            "Single animator file fallback");
+                    }
+
+                    yield break;
+                }
+
+                foreach (var binding in meshRendererBindings)
+                {
+                    yield return new RendererMeshSemanticBinding(
+                        binding.Renderer,
+                        binding.RendererId,
+                        "MeshRenderer",
+                        binding.Mesh,
+                        binding.MeshId,
+                        binding.GameObject,
+                        binding.MeshFileId,
+                        binding.MeshPathId,
+                        15,
+                        "Single animator MeshRenderer file fallback");
                 }
             }
         }
@@ -2423,8 +2641,7 @@ namespace AssetStudio.Avalonia.Services
 
                 if (!string.IsNullOrEmpty(avatarId)
                     || !string.IsNullOrEmpty(primaryMeshId)
-                    || !string.IsNullOrEmpty(groupId)
-                    || !string.IsNullOrEmpty(animatorId))
+                    || !string.IsNullOrEmpty(groupId))
                 {
                     relations.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
                         clipId,
@@ -2545,6 +2762,7 @@ namespace AssetStudio.Avalonia.Services
             SerializedFile sourceFile,
             Animation legacyAnimation,
             List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
+            List<RendererMeshSemanticBinding> meshRendererBindings,
             int animatorCount,
             SemanticAssetRelations relations)
         {
@@ -2559,13 +2777,17 @@ namespace AssetStudio.Avalonia.Services
                 ? GetSemanticGameObjectId(sourceFile, legacyAnimation.m_GameObject, animGameObject)
                 : string.Empty;
 
-            var meshMatches = FindSkinnedMeshesForAnimator(sourceFile, animGameObject, skinnedMeshBindings, Math.Max(1, animatorCount)).ToList();
+            var meshMatches = FindRendererMeshesForAnimator(
+                sourceFile,
+                animGameObject,
+                skinnedMeshBindings,
+                meshRendererBindings,
+                Math.Max(1, animatorCount)).ToList();
             var primaryMeshId = string.Empty;
             var meshSlotIndex = 0;
             var seenMeshes = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var match in meshMatches)
+            foreach (var binding in meshMatches)
             {
-                var binding = match.Binding;
                 if (string.IsNullOrEmpty(binding.MeshId) || !seenMeshes.Add(binding.MeshId))
                 {
                     continue;
@@ -2618,7 +2840,7 @@ namespace AssetStudio.Avalonia.Services
                     clipRef.m_FileID,
                     clipRef.m_PathID);
 
-                if (!string.IsNullOrEmpty(primaryMeshId) || !string.IsNullOrEmpty(groupId) || !string.IsNullOrEmpty(animationComponentId))
+                if (!string.IsNullOrEmpty(primaryMeshId) || !string.IsNullOrEmpty(groupId))
                 {
                     relations.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
                         clipId,
@@ -3009,17 +3231,71 @@ namespace AssetStudio.Avalonia.Services
 
                 if (binding.Renderer?.m_Bones != null && binding.Renderer.m_Bones.Length > 0)
                 {
-                    var maxBonesToInspect = Math.Min(binding.Renderer.m_Bones.Length, 48);
-                    for (var i = 0; i < maxBonesToInspect; i++)
+                    var maxBonesToInspect = Math.Min(binding.Renderer.m_Bones.Length, MaxRigBoneHashProbes);
+                    var pathSegments = new List<string>(16);
+                    var visitedTransforms = new HashSet<long>();
+                    for (var i = 0; i < maxBonesToInspect && boneHashes.Count < MaxRigBoneHashProbes; i++)
                     {
                         var transform = ResolveTransformBackground(sourceFile, binding.Renderer.m_Bones[i]);
-                        var go = transform != null ? ResolveGameObjectBackground(sourceFile, transform.m_GameObject) : null;
-                        if (!string.IsNullOrWhiteSpace(go?.m_Name))
+                        if (transform == null)
                         {
-                            var hash = ComputeUnityBonePathHash(go!.m_Name);
-                            if (hash != 0)
+                            continue;
+                        }
+
+                        pathSegments.Clear();
+                        visitedTransforms.Clear();
+                        Transform? current = transform;
+                        for (var depth = 0; current != null && depth < 64; depth++)
+                        {
+                            if (!visitedTransforms.Add(current.m_PathID))
                             {
-                                boneHashes.Add(hash);
+                                break;
+                            }
+
+                            var currentFile = current.assetsFile ?? sourceFile;
+                            var go = ResolveGameObjectBackground(currentFile, current.m_GameObject);
+                            if (!string.IsNullOrWhiteSpace(go?.m_Name))
+                            {
+                                pathSegments.Add(go!.m_Name);
+                            }
+
+                            if (current.m_Father == null || current.m_Father.IsNull)
+                            {
+                                break;
+                            }
+
+                            current = ResolveTransformBackground(currentFile, current.m_Father);
+                        }
+
+                        if (pathSegments.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        // Emit leaf name hash, full path hash, and relative path hashes beneath root ancestors
+                        // so Unity GenericBinding.path CRC32 hashes match Animator-root-relative paths.
+                        var leafHash = ComputeUnityBonePathHash(pathSegments[0]);
+                        if (leafHash != 0)
+                        {
+                            boneHashes.Add(leafHash);
+                        }
+
+                        pathSegments.Reverse();
+                        var fullPath = string.Join("/", pathSegments);
+                        var fullHash = ComputeUnityBonePathHash(fullPath);
+                        if (fullHash != 0)
+                        {
+                            boneHashes.Add(fullHash);
+                        }
+
+                        // Emit relative path without the outermost root (and second root if nested in scene)
+                        for (var strip = 1; strip < pathSegments.Count - 1 && strip <= 2; strip++)
+                        {
+                            var relPath = string.Join("/", pathSegments.Skip(strip));
+                            var relHash = ComputeUnityBonePathHash(relPath);
+                            if (relHash != 0)
+                            {
+                                boneHashes.Add(relHash);
                             }
                         }
                     }
@@ -3035,7 +3311,7 @@ namespace AssetStudio.Avalonia.Services
                         string.Empty,
                         hash));
                     count++;
-                    if (count >= 48)
+                    if (count >= MaxRigBoneHashProbes)
                     {
                         break;
                     }
@@ -3102,7 +3378,7 @@ namespace AssetStudio.Avalonia.Services
                     }
                 }
 
-                if (clipIds.Count == 0 || (avatarIds.Count == 0 && meshIds.Count == 0 && animatorIds.Count == 0))
+                if (clipIds.Count == 0 || (avatarIds.Count == 0 && meshIds.Count == 0))
                 {
                     continue;
                 }
