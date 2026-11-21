@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT AND ISC
+// Third-party FSB5 Vorbis setup packet codebook corpus attribution:
+//   - Fmod5Sharp (MIT License, Copyright (c) 2021 Sam Byass)
+//   - vgmstream (ISC License, Copyright (c) 2008-2025 Adam Gashlin, Fastelbja, Ronny Elfert, bnnm, et al.)
+//   - python-fsb5 (MIT License, HearthSim / python-fsb5 contributors)
+// See NOTICE.md in the repository root for full third-party attribution and license notices.
 #nullable enable
 using System;
 using System.Buffers.Binary;
