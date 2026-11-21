@@ -8,7 +8,10 @@ namespace AssetStudio
     public sealed class GameObject : EditorExtension
     {
         public PPtr<Component>[] m_Components;
+        public int m_Layer;
         public string m_Name;
+        public ushort m_Tag;
+        public bool m_IsActive;
 
         public Transform? m_Transform;
         public MeshRenderer? m_MeshRenderer;
@@ -31,8 +34,10 @@ namespace AssetStudio
                 m_Components[i] = new PPtr<Component>(reader);
             }
 
-            var m_Layer = reader.ReadInt32();
+            m_Layer = reader.ReadInt32();
             m_Name = reader.ReadAlignedString();
+            m_Tag = reader.ReadUInt16();
+            m_IsActive = reader.ReadBoolean();
         }
     }
 }

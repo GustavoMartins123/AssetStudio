@@ -288,11 +288,114 @@ namespace AssetStudio
         }
     }
 
+    public class SkeletonBoneLimit
+    {
+        public Vector3 m_Min;
+        public Vector3 m_Max;
+        public Vector3 m_Value;
+        public float m_Length;
+        public bool m_Modified;
+
+        public SkeletonBoneLimit(ObjectReader reader)
+        {
+            m_Min = reader.ReadVector3();
+            m_Max = reader.ReadVector3();
+            m_Value = reader.ReadVector3();
+            m_Length = reader.ReadSingle();
+            m_Modified = reader.ReadBoolean();
+            reader.AlignStream();
+        }
+    }
+
+    public class HumanBone
+    {
+        public string m_BoneName;
+        public string m_HumanName;
+        public SkeletonBoneLimit m_Limit;
+
+        public HumanBone(ObjectReader reader)
+        {
+            m_BoneName = reader.ReadAlignedString();
+            m_HumanName = reader.ReadAlignedString();
+            m_Limit = new SkeletonBoneLimit(reader);
+        }
+    }
+
+    public class SkeletonBone
+    {
+        public string m_Name;
+        public string m_ParentName;
+        public Vector3 m_Position;
+        public Quaternion m_Rotation;
+        public Vector3 m_Scale;
+
+        public SkeletonBone(ObjectReader reader)
+        {
+            m_Name = reader.ReadAlignedString();
+            m_ParentName = reader.ReadAlignedString();
+            m_Position = reader.ReadVector3();
+            m_Rotation = reader.ReadQuaternion();
+            m_Scale = reader.ReadVector3();
+        }
+    }
+
+    public class HumanDescription
+    {
+        public HumanBone[] m_Human;
+        public SkeletonBone[] m_Skeleton;
+        public float m_ArmTwist;
+        public float m_ForeArmTwist;
+        public float m_UpperLegTwist;
+        public float m_LegTwist;
+        public float m_ArmStretch;
+        public float m_LegStretch;
+        public float m_FeetSpacing;
+        public float m_GlobalScale;
+        public string m_RootMotionBoneName;
+        public bool m_HasTranslationDoF;
+        public bool m_HasExtraRoot;
+        public bool m_SkeletonHasParents;
+
+        public HumanDescription(ObjectReader reader)
+        {
+            int numHuman = reader.ReadInt32();
+            reader.CheckArrayLength(numHuman);
+            m_Human = new HumanBone[numHuman];
+            for (int i = 0; i < numHuman; i++)
+            {
+                m_Human[i] = new HumanBone(reader);
+            }
+
+            int numSkeleton = reader.ReadInt32();
+            reader.CheckArrayLength(numSkeleton);
+            m_Skeleton = new SkeletonBone[numSkeleton];
+            for (int i = 0; i < numSkeleton; i++)
+            {
+                m_Skeleton[i] = new SkeletonBone(reader);
+            }
+
+            m_ArmTwist = reader.ReadSingle();
+            m_ForeArmTwist = reader.ReadSingle();
+            m_UpperLegTwist = reader.ReadSingle();
+            m_LegTwist = reader.ReadSingle();
+            m_ArmStretch = reader.ReadSingle();
+            m_LegStretch = reader.ReadSingle();
+            m_FeetSpacing = reader.ReadSingle();
+            m_GlobalScale = reader.ReadSingle();
+            m_RootMotionBoneName = reader.ReadAlignedString();
+            m_HasTranslationDoF = reader.ReadBoolean();
+            m_HasExtraRoot = reader.ReadBoolean();
+            m_SkeletonHasParents = reader.ReadBoolean();
+            reader.AlignStream();
+        }
+    }
+
     public sealed class Avatar : NamedObject
     {
         public uint m_AvatarSize;
         public AvatarConstant m_Avatar;
         public KeyValuePair<uint, string>[] m_TOS;
+        public HumanDescription? m_HumanDescription;
 
         public Avatar(ObjectReader reader) : base(reader)
         {
@@ -307,7 +410,10 @@ namespace AssetStudio
                 m_TOS[i] = new KeyValuePair<uint, string>(reader.ReadUInt32(), reader.ReadAlignedString());
             }
 
-            //HumanDescription m_HumanDescription 2019 and up
+            if (version[0] >= 2019) //2019 and up
+            {
+                m_HumanDescription = new HumanDescription(reader);
+            }
         }
 
         public string FindBonePath(uint hash)

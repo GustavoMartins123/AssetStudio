@@ -22,6 +22,16 @@ namespace AssetStudio
         public PPtr<Material>[] m_Materials;
         public StaticBatchInfo? m_StaticBatchInfo;
         public uint[]? m_SubsetIndices;
+        public byte m_RayTracingAccelStructBuildFlagsOverride;
+        public byte m_RayTracingAccelStructBuildFlags;
+        public byte m_SmallMeshCulling;
+        public short m_ForceMeshLod;
+        public float m_MeshLodSelectionBias;
+        public uint m_RenderingLayerMask;
+        public int m_RendererPriority;
+        public short m_SortingLayer;
+        public short m_SortingOrder;
+        public int m_MaskInteraction;
 
         protected Renderer(ObjectReader reader) : base(reader)
         {
@@ -58,6 +68,15 @@ namespace AssetStudio
                     {
                         var m_RayTraceProcedural = reader.ReadByte();
                     }
+                    if (version[0] > 2023 || (version[0] == 2023 && version[1] >= 2)) //2023.2 and up
+                    {
+                        m_RayTracingAccelStructBuildFlagsOverride = reader.ReadByte();
+                        m_RayTracingAccelStructBuildFlags = reader.ReadByte();
+                    }
+                    if (version[0] >= 6000) //6000.0 and up
+                    {
+                        m_SmallMeshCulling = reader.ReadByte();
+                    }
                     reader.AlignStream();
                 }
                 else
@@ -69,19 +88,21 @@ namespace AssetStudio
                     reader.AlignStream();
                 }
 
+                if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 2)) //6000.2 and up
+                {
+                    m_ForceMeshLod = reader.ReadInt16();
+                    reader.AlignStream();
+                    m_MeshLodSelectionBias = reader.ReadSingle();
+                }
+
                 if (version[0] >= 2018) //2018 and up
                 {
-                    var m_RenderingLayerMask = reader.ReadUInt32();
+                    m_RenderingLayerMask = reader.ReadUInt32();
                 }
 
                 if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 3)) //2018.3 and up
                 {
-                    var m_RendererPriority = reader.ReadInt32();
-                }
-
-                if (version[0] >= 6000) //6000.0 and up
-                {
-                    reader.ReadInt32(); // Unknown field
+                    m_RendererPriority = reader.ReadInt32();
                 }
 
                 var m_LightmapIndex = reader.ReadUInt16();
@@ -153,9 +174,17 @@ namespace AssetStudio
                     var m_SortingLayerID = reader.ReadUInt32();
                 }
 
-                //SInt16 m_SortingLayer 5.6 and up
-                var m_SortingOrder = reader.ReadInt16();
+                if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
+                {
+                    m_SortingLayer = reader.ReadInt16();
+                }
+                m_SortingOrder = reader.ReadInt16();
                 reader.AlignStream();
+
+                if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 3)) //6000.3 and up
+                {
+                    m_MaskInteraction = reader.ReadInt32();
+                }
             }
         }
     }

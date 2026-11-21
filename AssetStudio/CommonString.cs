@@ -115,7 +115,8 @@ namespace AssetStudio
             {1121, "m_PrefabInstance"},
             {1138, "m_PrefabAsset"},
             {1152, "FileSize"},
-            {1161, "Hash128"}
+            {1161, "Hash128"},
+            {1200, "EntityId"}
         }.ToFrozenDictionary();
     }
 }

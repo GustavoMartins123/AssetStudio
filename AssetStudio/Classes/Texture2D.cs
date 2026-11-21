@@ -75,6 +75,13 @@ namespace AssetStudio
         public TextureFormat m_TextureFormat;
         public bool m_MipMap;
         public int m_MipCount;
+        public bool m_IsReadable;
+        public bool m_IsPreProcessed;
+        public bool m_IgnoreMipmapLimit;
+        public string m_MipmapLimitGroupName = string.Empty;
+        public bool m_StreamingMipmaps;
+        public int m_StreamingMipmapsPriority;
+        public int m_ColorSpace;
         public GLTextureSettings m_TextureSettings;
         public ResourceReader image_data;
         public StreamingInfo? m_StreamData;
@@ -106,13 +113,19 @@ namespace AssetStudio
             }
             if (version[0] > 2 || (version[0] == 2 && version[1] >= 6)) //2.6.0 and up
             {
-                var m_IsReadable = reader.ReadBoolean();
+                m_IsReadable = reader.ReadBoolean();
             }
             if (version[0] >= 2020) //2020.1 and up
             {
-                var m_IsPreProcessed = reader.ReadBoolean();
+                m_IsPreProcessed = reader.ReadBoolean();
             }
-            if (version[0] > 2019 || (version[0] == 2019 && version[1] >= 3)) //2019.3 and up
+            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) //2022.2 and up
+            {
+                m_IgnoreMipmapLimit = reader.ReadBoolean();
+                reader.AlignStream();
+                m_MipmapLimitGroupName = reader.ReadAlignedString();
+            }
+            else if (version[0] > 2019 || (version[0] == 2019 && version[1] >= 3)) //2019.3 - 2022.1
             {
                 var m_IgnoreMasterTextureLimit = reader.ReadBoolean();
             }
@@ -125,18 +138,12 @@ namespace AssetStudio
             }
             if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 2)) //2018.2 and up
             {
-                var m_StreamingMipmaps = reader.ReadBoolean();
+                m_StreamingMipmaps = reader.ReadBoolean();
             }
             reader.AlignStream();
             if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 2)) //2018.2 and up
             {
-                var m_StreamingMipmapsPriority = reader.ReadInt32();
-            }
-            if (version[0] >= 2022) //2022.x and up
-            {
-                var m_IgnoreMipmapLimit = reader.ReadBoolean();
-                reader.AlignStream();
-                var m_MipmapLimitGroupName = reader.ReadAlignedString();
+                m_StreamingMipmapsPriority = reader.ReadInt32();
             }
             var m_ImageCount = reader.ReadInt32();
             var m_TextureDimension = reader.ReadInt32();
@@ -147,7 +154,7 @@ namespace AssetStudio
             }
             if (version[0] > 3 || (version[0] == 3 && version[1] >= 5)) //3.5.0 and up
             {
-                var m_ColorSpace = reader.ReadInt32();
+                m_ColorSpace = reader.ReadInt32();
             }
             if (version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) //2020.2 and up
             {
@@ -200,6 +207,17 @@ namespace AssetStudio
             else if (image_data_size > 0)
             {
                 resourceReader = new ResourceReader(reader, reader.BaseStream.Position, image_data_size);
+                long remainingInObj = reader.byteSize - (reader.Position - reader.byteStart);
+                if (image_data_size <= remainingInObj && reader.BaseStream.Position + image_data_size <= reader.BaseStream.Length)
+                {
+                    reader.BaseStream.Position += image_data_size;
+                    reader.AlignStream();
+                    remainingInObj = reader.byteSize - (reader.Position - reader.byteStart);
+                    if (HasStreamData(version) && remainingInObj >= 12)
+                    {
+                        m_StreamData = new StreamingInfo(reader);
+                    }
+                }
             }
             else
             {
@@ -234,6 +252,13 @@ namespace AssetStudio
                 bool hasFormat = false;
                 bool mipMap = false;
                 int mipCount = 0;
+                bool isReadable = false;
+                bool isPreProcessed = false;
+                bool ignoreMipmapLimit = false;
+                string mipmapLimitGroupName = string.Empty;
+                bool streamingMipmaps = false;
+                int streamingMipmapsPriority = 0;
+                int colorSpace = 0;
                 GLTextureSettings? textureSettings = null;
                 StreamingInfo? streamData = null;
                 long imageDataOffset = 0;
@@ -245,6 +270,9 @@ namespace AssetStudio
                 {
                     switch (nodes[i].m_Name)
                     {
+                        case "m_Name":
+                            TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref i, out m_Name);
+                            break;
                         case "m_Width":
                             if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out width))
                                 return false;
@@ -266,6 +294,33 @@ namespace AssetStudio
                             if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out mipCount))
                                 return false;
                             break;
+                        case "m_IsReadable":
+                            if (!TypeTreeHelper.TryReadBoolean(nodes, nextSibling, reader, ref i, out isReadable))
+                                return false;
+                            break;
+                        case "m_IsPreProcessed":
+                            if (!TypeTreeHelper.TryReadBoolean(nodes, nextSibling, reader, ref i, out isPreProcessed))
+                                return false;
+                            break;
+                        case "m_IgnoreMipmapLimit":
+                            if (!TypeTreeHelper.TryReadBoolean(nodes, nextSibling, reader, ref i, out ignoreMipmapLimit))
+                                return false;
+                            break;
+                        case "m_MipmapLimitGroupName":
+                            TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref i, out mipmapLimitGroupName);
+                            break;
+                        case "m_StreamingMipmaps":
+                            if (!TypeTreeHelper.TryReadBoolean(nodes, nextSibling, reader, ref i, out streamingMipmaps))
+                                return false;
+                            break;
+                        case "m_StreamingMipmapsPriority":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out streamingMipmapsPriority))
+                                return false;
+                            break;
+                        case "m_ColorSpace":
+                            if (!TypeTreeHelper.TryReadInt32(nodes, nextSibling, reader, ref i, out colorSpace))
+                                return false;
+                            break;
                         case "m_TextureSettings":
                             textureSettings = ReadTextureSettingsStreaming(nodes, nextSibling, reader, ref i);
                             break;
@@ -284,7 +339,7 @@ namespace AssetStudio
                     }
                 }
 
-                if (width <= 0 || height <= 0 || !hasFormat || !Enum.IsDefined(typeof(TextureFormat), format))
+                if (width < 0 || height < 0 || !hasFormat || !Enum.IsDefined(typeof(TextureFormat), format))
                 {
                     return false;
                 }
@@ -302,6 +357,10 @@ namespace AssetStudio
                 {
                     resourceReader = new ResourceReader(reader, imageDataUnderscoreOffset, imageDataUnderscoreSize);
                 }
+                else if (width == 0 && height == 0)
+                {
+                    resourceReader = new ResourceReader(reader, reader.BaseStream.Position, 0);
+                }
 
                 if (resourceReader == null)
                 {
@@ -313,6 +372,13 @@ namespace AssetStudio
                 m_TextureFormat = (TextureFormat)format;
                 m_MipMap = mipMap;
                 m_MipCount = mipCount;
+                m_IsReadable = isReadable;
+                m_IsPreProcessed = isPreProcessed;
+                m_IgnoreMipmapLimit = ignoreMipmapLimit;
+                m_MipmapLimitGroupName = mipmapLimitGroupName;
+                m_StreamingMipmaps = streamingMipmaps;
+                m_StreamingMipmapsPriority = streamingMipmapsPriority;
+                m_ColorSpace = colorSpace;
                 m_TextureSettings = textureSettings ?? new GLTextureSettings();
                 m_StreamData = streamData;
                 image_data = resourceReader;

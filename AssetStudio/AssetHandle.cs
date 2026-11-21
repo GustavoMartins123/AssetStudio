@@ -898,6 +898,7 @@ namespace AssetStudio
                                 SkipPPtr(reader); // m_PrefabInternal
                             }
                             int componentsSize = reader.ReadInt32();
+                            reader.CheckArrayLength(componentsSize);
                             for (int i = 0; i < componentsSize; i++)
                             {
                                 if ((reader.version[0] == 5 && reader.version[1] < 5) || reader.version[0] < 5)
@@ -924,6 +925,50 @@ namespace AssetStudio
                             return reader.ReadAlignedString();
                         }
                     case ClassIDType.MonoScript:
+                    case ClassIDType.AnimationClip:
+                    case ClassIDType.AnimatorController:
+                    case ClassIDType.AnimatorOverrideController:
+                    case ClassIDType.AssetBundle:
+                    case ClassIDType.AudioClip:
+                    case ClassIDType.AudioMixer:
+                    case ClassIDType.AudioMixerController:
+                    case ClassIDType.AudioMixerGroup:
+                    case ClassIDType.AudioMixerGroupController:
+                    case ClassIDType.AudioMixerSnapshot:
+                    case ClassIDType.AudioMixerSnapshotController:
+                    case ClassIDType.Avatar:
+                    case ClassIDType.AvatarMask:
+                    case ClassIDType.ComputeShader:
+                    case ClassIDType.Cubemap:
+                    case ClassIDType.Flare:
+                    case ClassIDType.Font:
+                    case ClassIDType.LightProbes:
+                    case ClassIDType.LightingDataAsset:
+                    case ClassIDType.LightingSettings:
+                    case ClassIDType.Material:
+                    case ClassIDType.Mesh:
+                    case ClassIDType.MovieTexture:
+                    case ClassIDType.NamedObject:
+                    case ClassIDType.NavMeshData:
+                    case ClassIDType.PhysicMaterial:
+                    case ClassIDType.PhysicsMaterial2D:
+                    case ClassIDType.RayTracingShader:
+                    case ClassIDType.RenderTexture:
+                    case ClassIDType.RuntimeAnimatorController:
+                    case ClassIDType.Shader:
+                    case ClassIDType.ShaderVariantCollection:
+                    case ClassIDType.SpeedTreeWindAsset:
+                    case ClassIDType.Sprite:
+                    case ClassIDType.SpriteAtlas:
+                    case ClassIDType.SubstanceArchive:
+                    case ClassIDType.TerrainData:
+                    case ClassIDType.TerrainLayer:
+                    case ClassIDType.TextAsset:
+                    case ClassIDType.Texture:
+                    case ClassIDType.Texture2D:
+                    case ClassIDType.Texture2DArray:
+                    case ClassIDType.Texture3D:
+                    case ClassIDType.VideoClip:
                         {
                             // NamedObject : EditorExtension : Object
                             if (reader.platform == BuildTarget.NoTarget)
@@ -934,15 +979,7 @@ namespace AssetStudio
                             return reader.ReadAlignedString();
                         }
                     default:
-                        {
-                            // Para NamedObject subclasses genéricas
-                            if (reader.platform == BuildTarget.NoTarget)
-                            {
-                                SkipPPtr(reader); // m_PrefabParentObject
-                                SkipPPtr(reader); // m_PrefabInternal
-                            }
-                            return reader.ReadAlignedString();
-                        }
+                        return null;
                 }
             }
             catch

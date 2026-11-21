@@ -13,6 +13,7 @@ namespace AssetStudio
         public TextAsset(ObjectReader reader) : base(reader)
         {
             m_Script = reader.ReadUInt8Array();
+            reader.AlignStream();
         }
     }
 }

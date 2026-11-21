@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Collections.Specialized;
+using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -97,6 +98,35 @@ namespace AssetStudio
             }
         }
 
+        private static SerializedType? ResolveReferencedType(SerializedFile? assetsFile, string className, string nsName, string asmName)
+        {
+            var refTypes = assetsFile?.m_RefTypes;
+            if (refTypes == null || string.IsNullOrEmpty(className))
+            {
+                return null;
+            }
+
+            for (int i = 0; i < refTypes.Count; i++)
+            {
+                var rt = refTypes[i];
+                if (rt.m_KlassName == className && rt.m_NameSpace == nsName && rt.m_AsmName == asmName)
+                {
+                    return rt;
+                }
+            }
+
+            for (int i = 0; i < refTypes.Count; i++)
+            {
+                var rt = refTypes[i];
+                if (rt.m_KlassName == className && rt.m_NameSpace == nsName)
+                {
+                    return rt;
+                }
+            }
+
+            return null;
+        }
+
         public static string ReadTypeString(TypeTree m_Type, ObjectReader reader)
         {
             reader.Reset();
@@ -105,7 +135,7 @@ namespace AssetStudio
             var nextSibling = GetNextSiblingTable(m_Nodes);
             for (int i = 0; i < m_Nodes.Count; i++)
             {
-                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref i, depth: 0);
+                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref i, depth: 0, levelOffset: 0);
             }
             var readed = reader.Position - reader.byteStart;
             if (readed != reader.byteSize)
@@ -115,61 +145,61 @@ namespace AssetStudio
             return sb.ToString();
         }
 
-        private static void ReadStringValue(StringBuilder sb, List<TypeTreeNode> m_Nodes, int[] nextSibling, ObjectReader reader, ref int i, int depth)
+        private static void ReadStringValue(StringBuilder sb, List<TypeTreeNode> m_Nodes, int[] nextSibling, ObjectReader reader, ref int i, int depth, int levelOffset = 0)
         {
             ValidateDepth(depth);
             var m_Node = m_Nodes[i];
-            var level = m_Node.m_Level;
+            var level = m_Node.m_Level + levelOffset;
             var varTypeStr = m_Node.m_Type;
             var varNameStr = m_Node.m_Name;
-            object? value = null;
+            string? formattedValue = null;
             var append = true;
             var align = (m_Node.m_MetaFlag & 0x4000) != 0;
             switch (varTypeStr)
             {
                 case "SInt8":
-                    value = reader.ReadSByte();
+                    formattedValue = reader.ReadSByte().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "UInt8":
-                    value = reader.ReadByte();
+                    formattedValue = reader.ReadByte().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "char":
-                    value = ReadCharValue(reader);
+                    formattedValue = ReadCharValue(reader, m_Node.m_ByteSize).ToString();
                     break;
                 case "short":
                 case "SInt16":
-                    value = reader.ReadInt16();
+                    formattedValue = reader.ReadInt16().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "UInt16":
                 case "unsigned short":
-                    value = reader.ReadUInt16();
+                    formattedValue = reader.ReadUInt16().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "int":
                 case "SInt32":
-                    value = reader.ReadInt32();
+                    formattedValue = reader.ReadInt32().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "UInt32":
                 case "unsigned int":
                 case "Type*":
-                    value = reader.ReadUInt32();
+                    formattedValue = reader.ReadUInt32().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "long long":
                 case "SInt64":
-                    value = reader.ReadInt64();
+                    formattedValue = reader.ReadInt64().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "UInt64":
                 case "unsigned long long":
                 case "FileSize":
-                    value = reader.ReadUInt64();
+                    formattedValue = reader.ReadUInt64().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "float":
-                    value = reader.ReadSingle();
+                    formattedValue = reader.ReadSingle().ToString("G9", CultureInfo.InvariantCulture);
                     break;
                 case "double":
-                    value = reader.ReadDouble();
+                    formattedValue = reader.ReadDouble().ToString("G17", CultureInfo.InvariantCulture);
                     break;
                 case "bool":
-                    value = reader.ReadBoolean();
+                    formattedValue = reader.ReadBoolean().ToString(CultureInfo.InvariantCulture);
                     break;
                 case "string":
                     append = false;
@@ -182,12 +212,13 @@ namespace AssetStudio
                         int mapEnd = nextSibling[i];
                         if (i + 1 < mapEnd && (m_Nodes[i + 1].m_MetaFlag & 0x4000) != 0)
                             align = true;
+                        bool pairAlign = i + 3 < mapEnd && (m_Nodes[i + 3].m_MetaFlag & 0x4000) != 0;
                         append = false;
                         sb.Append('\t', level).Append(varTypeStr).Append(' ').Append(varNameStr).Append("\r\n");
                         sb.Append('\t', level + 1).Append("Array Array\r\n");
                         var size = reader.ReadInt32();
                         reader.CheckArrayLength(size);
-                        sb.Append('\t', level + 1).Append("int size = ").Append(size).Append("\r\n");
+                        sb.Append('\t', level + 1).Append("int size = ").Append(size.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
                         int firstIndex = i + 4;
                         int secondIndex = firstIndex < mapEnd ? nextSibling[firstIndex] : mapEnd;
                         if (size > 0 && (firstIndex >= mapEnd || secondIndex >= mapEnd))
@@ -197,12 +228,16 @@ namespace AssetStudio
                         i = mapEnd - 1;
                         for (int j = 0; j < size; j++)
                         {
-                            sb.Append('\t', level + 2).Append('[').Append(j).Append("]\r\n");
+                            sb.Append('\t', level + 2).Append('[').Append(j.ToString(CultureInfo.InvariantCulture)).Append("]\r\n");
                             sb.Append('\t', level + 2).Append("pair data\r\n");
                             int tmp1 = firstIndex;
                             int tmp2 = secondIndex;
-                            ReadStringValue(sb, m_Nodes, nextSibling, reader, ref tmp1, depth + 1);
-                            ReadStringValue(sb, m_Nodes, nextSibling, reader, ref tmp2, depth + 1);
+                            ReadStringValue(sb, m_Nodes, nextSibling, reader, ref tmp1, depth + 1, levelOffset);
+                            ReadStringValue(sb, m_Nodes, nextSibling, reader, ref tmp2, depth + 1, levelOffset);
+                            if (pairAlign)
+                            {
+                                reader.AlignStream();
+                            }
                         }
                         break;
                     }
@@ -214,7 +249,88 @@ namespace AssetStudio
                         AdvanceObjectBytes(reader, size);
                         i = nextSibling[i] - 1;
                         sb.Append('\t', level).Append(varTypeStr).Append(' ').Append(varNameStr).Append("\r\n");
-                        sb.Append('\t', level).Append("int size = ").Append(size).Append("\r\n");
+                        sb.Append('\t', level).Append("int size = ").Append(size.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+                        break;
+                    }
+                case "ReferencedObject":
+                    {
+                        append = false;
+                        sb.Append('\t', level).Append(varTypeStr).Append(' ').Append(varNameStr).Append("\r\n");
+                        int childStart = i + 1;
+                        int childEnd = nextSibling[i];
+                        i = childEnd - 1;
+
+                        long rid = 0;
+                        string className = string.Empty;
+                        string nsName = string.Empty;
+                        string asmName = string.Empty;
+
+                        for (int j = childStart; j < childEnd; j++)
+                        {
+                            var childNode = m_Nodes[j];
+                            if (childNode.m_Type == "ReferencedManagedType")
+                            {
+                                bool typeAlign = (childNode.m_MetaFlag & 0x4000) != 0;
+                                int typeLevel = childNode.m_Level + levelOffset;
+                                sb.Append('\t', typeLevel).Append(childNode.m_Type).Append(' ').Append(childNode.m_Name).Append("\r\n");
+                                className = reader.ReadAlignedString();
+                                sb.Append('\t', typeLevel + 1).Append("string class = \"").Append(className).Append("\"\r\n");
+                                nsName = reader.ReadAlignedString();
+                                sb.Append('\t', typeLevel + 1).Append("string ns = \"").Append(nsName).Append("\"\r\n");
+                                asmName = reader.ReadAlignedString();
+                                sb.Append('\t', typeLevel + 1).Append("string asm = \"").Append(asmName).Append("\"\r\n");
+                                if (typeAlign)
+                                {
+                                    reader.AlignStream();
+                                }
+                                j = nextSibling[j] - 1;
+                            }
+                            else if (childNode.m_Type == "ReferencedObjectData")
+                            {
+                                bool dataAlign = (childNode.m_MetaFlag & 0x4000) != 0;
+                                int dataLevel = childNode.m_Level + levelOffset;
+                                sb.Append('\t', dataLevel).Append(childNode.m_Type).Append(' ').Append(childNode.m_Name).Append("\r\n");
+                                if (!string.IsNullOrEmpty(className) && rid != -2)
+                                {
+                                    var refType = ResolveReferencedType(reader.assetsFile, className, nsName, asmName);
+                                    if (refType?.m_Type?.m_Nodes is { Count: > 1 } refNodes)
+                                    {
+                                        var refNextSibling = GetNextSiblingTable(refNodes);
+                                        for (int r = 1; r < refNodes.Count; r++)
+                                        {
+                                            if (refNodes[r].m_Type == "ManagedReferencesRegistry")
+                                            {
+                                                r = refNextSibling[r] - 1;
+                                                continue;
+                                            }
+                                            ReadStringValue(sb, refNodes, refNextSibling, reader, ref r, depth + 2, dataLevel);
+                                        }
+                                        if ((refNodes[0].m_MetaFlag & 0x4000) != 0)
+                                        {
+                                            reader.AlignStream();
+                                        }
+                                    }
+                                }
+                                if (dataAlign)
+                                {
+                                    reader.AlignStream();
+                                }
+                                j = nextSibling[j] - 1;
+                            }
+                            else if (childNode.m_Name == "rid" && (childNode.m_Type == "SInt64" || childNode.m_Type == "long long"))
+                            {
+                                rid = reader.ReadInt64();
+                                sb.Append('\t', childNode.m_Level + levelOffset).Append(childNode.m_Type).Append(" rid = ").Append(rid.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+                                if ((childNode.m_MetaFlag & 0x4000) != 0)
+                                {
+                                    reader.AlignStream();
+                                }
+                            }
+                            else
+                            {
+                                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref j, depth + 1, levelOffset);
+                            }
+                        }
                         break;
                     }
                 default:
@@ -229,7 +345,7 @@ namespace AssetStudio
                             sb.Append('\t', level + 1).Append("Array Array\r\n");
                             var size = reader.ReadInt32();
                             reader.CheckArrayLength(size);
-                            sb.Append('\t', level + 1).Append("int size = ").Append(size).Append("\r\n");
+                            sb.Append('\t', level + 1).Append("int size = ").Append(size.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
                             int elemIndex = i + 3;
                             if (size > 0 && elemIndex >= arrayEnd)
                             {
@@ -238,9 +354,9 @@ namespace AssetStudio
                             i = arrayEnd - 1;
                             for (int j = 0; j < size; j++)
                             {
-                                sb.Append('\t', level + 2).Append('[').Append(j).Append("]\r\n");
+                                sb.Append('\t', level + 2).Append('[').Append(j.ToString(CultureInfo.InvariantCulture)).Append("]\r\n");
                                 int tmp = elemIndex;
-                                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref tmp, depth + 1);
+                                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref tmp, depth + 1, levelOffset);
                             }
                             break;
                         }
@@ -253,14 +369,14 @@ namespace AssetStudio
                             i = childEnd - 1;
                             for (int j = childStart; j < childEnd; j++)
                             {
-                                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref j, depth + 1);
+                                ReadStringValue(sb, m_Nodes, nextSibling, reader, ref j, depth + 1, levelOffset);
                             }
                             break;
                         }
                     }
             }
             if (append)
-                sb.Append('\t', level).Append(varTypeStr).Append(' ').Append(varNameStr).Append(" = ").Append(value).Append("\r\n");
+                sb.Append('\t', level).Append(varTypeStr).Append(' ').Append(varNameStr).Append(" = ").Append(formattedValue).Append("\r\n");
             if (align)
                 reader.AlignStream();
         }
@@ -301,7 +417,7 @@ namespace AssetStudio
                     value = reader.ReadByte();
                     break;
                 case "char":
-                    value = ReadCharValue(reader);
+                    value = ReadCharValue(reader, m_Node.m_ByteSize);
                     break;
                 case "short":
                 case "SInt16":
@@ -347,6 +463,7 @@ namespace AssetStudio
                         int mapEnd = nextSibling[i];
                         if (i + 1 < mapEnd && (m_Nodes[i + 1].m_MetaFlag & 0x4000) != 0)
                             align = true;
+                        bool pairAlign = i + 3 < mapEnd && (m_Nodes[i + 3].m_MetaFlag & 0x4000) != 0;
                         int firstIndex = i + 4;
                         int secondIndex = firstIndex < mapEnd ? nextSibling[firstIndex] : mapEnd;
                         i = mapEnd - 1;
@@ -364,6 +481,10 @@ namespace AssetStudio
                             dic.Add(new KeyValuePair<object, object>(
                                 ReadValue(m_Nodes, nextSibling, reader, ref tmp1, depth + 1),
                                 ReadValue(m_Nodes, nextSibling, reader, ref tmp2, depth + 1)));
+                            if (pairAlign)
+                            {
+                                reader.AlignStream();
+                            }
                         }
                         value = dic;
                         break;
@@ -374,6 +495,89 @@ namespace AssetStudio
                         reader.CheckArrayLength(size);
                         value = reader.ReadBytes(size);
                         i = nextSibling[i] - 1;
+                        break;
+                    }
+                case "ReferencedObject":
+                    {
+                        int childStart = i + 1;
+                        int childEnd = nextSibling[i];
+                        i = childEnd - 1;
+                        var obj = new OrderedDictionary();
+                        long rid = 0;
+                        string className = string.Empty;
+                        string nsName = string.Empty;
+                        string asmName = string.Empty;
+
+                        for (int j = childStart; j < childEnd; j++)
+                        {
+                            var childNode = m_Nodes[j];
+                            if (childNode.m_Type == "ReferencedManagedType")
+                            {
+                                bool typeAlign = (childNode.m_MetaFlag & 0x4000) != 0;
+                                className = reader.ReadAlignedString();
+                                nsName = reader.ReadAlignedString();
+                                asmName = reader.ReadAlignedString();
+                                if (typeAlign)
+                                {
+                                    reader.AlignStream();
+                                }
+                                var typeDict = new OrderedDictionary
+                                {
+                                    ["class"] = className,
+                                    ["ns"] = nsName,
+                                    ["asm"] = asmName
+                                };
+                                obj[childNode.m_Name] = typeDict;
+                                j = nextSibling[j] - 1;
+                            }
+                            else if (childNode.m_Type == "ReferencedObjectData")
+                            {
+                                bool dataAlign = (childNode.m_MetaFlag & 0x4000) != 0;
+                                var dataDict = new OrderedDictionary();
+                                if (!string.IsNullOrEmpty(className) && rid != -2)
+                                {
+                                    var refType = ResolveReferencedType(reader.assetsFile, className, nsName, asmName);
+                                    if (refType?.m_Type?.m_Nodes is { Count: > 1 } refNodes)
+                                    {
+                                        var refNextSibling = GetNextSiblingTable(refNodes);
+                                        for (int r = 1; r < refNodes.Count; r++)
+                                        {
+                                            var refMember = refNodes[r];
+                                            if (refMember.m_Type == "ManagedReferencesRegistry")
+                                            {
+                                                r = refNextSibling[r] - 1;
+                                                continue;
+                                            }
+                                            dataDict[refMember.m_Name] = ReadValue(refNodes, refNextSibling, reader, ref r, depth + 2);
+                                        }
+                                        if ((refNodes[0].m_MetaFlag & 0x4000) != 0)
+                                        {
+                                            reader.AlignStream();
+                                        }
+                                    }
+                                }
+                                if (dataAlign)
+                                {
+                                    reader.AlignStream();
+                                }
+                                obj[childNode.m_Name] = dataDict;
+                                j = nextSibling[j] - 1;
+                            }
+                            else if (childNode.m_Name == "rid" && (childNode.m_Type == "SInt64" || childNode.m_Type == "long long"))
+                            {
+                                rid = reader.ReadInt64();
+                                if ((childNode.m_MetaFlag & 0x4000) != 0)
+                                {
+                                    reader.AlignStream();
+                                }
+                                obj[childNode.m_Name] = rid;
+                            }
+                            else
+                            {
+                                obj[childNode.m_Name] = ReadValue(m_Nodes, nextSibling, reader, ref j, depth + 1);
+                            }
+                        }
+                        value = obj;
                         break;
                     }
                 default:
@@ -422,12 +626,16 @@ namespace AssetStudio
             return value;
         }
 
-        private static char ReadCharValue(ObjectReader reader)
+        private static char ReadCharValue(ObjectReader reader, int byteSize = 2)
         {
+            if (byteSize == 1)
+            {
+                CheckObjectBytesAvailable(reader, 1);
+                return (char)reader.ReadByte();
+            }
+
             CheckObjectBytesAvailable(reader, 2);
-            Span<byte> charBytes = stackalloc byte[2];
-            EndianBinaryReader.ReadStreamExactly(reader.BaseStream, charBytes);
-            return BitConverter.ToChar(charBytes);
+            return (char)reader.ReadUInt16();
         }
 
         private static void CheckObjectBytesAvailable(ObjectReader reader, long count)
@@ -493,8 +701,9 @@ namespace AssetStudio
             }
         }
 
-        private static bool TryGetFixedPrimitiveByteSize(string typeName, out int byteSize)
+        private static bool TryGetFixedPrimitiveByteSize(TypeTreeNode node, out int byteSize)
         {
+            var typeName = node.m_Type;
             switch (typeName)
             {
                 case "SInt8":
@@ -503,6 +712,8 @@ namespace AssetStudio
                     byteSize = 1;
                     return true;
                 case "char":
+                    byteSize = node.m_ByteSize == 1 ? 1 : 2;
+                    return true;
                 case "short":
                 case "SInt16":
                 case "UInt16":
@@ -543,7 +754,7 @@ namespace AssetStudio
             var typeName = node.m_Type;
             bool align = (node.m_MetaFlag & 0x4000) != 0;
 
-            if (TryGetFixedPrimitiveByteSize(typeName, out int scalarBytes))
+            if (TryGetFixedPrimitiveByteSize(node, out int scalarBytes))
             {
                 AdvanceObjectBytes(reader, scalarBytes);
             }
@@ -560,6 +771,7 @@ namespace AssetStudio
                             int mapEnd = nextSibling[index];
                             if (index + 1 < mapEnd && (nodes[index + 1].m_MetaFlag & 0x4000) != 0)
                                 align = true;
+                            bool pairAlign = index + 3 < mapEnd && (nodes[index + 3].m_MetaFlag & 0x4000) != 0;
                             int firstIndex = index + 4;
                             int secondIndex = firstIndex < mapEnd ? nextSibling[firstIndex] : mapEnd;
                             index = mapEnd - 1;
@@ -575,6 +787,10 @@ namespace AssetStudio
                                 int tmp2 = secondIndex;
                                 SkipNode(nodes, nextSibling, reader, ref tmp1, depth + 1);
                                 SkipNode(nodes, nextSibling, reader, ref tmp2, depth + 1);
+                                if (pairAlign)
+                                {
+                                    reader.AlignStream();
+                                }
                             }
                             break;
                         }
@@ -587,6 +803,76 @@ namespace AssetStudio
                             }
                             AdvanceObjectBytes(reader, size);
                             index = nextSibling[index] - 1;
+                            break;
+                        }
+                    case "ReferencedObject":
+                        {
+                            int childStart = index + 1;
+                            int childEnd = nextSibling[index];
+                            index = childEnd - 1;
+                            long rid = 0;
+                            string className = string.Empty;
+                            string nsName = string.Empty;
+                            string asmName = string.Empty;
+
+                            for (int j = childStart; j < childEnd; j++)
+                            {
+                                var childNode = nodes[j];
+                                if (childNode.m_Type == "ReferencedManagedType")
+                                {
+                                    bool typeAlign = (childNode.m_MetaFlag & 0x4000) != 0;
+                                    className = reader.ReadAlignedString();
+                                    nsName = reader.ReadAlignedString();
+                                    asmName = reader.ReadAlignedString();
+                                    if (typeAlign)
+                                    {
+                                        reader.AlignStream();
+                                    }
+                                    j = nextSibling[j] - 1;
+                                }
+                                else if (childNode.m_Type == "ReferencedObjectData")
+                                {
+                                    bool dataAlign = (childNode.m_MetaFlag & 0x4000) != 0;
+                                    if (!string.IsNullOrEmpty(className) && rid != -2)
+                                    {
+                                        var refType = ResolveReferencedType(reader.assetsFile, className, nsName, asmName);
+                                        if (refType?.m_Type?.m_Nodes is { Count: > 1 } refNodes)
+                                        {
+                                            var refNextSibling = GetNextSiblingTable(refNodes);
+                                            for (int r = 1; r < refNodes.Count; r++)
+                                            {
+                                                if (refNodes[r].m_Type == "ManagedReferencesRegistry")
+                                                {
+                                                    r = refNextSibling[r] - 1;
+                                                    continue;
+                                                }
+                                                SkipNode(refNodes, refNextSibling, reader, ref r, depth + 2);
+                                            }
+                                            if ((refNodes[0].m_MetaFlag & 0x4000) != 0)
+                                            {
+                                                reader.AlignStream();
+                                            }
+                                        }
+                                    }
+                                    if (dataAlign)
+                                    {
+                                        reader.AlignStream();
+                                    }
+                                    j = nextSibling[j] - 1;
+                                }
+                                else if (childNode.m_Name == "rid" && (childNode.m_Type == "SInt64" || childNode.m_Type == "long long"))
+                                {
+                                    rid = reader.ReadInt64();
+                                    if ((childNode.m_MetaFlag & 0x4000) != 0)
+                                    {
+                                        reader.AlignStream();
+                                    }
+                                }
+                                else
+                                {
+                                    SkipNode(nodes, nextSibling, reader, ref j, depth + 1);
+                                }
+                            }
                             break;
                         }
                     default:
@@ -606,7 +892,7 @@ namespace AssetStudio
                                 }
                                 if (size > 0
                                     && (nodes[elemIndex].m_MetaFlag & 0x4000) == 0
-                                    && TryGetFixedPrimitiveByteSize(nodes[elemIndex].m_Type, out int elemBytes))
+                                    && TryGetFixedPrimitiveByteSize(nodes[elemIndex], out int elemBytes))
                                 {
                                     AdvanceObjectBytes(reader, (long)size * elemBytes);
                                 }

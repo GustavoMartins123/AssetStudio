@@ -11,6 +11,7 @@ namespace AssetStudio
     public static class BinaryReaderExtensions
     {
         private const int MaxArrayLength = 10000000;
+        private const long MaxByteArrayLength = 536_870_912; // 512 MiB
 
         public static void AlignStream(this BinaryReader reader)
         {
@@ -326,12 +327,22 @@ namespace AssetStudio
 
         private static void CheckBlittableArrayLength(BinaryReader reader, int length, int elementSize)
         {
-            if (length < 0 || length > MaxArrayLength)
+            if (length < 0)
             {
                 throw new OverflowException($"Invalid array length: {length}");
             }
 
             long byteCount = (long)length * elementSize;
+            if (byteCount > MaxByteArrayLength)
+            {
+                throw new OverflowException($"Invalid array length: {length}");
+            }
+
+            if (length > MaxArrayLength && (!reader.BaseStream.CanSeek || (reader.BaseStream.Length - reader.BaseStream.Position) < byteCount))
+            {
+                throw new OverflowException($"Invalid array length: {length}");
+            }
+
             long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
             if (byteCount > remainingStream)
             {

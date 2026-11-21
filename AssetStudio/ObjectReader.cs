@@ -37,7 +37,7 @@ namespace AssetStudio
             Position = byteStart;
         }
 
-        public new byte[] ReadBytes(int count)
+        public override byte[] ReadBytes(int count)
         {
             long remaining = byteSize - (Position - byteStart);
             if (count < 0 || count > remaining)

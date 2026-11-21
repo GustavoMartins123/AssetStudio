@@ -399,15 +399,21 @@ namespace AssetStudio
         public string path;
         public ClassIDType classID;
         public PPtr<MonoScript> script;
+        public int flags;
 
 
         public FloatCurve(ObjectReader reader)
         {
+            var version = reader.version;
             curve = new AnimationCurve<float>(reader, reader.ReadSingle);
             attribute = reader.ReadAlignedString();
             path = reader.ReadAlignedString();
             classID = (ClassIDType)reader.ReadInt32();
             script = new PPtr<MonoScript>(reader);
+            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) //2022.2 and up
+            {
+                flags = reader.ReadInt32();
+            }
         }
     }
 
@@ -436,11 +442,13 @@ namespace AssetStudio
         public string path = string.Empty;
         public int classID;
         public PPtr<MonoScript>? script;
+        public int flags;
 
         public PPtrCurve() { }
 
         public PPtrCurve(ObjectReader reader)
         {
+            var version = reader.version;
             int numCurves = reader.ReadInt32();
             reader.CheckArrayLength(numCurves);
             curve = new PPtrKeyframe[numCurves];
@@ -453,6 +461,10 @@ namespace AssetStudio
             path = reader.ReadAlignedString();
             classID = reader.ReadInt32();
             script = new PPtr<MonoScript>(reader);
+            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) //2022.2 and up
+            {
+                flags = reader.ReadInt32();
+            }
         }
     }
 
@@ -918,6 +930,7 @@ namespace AssetStudio
         public byte customType;
         public byte isPPtrCurve;
         public byte isIntCurve;
+        public byte isSerializeReferenceCurve;
 
         public GenericBinding() { }
 
@@ -940,6 +953,10 @@ namespace AssetStudio
             if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 1)) //2022.1 and up
             {
                 isIntCurve = reader.ReadByte();
+            }
+            if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 2)) //2022.2 and up
+            {
+                isSerializeReferenceCurve = reader.ReadByte();
             }
             reader.AlignStream();
         }
@@ -1060,6 +1077,8 @@ namespace AssetStudio
         public uint m_MuscleClipSize;
         public ClipMuscleConstant? m_MuscleClip;
         public AnimationClipBindingConstant? m_ClipBindingConstant;
+        public bool m_HasGenericRootTransform;
+        public bool m_HasMotionFloatCurves;
         public AnimationEvent[] m_Events;
 
 
@@ -1164,8 +1183,8 @@ namespace AssetStudio
             }
             if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 3)) //2018.3 and up
             {
-                var m_HasGenericRootTransform = reader.ReadBoolean();
-                var m_HasMotionFloatCurves = reader.ReadBoolean();
+                m_HasGenericRootTransform = reader.ReadBoolean();
+                m_HasMotionFloatCurves = reader.ReadBoolean();
                 reader.AlignStream();
             }
             int numEvents = reader.ReadInt32();

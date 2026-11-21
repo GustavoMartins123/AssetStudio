@@ -12,7 +12,7 @@ namespace AssetStudio
         public SecondarySpriteTexture(ObjectReader reader)
         {
             texture = new PPtr<Texture2D>(reader);
-            name = reader.ReadStringToNull();
+            name = reader.ReadAlignedString();
         }
     }
 
@@ -196,6 +196,35 @@ namespace AssetStudio
         }
     }
 
+    public class SpriteBone
+    {
+        public string name;
+        public string? guid;
+        public Vector3 position;
+        public Quaternion rotation;
+        public float length;
+        public int parentId;
+        public int color;
+
+        public SpriteBone(ObjectReader reader)
+        {
+            var version = reader.version;
+            name = reader.ReadAlignedString();
+            if (version[0] >= 2021) //2021.1 and up
+            {
+                guid = reader.ReadAlignedString();
+            }
+            position = reader.ReadVector3();
+            rotation = reader.ReadQuaternion();
+            length = reader.ReadSingle();
+            parentId = reader.ReadInt32();
+            if (version[0] >= 2021) //2021.1 and up
+            {
+                color = reader.ReadInt32();
+            }
+        }
+    }
+
     public sealed class Sprite : NamedObject
     {
         public Rectf m_Rect;
@@ -210,6 +239,8 @@ namespace AssetStudio
         public PPtr<SpriteAtlas>? m_SpriteAtlas;
         public SpriteRenderData m_RD;
         public Vector2[][] m_PhysicsShape = Array.Empty<Vector2[]>();
+        public SpriteBone[] m_Bones = Array.Empty<SpriteBone>();
+        public PPtr<MonoBehaviour>[] m_ScriptableObjects = Array.Empty<PPtr<MonoBehaviour>>();
 
         public Sprite(ObjectReader reader) : base(reader)
         {
@@ -252,6 +283,7 @@ namespace AssetStudio
             if (version[0] >= 2017) //2017 and up
             {
                 var m_PhysicsShapeSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_PhysicsShapeSize);
                 m_PhysicsShape = new Vector2[m_PhysicsShapeSize][];
                 for (int i = 0; i < m_PhysicsShapeSize; i++)
                 {
@@ -259,7 +291,27 @@ namespace AssetStudio
                 }
             }
 
-            //vector m_Bones 2018 and up
+            if (version[0] >= 2018) //2018 and up
+            {
+                var m_BonesSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_BonesSize);
+                m_Bones = new SpriteBone[m_BonesSize];
+                for (int i = 0; i < m_BonesSize; i++)
+                {
+                    m_Bones[i] = new SpriteBone(reader);
+                }
+            }
+
+            if (version[0] > 2023 || (version[0] == 2023 && version[1] >= 2)) //2023.2 and up
+            {
+                var m_ScriptableObjectsSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_ScriptableObjectsSize);
+                m_ScriptableObjects = new PPtr<MonoBehaviour>[m_ScriptableObjectsSize];
+                for (int i = 0; i < m_ScriptableObjectsSize; i++)
+                {
+                    m_ScriptableObjects[i] = new PPtr<MonoBehaviour>(reader);
+                }
+            }
         }
     }
 }

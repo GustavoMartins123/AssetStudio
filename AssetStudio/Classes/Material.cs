@@ -75,11 +75,32 @@ namespace AssetStudio
         }
     }
 
+    public class BuildTextureStackReference
+    {
+        public string groupName;
+        public string itemName;
+
+        public BuildTextureStackReference(ObjectReader reader)
+        {
+            groupName = reader.ReadAlignedString();
+            itemName = reader.ReadAlignedString();
+        }
+    }
+
     public sealed class Material : NamedObject
     {
         public PPtr<Shader> m_Shader;
         public PPtr<Material> m_Parent;
+        public string[] m_ValidKeywords = Array.Empty<string>();
+        public string[] m_InvalidKeywords = Array.Empty<string>();
+        public uint m_LightmapFlags;
+        public bool m_EnableInstancingVariants;
+        public bool m_DoubleSidedGI;
+        public int m_CustomRenderQueue;
+        public KeyValuePair<string, string>[] stringTagMap = Array.Empty<KeyValuePair<string, string>>();
+        public string[] disabledShaderPasses = Array.Empty<string>();
         public UnityPropertySheet m_SavedProperties;
+        public BuildTextureStackReference[] m_BuildTextureStacks = Array.Empty<BuildTextureStackReference>();
 
         public Material(ObjectReader reader) : base(reader)
         {
@@ -94,15 +115,15 @@ namespace AssetStudio
             m_Parent = new PPtr<Material>(0, 0, reader.assetsFile);
             if (version[0] == 4 && version[1] >= 1) //4.x
             {
-                var m_ShaderKeywords = reader.ReadStringArray();
+                m_ValidKeywords = reader.ReadStringArray();
             }
 
             if (version[0] >= 2021) //2021.1 and up
             {
                 if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 3)) //2021.3 and up
                 {
-                    var m_ValidKeywords = reader.ReadStringArray();
-                    var m_InvalidKeywords = reader.ReadStringArray();
+                    m_ValidKeywords = reader.ReadStringArray();
+                    m_InvalidKeywords = reader.ReadStringArray();
                 }
                 else if (version[0] >= 5) //5.0 ~ 2021.2
                 {
@@ -116,39 +137,54 @@ namespace AssetStudio
 
             if (version[0] >= 5) //5.0 and up
             {
-                var m_LightmapFlags = reader.ReadUInt32();
+                m_LightmapFlags = reader.ReadUInt32();
             }
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
             {
-                var m_EnableInstancingVariants = reader.ReadBoolean();
-                //var m_DoubleSidedGI = a_Stream.ReadBoolean(); //2017 and up
+                m_EnableInstancingVariants = reader.ReadBoolean();
+                if (version[0] >= 2017) //2017 and up
+                {
+                    m_DoubleSidedGI = reader.ReadBoolean();
+                }
                 reader.AlignStream();
             }
 
             if (version[0] > 4 || (version[0] == 4 && version[1] >= 3)) //4.3 and up
             {
-                var m_CustomRenderQueue = reader.ReadInt32();
+                m_CustomRenderQueue = reader.ReadInt32();
             }
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 1)) //5.1 and up
             {
                 var stringTagMapSize = reader.ReadInt32();
+                reader.CheckArrayLength(stringTagMapSize);
+                stringTagMap = new KeyValuePair<string, string>[stringTagMapSize];
                 for (int i = 0; i < stringTagMapSize; i++)
                 {
                     var first = reader.ReadAlignedString();
                     var second = reader.ReadAlignedString();
+                    stringTagMap[i] = new KeyValuePair<string, string>(first, second);
                 }
             }
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
             {
-                var disabledShaderPasses = reader.ReadStringArray();
+                disabledShaderPasses = reader.ReadStringArray();
             }
 
             m_SavedProperties = new UnityPropertySheet(reader);
 
-            //vector m_BuildTextureStacks 2020 and up
+            if (version[0] >= 2020) //2020.1 and up
+            {
+                int numStacks = reader.ReadInt32();
+                reader.CheckArrayLength(numStacks);
+                m_BuildTextureStacks = new BuildTextureStackReference[numStacks];
+                for (int i = 0; i < numStacks; i++)
+                {
+                    m_BuildTextureStacks[i] = new BuildTextureStackReference(reader);
+                }
+            }
         }
 
         [System.Diagnostics.CodeAnalysis.MemberNotNullWhen(true, nameof(m_Shader), nameof(m_Parent), nameof(m_SavedProperties))]

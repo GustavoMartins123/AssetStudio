@@ -75,13 +75,15 @@ namespace AssetStudio
                     continue;
                 }
 
-                if (TryMergePartsToTarget(orderedParts, destFull, overwriteTarget: false, out var destinationWriteFailed))
+                bool isReadOnlySource = IsReadOnlyDirectoryOrParts(destPath, orderedParts);
+                bool destinationWriteFailed = false;
+                if (!isReadOnlySource && TryMergePartsToTarget(orderedParts, destFull, overwriteTarget: false, out destinationWriteFailed))
                 {
                     MergedSplitFallbackPaths.TryRemove(destKey, out _);
                     continue;
                 }
 
-                if (!destinationWriteFailed)
+                if (!isReadOnlySource && !destinationWriteFailed)
                 {
                     MergedSplitFallbackPaths.TryRemove(destKey, out _);
                     continue;
@@ -175,10 +177,46 @@ namespace AssetStudio
             return true;
         }
 
+        private static bool IsReadOnlyDirectoryOrParts(string destPath, IReadOnlyList<string> orderedParts)
+        {
+            try
+            {
+                var dirAttr = File.GetAttributes(destPath);
+                if ((dirAttr & FileAttributes.ReadOnly) != 0)
+                {
+                    return true;
+                }
+
+                for (int i = 0; i < orderedParts.Count; i++)
+                {
+                    var partAttr = File.GetAttributes(orderedParts[i]);
+                    if ((partAttr & FileAttributes.ReadOnly) != 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                return true;
+            }
+
+            return false;
+        }
+
         private static bool TryMergePartsToTarget(IReadOnlyList<string> orderedParts, string targetPath, bool overwriteTarget, out bool destinationWriteFailed)
         {
             destinationWriteFailed = false;
-            var tmpPath = targetPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            var tempStagingDir = Path.Combine(Path.GetTempPath(), "AssetStudio_SplitStaging");
+            try
+            {
+                Directory.CreateDirectory(tempStagingDir);
+            }
+            catch
+            {
+                tempStagingDir = Path.GetTempPath();
+            }
+            var tmpPath = Path.Combine(tempStagingDir, Path.GetFileName(targetPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
             bool moved = false;
 
             try

@@ -559,8 +559,59 @@ namespace AssetStudio
                     m_IntValues = reader.ReadInt32Array();
                     m_BoolValues = reader.ReadBooleanArray();
                     reader.AlignStream();
+
+                    if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 3)) //6000.3 and up
+                    {
+                        var m_EntityIdValues = reader.ReadInt32Array();
+                    }
+                    if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 4)) //6000.4 and up
+                    {
+                        var m_ExtraValues = reader.ReadInt32Array();
+                    }
                 }
             }
+        }
+    }
+
+    public class StateKey
+    {
+        public uint m_StateID;
+        public int m_LayerIndex;
+
+        public StateKey(ObjectReader reader)
+        {
+            m_StateID = reader.ReadUInt32();
+            m_LayerIndex = reader.ReadInt32();
+        }
+    }
+
+    public class StateRange
+    {
+        public uint m_StartIndex;
+        public uint m_Count;
+
+        public StateRange(ObjectReader reader)
+        {
+            m_StartIndex = reader.ReadUInt32();
+            m_Count = reader.ReadUInt32();
+        }
+    }
+
+    public class StateMachineBehaviourVectorDescription
+    {
+        public KeyValuePair<StateKey, StateRange>[] m_StateMachineBehaviourRanges;
+        public uint[] m_StateMachineBehaviourIndices;
+
+        public StateMachineBehaviourVectorDescription(ObjectReader reader)
+        {
+            int numRanges = reader.ReadInt32();
+            reader.CheckArrayLength(numRanges);
+            m_StateMachineBehaviourRanges = new KeyValuePair<StateKey, StateRange>[numRanges];
+            for (int i = 0; i < numRanges; i++)
+            {
+                m_StateMachineBehaviourRanges[i] = new KeyValuePair<StateKey, StateRange>(new StateKey(reader), new StateRange(reader));
+            }
+            m_StateMachineBehaviourIndices = reader.ReadUInt32Array();
         }
     }
 
@@ -596,13 +647,21 @@ namespace AssetStudio
 
     public sealed class AnimatorController : RuntimeAnimatorController
     {
+        public uint m_ControllerSize;
         public ControllerConstant m_Controller;
         public KeyValuePair<uint, string>[] m_TOS;
         public PPtr<AnimationClip>[] m_AnimationClips;
+        public StateMachineBehaviourVectorDescription? m_StateMachineBehaviourVectorDescription;
+        public PPtr<MonoBehaviour>[] m_StateMachineBehaviours = Array.Empty<PPtr<MonoBehaviour>>();
+        public bool m_MultiThreadedStateMachine;
 
         public AnimatorController(ObjectReader reader) : base(reader)
         {
-            var m_ControllerSize = reader.ReadUInt32();
+            if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 4)) //6000.4 and up
+            {
+                var m_ControllerFlags = reader.ReadUInt32();
+            }
+            m_ControllerSize = reader.ReadUInt32();
             m_Controller = new ControllerConstant(reader);
 
             int tosSize = reader.ReadInt32();
@@ -619,6 +678,24 @@ namespace AssetStudio
             for (int i = 0; i < numClips; i++)
             {
                 m_AnimationClips[i] = new PPtr<AnimationClip>(reader);
+            }
+
+            if (version[0] >= 5) //5.0 and up
+            {
+                m_StateMachineBehaviourVectorDescription = new StateMachineBehaviourVectorDescription(reader);
+                int numBehaviours = reader.ReadInt32();
+                reader.CheckArrayLength(numBehaviours);
+                m_StateMachineBehaviours = new PPtr<MonoBehaviour>[numBehaviours];
+                for (int i = 0; i < numBehaviours; i++)
+                {
+                    m_StateMachineBehaviours[i] = new PPtr<MonoBehaviour>(reader);
+                }
+
+                if (version[0] > 5 || (version[0] == 5 && version[1] >= 4)) //5.4 and up
+                {
+                    m_MultiThreadedStateMachine = reader.ReadBoolean();
+                    reader.AlignStream();
+                }
             }
         }
     }
