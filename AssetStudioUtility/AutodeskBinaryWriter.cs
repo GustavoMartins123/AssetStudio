@@ -13,11 +13,14 @@ namespace AssetStudio
     public static class AutodeskBinaryWriter
     {
         public const int DefaultWriteBufferSize = 256 * 1024; // 256 KiB
+        public const long MaxInMemoryBufferBytes = 64L * 1024 * 1024; // 64 MiB
+        public const long Max32BitSafePayloadBytes = 1_800_000_000L; // ~1.8 GiB safe threshold for 32-bit offsets
 
         private static readonly byte[] HeadMagic = Encoding.ASCII.GetBytes("Kaydara FBX Binary  \0\u001a\0");
         private static readonly byte[] FootId = new byte[] { 0xfa, 0xbc, 0xab, 0x09, 0xd0, 0xc8, 0xd4, 0x66, 0xb1, 0x76, 0xfb, 0x83, 0x1c, 0xf7, 0x26, 0x7e };
         private static readonly byte[] ExtMagic = new byte[] { 0xf8, 0x5a, 0x8c, 0x6a, 0xde, 0xf5, 0xd9, 0x7e, 0xec, 0xe9, 0x0c, 0xe3, 0x75, 0x8f, 0x29, 0x0b };
         private static readonly byte[] NullSentinel = new byte[13];
+        private static readonly byte[] NullSentinel64 = new byte[25];
         private static readonly byte[] FooterZeros120 = new byte[120];
 
         private sealed class ArrayScratchBuffers : IDisposable
@@ -68,7 +71,15 @@ namespace AssetStudio
             ArgumentNullException.ThrowIfNull(document);
             ArgumentNullException.ThrowIfNull(outputStream);
 
-            using var bufferStream = new MemoryStream(DefaultWriteBufferSize);
+            long estimatedBytes = EstimateDocumentBytes(document);
+            if (outputStream.CanSeek && (estimatedBytes > MaxInMemoryBufferBytes || (int)document.Version >= 7500))
+            {
+                WriteDirectToSeekableStream(document, outputStream);
+                return;
+            }
+
+            int initialCapacity = (int)Math.Clamp(estimatedBytes, DefaultWriteBufferSize, MaxInMemoryBufferBytes);
+            using var bufferStream = new MemoryStream(initialCapacity);
             WriteDirectToSeekableStream(document, bufferStream);
 
             if (bufferStream.TryGetBuffer(out var segment) && segment.Array != null)
@@ -84,30 +95,34 @@ namespace AssetStudio
 
         /// <summary>
         /// Writes the FBX binary document directly to a seekable stream without an outer buffer.
-        /// Used internally by <see cref="Write(FbxDocument, Stream)"/> with a <see cref="MemoryStream"/>
-        /// and exposed for benchmark/parity verification against unbuffered streams.
+        /// Automatically selects FBX 7500 64-bit node header offsets when <paramref name="document"/> specifies
+        /// version 7500+ or when the estimated payload exceeds the 32-bit safe offset threshold.
         /// </summary>
         public static void WriteDirectToSeekableStream(FbxDocument document, Stream seekableStream)
         {
             ArgumentNullException.ThrowIfNull(document);
             ArgumentNullException.ThrowIfNull(seekableStream);
 
+            long estimatedBytes = EstimateDocumentBytes(document);
+            bool use64Bit = (int)document.Version >= 7500 || estimatedBytes > Max32BitSafePayloadBytes;
+            int versionNumber = use64Bit ? 7500 : 7400;
+
             using var scratch = new ArrayScratchBuffers();
             using var bw = new BinaryWriter(seekableStream, Encoding.UTF8, leaveOpen: true);
 
             bw.Write(HeadMagic);
-            bw.Write(7400);
+            bw.Write(versionNumber);
 
             foreach (var node in document.Nodes)
             {
                 if (node != null)
                 {
-                    WriteNode(bw, node, scratch);
+                    WriteNode(bw, node, scratch, use64Bit);
                 }
             }
 
             // Top-level null sentinel
-            bw.Write(NullSentinel);
+            bw.Write(use64Bit ? NullSentinel64 : NullSentinel);
 
             // Autodesk standard footer
             bw.Write(FootId);
@@ -120,21 +135,82 @@ namespace AssetStudio
             padBytes.Clear();
             bw.Write(padBytes.Slice(0, pad)); // padding ensuring version is at 16-byte boundary
 
-            bw.Write(7400);
+            bw.Write(versionNumber);
             bw.Write(FooterZeros120);
             bw.Write(ExtMagic);
             bw.Flush();
         }
 
-        private static void WriteNode(BinaryWriter bw, FbxNode node, ArrayScratchBuffers scratch)
+        private static long EstimateDocumentBytes(FbxDocument document)
+        {
+            long total = 512;
+            if (document.Nodes != null)
+            {
+                for (int i = 0; i < document.Nodes.Length; i++)
+                {
+                    var node = document.Nodes[i];
+                    if (node != null)
+                    {
+                        total += EstimateNodeBytes(node);
+                    }
+                }
+            }
+            return total;
+        }
+
+        private static long EstimateNodeBytes(FbxNode node)
+        {
+            long total = 32 + (node.Identifier?.Value?.Length ?? 0);
+            if (node.Properties != null)
+            {
+                for (int i = 0; i < node.Properties.Length; i++)
+                {
+                    total += node.Properties[i] switch
+                    {
+                        DoubleArrayToken dat => 16L + dat.Values.LongLength * 8L,
+                        FloatArrayToken fat => 16L + fat.Values.LongLength * 4L,
+                        IntegerArrayToken iat => 16L + iat.Values.LongLength * 4L,
+                        LongArrayToken lat => 16L + lat.Values.LongLength * 8L,
+                        BooleanArrayToken blat => 16L + blat.Values.LongLength,
+                        ByteArrayToken bat => 8L + bat.Values.LongLength,
+                        StringToken st => 8L + (st.Value?.Length ?? 0),
+                        _ => 12L
+                    };
+                }
+            }
+            if (node.Nodes != null)
+            {
+                for (int i = 0; i < node.Nodes.Length; i++)
+                {
+                    var child = node.Nodes[i];
+                    if (child != null)
+                    {
+                        total += EstimateNodeBytes(child);
+                    }
+                }
+            }
+            return total;
+        }
+
+        private static void WriteNode(BinaryWriter bw, FbxNode node, ArrayScratchBuffers scratch, bool use64Bit = false)
         {
             var stream = bw.BaseStream;
             long startPos = stream.Position;
 
-            // Placeholders: EndOffset (4 bytes), PropCount (4 bytes), PropLength (4 bytes)
-            bw.Write(0u);
-            bw.Write((uint)node.Properties.Length);
-            bw.Write(0u);
+            if (use64Bit)
+            {
+                // Placeholders: EndOffset (8 bytes), PropCount (8 bytes), PropLength (8 bytes)
+                bw.Write(0UL);
+                bw.Write((ulong)node.Properties.Length);
+                bw.Write(0UL);
+            }
+            else
+            {
+                // Placeholders: EndOffset (4 bytes), PropCount (4 bytes), PropLength (4 bytes)
+                bw.Write(0u);
+                bw.Write((uint)node.Properties.Length);
+                bw.Write(0u);
+            }
 
             var name = node.Identifier?.Value ?? string.Empty;
             if (name.Length == 0)
@@ -175,7 +251,7 @@ namespace AssetStudio
                 WriteProperty(bw, prop, scratch);
             }
             long propEnd = stream.Position;
-            uint propLen = (uint)(propEnd - propStart);
+            long propLen = propEnd - propStart;
 
             bool alwaysSentinel = name == "AnimationStack" || name == "AnimationLayer";
             if (node.Nodes.Length > 0 || alwaysSentinel)
@@ -184,19 +260,28 @@ namespace AssetStudio
                 {
                     if (child != null)
                     {
-                        WriteNode(bw, child, scratch);
+                        WriteNode(bw, child, scratch, use64Bit);
                     }
                 }
-                bw.Write(NullSentinel);
+                bw.Write(use64Bit ? NullSentinel64 : NullSentinel);
             }
 
             long endOffset = stream.Position;
 
             // Backpatch
             stream.Position = startPos;
-            bw.Write((uint)endOffset);
-            stream.Position = startPos + 8;
-            bw.Write(propLen);
+            if (use64Bit)
+            {
+                bw.Write((ulong)endOffset);
+                stream.Position = startPos + 16;
+                bw.Write((ulong)propLen);
+            }
+            else
+            {
+                bw.Write((uint)endOffset);
+                stream.Position = startPos + 8;
+                bw.Write((uint)propLen);
+            }
 
             stream.Position = endOffset;
         }
@@ -230,7 +315,7 @@ namespace AssetStudio
                     bw.Write(dt.Value);
                     break;
                 case StringToken str:
-                    var strValue = str.Value ?? string.Empty;
+                    var strValue = NormalizeBinaryObjectName(str.Value ?? string.Empty);
                     int strByteLen = Encoding.UTF8.GetByteCount(strValue);
                     bw.Write((byte)'S');
                     bw.Write(strByteLen);
@@ -371,6 +456,49 @@ namespace AssetStudio
             }
 
             return (b << 16) | a;
+        }
+
+        private static string NormalizeBinaryObjectName(string strValue)
+        {
+            if (string.IsNullOrEmpty(strValue) || strValue.IndexOf('\0') >= 0)
+            {
+                return strValue;
+            }
+
+            int sep = strValue.IndexOf("::", StringComparison.Ordinal);
+            if (sep > 0)
+            {
+                var prefix = strValue.AsSpan(0, sep);
+                if (IsFbxObjectClassPrefix(prefix))
+                {
+                    return string.Concat(strValue.AsSpan(sep + 2), "\0\u0001", prefix);
+                }
+            }
+
+            return strValue;
+        }
+
+        private static bool IsFbxObjectClassPrefix(ReadOnlySpan<char> prefix)
+        {
+            return prefix.SequenceEqual("Model")
+                || prefix.SequenceEqual("Geometry")
+                || prefix.SequenceEqual("Material")
+                || prefix.SequenceEqual("Texture")
+                || prefix.SequenceEqual("Video")
+                || prefix.SequenceEqual("Deformer")
+                || prefix.SequenceEqual("SubDeformer")
+                || prefix.SequenceEqual("Pose")
+                || prefix.SequenceEqual("AnimStack")
+                || prefix.SequenceEqual("AnimationStack")
+                || prefix.SequenceEqual("AnimLayer")
+                || prefix.SequenceEqual("AnimationLayer")
+                || prefix.SequenceEqual("AnimCurveNode")
+                || prefix.SequenceEqual("AnimationCurveNode")
+                || prefix.SequenceEqual("AnimCurve")
+                || prefix.SequenceEqual("AnimationCurve")
+                || prefix.SequenceEqual("NodeAttribute")
+                || prefix.SequenceEqual("SceneInfo")
+                || prefix.SequenceEqual("Document");
         }
     }
 }

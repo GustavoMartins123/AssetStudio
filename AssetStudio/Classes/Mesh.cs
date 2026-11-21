@@ -127,6 +127,8 @@ namespace AssetStudio
         public StreamInfo[] m_Streams = Array.Empty<StreamInfo>();
         public byte[] m_DataSize = Array.Empty<byte>();
 
+        public VertexData() { }
+
         public VertexData(ObjectReader reader)
         {
             var version = reader.version;
@@ -197,6 +199,10 @@ namespace AssetStudio
                     {
                         if (m_Channel.dimension > 0)
                         {
+                            if (version[0] < 2018 && chn == 2 && m_Channel.format == 2) //kShaderChannelColor && kChannelFormatColor
+                            {
+                                m_Channel.dimension = 4;
+                            }
                             chnMask |= 1u << chn;
                             stride += m_Channel.dimension * MeshHelper.GetFormatSize(MeshHelper.ToVertexFormat(m_Channel.format, version));
                         }
@@ -462,6 +468,7 @@ namespace AssetStudio
         public BlendShapeData? m_Shapes;
         public Matrix4x4[]? m_BindPose;
         public uint[] m_BoneNameHashes = Array.Empty<uint>();
+        public uint[] m_VariableBoneCountWeights = Array.Empty<uint>();
         public int m_VertexCount;
         public float[]? m_Vertices;
         public BoneWeights4[]? m_Skin;
@@ -542,7 +549,7 @@ namespace AssetStudio
                         m_BonesAABB[i] = new MinMaxAABB(reader);
                     }
 
-                    var m_VariableBoneCountWeights = reader.ReadUInt32Array();
+                    m_VariableBoneCountWeights = reader.ReadUInt32Array();
                 }
 
                 var m_MeshCompression = reader.ReadByte();
@@ -696,6 +703,29 @@ namespace AssetStudio
                 m_StreamData = new StreamingInfo(reader);
             }
 
+            if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 2)) //6000.2 and up (m_MeshLodInfo)
+            {
+                var m_LodSlope = reader.ReadSingle();
+                var m_LodBias = reader.ReadSingle();
+                reader.AlignStream();
+                var m_NumLevels = reader.ReadInt32();
+                reader.AlignStream();
+                var m_LodSubMeshesSize = reader.ReadInt32();
+                reader.CheckArrayLength(m_LodSubMeshesSize);
+                for (int i = 0; i < m_LodSubMeshesSize; i++)
+                {
+                    var m_LevelsSize = reader.ReadInt32();
+                    reader.CheckArrayLength(m_LevelsSize);
+                    for (int j = 0; j < m_LevelsSize; j++)
+                    {
+                        var m_IndexStart = reader.ReadUInt32();
+                        var m_IndexCount = reader.ReadUInt32();
+                    }
+                    reader.AlignStream();
+                }
+                reader.AlignStream();
+            }
+
             if (LazyLoadMeshData)
             {
                 m_VertexCount = GetDeferredVertexCount();
@@ -774,6 +804,9 @@ namespace AssetStudio
             }
 
             m_VertexCount = (int)m_VertexData.m_VertexCount;
+            bool hasBlendWeights = false;
+            bool hasBlendIndices = false;
+            int blendIndicesDim = 0;
 
             for (var chn = 0; chn < m_VertexData.m_Channels.Length; chn++)
             {
@@ -863,18 +896,22 @@ namespace AssetStudio
                                     {
                                         break;
                                     }
+                                    hasBlendWeights = true;
                                     if (m_Skin == null)
                                     {
                                         InitMSkin();
                                     }
                                     {
-                                        // BoneWeights4 holds at most 4 influences; dimension can be up to 15.
-                                        var weightCount = Math.Min((int)m_Channel.dimension, 4);
+                                        int weightCount = m_Channel.dimension;
                                         for (int i = 0; i < m_VertexCount; i++)
                                         {
+                                            if (weightCount > m_Skin[i].weight.Length)
+                                            {
+                                                Array.Resize(ref m_Skin[i].weight, weightCount);
+                                            }
                                             for (int j = 0; j < weightCount; j++)
                                             {
-                                                m_Skin[i].weight[j] = componentsFloatArray[i * m_Channel.dimension + j];
+                                                m_Skin[i].weight[j] = componentsFloatArray[i * weightCount + j];
                                             }
                                         }
                                     }
@@ -884,17 +921,23 @@ namespace AssetStudio
                                     {
                                         break;
                                     }
+                                    hasBlendIndices = true;
+                                    blendIndicesDim = m_Channel.dimension;
                                     if (m_Skin == null)
                                     {
                                         InitMSkin();
                                     }
                                     {
-                                        var indexCount = Math.Min((int)m_Channel.dimension, 4);
+                                        int indexCount = m_Channel.dimension;
                                         for (int i = 0; i < m_VertexCount; i++)
                                         {
+                                            if (indexCount > m_Skin[i].boneIndex.Length)
+                                            {
+                                                Array.Resize(ref m_Skin[i].boneIndex, indexCount);
+                                            }
                                             for (int j = 0; j < indexCount; j++)
                                             {
-                                                m_Skin[i].boneIndex[j] = componentsIntArray[i * m_Channel.dimension + j];
+                                                m_Skin[i].boneIndex[j] = componentsIntArray[i * indexCount + j];
                                             }
                                         }
                                     }
@@ -937,6 +980,55 @@ namespace AssetStudio
                                     m_Tangents = componentsFloatArray;
                                     break;
                             }
+                        }
+                    }
+                }
+            }
+
+            if (hasBlendIndices && !hasBlendWeights && m_Skin != null)
+            {
+                if (blendIndicesDim == 2 && m_VariableBoneCountWeights != null && m_VariableBoneCountWeights.Length > 0)
+                {
+                    for (int i = 0; i < m_VertexCount && i < m_Skin.Length; i++)
+                    {
+                        uint start = (uint)m_Skin[i].boneIndex[0];
+                        int count = m_Skin[i].boneIndex[1];
+                        if (count <= 0)
+                        {
+                            continue;
+                        }
+                        int slotCount = Math.Max(4, count);
+                        var newIndices = new int[slotCount];
+                        var newWeights = new float[slotCount];
+                        if ((ulong)(start + (uint)count) * 2UL <= (ulong)m_VariableBoneCountWeights.Length)
+                        {
+                            for (int k = 0; k < count; k++)
+                            {
+                                uint pairOffset = (start + (uint)k) * 2u;
+                                newIndices[k] = (int)m_VariableBoneCountWeights[pairOffset];
+                                newWeights[k] = BitConverter.UInt32BitsToSingle(m_VariableBoneCountWeights[pairOffset + 1u]);
+                            }
+                        }
+                        else if ((ulong)(start + (uint)count) <= (ulong)m_VariableBoneCountWeights.Length)
+                        {
+                            for (int k = 0; k < count; k++)
+                            {
+                                uint packed = m_VariableBoneCountWeights[start + (uint)k];
+                                newIndices[k] = (int)(packed & 0xFFFFu);
+                                newWeights[k] = (packed >> 16) / 65535f;
+                            }
+                        }
+                        m_Skin[i].boneIndex = newIndices;
+                        m_Skin[i].weight = newWeights;
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < m_VertexCount && i < m_Skin.Length; i++)
+                    {
+                        if (m_Skin[i].weight.Length > 0)
+                        {
+                            m_Skin[i].weight[0] = 1.0f;
                         }
                     }
                 }
@@ -1208,7 +1300,8 @@ namespace AssetStudio
                 }
                 else
                 {
-                    throw new NotSupportedException("Failed getting triangles. Submesh topology is lines or points.");
+                    // Non-polygon topology (Lines, LineStrip, Points): set indexCount = 0 so polygon exporters skip it without failing the mesh.
+                    m_SubMesh.indexCount = 0;
                 }
             }
         }
@@ -1458,14 +1551,20 @@ namespace AssetStudio
                 switch (format)
                 {
                     case VertexFormat.UInt8:
-                    case VertexFormat.SInt8:
                         result[i] = inputBytes[i];
                         break;
+                    case VertexFormat.SInt8:
+                        result[i] = (sbyte)inputBytes[i];
+                        break;
                     case VertexFormat.UInt16:
+                        result[i] = BitConverter.ToUInt16(inputBytes, i * 2);
+                        break;
                     case VertexFormat.SInt16:
                         result[i] = BitConverter.ToInt16(inputBytes, i * 2);
                         break;
                     case VertexFormat.UInt32:
+                        result[i] = (int)BitConverter.ToUInt32(inputBytes, i * 4);
+                        break;
                     case VertexFormat.SInt32:
                         result[i] = BitConverter.ToInt32(inputBytes, i * 4);
                         break;

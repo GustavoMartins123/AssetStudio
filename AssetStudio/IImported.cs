@@ -82,10 +82,18 @@ namespace AssetStudio
 
         public ImportedFrame? FindFrameByPath(string path)
         {
+            if (string.IsNullOrEmpty(path))
+            {
+                return null;
+            }
             var name = path.Substring(path.LastIndexOf('/') + 1);
             foreach (var frame in FindChilds(name))
             {
-                if (frame.Path.EndsWith(path, StringComparison.Ordinal))
+                var framePath = frame.Path;
+                if (string.Equals(framePath, path, StringComparison.Ordinal)
+                    || (framePath.Length > path.Length
+                        && framePath[framePath.Length - path.Length - 1] == '/'
+                        && framePath.EndsWith(path, StringComparison.Ordinal)))
                 {
                     return frame;
                 }

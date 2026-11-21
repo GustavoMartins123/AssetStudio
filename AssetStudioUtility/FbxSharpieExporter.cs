@@ -16,7 +16,9 @@ namespace AssetStudio
         private FbxNode _connections;
         private long _nextId = 1000;
         private float _scaleFactor;
+        private int _versionIndex;
         private bool _isAscii;
+        private bool _is60Fps;
         private bool _exportSkins;
         private bool _exportAnimations;
         private bool _exportBlendShape;
@@ -25,6 +27,11 @@ namespace AssetStudio
         private float _boneSize;
         private string? _exportDirectory;
         private ImportedFrame? _rootFrame;
+        private FbxNode? _globalSettingsProps;
+        private FbxNode? _definitionsCountNode;
+        private Dictionary<string, FbxNode> _definitionTypeCountNodes = new Dictionary<string, FbxNode>(StringComparer.Ordinal);
+        private Dictionary<long, System.Numerics.Matrix4x4> _bindPoseMatrixByModelId = new Dictionary<long, System.Numerics.Matrix4x4>();
+        private List<long> _extraMeshModelIds = new List<long>();
         private Dictionary<string, long> _frameIdMap = new Dictionary<string, long>();
         private Dictionary<string, string?> _frameUniqueSuffixMap = new Dictionary<string, string?>();
         private Dictionary<string, ImportedFrame> _frameByPathMap = new Dictionary<string, ImportedFrame>();
@@ -86,7 +93,9 @@ namespace AssetStudio
             bool exportSkins = true, bool exportAnimations = true, bool exportBlendShape = true, bool castToBone = false, float boneSize = 10f, bool exportMeshes = true)
         {
             _scaleFactor = scaleFactor;
+            _versionIndex = versionIndex;
             _isAscii = isAscii;
+            _is60Fps = is60Fps;
             _exportSkins = exportSkins;
             _exportAnimations = exportAnimations;
             _exportBlendShape = exportBlendShape;
@@ -94,7 +103,7 @@ namespace AssetStudio
             _boneSize = boneSize;
             _exportMeshes = exportMeshes;
             _document = new FbxDocument();
-            _document.Version = FbxVersion.v7_4;
+            _document.Version = versionIndex >= 5 ? (FbxVersion)7500 : FbxVersion.v7_4;
 
             BuildHeader();
             BuildGlobalSettings(scaleFactor);
@@ -106,6 +115,12 @@ namespace AssetStudio
 
             _connections = N("Connections");
             _document.AddNode(_connections);
+        }
+
+        private string FormatObjectName(string? name, string className)
+        {
+            var cleanName = name ?? string.Empty;
+            return _isAscii ? $"{className}::{cleanName}" : $"{cleanName}\0\u0001{className}";
         }
 
         public void Export(IImported convert, string exportPath)
@@ -129,7 +144,6 @@ namespace AssetStudio
                 if (convert.RootFrame != null)
                 {
                     ExportFrame(convert.RootFrame, 0, System.Numerics.Matrix4x4.Identity);
-                    ExportBindPose();
                 }
 
                 if (_exportMeshes && convert.MaterialList != null)
@@ -144,10 +158,15 @@ namespace AssetStudio
                         ExportMesh(convert.MeshList[i], convert);
                 }
 
+                if (convert.RootFrame != null || _extraMeshModelIds.Count > 0)
+                {
+                    ExportBindPose();
+                }
+
                 if (_exportBlendShape && convert.MorphList != null)
                 {
                     for (int i = 0; i < convert.MorphList.Count; i++)
-                        ExportMorph(convert.MorphList[i]);
+                        ExportMorph(convert.MorphList[i], convert);
                 }
 
                 if (_exportAnimations && convert.AnimationList != null)
@@ -156,6 +175,8 @@ namespace AssetStudio
                         ExportAnimation(convert.AnimationList[i]);
                 }
 
+                UpdateGlobalSettingsTiming(convert);
+                UpdateDefinitionsCounts();
                 BuildTakes();
                 WriteExportReport(exportPath, convert);
                 if (_isAscii) FbxIO.WriteAscii(_document, exportPath); else AutodeskBinaryWriter.Write(_document, exportPath);
@@ -175,6 +196,7 @@ namespace AssetStudio
             _frameIdMap[normalizedPath] = id;
             var globalMatrix = BuildLocalMatrix(frame) * parentGlobal;
             _frameGlobalMatrixMap[normalizedPath] = globalMatrix;
+            _bindPoseMatrixByModelId[id] = globalMatrix;
             var isBone = IsBonePath(normalizedPath);
             var zeroTransform = ShouldZeroBoneTransform(normalizedPath);
             var modelType = (_exportMeshes && _meshPathSet.Contains(normalizedPath)) ? "Mesh" : isBone ? "LimbNode" : "Null";
@@ -182,7 +204,7 @@ namespace AssetStudio
 
             var model = N("Model");
             model.AddProperty(new LongToken(id));
-            model.AddProperty(new StringToken($"Model::{fbxName}"));
+            model.AddProperty(new StringToken(FormatObjectName(fbxName, "Model")));
             model.AddProperty(new StringToken(modelType));
 
             var props = N("Properties70");
@@ -216,7 +238,7 @@ namespace AssetStudio
             var attrId = GenId();
             var attr = N("NodeAttribute");
             attr.AddProperty(new LongToken(attrId));
-            attr.AddProperty(new StringToken($"NodeAttribute::{name}"));
+            attr.AddProperty(new StringToken(FormatObjectName(name, "NodeAttribute")));
             attr.AddProperty(new StringToken("LimbNode"));
             AddSimpleNode(attr, "TypeFlags", "Skeleton");
 
@@ -236,26 +258,56 @@ namespace AssetStudio
 
         private void ExportBindPose()
         {
-            if (_frameIdMap.Count == 0)
+            if (_frameIdMap.Count == 0 && _extraMeshModelIds.Count == 0)
+                return;
+
+            var poseNodes = new List<(long NodeId, System.Numerics.Matrix4x4 Matrix)>(_frameIdMap.Count + _extraMeshModelIds.Count);
+            var includedIds = new HashSet<long>();
+
+            foreach (var item in _frameIdMap)
+            {
+                if (_bindPoseMatrixByModelId.TryGetValue(item.Value, out var bindMat))
+                {
+                    if (includedIds.Add(item.Value))
+                        poseNodes.Add((item.Value, bindMat));
+                }
+                else if (_frameGlobalMatrixMap.TryGetValue(item.Key, out var globalMat))
+                {
+                    if (includedIds.Add(item.Value))
+                        poseNodes.Add((item.Value, globalMat));
+                }
+            }
+
+            for (int i = 0; i < _extraMeshModelIds.Count; i++)
+            {
+                long extraId = _extraMeshModelIds[i];
+                if (includedIds.Add(extraId))
+                {
+                    var mat = _bindPoseMatrixByModelId.TryGetValue(extraId, out var bindMat)
+                        ? bindMat
+                        : System.Numerics.Matrix4x4.Identity;
+                    poseNodes.Add((extraId, mat));
+                }
+            }
+
+            if (poseNodes.Count == 0)
                 return;
 
             var pose = N("Pose");
             pose.AddProperty(new LongToken(GenId()));
-            pose.AddProperty(new StringToken("Pose::BindPose"));
+            pose.AddProperty(new StringToken(FormatObjectName("BindPose", "Pose")));
             pose.AddProperty(new StringToken("BindPose"));
             AddSimpleNode(pose, "Type", "BindPose");
             AddSimpleNode(pose, "Version", 100);
-            AddSimpleNode(pose, "NbPoseNodes", _frameIdMap.Count);
+            AddSimpleNode(pose, "NbPoseNodes", poseNodes.Count);
 
-            foreach (var item in _frameIdMap)
+            for (int i = 0; i < poseNodes.Count; i++)
             {
-                if (!_frameGlobalMatrixMap.TryGetValue(item.Key, out var matrix))
-                    continue;
-
+                var (nodeId, matrix) = poseNodes[i];
                 var poseNode = N("PoseNode");
 
                 var node = N("Node");
-                node.AddProperty(new LongToken(item.Value));
+                node.AddProperty(new LongToken(nodeId));
                 poseNode.AddNode(node);
 
                 var matrixNode = N("Matrix");
@@ -277,11 +329,41 @@ namespace AssetStudio
             if (mesh.Path != null && TryGetFrameId(mesh.Path, out var meshModelId))
                 modelId = meshModelId;
 
-            // If no frame was found for this mesh, create a standalone Model node
-            // so geometry and materials can be properly connected
-            if (modelId == 0)
+            bool isSkinned = _exportSkins && mesh.BoneList != null && mesh.BoneList.Count > 0;
+            var normalizedMeshPath = NormalizeFramePath(mesh.Path);
+
+            // If this is a skinned mesh whose path points to an ancestor of its own bones (e.g. RootFrame),
+            // create a dedicated child Model node of type "Mesh" under that ancestor so the FBX hierarchy is strictly acyclic!
+            if (modelId != 0 && isSkinned && IsAncestorOfAnyBone(normalizedMeshPath))
+            {
+                long parentModelId = modelId;
+                modelId = GenId();
+                _exportedFrameCount++;
+                var meshName = string.IsNullOrEmpty(mesh.Path) ? "CombinedMesh" : $"{mesh.Path}_Mesh";
+                var lastSlash = meshName.LastIndexOf('/');
+                if (lastSlash >= 0) meshName = meshName.Substring(lastSlash + 1);
+                var fbxName = GetUniqueFbxName(meshName);
+
+                var model = N("Model");
+                model.AddProperty(new LongToken(modelId));
+                model.AddProperty(new StringToken(FormatObjectName(fbxName, "Model")));
+                model.AddProperty(new StringToken("Mesh"));
+
+                var props = N("Properties70");
+                props.AddNode(MakeP("Lcl Translation", "Lcl Translation", "", "A+", 0, 0, 0));
+                props.AddNode(MakeP("Lcl Rotation", "Lcl Rotation", "", "A+", 0, 0, 0));
+                props.AddNode(MakeP("Lcl Scaling", "Lcl Scaling", "", "A+", 1, 1, 1));
+                model.AddNode(props);
+
+                _objects.AddNode(model);
+                Connect(modelId, parentModelId);
+                _extraMeshModelIds.Add(modelId);
+                _bindPoseMatrixByModelId[modelId] = GetFrameMatrix(mesh.Path, System.Numerics.Matrix4x4.Identity);
+            }
+            else if (modelId == 0)
             {
                 modelId = GenId();
+                _exportedFrameCount++;
                 var meshName = mesh.Path ?? "UnnamedMesh";
                 var lastSlash = meshName.LastIndexOf('/');
                 if (lastSlash >= 0) meshName = meshName.Substring(lastSlash + 1);
@@ -289,7 +371,7 @@ namespace AssetStudio
 
                 var model = N("Model");
                 model.AddProperty(new LongToken(modelId));
-                model.AddProperty(new StringToken($"Model::{fbxName}"));
+                model.AddProperty(new StringToken(FormatObjectName(fbxName, "Model")));
                 model.AddProperty(new StringToken("Mesh"));
 
                 var props = N("Properties70");
@@ -300,6 +382,8 @@ namespace AssetStudio
 
                 _objects.AddNode(model);
                 Connect(modelId, 0); // connect to root
+                _extraMeshModelIds.Add(modelId);
+                _bindPoseMatrixByModelId[modelId] = System.Numerics.Matrix4x4.Identity;
             }
 
             var geoId = GenId();
@@ -309,7 +393,7 @@ namespace AssetStudio
 
             var geo = N("Geometry");
             geo.AddProperty(new LongToken(geoId));
-            geo.AddProperty(new StringToken($"Geometry::{mesh.Path}"));
+            geo.AddProperty(new StringToken(FormatObjectName(mesh.Path, "Geometry")));
             geo.AddProperty(new StringToken("Mesh"));
 
             BuildVertices(geo, mesh);
@@ -326,7 +410,10 @@ namespace AssetStudio
                 }
             }
             if (mesh.hasTangent)
+            {
                 BuildLayerElementTangent(geo, mesh, resolvedFaces.Indices);
+                BuildLayerElementBinormal(geo, mesh, resolvedFaces.Indices);
+            }
             if (mesh.hasColor)
                 BuildLayerElementColor(geo, mesh, resolvedFaces.Indices);
 
@@ -598,6 +685,40 @@ namespace AssetStudio
             geo.AddNode(layer);
         }
 
+        private void BuildLayerElementBinormal(FbxNode geo, ImportedMesh mesh, int[] resolvedIndices)
+        {
+            var layer = N("LayerElementBinormal");
+            layer.AddProperty(new IntegerToken(0));
+            AddSimpleNode(layer, "Version", 101);
+            AddSimpleNode(layer, "Name", "");
+            AddSimpleNode(layer, "MappingInformationType", "ByPolygonVertex");
+            AddSimpleNode(layer, "ReferenceInformationType", "Direct");
+
+            var vertexList = mesh.VertexList;
+            int indexCount = resolvedIndices.Length;
+            var binormalData = new double[indexCount * 3];
+            for (int i = 0; i < indexCount; i++)
+            {
+                var v = vertexList[resolvedIndices[i]];
+                var n = v.Normal;
+                var t = v.Tangent;
+                double tw = SanitizeFinite(t.W);
+                if (Math.Abs(tw) < 1e-6) tw = 1.0;
+                double bx = ((double)n.Y * t.Z - (double)n.Z * t.Y) * tw;
+                double by = ((double)n.Z * t.X - (double)n.X * t.Z) * tw;
+                double bz = ((double)n.X * t.Y - (double)n.Y * t.X) * tw;
+                int offset = i * 3;
+                binormalData[offset] = SanitizeFinite(bx);
+                binormalData[offset + 1] = SanitizeFinite(by);
+                binormalData[offset + 2] = SanitizeFinite(bz);
+            }
+
+            var binormNode = N("Binormals");
+            binormNode.AddProperty(new DoubleArrayToken(binormalData));
+            layer.AddNode(binormNode);
+            geo.AddNode(layer);
+        }
+
         private void BuildLayerElementColor(FbxNode geo, ImportedMesh mesh, int[] resolvedIndices)
         {
             var layer = N("LayerElementColor");
@@ -670,22 +791,34 @@ namespace AssetStudio
 
             if (mesh.hasNormal)
                 AddLayerRef(layer, "LayerElementNormal");
-            if (mesh.hasUV != null)
-            {
-                for (int uvIndex = 0; uvIndex < mesh.hasUV.Length; uvIndex++)
-                {
-                    if (mesh.hasUV[uvIndex])
-                        AddLayerRef(layer, "LayerElementUV", uvIndex);
-                }
-            }
+            if (mesh.hasUV != null && mesh.hasUV.Length > 0 && mesh.hasUV[0])
+                AddLayerRef(layer, "LayerElementUV", 0);
             if (mesh.hasTangent)
+            {
                 AddLayerRef(layer, "LayerElementTangent");
+                AddLayerRef(layer, "LayerElementBinormal");
+            }
             if (mesh.hasColor)
                 AddLayerRef(layer, "LayerElementColor");
             if (mesh.SubmeshList != null && mesh.SubmeshList.Count > 0)
                 AddLayerRef(layer, "LayerElementMaterial");
 
             geo.AddNode(layer);
+
+            if (mesh.hasUV != null)
+            {
+                for (int uvIndex = 1; uvIndex < mesh.hasUV.Length; uvIndex++)
+                {
+                    if (mesh.hasUV[uvIndex])
+                    {
+                        var uvLayer = N("Layer");
+                        uvLayer.AddProperty(new IntegerToken(uvIndex));
+                        AddSimpleNode(uvLayer, "Version", 100);
+                        AddLayerRef(uvLayer, "LayerElementUV", uvIndex);
+                        geo.AddNode(uvLayer);
+                    }
+                }
+            }
         }
 
         private void AddLayerRef(FbxNode layer, string typeName, int index = 0)
@@ -732,7 +865,7 @@ namespace AssetStudio
             _exportedSkinCount++;
             var skin = N("Deformer");
             skin.AddProperty(new LongToken(skinId));
-            skin.AddProperty(new StringToken("Deformer::Skin"));
+            skin.AddProperty(new StringToken(FormatObjectName("Skin", "Deformer")));
             skin.AddProperty(new StringToken("Skin"));
             AddSimpleNode(skin, "Version", 101);
             AddSimpleNode(skin, "Link_DeformAcuracy", 50.0);
@@ -740,7 +873,10 @@ namespace AssetStudio
             Connect(skinId, geoId);
 
             var meshBindMatrix = GetFrameMatrix(mesh.Path, System.Numerics.Matrix4x4.Identity);
-            var transform = NumericsToFbxArray(meshBindMatrix);
+            if (mesh.Path != null && TryGetFrameId(mesh.Path, out var meshFrameId))
+            {
+                _bindPoseMatrixByModelId[meshFrameId] = meshBindMatrix;
+            }
 
             var boneList = mesh.BoneList;
             if (boneList == null || boneList.Count == 0)
@@ -749,7 +885,7 @@ namespace AssetStudio
             int boneCount = boneList.Count;
             int vertexCount = vertexList.Count;
 
-            // Single-pass count per bone: O(V) instead of O(B * V) and exact-sized arrays with zero LOH waste
+            // Single-pass count per bone with per-vertex duplicate bone slot deduplication and no 4-weight cap
             var influenceCounts = new int[boneCount];
             for (int v = 0; v < vertexCount; v++)
             {
@@ -758,7 +894,6 @@ namespace AssetStudio
                 var weights = vert.Weights;
                 if (boneIndices == null || weights == null) continue;
                 int weightSlots = boneIndices.Length < weights.Length ? boneIndices.Length : weights.Length;
-                if (weightSlots > 4) weightSlots = 4;
                 for (int w = 0; w < weightSlots; w++)
                 {
                     float weight = weights[w];
@@ -767,7 +902,19 @@ namespace AssetStudio
                         int bIdx = boneIndices[w];
                         if ((uint)bIdx < (uint)boneCount && boneList[bIdx].Path != null)
                         {
-                            influenceCounts[bIdx]++;
+                            bool duplicate = false;
+                            for (int p = 0; p < w; p++)
+                            {
+                                if (boneIndices[p] == bIdx && weights[p] > 0f && !float.IsNaN(weights[p]) && !float.IsInfinity(weights[p]))
+                                {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (!duplicate)
+                            {
+                                influenceCounts[bIdx]++;
+                            }
                         }
                     }
                 }
@@ -793,7 +940,6 @@ namespace AssetStudio
                 var weights = vert.Weights;
                 if (boneIndices == null || weights == null) continue;
                 int weightSlots = boneIndices.Length < weights.Length ? boneIndices.Length : weights.Length;
-                if (weightSlots > 4) weightSlots = 4;
                 for (int w = 0; w < weightSlots; w++)
                 {
                     float weight = weights[w];
@@ -802,9 +948,32 @@ namespace AssetStudio
                         int bIdx = boneIndices[w];
                         if ((uint)bIdx < (uint)boneCount && boneVertexIndices[bIdx] != null)
                         {
+                            bool duplicate = false;
+                            for (int p = 0; p < w; p++)
+                            {
+                                if (boneIndices[p] == bIdx && weights[p] > 0f && !float.IsNaN(weights[p]) && !float.IsInfinity(weights[p]))
+                                {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (duplicate)
+                            {
+                                continue;
+                            }
+
+                            double totalWeight = weight;
+                            for (int p = w + 1; p < weightSlots; p++)
+                            {
+                                if (boneIndices[p] == bIdx && weights[p] > 0f && !float.IsNaN(weights[p]) && !float.IsInfinity(weights[p]))
+                                {
+                                    totalWeight += weights[p];
+                                }
+                            }
+
                             int pos = writeCursor[bIdx]++;
                             boneVertexIndices[bIdx][pos] = v;
-                            boneVertexWeights[bIdx][pos] = weight;
+                            boneVertexWeights[bIdx][pos] = totalWeight;
                         }
                     }
                 }
@@ -815,6 +984,12 @@ namespace AssetStudio
                 var bone = boneList[boneIdx];
                 if (bone.Path == null)
                     continue;
+
+                var linkMatrix = GetBindPoseLinkMatrix(meshBindMatrix, bone);
+                if (TryGetFrameId(bone.Path, out var boneModelId))
+                {
+                    _bindPoseMatrixByModelId[boneModelId] = linkMatrix;
+                }
 
                 _candidateClusterCount++;
 
@@ -829,10 +1004,10 @@ namespace AssetStudio
                 _exportedClusterCount++;
                 var cluster = N("Deformer");
                 cluster.AddProperty(new LongToken(clusterId));
-                cluster.AddProperty(new StringToken($"SubDeformer::{bone.Path}"));
+                cluster.AddProperty(new StringToken(FormatObjectName(bone.Path, "SubDeformer")));
                 cluster.AddProperty(new StringToken("Cluster"));
                 AddSimpleNode(cluster, "Version", 100);
-                AddSimpleNode(cluster, "Mode", "TotalOne");
+                AddSimpleNode(cluster, "Mode", "Total1");
                 AddSimpleNode(cluster, "UserData", "");
 
                 var idxNode = N("Indexes");
@@ -843,10 +1018,11 @@ namespace AssetStudio
                 wNode.AddProperty(new DoubleArrayToken(boneVertexWeights[boneIdx]));
                 cluster.AddNode(wNode);
 
-                var transformLink = NumericsToFbxArray(GetBindPoseLinkMatrix(meshBindMatrix, bone));
+                var clusterTransform = NumericsToFbxArray(UnityBindPoseToNumerics(bone.Matrix));
+                var transformLink = NumericsToFbxArray(linkMatrix);
 
                 var tNode = N("Transform");
-                tNode.AddProperty(new DoubleArrayToken(transform));
+                tNode.AddProperty(new DoubleArrayToken(clusterTransform));
                 cluster.AddNode(tNode);
 
                 var tlNode = N("TransformLink");
@@ -856,7 +1032,7 @@ namespace AssetStudio
                 _objects.AddNode(cluster);
                 Connect(clusterId, skinId);
 
-                if (TryGetFrameId(bone.Path, out var boneModelId))
+                if (boneModelId != 0)
                     Connect(boneModelId, clusterId);
             }
         }
@@ -869,7 +1045,7 @@ namespace AssetStudio
 
             var matNode = N("Material");
             matNode.AddProperty(new LongToken(id));
-            matNode.AddProperty(new StringToken($"Material::{mat.Name}"));
+            matNode.AddProperty(new StringToken(FormatObjectName(mat.Name, "Material")));
             matNode.AddProperty(new StringToken(""));
 
             AddSimpleNode(matNode, "Version", 102);
@@ -880,14 +1056,8 @@ namespace AssetStudio
             props.AddNode(MakeColorP("AmbientColor", mat.Ambient));
             props.AddNode(MakeColorP("EmissiveColor", mat.Emissive));
             props.AddNode(MakeColorP("SpecularColor", mat.Specular));
-
-            var shininess = N("P");
-            shininess.AddProperty(new StringToken("Shininess"));
-            shininess.AddProperty(new StringToken("Number"));
-            shininess.AddProperty(new StringToken(""));
-            shininess.AddProperty(new StringToken("A"));
-            shininess.AddProperty(new DoubleToken(SanitizeFinite(mat.Shininess)));
-            props.AddNode(shininess);
+            props.AddNode(MakeNumberP("Shininess", SanitizeFinite(mat.Shininess)));
+            props.AddNode(MakeNumberP("TransparencyFactor", SanitizeFinite(mat.Transparency)));
 
             matNode.AddNode(props);
             _objects.AddNode(matNode);
@@ -895,10 +1065,35 @@ namespace AssetStudio
             ExportMaterialTextures(mat, id);
         }
 
+        private static readonly string[] FallbackMaterialTextureSlots =
+        {
+            "DiffuseFactor",
+            "SpecularFactor",
+            "EmissiveFactor",
+            "AmbientFactor",
+            "ReflectionColor",
+            "ShininessExponent",
+            "TransparencyFactor",
+            "TransparentColor",
+            "Bump"
+        };
+
         private void ExportMaterialTextures(ImportedMaterial mat, long materialId)
         {
             if (mat.Textures == null)
                 return;
+
+            bool hasExplicitDiffuse = false;
+            for (int i = 0; i < mat.Textures.Count; i++)
+            {
+                if (!string.IsNullOrEmpty(mat.Textures[i].Name) && mat.Textures[i].Dest == 0)
+                {
+                    hasExplicitDiffuse = true;
+                    break;
+                }
+            }
+
+            var usedSlots = new HashSet<string>(StringComparer.Ordinal);
 
             for (int i = 0; i < mat.Textures.Count; i++)
             {
@@ -910,7 +1105,7 @@ namespace AssetStudio
                 long textureId;
                 if (texture != null)
                 {
-                    textureId = ExportTexture(texture);
+                    textureId = ExportTexture(texture, matTex.Offset, matTex.Scale);
                 }
                 else
                 {
@@ -920,12 +1115,43 @@ namespace AssetStudio
                         {
                             Data = null
                         };
-                        textureId = ExportTexture(dummyTex);
+                        textureId = ExportTexture(dummyTex, matTex.Offset, matTex.Scale);
                     }
                 }
 
-                ConnectProperty(textureId, materialId, GetMaterialTextureProperty(matTex.Dest));
+                string slotName = GetMaterialTextureProperty(matTex.Dest);
+                if (matTex.Dest < 0)
+                {
+                    if (!hasExplicitDiffuse && !usedSlots.Contains("DiffuseColor"))
+                    {
+                        slotName = "DiffuseColor";
+                    }
+                    else
+                    {
+                        slotName = PickUnusedMaterialSlot(usedSlots);
+                    }
+                }
+                else if (usedSlots.Contains(slotName))
+                {
+                    slotName = PickUnusedMaterialSlot(usedSlots);
+                }
+
+                usedSlots.Add(slotName);
+                ConnectProperty(textureId, materialId, slotName);
             }
+        }
+
+        private static string PickUnusedMaterialSlot(HashSet<string> usedSlots)
+        {
+            for (int i = 0; i < FallbackMaterialTextureSlots.Length; i++)
+            {
+                if (!usedSlots.Contains(FallbackMaterialTextureSlots[i]))
+                {
+                    return FallbackMaterialTextureSlots[i];
+                }
+            }
+
+            return "DiffuseFactor";
         }
 
         private void BuildSourceTextureMap(List<ImportedTexture> textureList)
@@ -1030,7 +1256,7 @@ namespace AssetStudio
             return _rootFrame?.FindFrameByPath(normalizedPath);
         }
 
-        private long ExportTexture(ImportedTexture texture)
+        private long ExportTexture(ImportedTexture texture, Vector2 offset = default, Vector2 scale = default)
         {
             if (_textureIdMap.TryGetValue(texture.Name, out var existingTextureId))
                 return existingTextureId;
@@ -1053,19 +1279,27 @@ namespace AssetStudio
 
             var texNode = N("Texture");
             texNode.AddProperty(new LongToken(textureId));
-            texNode.AddProperty(new StringToken($"Texture::{texture.Name}"));
+            texNode.AddProperty(new StringToken(FormatObjectName(texture.Name, "Texture")));
             texNode.AddProperty(new StringToken(""));
             AddSimpleNode(texNode, "Type", "TextureVideoClip");
             AddSimpleNode(texNode, "Version", 202);
-            AddSimpleNode(texNode, "TextureName", $"Texture::{texture.Name}");
-            AddSimpleNode(texNode, "Media", $"Video::{texture.Name}");
+            AddSimpleNode(texNode, "TextureName", FormatObjectName(texture.Name, "Texture"));
+            AddSimpleNode(texNode, "Media", FormatObjectName(texture.Name, "Video"));
             AddSimpleNode(texNode, "FileName", fileName);
             AddSimpleNode(texNode, "RelativeFilename", relativeFileName);
+
+            double scaleX = (scale.X == 0f && scale.Y == 0f) ? 1.0 : SanitizeFinite(scale.X);
+            double scaleY = (scale.X == 0f && scale.Y == 0f) ? 1.0 : SanitizeFinite(scale.Y);
+            var texProps = N("Properties70");
+            texProps.AddNode(MakeP("Translation", "Vector", "", "A", SanitizeFinite(offset.X), SanitizeFinite(offset.Y), 0.0));
+            texProps.AddNode(MakeP("Scaling", "Vector", "", "A", scaleX, scaleY, 1.0));
+            texNode.AddNode(texProps);
+
             _objects.AddNode(texNode);
 
             var videoNode = N("Video");
             videoNode.AddProperty(new LongToken(videoId));
-            videoNode.AddProperty(new StringToken($"Video::{texture.Name}"));
+            videoNode.AddProperty(new StringToken(FormatObjectName(texture.Name, "Video")));
             videoNode.AddProperty(new StringToken("Clip"));
             AddSimpleNode(videoNode, "Type", "Clip");
             AddSimpleNode(videoNode, "UseMipMap", 0);
@@ -1099,12 +1333,14 @@ namespace AssetStudio
         {
             switch (dest)
             {
+                case 0:
+                    return "DiffuseColor";
                 case 1:
                     return "NormalMap";
                 case 2:
                     return "SpecularColor";
                 case 3:
-                    return "SpecularFactor";
+                    return "ReflectionFactor";
                 case 4:
                     return "EmissiveColor";
                 case 5:
@@ -1113,8 +1349,12 @@ namespace AssetStudio
                     return "Bump";
                 case 7:
                     return "DiffuseFactor";
+                case 8:
+                    return "ShininessExponent";
+                case 9:
+                    return "TransparencyFactor";
                 default:
-                    return "DiffuseColor";
+                    return "DiffuseFactor";
             }
         }
 
@@ -1138,18 +1378,43 @@ namespace AssetStudio
             if (anim.TrackList == null || anim.TrackList.Count == 0)
                 return;
 
-            var stackId = GenId();
-            _exportedAnimationStackCount++;
-            var stack = N("AnimationStack");
-            stack.AddProperty(new LongToken(stackId));
-            stack.AddProperty(new StringToken($"AnimStack::{anim.Name}"));
-            stack.AddProperty(new StringToken(""));
-
-            var stackProps = N("Properties70");
+            var validTracks = new List<(ImportedAnimationKeyframedTrack Track, long ModelId, long BsChannelId)>(anim.TrackList.Count);
+            var missingTrackCount = 0;
             float maxTime = 0;
+
             for (int tIdx = 0; tIdx < anim.TrackList.Count; tIdx++)
             {
                 var track = anim.TrackList[tIdx];
+                if (track.Path == null) continue;
+
+                long modelId = 0;
+                bool hasModel = TryGetFrameId(track.Path, out modelId);
+                long bsChannelId = 0;
+                if (track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)
+                {
+                    var mapKey = track.Path + "::" + track.BlendShape.ChannelName;
+                    if (!_blendShapeChannelMap.TryGetValue(mapKey, out bsChannelId))
+                    {
+                        var normTrackPath = NormalizeFramePath(track.Path);
+                        if (!string.IsNullOrEmpty(normTrackPath))
+                        {
+                            _blendShapeChannelMap.TryGetValue(normTrackPath + "::" + track.BlendShape.ChannelName, out bsChannelId);
+                        }
+                    }
+                }
+
+                bool hasTrs = hasModel && (track.Translations.Count > 0 || track.Rotations.Count > 0 || track.Scalings.Count > 0);
+                bool hasBs = bsChannelId != 0 && track.BlendShape != null && track.BlendShape.Keyframes.Count > 0;
+                if (!hasTrs && !hasBs)
+                {
+                    if (!hasModel && (track.Translations.Count > 0 || track.Rotations.Count > 0 || track.Scalings.Count > 0 || (track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)))
+                    {
+                        missingTrackCount++;
+                        _missingAnimationTrackCount++;
+                    }
+                    continue;
+                }
+
                 for (int i = 0; i < track.Translations.Count; i++)
                 {
                     float t = (float)SanitizeFinite(track.Translations[i].time);
@@ -1165,7 +1430,7 @@ namespace AssetStudio
                     float t = (float)SanitizeFinite(track.Scalings[i].time);
                     if (t > maxTime) maxTime = t;
                 }
-                if (track.BlendShape != null)
+                if (hasBs && track.BlendShape != null)
                 {
                     var bsKeys = track.BlendShape.Keyframes;
                     for (int i = 0; i < bsKeys.Count; i++)
@@ -1174,8 +1439,25 @@ namespace AssetStudio
                         if (t > maxTime) maxTime = t;
                     }
                 }
+
+                validTracks.Add((track, modelId, bsChannelId));
             }
-            var fbxTime = (long)(maxTime * 46186158000L);
+
+            if (validTracks.Count == 0)
+            {
+                Logger.Warning($"Animation '{anim.Name}' has {anim.TrackList.Count} tracks, but none matched the exported frame hierarchy.");
+                return;
+            }
+
+            var stackId = GenId();
+            _exportedAnimationStackCount++;
+            var stack = N("AnimationStack");
+            stack.AddProperty(new LongToken(stackId));
+            stack.AddProperty(new StringToken(FormatObjectName(anim.Name, "AnimStack")));
+            stack.AddProperty(new StringToken(""));
+
+            var stackProps = N("Properties70");
+            var fbxTime = (long)Math.Round(maxTime * 46186158000.0);
             _takes.Add((anim.Name, 0, fbxTime));
             stackProps.AddNode(MakeStringP("Description", ""));
             stackProps.AddNode(MakeTimeP("LocalStart", 0));
@@ -1188,49 +1470,39 @@ namespace AssetStudio
             var layerId = GenId();
             var layer = N("AnimationLayer");
             layer.AddProperty(new LongToken(layerId));
-            layer.AddProperty(new StringToken("AnimLayer::Base Layer"));
+            layer.AddProperty(new StringToken(FormatObjectName("Base Layer", "AnimLayer")));
             layer.AddProperty(new StringToken(""));
             _objects.AddNode(layer);
             Connect(layerId, stackId);
 
             var exportedTrackCount = 0;
-            var missingTrackCount = 0;
-            for (int tIdx = 0; tIdx < anim.TrackList.Count; tIdx++)
+            for (int i = 0; i < validTracks.Count; i++)
             {
-                var track = anim.TrackList[tIdx];
-                if (track.Path == null) continue;
-                if (!TryGetFrameId(track.Path, out var modelId))
-                {
-                    missingTrackCount++;
-                    _missingAnimationTrackCount++;
-                    continue;
-                }
-
+                var (track, modelId, bsChannelId) = validTracks[i];
                 var exportedTrack = false;
-                if (track.Translations.Count > 0)
+                if (modelId != 0)
                 {
-                    ExportCurveNode(layerId, modelId, "T", "Lcl Translation", track.Translations);
-                    exportedTrack = true;
-                }
-                if (track.Rotations.Count > 0)
-                {
-                    ExportCurveNode(layerId, modelId, "R", "Lcl Rotation", track.Rotations);
-                    exportedTrack = true;
-                }
-                if (track.Scalings.Count > 0)
-                {
-                    ExportCurveNode(layerId, modelId, "S", "Lcl Scaling", track.Scalings);
-                    exportedTrack = true;
-                }
-
-                if (track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)
-                {
-                    var mapKey = track.Path + "::" + track.BlendShape.ChannelName;
-                    if (_blendShapeChannelMap.TryGetValue(mapKey, out var bsChannelId))
+                    if (track.Translations.Count > 0)
                     {
-                        ExportCurveNode1D(layerId, bsChannelId, track.BlendShape.ChannelName, "DeformPercent", track.BlendShape.Keyframes);
+                        ExportCurveNode(layerId, modelId, "T", "Lcl Translation", track.Translations);
                         exportedTrack = true;
                     }
+                    if (track.Rotations.Count > 0)
+                    {
+                        ExportCurveNode(layerId, modelId, "R", "Lcl Rotation", track.Rotations);
+                        exportedTrack = true;
+                    }
+                    if (track.Scalings.Count > 0)
+                    {
+                        ExportCurveNode(layerId, modelId, "S", "Lcl Scaling", track.Scalings);
+                        exportedTrack = true;
+                    }
+                }
+
+                if (bsChannelId != 0 && track.BlendShape != null && track.BlendShape.Keyframes.Count > 0)
+                {
+                    ExportCurveNode1D(layerId, bsChannelId, track.BlendShape.ChannelName, "DeformPercent", track.BlendShape.Keyframes);
+                    exportedTrack = true;
                 }
 
                 if (exportedTrack)
@@ -1240,9 +1512,7 @@ namespace AssetStudio
                 }
             }
 
-            if (exportedTrackCount == 0)
-                Logger.Warning($"Animation '{anim.Name}' has {anim.TrackList.Count} tracks, but none matched the exported frame hierarchy.");
-            else if (missingTrackCount > 0)
+            if (missingTrackCount > 0)
                 Logger.Warning($"Animation '{anim.Name}' exported {exportedTrackCount} tracks; {missingTrackCount} track paths did not match the exported frame hierarchy.");
         }
 
@@ -1251,7 +1521,17 @@ namespace AssetStudio
             modelId = 0;
             var normalizedPath = NormalizeFramePath(path);
             if (string.IsNullOrEmpty(normalizedPath))
+            {
+                if (_rootFrame != null)
+                {
+                    var rootPath = NormalizeFramePath(_rootFrame.Path);
+                    if (!string.IsNullOrEmpty(rootPath) && _frameIdMap.TryGetValue(rootPath, out modelId))
+                    {
+                        return true;
+                    }
+                }
                 return false;
+            }
 
             if (_frameIdMap.TryGetValue(normalizedPath, out modelId))
                 return true;
@@ -1388,10 +1668,6 @@ namespace AssetStudio
             for (int m = 0; m < convert.MeshList.Count; m++)
             {
                 var mesh = convert.MeshList[m];
-                var meshPath = NormalizeFramePath(mesh.Path);
-                if (!string.IsNullOrEmpty(meshPath))
-                    _meshPathSet.Add(meshPath);
-
                 if (mesh.BoneList == null)
                     continue;
 
@@ -1409,6 +1685,40 @@ namespace AssetStudio
                     AddBonePathWithParent(frame, normalizedPath);
                 }
             }
+
+            for (int m = 0; m < convert.MeshList.Count; m++)
+            {
+                var mesh = convert.MeshList[m];
+                var meshPath = NormalizeFramePath(mesh.Path);
+                if (string.IsNullOrEmpty(meshPath))
+                    continue;
+
+                bool isSkinned = _exportSkins && mesh.BoneList != null && mesh.BoneList.Count > 0;
+                if (isSkinned && IsAncestorOfAnyBone(meshPath))
+                {
+                    // Do not mark a bone ancestor (e.g. RootFrame) as a "Mesh" Model node; ExportMesh creates a dedicated child Mesh node.
+                    continue;
+                }
+
+                _meshPathSet.Add(meshPath);
+            }
+        }
+
+        private bool IsAncestorOfAnyBone(string normalizedPath)
+        {
+            if (string.IsNullOrEmpty(normalizedPath) || _bonePathSet.Count == 0)
+                return false;
+
+            if (normalizedPath == NormalizeFramePath(_rootFrame?.Path))
+                return true;
+
+            string prefix = normalizedPath + "/";
+            foreach (var bonePath in _bonePathSet)
+            {
+                if (bonePath.StartsWith(prefix, StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
         }
 
         private void AddBonePathWithParent(ImportedFrame? frame, string fallbackPath)
@@ -1455,10 +1765,11 @@ namespace AssetStudio
             var curveNodeId = GenId();
             var curveNode = N("AnimationCurveNode");
             curveNode.AddProperty(new LongToken(curveNodeId));
-            curveNode.AddProperty(new StringToken($"AnimCurveNode::{channelName}"));
+            curveNode.AddProperty(new StringToken(FormatObjectName(channelName, "AnimCurveNode")));
             curveNode.AddProperty(new StringToken(""));
+            string channelProp = $"d|{propName}";
             var props = N("Properties70");
-            props.AddNode(MakeNumberP("d", keyframes.Count > 0 ? keyframes[0].value : 0));
+            props.AddNode(MakeNumberP(channelProp, keyframes.Count > 0 ? keyframes[0].value : 0));
             curveNode.AddNode(props);
             _objects.AddNode(curveNode);
 
@@ -1468,14 +1779,30 @@ namespace AssetStudio
             int keyCount = keyframes.Count;
             var timesArr = new long[keyCount];
             var valuesArr = new float[keyCount];
+            int writePos = 0;
             for (int i = 0; i < keyCount; i++)
             {
                 var k = keyframes[i];
-                timesArr[i] = (long)(SanitizeFinite(k.time) * 46186158000L);
-                valuesArr[i] = (float)SanitizeDouble(k.value);
+                long kTime = (long)Math.Round(SanitizeFinite(k.time) * 46186158000.0);
+                float val = (float)SanitizeDouble(k.value);
+                if (writePos > 0 && kTime == timesArr[writePos - 1])
+                {
+                    valuesArr[writePos - 1] = val;
+                }
+                else
+                {
+                    timesArr[writePos] = kTime;
+                    valuesArr[writePos] = val;
+                    writePos++;
+                }
+            }
+            if (writePos != keyCount)
+            {
+                Array.Resize(ref timesArr, writePos);
+                Array.Resize(ref valuesArr, writePos);
             }
 
-            ExportCurve(curveNodeId, "d", timesArr, valuesArr);
+            ExportCurve(curveNodeId, channelProp, timesArr, valuesArr);
         }
 
         private void ExportCurveNode(long layerId, long modelId, string channel, string propName, List<ImportedKeyframe<Vector3>> keyframes)
@@ -1483,7 +1810,7 @@ namespace AssetStudio
             var curveNodeId = GenId();
             var curveNode = N("AnimationCurveNode");
             curveNode.AddProperty(new LongToken(curveNodeId));
-            curveNode.AddProperty(new StringToken($"AnimCurveNode::{channel}"));
+            curveNode.AddProperty(new StringToken(FormatObjectName(channel, "AnimCurveNode")));
             curveNode.AddProperty(new StringToken(""));
 
             var props = N("Properties70");
@@ -1503,13 +1830,35 @@ namespace AssetStudio
             var xArr = new float[keyCount];
             var yArr = new float[keyCount];
             var zArr = new float[keyCount];
+            int writePos = 0;
             for (int i = 0; i < keyCount; i++)
             {
                 var k = keyframes[i];
-                timesArr[i] = (long)(SanitizeFinite(k.time) * 46186158000L);
-                xArr[i] = (float)SanitizeDouble(k.value.X);
-                yArr[i] = (float)SanitizeDouble(k.value.Y);
-                zArr[i] = (float)SanitizeDouble(k.value.Z);
+                long kTime = (long)Math.Round(SanitizeFinite(k.time) * 46186158000.0);
+                float vx = (float)SanitizeDouble(k.value.X);
+                float vy = (float)SanitizeDouble(k.value.Y);
+                float vz = (float)SanitizeDouble(k.value.Z);
+                if (writePos > 0 && kTime == timesArr[writePos - 1])
+                {
+                    xArr[writePos - 1] = vx;
+                    yArr[writePos - 1] = vy;
+                    zArr[writePos - 1] = vz;
+                }
+                else
+                {
+                    timesArr[writePos] = kTime;
+                    xArr[writePos] = vx;
+                    yArr[writePos] = vy;
+                    zArr[writePos] = vz;
+                    writePos++;
+                }
+            }
+            if (writePos != keyCount)
+            {
+                Array.Resize(ref timesArr, writePos);
+                Array.Resize(ref xArr, writePos);
+                Array.Resize(ref yArr, writePos);
+                Array.Resize(ref zArr, writePos);
             }
 
             ExportCurve(curveNodeId, "d|X", timesArr, xArr);
@@ -1523,7 +1872,7 @@ namespace AssetStudio
             _exportedAnimationCurveCount++;
             var curve = N("AnimationCurve");
             curve.AddProperty(new LongToken(curveId));
-            curve.AddProperty(new StringToken($"AnimCurve::"));
+            curve.AddProperty(new StringToken(FormatObjectName("", "AnimCurve")));
             curve.AddProperty(new StringToken(""));
 
             AddSimpleNode(curve, "Default", 0.0);
@@ -1563,16 +1912,34 @@ namespace AssetStudio
             _connections.AddNode(c);
         }
 
-        private void ExportMorph(ImportedMorph morph)
+        private void ExportMorph(ImportedMorph morph, IImported convert)
         {
             if (morph.Channels == null || morph.Channels.Count == 0) return;
             if (morph.Path == null) return;
             if (!_meshIdMap.TryGetValue(morph.Path, out var geoId)) return;
 
+            ImportedMesh? baseMesh = null;
+            if (convert.MeshList != null)
+            {
+                baseMesh = ImportedHelpers.FindMesh(morph.Path, convert.MeshList);
+                if (baseMesh == null)
+                {
+                    var normMorphPath = NormalizeFramePath(morph.Path);
+                    for (int m = 0; m < convert.MeshList.Count; m++)
+                    {
+                        if (string.Equals(NormalizeFramePath(convert.MeshList[m].Path), normMorphPath, StringComparison.Ordinal))
+                        {
+                            baseMesh = convert.MeshList[m];
+                            break;
+                        }
+                    }
+                }
+            }
+
             var blendShapeId = GenId();
             var bs = N("Deformer");
             bs.AddProperty(new LongToken(blendShapeId));
-            bs.AddProperty(new StringToken($"Deformer::BlendShape"));
+            bs.AddProperty(new StringToken(FormatObjectName("BlendShape", "Deformer")));
             bs.AddProperty(new StringToken("BlendShape"));
             AddSimpleNode(bs, "Version", 100);
             _objects.AddNode(bs);
@@ -1584,10 +1951,14 @@ namespace AssetStudio
                 var channelId = GenId();
                 var bc = N("Deformer");
                 bc.AddProperty(new LongToken(channelId));
-                bc.AddProperty(new StringToken($"SubDeformer::{channel.Name}"));
+                bc.AddProperty(new StringToken(FormatObjectName(channel.Name, "SubDeformer")));
                 bc.AddProperty(new StringToken("BlendShapeChannel"));
                 AddSimpleNode(bc, "Version", 100);
                 AddSimpleNode(bc, "DeformPercent", 0.0);
+
+                var bcProps = N("Properties70");
+                bcProps.AddNode(MakeNumberP("DeformPercent", 0.0));
+                bc.AddNode(bcProps);
 
                 var fullWeights = N("FullWeights");
                 int kfCount = channel.KeyframeList.Count;
@@ -1601,14 +1972,20 @@ namespace AssetStudio
                 Connect(channelId, blendShapeId);
 
                 _blendShapeChannelMap[morph.Path + "::" + channel.Name] = channelId;
+                var normMorphPath = NormalizeFramePath(morph.Path);
+                if (!string.IsNullOrEmpty(normMorphPath))
+                {
+                    _blendShapeChannelMap[normMorphPath + "::" + channel.Name] = channelId;
+                }
 
                 for (int kIdx = 0; kIdx < kfCount; kIdx++)
                 {
                     var keyframe = channel.KeyframeList[kIdx];
                     var shapeId = GenId();
+                    var shapeName = kfCount > 1 ? $"{channel.Name}_Frame{kIdx}" : channel.Name;
                     var shape = N("Geometry");
                     shape.AddProperty(new LongToken(shapeId));
-                    shape.AddProperty(new StringToken($"Geometry::{channel.Name}"));
+                    shape.AddProperty(new StringToken(FormatObjectName(shapeName, "Geometry")));
                     shape.AddProperty(new StringToken("Shape"));
 
                     AddSimpleNode(shape, "Version", 100);
@@ -1618,14 +1995,20 @@ namespace AssetStudio
                     var indices = new int[vertCount];
                     var verts = new double[vertCount * 3];
                     var normals = keyframe.hasNormals ? new double[vertCount * 3] : null;
+                    var baseVertexList = baseMesh?.VertexList;
                     for (int i = 0; i < vertCount; i++)
                     {
                         var v = morphVerts[i];
                         int offset = i * 3;
                         indices[i] = (int)v.Index;
-                        verts[offset] = SanitizeFinite(v.Vertex.Vertex.X);
-                        verts[offset + 1] = SanitizeFinite(v.Vertex.Vertex.Y);
-                        verts[offset + 2] = SanitizeFinite(v.Vertex.Vertex.Z);
+                        Vector3 basePos = default;
+                        if (baseVertexList != null && v.Index < (uint)baseVertexList.Count)
+                        {
+                            basePos = baseVertexList[(int)v.Index].Vertex;
+                        }
+                        verts[offset] = SanitizeFinite((double)v.Vertex.Vertex.X - basePos.X);
+                        verts[offset + 1] = SanitizeFinite((double)v.Vertex.Vertex.Y - basePos.Y);
+                        verts[offset + 2] = SanitizeFinite((double)v.Vertex.Vertex.Z - basePos.Z);
                         if (normals != null)
                         {
                             normals[offset] = SanitizeFinite(v.Vertex.Normal.X);
@@ -1657,31 +2040,32 @@ namespace AssetStudio
 
         private void BuildHeader()
         {
+            var now = DateTime.UtcNow;
             var header = N("FBXHeaderExtension");
 
             var ver = N("FBXHeaderVersion"); ver.AddProperty(new IntegerToken(1003));
             header.AddNode(ver);
-            var fbxVer = N("FBXVersion"); fbxVer.AddProperty(new IntegerToken(7400));
+            var fbxVer = N("FBXVersion"); fbxVer.AddProperty(new IntegerToken(_versionIndex >= 5 ? 7500 : 7400));
             header.AddNode(fbxVer);
             var encType = N("EncryptionType"); encType.AddProperty(new IntegerToken(0));
             header.AddNode(encType);
 
             var ts = N("CreationTimeStamp");
             AddSimpleNode(ts, "Version", 1000);
-            AddSimpleNode(ts, "Year", 1970);
-            AddSimpleNode(ts, "Month", 1);
-            AddSimpleNode(ts, "Day", 1);
-            AddSimpleNode(ts, "Hour", 10);
-            AddSimpleNode(ts, "Minute", 0);
-            AddSimpleNode(ts, "Second", 0);
-            AddSimpleNode(ts, "Millisecond", 0);
+            AddSimpleNode(ts, "Year", now.Year);
+            AddSimpleNode(ts, "Month", now.Month);
+            AddSimpleNode(ts, "Day", now.Day);
+            AddSimpleNode(ts, "Hour", now.Hour);
+            AddSimpleNode(ts, "Minute", now.Minute);
+            AddSimpleNode(ts, "Second", now.Second);
+            AddSimpleNode(ts, "Millisecond", now.Millisecond);
             header.AddNode(ts);
 
-            var creator = N("Creator"); creator.AddProperty(new StringToken("ModelExtractor - Neon Divide"));
+            var creator = N("Creator"); creator.AddProperty(new StringToken("AssetStudio"));
             header.AddNode(creator);
 
             var sceneInfo = N("SceneInfo");
-            sceneInfo.AddProperty(new StringToken("GlobalInfo\0\u0001SceneInfo"));
+            sceneInfo.AddProperty(new StringToken(FormatObjectName("GlobalInfo", "SceneInfo")));
             sceneInfo.AddProperty(new StringToken("UserData"));
             AddSimpleNode(sceneInfo, "Type", "UserData");
             AddSimpleNode(sceneInfo, "Version", 100);
@@ -1709,11 +2093,11 @@ namespace AssetStudio
             _document.AddNode(fileId);
 
             var cTime = N("CreationTime");
-            cTime.AddProperty(new StringToken("1970-01-01 10:00:00:000"));
+            cTime.AddProperty(new StringToken(now.ToString("yyyy-MM-dd HH:mm:ss:fff", System.Globalization.CultureInfo.InvariantCulture)));
             _document.AddNode(cTime);
 
             var topCreator = N("Creator");
-            topCreator.AddProperty(new StringToken("ModelExtractor - Neon Divide"));
+            topCreator.AddProperty(new StringToken("AssetStudio"));
             _document.AddNode(topCreator);
         }
 
@@ -1723,7 +2107,7 @@ namespace AssetStudio
             AddSimpleNode(docs, "Count", 1);
             var doc = N("Document");
             doc.AddProperty(new LongToken(GenId()));
-            doc.AddProperty(new StringToken("Scene\0\u0001Document"));
+            doc.AddProperty(new StringToken(FormatObjectName("Scene", "Document")));
             doc.AddProperty(new StringToken("Scene"));
             doc.AddNode(N("Properties70"));
             AddSimpleNode(doc, "RootNode", 0L);
@@ -1738,7 +2122,8 @@ namespace AssetStudio
         {
             var definitions = N("Definitions");
             AddSimpleNode(definitions, "Version", 100);
-            AddSimpleNode(definitions, "Count", 13);
+            _definitionsCountNode = N("Count");
+            definitions.AddNode(_definitionsCountNode);
 
             AddObjectType(definitions, "GlobalSettings");
             AddObjectType(definitions, "Model");
@@ -1761,8 +2146,42 @@ namespace AssetStudio
         {
             var objectType = N("ObjectType");
             objectType.AddProperty(new StringToken(typeName));
-            AddSimpleNode(objectType, "Count", 0);
+            var countNode = N("Count");
+            objectType.AddNode(countNode);
+            _definitionTypeCountNodes[typeName] = countNode;
             definitions.AddNode(objectType);
+        }
+
+        private void UpdateDefinitionsCounts()
+        {
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["GlobalSettings"] = 1
+            };
+
+            int totalCount = 1;
+            if (_objects?.Nodes != null)
+            {
+                for (int i = 0; i < _objects.Nodes.Length; i++)
+                {
+                    var node = _objects.Nodes[i];
+                    var typeName = node?.Identifier?.Value;
+                    if (string.IsNullOrEmpty(typeName))
+                        continue;
+
+                    counts.TryGetValue(typeName, out var existing);
+                    counts[typeName] = existing + 1;
+                    totalCount++;
+                }
+            }
+
+            _definitionsCountNode?.AddProperty(new IntegerToken(totalCount));
+
+            foreach (var kv in _definitionTypeCountNodes)
+            {
+                counts.TryGetValue(kv.Key, out var typeCount);
+                kv.Value.AddProperty(new IntegerToken(typeCount));
+            }
         }
 
         private void BuildTakes()
@@ -1797,6 +2216,7 @@ namespace AssetStudio
                     takes.AddNode(take);
                 }
             }
+            _document.AddNode(takes);
         }
 
         private void WriteExportReport(string exportPath, IImported convert)
@@ -1912,6 +2332,7 @@ namespace AssetStudio
             AddSimpleNode(gs, "Version", 1000);
 
             var props = N("Properties70");
+            _globalSettingsProps = props;
             props.AddNode(MakeIntP("UpAxis", 1));
             props.AddNode(MakeIntP("UpAxisSign", 1));
             props.AddNode(MakeIntP("FrontAxis", 2));
@@ -1924,17 +2345,97 @@ namespace AssetStudio
             props.AddNode(MakeStringP("source", "Unity3D"));
             props.AddNode(MakeStringP("platform", "Windows"));
 
+            double effectiveUnitScale = 100.0 * SanitizeDouble(scaleFactor);
+            if (effectiveUnitScale <= 0)
+                effectiveUnitScale = 100.0;
 
             var unitScale = N("P");
             unitScale.AddProperty(new StringToken("UnitScaleFactor"));
             unitScale.AddProperty(new StringToken("double"));
             unitScale.AddProperty(new StringToken("Number"));
             unitScale.AddProperty(new StringToken(""));
-            unitScale.AddProperty(new DoubleToken(scaleFactor));
+            unitScale.AddProperty(new DoubleToken(effectiveUnitScale));
             props.AddNode(unitScale);
+
+            var origUnitScale = N("P");
+            origUnitScale.AddProperty(new StringToken("OriginalUnitScaleFactor"));
+            origUnitScale.AddProperty(new StringToken("double"));
+            origUnitScale.AddProperty(new StringToken("Number"));
+            origUnitScale.AddProperty(new StringToken(""));
+            origUnitScale.AddProperty(new DoubleToken(effectiveUnitScale));
+            props.AddNode(origUnitScale);
 
             gs.AddNode(props);
             _document.AddNode(gs);
+        }
+
+        private void UpdateGlobalSettingsTiming(IImported convert)
+        {
+            if (_globalSettingsProps == null)
+                return;
+
+            double fps = _is60Fps ? 60.0 : 30.0;
+            if (convert.AnimationList != null)
+            {
+                for (int i = 0; i < convert.AnimationList.Count; i++)
+                {
+                    var sr = convert.AnimationList[i].SampleRate;
+                    if (sr > 0f && !float.IsNaN(sr) && !float.IsInfinity(sr))
+                    {
+                        fps = sr;
+                        break;
+                    }
+                }
+            }
+
+            int timeMode;
+            if (Math.Abs(fps - 30.0) < 1e-3)
+            {
+                timeMode = 6; // eFrames30
+                fps = 30.0;
+            }
+            else if (Math.Abs(fps - 60.0) < 1e-3)
+            {
+                timeMode = 14; // eFrames60
+                fps = 60.0;
+            }
+            else
+            {
+                timeMode = 11; // eCustom
+            }
+
+            long maxStop = 0;
+            for (int i = 0; i < _takes.Count; i++)
+            {
+                if (_takes[i].Stop > maxStop)
+                    maxStop = _takes[i].Stop;
+            }
+            if (maxStop <= 0)
+            {
+                maxStop = 46186158000L;
+            }
+
+            _globalSettingsProps.AddNode(MakeEnumP("TimeMode", timeMode));
+            var customFpsNode = N("P");
+            customFpsNode.AddProperty(new StringToken("CustomFrameRate"));
+            customFpsNode.AddProperty(new StringToken("double"));
+            customFpsNode.AddProperty(new StringToken("Number"));
+            customFpsNode.AddProperty(new StringToken(""));
+            customFpsNode.AddProperty(new DoubleToken(SanitizeDouble(fps)));
+            _globalSettingsProps.AddNode(customFpsNode);
+            _globalSettingsProps.AddNode(MakeTimeP("TimeSpanStart", 0));
+            _globalSettingsProps.AddNode(MakeTimeP("TimeSpanStop", maxStop));
+        }
+
+        private FbxNode MakeEnumP(string name, int value)
+        {
+            var p = N("P");
+            p.AddProperty(new StringToken(name));
+            p.AddProperty(new StringToken("enum"));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new StringToken(""));
+            p.AddProperty(new IntegerToken(value));
+            return p;
         }
 
         private void Connect(long childId, long parentId)
