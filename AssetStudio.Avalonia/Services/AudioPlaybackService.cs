@@ -264,7 +264,8 @@ namespace AssetStudio.Avalonia.Services
                 preferTranscode,
                 cancellationToken,
                 tempDirectory,
-                transcoder);
+                transcoder,
+                audioClip.m_SubsoundIndex);
         }
 
         public static AudioPreviewSource? PrepareRawAudioData(
@@ -275,7 +276,8 @@ namespace AssetStudio.Avalonia.Services
             bool preferTranscode,
             CancellationToken cancellationToken,
             string? tempDirectory = null,
-            TranscodeToWavDelegate? transcoder = null)
+            TranscodeToWavDelegate? transcoder = null,
+            int subsoundIndex = 0)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (audioData == null || audioData.Length == 0)
@@ -284,14 +286,16 @@ namespace AssetStudio.Avalonia.Services
             }
 
             var normalizedFallback = AudioPreviewMedia.NormalizeExtension(fallbackExtension);
-            var analysis = AnalyzeAudioData(audioData, normalizedFallback, metadataDurationMs);
+            var analysis = AnalyzeAudioData(audioData, normalizedFallback, metadataDurationMs, subsoundIndex);
             cancellationToken.ThrowIfCancellationRequested();
 
             var sampleData = analysis.RebuiltData ?? audioData;
             var formatExtension = analysis.Extension;
             var durationMs = analysis.DurationMs > 0 ? analysis.DurationMs : Math.Max(0, metadataDurationMs);
             var sourceDescription = analysis.DecodedFromFsb
-                ? "FSB5 -> WAV (PCM)"
+                ? (string.Equals(formatExtension, ".ogg", StringComparison.OrdinalIgnoreCase)
+                    ? "FSB5 -> OGG (Vorbis)"
+                    : "FSB5 -> WAV (PCM)")
                 : formatExtension.ToUpperInvariant().TrimStart('.');
 
             if (ShouldTranscodeAudioForPreview(formatExtension, preferTranscode))
@@ -340,7 +344,7 @@ namespace AssetStudio.Avalonia.Services
             return new AudioPreviewSource(sampleData, formatExtension, durationMs, sourceDescription);
         }
 
-        public static AudioPreviewAnalysisResult AnalyzeAudioData(byte[] audioData, string fallbackExtension, long metadataDurationMs = 0)
+        public static AudioPreviewAnalysisResult AnalyzeAudioData(byte[] audioData, string fallbackExtension, long metadataDurationMs = 0, int subsoundIndex = 0)
         {
             byte[]? rebuiltData = null;
             var rebuiltExtension = AudioPreviewMedia.NormalizeExtension(fallbackExtension);
@@ -350,7 +354,7 @@ namespace AssetStudio.Avalonia.Services
             {
                 try
                 {
-                    rebuiltData = UnityAudioDecoder.ConvertToWav(audioData);
+                    rebuiltData = UnityAudioDecoder.ConvertToWav(audioData, subsoundIndex);
                     if (rebuiltData != null && rebuiltData.Length > 0)
                     {
                         rebuiltExtension = ".wav";
@@ -358,7 +362,16 @@ namespace AssetStudio.Avalonia.Services
                     }
                     else
                     {
-                        rebuiltData = null;
+                        rebuiltData = UnityAudioDecoder.ConvertToOgg(audioData, subsoundIndex);
+                        if (rebuiltData != null && rebuiltData.Length > 0)
+                        {
+                            rebuiltExtension = ".ogg";
+                            decodedFromFsb = true;
+                        }
+                        else
+                        {
+                            rebuiltData = null;
+                        }
                     }
                 }
                 catch

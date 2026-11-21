@@ -1878,6 +1878,16 @@ namespace AssetStudio.Avalonia.Services
                         }
                     }
 
+                    // For FSB5 Vorbis clips (either ConvertAudio=false or when WAV transcoding was unavailable),
+                    // export reconstructed standard Ogg Vorbis (.ogg) instead of raw unplayable .fsb.
+                    var oggBuffer = UnityAudioDecoder.ConvertToOgg(m_AudioData, m_AudioClip.m_SubsoundIndex);
+                    if (oggBuffer != null && oggBuffer.Length > 0)
+                    {
+                        if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".ogg", item, out var oggPath)) return false;
+                        WriteBytesExport(oggPath, oggBuffer);
+                        return true;
+                    }
+
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, converter.GetExtensionName(), item, out var filePath)) return false;
                     WriteBytesExport(filePath, m_AudioData);
                     return true;
@@ -2479,13 +2489,18 @@ namespace AssetStudio.Avalonia.Services
                     return fsbWav;
                 }
 
-                // Fallback to FFmpegAudioTranscoder for compressed FSB5 payloads (e.g. Vorbis/MPEG/Opus)
+                // Reconstruct FSB5 Vorbis -> standard Ogg Vorbis (.ogg) before handing to FFmpeg
+                var fsbOgg = UnityAudioDecoder.ConvertToOgg(data, audioClip.m_SubsoundIndex);
+                var transcodeInputData = (fsbOgg != null && fsbOgg.Length > 0) ? fsbOgg : data;
+                var transcodeInputExtension = (fsbOgg != null && fsbOgg.Length > 0) ? ".ogg" : ".fsb";
+
+                // Fallback to FFmpegAudioTranscoder for compressed FSB5 payloads (e.g. reconstructed Ogg Vorbis / MPEG / Opus)
                 var workDir = string.IsNullOrEmpty(tempDirectory) ? Path.GetTempPath() : tempDirectory;
-                var inputPath = MediaTempFiles.CreateUniquePath(workDir, "assetstudio_export_audio_in_", ".fsb");
+                var inputPath = MediaTempFiles.CreateUniquePath(workDir, "assetstudio_export_audio_in_", transcodeInputExtension);
                 var outputPath = MediaTempFiles.CreateUniquePath(workDir, "assetstudio_export_audio_out_", ".wav");
                 try
                 {
-                    File.WriteAllBytes(inputPath, data);
+                    File.WriteAllBytes(inputPath, transcodeInputData);
                     bool succeeded = transcoder != null
                         ? transcoder(inputPath, outputPath, CancellationToken.None)
                         : FFmpegAudioTranscoder.TryTranscodeToPcmWav(inputPath, outputPath, CancellationToken.None).Success;

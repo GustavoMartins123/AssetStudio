@@ -24,6 +24,16 @@ namespace AssetStudio
             return null;
         }
 
+        public byte[]? ConvertToOgg()
+        {
+            var audioData = m_AudioClip.m_AudioData.GetData();
+            if (audioData != null && audioData.Length > 0)
+            {
+                return UnityAudioDecoder.ConvertToOgg(audioData, m_AudioClip.m_SubsoundIndex);
+            }
+            return null;
+        }
+
 
         public string GetExtensionName()
         {

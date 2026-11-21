@@ -138,6 +138,64 @@ namespace AssetStudio
 
         private const long MaxPcmSamples = 256L * 1024L * 1024L;
 
+        public static UnityAudioCodec DetectFsb5Codec(byte[]? containerData)
+        {
+            if (containerData == null
+                || containerData.Length < 28
+                || containerData[0] != (byte)'F'
+                || containerData[1] != (byte)'S'
+                || containerData[2] != (byte)'B'
+                || containerData[3] != (byte)'5')
+            {
+                return UnityAudioCodec.None;
+            }
+
+            return (UnityAudioCodec)ReadUInt32LE(containerData, 24);
+        }
+
+        public static byte[]? ConvertToOgg(byte[] containerData)
+        {
+            return ConvertToOgg(containerData, 0);
+        }
+
+        public static byte[]? ConvertToOgg(byte[] containerData, int subsoundIndex)
+        {
+            if (!TryExtractFsb5Sample(containerData, subsoundIndex, out var codec, out var activeSample, out int sampleOffset, out int sampleSize))
+            {
+                return null;
+            }
+
+            if (codec != UnityAudioCodec.Vorbis)
+            {
+                return null;
+            }
+
+            return Fsb5VorbisReconstructor.ReconstructOgg(activeSample, containerData.AsSpan(sampleOffset, sampleSize));
+        }
+
+        public static bool TryDecode(byte[] containerData, int subsoundIndex, out byte[] decodedData, out string extension)
+        {
+            var wav = ConvertToWav(containerData, subsoundIndex);
+            if (wav != null && wav.Length > 0)
+            {
+                decodedData = wav;
+                extension = ".wav";
+                return true;
+            }
+
+            var ogg = ConvertToOgg(containerData, subsoundIndex);
+            if (ogg != null && ogg.Length > 0)
+            {
+                decodedData = ogg;
+                extension = ".ogg";
+                return true;
+            }
+
+            decodedData = Array.Empty<byte>();
+            extension = string.Empty;
+            return false;
+        }
+
         public static byte[]? ConvertToWav(byte[] containerData)
         {
             return ConvertToWav(containerData, 0);
@@ -145,206 +203,237 @@ namespace AssetStudio
 
         public static byte[]? ConvertToWav(byte[] containerData, int subsoundIndex)
         {
-            if (containerData == null || containerData.Length < 60 || subsoundIndex < 0)
+            if (!TryExtractFsb5Sample(containerData, subsoundIndex, out var codec, out var activeSample, out int sampleOffset, out int sampleSize))
+            {
+                return null;
+            }
+
+            if (codec == UnityAudioCodec.Vorbis)
+            {
+                return null;
+            }
+
+            byte[] sampleBytes = new byte[sampleSize];
+            Array.Copy(containerData, sampleOffset, sampleBytes, 0, sampleSize);
+
+            short[]? decodedPcm = null;
+
+            if (codec == UnityAudioCodec.ImaAdpcm)
+            {
+                long totalSamples = (long)activeSample.SampleCount * activeSample.NumChannels;
+                long maxAllowedSamples = (long)sampleSize * 2 + 64L * activeSample.NumChannels;
+                if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
+                    return null;
+
+                if (activeSample.NumChannels >= 2)
+                {
+                    decodedPcm = DecodeImaAdpcmInterleaved(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels);
+                }
+                else
+                {
+                    decodedPcm = DecodeImaAdpcmMono(sampleBytes, (int)activeSample.SampleCount);
+                }
+            }
+            else if (codec == UnityAudioCodec.Fadpcm)
+            {
+                decodedPcm = DecodeFadpcm(sampleBytes, activeSample.NumChannels);
+            }
+            else if (codec == UnityAudioCodec.Gcadpcm)
+            {
+                long totalSamples = (long)activeSample.SampleCount * activeSample.NumChannels;
+                long maxAllowedSamples = (long)sampleSize * 2 + 64L * activeSample.NumChannels;
+                if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
+                    return null;
+
+                // Find DSPCOEFF chunk (type 7)
+                UnityAudioChunk? dspCoeffChunk = activeSample.Chunks.Find(c => c.ChunkType == 7);
+                if (dspCoeffChunk != null)
+                {
+                    var dspCoeffs = ParseDspCoefficients(dspCoeffChunk.Data, activeSample.NumChannels);
+                    decodedPcm = DecodeGcadpcm(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels, dspCoeffs);
+                }
+            }
+            else if (codec == UnityAudioCodec.Pcm8
+                || codec == UnityAudioCodec.Pcm16
+                || codec == UnityAudioCodec.Pcm24
+                || codec == UnityAudioCodec.Pcm32
+                || codec == UnityAudioCodec.PcmFloat)
+            {
+                int bytesPerSample = codec switch
+                {
+                    UnityAudioCodec.Pcm8 => 1,
+                    UnityAudioCodec.Pcm16 => 2,
+                    UnityAudioCodec.Pcm24 => 3,
+                    UnityAudioCodec.Pcm32 => 4,
+                    UnityAudioCodec.PcmFloat => 4,
+                    _ => 2
+                };
+                long sampleLength64 = (long)activeSample.SampleCount * activeSample.NumChannels;
+                long maxSamplesFromPayload = sampleSize / bytesPerSample + 1024;
+                if (sampleLength64 <= 0 || sampleLength64 > MaxPcmSamples || sampleLength64 > maxSamplesFromPayload)
+                    return null;
+
+                int sampleLength = (int)sampleLength64;
+                decodedPcm = new short[sampleLength];
+                for (int i = 0; i < sampleLength; i++)
+                {
+                    int srcOffset = i * bytesPerSample;
+                    if (srcOffset + bytesPerSample <= sampleBytes.Length)
+                    {
+                        if (codec == UnityAudioCodec.Pcm8)
+                        {
+                            // Convert unsigned 8-bit to signed 16-bit
+                            decodedPcm[i] = (short)((sampleBytes[srcOffset] - 128) * 256);
+                        }
+                        else if (codec == UnityAudioCodec.Pcm16)
+                        {
+                            decodedPcm[i] = ReadInt16LE(sampleBytes, srcOffset);
+                        }
+                        else if (codec == UnityAudioCodec.Pcm24)
+                        {
+                            // Signed 24-bit little-endian: top 16 bits map directly to signed 16-bit PCM
+                            decodedPcm[i] = (short)(sampleBytes[srcOffset + 1] | (sampleBytes[srcOffset + 2] << 8));
+                        }
+                        else if (codec == UnityAudioCodec.Pcm32)
+                        {
+                            int val32 = (int)ReadUInt32LE(sampleBytes, srcOffset);
+                            decodedPcm[i] = (short)(val32 >> 16);
+                        }
+                        else if (codec == UnityAudioCodec.PcmFloat)
+                        {
+                            float f = BitConverter.Int32BitsToSingle((int)ReadUInt32LE(sampleBytes, srcOffset));
+                            if (float.IsNaN(f))
+                            {
+                                decodedPcm[i] = 0;
+                            }
+                            else
+                            {
+                                float clamped = Math.Clamp(f, -1f, 1f);
+                                float scaled = clamped < 0f ? clamped * 32768f : clamped * 32767f;
+                                decodedPcm[i] = (short)Math.Clamp((int)MathF.Round(scaled), short.MinValue, short.MaxValue);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (decodedPcm == null || decodedPcm.Length == 0)
                 return null;
 
-            using (var stream = new MemoryStream(containerData))
-            using (var reader = new BinaryReader(stream))
+            return CreateWavFile(decodedPcm, activeSample.Frequency, activeSample.NumChannels);
+        }
+
+        private static bool TryExtractFsb5Sample(
+            byte[] containerData,
+            int subsoundIndex,
+            out UnityAudioCodec codec,
+            out UnityAudioSampleMetadata activeSample,
+            out int sampleOffset,
+            out int sampleSize)
+        {
+            codec = UnityAudioCodec.None;
+            activeSample = null!;
+            sampleOffset = 0;
+            sampleSize = 0;
+
+            if (containerData == null || containerData.Length < 60 || subsoundIndex < 0)
+                return false;
+
+            using var stream = new MemoryStream(containerData);
+            using var reader = new BinaryReader(stream);
+
+            // Parse container header
+            var magicBytes = reader.ReadBytes(4);
+            string magic = Encoding.ASCII.GetString(magicBytes);
+            if (magic != "FSB5")
+                return false;
+
+            uint version = reader.ReadUInt32();
+            uint numSamples = reader.ReadUInt32();
+            uint sizeOfSampleHeaders = reader.ReadUInt32();
+            uint sizeOfNameTable = reader.ReadUInt32();
+            uint sizeOfData = reader.ReadUInt32();
+            uint codecValue = reader.ReadUInt32();
+            codec = (UnityAudioCodec)codecValue;
+
+            uint headerSize = (version == 0) ? 64u : 60u;
+            long sampleHeadersEnd = (long)headerSize + sizeOfSampleHeaders;
+            long audioDataStart = sampleHeadersEnd + sizeOfNameTable;
+            if (containerData.Length < headerSize
+                || numSamples == 0
+                || subsoundIndex >= numSamples
+                || (long)numSamples * 8 > sizeOfSampleHeaders
+                || sampleHeadersEnd > containerData.Length
+                || audioDataStart > containerData.Length)
             {
-                // Parse container header
-                var magicBytes = reader.ReadBytes(4);
-                string magic = Encoding.ASCII.GetString(magicBytes);
-                if (magic != "FSB5")
-                    return null;
-
-                uint version = reader.ReadUInt32();
-                uint numSamples = reader.ReadUInt32();
-                uint sizeOfSampleHeaders = reader.ReadUInt32();
-                uint sizeOfNameTable = reader.ReadUInt32();
-                uint sizeOfData = reader.ReadUInt32();
-                uint codecValue = reader.ReadUInt32();
-                var codec = (UnityAudioCodec)codecValue;
-
-                uint headerSize = (version == 0) ? 64u : 60u;
-                long sampleHeadersEnd = (long)headerSize + sizeOfSampleHeaders;
-                long audioDataStart = sampleHeadersEnd + sizeOfNameTable;
-                if (containerData.Length < headerSize
-                    || numSamples == 0
-                    || subsoundIndex >= numSamples
-                    || (long)numSamples * 8 > sizeOfSampleHeaders
-                    || sampleHeadersEnd > containerData.Length
-                    || audioDataStart > containerData.Length)
-                {
-                    return null;
-                }
-
-                // Read sample headers and their immediately-following chunks in FSB5 wire order
-                stream.Position = headerSize;
-                var sampleMetadatas = new List<UnityAudioSampleMetadata>((int)numSamples);
-                for (int i = 0; i < numSamples; i++)
-                {
-                    if (stream.Position + 8 > sampleHeadersEnd)
-                        return null;
-                    var meta = new UnityAudioSampleMetadata();
-                    meta.Read(reader);
-                    if (meta.HasAnyChunks)
-                    {
-                        bool moreChunks = true;
-                        while (moreChunks)
-                        {
-                            if (stream.Position + 4 > sampleHeadersEnd)
-                                return null;
-                            uint rawChunk = reader.ReadUInt32();
-                            moreChunks = (rawChunk & 1) == 1;
-                            uint chunkSize = (rawChunk >> 1) & 0xFFFFFF;
-                            uint chunkType = (rawChunk >> 25) & 0x7F;
-                            if (chunkSize > sampleHeadersEnd - stream.Position)
-                                return null;
-                            byte[] chunkData = reader.ReadBytes((int)chunkSize);
-                            if (chunkData.Length < chunkSize)
-                                return null;
-                            meta.Chunks.Add(new UnityAudioChunk(chunkType, chunkData));
-
-                            // Override frequency if FREQUENCY chunk (type 2)
-                            if (chunkType == 2 && chunkData.Length >= 4)
-                            {
-                                meta.FrequencyId = BitConverter.ToUInt32(chunkData, 0);
-                            }
-                            // Override channel count if CHANNELS chunk (type 1)
-                            else if (chunkType == 1 && chunkData.Length >= 1)
-                            {
-                                meta.NumChannels = chunkData[0];
-                                meta.IsStereo = meta.NumChannels == 2;
-                            }
-                        }
-                    }
-                    sampleMetadatas.Add(meta);
-                }
-
-                var activeSample = sampleMetadatas[subsoundIndex];
-                if (activeSample.NumChannels <= 0 || activeSample.NumChannels > 16 || activeSample.Frequency <= 0)
-                    return null;
-
-                long sampleOffset = audioDataStart + activeSample.DataOffset;
-                long nextDataOffset = (subsoundIndex + 1 < sampleMetadatas.Count)
-                    ? sampleMetadatas[subsoundIndex + 1].DataOffset
-                    : sizeOfData;
-                long sampleSize = nextDataOffset - activeSample.DataOffset;
-
-                if (sampleOffset < 0 || sampleSize <= 0 || sampleSize > int.MaxValue || sampleOffset > containerData.Length - sampleSize)
-                {
-                    return null;
-                }
-
-                byte[] sampleBytes = new byte[sampleSize];
-                Array.Copy(containerData, sampleOffset, sampleBytes, 0, sampleSize);
-
-                short[]? decodedPcm = null;
-
-                if (codec == UnityAudioCodec.ImaAdpcm)
-                {
-                    long totalSamples = (long)activeSample.SampleCount * activeSample.NumChannels;
-                    long maxAllowedSamples = sampleSize * 2 + 64L * activeSample.NumChannels;
-                    if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
-                        return null;
-
-                    if (activeSample.NumChannels >= 2)
-                    {
-                        decodedPcm = DecodeImaAdpcmInterleaved(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels);
-                    }
-                    else
-                    {
-                        decodedPcm = DecodeImaAdpcmMono(sampleBytes, (int)activeSample.SampleCount);
-                    }
-                }
-                else if (codec == UnityAudioCodec.Fadpcm)
-                {
-                    decodedPcm = DecodeFadpcm(sampleBytes, activeSample.NumChannels);
-                }
-                else if (codec == UnityAudioCodec.Gcadpcm)
-                {
-                    long totalSamples = (long)activeSample.SampleCount * activeSample.NumChannels;
-                    long maxAllowedSamples = sampleSize * 2 + 64L * activeSample.NumChannels;
-                    if (activeSample.SampleCount == 0 || activeSample.SampleCount > int.MaxValue || totalSamples <= 0 || totalSamples > MaxPcmSamples || totalSamples > maxAllowedSamples)
-                        return null;
-
-                    // Find DSPCOEFF chunk (type 7)
-                    UnityAudioChunk? dspCoeffChunk = activeSample.Chunks.Find(c => c.ChunkType == 7);
-                    if (dspCoeffChunk != null)
-                    {
-                        var dspCoeffs = ParseDspCoefficients(dspCoeffChunk.Data, activeSample.NumChannels);
-                        decodedPcm = DecodeGcadpcm(sampleBytes, (int)activeSample.SampleCount, activeSample.NumChannels, dspCoeffs);
-                    }
-                }
-                else if (codec == UnityAudioCodec.Pcm8
-                    || codec == UnityAudioCodec.Pcm16
-                    || codec == UnityAudioCodec.Pcm24
-                    || codec == UnityAudioCodec.Pcm32
-                    || codec == UnityAudioCodec.PcmFloat)
-                {
-                    int bytesPerSample = codec switch
-                    {
-                        UnityAudioCodec.Pcm8 => 1,
-                        UnityAudioCodec.Pcm16 => 2,
-                        UnityAudioCodec.Pcm24 => 3,
-                        UnityAudioCodec.Pcm32 => 4,
-                        UnityAudioCodec.PcmFloat => 4,
-                        _ => 2
-                    };
-                    long sampleLength64 = (long)activeSample.SampleCount * activeSample.NumChannels;
-                    long maxSamplesFromPayload = sampleSize / bytesPerSample + 1024;
-                    if (sampleLength64 <= 0 || sampleLength64 > MaxPcmSamples || sampleLength64 > maxSamplesFromPayload)
-                        return null;
-
-                    int sampleLength = (int)sampleLength64;
-                    decodedPcm = new short[sampleLength];
-                    for (int i = 0; i < sampleLength; i++)
-                    {
-                        int srcOffset = i * bytesPerSample;
-                        if (srcOffset + bytesPerSample <= sampleBytes.Length)
-                        {
-                            if (codec == UnityAudioCodec.Pcm8)
-                            {
-                                // Convert unsigned 8-bit to signed 16-bit
-                                decodedPcm[i] = (short)((sampleBytes[srcOffset] - 128) * 256);
-                            }
-                            else if (codec == UnityAudioCodec.Pcm16)
-                            {
-                                decodedPcm[i] = ReadInt16LE(sampleBytes, srcOffset);
-                            }
-                            else if (codec == UnityAudioCodec.Pcm24)
-                            {
-                                // Signed 24-bit little-endian: top 16 bits map directly to signed 16-bit PCM
-                                decodedPcm[i] = (short)(sampleBytes[srcOffset + 1] | (sampleBytes[srcOffset + 2] << 8));
-                            }
-                            else if (codec == UnityAudioCodec.Pcm32)
-                            {
-                                int val32 = (int)ReadUInt32LE(sampleBytes, srcOffset);
-                                decodedPcm[i] = (short)(val32 >> 16);
-                            }
-                            else if (codec == UnityAudioCodec.PcmFloat)
-                            {
-                                float f = BitConverter.Int32BitsToSingle((int)ReadUInt32LE(sampleBytes, srcOffset));
-                                if (float.IsNaN(f))
-                                {
-                                    decodedPcm[i] = 0;
-                                }
-                                else
-                                {
-                                    float clamped = Math.Clamp(f, -1f, 1f);
-                                    float scaled = clamped < 0f ? clamped * 32768f : clamped * 32767f;
-                                    decodedPcm[i] = (short)Math.Clamp((int)MathF.Round(scaled), short.MinValue, short.MaxValue);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (decodedPcm == null || decodedPcm.Length == 0)
-                    return null;
-
-                return CreateWavFile(decodedPcm, activeSample.Frequency, activeSample.NumChannels);
+                return false;
             }
+
+            // Read sample headers and their immediately-following chunks in FSB5 wire order
+            stream.Position = headerSize;
+            var sampleMetadatas = new List<UnityAudioSampleMetadata>((int)numSamples);
+            for (int i = 0; i < numSamples; i++)
+            {
+                if (stream.Position + 8 > sampleHeadersEnd)
+                    return false;
+                var meta = new UnityAudioSampleMetadata();
+                meta.Read(reader);
+                if (meta.HasAnyChunks)
+                {
+                    bool moreChunks = true;
+                    while (moreChunks)
+                    {
+                        if (stream.Position + 4 > sampleHeadersEnd)
+                            return false;
+                        uint rawChunk = reader.ReadUInt32();
+                        moreChunks = (rawChunk & 1) == 1;
+                        uint chunkSize = (rawChunk >> 1) & 0xFFFFFF;
+                        uint chunkType = (rawChunk >> 25) & 0x7F;
+                        if (chunkSize > sampleHeadersEnd - stream.Position)
+                            return false;
+                        byte[] chunkData = reader.ReadBytes((int)chunkSize);
+                        if (chunkData.Length < chunkSize)
+                            return false;
+                        meta.Chunks.Add(new UnityAudioChunk(chunkType, chunkData));
+
+                        // Override frequency if FREQUENCY chunk (type 2)
+                        if (chunkType == 2 && chunkData.Length >= 4)
+                        {
+                            meta.FrequencyId = BitConverter.ToUInt32(chunkData, 0);
+                        }
+                        // Override channel count if CHANNELS chunk (type 1)
+                        else if (chunkType == 1 && chunkData.Length >= 1)
+                        {
+                            meta.NumChannels = chunkData[0];
+                            meta.IsStereo = meta.NumChannels == 2;
+                        }
+                    }
+                }
+                sampleMetadatas.Add(meta);
+            }
+
+            activeSample = sampleMetadatas[subsoundIndex];
+            if (activeSample.NumChannels <= 0 || activeSample.NumChannels > 16 || activeSample.Frequency <= 0)
+                return false;
+
+            long sampleOffset64 = audioDataStart + activeSample.DataOffset;
+            long nextDataOffset = (subsoundIndex + 1 < sampleMetadatas.Count)
+                ? sampleMetadatas[subsoundIndex + 1].DataOffset
+                : sizeOfData;
+            long sampleSize64 = nextDataOffset - activeSample.DataOffset;
+
+            if (sampleOffset64 < 0
+                || sampleOffset64 > int.MaxValue
+                || sampleSize64 <= 0
+                || sampleSize64 > int.MaxValue
+                || sampleOffset64 > containerData.Length - sampleSize64)
+            {
+                return false;
+            }
+
+            sampleOffset = (int)sampleOffset64;
+            sampleSize = (int)sampleSize64;
+            return true;
         }
 
         private static short[] DecodeImaAdpcmInterleaved(byte[] sampleBytes, int sampleCount, int channels)
