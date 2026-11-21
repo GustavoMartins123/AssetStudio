@@ -36,16 +36,39 @@ public partial class MainWindow
     }
 
     private Task<string?> PickSaveFbxDialogAsync(string title, string suggestedFileName)
+        => PickSaveModelDialogAsync(title, suggestedFileName);
+
+    private Task<string?> PickSaveModelDialogAsync(string title, string suggestedFileName)
     {
+        var defaultExt = AssetExportService.GetModelFileExtension(exportOptions).TrimStart('.');
+        var filters = exportOptions.ModelFormat switch
+        {
+            ModelExportFormat.Glb => new[]
+            {
+                new FileTypeFilterSpec("glTF Binary (.glb)", "*.glb"),
+                new FileTypeFilterSpec("glTF Separate (.gltf)", "*.gltf"),
+                new FileTypeFilterSpec("FBX file (.fbx)", "*.fbx")
+            },
+            ModelExportFormat.Gltf => new[]
+            {
+                new FileTypeFilterSpec("glTF Separate (.gltf)", "*.gltf"),
+                new FileTypeFilterSpec("glTF Binary (.glb)", "*.glb"),
+                new FileTypeFilterSpec("FBX file (.fbx)", "*.fbx")
+            },
+            _ => new[]
+            {
+                new FileTypeFilterSpec("FBX file (.fbx)", "*.fbx"),
+                new FileTypeFilterSpec("glTF Binary (.glb)", "*.glb"),
+                new FileTypeFilterSpec("glTF Separate (.gltf)", "*.gltf")
+            }
+        };
+
         return ViewModel.DialogService.PickSaveFileAsync(new SaveFilePickerRequest(
             title: title,
             suggestedFileName: suggestedFileName,
-            defaultExtension: "fbx",
+            defaultExtension: defaultExt,
             suggestedStartDirectory: appSettings.ExportFolderPath,
-            fileTypeFilters: new[]
-            {
-                new FileTypeFilterSpec("Fbx file", "*.fbx")
-            }));
+            fileTypeFilters: filters));
     }
 
     private void SaveLoadFolder(string path)

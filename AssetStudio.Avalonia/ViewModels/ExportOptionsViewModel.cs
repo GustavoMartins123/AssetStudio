@@ -19,6 +19,13 @@ namespace AssetStudio.Avalonia.ViewModels
 
         private static readonly string[] TextureFormatChoices = Enum.GetNames<ImageFormat>();
 
+        private static readonly string[] ModelFormatChoices =
+        {
+            "FBX (.fbx)",
+            "glTF Binary (.glb)",
+            "glTF Separate (.gltf)"
+        };
+
         private static readonly string[] FbxVersionChoices =
         {
             "FBX 6.1",
@@ -56,6 +63,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _boneSizeText = string.Empty;
         private decimal _scaleFactor;
         private string _scaleFactorText = string.Empty;
+        private ModelExportFormat _modelFormat;
         private int _fbxVersion;
         private int _fbxFormat;
         private bool _exportUnityMeta;
@@ -92,6 +100,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public IReadOnlyList<string> AssetGroupingOptions => AssetGroupingChoices;
 
         public IReadOnlyList<string> TextureFormatOptions => TextureFormatChoices;
+
+        public IReadOnlyList<string> ModelFormatOptions => ModelFormatChoices;
 
         public IReadOnlyList<string> FbxVersionOptions => FbxVersionChoices;
 
@@ -302,6 +312,28 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        public ModelExportFormat ModelFormat
+        {
+            get => _modelFormat;
+            set
+            {
+                var clamped = (ModelExportFormat)Math.Clamp((int)value, 0, ModelFormatChoices.Length - 1);
+                if (SetProperty(ref _modelFormat, clamped))
+                {
+                    OnPropertyChanged(nameof(ModelFormatIndex));
+                    OnPropertyChanged(nameof(IsFbxFormatSelected));
+                }
+            }
+        }
+
+        public int ModelFormatIndex
+        {
+            get => Math.Clamp((int)_modelFormat, 0, ModelFormatChoices.Length - 1);
+            set => ModelFormat = (ModelExportFormat)Math.Clamp(value, 0, ModelFormatChoices.Length - 1);
+        }
+
+        public bool IsFbxFormatSelected => _modelFormat == ModelExportFormat.Fbx;
+
         public int FbxVersion
         {
             get => _fbxVersion;
@@ -382,6 +414,7 @@ namespace AssetStudio.Avalonia.ViewModels
             _scaleFactorText = source.ScaleFactor.ToString(CultureInfo.InvariantCulture);
             OnPropertyChanged(nameof(ScaleFactor));
             OnPropertyChanged(nameof(ScaleFactorText));
+            ModelFormat = source.ModelFormat;
             FbxVersion = source.FbxVersion;
             FbxFormat = source.FbxFormat;
             ExportUnityMeta = source.ExportUnityMeta;
@@ -408,6 +441,7 @@ namespace AssetStudio.Avalonia.ViewModels
             destination.CombineMeshes = CombineMeshes;
             destination.BoneSize = TryParseNonNegativeDecimal(BoneSizeText, out var bone) ? bone : BoneSize;
             destination.ScaleFactor = TryParsePositiveDecimal(ScaleFactorText, out var scale) ? scale : ScaleFactor;
+            destination.ModelFormat = ModelFormat;
             destination.FbxVersion = Math.Clamp(FbxVersion, 0, FbxVersionChoices.Length - 1);
             destination.FbxFormat = Math.Clamp(FbxFormat, 0, FbxFormatChoices.Length - 1);
             destination.ExportUnityMeta = ExportUnityMeta;

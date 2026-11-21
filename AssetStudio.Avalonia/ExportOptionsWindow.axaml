@@ -6,7 +6,7 @@
         x:DataType="vm:ExportOptionsViewModel"
         Title="Export options"
         Width="420"
-        Height="660"
+        Height="700"
         WindowStartupLocation="CenterOwner"
         CanResize="False">
 
@@ -34,21 +34,29 @@
 
             <Border Height="1" Margin="0,4" Background="Gray" />
 
-            <TextBlock Text="FBX" />
+            <TextBlock Text="3D Model Export" />
+
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Model format" Width="130" VerticalAlignment="Center" />
+                <ComboBox ItemsSource="{Binding ModelFormatOptions}"
+                          SelectedIndex="{Binding ModelFormatIndex, Mode=TwoWay}" />
+            </StackPanel>
+
             <CheckBox Content="Export skins"
                       IsChecked="{Binding ExportSkins, Mode=TwoWay}" />
             <CheckBox Content="Export animations"
                       IsChecked="{Binding ExportAnimations, Mode=TwoWay}" />
-            <CheckBox Content="Export animations as separate FBX files"
+            <CheckBox Content="Export animations as separate model files"
                       IsChecked="{Binding ExportAnimationsSplit, Mode=TwoWay}" />
             <CheckBox Content="Export blend shapes"
                       IsChecked="{Binding ExportBlendShape, Mode=TwoWay}" />
             <CheckBox Content="Cast to bone"
-                      IsChecked="{Binding CastToBone, Mode=TwoWay}" />
+                      IsChecked="{Binding CastToBone, Mode=TwoWay}"
+                      IsEnabled="{Binding IsFbxFormatSelected}" />
             <CheckBox Content="Combine meshes into single mesh"
                       IsChecked="{Binding CombineMeshes, Mode=TwoWay}" />
 
-            <StackPanel Orientation="Horizontal" Spacing="8">
+            <StackPanel Orientation="Horizontal" Spacing="8" IsEnabled="{Binding IsFbxFormatSelected}">
                 <TextBlock Text="Bone size" Width="130" VerticalAlignment="Center" />
                 <TextBox Width="90" Text="{Binding BoneSizeText, Mode=TwoWay}" />
             </StackPanel>
@@ -58,13 +66,13 @@
                 <TextBox Width="90" Text="{Binding ScaleFactorText, Mode=TwoWay}" />
             </StackPanel>
 
-            <StackPanel Orientation="Horizontal" Spacing="8">
+            <StackPanel Orientation="Horizontal" Spacing="8" IsEnabled="{Binding IsFbxFormatSelected}">
                 <TextBlock Text="FBX version" Width="130" VerticalAlignment="Center" />
                 <ComboBox ItemsSource="{Binding FbxVersionOptions}"
                           SelectedIndex="{Binding FbxVersion, Mode=TwoWay}" />
             </StackPanel>
 
-            <StackPanel Orientation="Horizontal" Spacing="8">
+            <StackPanel Orientation="Horizontal" Spacing="8" IsEnabled="{Binding IsFbxFormatSelected}">
                 <TextBlock Text="FBX format" Width="130" VerticalAlignment="Center" />
                 <ComboBox ItemsSource="{Binding FbxFormatOptions}"
                           SelectedIndex="{Binding FbxFormat, Mode=TwoWay}" />

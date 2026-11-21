@@ -1182,6 +1182,9 @@ namespace AssetStudio
                 iMat.Reflection = new Color(0, 0, 0, 1);
                 iMat.Shininess = 20f;
                 iMat.Transparency = 0f;
+                iMat.DoubleSided = mat.m_DoubleSidedGI;
+                bool alphaClipEnabled = false;
+                float? urpSurface = null;
                 foreach (var col in mat.m_SavedProperties?.m_Colors ?? Array.Empty<KeyValuePair<string, Color>>())
                 {
                     switch (col.Key)
@@ -1216,6 +1219,54 @@ namespace AssetStudio
                         case "_Transparency":
                             iMat.Transparency = flt.Value;
                             break;
+                        case "_Metallic":
+                            iMat.Metallic = flt.Value;
+                            break;
+                        case "_Glossiness":
+                        case "_Smoothness":
+                        case "_GlossMapScale":
+                            iMat.Smoothness = flt.Value;
+                            break;
+                        case "_Roughness":
+                            iMat.Roughness = flt.Value;
+                            break;
+                        case "_Cutoff":
+                        case "_AlphaCutoff":
+                            iMat.AlphaCutoff = flt.Value;
+                            break;
+                        case "_Mode":
+                            iMat.SurfaceMode = flt.Value;
+                            break;
+                        case "_Surface":
+                            urpSurface = flt.Value;
+                            break;
+                        case "_AlphaClip":
+                            alphaClipEnabled = flt.Value >= 0.5f;
+                            break;
+                        case "_Cull":
+                            if (flt.Value <= 0.5f)
+                            {
+                                iMat.DoubleSided = true;
+                            }
+                            break;
+                        case "_BumpScale":
+                            iMat.BumpScale = flt.Value;
+                            break;
+                        case "_OcclusionStrength":
+                            iMat.OcclusionStrength = flt.Value;
+                            break;
+                    }
+                }
+
+                if (!iMat.SurfaceMode.HasValue)
+                {
+                    if (alphaClipEnabled)
+                    {
+                        iMat.SurfaceMode = 1f;
+                    }
+                    else if (urpSurface.HasValue && urpSurface.Value >= 0.5f)
+                    {
+                        iMat.SurfaceMode = 3f;
                     }
                 }
 

@@ -2229,16 +2229,40 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
-        public static void ExportFbx(
+        public static string GetModelFileExtension(ExportOptionsState? exportOptions)
+            => ModelExporter.GetModelFileExtension(exportOptions?.ModelFormat ?? ModelExportFormat.Fbx);
+
+        private static ModelExportFormat ResolveModelExportFormat(string exportFile, ExportOptionsState exportOptions)
+        {
+            var ext = Path.GetExtension(exportFile);
+            if (string.Equals(ext, ".glb", StringComparison.OrdinalIgnoreCase))
+            {
+                return ModelExportFormat.Glb;
+            }
+            if (string.Equals(ext, ".gltf", StringComparison.OrdinalIgnoreCase))
+            {
+                return ModelExportFormat.Gltf;
+            }
+            if (string.Equals(ext, ".fbx", StringComparison.OrdinalIgnoreCase))
+            {
+                return ModelExportFormat.Fbx;
+            }
+            return exportOptions.ModelFormat;
+        }
+
+        public static void ExportModel(
             IImported convert,
             string exportFile,
             ExportOptionsState exportOptions,
             ConcurrentDictionary<string, byte>? reservedPaths = null)
         {
+            var format = ResolveModelExportFormat(exportFile, exportOptions);
+            var ext = ModelExporter.GetModelFileExtension(format);
+
             if (exportOptions.ExportAnimations && exportOptions.ExportAnimationsSplit && convert.AnimationList?.Count > 0)
             {
                 var effectiveConvert = exportOptions.CombineMeshes && convert.MeshList?.Count > 1
-                    ? ModelConverter.CreateCombinedView(convert)
+                    ? ModelConverter.CreateCombinedView(convert) ?? convert
                     : convert;
 
                 var mainConvert = new ImportedWrapper(effectiveConvert)
@@ -2247,7 +2271,8 @@ namespace AssetStudio.Avalonia.Services
                 };
                 try
                 {
-                    ModelExporter.ExportFbx(exportFile, mainConvert,
+                    ModelExporter.ExportModel(exportFile, mainConvert,
+                        format,
                         exportOptions.ExportSkins,
                         false,
                         exportOptions.ExportBlendShape,
@@ -2274,7 +2299,7 @@ namespace AssetStudio.Avalonia.Services
                 {
                     var candidateAnimFile = Path.Combine(
                         Path.GetDirectoryName(exportFile)!,
-                        $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}.fbx");
+                        $"{Path.GetFileNameWithoutExtension(exportFile)}_{FixFileName(anim.Name)}{ext}");
                     var animFile = reservedPaths != null
                         ? ReserveUniqueFilePath(candidateAnimFile, reservedPaths)
                         : GetUniqueFilePath(candidateAnimFile);
@@ -2284,7 +2309,8 @@ namespace AssetStudio.Avalonia.Services
                     };
                     try
                     {
-                        ModelExporter.ExportFbx(animFile, animConvert,
+                        ModelExporter.ExportModel(animFile, animConvert,
+                            format,
                             exportOptions.ExportSkins,
                             true,
                             exportOptions.ExportBlendShape,
@@ -2319,7 +2345,8 @@ namespace AssetStudio.Avalonia.Services
             {
                 try
                 {
-                    ModelExporter.ExportFbx(exportFile, convert,
+                    ModelExporter.ExportModel(exportFile, convert,
+                        format,
                         exportOptions.ExportSkins,
                         exportOptions.ExportAnimations,
                         exportOptions.ExportBlendShape,
@@ -2342,6 +2369,13 @@ namespace AssetStudio.Avalonia.Services
                 }
             }
         }
+
+        public static void ExportFbx(
+            IImported convert,
+            string exportFile,
+            ExportOptionsState exportOptions,
+            ConcurrentDictionary<string, byte>? reservedPaths = null)
+            => ExportModel(convert, exportFile, exportOptions, reservedPaths);
 
         public SplitObjectsExportSummary ExportSplitObjects(
             string exportRoot,
@@ -2398,8 +2432,9 @@ namespace AssetStudio.Avalonia.Services
                         : exportRoot;
                     Directory.CreateDirectory(targetFolder);
 
+                    var modelExt = GetModelFileExtension(exportOptions);
                     var exportFile = ReserveUniqueFilePath(
-                        Path.Combine(targetFolder, FixFileName(gameObject.m_Name) + ".fbx"),
+                        Path.Combine(targetFolder, FixFileName(gameObject.m_Name) + modelExt),
                         reservedPaths);
                     statusUpdate?.Invoke($"Exporting {Path.GetFileName(exportFile)}");
 
@@ -2409,7 +2444,7 @@ namespace AssetStudio.Avalonia.Services
                         var convert = clips == null
                             ? new ModelConverter(gameObject, exportOptions.ConvertTextureFormat)
                             : new ModelConverter(gameObject, exportOptions.ConvertTextureFormat, clips);
-                        ExportFbx(convert, exportFile, exportOptions, reservedPaths);
+                        ExportModel(convert, exportFile, exportOptions, reservedPaths);
                         Interlocked.Increment(ref exported);
                     }
                     catch (OperationCanceledException)

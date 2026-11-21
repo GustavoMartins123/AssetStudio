@@ -230,6 +230,14 @@ namespace AssetStudio
         public Color Reflection { get; set; }
         public float Shininess { get; set; }
         public float Transparency { get; set; }
+        public float? Metallic { get; set; }
+        public float? Smoothness { get; set; }
+        public float? Roughness { get; set; }
+        public float? AlphaCutoff { get; set; }
+        public float? SurfaceMode { get; set; }
+        public float? BumpScale { get; set; }
+        public float? OcclusionStrength { get; set; }
+        public bool DoubleSided { get; set; }
         public List<ImportedMaterialTexture> Textures { get; set; } = new List<ImportedMaterialTexture>();
     }
 

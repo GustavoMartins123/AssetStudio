@@ -416,7 +416,8 @@ public partial class MainWindow
         SaveExportFolder(selectedExportRoot);
         var exportPath = Path.Combine(selectedExportRoot, "Animator");
         Directory.CreateDirectory(exportPath);
-        var exportFile = AssetExportService.GetUniqueFilePath(Path.Combine(exportPath, FixFileName(animator.Name) + ".fbx"));
+        var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
+        var exportFile = AssetExportService.GetUniqueFilePath(Path.Combine(exportPath, FixFileName(animator.Name) + modelExt));
         var selectedGameObjects = GetTopLevelSelectedGameObjects(selectedAssets
             .Where(x => x.Type != ClassIDType.AnimationClip && x.TreeNode?.GameObject != null)
             .Select(x => x.TreeNode!.GameObject!)
@@ -524,8 +525,9 @@ public partial class MainWindow
             return;
         }
 
-        var suggestedName = FixFileName(gameObjects[0].m_Name) + " (merge).fbx";
-        var exportFile = await PickSaveFbxDialogAsync("Save merged FBX", suggestedName);
+        var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
+        var suggestedName = FixFileName(gameObjects[0].m_Name) + " (merge)" + modelExt;
+        var exportFile = await PickSaveModelDialogAsync("Save merged model", suggestedName);
         if (string.IsNullOrWhiteSpace(exportFile)) return;
         var exportFolder = Path.GetDirectoryName(exportFile);
         if (!string.IsNullOrEmpty(exportFolder))
@@ -952,6 +954,7 @@ public partial class MainWindow
         Directory.CreateDirectory(exportPath);
         var fileName = FixFileName(AssetExportService.GetExportFileName(item));
 
+        var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
         switch (assetObj)
         {
             case Animator m_Animator:
@@ -963,7 +966,7 @@ public partial class MainWindow
                 {
                     var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(animatorGroup.GroupName) ? animatorGroup.GroupName : fileName);
                     if (conversionContext.TryMarkModelGroupExported(animatorGroup.GroupId)
-                        && conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var groupFbxPath)
+                        && conversionContext.TryGetAssetFilePath(exportPath, groupFileName, modelExt, item, out var groupFbxPath)
                         && ExportModelGroupFbx(animatorGroup, animatorGroupMeshes, groupFbxPath))
                     {
                         exported = true;
@@ -974,7 +977,7 @@ public partial class MainWindow
                 {
                     var convert = new ModelConverter(m_Animator, exportOptions.ConvertTextureFormat);
                     if (convert.MeshList.Count > 0
-                        && conversionContext.TryGetAssetFilePath(exportPath, fileName, ".fbx", item, out var exportFullPath))
+                        && conversionContext.TryGetAssetFilePath(exportPath, fileName, modelExt, item, out var exportFullPath))
                     {
                         ExportFbx(convert, exportFullPath);
                         exported = true;
@@ -1003,7 +1006,7 @@ public partial class MainWindow
                 {
                     var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(avatarGroup.GroupName) ? avatarGroup.GroupName : fileName);
                     if (conversionContext.TryMarkModelGroupExported(avatarGroup.GroupId)
-                        && conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var groupFbxPath)
+                        && conversionContext.TryGetAssetFilePath(exportPath, groupFileName, modelExt, item, out var groupFbxPath)
                         && ExportModelGroupFbx(avatarGroup, avatarGroupMeshes, groupFbxPath))
                     {
                         exported = true;
@@ -1053,8 +1056,9 @@ public partial class MainWindow
             var convert = animator != null
                 ? new ModelConverter(animator, exportOptions.ConvertTextureFormat)
                 : new ModelConverter(item.TreeNode.GameObject, exportOptions.ConvertTextureFormat);
+            var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
             if (convert.MeshList.Count > 0
-                && conversionContext.TryGetAssetFilePath(exportPath, fileName, ".fbx", item, out var fbxPath))
+                && conversionContext.TryGetAssetFilePath(exportPath, fileName, modelExt, item, out var fbxPath))
             {
                 ExportFbx(convert, fbxPath);
                 return true;
@@ -1113,8 +1117,9 @@ public partial class MainWindow
             return;
         }
 
-        var suggestedName = FixFileName(AssetExportService.GetExportFileName(primaryAsset)) + ".fbx";
-        var exportFile = await PickSaveFbxDialogAsync("Export Model Group (FBX)", suggestedName);
+        var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
+        var suggestedName = FixFileName(AssetExportService.GetExportFileName(primaryAsset)) + modelExt;
+        var exportFile = await PickSaveModelDialogAsync("Export Model Group", suggestedName);
         if (string.IsNullOrWhiteSpace(exportFile)) return;
         var exportFolder = Path.GetDirectoryName(exportFile);
         if (!string.IsNullOrEmpty(exportFolder))
@@ -1414,8 +1419,9 @@ public partial class MainWindow
                 return false;
             }
 
+            var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
             var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(group.GroupName) ? group.GroupName : fileName);
-            if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var fbxPath)
+            if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, modelExt, item, out var fbxPath)
                 && ExportModelGroupFbx(group, groupMeshes, fbxPath))
             {
                 return true;
@@ -1436,8 +1442,9 @@ public partial class MainWindow
                 return false;
             }
 
+            var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
             var groupFileName = FixFileName(!string.IsNullOrWhiteSpace(eagerName) ? eagerName : fileName);
-            if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, ".fbx", item, out var fbxPath)
+            if (conversionContext.TryGetAssetFilePath(exportPath, groupFileName, modelExt, item, out var fbxPath)
                 && ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar, null, fbxPath))
             {
                 return true;
@@ -1729,7 +1736,7 @@ public partial class MainWindow
         IImported convert,
         string exportFile,
         ConcurrentDictionary<string, byte>? reservedPaths = null)
-        => AssetExportService.ExportFbx(convert, exportFile, exportOptions, reservedPaths);
+        => AssetExportService.ExportModel(convert, exportFile, exportOptions, reservedPaths);
 
     internal sealed class ExportConversionContext : Services.ExportConversionContext
     {
