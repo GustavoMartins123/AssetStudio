@@ -48,7 +48,6 @@ namespace AssetStudio.Tests
                 Assert.Equal(kind != PreviewSurfaceKind.None, vm.HasActivePreview);
 
                 var expectedTextSurface = kind is PreviewSurfaceKind.Text
-                    or PreviewSurfaceKind.Shader
                     or PreviewSurfaceKind.MonoBehaviour
                     or PreviewSurfaceKind.AnimatorGraph
                     or PreviewSurfaceKind.Prefab;
