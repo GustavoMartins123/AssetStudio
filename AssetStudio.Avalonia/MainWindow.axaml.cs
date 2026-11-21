@@ -144,6 +144,18 @@ public partial class MainWindow : Window
     private long lazyIndexingSessionId;
     private bool projectAutoIndexStarted;
     private int foregroundLazyLoadCount;
+    private int _projectSessionTornDown;
+    private bool _isReturningToProjectManager;
+    private CancellationTokenSource? _progressiveScanCts;
+    private bool IsWindowClosingOrClosed => Volatile.Read(ref _projectSessionTornDown) != 0;
+    private readonly Func<bool> _shouldYieldForUserInteractionDelegate;
+    private readonly Func<string, int, int, MemoryPressureResult> _memoryPressureCallback;
+    private readonly IProgress<int> _progressReporter;
+    private readonly EventHandler<SizeChangedEventArgs> _previewContentHostSizeChangedHandler;
+    private readonly EventHandler<RoutedEventArgs> _specifyUnityVersionLostFocusHandler;
+    private readonly Action<string> _textureGlGpuErrorHandler;
+    private readonly Action<string> _glGpuErrorHandler;
+    private readonly Action<int, int> _glAnimationFrameChangedHandler;
 
     public MainWindow() : this(null)
     {
@@ -186,7 +198,8 @@ public partial class MainWindow : Window
         AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
         GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
         GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
-        PreviewContentHost.SizeChanged += (_, _) => Update2DAnimationImageLayout();
+        _previewContentHostSizeChangedHandler = (_, _) => Update2DAnimationImageLayout();
+        PreviewContentHost.SizeChanged += _previewContentHostSizeChangedHandler;
         PreviewContentHost.PointerWheelChanged += ImagePreviewBox_PointerWheelChanged;
         ImagePreviewBox.PointerWheelChanged += ImagePreviewBox_PointerWheelChanged;
         InitializeTheme();
@@ -200,11 +213,13 @@ public partial class MainWindow : Window
         logger.ShowErrorMessage = ViewModel.Options.ShowErrorMessage;
         Logger.Default = logger;
         exportOptions.CopyFrom(appSettings.ExportOptions);
-        SpecifyUnityVersionTextBox.LostFocus += (s, e) => ApplyUnityVersionOption();
+        _specifyUnityVersionLostFocusHandler = (_, _) => ApplyUnityVersionOption();
+        SpecifyUnityVersionTextBox.LostFocus += _specifyUnityVersionLostFocusHandler;
         ApplyUnityVersionOption();
         WireViewModelCommandsAndOptions();
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
-        AssetsManager.ShouldYieldForUserInteraction = ShouldPauseBackgroundWork;
+        _shouldYieldForUserInteractionDelegate = ShouldPauseBackgroundWork;
+        AssetsManager.ShouldYieldForUserInteraction = _shouldYieldForUserInteractionDelegate;
         assetsManager.ShouldKeepFileCallback = fileName =>
         {
             lock (preloaderLock)
@@ -213,25 +228,35 @@ public partial class MainWindow : Window
                     || (_currentlySelectedUniqueID != null && _currentlySelectedUniqueID.StartsWith(fileName + "#"));
             }
         };
-        Progress.Default = new Progress<int>(SetProgressBarValue);
+        _progressReporter = new Progress<int>(SetProgressBarValue);
+        Progress.Default = _progressReporter;
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, Window_DragOver);
         AddHandler(DragDrop.DropEvent, Window_Drop);
 
-        AssetsManager.MemoryPressureCallback = (operation, loadPercent, limitPercent) =>
+        _memoryPressureCallback = (operation, loadPercent, limitPercent) =>
         {
+            if (IsWindowClosingOrClosed)
+            {
+                return MemoryPressureResult.StopAndKeep;
+            }
             if (global::Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
             {
                 return MemoryPressureResult.Continue;
             }
             return global::Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
             {
+                if (IsWindowClosingOrClosed)
+                {
+                    return MemoryPressureResult.StopAndKeep;
+                }
                 var msg = $"Memory usage has reached {loadPercent}% (limit: {limitPercent}%) during {operation}.\n\n" +
                           "Continuing may slow down your system or cause it to run out of memory.\n\n" +
                           "What would you like to do?";
                 return await ShowMemoryPressureWarningDialog(msg);
             }).GetAwaiter().GetResult();
         };
+        AssetsManager.MemoryPressureCallback = _memoryPressureCallback;
 
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
@@ -293,35 +318,56 @@ public partial class MainWindow : Window
             logger.Log(LoggerEvent.Warning, $"GPU acceleration detection failed: {ex.Message}. Defaulting to GPU preview.");
         }
 
+        _textureGlGpuErrorHandler = (errMsg) =>
+        {
+            if (IsWindowClosingOrClosed)
+            {
+                return;
+            }
+            logger.Log(LoggerEvent.Warning, $"GPU texture preview error: {errMsg}. Falling back to CPU.");
+            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                if (IsWindowClosingOrClosed)
+                {
+                    return;
+                }
+                if (errMsg.Contains("initialization") || errMsg.Contains("link error") || errMsg.Contains("compile error"))
+                {
+                    useGpuTexturePreview = false;
+                }
+                UpdateImagePreview(forceCpu: true);
+            });
+        };
         if (TextureGLPreview != null)
         {
-            TextureGLPreview.GpuErrorOccurred += (errMsg) =>
-            {
-                logger.Log(LoggerEvent.Warning, $"GPU texture preview error: {errMsg}. Falling back to CPU.");
-                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                {
-                    if (errMsg.Contains("initialization") || errMsg.Contains("link error") || errMsg.Contains("compile error"))
-                    {
-                        useGpuTexturePreview = false;
-                    }
-                    UpdateImagePreview(forceCpu: true);
-                });
-            };
+            TextureGLPreview.GpuErrorOccurred += _textureGlGpuErrorHandler;
         }
 
-        if (GLPreviewControl != null)
+        _glGpuErrorHandler = (errMsg) =>
         {
-            GLPreviewControl.GpuErrorOccurred += (errMsg) =>
+            if (!IsWindowClosingOrClosed)
             {
                 logger.Log(LoggerEvent.Warning, $"GPU mesh preview error: {errMsg}.");
-            };
-            GLPreviewControl.AnimationFrameChanged += (currentFrame, totalFrames) =>
+            }
+        };
+        _glAnimationFrameChangedHandler = (currentFrame, totalFrames) =>
+        {
+            if (IsWindowClosingOrClosed)
             {
-                global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                return;
+            }
+            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                if (!IsWindowClosingOrClosed)
                 {
                     UpdateAnimationPlaybackFrame(currentFrame, totalFrames);
-                });
-            };
+                }
+            });
+        };
+        if (GLPreviewControl != null)
+        {
+            GLPreviewControl.GpuErrorOccurred += _glGpuErrorHandler;
+            GLPreviewControl.AnimationFrameChanged += _glAnimationFrameChangedHandler;
             GLPreviewControl.MeshGeometryLoaded += OnMeshPreviewGeometryLoaded;
         }
 
@@ -337,6 +383,7 @@ public partial class MainWindow : Window
         handlers.LoadFolderEagerAsync = LoadFolderEagerCommandHandlerAsync;
         handlers.ExtractFileAsync = ExtractFileCommandHandlerAsync;
         handlers.ExtractFolderAsync = ExtractFolderCommandHandlerAsync;
+        handlers.OpenProjectManagerAsync = ReturnToProjectManagerCommandHandlerAsync;
 
         handlers.SetProjectRootAsync = SetProjectRootCommandHandlerAsync;
         handlers.ShowExportOptionsAsync = ShowExportOptionsCommandHandlerAsync;
@@ -592,12 +639,41 @@ public partial class MainWindow : Window
         BuildAssetStructures();
     }
 
+    private void CancelProgressiveScan()
+    {
+        var previous = Interlocked.Exchange(ref _progressiveScanCts, null);
+        if (previous == null)
+        {
+            return;
+        }
+
+        try
+        {
+            previous.Cancel();
+        }
+        catch
+        {
+        }
+
+        previous.Dispose();
+    }
+
     private async Task BeginProgressiveLoadAsync(string[] paths, string statusPrefix)
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return;
+        }
+
         currentScanResult = null;
         if (paths.Length == 1 && Directory.Exists(paths[0]))
         {
             currentScanResult = await ScanFolderForProgressiveIndexAsync(paths[0], statusPrefix);
+        }
+
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return;
         }
 
         LoadPathsProgressiveAsync(paths);
@@ -605,9 +681,19 @@ public partial class MainWindow : Window
 
     private async Task<ProjectScanResult?> ScanFolderForProgressiveIndexAsync(string folderPath, string statusPrefix)
     {
+        CancelProgressiveScan();
+        var scanCts = new CancellationTokenSource();
+        var previousCts = Interlocked.Exchange(ref _progressiveScanCts, scanCts);
+        previousCts?.Dispose();
+        var token = scanCts.Token;
+
         StatusStripUpdate($"{statusPrefix}: scanning folder...");
         var scanProgress = new Progress<ScanProgress>(p =>
         {
+            if (token.IsCancellationRequested || IsWindowClosingOrClosed)
+            {
+                return;
+            }
             if (p.TotalFiles > 0)
             {
                 StatusStripUpdate($"{statusPrefix}: scanning... {p.ScannedFiles:N0}/{p.TotalFiles:N0} files ({FormatBytes(p.ScannedBytes)})");
@@ -620,15 +706,32 @@ public partial class MainWindow : Window
 
         try
         {
-            var scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath, CancellationToken.None, scanProgress));
-            StatusStripUpdate($"{statusPrefix}: scan complete. {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
+            var scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath, token, scanProgress), token);
+            if (!token.IsCancellationRequested && !IsWindowClosingOrClosed)
+            {
+                StatusStripUpdate($"{statusPrefix}: scan complete. {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
+            }
             return scanResult;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
         }
         catch (Exception ex)
         {
-            Logger.Warning($"{statusPrefix}: folder scan failed; continuing without SQLite cache validation. {ex.Message}");
-            StatusStripUpdate($"{statusPrefix}: scan failed; indexing without cache validation.");
+            if (!IsWindowClosingOrClosed)
+            {
+                Logger.Warning($"{statusPrefix}: folder scan failed; continuing without SQLite cache validation. {ex.Message}");
+                StatusStripUpdate($"{statusPrefix}: scan failed; indexing without cache validation.");
+            }
             return null;
+        }
+        finally
+        {
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _progressiveScanCts, null, scanCts), scanCts))
+            {
+                scanCts.Dispose();
+            }
         }
     }
 
@@ -668,6 +771,11 @@ public partial class MainWindow : Window
 
     private async void LoadPathsProgressiveAsync(string[] paths)
     {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return;
+        }
+
         ResetForm();
         assetsManager.Clear();
         assetsManager.LazyLoading = true;
@@ -923,6 +1031,10 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            if (IsWindowClosingOrClosed || sessionId != lazyIndexingSessionId)
+            {
+                return;
+            }
             MessageBox.Show(this, $"Error during progressive load:\n{ex.Message}", "Load failed");
             StatusStripUpdate("Progressive load failed.");
         }
@@ -972,6 +1084,10 @@ public partial class MainWindow : Window
             {
                 Dispatcher.UIThread.Post(() =>
                 {
+                    if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed)
+                    {
+                        return;
+                    }
                     ShowMemoryPressureError(ex);
                     ViewModel.IsPauseEnabled = false;
                     ViewModel.IsResumeEnabled = true;
@@ -1792,41 +1908,236 @@ public partial class MainWindow : Window
         ProjectSession.ApplyProjectAnalysis((ProjectAnalysisReport?)null);
     }
 
-    protected override void OnClosing(WindowClosingEventArgs e)
+    private async Task ReturnToProjectManagerCommandHandlerAsync()
+    {
+        if (_isReturningToProjectManager || IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        _isReturningToProjectManager = true;
+        var currentProjectId = projectContext?.Project.Id
+            ?? ViewModel.ProjectSession.SelectedProjectRecord?.Id;
+
+        try
+        {
+            await StopActiveBackgroundWorkForNavigationAsync();
+
+            if (IsWindowClosingOrClosed)
+            {
+                return;
+            }
+
+            if (global::Avalonia.Application.Current is App app)
+            {
+                if (!app.NavigateToProjectManager(this, currentProjectId))
+                {
+                    _isReturningToProjectManager = false;
+                }
+                return;
+            }
+
+            var projectManager = new ProjectManagerWindow(initialSelectedProjectId: currentProjectId, autoRefresh: false);
+            if (global::Avalonia.Application.Current?.ApplicationLifetime is global::Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop)
+            {
+                desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+                desktop.MainWindow = projectManager;
+            }
+
+            projectManager.Show();
+            projectManager.Activate();
+            TeardownProjectSession();
+            Close();
+            projectManager.BeginRefreshProjects(currentProjectId);
+        }
+        catch
+        {
+            _isReturningToProjectManager = false;
+            throw;
+        }
+    }
+
+    private async Task StopActiveBackgroundWorkForNavigationAsync()
     {
         lazyIndexingSessionId++;
+        CancelProgressiveScan();
         ViewModel.LoadingService.StopIndexing();
-        UnwireViewModelOptions();
+        CancelProjectAnalysis();
+        CancelPendingArenaCoalescedSort();
+        CancelPendingPreview();
+        _previewRequestCoordinator.CancelCurrent();
+        _dumpRequestCoordinator.CancelCurrent();
+        _animationPreviewCoordinator.CancelCurrent();
+        lock (preloaderLock)
+        {
+            preloaderCts?.Cancel();
+            preloaderCts?.Dispose();
+            preloaderCts = null;
+            preloadedUniqueIds.Clear();
+        }
+        Stop2DAnimation();
+        AudioReset(recreateAudioPlayer: false);
+        VideoReset();
+        FlushAvatarPreviewSettingsSave();
+
+        var activeIndexingTask = ViewModel.LoadingService.ActiveIndexingTask;
+        if (activeIndexingTask != null && !activeIndexingTask.IsCompleted)
+        {
+            try
+            {
+                await Task.WhenAny(activeIndexingTask, Task.Delay(TimeSpan.FromMilliseconds(1500)));
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    internal void TeardownProjectSession()
+    {
+        if (Interlocked.Exchange(ref _projectSessionTornDown, 1) != 0)
+        {
+            return;
+        }
+
+        lazyIndexingSessionId++;
+        CancelProgressiveScan();
+        ViewModel.LoadingService.StopIndexing();
         CancelProjectAnalysis();
         CancelPendingArenaCoalescedSort();
         listSearchDebounce?.Cancel();
         listSearchDebounce?.Dispose();
         listSearchDebounce = null;
+        lock (preloaderLock)
+        {
+            preloaderCts?.Cancel();
+            preloaderCts?.Dispose();
+            preloaderCts = null;
+            preloadedUniqueIds.Clear();
+        }
+        previewCandidateSelectionCts?.Cancel();
+        previewCandidateSelectionCts?.Dispose();
+        previewCandidateSelectionCts = null;
+        _videoPreviewLoadCts?.Cancel();
+        _videoPreviewLoadCts?.Dispose();
+        _videoPreviewLoadCts = null;
         _previewRequestCoordinator.CancelCurrent();
         _dumpRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         _animationRigPreviewCache.Clear();
         treeSearchSession.Invalidate();
         appliedTreeSearchMatches = null;
+        FlushAvatarPreviewSettingsSave();
         ClearPreview();
         ReleaseGlPreviewResources();
+
+        PreviewContentHost.SizeChanged -= _previewContentHostSizeChangedHandler;
+        PreviewContentHost.PointerWheelChanged -= ImagePreviewBox_PointerWheelChanged;
+        ImagePreviewBox.PointerWheelChanged -= ImagePreviewBox_PointerWheelChanged;
+        SpecifyUnityVersionTextBox.LostFocus -= _specifyUnityVersionLostFocusHandler;
+        RemoveHandler(DragDrop.DragOverEvent, Window_DragOver);
+        RemoveHandler(DragDrop.DropEvent, Window_Drop);
+        VideoProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
+        VideoProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
+        if (_audioProgressHandlersAttached && AudioProgressBar != null)
+        {
+            AudioProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, AudioProgressBar_DragStarted);
+            AudioProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, AudioProgressBar_DragCompleted);
+            _audioProgressHandlersAttached = false;
+        }
+        FfmpegVideoPlayer.MediaEnded -= FfmpegVideoPlayer_MediaEnded;
+
+        if (TextureGLPreview != null)
+        {
+            TextureGLPreview.GpuErrorOccurred -= _textureGlGpuErrorHandler;
+        }
         if (GLPreviewControl != null)
         {
+            GLPreviewControl.GpuErrorOccurred -= _glGpuErrorHandler;
+            GLPreviewControl.AnimationFrameChanged -= _glAnimationFrameChangedHandler;
+            GLPreviewControl.MeshGeometryLoaded -= OnMeshPreviewGeometryLoaded;
             GLPreviewControl.LoadMeshPreviewGeometryCache = null;
             GLPreviewControl.SaveMeshPreviewGeometryCache = null;
         }
-        ViewModel.ResetSession();
-        ViewModel.Dispose();
-        resolvedSourcePathCache.Clear();
-        lazySourcePathBySerializedFile.Clear();
-        lazySourceFileSearchCache.Clear();
-        assetsManager.DecompressionCache = null;
-        AssetsManager.ShouldYieldForUserInteraction = null;
-        FlushAvatarPreviewSettingsSave();
+
+        if (_audioTimer != null)
+        {
+            _audioTimer.Stop();
+            _audioTimer.Tick -= AudioTimer_Tick;
+            _audioTimer = null;
+        }
+        if (_ffmpegVideoTimer != null)
+        {
+            _ffmpegVideoTimer.Stop();
+            _ffmpegVideoTimer.Tick -= FfmpegVideoTimer_Tick;
+            _ffmpegVideoTimer = null;
+        }
+        if (avatarPreviewSettingsSaveTimer != null)
+        {
+            avatarPreviewSettingsSaveTimer.Stop();
+            avatarPreviewSettingsSaveTimer.Tick -= AvatarPreviewSettingsSaveTimer_Tick;
+            avatarPreviewSettingsSaveTimer = null;
+        }
+
+        UnwireViewModelOptions();
+        ViewModel.CommandHandlers.Clear();
         AudioReset(recreateAudioPlayer: false);
         VideoReset();
         _audioPlaybackService?.Dispose();
+        _audioPlaybackService = null;
         _pcmWavePreviewPlayer?.Dispose();
+        _pcmWavePreviewPlayer = null;
+
+        lock (previewCacheLock)
+        {
+            meshToMaterialsCache = null;
+            meshAssociatedRenderersCache = null;
+            meshSourceTypesCache = null;
+            materialMainTextureCache = null;
+            materialPreviewMaterialCache = null;
+            materialTextureSlotsCache = null;
+            objectToAssetItemCache = null;
+            animationClipAvatarCache = null;
+            avatarMeshCache = null;
+            avatarMeshesCache = null;
+            meshAvatarCache = null;
+            meshSkinnedRenderersCache = null;
+            animationClipTransformBindingsCache = null;
+        }
+
+        sceneTreeNodes.Clear();
+        treeSearchResults.Clear();
+        SceneTreeView.ItemsSource = null;
+        AssetListDataGrid.ItemsSource = null;
+        AssetClassesDataGrid.ItemsSource = null;
+        assetContextItem = null;
+        assetContextCellText = string.Empty;
+        _currentlySelectedUniqueID = null;
+        currentScanResult = null;
+        resolvedSourcePathCache.Clear();
+        lazySourcePathBySerializedFile.Clear();
+        lazySourceFileSearchCache.Clear();
+
+        if (ReferenceEquals(Logger.Default, logger))
+        {
+            Logger.Default = new DummyLogger();
+        }
+        if (ReferenceEquals(Progress.Default, _progressReporter))
+        {
+            Progress.Default = new Progress<int>();
+        }
+        if (ReferenceEquals(AssetsManager.ShouldYieldForUserInteraction, _shouldYieldForUserInteractionDelegate))
+        {
+            AssetsManager.ShouldYieldForUserInteraction = null;
+        }
+        if (ReferenceEquals(AssetsManager.MemoryPressureCallback, _memoryPressureCallback))
+        {
+            AssetsManager.MemoryPressureCallback = null;
+        }
+
+        assetsManager.ShouldKeepFileCallback = null;
+        assetsManager.DecompressionCache = null;
+        BundleFile.CacheDirectory = string.Empty;
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         SpriteHelper.ClearAtlasCache();
         AssetExportHelper.ClearShaderGuidCache();
@@ -1834,8 +2145,16 @@ public partial class MainWindow : Window
         {
             assemblyLoader.Clear();
         }
+
+        ViewModel.ResetSession();
+        ViewModel.Dispose();
         _sqliteCache.Dispose();
         assetsManager.Dispose();
+    }
+
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        TeardownProjectSession();
         base.OnClosing(e);
     }
 

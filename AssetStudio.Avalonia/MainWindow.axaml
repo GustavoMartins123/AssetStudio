@@ -13,37 +13,51 @@
         Icon="/Assets/as.png"
         Width="1264" Height="681"
         WindowStartupLocation="CenterScreen">
-    
+
+    <Window.KeyBindings>
+        <KeyBinding Gesture="Ctrl+Shift+P" Command="{Binding OpenProjectManagerCommand}" />
+    </Window.KeyBindings>
+
     <DockPanel>
-        <Menu DockPanel.Dock="Top">
-            <MenuItem Header="_File">
-                <MenuItem Header="Load file" Command="{Binding LoadFileCommand}">
-                    <MenuItem.Icon>
-                        <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
-                    </MenuItem.Icon>
+        <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto">
+            <Menu Grid.Column="0">
+                <MenuItem Header="_File">
+                    <MenuItem Header="Load file" Command="{Binding LoadFileCommand}">
+                        <MenuItem.Icon>
+                            <PathIcon Data="{StaticResource icon_file}" Width="16" Height="16" />
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="Load folder" Command="{Binding LoadFolderCommand}">
+                        <MenuItem.Icon>
+                            <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="Load folder (Full / Scene Hierarchy)" Command="{Binding LoadFolderEagerCommand}">
+                        <MenuItem.Icon>
+                            <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <Separator />
+                    <MenuItem Header="Extract file" Command="{Binding ExtractFileCommand}">
+                        <MenuItem.Icon>
+                            <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="Extract folder" Command="{Binding ExtractFolderCommand}">
+                        <MenuItem.Icon>
+                            <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <Separator />
+                    <MenuItem x:Name="backToProjectsMenuItem"
+                              Header="Back to _Projects..."
+                              InputGesture="Ctrl+Shift+P"
+                              Command="{Binding OpenProjectManagerCommand}">
+                        <MenuItem.Icon>
+                            <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
+                        </MenuItem.Icon>
+                    </MenuItem>
                 </MenuItem>
-                <MenuItem Header="Load folder" Command="{Binding LoadFolderCommand}">
-                    <MenuItem.Icon>
-                        <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
-                    </MenuItem.Icon>
-                </MenuItem>
-                <MenuItem Header="Load folder (Full / Scene Hierarchy)" Command="{Binding LoadFolderEagerCommand}">
-                    <MenuItem.Icon>
-                        <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />
-                    </MenuItem.Icon>
-                </MenuItem>
-                <Separator />
-                <MenuItem Header="Extract file" Command="{Binding ExtractFileCommand}">
-                    <MenuItem.Icon>
-                        <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
-                    </MenuItem.Icon>
-                </MenuItem>
-                <MenuItem Header="Extract folder" Command="{Binding ExtractFolderCommand}">
-                    <MenuItem.Icon>
-                        <PathIcon Data="{StaticResource icon_extract}" Width="16" Height="16" />
-                    </MenuItem.Icon>
-                </MenuItem>
-            </MenuItem>
             <MenuItem Header="_Options">
                 <MenuItem x:Name="displayAll" Header="Display all assets" ToggleType="CheckBox" IsChecked="{Binding Options.DisplayAll, Mode=TwoWay}">
                     <MenuItem.Icon>
@@ -204,7 +218,21 @@
                 <MenuItem x:Name="resumeIndexingMenu" Header="Resume Indexing" Command="{Binding ResumeIndexingCommand}" />
                 <MenuItem x:Name="stopIndexingMenu" Header="Stop/Cancel Indexing" Command="{Binding StopIndexingCommand}" />
             </MenuItem>
-        </Menu>
+            </Menu>
+            <Button x:Name="BackToProjectsButton"
+                    Grid.Column="1"
+                    Command="{Binding OpenProjectManagerCommand}"
+                    VerticalAlignment="Center"
+                    Margin="4,2,8,2"
+                    Padding="10,3"
+                    FontSize="12"
+                    ToolTip.Tip="Close current project and return to Projects (Ctrl+Shift+P)">
+                <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Text="←" VerticalAlignment="Center" FontWeight="SemiBold" />
+                    <TextBlock Text="Projects" VerticalAlignment="Center" />
+                </StackPanel>
+            </Button>
+        </Grid>
 
         <Border x:Name="ProjectAnalysisBannerBorder"
                 DockPanel.Dock="Top"

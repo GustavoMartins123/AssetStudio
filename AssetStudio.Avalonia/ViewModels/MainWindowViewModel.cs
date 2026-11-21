@@ -77,6 +77,78 @@ namespace AssetStudio.Avalonia.ViewModels
         public Action<int>? ShadeModeChanged { get; set; }
         public Action<int>? NormalModeChanged { get; set; }
         public Action<PreviewChannelMask>? TextureChannelToggled { get; set; }
+
+        public void Clear()
+        {
+            LoadFileAsync = null;
+            LoadFolderAsync = null;
+            LoadFolderEagerAsync = null;
+            ExtractFileAsync = null;
+            ExtractFolderAsync = null;
+            OpenProjectManagerAsync = null;
+
+            SetProjectRootAsync = null;
+            ShowExportOptionsAsync = null;
+            ClearProjectCacheAsync = null;
+
+            ExportAllObjectsSplitAsync = null;
+            ExportSelectedObjectsSplitAsync = null;
+            ExportSelectedObjectsSplitWithAnimationClipAsync = null;
+            ExportSelectedObjectsMergeAsync = null;
+            ExportSelectedObjectsMergeWithAnimationClipAsync = null;
+
+            ExportAllAssetsAsync = null;
+            ExportSelectedAssetsAsync = null;
+            ExportFilteredAssetsAsync = null;
+            ExportModelGroupFbxAsync = null;
+            ExportAnimatorWithSelectedAnimationClipAsync = null;
+            ExportAllAssetsRawAsync = null;
+            ExportSelectedAssetsRawAsync = null;
+            ExportFilteredAssetsRawAsync = null;
+            ExportAllAssetsDumpAsync = null;
+            ExportSelectedAssetsDumpAsync = null;
+            ExportFilteredAssetsDumpAsync = null;
+            ExportAllAssetsXmlAsync = null;
+            ExportSelectedAssetsXmlAsync = null;
+            ExportFilteredAssetsXmlAsync = null;
+            ExportErrorLogAsync = null;
+
+            FilterTypeAll = null;
+            ToggleFilterType = null;
+            ExportClassStructuresAsync = null;
+
+            PauseIndexing = null;
+            ResumeIndexing = null;
+            StopIndexing = null;
+
+            ClearClassFilter = null;
+            CopyAssetCellTextAsync = null;
+            GoToSceneHierarchy = null;
+            ShowOriginalFileAsync = null;
+            ShowClassInstances = null;
+
+            SetTextAssetDisplayMode = null;
+            ToggleAnimationPlayPause = null;
+            RestartAnimation = null;
+            ResetMeshView = null;
+            RotateMeshLeft = null;
+            RotateMeshRight = null;
+            RotateMeshUp = null;
+            RotateMeshDown = null;
+            ResetMeshMaterialColor = null;
+
+            VideoPlayPauseAsync = null;
+            VideoStopAsync = null;
+            VideoExportAsync = null;
+            AudioPlayAsync = null;
+            AudioPause = null;
+            AudioStop = null;
+
+            WireframeModeChanged = null;
+            ShadeModeChanged = null;
+            NormalModeChanged = null;
+            TextureChannelToggled = null;
+        }
     }
 
     public class MainWindowViewModel : ViewModelBase, IDisposable
@@ -90,6 +162,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _isPauseEnabled;
         private bool _isResumeEnabled;
         private bool _isStopEnabled;
+        private bool _isReturningToProjectManager;
 
         public MainWindowViewModel(Action<Action>? dispatchToUi)
             : this(loadingService: null, dispatchToUi: dispatchToUi)
@@ -138,7 +211,10 @@ namespace AssetStudio.Avalonia.ViewModels
             LoadFolderEagerCommand = new AsyncRelayCommand(ExecuteLoadFolderEagerAsync, onException: HandleCommandException);
             ExtractFileCommand = new AsyncRelayCommand(ExecuteExtractFileAsync, onException: HandleCommandException);
             ExtractFolderCommand = new AsyncRelayCommand(ExecuteExtractFolderAsync, onException: HandleCommandException);
-            OpenProjectManagerCommand = new AsyncRelayCommand(ExecuteOpenProjectManagerAsync, onException: HandleCommandException);
+            OpenProjectManagerCommand = new AsyncRelayCommand(
+                ExecuteOpenProjectManagerAsync,
+                canExecute: () => CanOpenProjectManager,
+                onException: HandleCommandException);
 
             SetProjectRootCommand = new AsyncRelayCommand(ExecuteSetProjectRootAsync, onException: HandleCommandException);
             ShowExportOptionsCommand = new AsyncRelayCommand(ExecuteShowExportOptionsAsync, onException: HandleCommandException);
@@ -364,6 +440,23 @@ namespace AssetStudio.Avalonia.ViewModels
             set => Options.SpecifyUnityVersion = value ?? string.Empty;
         }
 
+        public event Action<string?>? ReturnToProjectManagerRequested;
+
+        public bool IsReturningToProjectManager
+        {
+            get => _isReturningToProjectManager;
+            private set
+            {
+                if (SetProperty(ref _isReturningToProjectManager, value))
+                {
+                    OnPropertyChanged(nameof(CanOpenProjectManager));
+                    OpenProjectManagerCommand.NotifyCanExecuteChanged();
+                }
+            }
+        }
+
+        public bool CanOpenProjectManager => !_disposed && !_isReturningToProjectManager;
+
         private void OnIndexingProgressPropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
             switch (e.PropertyName)
@@ -491,16 +584,49 @@ namespace AssetStudio.Avalonia.ViewModels
 
         private async Task ExecuteOpenProjectManagerAsync()
         {
-            if (CommandHandlers.OpenProjectManagerAsync != null)
+            if (!CanOpenProjectManager)
             {
-                await CommandHandlers.OpenProjectManagerAsync();
                 return;
             }
 
-            var result = await _dialogService.ShowProjectManagerAsync(ProjectSession.ProjectFolderPath);
-            if (result != null && !string.IsNullOrWhiteSpace(result.ProjectPath))
+            var previousProjectId = ProjectSession.SelectedProjectRecord?.Id;
+            var previousProjectPath = ProjectSession.ProjectFolderPath;
+
+            IsReturningToProjectManager = true;
+            ProjectSession.BeginClosingProject();
+            try
             {
-                ProjectSession.SetLoadedProject(result.ProjectPath, displayName: result.ProjectName, isLazyMode: true);
+                if (CommandHandlers.OpenProjectManagerAsync != null)
+                {
+                    StatusText = "Returning to Projects...";
+                    await CommandHandlers.OpenProjectManagerAsync();
+                    return;
+                }
+
+                var result = await _dialogService.ShowProjectManagerAsync(previousProjectPath);
+                if (result != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(result.ProjectPath))
+                    {
+                        ProjectSession.SetLoadedProject(result.ProjectPath, displayName: result.ProjectName, isLazyMode: true);
+                    }
+                    else if (result.OpenedWithoutProject)
+                    {
+                        ResetSession();
+                    }
+                }
+                else
+                {
+                    ReturnToProjectManagerRequested?.Invoke(previousProjectId);
+                }
+            }
+            finally
+            {
+                if (!_disposed)
+                {
+                    ProjectSession.CancelClosingProject();
+                    IsReturningToProjectManager = false;
+                }
             }
         }
 
@@ -1011,6 +1137,7 @@ namespace AssetStudio.Avalonia.ViewModels
             IsPauseEnabled = false;
             IsResumeEnabled = false;
             IsStopEnabled = false;
+            IsReturningToProjectManager = false;
         }
 
         public void Dispose()
@@ -1025,6 +1152,7 @@ namespace AssetStudio.Avalonia.ViewModels
             Options.EnablePreviewChanged -= OnOptionsEnablePreviewChanged;
             Options.DisplayInfoChanged -= OnOptionsDisplayInfoChanged;
             Options.SpecifyUnityVersionChanged -= OnOptionsSpecifyUnityVersionChanged;
+            CommandHandlers.Clear();
             _loadingService.StopIndexing();
             PreviewSession.Dispose();
             Export.Dispose();
@@ -1040,6 +1168,10 @@ namespace AssetStudio.Avalonia.ViewModels
             IsPauseEnabled = false;
             IsResumeEnabled = false;
             IsStopEnabled = false;
+            _isReturningToProjectManager = false;
+            OnPropertyChanged(nameof(IsReturningToProjectManager));
+            OnPropertyChanged(nameof(CanOpenProjectManager));
+            OpenProjectManagerCommand.NotifyCanExecuteChanged();
         }
 
         private sealed class NoOpDialogService : IDialogService

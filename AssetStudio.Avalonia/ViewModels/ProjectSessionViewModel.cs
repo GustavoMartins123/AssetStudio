@@ -23,6 +23,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _cacheStatusSummary = string.Empty;
         private string _windowTitle;
         private ManagedProject? _selectedProjectRecord;
+        private bool _isClosingProject;
         private ProjectAnalysisStatus _analysisStatus = ProjectAnalysisStatus.Pending;
         private ProjectAnalysisResult? _currentAnalysisResult;
         private ProjectAnalysisReport? _currentAnalysisReport;
@@ -114,7 +115,21 @@ namespace AssetStudio.Avalonia.ViewModels
         public ManagedProject? SelectedProjectRecord
         {
             get => _selectedProjectRecord;
-            set => SetProperty(ref _selectedProjectRecord, value);
+            set
+            {
+                if (SetProperty(ref _selectedProjectRecord, value))
+                {
+                    OnPropertyChanged(nameof(ActiveProjectId));
+                }
+            }
+        }
+
+        public string ActiveProjectId => _selectedProjectRecord?.Id ?? string.Empty;
+
+        public bool IsClosingProject
+        {
+            get => _isClosingProject;
+            private set => SetProperty(ref _isClosingProject, value);
         }
 
         public ProjectAnalysisStatus AnalysisStatus
@@ -489,6 +504,22 @@ namespace AssetStudio.Avalonia.ViewModels
             });
         }
 
+        public void BeginClosingProject()
+        {
+            _dispatchToUi(() =>
+            {
+                IsClosingProject = true;
+            });
+        }
+
+        public void CancelClosingProject()
+        {
+            _dispatchToUi(() =>
+            {
+                IsClosingProject = false;
+            });
+        }
+
         public void ResetSession(bool keepSavedProjects = true)
         {
             _dispatchToUi(() =>
@@ -497,6 +528,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 ProjectDisplayName = string.Empty;
                 HasLoadedProject = false;
                 IsLazyMode = false;
+                IsClosingProject = false;
                 UnityVersion = string.Empty;
                 ScriptingBackend = UnityScriptingBackend.Unknown;
                 CacheStatusSummary = string.Empty;

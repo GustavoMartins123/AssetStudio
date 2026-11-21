@@ -449,9 +449,9 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public bool CanAdd => !IsBusy;
 
-        public bool CanOpenWithoutProject => !IsBusy;
+        public bool CanOpenWithoutProject => !IsBusy && !HasLaunched;
 
-        public bool CanOpen => _selectedProject != null && !IsBusy;
+        public bool CanOpen => _selectedProject != null && !IsBusy && !HasLaunched;
 
         public bool CanEdit => _selectedProject != null && !IsBusy;
 
@@ -727,7 +727,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public async Task OpenSelectedProjectAsync()
         {
-            if (_isOpeningProject || _isDeletingProject || _isRefreshingProjects)
+            if (_isOpeningProject || _isDeletingProject || _isRefreshingProjects || HasLaunched)
             {
                 return;
             }
@@ -743,7 +743,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public async Task OpenProjectByIdAsync(string projectId)
         {
-            if (string.IsNullOrWhiteSpace(projectId) || _isOpeningProject || _isDeletingProject)
+            if (string.IsNullOrWhiteSpace(projectId) || _isOpeningProject || _isDeletingProject || HasLaunched)
             {
                 return;
             }
@@ -789,7 +789,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public void OpenWithoutProject()
         {
-            if (IsBusy)
+            if (IsBusy || HasLaunched)
             {
                 return;
             }
@@ -917,6 +917,7 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             OpenedLaunchContext = context;
             HasLaunched = true;
+            NotifyStateAndCommandsChanged();
             LaunchProject?.Invoke(context);
             RequestClose?.Invoke(true);
         }

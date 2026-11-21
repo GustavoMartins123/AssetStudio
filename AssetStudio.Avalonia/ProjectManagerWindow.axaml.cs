@@ -19,14 +19,29 @@ namespace AssetStudio.Avalonia;
 
 public partial class ProjectManagerWindow : Window
 {
+    private bool _isLaunchingMainWindow;
+
     public ProjectManagerWindow()
-        : this(new ProjectManagerViewModel(
-            store: ProjectManagerStore.Shared,
-            dispatchToUi: action => Dispatcher.UIThread.Post(action, DispatcherPriority.Background)))
+        : this(initialSelectedProjectId: null, autoRefresh: true)
+    {
+    }
+
+    public ProjectManagerWindow(string? initialSelectedProjectId, bool autoRefresh = true)
+        : this(
+            new ProjectManagerViewModel(
+                store: ProjectManagerStore.Shared,
+                dispatchToUi: action => Dispatcher.UIThread.Post(action, DispatcherPriority.Background)),
+            initialSelectedProjectId,
+            autoRefresh)
     {
     }
 
     public ProjectManagerWindow(ProjectManagerViewModel viewModel)
+        : this(viewModel, initialSelectedProjectId: null, autoRefresh: true)
+    {
+    }
+
+    public ProjectManagerWindow(ProjectManagerViewModel viewModel, string? initialSelectedProjectId, bool autoRefresh = true)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         InitializeComponent();
@@ -48,14 +63,27 @@ public partial class ProjectManagerWindow : Window
         ViewModel.RequestClose += OnRequestClose;
 
         DataContext = ViewModel;
-        _ = ViewModel.RefreshProjectsAsync();
+        if (autoRefresh)
+        {
+            BeginRefreshProjects(initialSelectedProjectId);
+        }
     }
 
     public ProjectManagerViewModel ViewModel { get; }
 
+    public void BeginRefreshProjects(string? selectProjectId = null)
+    {
+        _ = ViewModel.RefreshProjectsAsync(selectProjectId);
+    }
+
     protected override void OnClosed(EventArgs e)
     {
         ViewModel.RequestClose -= OnRequestClose;
+        ViewModel.EditProjectAsync = null;
+        ViewModel.ConfirmDeleteAsync = null;
+        ViewModel.PickIl2CppDumperPathAsync = null;
+        ViewModel.ShowError = null;
+        ViewModel.LaunchProject = null;
         ViewModel.Dispose();
         base.OnClosed(e);
     }
@@ -130,16 +158,41 @@ public partial class ProjectManagerWindow : Window
 
     private void LaunchMainWindow(ProjectLaunchContext? context)
     {
-        var mainWindow = context == null ? new MainWindow() : new MainWindow(context);
-
-        if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        if (_isLaunchingMainWindow)
         {
-            desktop.MainWindow = mainWindow;
+            return;
         }
 
-        mainWindow.Show();
-        mainWindow.StartProjectIndexingOnOpen();
-        Close();
+        _isLaunchingMainWindow = true;
+        try
+        {
+            if (Application.Current is App app)
+            {
+                if (!app.NavigateToMainWindow(this, context))
+                {
+                    _isLaunchingMainWindow = false;
+                }
+                return;
+            }
+
+            var mainWindow = context == null ? new MainWindow() : new MainWindow(context);
+
+            if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+            {
+                desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+                desktop.MainWindow = mainWindow;
+            }
+
+            mainWindow.Show();
+            mainWindow.Activate();
+            mainWindow.StartProjectIndexingOnOpen();
+            Close();
+        }
+        catch
+        {
+            _isLaunchingMainWindow = false;
+            throw;
+        }
     }
 }
 
