@@ -389,4 +389,33 @@ namespace AssetStudio.Avalonia
         public List<string> DistinctMaterialIds { get; } = new();
         public List<string> DistinctTextureIds { get; } = new();
     }
+
+    internal sealed class CompatibleAnimationClipInfo
+    {
+        public CompatibleAnimationClipInfo(
+            string clipAssetId,
+            string clipName,
+            long pathId,
+            string relationKind,
+            int matchScore,
+            int matchedBoneCount = 0,
+            int totalClipBoneCount = 0)
+        {
+            ClipAssetId = clipAssetId ?? string.Empty;
+            ClipName = clipName ?? string.Empty;
+            PathId = pathId;
+            RelationKind = relationKind ?? string.Empty;
+            MatchScore = matchScore;
+            MatchedBoneCount = matchedBoneCount;
+            TotalClipBoneCount = totalClipBoneCount;
+        }
+
+        public string ClipAssetId { get; }
+        public string ClipName { get; }
+        public long PathId { get; }
+        public string RelationKind { get; }
+        public int MatchScore { get; }
+        public int MatchedBoneCount { get; }
+        public int TotalClipBoneCount { get; }
+    }
 }

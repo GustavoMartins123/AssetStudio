@@ -1092,14 +1092,182 @@ namespace AssetStudio.Avalonia
                 cmd.Parameters.AddWithValue("@projectId", projectId);
                 cmd.Parameters.AddWithValue("@clipAssetId", clipAssetId);
                 cmd.Parameters.AddWithValue("@meshType", (int)ClassIDType.Mesh);
-                using var reader = cmd.ExecuteReader();
-                while (reader.Read())
-                {
-                    result.Add(reader.GetString(0));
-                }
-            });
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        result.Add(reader.GetString(0));
+                    }
+                });
 
-            return result;
+                return result;
+            }
+
+            internal List<CompatibleAnimationClipInfo> LoadCompatibleAnimationClipsForTarget(
+                string folderPath,
+                string signature,
+                string? avatarAssetId = null,
+                string? modelGroupId = null,
+                string? animatorAssetId = null,
+                string? controllerAssetId = null,
+                IReadOnlyList<string>? meshAssetIds = null,
+                int maxResults = 512)
+            {
+                var result = new List<CompatibleAnimationClipInfo>();
+                if (maxResults <= 0)
+                {
+                    return result;
+                }
+
+                var cleanAvatarId = avatarAssetId?.Trim() ?? string.Empty;
+                var cleanGroupId = modelGroupId?.Trim() ?? string.Empty;
+                var cleanAnimatorId = animatorAssetId?.Trim() ?? string.Empty;
+                var cleanControllerId = controllerAssetId?.Trim() ?? string.Empty;
+                var cleanMeshIds = (meshAssetIds ?? Array.Empty<string>())
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Select(id => id.Trim())
+                    .Distinct(StringComparer.Ordinal)
+                    .Take(64)
+                    .ToList();
+
+                if (string.IsNullOrEmpty(cleanAvatarId)
+                    && string.IsNullOrEmpty(cleanGroupId)
+                    && string.IsNullOrEmpty(cleanAnimatorId)
+                    && string.IsNullOrEmpty(cleanControllerId)
+                    && cleanMeshIds.Count == 0)
+                {
+                    return result;
+                }
+
+                ExecuteProjectReadQuery(folderPath, signature, "compatible animation clips for target", (conn, transaction, projectId) =>
+                {
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = transaction;
+                    cmd.Parameters.AddWithValue("@projectId", projectId);
+                    cmd.Parameters.AddWithValue("@clipType", (int)ClassIDType.AnimationClip);
+                    cmd.Parameters.AddWithValue("@maxResults", maxResults);
+
+                    var unionQueries = new List<string>();
+                    if (!string.IsNullOrEmpty(cleanAvatarId))
+                    {
+                        cmd.Parameters.AddWithValue("@avatarId", cleanAvatarId);
+                        unionQueries.Add(@"
+                            SELECT
+                                t.ClipAssetUniqueID AS ClipId,
+                                t.RelationKind AS RelKind,
+                                t.MatchScore AS Score,
+                                t.MatchedBoneCount AS MatchedBones,
+                                t.TotalClipBoneCount AS TotalBones
+                            FROM AnimationClipTargets t
+                            WHERE t.ProjectId = @projectId
+                              AND t.AvatarAssetUniqueID = @avatarId");
+                    }
+
+                    if (!string.IsNullOrEmpty(cleanGroupId))
+                    {
+                        cmd.Parameters.AddWithValue("@groupId", cleanGroupId);
+                        unionQueries.Add(@"
+                            SELECT
+                                t.ClipAssetUniqueID AS ClipId,
+                                t.RelationKind AS RelKind,
+                                t.MatchScore AS Score,
+                                t.MatchedBoneCount AS MatchedBones,
+                                t.TotalClipBoneCount AS TotalBones
+                            FROM AnimationClipTargets t
+                            WHERE t.ProjectId = @projectId
+                              AND t.ModelGroupId = @groupId");
+                    }
+
+                    if (!string.IsNullOrEmpty(cleanAnimatorId))
+                    {
+                        cmd.Parameters.AddWithValue("@animatorId", cleanAnimatorId);
+                        unionQueries.Add(@"
+                            SELECT
+                                t.ClipAssetUniqueID AS ClipId,
+                                t.RelationKind AS RelKind,
+                                t.MatchScore AS Score,
+                                t.MatchedBoneCount AS MatchedBones,
+                                t.TotalClipBoneCount AS TotalBones
+                            FROM AnimationClipTargets t
+                            WHERE t.ProjectId = @projectId
+                              AND t.AnimatorAssetUniqueID = @animatorId");
+                    }
+
+                    if (cleanMeshIds.Count > 0)
+                    {
+                        var meshPlaceholders = new List<string>(cleanMeshIds.Count);
+                        for (var i = 0; i < cleanMeshIds.Count; i++)
+                        {
+                            var paramName = "@meshId" + i.ToString(CultureInfo.InvariantCulture);
+                            meshPlaceholders.Add(paramName);
+                            cmd.Parameters.AddWithValue(paramName, cleanMeshIds[i]);
+                        }
+
+                        unionQueries.Add($@"
+                            SELECT
+                                t.ClipAssetUniqueID AS ClipId,
+                                t.RelationKind AS RelKind,
+                                t.MatchScore AS Score,
+                                t.MatchedBoneCount AS MatchedBones,
+                                t.TotalClipBoneCount AS TotalBones
+                            FROM AnimationClipTargets t
+                            WHERE t.ProjectId = @projectId
+                              AND t.MeshAssetUniqueID IN ({string.Join(",", meshPlaceholders)})");
+                    }
+
+                    if (!string.IsNullOrEmpty(cleanControllerId))
+                    {
+                        cmd.Parameters.AddWithValue("@controllerId", cleanControllerId);
+                        unionQueries.Add(@"
+                            SELECT
+                                ae.TargetAssetUniqueID AS ClipId,
+                                'AnimatorController' AS RelKind,
+                                10000 AS Score,
+                                0 AS MatchedBones,
+                                0 AS TotalBones
+                            FROM AssetEdges ae
+                            WHERE ae.ProjectId = @projectId
+                              AND ae.SourceAssetUniqueID = @controllerId
+                              AND ae.EdgeKind = 'AnimationClip'
+                              AND ae.TargetAssetUniqueID <> ''");
+                    }
+
+                    cmd.CommandText = $@"
+                        WITH RawCandidates AS (
+                            {string.Join(" UNION ALL ", unionQueries)}
+                        )
+                        SELECT
+                            rc.ClipId,
+                            COALESCE(clipAsset.Name, ''),
+                            COALESCE(clipAsset.PathID, 0),
+                            MAX(rc.RelKind),
+                            MAX(rc.Score) AS BestScore,
+                            MAX(rc.MatchedBones) AS BestMatchedBones,
+                            MAX(rc.TotalBones) AS BestTotalBones
+                        FROM RawCandidates rc
+                        INNER JOIN Assets clipAsset
+                          ON clipAsset.ProjectId = @projectId
+                         AND clipAsset.UniqueID = rc.ClipId
+                         AND clipAsset.Type = @clipType
+                        WHERE rc.ClipId <> ''
+                        GROUP BY rc.ClipId
+                        ORDER BY BestScore DESC, BestMatchedBones DESC, clipAsset.Name ASC, rc.ClipId ASC
+                        LIMIT @maxResults";
+
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        result.Add(new CompatibleAnimationClipInfo(
+                            reader.GetString(0),
+                            reader.GetString(1),
+                            reader.GetInt64(2),
+                            reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                            reader.IsDBNull(4) ? 0 : reader.GetInt32(4),
+                            reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
+                            reader.IsDBNull(6) ? 0 : reader.GetInt32(6)));
+                    }
+                });
+
+                return result;
+            }
         }
     }
-}

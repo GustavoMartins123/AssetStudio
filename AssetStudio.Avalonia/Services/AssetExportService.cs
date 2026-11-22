@@ -2254,7 +2254,8 @@ namespace AssetStudio.Avalonia.Services
             IImported convert,
             string exportFile,
             ExportOptionsState exportOptions,
-            ConcurrentDictionary<string, byte>? reservedPaths = null)
+            ConcurrentDictionary<string, byte>? reservedPaths = null,
+            List<string>? exportedFilePaths = null)
         {
             var format = ResolveModelExportFormat(exportFile, exportOptions);
             var ext = ModelExporter.GetModelFileExtension(format);
@@ -2282,6 +2283,7 @@ namespace AssetStudio.Avalonia.Services
                         exportOptions.FbxVersion,
                         exportOptions.FbxFormat == 1,
                         exportOptions.CombineMeshes);
+                    exportedFilePaths?.Add(exportFile);
                 }
                 catch
                 {
@@ -2320,6 +2322,7 @@ namespace AssetStudio.Avalonia.Services
                             exportOptions.FbxVersion,
                             exportOptions.FbxFormat == 1,
                             exportOptions.CombineMeshes);
+                        exportedFilePaths?.Add(animFile);
                     }
                     catch
                     {
@@ -2356,6 +2359,7 @@ namespace AssetStudio.Avalonia.Services
                         exportOptions.FbxVersion,
                         exportOptions.FbxFormat == 1,
                         exportOptions.CombineMeshes);
+                    exportedFilePaths?.Add(exportFile);
                 }
                 catch
                 {

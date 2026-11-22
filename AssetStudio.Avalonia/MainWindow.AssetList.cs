@@ -136,13 +136,12 @@ public partial class MainWindow
     {
         var selectedAssets = GetSelectedAssets();
         var singleSelected = selectedAssets.Count == 1;
-        var hasAnimatorWithClips = selectedAssets.Any(x => x.Type == ClassIDType.Animator)
-            && selectedAssets.Any(x => x.Type == ClassIDType.AnimationClip);
+        var hasModelWithClips = Services.BatchAnimationExportHelper.CanExportSelectionWithAnimationClips(selectedAssets);
         var hasModelGroupTarget = selectedAssets.Any(x => x.Type is ClassIDType.Mesh or ClassIDType.Animator or ClassIDType.Avatar);
 
         goToSceneHierarchyMenuItem.IsVisible = singleSelected && selectedAssets[0].TreeNode != null;
         showOriginalFileMenuItem.IsVisible = singleSelected;
-        exportAnimatorWithSelectedAnimationClipMenuItem.IsVisible = hasAnimatorWithClips;
+        exportAnimatorWithSelectedAnimationClipMenuItem.IsVisible = hasModelWithClips;
         exportModelGroupFbxMenuItem.IsVisible = hasModelGroupTarget;
     }
 

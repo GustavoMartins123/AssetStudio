@@ -1,0 +1,146 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.BatchAnimationExportWindow"
+        x:CompileBindings="True"
+        x:DataType="vm:BatchAnimationExportViewModel"
+        Title="Batch Export Animations"
+        Width="560"
+        Height="620"
+        MinWidth="460"
+        MinHeight="480"
+        WindowStartupLocation="CenterOwner">
+
+    <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" Margin="14" RowSpacing="10">
+        <!-- Target Model Header -->
+        <Border Grid.Row="0"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,8">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                <StackPanel Grid.Column="0" Spacing="2">
+                    <TextBlock Text="Target 3D Model / Rig"
+                               FontSize="11"
+                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                    <TextBlock Text="{Binding TargetDisplayName}"
+                               FontSize="14"
+                               FontWeight="SemiBold"
+                               TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+                <TextBlock Grid.Column="1"
+                           Text="{Binding SelectionSummaryText}"
+                           FontSize="12"
+                           FontWeight="SemiBold"
+                           VerticalAlignment="Center" />
+            </Grid>
+        </Border>
+
+        <!-- Search Filter & Select All / Deselect All -->
+        <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+            <TextBox x:Name="ClipFilterTextBox"
+                     Grid.Column="0"
+                     PlaceholderText="Filter animations by name, relation, or PathID..."
+                     Text="{Binding SearchText, Mode=TwoWay}" />
+            <Button x:Name="SelectAllClipsButton"
+                    Grid.Column="1"
+                    Content="Select All"
+                    Padding="10,5"
+                    Command="{Binding SelectAllCommand}" />
+            <Button x:Name="DeselectAllClipsButton"
+                    Grid.Column="2"
+                    Content="Deselect All"
+                    Padding="10,5"
+                    Command="{Binding DeselectAllCommand}" />
+        </Grid>
+
+        <!-- Compatible AnimationClips List -->
+        <Border Grid.Row="2"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6">
+            <ListBox x:Name="CompatibleClipsListBox"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     ItemsSource="{Binding FilteredClips}">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="vm:BatchAnimationClipItemViewModel" x:CompileBindings="True">
+                        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10" Margin="4,3">
+                            <CheckBox Grid.Column="0"
+                                      IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                      VerticalAlignment="Center" />
+                            <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding Name}"
+                                           FontWeight="SemiBold"
+                                           FontSize="12"
+                                           TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="{Binding DetailText}"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                           TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <TextBlock Grid.Column="2"
+                                       Text="{Binding DurationAndFramesText}"
+                                       IsVisible="{Binding HasTimingInfo}"
+                                       FontSize="11"
+                                       FontFamily="Monospace"
+                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                       VerticalAlignment="Center" />
+                        </Grid>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </Border>
+
+        <!-- Export Mode & Format Options -->
+        <Border Grid.Row="3"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,10">
+            <StackPanel Spacing="8">
+                <TextBlock Text="Export Mode"
+                           FontSize="12"
+                           FontWeight="SemiBold" />
+                <RadioButton x:Name="SingleFileModeRadio"
+                             GroupName="BatchAnimExportModeGroup"
+                             Content="{Binding SingleFileModeLabel}"
+                             IsChecked="{Binding IsSingleFileMode, Mode=TwoWay}" />
+                <RadioButton x:Name="SplitFolderModeRadio"
+                             GroupName="BatchAnimExportModeGroup"
+                             Content="{Binding SplitFolderModeLabel}"
+                             IsChecked="{Binding IsSplitFolderMode, Mode=TwoWay}" />
+                <Grid ColumnDefinitions="120,*" ColumnSpacing="8" Margin="0,4,0,0">
+                    <TextBlock Grid.Column="0"
+                               Text="Model format"
+                               VerticalAlignment="Center"
+                               FontSize="12" />
+                    <ComboBox x:Name="BatchModelFormatComboBox"
+                              Grid.Column="1"
+                              ItemsSource="{Binding ModelFormatOptions}"
+                              SelectedIndex="{Binding ModelFormatIndex, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch" />
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <!-- Action Buttons -->
+        <StackPanel Grid.Row="4"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Spacing="8">
+            <Button x:Name="ConfirmBatchExportButton"
+                    Content="{Binding ConfirmButtonText}"
+                    MinWidth="130"
+                    HorizontalContentAlignment="Center"
+                    Command="{Binding ConfirmCommand}" />
+            <Button x:Name="CancelBatchExportButton"
+                    Content="Cancel"
+                    MinWidth="85"
+                    HorizontalContentAlignment="Center"
+                    Command="{Binding CancelCommand}" />
+        </StackPanel>
+    </Grid>
+</Window>

@@ -439,6 +439,7 @@ public partial class MainWindow : Window
         handlers.RotateMeshDown = ExecuteRotateMeshDown;
         handlers.ResetMeshMaterialColor = ExecuteResetMeshMaterialColor;
         handlers.ExportPreviewModelAsync = ExportPreviewModelCommandHandlerAsync;
+        handlers.BatchExportPreviewAnimationsAsync = BatchExportPreviewAnimationsCommandHandlerAsync;
         handlers.NavigateToReferencedAssetAsync = NavigateToReferencedAssetCommandHandlerAsync;
 
         handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;

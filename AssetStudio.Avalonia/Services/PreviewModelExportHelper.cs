@@ -45,6 +45,25 @@ namespace AssetStudio.Avalonia.Services
 
             return safeBase + ext;
         }
+
+        public string BuildCharacterBaseFileName(ExportOptionsState? exportOptions)
+        {
+            var ext = AssetExportService.GetModelFileExtension(exportOptions);
+            var characterBase = PreviewModelExportHelper.SelectSuggestedBaseName(
+                ExportFullModelGroup,
+                ModelGroupName,
+                PrimaryMesh,
+                Avatar,
+                clip: null,
+                SelectedAsset);
+            var safeBase = AssetExportService.FixFileName(string.IsNullOrWhiteSpace(characterBase) ? "model" : characterBase);
+            if (string.IsNullOrWhiteSpace(safeBase))
+            {
+                safeBase = "model";
+            }
+
+            return safeBase + ext;
+        }
     }
 
     public static class PreviewModelExportHelper

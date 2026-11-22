@@ -24,6 +24,15 @@ public sealed class ExportOptionsState
     public bool ExportSkins { get; set; } = true;
     public bool ExportAnimations { get; set; } = true;
     public bool ExportAnimationsSplit { get; set; } = false;
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    [Newtonsoft.Json.JsonIgnore]
+    public bool SplitAnimations
+    {
+        get => ExportAnimationsSplit;
+        set => ExportAnimationsSplit = value;
+    }
+
     public bool ExportBlendShape { get; set; } = true;
     public bool CastToBone { get; set; }
     public bool CombineMeshes { get; set; } = false;

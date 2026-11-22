@@ -66,6 +66,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public Action? RotateMeshDown { get; set; }
         public Action? ResetMeshMaterialColor { get; set; }
         public Func<Task>? ExportPreviewModelAsync { get; set; }
+        public Func<Task>? BatchExportPreviewAnimationsAsync { get; set; }
         public Func<AssetReferenceItem?, Task>? NavigateToReferencedAssetAsync { get; set; }
 
         public Func<Task>? VideoPlayPauseAsync { get; set; }
@@ -140,6 +141,7 @@ namespace AssetStudio.Avalonia.ViewModels
             RotateMeshDown = null;
             ResetMeshMaterialColor = null;
             ExportPreviewModelAsync = null;
+            BatchExportPreviewAnimationsAsync = null;
             NavigateToReferencedAssetAsync = null;
 
             VideoPlayPauseAsync = null;
@@ -282,6 +284,10 @@ namespace AssetStudio.Avalonia.ViewModels
                 ExecuteExportPreviewModelAsync,
                 canExecute: () => CanStartPreviewModelExport,
                 onException: HandleCommandException);
+            BatchExportPreviewAnimationsCommand = new AsyncRelayCommand(
+                ExecuteBatchExportPreviewAnimationsAsync,
+                canExecute: () => CanStartPreviewModelExport,
+                onException: HandleCommandException);
             NavigateToReferencedAssetCommand = new AsyncRelayCommand<AssetReferenceItem>(
                 ExecuteNavigateToReferencedAssetAsync,
                 canExecute: item => !_disposed && item?.IsNavigable == true,
@@ -390,6 +396,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand RotateMeshDownCommand { get; }
         public RelayCommand ResetMeshMaterialColorCommand { get; }
         public AsyncRelayCommand ExportPreviewModelCommand { get; }
+        public AsyncRelayCommand BatchExportPreviewAnimationsCommand { get; }
         public AsyncRelayCommand<AssetReferenceItem> NavigateToReferencedAssetCommand { get; }
         public AsyncRelayCommand NavigateToSelectedReferenceCommand { get; }
 
@@ -502,6 +509,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     OnPropertyChanged(nameof(CanExportPreviewModel));
                     OnPropertyChanged(nameof(CanStartPreviewModelExport));
                     ExportPreviewModelCommand.NotifyCanExecuteChanged();
+                    BatchExportPreviewAnimationsCommand.NotifyCanExecuteChanged();
                     break;
                 case nameof(PreviewSessionViewModel.SelectedReferenceItem):
                     OnPropertyChanged(nameof(CanNavigateToSelectedReference));
@@ -517,6 +525,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 OnPropertyChanged(nameof(CanExportPreviewModel));
                 OnPropertyChanged(nameof(CanStartPreviewModelExport));
                 ExportPreviewModelCommand.NotifyCanExecuteChanged();
+                BatchExportPreviewAnimationsCommand.NotifyCanExecuteChanged();
             }
         }
 
@@ -527,6 +536,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 case nameof(ExportViewModel.IsExporting):
                     OnPropertyChanged(nameof(CanStartPreviewModelExport));
                     ExportPreviewModelCommand.NotifyCanExecuteChanged();
+                    BatchExportPreviewAnimationsCommand.NotifyCanExecuteChanged();
                     if (Export.IsExporting)
                     {
                         LoadingProgress = Export.ProgressPercent;
@@ -1101,6 +1111,32 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        private async Task ExecuteBatchExportPreviewAnimationsAsync()
+        {
+            if (CommandHandlers.BatchExportPreviewAnimationsAsync != null)
+            {
+                await CommandHandlers.BatchExportPreviewAnimationsAsync();
+                return;
+            }
+
+            if (!CanExportPreviewModel)
+            {
+                return;
+            }
+
+            var baseName = !string.IsNullOrWhiteSpace(MeshPreview.ActiveMeshName)
+                ? MeshPreview.ActiveMeshName
+                : !string.IsNullOrWhiteSpace(MeshPreview.ActiveAvatarName)
+                    ? MeshPreview.ActiveAvatarName
+                    : PreviewSession.ActiveAsset?.Name ?? "model";
+            var suggestedFileName = AssetExportService.FixFileName(baseName) + ".glb";
+            var path = await _dialogService.PickSaveFileAsync(new SaveFilePickerRequest("Batch Export Animations", suggestedFileName, "glb"));
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                StatusText = $"Selected batch export target: {path}";
+            }
+        }
+
         private async Task ExecuteNavigateToReferencedAssetAsync(AssetReferenceItem? target)
         {
             if (target == null || !target.IsNavigable || _disposed)
@@ -1312,6 +1348,7 @@ namespace AssetStudio.Avalonia.ViewModels
             OnPropertyChanged(nameof(CanNavigateToSelectedReference));
             OpenProjectManagerCommand.NotifyCanExecuteChanged();
             ExportPreviewModelCommand.NotifyCanExecuteChanged();
+            BatchExportPreviewAnimationsCommand.NotifyCanExecuteChanged();
             NavigateToSelectedReferenceCommand.NotifyCanExecuteChanged();
             NavigateToReferencedAssetCommand.NotifyCanExecuteChanged();
         }

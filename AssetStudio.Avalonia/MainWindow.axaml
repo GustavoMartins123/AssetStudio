@@ -161,7 +161,7 @@
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
-                <MenuItem Header="Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}">
+                <MenuItem Header="Model / Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_export}" Width="16" Height="16" />
                     </MenuItem.Icon>
@@ -297,7 +297,7 @@
                                     <MenuItem Header="Copy text" Command="{Binding CopyAssetCellTextCommand}" />
                                     <MenuItem Header="Export selected assets" Command="{Binding ExportSelectedAssetsCommand}" />
                                     <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group..." Command="{Binding ExportModelGroupFbxCommand}" />
-                                    <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}" />
+                                    <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Model / Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}" />
                                     <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Command="{Binding GoToSceneHierarchyCommand}" />
                                     <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Command="{Binding ShowOriginalFileCommand}" />
                                 </ContextMenu>
@@ -594,6 +594,7 @@
                                         <!-- Reset View & 1-Click Model Export -->
                                         <Button x:Name="ResetViewBtn" Content="Reset View" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ResetMeshViewCommand}" Height="28" FontSize="11" />
                                         <Button x:Name="ExportPreviewModelBtn" Content="Export Model..." HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ExportPreviewModelCommand}" IsVisible="{Binding CanExportPreviewModel}" IsEnabled="{Binding CanStartPreviewModelExport}" Height="28" FontSize="11" ToolTip.Tip="Export the currently previewed 3D model (.glb / .gltf / .fbx)" />
+                                        <Button x:Name="BatchExportAnimationsBtn" Content="Batch Export Animations..." HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding BatchExportPreviewAnimationsCommand}" IsVisible="{Binding CanExportPreviewModel}" IsEnabled="{Binding CanStartPreviewModelExport}" Height="28" FontSize="11" ToolTip.Tip="Select and export multiple compatible AnimationClips with this 3D model (.glb / .gltf / .fbx)" />
                                         <StackPanel x:Name="PreviewExportProgressPanel" Spacing="3" IsVisible="{Binding Export.IsExporting}">
                                             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
                                                 <TextBlock x:Name="PreviewExportStatusText" Text="{Binding Export.StatusText}" Foreground="#DDD" FontSize="10" TextTrimming="CharacterEllipsis" />

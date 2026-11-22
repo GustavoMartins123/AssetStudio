@@ -402,56 +402,77 @@ public partial class MainWindow
 
     private async Task ExportAnimatorWithSelectedAnimationClips(List<AssetItem> selectedAssets)
     {
-        var animator = selectedAssets.FirstOrDefault(x => x.Type == ClassIDType.Animator);
-        var animationList = selectedAssets.Where(x => x.Type == ClassIDType.AnimationClip).ToList();
-        if (animator == null || animationList.Count == 0)
+        if (!BatchAnimationExportHelper.CanExportSelectionWithAnimationClips(selectedAssets))
         {
-            StatusStripUpdate("Select one Animator and one or more AnimationClips.");
+            StatusStripUpdate("Select a model (Animator, Mesh, Avatar, SkinnedMeshRenderer, or GameObject) and AnimationClips, or select multiple AnimationClips.");
             return;
         }
 
+        var initialResolution = BatchAnimationExportHelper.ResolveAssetListSelection(selectedAssets);
         var selectedExportRoot = await PickExportFolderDialogAsync("Select the save folder");
         if (string.IsNullOrWhiteSpace(selectedExportRoot)) return;
 
         SaveExportFolder(selectedExportRoot);
-        var exportPath = Path.Combine(selectedExportRoot, "Animator");
+        var subfolderName = initialResolution.Kind switch
+        {
+            BatchAnimationSelectionKind.ExplicitAnimator => "Animator",
+            BatchAnimationSelectionKind.ExplicitAvatar => "Avatar",
+            BatchAnimationSelectionKind.ExplicitMesh => "Mesh",
+            BatchAnimationSelectionKind.ExplicitSkinnedMeshRenderer => "Model",
+            BatchAnimationSelectionKind.ExplicitGameObject => "GameObject",
+            _ => "AnimatedModel"
+        };
+        var exportPath = Path.Combine(selectedExportRoot, subfolderName);
         Directory.CreateDirectory(exportPath);
-        var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
-        var exportFile = AssetExportService.GetUniqueFilePath(Path.Combine(exportPath, FixFileName(animator.Name) + modelExt));
-        var selectedGameObjects = GetTopLevelSelectedGameObjects(selectedAssets
-            .Where(x => x.Type != ClassIDType.AnimationClip && x.TreeNode?.GameObject != null)
-            .Select(x => x.TreeNode!.GameObject!)
-            .Distinct()
-            .ToList());
 
+        var targetDisplayName = initialResolution.PrimaryModelAsset?.Name ?? initialResolution.SuggestedBaseName;
         ExportState.BeginExport(
             ExportOperationMode.Animator,
-            1,
+            100,
             exportPath,
-            $"Exporting {animator.Name}...");
-        StatusStripUpdate($"Exporting {animator.Name}...");
+            $"Exporting {targetDisplayName} with {initialResolution.SelectedClipAssets.Count} AnimationClip(s)...");
+        void ReportStage(int percent, string stageText)
+        {
+            ExportState.ReportStageProgress(percent, stageText);
+            StatusStripUpdate(stageText);
+        }
+
+        ReportStage(5, $"Exporting {targetDisplayName} with {initialResolution.SelectedClipAssets.Count} AnimationClip(s)...");
         var exportErrors = new List<string>();
         var currentExportPath = Path.Combine(exportPath, "export-current.txt");
         bool success = false;
+        string? exportedPrimaryFile = null;
+        var exportedFiles = new List<string>();
+
         await Task.Run(() =>
         {
             try
             {
-                EnsureLazyAssetsLoadedForExport(selectedAssets);
-                var clips = animationList.Select(x => (AnimationClip)x.Asset!).ToArray();
-                AssetExportService.WriteCurrentExport(currentExportPath, animator, 1, 1);
-                IImported convert = selectedGameObjects.Count > 0
-                    ? new ModelConverter(animator.Name, selectedGameObjects, exportOptions.ConvertTextureFormat, clips)
-                    : new ModelConverter((Animator)animator.Asset!, exportOptions.ConvertTextureFormat, clips);
-                ExportFbx(convert, exportFile);
-                success = true;
+                var trackItem = initialResolution.PrimaryModelAsset ?? initialResolution.SelectedClipAssets.FirstOrDefault();
+                if (trackItem != null)
+                {
+                    AssetExportService.WriteCurrentExport(currentExportPath, trackItem, 1, 1);
+                }
+
+                success = ExportSelectionWithAnimationClipsCore(
+                    selectedAssets,
+                    exportPath,
+                    exportOptions,
+                    ReportStage,
+                    out exportedPrimaryFile,
+                    out var errorMsg,
+                    exportedFiles);
+                if (!success && !string.IsNullOrWhiteSpace(errorMsg))
+                {
+                    exportErrors.Add(errorMsg);
+                }
             }
             catch (Exception ex)
             {
-                var error = $"Export Animator:{animator.Name} error";
+                var error = $"Export Model+AnimationClips:{targetDisplayName} error";
                 exportErrors.Add($"{error}{Environment.NewLine}{ex}");
                 Logger.Error(error, ex);
-                StatusStripUpdate($"Error exporting {animator.Name}: {ex.Message}");
+                StatusStripUpdate($"Error exporting {targetDisplayName}: {ex.Message}");
             }
             finally
             {
@@ -463,8 +484,15 @@ public partial class MainWindow
 
         if (success)
         {
-            var status = $"Finished exporting {Path.GetFileName(exportFile)}";
-            ExportState.Complete(1, statusText: status, errorLogPath: errorReportPath);
+            var primaryFileName = !string.IsNullOrWhiteSpace(exportedPrimaryFile)
+                ? Path.GetFileName(exportedPrimaryFile)
+                : targetDisplayName;
+            var splitSuffix = exportedFiles.Count > 1
+                ? $" (+ {exportedFiles.Count - 1} split animation file(s))"
+                : string.Empty;
+            var status = $"Finished exporting {primaryFileName}{splitSuffix}";
+            ExportState.ReportStageProgress(100, status);
+            ExportState.Complete(Math.Max(1, exportedFiles.Count), statusText: status, errorLogPath: errorReportPath);
             StatusStripUpdate(status);
             if (exportOptions.OpenAfterExport)
             {
@@ -473,11 +501,553 @@ public partial class MainWindow
         }
         else
         {
-            var status = "Animator export failed.";
+            var status = "Model + AnimationClips export failed.";
             if (errorReportPath != null) status += $" Error report: {Path.GetFileName(errorReportPath)}.";
             ExportState.Fail(status, errorReportPath);
             StatusStripUpdate(status);
         }
+    }
+
+    internal bool ExportSelectionWithAnimationClipsCore(
+        IReadOnlyList<AssetItem> selectedAssets,
+        string exportDirectoryOrFilePath,
+        ExportOptionsState? optionsOverride,
+        Action<int, string>? reportStage,
+        out string? exportedPrimaryFilePath,
+        out string? errorMessage,
+        List<string>? exportedFilePaths = null)
+    {
+        exportedPrimaryFilePath = null;
+        errorMessage = null;
+
+        if (!BatchAnimationExportHelper.CanExportSelectionWithAnimationClips(selectedAssets))
+        {
+            errorMessage = "Selection does not contain any AnimationClips or valid model targets.";
+            return false;
+        }
+
+        using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+
+        reportStage?.Invoke(10, "Loading selected assets...");
+        EnsureLazyAssetsLoadedForExport(selectedAssets.Where(x => x != null).ToList());
+
+        var resolution = BatchAnimationExportHelper.ResolveAssetListSelection(selectedAssets);
+        if (!resolution.IsValid || resolution.SelectedClips.Count == 0)
+        {
+            errorMessage = "Failed to materialize selected AnimationClips.";
+            return false;
+        }
+
+        var clips = resolution.SelectedClips.ToArray();
+        var effectiveOptions = (optionsOverride ?? exportOptions).Clone();
+        effectiveOptions.ExportAnimations = true;
+
+        var modelExt = AssetExportService.GetModelFileExtension(effectiveOptions);
+        var isExplicitFile = string.Equals(Path.GetExtension(exportDirectoryOrFilePath), ".glb", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Path.GetExtension(exportDirectoryOrFilePath), ".gltf", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Path.GetExtension(exportDirectoryOrFilePath), ".fbx", StringComparison.OrdinalIgnoreCase);
+
+        string ResolveExportFilePath(string baseName)
+        {
+            if (isExplicitFile)
+            {
+                var dir = Path.GetDirectoryName(exportDirectoryOrFilePath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                return exportDirectoryOrFilePath;
+            }
+
+            Directory.CreateDirectory(exportDirectoryOrFilePath);
+            var safeName = FixFileName(string.IsNullOrWhiteSpace(baseName) ? resolution.SuggestedBaseName : baseName);
+            return AssetExportService.GetUniqueFilePath(Path.Combine(exportDirectoryOrFilePath, safeName + modelExt));
+        }
+
+        var selectedTopGameObjects = GetTopLevelSelectedGameObjects(resolution.SelectedGameObjects.ToList());
+
+        switch (resolution.Kind)
+        {
+            case BatchAnimationSelectionKind.ExplicitAnimator when resolution.Animator != null:
+            {
+                var animator = resolution.Animator;
+                var baseName = resolution.PrimaryModelAsset?.Name ?? resolution.SuggestedBaseName;
+                if (TryFindModelGroupForAnimator(animator, out var animGroup, out var animGroupParts)
+                    && animGroup != null
+                    && animGroupParts.Count > 0)
+                {
+                    var groupBaseName = !string.IsNullOrWhiteSpace(animGroup.GroupName) ? animGroup.GroupName : baseName;
+                    var groupFile = ResolveExportFilePath(groupBaseName);
+                    if (ExportResolvedPreviewModelGroup(animGroup, animGroupParts, fallbackAvatar: null, clips, groupFile, reportStage: reportStage, optionsOverride: effectiveOptions, exportedFilePaths: exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = groupFile;
+                        return true;
+                    }
+                }
+
+                Avatar? animAvatar = null;
+                animator.m_Avatar?.TryGet(out animAvatar);
+                if (animAvatar != null
+                    && TryBuildEagerModelGroupForAvatar(animAvatar, out var eagerAvName, out var eagerAvRoot, out var eagerAvMeshes, out var eagerAvRenderers)
+                    && eagerAvMeshes.Count > 0)
+                {
+                    var eagerFile = ResolveExportFilePath(!string.IsNullOrWhiteSpace(eagerAvName) ? eagerAvName : baseName);
+                    if (ExportEagerModelGroupWithMaterials(eagerAvName, eagerAvRoot, eagerAvMeshes, eagerAvRenderers, animAvatar, clips, eagerFile, effectiveOptions, reportStage, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = eagerFile;
+                        return true;
+                    }
+                }
+
+                var exportFile = ResolveExportFilePath(baseName);
+                HydrateAnimatorHierarchyMaterialsForExport(animator, selectedTopGameObjects);
+                reportStage?.Invoke(65, $"Converting {baseName} with {clips.Length} animation(s)...");
+                IImported convert = selectedTopGameObjects.Count > 0
+                    ? new ModelConverter(baseName, selectedTopGameObjects, effectiveOptions.ConvertTextureFormat, clips)
+                    : new ModelConverter(animator, effectiveOptions.ConvertTextureFormat, clips);
+
+                if (convert.MeshList.Count == 0 && animAvatar != null)
+                {
+                    var avatarMeshes = FindMeshesForAvatar(animAvatar);
+                    if (avatarMeshes.Count > 0)
+                    {
+                        var renderers = avatarMeshes.Select(m => FindSkinnedRendererForAvatarMesh(animAvatar, m) ?? FindSingleRendererForMeshForExport(m)).ToList();
+                        if (ExportEagerModelGroupWithMaterials(baseName, eagerRoot: null, avatarMeshes, renderers!, animAvatar, clips, exportFile, effectiveOptions, reportStage, exportedFilePaths))
+                        {
+                            exportedPrimaryFilePath = exportFile;
+                            return true;
+                        }
+                    }
+                }
+
+                reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
+                AssetExportService.ExportModel(convert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
+                exportedPrimaryFilePath = exportFile;
+                return true;
+            }
+
+            case BatchAnimationSelectionKind.ExplicitAvatar when resolution.Avatar != null:
+            {
+                var avatar = resolution.Avatar;
+                var exportFile = ResolveExportFilePath(avatar.m_Name ?? resolution.SuggestedBaseName);
+                if (ExportPreviewAvatarRigCore(avatar, clips, exportFile, reportStage, effectiveOptions, exportedFilePaths))
+                {
+                    exportedPrimaryFilePath = exportFile;
+                    return true;
+                }
+                errorMessage = $"Could not resolve rigged meshes or skeleton for Avatar '{avatar.m_Name}'.";
+                return false;
+            }
+
+            case BatchAnimationSelectionKind.ExplicitSkinnedMeshRenderer when resolution.SkinnedMeshRenderer != null:
+            case BatchAnimationSelectionKind.ExplicitMesh when resolution.PrimaryMesh != null:
+            {
+                var primaryMesh = resolution.PrimaryMesh;
+                var smr = resolution.SkinnedMeshRenderer;
+                if (primaryMesh == null && smr?.m_Mesh != null)
+                {
+                    smr.m_Mesh.TryGet(out primaryMesh);
+                }
+
+                if (primaryMesh == null)
+                {
+                    errorMessage = "Could not resolve Mesh for export.";
+                    return false;
+                }
+
+                var avatar = resolution.Avatar ?? FindBestAvatarForMesh(primaryMesh);
+                if (avatar == null)
+                {
+                    avatar = TryResolveAvatarFromClipsOrHierarchy(clips, resolution.PrimaryModelAsset, resolution.RootGameObject);
+                }
+
+                if (TryFindModelGroupForMesh(primaryMesh, out var meshGroup, out var meshGroupParts)
+                    && meshGroup != null
+                    && meshGroupParts.Count > 0)
+                {
+                    var groupFile = ResolveExportFilePath(!string.IsNullOrWhiteSpace(meshGroup.GroupName) ? meshGroup.GroupName : resolution.SuggestedBaseName);
+                    if (ExportResolvedPreviewModelGroup(meshGroup, meshGroupParts, avatar, clips, groupFile, reportStage: reportStage, optionsOverride: effectiveOptions, exportedFilePaths: exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = groupFile;
+                        return true;
+                    }
+                }
+
+                if (TryBuildEagerModelGroupForMesh(primaryMesh, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar)
+                    && eagerMeshes.Count > 0)
+                {
+                    var eagerFile = ResolveExportFilePath(!string.IsNullOrWhiteSpace(eagerName) ? eagerName : resolution.SuggestedBaseName);
+                    if (ExportEagerModelGroupWithMaterials(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar ?? avatar, clips, eagerFile, effectiveOptions, reportStage, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = eagerFile;
+                        return true;
+                    }
+                }
+
+                if (resolution.SelectedMeshes.Count > 1)
+                {
+                    var multiMeshes = resolution.SelectedMeshes.ToList();
+                    var multiRenderers = multiMeshes
+                        .Select(m => (Renderer?)(FindSkinnedRendererForAvatarMesh(avatar, m) ?? FindSingleRendererForMeshForExport(m)))
+                        .ToList();
+                    var multiFile = ResolveExportFilePath(resolution.SuggestedBaseName);
+                    if (ExportEagerModelGroupWithMaterials(resolution.SuggestedBaseName, resolution.RootGameObject, multiMeshes, multiRenderers!, avatar, clips, multiFile, effectiveOptions, reportStage, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = multiFile;
+                        return true;
+                    }
+                }
+
+                var singleFile = ResolveExportFilePath(primaryMesh.m_Name ?? resolution.SuggestedBaseName);
+                if (ExportPreviewSingleMeshCore(primaryMesh, avatar, clips, singleFile, out var actualSingleFile, reportStage, effectiveOptions, exportedFilePaths, explicitRenderer: smr))
+                {
+                    exportedPrimaryFilePath = actualSingleFile;
+                    return true;
+                }
+
+                errorMessage = $"Failed to export mesh '{primaryMesh.m_Name}' with selected AnimationClips.";
+                return false;
+            }
+
+            case BatchAnimationSelectionKind.ExplicitGameObject when resolution.RootGameObject != null || selectedTopGameObjects.Count > 0:
+            {
+                var rootGo = resolution.RootGameObject ?? selectedTopGameObjects[0];
+                var baseName = !string.IsNullOrWhiteSpace(rootGo.m_Name) ? rootGo.m_Name : resolution.SuggestedBaseName;
+                var animator = resolution.PrimaryModelAsset != null
+                    ? FindAnimatorForModelExport(resolution.PrimaryModelAsset)
+                    : rootGo.m_Animator;
+
+                if (animator != null
+                    && TryFindModelGroupForAnimator(animator, out var goAnimGroup, out var goAnimGroupParts)
+                    && goAnimGroup != null
+                    && goAnimGroupParts.Count > 0)
+                {
+                    var groupFile = ResolveExportFilePath(!string.IsNullOrWhiteSpace(goAnimGroup.GroupName) ? goAnimGroup.GroupName : baseName);
+                    if (ExportResolvedPreviewModelGroup(goAnimGroup, goAnimGroupParts, resolution.Avatar, clips, groupFile, reportStage: reportStage, optionsOverride: effectiveOptions, exportedFilePaths: exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = groupFile;
+                        return true;
+                    }
+                }
+
+                var subMeshes = new List<Mesh>();
+                var subRenderers = new List<Renderer>();
+                foreach (var go in selectedTopGameObjects.Count > 0 ? selectedTopGameObjects : new List<GameObject> { rootGo })
+                {
+                    AssetExportService.CollectSubtreeMeshesAndRenderers(go, subMeshes, subRenderers);
+                }
+
+                if (subMeshes.Count > 0)
+                {
+                    if (TryFindModelGroupForMesh(subMeshes[0], out var goMeshGroup, out var goMeshParts)
+                        && goMeshGroup != null
+                        && goMeshParts.Count > 0)
+                    {
+                        var groupFile = ResolveExportFilePath(!string.IsNullOrWhiteSpace(goMeshGroup.GroupName) ? goMeshGroup.GroupName : baseName);
+                        if (ExportResolvedPreviewModelGroup(goMeshGroup, goMeshParts, resolution.Avatar, clips, groupFile, reportStage: reportStage, optionsOverride: effectiveOptions, exportedFilePaths: exportedFilePaths))
+                        {
+                            exportedPrimaryFilePath = groupFile;
+                            return true;
+                        }
+                    }
+
+                    var avatar = resolution.Avatar ?? TryResolveAvatarFromClipsOrHierarchy(clips, resolution.PrimaryModelAsset, rootGo);
+                    var goFile = ResolveExportFilePath(baseName);
+                    if (ExportEagerModelGroupWithMaterials(baseName, rootGo, subMeshes, subRenderers, avatar, clips, goFile, effectiveOptions, reportStage, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = goFile;
+                        return true;
+                    }
+                }
+
+                var fallbackGoFile = ResolveExportFilePath(baseName);
+                IImported goConvert = selectedTopGameObjects.Count > 1
+                    ? new ModelConverter(baseName, selectedTopGameObjects, effectiveOptions.ConvertTextureFormat, clips)
+                    : new ModelConverter(rootGo, effectiveOptions.ConvertTextureFormat, clips);
+                if (goConvert.MeshList.Count > 0)
+                {
+                    AssetExportService.ExportModel(goConvert, fallbackGoFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
+                    exportedPrimaryFilePath = fallbackGoFile;
+                    return true;
+                }
+
+                errorMessage = $"GameObject '{baseName}' contains no exportable meshes.";
+                return false;
+            }
+
+            case BatchAnimationSelectionKind.ClipsOnly:
+            {
+                reportStage?.Invoke(15, $"Resolving character model for {clips.Length} AnimationClip(s)...");
+                var sharedCandidate = BatchAnimationExportHelper.SelectSharedPreviewCandidateForClips(
+                    clips,
+                    clip => BuildAnimationClipPreviewCandidates(clip, currentPreviewAvatar, currentPreviewMesh),
+                    IsAnimationClipCompatibleWithAvatar,
+                    IsAnimationClipCompatibleWithMesh);
+
+                var resolvedCandidate = ResolveAnimationClipPreviewCandidate(sharedCandidate, cacheRelation: true);
+                if (resolvedCandidate != null)
+                {
+                    var groupMeshes = resolvedCandidate.IsModelGroup
+                        ? ResolveModelGroupMeshesForPreview(resolvedCandidate, CancellationToken.None)
+                        : resolvedCandidate.ModelGroupMeshes;
+                    var groupTransforms = resolvedCandidate.IsModelGroup
+                        ? ResolveModelGroupTransformsForPreview(resolvedCandidate, groupMeshes.Count)
+                        : resolvedCandidate.ModelGroupTransforms;
+                    var primaryMesh = resolvedCandidate.Mesh ?? groupMeshes.FirstOrDefault();
+                    var avatar = resolvedCandidate.Avatar ?? (primaryMesh != null ? FindBestAvatarForMesh(primaryMesh) : null);
+
+                    var hasMultiGroup = resolvedCandidate.IsModelGroup
+                        || groupMeshes.Count > 1
+                        || resolvedCandidate.ModelGroupMeshInfos.Count > 1
+                        || resolvedCandidate.ModelGroupMeshIds.Count > 1;
+
+                    var candidateBaseName = !string.IsNullOrWhiteSpace(resolvedCandidate.ModelGroupName)
+                        ? resolvedCandidate.ModelGroupName
+                        : !string.IsNullOrWhiteSpace(primaryMesh?.m_Name)
+                            ? primaryMesh!.m_Name
+                            : !string.IsNullOrWhiteSpace(avatar?.m_Name)
+                                ? avatar!.m_Name
+                                : resolution.SuggestedBaseName;
+
+                    var target = new PreviewModelExportTarget
+                    {
+                        Kind = hasMultiGroup ? PreviewModelExportKind.AnimatedModelGroup : PreviewModelExportKind.AnimatedSingleMesh,
+                        SuggestedBaseName = candidateBaseName,
+                        ExportFullModelGroup = true,
+                        ModelGroupId = resolvedCandidate.ModelGroupId,
+                        ModelGroupName = resolvedCandidate.ModelGroupName,
+                        PrimaryMesh = primaryMesh,
+                        Avatar = avatar,
+                        AnimationClip = clips[0],
+                        CandidateMeshes = groupMeshes,
+                        CandidateMeshInfos = resolvedCandidate.ModelGroupMeshInfos,
+                        CandidateTransforms = groupTransforms
+                    };
+
+                    var exportFile = ResolveExportFilePath(candidateBaseName);
+                    if (ExportPreviewModelTargetCore(target, clips, preferFullModelGroup: true, exportFile, out var actualFile, reportStage, effectiveOptions, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = actualFile;
+                        return true;
+                    }
+                }
+
+                // Fallback: scan in-memory loaded files for any compatible Avatar or Mesh
+                var fallbackAvatar = TryResolveAvatarFromClipsOrHierarchy(clips, null, null);
+                if (fallbackAvatar != null)
+                {
+                    var exportFile = ResolveExportFilePath(fallbackAvatar.m_Name ?? resolution.SuggestedBaseName);
+                    if (ExportPreviewAvatarRigCore(fallbackAvatar, clips, exportFile, reportStage, effectiveOptions, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = exportFile;
+                        return true;
+                    }
+                }
+
+                var fallbackMesh = TryFindCompatibleMeshForClipsInLoadedFiles(clips);
+                if (fallbackMesh != null)
+                {
+                    var exportFile = ResolveExportFilePath(fallbackMesh.m_Name ?? resolution.SuggestedBaseName);
+                    if (ExportPreviewSingleMeshCore(fallbackMesh, fallbackAvatar, clips, exportFile, out var actualFile, reportStage, effectiveOptions, exportedFilePaths))
+                    {
+                        exportedPrimaryFilePath = actualFile;
+                        return true;
+                    }
+                }
+
+                errorMessage = "Could not resolve a compatible character ModelGroup, Avatar, or Mesh for the selected AnimationClips.";
+                return false;
+            }
+        }
+
+        errorMessage = "No valid model target resolved for export.";
+        return false;
+    }
+
+    private void HydrateAnimatorHierarchyMaterialsForExport(Animator animator, IReadOnlyList<GameObject> selectedGameObjects)
+    {
+        if (!assetsManager.LazyLoading)
+        {
+            return;
+        }
+
+        var visitedMaterials = new HashSet<Material>();
+        var visitedTextures = new HashSet<string>(StringComparer.Ordinal);
+        var roots = new List<GameObject>();
+        if (selectedGameObjects.Count > 0)
+        {
+            roots.AddRange(selectedGameObjects);
+        }
+        else if (animator.m_GameObject != null && animator.m_GameObject.TryGet(out var animGo) && animGo != null)
+        {
+            roots.Add(animGo);
+        }
+
+        var subMeshes = new List<Mesh>();
+        var subRenderers = new List<Renderer>();
+        foreach (var root in roots)
+        {
+            AssetExportService.CollectSubtreeMeshesAndRenderers(root, subMeshes, subRenderers);
+        }
+
+        foreach (var renderer in subRenderers)
+        {
+            EnsureRendererMaterialsLoadedForExport(renderer, visitedMaterials, visitedTextures);
+        }
+    }
+
+    private Avatar? TryResolveAvatarFromClipsOrHierarchy(
+        IReadOnlyList<AnimationClip> clips,
+        AssetItem? modelAssetItem,
+        GameObject? rootGo)
+    {
+        if (modelAssetItem != null)
+        {
+            var anim = FindAnimatorForModelExport(modelAssetItem);
+            if (anim?.m_Avatar != null && anim.m_Avatar.TryGet(out var animAv) && animAv != null)
+            {
+                return animAv;
+            }
+        }
+
+        if (rootGo?.m_Animator?.m_Avatar != null && rootGo.m_Animator.m_Avatar.TryGet(out var goAv) && goAv != null)
+        {
+            return goAv;
+        }
+
+        for (var i = 0; i < clips.Count; i++)
+        {
+            var avatars = FindCandidateAvatarsForAnimationClip(clips[i]);
+            if (avatars.Count > 0)
+            {
+                return avatars[0];
+            }
+        }
+
+        var loadedFiles = GetLoadedFilesSnapshot();
+        for (var f = 0; f < loadedFiles.Count; f++)
+        {
+            var file = loadedFiles[f];
+            if (file == null) continue;
+            AssetStudio.Object[] objs;
+            lock (file)
+            {
+                objs = file.Objects.ToArray();
+            }
+
+            foreach (var av in objs.OfType<Avatar>())
+            {
+                if (clips.Any(c => IsAnimationClipCompatibleWithAvatar(c, av)))
+                {
+                    return av;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private Mesh? TryFindCompatibleMeshForClipsInLoadedFiles(IReadOnlyList<AnimationClip> clips)
+    {
+        for (var i = 0; i < clips.Count; i++)
+        {
+            var cachedMeshes = TryLoadMeshesForAnimationClipFromSemanticCache(clips[i]);
+            if (cachedMeshes.Count > 0)
+            {
+                return cachedMeshes[0];
+            }
+        }
+
+        var loadedFiles = GetLoadedFilesSnapshot();
+        for (var f = 0; f < loadedFiles.Count; f++)
+        {
+            var file = loadedFiles[f];
+            if (file == null) continue;
+            AssetStudio.Object[] objs;
+            lock (file)
+            {
+                objs = file.Objects.ToArray();
+            }
+
+            foreach (var mesh in objs.OfType<Mesh>())
+            {
+                if (clips.Any(c => IsAnimationClipCompatibleWithMesh(c, mesh)))
+                {
+                    return mesh;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private bool ExportEagerModelGroupWithMaterials(
+        string groupName,
+        GameObject? eagerRoot,
+        IReadOnlyList<Mesh> meshes,
+        IReadOnlyList<Renderer> renderers,
+        Avatar? avatar,
+        AnimationClip[]? clips,
+        string exportFile,
+        ExportOptionsState effectiveOptions,
+        Action<int, string>? reportStage = null,
+        List<string>? exportedFilePaths = null)
+    {
+        if (meshes.Count == 0 && eagerRoot == null)
+        {
+            return false;
+        }
+
+        var visitedMaterials = new HashSet<Material>();
+        var visitedTextures = new HashSet<string>(StringComparer.Ordinal);
+        var partMaterials = new List<IReadOnlyList<Material>>(meshes.Count);
+        var partNames = new List<string>(meshes.Count);
+        var resolvedRenderers = new List<Renderer>(meshes.Count);
+
+        for (var i = 0; i < meshes.Count; i++)
+        {
+            var pct = 20 + (int)((i + 1) * 35.0 / Math.Max(1, meshes.Count));
+            reportStage?.Invoke(pct, $"Preparing part {i + 1}/{meshes.Count}...");
+
+            var mesh = meshes[i];
+            var renderer = (renderers != null && i < renderers.Count ? renderers[i] : null)
+                ?? FindSkinnedRendererForAvatarMesh(avatar, mesh)
+                ?? FindSingleRendererForMeshForExport(mesh);
+
+            var mats = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures);
+            resolvedRenderers.Add(renderer!);
+            partMaterials.Add(mats.Where(m => m != null).Cast<Material>().ToList());
+
+            string? goName = null;
+            if (renderer?.m_GameObject != null && renderer.m_GameObject.TryGet(out var rGo))
+            {
+                goName = rGo?.m_Name;
+            }
+            partNames.Add(!string.IsNullOrWhiteSpace(goName) ? goName! : (mesh.m_Name ?? $"Part_{i}"));
+        }
+
+        reportStage?.Invoke(65, $"Converting {meshes.Count} part(s) & {clips?.Length ?? 0} animation(s)...");
+        var convert = ModelConverter.CreateFromModelGroup(
+            groupName,
+            eagerRoot,
+            meshes,
+            resolvedRenderers,
+            avatar,
+            clips,
+            effectiveOptions.ConvertTextureFormat,
+            combineMeshes: false,
+            partTransforms: null,
+            partMaterials: partMaterials,
+            partNames: partNames);
+
+        if (convert.MeshList.Count == 0)
+        {
+            return false;
+        }
+
+        reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
+        AssetExportService.ExportModel(convert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
+        return true;
     }
 
     private async Task ExportAllObjectsSplitCommandHandlerAsync()
@@ -1178,24 +1748,14 @@ public partial class MainWindow
                     ? new[] { target.AnimationClip }
                     : (!exportOptions.ExportAnimations ? Array.Empty<AnimationClip>() : null);
 
-                if (preferFullModelGroup)
-                {
-                    success = ExportPreviewModelGroupCore(target, clipArg, exportFile, ReportStage);
-                }
-
-                if (!success && target.PrimaryMesh != null && !preferFullModelGroup)
-                {
-                    success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile, ReportStage);
-                }
-                else if (!success && preferFullModelGroup && target.PrimaryMesh != null)
-                {
-                    // Graceful fallback to primary mesh if group metadata could not be materialized.
-                    success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile, ReportStage);
-                }
-                else if (!success && target.Avatar != null)
-                {
-                    success = ExportPreviewAvatarRigCore(target.Avatar, clipArg, exportFile, ReportStage);
-                }
+                success = ExportPreviewModelTargetCore(
+                    target,
+                    clipArg,
+                    preferFullModelGroup,
+                    exportFile,
+                    out actualExportFile,
+                    ReportStage,
+                    exportOptions);
             }
             catch (Exception ex)
             {
@@ -1230,6 +1790,643 @@ public partial class MainWindow
                 ExportState.Complete(0, statusText: status);
             }
             StatusStripUpdate(status);
+        }
+    }
+
+    internal bool ExportPreviewModelTargetCore(
+        PreviewModelExportTarget target,
+        AnimationClip[]? clipArg,
+        bool preferFullModelGroup,
+        string exportFile,
+        out string actualExportFile,
+        Action<int, string>? reportStage = null,
+        ExportOptionsState? optionsOverride = null,
+        List<string>? exportedFilePaths = null)
+    {
+        actualExportFile = exportFile;
+        bool success = false;
+
+        if (preferFullModelGroup)
+        {
+            success = ExportPreviewModelGroupCore(target, clipArg, exportFile, reportStage, optionsOverride, exportedFilePaths);
+        }
+
+        if (!success && target.PrimaryMesh != null && !preferFullModelGroup)
+        {
+            success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile, reportStage, optionsOverride, exportedFilePaths);
+        }
+        else if (!success && preferFullModelGroup && target.PrimaryMesh != null)
+        {
+            // Graceful fallback to primary mesh if group metadata could not be materialized.
+            success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile, reportStage, optionsOverride, exportedFilePaths);
+        }
+        else if (!success && target.Avatar != null)
+        {
+            success = ExportPreviewAvatarRigCore(target.Avatar, clipArg, exportFile, reportStage, optionsOverride, exportedFilePaths);
+        }
+
+        return success;
+    }
+
+    internal async Task BatchExportPreviewAnimationsCommandHandlerAsync()
+    {
+        if (ExportState.IsExporting)
+        {
+            return;
+        }
+
+        var selectedAsset = AssetListDataGrid?.SelectedItem as AssetItem;
+        var selectedCandidate = SelectedPreviewCandidate;
+        var target = PreviewModelExportHelper.ResolveExportTarget(
+            PreviewSession.ActiveKind,
+            selectedAsset,
+            selectedCandidate,
+            currentPreviewMesh,
+            currentPreviewAvatar,
+            currentPreviewAnimationClip,
+            MeshPreview.ShowFullModelGroup);
+
+        if (!target.IsValid)
+        {
+            StatusStripUpdate("No 3D model is currently active in Preview to batch export animations.");
+            return;
+        }
+
+        StatusStripUpdate($"Discovering compatible AnimationClips for {target.SuggestedBaseName}...");
+        var compatibleClips = await Task.Run(() => DiscoverCompatibleAnimationClipsForTarget(target));
+        if (compatibleClips.Count == 0)
+        {
+            StatusStripUpdate($"No compatible AnimationClips found for {target.SuggestedBaseName}.");
+            return;
+        }
+
+        var targetDisplayName = BuildBatchExportTargetDisplayName(target);
+        var dialogVm = new BatchAnimationExportViewModel(targetDisplayName, compatibleClips, exportOptions);
+        var dialogWindow = new BatchAnimationExportWindow(dialogVm);
+        var result = await dialogWindow.ShowDialog<BatchAnimationExportDialogResult?>(this);
+        if (result == null || result.SelectedClips.Count == 0)
+        {
+            return;
+        }
+
+        var effectiveOptions = exportOptions.Clone();
+        effectiveOptions.ExportAnimations = true;
+        effectiveOptions.ExportAnimationsSplit = result.SplitAnimations;
+        effectiveOptions.ModelFormat = result.ModelFormat;
+
+        string exportFile;
+        string? exportFolder;
+        var suggestedFileName = target.BuildCharacterBaseFileName(effectiveOptions);
+
+        if (result.SplitAnimations)
+        {
+            var pickedFolder = await PickExportFolderDialogAsync("Select folder for split animation export");
+            if (string.IsNullOrWhiteSpace(pickedFolder))
+            {
+                return;
+            }
+
+            SaveExportFolder(pickedFolder);
+            exportFolder = pickedFolder;
+            Directory.CreateDirectory(exportFolder);
+            exportFile = AssetExportService.GetUniqueFilePath(Path.Combine(exportFolder, suggestedFileName));
+        }
+        else
+        {
+            var pickedFile = await PickSaveModelDialogAsync("Batch Export Model with Animations", suggestedFileName);
+            if (string.IsNullOrWhiteSpace(pickedFile))
+            {
+                return;
+            }
+
+            exportFile = pickedFile;
+            exportFolder = Path.GetDirectoryName(exportFile);
+            if (!string.IsNullOrEmpty(exportFolder))
+            {
+                SaveExportFolder(exportFolder);
+            }
+        }
+
+        var fileDisplayName = Path.GetFileName(exportFile);
+        ExportState.BeginExport(
+            ExportOperationMode.Animator,
+            100,
+            exportFolder,
+            $"Preparing batch animation export ({result.SelectedClips.Count} clips): {fileDisplayName}...");
+
+        void ReportStage(int percent, string stageText)
+        {
+            ExportState.ReportStageProgress(percent, stageText);
+            StatusStripUpdate(stageText);
+        }
+
+        ReportStage(5, $"Preparing batch animation export ({result.SelectedClips.Count} clips)...");
+
+        bool success = false;
+        string actualExportFile = exportFile;
+        string? errorMessage = null;
+        var exportedFiles = new List<string>();
+        var preferFullModelGroup = target.ExportFullModelGroup || MeshPreview.ShowFullModelGroup;
+
+        await Task.Run(() =>
+        {
+            using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+            try
+            {
+                if (target.SelectedAsset != null && target.SelectedAsset.Asset == null)
+                {
+                    ReportStage(8, $"Loading asset data for {target.SuggestedBaseName}...");
+                    EnsureLazyAssetsLoadedForExport(new List<AssetItem> { target.SelectedAsset });
+                }
+
+                var resolvedClips = MaterializeSelectedBatchAnimationClips(result.SelectedClips, ReportStage);
+                if (resolvedClips.Length == 0)
+                {
+                    errorMessage = "None of the selected AnimationClips could be loaded.";
+                    return;
+                }
+
+                success = ExportPreviewModelTargetCore(
+                    target,
+                    resolvedClips,
+                    preferFullModelGroup,
+                    exportFile,
+                    out actualExportFile,
+                    ReportStage,
+                    effectiveOptions,
+                    exportedFiles);
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                Logger.Error($"Batch animation export failed for {target.SuggestedBaseName}", ex);
+            }
+        });
+
+        if (success)
+        {
+            var exportedName = Path.GetFileName(actualExportFile);
+            var modeSummary = result.SplitAnimations
+                ? $" ({Math.Max(1, exportedFiles.Count - 1)} split clip files)"
+                : $" ({result.SelectedClips.Count} embedded clip(s))";
+            var status = $"Finished exporting {exportedName}{modeSummary}";
+            ExportState.ReportStageProgress(100, status);
+            ExportState.Complete(Math.Max(1, exportedFiles.Count), statusText: status);
+            StatusStripUpdate(status);
+            if (effectiveOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+            {
+                OpenFolder(exportFolder);
+            }
+        }
+        else
+        {
+            var status = errorMessage != null
+                ? $"Error batch exporting animations: {errorMessage}"
+                : $"Could not batch export animations for {target.SuggestedBaseName}.";
+            if (errorMessage != null)
+            {
+                ExportState.Fail(status);
+            }
+            else
+            {
+                ExportState.Complete(0, statusText: status);
+            }
+            StatusStripUpdate(status);
+        }
+    }
+
+    private static string BuildBatchExportTargetDisplayName(PreviewModelExportTarget target)
+    {
+        var baseName = PreviewModelExportHelper.SelectSuggestedBaseName(
+            target.ExportFullModelGroup,
+            target.ModelGroupName,
+            target.PrimaryMesh,
+            target.Avatar,
+            clip: null,
+            target.SelectedAsset);
+        var partCount = Math.Max(target.CandidateMeshes.Count, target.CandidateMeshInfos.Count);
+        return partCount > 1
+            ? $"{baseName} ({partCount} parts)"
+            : baseName;
+    }
+
+    internal AnimationClip[] MaterializeSelectedBatchAnimationClips(
+        IReadOnlyList<BatchAnimationClipItemViewModel> selectedItems,
+        Action<int, string>? reportStage = null)
+    {
+        var resolved = new List<AnimationClip>(selectedItems.Count);
+        var seen = new HashSet<AnimationClip>();
+
+        // Batch-load any AssetItems first
+        var assetItemsToLoad = selectedItems
+            .Where(x => x.Clip == null && x.AssetItem != null && x.AssetItem.Asset == null)
+            .Select(x => x.AssetItem!)
+            .ToList();
+        if (assetItemsToLoad.Count > 0)
+        {
+            reportStage?.Invoke(10, $"Loading {assetItemsToLoad.Count} selected AnimationClip asset(s)...");
+            EnsureLazyAssetsLoadedForExport(assetItemsToLoad);
+        }
+
+        // Group any remaining lazy ClipAssetIds by source file path so each bundle/file is loaded once
+        var handlesBySource = new List<(BatchAnimationClipItemViewModel Item, AssetHandle Handle, string SourceKey)>();
+        foreach (var item in selectedItems)
+        {
+            if (item.Clip != null)
+            {
+                continue;
+            }
+            if (item.AssetItem?.Asset is AnimationClip)
+            {
+                continue;
+            }
+            if (!string.IsNullOrWhiteSpace(item.ClipAssetId))
+            {
+                var handle = assetsManager.ProjectIndex.GetHandle(item.ClipAssetId);
+                if (handle != null)
+                {
+                    if (handle.RealObject is not AnimationClip)
+                    {
+                        var sourceKey = ResolveLazyHandleSourcePath(handle) ?? handle.SerializedFileName ?? string.Empty;
+                        handlesBySource.Add((item, handle, sourceKey));
+                    }
+                }
+            }
+        }
+
+        if (handlesBySource.Count > 0)
+        {
+            var done = 0;
+            foreach (var group in handlesBySource.GroupBy(x => x.SourceKey, StringComparer.OrdinalIgnoreCase))
+            {
+                foreach (var entry in group)
+                {
+                    done++;
+                    reportStage?.Invoke(10 + (int)(done * 10.0 / handlesBySource.Count), $"Loading AnimationClip {done}/{handlesBySource.Count} ({entry.Item.Name})...");
+                    _ = ResolveSemanticRelationHandleForPreview(entry.Handle);
+                }
+            }
+        }
+
+        foreach (var item in selectedItems)
+        {
+            var clip = item.Clip
+                ?? (item.AssetItem?.Asset as AnimationClip)
+                ?? (!string.IsNullOrWhiteSpace(item.ClipAssetId)
+                    ? (assetsManager.ProjectIndex.GetHandle(item.ClipAssetId)?.RealObject as AnimationClip
+                        ?? ResolvePreviewCandidateAsset(item.ClipAssetId) as AnimationClip)
+                    : null);
+            if (clip != null && seen.Add(clip))
+            {
+                resolved.Add(clip);
+            }
+        }
+
+        return resolved.ToArray();
+    }
+
+    internal List<BatchAnimationClipItemViewModel> DiscoverCompatibleAnimationClipsForTarget(PreviewModelExportTarget target)
+    {
+        var itemsByKey = new Dictionary<string, BatchAnimationClipItemViewModel>(StringComparer.Ordinal);
+        var orderedKeys = new List<string>();
+
+        void AddOrUpgradeCandidate(
+            string? clipId,
+            string? name,
+            long pathId,
+            string relation,
+            int score,
+            AnimationClip? clipObj = null,
+            AssetItem? assetItem = null,
+            bool isSelected = true)
+        {
+            if (clipObj == null && !string.IsNullOrWhiteSpace(clipId))
+            {
+                clipObj = assetsManager.ProjectIndex.GetHandle(clipId!)?.RealObject as AnimationClip;
+            }
+
+            var effectiveId = !string.IsNullOrWhiteSpace(clipId)
+                ? clipId!
+                : clipObj != null
+                    ? GetPreviewObjectKey(clipObj)
+                    : assetItem?.Handle?.UniqueID ?? assetItem?.UniqueID ?? string.Empty;
+            var effectivePathId = pathId != 0
+                ? pathId
+                : clipObj?.m_PathID ?? assetItem?.PathID ?? 0;
+            var key = !string.IsNullOrWhiteSpace(effectiveId)
+                ? effectiveId
+                : $"pathid:{effectivePathId}";
+            if (string.IsNullOrWhiteSpace(key) || key == "pathid:0")
+            {
+                return;
+            }
+
+            var displayName = !string.IsNullOrWhiteSpace(name)
+                ? name!
+                : !string.IsNullOrWhiteSpace(clipObj?.m_Name)
+                    ? clipObj!.m_Name
+                    : !string.IsNullOrWhiteSpace(assetItem?.Name)
+                        ? assetItem!.Name
+                        : !string.IsNullOrWhiteSpace(effectiveId)
+                            ? GetPreviewHandleName(effectiveId, "AnimationClip")
+                            : $"AnimationClip ({effectivePathId})";
+
+            BatchAnimationExportHelper.ExtractClipTimingMetadata(clipObj, out var duration, out var sampleRate, out var frames);
+
+            var vm = new BatchAnimationClipItemViewModel(
+                displayName,
+                effectiveId,
+                effectivePathId,
+                relation,
+                score,
+                duration,
+                sampleRate,
+                frames,
+                clipObj,
+                assetItem,
+                isSelected);
+
+            if (!itemsByKey.TryGetValue(key, out var existing))
+            {
+                itemsByKey[key] = vm;
+                orderedKeys.Add(key);
+            }
+            else if (score > existing.MatchScore || (existing.Clip == null && clipObj != null))
+            {
+                itemsByKey[key] = new BatchAnimationClipItemViewModel(
+                    displayName,
+                    effectiveId,
+                    effectivePathId,
+                    score >= existing.MatchScore && !string.IsNullOrWhiteSpace(relation) ? relation : existing.Relation,
+                    Math.Max(score, existing.MatchScore),
+                    duration > 0f ? duration : existing.DurationSeconds,
+                    sampleRate > 0f ? sampleRate : existing.SampleRate,
+                    frames > 0 ? frames : existing.FrameCount,
+                    clipObj ?? existing.Clip,
+                    assetItem ?? existing.AssetItem,
+                    existing.IsSelected || isSelected);
+            }
+        }
+
+        // 1. Always include the currently active preview AnimationClip if present
+        if (target.AnimationClip != null)
+        {
+            AddOrUpgradeCandidate(
+                GetPreviewObjectKey(target.AnimationClip),
+                target.AnimationClip.m_Name,
+                target.AnimationClip.m_PathID,
+                "Active preview",
+                20000,
+                target.AnimationClip);
+        }
+
+        // 2. Include any AnimationClips currently selected in the Asset List
+        foreach (var selected in GetSelectedAssets())
+        {
+            if (selected.Type == ClassIDType.AnimationClip || selected.Asset is AnimationClip)
+            {
+                AddOrUpgradeCandidate(
+                    selected.Handle?.UniqueID ?? selected.UniqueID,
+                    selected.Name,
+                    selected.PathID,
+                    "Selected in Asset List",
+                    19000,
+                    selected.Asset as AnimationClip,
+                    selected);
+            }
+        }
+
+        // 3. Resolve Avatar, ModelGroupInfo, Animator, Controller, and all Mesh IDs for the target
+        var avatar = target.Avatar;
+        var primaryMesh = target.PrimaryMesh;
+        if (avatar == null && primaryMesh != null)
+        {
+            avatar = FindBestAvatarForMesh(primaryMesh);
+        }
+
+        ModelGroupInfo? group = null;
+        var groupParts = new List<ModelGroupMeshInfo>();
+        if (!string.IsNullOrWhiteSpace(target.ModelGroupId))
+        {
+            group = LoadModelGroupByIdForPreview(target.ModelGroupId);
+            groupParts = target.CandidateMeshInfos.Count > 0
+                ? target.CandidateMeshInfos.ToList()
+                : LoadModelGroupMeshesForPreview(target.ModelGroupId);
+        }
+        if ((group == null || groupParts.Count == 0) && avatar != null)
+        {
+            TryFindModelGroupForAvatar(avatar, out group, out groupParts);
+        }
+        if ((group == null || groupParts.Count == 0) && primaryMesh != null)
+        {
+            TryFindModelGroupForMesh(primaryMesh, out group, out groupParts);
+        }
+
+        var avatarId = !string.IsNullOrWhiteSpace(group?.AvatarAssetId)
+            ? group!.AvatarAssetId
+            : GetPreviewObjectKey(avatar);
+        if (avatar == null && !string.IsNullOrWhiteSpace(avatarId))
+        {
+            avatar = ResolveAvatarPreviewCandidate(avatarId);
+        }
+
+        var groupId = !string.IsNullOrWhiteSpace(group?.GroupId) ? group!.GroupId : target.ModelGroupId;
+        var animatorId = group?.AnimatorAssetId ?? string.Empty;
+        var controllerId = group?.ControllerAssetId ?? string.Empty;
+
+        var meshIds = new HashSet<string>(StringComparer.Ordinal);
+        if (primaryMesh != null)
+        {
+            var pk = GetPreviewObjectKey(primaryMesh);
+            if (!string.IsNullOrWhiteSpace(pk)) meshIds.Add(pk);
+        }
+        foreach (var cm in target.CandidateMeshes)
+        {
+            var ck = GetPreviewObjectKey(cm);
+            if (!string.IsNullOrWhiteSpace(ck)) meshIds.Add(ck);
+        }
+        foreach (var info in target.CandidateMeshInfos)
+        {
+            if (!string.IsNullOrWhiteSpace(info.MeshAssetId)) meshIds.Add(info.MeshAssetId);
+        }
+        foreach (var info in groupParts)
+        {
+            if (!string.IsNullOrWhiteSpace(info.MeshAssetId)) meshIds.Add(info.MeshAssetId);
+        }
+
+        // 4. Query SQLite v15 AnimationClipTargets & AssetEdges
+        if (assetsManager.LazyLoading && currentScanResult != null)
+        {
+            var folderPath = GetCurrentCacheFolderPath();
+            if (!string.IsNullOrWhiteSpace(folderPath))
+            {
+                var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+                var dbClips = _sqliteCache.LoadCompatibleAnimationClipsForTarget(
+                    folderPath,
+                    signature,
+                    avatarId,
+                    groupId,
+                    animatorId,
+                    controllerId,
+                    meshIds.ToList());
+                foreach (var dbClip in dbClips)
+                {
+                    var label = dbClip.RelationKind switch
+                    {
+                        "BoneHashMatch" => "Bone match",
+                        "AnimatorController" => "AnimatorController",
+                        "LegacyAnimation" => "Legacy animation",
+                        "Container" => "Container",
+                        _ => !string.IsNullOrWhiteSpace(dbClip.RelationKind) ? dbClip.RelationKind : "Compatible rig"
+                    };
+                    AddOrUpgradeCandidate(
+                        dbClip.ClipAssetId,
+                        dbClip.ClipName,
+                        dbClip.PathId,
+                        label,
+                        dbClip.MatchScore);
+                }
+            }
+        }
+
+        // 5. Inspect in-memory loaded files (covers Eager Mode and local files in Lazy Mode)
+        var loadedFiles = GetLoadedFilesSnapshot();
+        if (loadedFiles.Count > 0)
+        {
+            // If lazy mode and SQLite returned 0 additional clips, materialize AnimationClips in the target's own file(s)
+            if (assetsManager.LazyLoading && itemsByKey.Count <= 1)
+            {
+                var targetFiles = new HashSet<SerializedFile>();
+                if (avatar?.assetsFile != null) targetFiles.Add(avatar.assetsFile);
+                if (primaryMesh?.assetsFile != null) targetFiles.Add(primaryMesh.assetsFile);
+                if (target.AnimationClip?.assetsFile != null) targetFiles.Add(target.AnimationClip.assetsFile);
+                if (target.SelectedAsset?.SourceFile != null) targetFiles.Add(target.SelectedAsset.SourceFile);
+
+                if (targetFiles.Count > 0)
+                {
+                    var localRefTypes = new HashSet<ClassIDType>
+                    {
+                        ClassIDType.AnimationClip,
+                        ClassIDType.Animator,
+                        ClassIDType.AnimatorController,
+                        ClassIDType.AnimatorOverrideController,
+                        ClassIDType.Animation
+                    };
+                    using (assetsManager.LruCache.SuspendEviction())
+                    {
+                        foreach (var tf in targetFiles)
+                        {
+                            MaterializeReferenceObjects(tf, localRefTypes);
+                        }
+                    }
+                }
+            }
+
+            var inMemoryMeshes = new List<Mesh>();
+            if (primaryMesh != null) inMemoryMeshes.Add(primaryMesh);
+            foreach (var cm in target.CandidateMeshes)
+            {
+                if (cm != null && !inMemoryMeshes.Contains(cm))
+                {
+                    inMemoryMeshes.Add(cm);
+                }
+            }
+
+            for (var f = 0; f < loadedFiles.Count; f++)
+            {
+                var file = loadedFiles[f];
+                if (file == null) continue;
+                AssetStudio.Object[] objs;
+                lock (file)
+                {
+                    objs = file.Objects.ToArray();
+                }
+
+                // Check Animators matching our Avatar or RootGameObject
+                foreach (var anim in objs.OfType<Animator>())
+                {
+                    var matchesAvatar = avatar != null
+                        && anim.m_Avatar != null
+                        && anim.m_Avatar.TryGet(out var animAv)
+                        && AreSamePreviewObject(animAv, avatar);
+                    var matchesAnimatorId = !string.IsNullOrWhiteSpace(animatorId)
+                        && string.Equals(GetPreviewObjectKey(anim), animatorId, StringComparison.Ordinal);
+
+                    if (!matchesAvatar && !matchesAnimatorId)
+                    {
+                        continue;
+                    }
+
+                    if (anim.m_Controller != null && anim.m_Controller.TryGet(out var ctrl))
+                    {
+                        CollectClipsFromController(ctrl, (clip, rel) =>
+                            AddOrUpgradeCandidate(GetPreviewObjectKey(clip), clip.m_Name, clip.m_PathID, rel, 15000, clip));
+                    }
+                }
+
+                // Check all materialized AnimationClips for bone-hash compatibility with Avatar or Mesh
+                foreach (var clip in objs.OfType<AnimationClip>())
+                {
+                    if (avatar != null && IsAnimationClipCompatibleWithAvatar(clip, avatar))
+                    {
+                        AddOrUpgradeCandidate(GetPreviewObjectKey(clip), clip.m_Name, clip.m_PathID, "Avatar bone match", 9000, clip);
+                    }
+                    else if (inMemoryMeshes.Count > 0 && inMemoryMeshes.Any(m => IsAnimationClipCompatibleWithMesh(clip, m)))
+                    {
+                        AddOrUpgradeCandidate(GetPreviewObjectKey(clip), clip.m_Name, clip.m_PathID, "Mesh bone match", 8500, clip);
+                    }
+                }
+            }
+        }
+
+        return orderedKeys
+            .Select(k => itemsByKey[k])
+            .OrderByDescending(x => x.MatchScore)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static void CollectClipsFromController(
+        RuntimeAnimatorController? controller,
+        Action<AnimationClip, string> onClipFound)
+    {
+        if (controller == null)
+        {
+            return;
+        }
+
+        switch (controller)
+        {
+            case AnimatorController ac when ac.m_AnimationClips != null:
+                foreach (var clipPtr in ac.m_AnimationClips)
+                {
+                    if (clipPtr != null && clipPtr.TryGet(out var clip) && clip != null)
+                    {
+                        onClipFound(clip, "AnimatorController");
+                    }
+                }
+                break;
+
+            case AnimatorOverrideController aoc:
+                if (aoc.m_Clips != null)
+                {
+                    foreach (var pair in aoc.m_Clips)
+                    {
+                        if (pair?.m_OverrideClip != null && pair.m_OverrideClip.TryGet(out var ovClip) && ovClip != null)
+                        {
+                            onClipFound(ovClip, "AnimatorOverrideController");
+                        }
+                        else if (pair?.m_OriginalClip != null && pair.m_OriginalClip.TryGet(out var origClip) && origClip != null)
+                        {
+                            onClipFound(origClip, "AnimatorOverrideController");
+                        }
+                    }
+                }
+                if (aoc.m_Controller != null && aoc.m_Controller.TryGet(out var baseCtrl) && baseCtrl != null && !ReferenceEquals(baseCtrl, aoc))
+                {
+                    CollectClipsFromController(baseCtrl, onClipFound);
+                }
+                break;
         }
     }
 
@@ -1349,8 +2546,11 @@ public partial class MainWindow
         PreviewModelExportTarget target,
         AnimationClip[]? clipArg,
         string exportFile,
-        Action<int, string>? reportStage = null)
+        Action<int, string>? reportStage = null,
+        ExportOptionsState? optionsOverride = null,
+        List<string>? exportedFilePaths = null)
     {
+        var effectiveOptions = optionsOverride ?? exportOptions;
         var inMemoryMeshes = BuildInMemoryPreviewMeshLookup(target);
         ModelGroupInfo? group = null;
         var groupParts = new List<ModelGroupMeshInfo>();
@@ -1376,7 +2576,7 @@ public partial class MainWindow
 
         if (group != null && groupParts.Count > 0)
         {
-            if (ExportResolvedPreviewModelGroup(group, groupParts, target.Avatar, clipArg, exportFile, inMemoryMeshes, reportStage))
+            if (ExportResolvedPreviewModelGroup(group, groupParts, target.Avatar, clipArg, exportFile, inMemoryMeshes, reportStage, effectiveOptions, exportedFilePaths))
             {
                 return true;
             }
@@ -1384,14 +2584,14 @@ public partial class MainWindow
 
         if (target.Avatar != null
             && TryBuildEagerModelGroupForAvatar(target.Avatar, out var eagerAvatarName, out var eagerAvatarRoot, out var eagerAvatarMeshes, out var eagerAvatarRenderers)
-            && ExportModelGroupFbx(eagerAvatarName, eagerAvatarRoot, eagerAvatarMeshes, eagerAvatarRenderers, target.Avatar, clipArg, exportFile))
+            && ExportEagerModelGroupWithMaterials(eagerAvatarName, eagerAvatarRoot, eagerAvatarMeshes, eagerAvatarRenderers, target.Avatar, clipArg, exportFile, effectiveOptions, reportStage, exportedFilePaths))
         {
             return true;
         }
 
         if (target.PrimaryMesh != null
             && TryBuildEagerModelGroupForMesh(target.PrimaryMesh, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar)
-            && ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar ?? target.Avatar, clipArg, exportFile))
+            && ExportEagerModelGroupWithMaterials(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar ?? target.Avatar, clipArg, exportFile, effectiveOptions, reportStage, exportedFilePaths))
         {
             return true;
         }
@@ -1446,7 +2646,7 @@ public partial class MainWindow
                 resolvedRenderers,
                 target.Avatar,
                 clipArg,
-                exportOptions.ConvertTextureFormat,
+                effectiveOptions.ConvertTextureFormat,
                 combineMeshes: false,
                 partTransforms: partTransforms!,
                 partMaterials: partMaterials,
@@ -1454,7 +2654,7 @@ public partial class MainWindow
             if (convert.MeshList.Count > 0)
             {
                 reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
-                AssetExportService.ExportModel(convert, exportFile, exportOptions);
+                AssetExportService.ExportModel(convert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
                 return true;
             }
         }
@@ -1469,8 +2669,11 @@ public partial class MainWindow
         AnimationClip[]? animationClips,
         string exportFile,
         Dictionary<string, Mesh>? inMemoryMeshes = null,
-        Action<int, string>? reportStage = null)
+        Action<int, string>? reportStage = null,
+        ExportOptionsState? optionsOverride = null,
+        List<string>? exportedFilePaths = null)
     {
+        var effectiveOptions = optionsOverride ?? exportOptions;
         reportStage?.Invoke(18, $"Resolving rig root for {group.GroupName}...");
         var rootGameObject = !string.IsNullOrWhiteSpace(group.RootGameObjectAssetId)
             ? ResolvePreviewCandidateAsset(group.RootGameObjectAssetId) as GameObject
@@ -1507,11 +2710,11 @@ public partial class MainWindow
                 }
 
                 reportStage?.Invoke(65, $"Converting rig & textures ({subMeshes.Count} parts)...");
-                var directConvert = new ModelConverter(animator, exportOptions.ConvertTextureFormat, animationClips);
+                var directConvert = new ModelConverter(animator, effectiveOptions.ConvertTextureFormat, animationClips);
                 if (directConvert.MeshList.Count >= Math.Max(1, groupMeshes.Count))
                 {
                     reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
-                    AssetExportService.ExportModel(directConvert, exportFile, exportOptions);
+                    AssetExportService.ExportModel(directConvert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
                     return true;
                 }
             }
@@ -1587,7 +2790,7 @@ public partial class MainWindow
             resolvedRenderers,
             avatar,
             animationClips,
-            exportOptions.ConvertTextureFormat,
+            effectiveOptions.ConvertTextureFormat,
             combineMeshes: false,
             partTransforms: partTransforms!,
             partMaterials: partMaterials,
@@ -1598,7 +2801,7 @@ public partial class MainWindow
         }
 
         reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
-        AssetExportService.ExportModel(convert, exportFile, exportOptions);
+        AssetExportService.ExportModel(convert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
         return true;
     }
 
@@ -1608,8 +2811,12 @@ public partial class MainWindow
         AnimationClip[]? clipArg,
         string exportFile,
         out string actualExportFile,
-        Action<int, string>? reportStage = null)
+        Action<int, string>? reportStage = null,
+        ExportOptionsState? optionsOverride = null,
+        List<string>? exportedFilePaths = null,
+        Renderer? explicitRenderer = null)
     {
+        var effectiveOptions = optionsOverride ?? exportOptions;
         actualExportFile = exportFile;
         reportStage?.Invoke(20, $"Preparing mesh {mesh.m_Name}...");
         mesh.EnsureProcessed();
@@ -1617,8 +2824,8 @@ public partial class MainWindow
         var visitedMaterials = new HashSet<Material>();
         var visitedTextures = new HashSet<string>(StringComparer.Ordinal);
 
-        // Prefer O(1) SQLite semantic renderer lookup before falling back to linear file scan.
-        Renderer? renderer = FindSkinnedRendererForAvatarMesh(avatar, mesh);
+        // Prefer explicit or O(1) SQLite semantic renderer lookup before falling back to linear file scan.
+        Renderer? renderer = explicitRenderer ?? FindSkinnedRendererForAvatarMesh(avatar, mesh);
         if (renderer == null && !assetsManager.LazyLoading)
         {
             renderer = FindSingleRendererForMeshForExport(mesh);
@@ -1641,7 +2848,7 @@ public partial class MainWindow
                 renderer != null ? new[] { renderer } : null,
                 avatar,
                 clipArg,
-                exportOptions.ConvertTextureFormat,
+                effectiveOptions.ConvertTextureFormat,
                 combineMeshes: false,
                 partTransforms: new float[]?[] { null }!,
                 partMaterials: new IReadOnlyList<Material>[] { nonNullMaterials },
@@ -1649,7 +2856,7 @@ public partial class MainWindow
             if (convert.MeshList.Count > 0)
             {
                 reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
-                AssetExportService.ExportModel(convert, exportFile, exportOptions);
+                AssetExportService.ExportModel(convert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
                 return true;
             }
         }
@@ -1661,6 +2868,7 @@ public partial class MainWindow
         if (AssetExportService.ExportMeshToObj(mesh, objPath))
         {
             actualExportFile = objPath;
+            exportedFilePaths?.Add(objPath);
             return true;
         }
 
@@ -1671,20 +2879,23 @@ public partial class MainWindow
         Avatar avatar,
         AnimationClip[]? clipArg,
         string exportFile,
-        Action<int, string>? reportStage = null)
+        Action<int, string>? reportStage = null,
+        ExportOptionsState? optionsOverride = null,
+        List<string>? exportedFilePaths = null)
     {
+        var effectiveOptions = optionsOverride ?? exportOptions;
         reportStage?.Invoke(15, $"Resolving Avatar rig {avatar.m_Name}...");
         if (TryFindModelGroupForAvatar(avatar, out var avatarGroup, out var avatarGroupParts)
             && avatarGroup != null
             && avatarGroupParts.Count > 0)
         {
-            return ExportResolvedPreviewModelGroup(avatarGroup, avatarGroupParts, avatar, clipArg, exportFile, reportStage: reportStage);
+            return ExportResolvedPreviewModelGroup(avatarGroup, avatarGroupParts, avatar, clipArg, exportFile, reportStage: reportStage, optionsOverride: effectiveOptions, exportedFilePaths: exportedFilePaths);
         }
 
         if (TryBuildEagerModelGroupForAvatar(avatar, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers))
         {
             reportStage?.Invoke(65, $"Converting {eagerMeshes.Count} part(s) for {avatar.m_Name}...");
-            return ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, avatar, clipArg, exportFile);
+            return ExportEagerModelGroupWithMaterials(eagerName, eagerRoot, eagerMeshes, eagerRenderers, avatar, clipArg, exportFile, effectiveOptions, reportStage, exportedFilePaths);
         }
 
         var loadedFiles = GetLoadedFilesSnapshot();
@@ -1706,15 +2917,34 @@ public partial class MainWindow
                     && AreSamePreviewObject(animAvatar, avatar))
                 {
                     reportStage?.Invoke(65, $"Converting Animator for {avatar.m_Name}...");
-                    var convert = new ModelConverter(animator, exportOptions.ConvertTextureFormat, clipArg);
+                    var convert = new ModelConverter(animator, effectiveOptions.ConvertTextureFormat, clipArg);
                     if (convert.MeshList.Count > 0)
                     {
                         reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
-                        AssetExportService.ExportModel(convert, exportFile, exportOptions);
+                        AssetExportService.ExportModel(convert, exportFile, effectiveOptions, exportedFilePaths: exportedFilePaths);
                         return true;
                     }
                 }
             }
+        }
+
+        var avatarMeshes = FindMeshesForAvatar(avatar);
+        if (avatarMeshes.Count > 0)
+        {
+            var renderers = avatarMeshes
+                .Select(m => (Renderer?)(FindSkinnedRendererForAvatarMesh(avatar, m) ?? FindSingleRendererForMeshForExport(m)))
+                .ToList();
+            return ExportEagerModelGroupWithMaterials(
+                avatar.m_Name ?? Path.GetFileNameWithoutExtension(exportFile),
+                eagerRoot: null,
+                avatarMeshes,
+                renderers!,
+                avatar,
+                clipArg,
+                exportFile,
+                effectiveOptions,
+                reportStage,
+                exportedFilePaths);
         }
 
         return false;
