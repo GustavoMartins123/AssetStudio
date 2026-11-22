@@ -5,14 +5,32 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.Loader;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace AssetStudio
 {
+    public sealed class DecryptionProfileCollectionDocument
+    {
+        [JsonPropertyName("profiles")]
+        public List<DecryptionProfile> Profiles { get; set; } = new List<DecryptionProfile>();
+    }
+
     public static class DecryptionHelper
     {
+        private static readonly JsonSerializerOptions ProfileJsonOptions = new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            PropertyNameCaseInsensitive = true,
+            ReadCommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
+
         // Read lock-free from many loader threads; written only while catalogLock is held.
         private static readonly ConcurrentDictionary<string, (string BundleName, string Hash, string Crc)> metadataMap =
             new ConcurrentDictionary<string, (string BundleName, string Hash, string Crc)>(StringComparer.OrdinalIgnoreCase);
@@ -27,11 +45,28 @@ namespace AssetStudio
         private static readonly object providerLock = new object();
         private static readonly List<DecryptionProfile> registeredProfiles = new List<DecryptionProfile>();
         private static readonly List<IStreamTransformProvider> customProviders = new List<IStreamTransformProvider>();
+        private static readonly HashSet<string> loadedPluginAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static IStreamTransformProvider[] activePipeline = BuildDefaultPipeline();
 
         private static readonly byte[] encryptionMagic = Encoding.ASCII.GetBytes("Encryption");
 
         public static ReadOnlySpan<byte> EncryptionMagicBytes => encryptionMagic;
+
+        public static string GetUserDecryptionProfilesDirectory()
+            => Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio",
+                "DecryptionProfiles");
+
+        public static string GetUserDecryptionPluginsDirectory()
+            => Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AssetStudio",
+                "Plugins",
+                "Decryption");
+
+        public static string GetAppDecryptionPluginsDirectory()
+            => Path.Combine(AppContext.BaseDirectory, "Plugins", "Decryption");
 
         private static IStreamTransformProvider[] BuildDefaultPipeline()
         {
@@ -50,6 +85,34 @@ namespace AssetStudio
         public static IReadOnlyList<IStreamTransformProvider> GetRegisteredProviders()
             => activePipeline;
 
+        public static IReadOnlyList<IStreamTransformProvider> GetCustomProviders()
+        {
+            lock (providerLock)
+            {
+                return customProviders.Count == 0
+                    ? Array.Empty<IStreamTransformProvider>()
+                    : customProviders.ToArray();
+            }
+        }
+
+        public static IReadOnlyList<DecryptionProfile> GetRegisteredProfiles()
+        {
+            lock (providerLock)
+            {
+                if (registeredProfiles.Count == 0)
+                {
+                    return Array.Empty<DecryptionProfile>();
+                }
+
+                var result = new DecryptionProfile[registeredProfiles.Count];
+                for (int i = 0; i < registeredProfiles.Count; i++)
+                {
+                    result[i] = registeredProfiles[i].Clone();
+                }
+                return result;
+            }
+        }
+
         public static void RegisterProvider(IStreamTransformProvider provider)
         {
             ArgumentNullException.ThrowIfNull(provider);
@@ -64,14 +127,203 @@ namespace AssetStudio
         public static void RegisterProfile(DecryptionProfile profile)
         {
             ArgumentNullException.ThrowIfNull(profile);
+            var copy = profile.Clone();
+            if (string.IsNullOrWhiteSpace(copy.Id))
+            {
+                copy.Id = $"profile-{Guid.NewGuid():N}".Substring(0, 16);
+            }
+
             lock (providerLock)
             {
-                if (!string.IsNullOrWhiteSpace(profile.Id))
-                {
-                    registeredProfiles.RemoveAll(p => string.Equals(p.Id, profile.Id, StringComparison.OrdinalIgnoreCase));
-                }
-                registeredProfiles.Add(profile);
+                registeredProfiles.RemoveAll(p => string.Equals(p.Id, copy.Id, StringComparison.OrdinalIgnoreCase));
+                registeredProfiles.Add(copy);
             }
+        }
+
+        public static bool RemoveProfile(string id, bool deleteUserFile = false)
+        {
+            if (string.IsNullOrWhiteSpace(id))
+            {
+                return false;
+            }
+
+            bool removed;
+            lock (providerLock)
+            {
+                removed = registeredProfiles.RemoveAll(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase)) > 0;
+            }
+
+            if (deleteUserFile)
+            {
+                TryDeleteUserProfileFile(id);
+            }
+
+            return removed;
+        }
+
+        public static string SaveProfileToUserDirectory(DecryptionProfile profile, string? targetDirectory = null)
+        {
+            ArgumentNullException.ThrowIfNull(profile);
+            var copy = profile.Clone();
+            if (string.IsNullOrWhiteSpace(copy.Id))
+            {
+                copy.Id = $"profile-{DateTime.UtcNow:yyyyMMddHHmmss}";
+            }
+
+            RegisterProfile(copy);
+
+            string dir = string.IsNullOrWhiteSpace(targetDirectory)
+                ? GetUserDecryptionProfilesDirectory()
+                : targetDirectory;
+            Directory.CreateDirectory(dir);
+
+            string fileName = BuildSafeProfileFileName(copy.Id) + ".json";
+            string fullPath = Path.Combine(dir, fileName);
+            string tempPath = fullPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+
+            string json = JsonSerializer.Serialize(copy, ProfileJsonOptions);
+            File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.Move(tempPath, fullPath, overwrite: true);
+            return fullPath;
+        }
+
+        private static void TryDeleteUserProfileFile(string profileId, string? targetDirectory = null)
+        {
+            try
+            {
+                string dir = string.IsNullOrWhiteSpace(targetDirectory)
+                    ? GetUserDecryptionProfilesDirectory()
+                    : targetDirectory;
+                if (!Directory.Exists(dir))
+                {
+                    return;
+                }
+
+                string expectedPath = Path.Combine(dir, BuildSafeProfileFileName(profileId) + ".json");
+                if (File.Exists(expectedPath))
+                {
+                    File.Delete(expectedPath);
+                    return;
+                }
+
+                // Also scan user directory in case the profile lived under a custom filename
+                foreach (var jsonFile in Directory.EnumerateFiles(dir, "*.json", SearchOption.TopDirectoryOnly))
+                {
+                    var items = TryDeserializeProfilesFile(jsonFile);
+                    if (items.Count == 1 && string.Equals(items[0].Id, profileId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Delete(jsonFile);
+                        break;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string BuildSafeProfileFileName(string id)
+        {
+            var sb = new StringBuilder(id.Length);
+            foreach (char c in id.Trim())
+            {
+                if (char.IsLetterOrDigit(c) || c == '-' || c == '_')
+                {
+                    sb.Append(c);
+                }
+                else
+                {
+                    sb.Append('_');
+                }
+            }
+            return sb.Length > 0 ? sb.ToString() : "profile";
+        }
+
+        public static int LoadProfilesFromFile(string jsonFilePath)
+        {
+            if (string.IsNullOrWhiteSpace(jsonFilePath) || !File.Exists(jsonFilePath))
+            {
+                return 0;
+            }
+
+            var items = TryDeserializeProfilesFile(jsonFilePath);
+            for (int i = 0; i < items.Count; i++)
+            {
+                RegisterProfile(items[i]);
+            }
+            return items.Count;
+        }
+
+        public static int ImportProfilesFromFile(string jsonFilePath, bool saveToUserDirectory = true, string? userDirectory = null)
+        {
+            if (string.IsNullOrWhiteSpace(jsonFilePath) || !File.Exists(jsonFilePath))
+            {
+                return 0;
+            }
+
+            var items = TryDeserializeProfilesFile(jsonFilePath);
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (saveToUserDirectory)
+                {
+                    SaveProfileToUserDirectory(items[i], userDirectory);
+                }
+                else
+                {
+                    RegisterProfile(items[i]);
+                }
+            }
+            return items.Count;
+        }
+
+        private static List<DecryptionProfile> TryDeserializeProfilesFile(string jsonFilePath)
+        {
+            var result = new List<DecryptionProfile>();
+            try
+            {
+                string text = File.ReadAllText(jsonFilePath);
+                string trimmed = text.TrimStart();
+                if (trimmed.StartsWith("[", StringComparison.Ordinal))
+                {
+                    var list = JsonSerializer.Deserialize<List<DecryptionProfile>>(text, ProfileJsonOptions);
+                    if (list != null)
+                    {
+                        result.AddRange(list.Where(static p => p != null));
+                    }
+                }
+                else if (trimmed.StartsWith("{", StringComparison.Ordinal))
+                {
+                    using var doc = JsonDocument.Parse(text, new JsonDocumentOptions
+                    {
+                        CommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true
+                    });
+
+                    if (doc.RootElement.TryGetProperty("profiles", out var profilesElem)
+                        && profilesElem.ValueKind == JsonValueKind.Array)
+                    {
+                        var collection = JsonSerializer.Deserialize<DecryptionProfileCollectionDocument>(text, ProfileJsonOptions);
+                        if (collection?.Profiles != null)
+                        {
+                            result.AddRange(collection.Profiles.Where(static p => p != null));
+                        }
+                    }
+                    else
+                    {
+                        var single = JsonSerializer.Deserialize<DecryptionProfile>(text, ProfileJsonOptions);
+                        if (single != null)
+                        {
+                            result.Add(single);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to parse decryption profile file '{Path.GetFileName(jsonFilePath)}': {ex.Message}");
+            }
+
+            return result;
         }
 
         public static int LoadProfilesFromDirectory(string directoryPath)
@@ -82,39 +334,138 @@ namespace AssetStudio
             }
 
             int loaded = 0;
-            foreach (var jsonFile in Directory.EnumerateFiles(directoryPath, "*.json", SearchOption.TopDirectoryOnly))
+            foreach (var jsonFile in Directory.EnumerateFiles(directoryPath, "*.json", SearchOption.TopDirectoryOnly)
+                .OrderBy(static p => p, StringComparer.OrdinalIgnoreCase))
             {
-                try
-                {
-                    var text = File.ReadAllText(jsonFile);
-                    if (text.TrimStart().StartsWith("[", StringComparison.Ordinal))
-                    {
-                        var list = JsonSerializer.Deserialize<List<DecryptionProfile>>(text);
-                        if (list != null)
-                        {
-                            foreach (var item in list)
-                            {
-                                RegisterProfile(item);
-                                loaded++;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        var single = JsonSerializer.Deserialize<DecryptionProfile>(text);
-                        if (single != null)
-                        {
-                            RegisterProfile(single);
-                            loaded++;
-                        }
-                    }
-                }
-                catch
-                {
-                }
+                loaded += LoadProfilesFromFile(jsonFile);
             }
 
             return loaded;
+        }
+
+        public static int LoadPluginsFromDirectory(string directoryPath)
+        {
+            if (string.IsNullOrWhiteSpace(directoryPath) || !Directory.Exists(directoryPath))
+            {
+                return 0;
+            }
+
+            int loadedProviders = 0;
+            foreach (var dllPath in Directory.EnumerateFiles(directoryPath, "*.dll", SearchOption.TopDirectoryOnly)
+                .OrderBy(static p => p, StringComparer.OrdinalIgnoreCase))
+            {
+                string fullPath;
+                try
+                {
+                    fullPath = Path.GetFullPath(dllPath);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var loadContext = new DecryptionPluginLoadContext(fullPath);
+                    Assembly assembly = loadContext.LoadFromAssemblyPath(fullPath);
+                    Type[] exportedTypes;
+                    try
+                    {
+                        exportedTypes = assembly.GetExportedTypes();
+                    }
+                    catch (ReflectionTypeLoadException rtle)
+                    {
+                        exportedTypes = rtle.Types.Where(static t => t != null).Cast<Type>().ToArray();
+                    }
+
+                    foreach (var type in exportedTypes)
+                    {
+                        if (type.IsAbstract || type.IsInterface || !typeof(IStreamTransformProvider).IsAssignableFrom(type))
+                        {
+                            continue;
+                        }
+
+                        var ctor = type.GetConstructor(Type.EmptyTypes);
+                        if (ctor == null)
+                        {
+                            continue;
+                        }
+
+                        if (Activator.CreateInstance(type) is IStreamTransformProvider provider)
+                        {
+                            RegisterProvider(provider);
+                            loadedProviders++;
+                        }
+                    }
+
+                    lock (providerLock)
+                    {
+                        loadedPluginAssemblies.Add(fullPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to load decryption plugin '{Path.GetFileName(dllPath)}': {ex.Message}");
+                }
+            }
+
+            return loadedProviders;
+        }
+
+        public static (int ProfilesLoaded, int PluginsLoaded) LoadLocalProfilesAndPlugins(string? projectRoot = null)
+        {
+            int profiles = 0;
+            int plugins = 0;
+
+            string appBase = AppContext.BaseDirectory;
+            profiles += LoadProfilesFromFile(Path.Combine(appBase, "decryption_profiles.json"));
+            profiles += LoadProfilesFromDirectory(Path.Combine(appBase, "DecryptionProfiles"));
+            profiles += LoadProfilesFromDirectory(GetUserDecryptionProfilesDirectory());
+
+            if (!string.IsNullOrWhiteSpace(projectRoot) && Directory.Exists(projectRoot))
+            {
+                profiles += LoadProfilesFromFile(Path.Combine(projectRoot, "decryption_profiles.json"));
+            }
+
+            plugins += LoadPluginsFromDirectory(GetAppDecryptionPluginsDirectory());
+            plugins += LoadPluginsFromDirectory(GetUserDecryptionPluginsDirectory());
+
+            return (profiles, plugins);
+        }
+
+        public static (int ProfilesLoaded, int PluginsLoaded) ReloadLocalProfilesAndPlugins(string? projectRoot = null)
+        {
+            lock (providerLock)
+            {
+                registeredProfiles.Clear();
+                customProviders.Clear();
+                loadedPluginAssemblies.Clear();
+                activePipeline = BuildDefaultPipeline();
+            }
+
+            return LoadLocalProfilesAndPlugins(projectRoot);
+        }
+
+        private sealed class DecryptionPluginLoadContext : AssemblyLoadContext
+        {
+            private readonly AssemblyDependencyResolver resolver;
+
+            public DecryptionPluginLoadContext(string pluginPath)
+                : base(isCollectible: false)
+            {
+                resolver = new AssemblyDependencyResolver(pluginPath);
+            }
+
+            protected override Assembly? Load(AssemblyName assemblyName)
+            {
+                if (string.Equals(assemblyName.Name, typeof(IStreamTransformProvider).Assembly.GetName().Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return typeof(IStreamTransformProvider).Assembly;
+                }
+
+                string? path = resolver.ResolveAssemblyToPath(assemblyName);
+                return path != null ? LoadFromAssemblyPath(path) : null;
+            }
         }
 
         private static IReadOnlyList<DecryptionProfile> GetProfilesSnapshot()
@@ -128,9 +479,10 @@ namespace AssetStudio
         }
 
         /// <summary>
-        /// Forgets all parsed Addressables catalogs and custom profiles/providers so they are re-read.
+        /// Clears per-project Addressables catalog decryption caches without removing user-configured
+        /// decryption profiles or local transform plugins.
         /// </summary>
-        public static void Clear()
+        public static void ClearSessionCaches()
         {
             lock (catalogLock)
             {
@@ -138,14 +490,23 @@ namespace AssetStudio
                 metadataMap.Clear();
             }
 
+            AddressablesCatalogDependencyResolver.ClearCache();
+        }
+
+        /// <summary>
+        /// Forgets all parsed Addressables catalogs and custom profiles/providers so they are re-read.
+        /// </summary>
+        public static void Clear()
+        {
+            ClearSessionCaches();
+
             lock (providerLock)
             {
                 registeredProfiles.Clear();
                 customProviders.Clear();
+                loadedPluginAssemblies.Clear();
                 activePipeline = BuildDefaultPipeline();
             }
-
-            AddressablesCatalogDependencyResolver.ClearCache();
         }
 
         public static Stream? CheckAndDecryptStream(Stream? stream, string? filePath)
@@ -226,17 +587,24 @@ namespace AssetStudio
                     return false;
                 }
 
-                int probeSize = (int)Math.Min(UnityHeaderProbe.DefaultProbeBufferSize, fs.Length);
-                byte[] rented = ArrayPool<byte>.Shared.Rent(probeSize);
-                try
+                var resolved = CheckAndDecryptStream(fs, filePath, out var appliedProviderId, out var detectedBarrier);
+                if (resolved != null && !ReferenceEquals(resolved, fs))
                 {
-                    int read = fs.Read(rented, 0, probeSize);
-                    return UnityHeaderProbe.TryDetectEncryptionBarrier(rented.AsSpan(0, read), fs.Length, filePath, out barrier);
+                    resolved.Dispose();
                 }
-                finally
+
+                if (!string.IsNullOrEmpty(appliedProviderId))
                 {
-                    ArrayPool<byte>.Shared.Return(rented);
+                    return false;
                 }
+
+                if (detectedBarrier.HasValue)
+                {
+                    barrier = detectedBarrier.Value;
+                    return true;
+                }
+
+                return false;
             }
             catch
             {

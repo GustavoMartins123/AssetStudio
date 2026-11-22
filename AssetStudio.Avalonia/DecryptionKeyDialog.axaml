@@ -1,0 +1,305 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AssetStudio.Avalonia.ViewModels"
+        x:Class="AssetStudio.Avalonia.DecryptionKeyDialog"
+        x:CompileBindings="True"
+        x:DataType="vm:DecryptionKeyDialogViewModel"
+        Title="{Binding DialogTitle}"
+        Width="740"
+        Height="660"
+        MinWidth="580"
+        MinHeight="520"
+        WindowStartupLocation="CenterOwner">
+
+    <Grid RowDefinitions="Auto,*,Auto" Margin="14" RowSpacing="10">
+        <!-- Context / Encrypted Files Banner -->
+        <Border Grid.Row="0"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                BorderThickness="1"
+                CornerRadius="6"
+                Padding="12,10">
+            <StackPanel Spacing="6">
+                <TextBlock Text="{Binding EncryptedSummaryTitle}"
+                           FontSize="13"
+                           FontWeight="SemiBold"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="{Binding EncryptedSummaryDetail}"
+                           FontSize="11"
+                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                           TextWrapping="Wrap" />
+
+                <ItemsControl ItemsSource="{Binding BarrierSamples}"
+                              IsVisible="{Binding HasBarrierSamples}"
+                              Margin="0,2,0,0">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:DecryptionBarrierSampleItem" x:CompileBindings="True">
+                            <TextBlock Text="{Binding DisplayLine}"
+                                       FontSize="11"
+                                       FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                       TextTrimming="CharacterEllipsis" />
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </Border>
+
+        <!-- Scrollable Main Form + Saved Profiles -->
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="12" Margin="0,0,6,0">
+                <!-- Key / Cipher Form -->
+                <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                        BorderThickness="1"
+                        CornerRadius="6"
+                        Padding="12,10">
+                    <StackPanel Spacing="8">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Text="Add or Edit Decryption Key"
+                                       FontSize="12"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center" />
+                            <Button Grid.Column="1"
+                                    Content="Clear Form"
+                                    Padding="8,3"
+                                    FontSize="11"
+                                    Command="{Binding NewProfileCommand}" />
+                        </Grid>
+
+                        <Grid ColumnDefinitions="130,*,120,*" ColumnSpacing="8" RowSpacing="8" RowDefinitions="Auto,Auto">
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Profile ID" VerticalAlignment="Center" FontSize="12" />
+                            <TextBox Grid.Row="0" Grid.Column="1"
+                                     PlaceholderText="Auto-generated if empty"
+                                     Text="{Binding ProfileId, Mode=TwoWay}" />
+
+                            <TextBlock Grid.Row="0" Grid.Column="2" Text="Algorithm" VerticalAlignment="Center" FontSize="12" Margin="8,0,0,0" />
+                            <ComboBox Grid.Row="0" Grid.Column="3"
+                                      ItemsSource="{Binding AlgorithmOptions}"
+                                      SelectedIndex="{Binding SelectedAlgorithmIndex, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch" />
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="File Pattern(s)" VerticalAlignment="Center" FontSize="12" />
+                            <TextBox Grid.Row="1" Grid.Column="1"
+                                     PlaceholderText="*.bundle;*.enc"
+                                     Text="{Binding FileNamePattern, Mode=TwoWay}" />
+
+                            <CheckBox Grid.Row="1" Grid.Column="2" Grid.ColumnSpan="2"
+                                      Margin="8,0,0,0"
+                                      Content="Validate decrypted Unity header (safe for mixed folders)"
+                                      IsChecked="{Binding ValidateUnityHeader, Mode=TwoWay}"
+                                      VerticalAlignment="Center" />
+                        </Grid>
+
+                        <!-- Key Input -->
+                        <Grid ColumnDefinitions="130,*,120" ColumnSpacing="8" IsVisible="{Binding IsKeySectionVisible}">
+                            <TextBlock Grid.Column="0" Text="Key" VerticalAlignment="Center" FontSize="12" />
+                            <TextBox x:Name="KeyInputTextBox"
+                                     Grid.Column="1"
+                                     PlaceholderText="Hex (e.g. 00112233...) or UTF-8 key"
+                                     FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                     Text="{Binding KeyInput, Mode=TwoWay}" />
+                            <ComboBox Grid.Column="2"
+                                      ItemsSource="{Binding KeyFormatOptions}"
+                                      SelectedIndex="{Binding SelectedKeyFormatIndex, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch" />
+                        </Grid>
+
+                        <!-- IV / Nonce Input -->
+                        <Grid ColumnDefinitions="130,*,185" ColumnSpacing="8" IsVisible="{Binding IsIvSectionVisible}">
+                            <TextBlock Grid.Column="0" Text="IV / Nonce" VerticalAlignment="Center" FontSize="12" />
+                            <TextBox Grid.Column="1"
+                                     PlaceholderText="16B for AES, 12B for ChaCha20 (blank = zeros)"
+                                     FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                     IsEnabled="{Binding IsIvTextInputEnabled}"
+                                     Text="{Binding IvInput, Mode=TwoWay}" />
+                            <ComboBox Grid.Column="2"
+                                      ItemsSource="{Binding IvModeOptions}"
+                                      SelectedIndex="{Binding SelectedIvModeIndex, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch" />
+                        </Grid>
+
+                        <!-- Padding -->
+                        <Grid ColumnDefinitions="130,220,*" ColumnSpacing="8" IsVisible="{Binding IsPaddingVisible}">
+                            <TextBlock Grid.Column="0" Text="Block Padding" VerticalAlignment="Center" FontSize="12" />
+                            <ComboBox Grid.Column="1"
+                                      ItemsSource="{Binding PaddingOptions}"
+                                      SelectedIndex="{Binding SelectedPaddingIndex, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch" />
+                        </Grid>
+
+                        <!-- Advanced Options -->
+                        <Expander Header="Advanced Options (Range, Skip Bytes, Key Derivation, CTR Counter, Magic)"
+                                  IsExpanded="False"
+                                  HorizontalAlignment="Stretch">
+                            <StackPanel Spacing="8" Margin="0,6,0,0">
+                                <Grid ColumnDefinitions="130,*,110,*" ColumnSpacing="8" RowSpacing="8" RowDefinitions="Auto,Auto,Auto">
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Skip Header Bytes" VerticalAlignment="Center" FontSize="12" />
+                                    <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding SkipBytesText, Mode=TwoWay}" />
+
+                                    <TextBlock Grid.Row="0" Grid.Column="2" Text="Range Start" VerticalAlignment="Center" FontSize="12" Margin="6,0,0,0" />
+                                    <TextBox Grid.Row="0" Grid.Column="3" Text="{Binding RangeStartText, Mode=TwoWay}" />
+
+                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Range Length" VerticalAlignment="Center" FontSize="12" />
+                                    <TextBox Grid.Row="1" Grid.Column="1"
+                                             PlaceholderText="-1 = full stream"
+                                             Text="{Binding RangeLengthText, Mode=TwoWay}" />
+
+                                    <TextBlock Grid.Row="1" Grid.Column="2" Text="Path Pattern" VerticalAlignment="Center" FontSize="12" Margin="6,0,0,0" />
+                                    <TextBox Grid.Row="1" Grid.Column="3"
+                                             PlaceholderText="e.g. */StreamingAssets/*"
+                                             Text="{Binding PathPattern, Mode=TwoWay}" />
+
+                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Magic Hex" VerticalAlignment="Center" FontSize="12" />
+                                    <TextBox Grid.Row="2" Grid.Column="1"
+                                             PlaceholderText="Optional file header bytes"
+                                             Text="{Binding MagicHex, Mode=TwoWay}" />
+
+                                    <TextBlock Grid.Row="2" Grid.Column="2" Text="Magic Offset" VerticalAlignment="Center" FontSize="12" Margin="6,0,0,0" />
+                                    <TextBox Grid.Row="2" Grid.Column="3" Text="{Binding MagicOffsetText, Mode=TwoWay}" />
+                                </Grid>
+
+                                <!-- CTR / ChaCha Counter -->
+                                <Grid ColumnDefinitions="130,140,*" ColumnSpacing="8" IsVisible="{Binding IsCtrOptionsVisible}">
+                                    <TextBlock Grid.Column="0" Text="Counter Start" VerticalAlignment="Center" FontSize="12" />
+                                    <TextBox Grid.Column="1" Text="{Binding CounterStartText, Mode=TwoWay}" />
+                                    <CheckBox Grid.Column="2"
+                                              Content="Little-endian counter increment"
+                                              IsChecked="{Binding CounterLittleEndian, Mode=TwoWay}"
+                                              VerticalAlignment="Center" />
+                                </Grid>
+
+                                <!-- Key Derivation (KDF) -->
+                                <Grid ColumnDefinitions="130,*,120,*" ColumnSpacing="8" IsVisible="{Binding IsKeySectionVisible}">
+                                    <TextBlock Grid.Column="0" Text="Key Derivation" VerticalAlignment="Center" FontSize="12" />
+                                    <ComboBox Grid.Column="1"
+                                              ItemsSource="{Binding KdfOptions}"
+                                              SelectedIndex="{Binding SelectedKdfIndex, Mode=TwoWay}"
+                                              HorizontalAlignment="Stretch" />
+
+                                    <TextBlock Grid.Column="2" Text="Derived Length" VerticalAlignment="Center" FontSize="12" Margin="6,0,0,0" IsVisible="{Binding IsKdfLengthVisible}" />
+                                    <ComboBox Grid.Column="3"
+                                              ItemsSource="{Binding DerivedKeyLengthOptions}"
+                                              SelectedIndex="{Binding SelectedDerivedKeyLengthIndex, Mode=TwoWay}"
+                                              IsVisible="{Binding IsKdfLengthVisible}"
+                                              HorizontalAlignment="Stretch" />
+                                </Grid>
+
+                                <Grid ColumnDefinitions="130,*,110,90" ColumnSpacing="8" IsVisible="{Binding IsKdfSaltVisible}">
+                                    <TextBlock Grid.Column="0" Text="PBKDF2 Salt" VerticalAlignment="Center" FontSize="12" />
+                                    <TextBox Grid.Column="1" Text="{Binding SaltInput, Mode=TwoWay}" />
+                                    <ComboBox Grid.Column="2"
+                                              ItemsSource="{Binding SaltFormatOptions}"
+                                              SelectedIndex="{Binding SelectedSaltFormatIndex, Mode=TwoWay}"
+                                              HorizontalAlignment="Stretch" />
+                                    <TextBox Grid.Column="3"
+                                             PlaceholderText="Iter."
+                                             ToolTip.Tip="PBKDF2 iteration count"
+                                             Text="{Binding KdfIterationsText, Mode=TwoWay}" />
+                                </Grid>
+                            </StackPanel>
+                        </Expander>
+
+                        <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                            <Button Content="Save Profile to List"
+                                    Padding="10,4"
+                                    Command="{Binding SaveProfileCommand}" />
+                        </StackPanel>
+
+                        <TextBlock Text="{Binding ValidationError}"
+                                   IsVisible="{Binding HasValidationError}"
+                                   Foreground="#E53935"
+                                   FontSize="12"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding StatusMessage}"
+                                   IsVisible="{Binding HasStatusMessage}"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                   FontSize="12"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Local Profiles & Plugins Section -->
+                <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                        BorderThickness="1"
+                        CornerRadius="6"
+                        Padding="12,10">
+                    <StackPanel Spacing="8">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Text="Configured Local Profiles &amp; Plugins"
+                                       FontSize="12"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center" />
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                <Button Content="Import JSON..." Padding="8,3" FontSize="11" Command="{Binding ImportJsonCommand}" />
+                                <Button Content="Profiles Folder" Padding="8,3" FontSize="11" Command="{Binding OpenProfilesFolderCommand}" />
+                                <Button Content="Plugins Folder" Padding="8,3" FontSize="11" Command="{Binding OpenPluginsFolderCommand}" />
+                                <Button Content="Reload" Padding="8,3" FontSize="11" Command="{Binding ReloadPluginsCommand}" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Border BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                MinHeight="78"
+                                MaxHeight="140">
+                            <Grid>
+                                <ListBox ItemsSource="{Binding Profiles}"
+                                         SelectedItem="{Binding SelectedProfile, Mode=TwoWay}"
+                                         Background="Transparent"
+                                         BorderThickness="0"
+                                         IsVisible="{Binding HasProfiles}">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:DecryptionProfileListItemViewModel" x:CompileBindings="True">
+                                            <Grid ColumnDefinitions="180,*" ColumnSpacing="10" Margin="2,2">
+                                                <TextBlock Grid.Column="0" Text="{Binding Id}" FontWeight="SemiBold" FontSize="12" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Grid.Column="1" Text="{Binding SummaryText}" FontSize="11" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" TextTrimming="CharacterEllipsis" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                                <TextBlock Text="No local decryption profiles configured yet."
+                                           IsVisible="{Binding !HasProfiles}"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                            </Grid>
+                        </Border>
+
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0"
+                                       Text="{Binding PluginsSummaryText}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                       VerticalAlignment="Center"
+                                       TextWrapping="Wrap" />
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                <Button Content="Edit Selected" Padding="8,3" FontSize="11" Command="{Binding LoadSelectedProfileCommand}" />
+                                <Button Content="Remove Selected" Padding="8,3" FontSize="11" Command="{Binding DeleteSelectedProfileCommand}" />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Bottom Action Buttons -->
+        <StackPanel Grid.Row="2"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Spacing="8">
+            <Button x:Name="ApplyAndReanalyzeButton"
+                    Content="{Binding PrimaryButtonText}"
+                    MinWidth="150"
+                    HorizontalContentAlignment="Center"
+                    Command="{Binding ApplyAndReanalyzeCommand}" />
+            <Button x:Name="SecondaryCloseButton"
+                    Content="{Binding SecondaryButtonText}"
+                    MinWidth="140"
+                    HorizontalContentAlignment="Center"
+                    Command="{Binding SecondaryCloseCommand}" />
+        </StackPanel>
+    </Grid>
+</Window>

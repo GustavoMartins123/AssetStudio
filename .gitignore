@@ -369,3 +369,12 @@ dist/
 build/
 
 Exported/
+
+# Local user decryption profiles and plugins (keep real keys/plugins out of git)
+decryption_profiles.json
+**/decryption_profiles.json
+DecryptionProfiles/
+**/DecryptionProfiles/
+Plugins/
+**/Plugins/
+!decryption_profiles.example.json

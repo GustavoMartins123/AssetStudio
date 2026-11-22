@@ -63,6 +63,11 @@ namespace AssetStudio.Avalonia
 
         public string GetFolderSignature(ProjectScanResult scanResult)
         {
+            if (scanResult.EncryptedFileCount > 0)
+            {
+                return $"{scanResult.TotalFiles}_{scanResult.TotalBytes}_{scanResult.UnityBundleCount}_e{scanResult.EncryptedFileCount}";
+            }
+
             return $"{scanResult.TotalFiles}_{scanResult.TotalBytes}_{scanResult.UnityBundleCount}";
         }
 

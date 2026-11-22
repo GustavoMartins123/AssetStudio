@@ -68,7 +68,12 @@ public partial class MainWindow : Window
 
     private void SetProgressBarValue(int value)
     {
-        Dispatcher.UIThread.Post(() => ViewModel.LoadingProgress = value);
+        Dispatcher.UIThread.Post(() =>
+        {
+            ViewModel.LoadingProgress = ViewModel.Export.IsExporting
+                ? value
+                : ComputeEffectiveLoadingProgress(value);
+        });
     }
 
     private void ShowIndexingProgressPanel(IndexingProgressUpdate update, int percentDecimals = 1)

@@ -116,6 +116,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _canCancel;
         private bool _hasPreviousIncompleteSession;
         private string _incompleteSessionSummary = string.Empty;
+        private int _encryptedFileCount;
+        private int _readableAssetFileCount;
+        private double _coverageCapPercent = 100.0;
 
         public IndexingStatus Status
         {
@@ -241,6 +244,48 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _incompleteSessionSummary;
             private set => SetProperty(ref _incompleteSessionSummary, value ?? string.Empty);
+        }
+
+        public int EncryptedFileCount
+        {
+            get => _encryptedFileCount;
+            private set
+            {
+                if (SetProperty(ref _encryptedFileCount, value))
+                {
+                    OnPropertyChanged(nameof(HasEncryptedFiles));
+                    OnPropertyChanged(nameof(TotalAssetFileCount));
+                }
+            }
+        }
+
+        public int ReadableAssetFileCount
+        {
+            get => _readableAssetFileCount;
+            private set
+            {
+                if (SetProperty(ref _readableAssetFileCount, value))
+                {
+                    OnPropertyChanged(nameof(TotalAssetFileCount));
+                }
+            }
+        }
+
+        public int TotalAssetFileCount => _readableAssetFileCount + _encryptedFileCount;
+
+        public double CoverageCapPercent
+        {
+            get => _coverageCapPercent;
+            private set => SetProperty(ref _coverageCapPercent, value);
+        }
+
+        public bool HasEncryptedFiles => _encryptedFileCount > 0;
+
+        public void SetEncryptionCoverage(int readableAssetFiles, int encryptedFiles)
+        {
+            ReadableAssetFileCount = Math.Max(0, readableAssetFiles);
+            EncryptedFileCount = Math.Max(0, encryptedFiles);
+            CoverageCapPercent = ProjectScanResult.ComputeCoveragePercent(_readableAssetFileCount, _encryptedFileCount);
         }
 
         public void BeginScanning(string? currentTarget = null, int scannedFiles = 0, int totalFiles = 0)
@@ -547,6 +592,10 @@ namespace AssetStudio.Avalonia.ViewModels
                     ? safeProcessed * 100.0 / safeTotal
                     : (resolvedStatus == IndexingStatus.Completed ? 100.0 : 0.0));
             var percent = Math.Clamp(computedPercent, 0.0, 100.0);
+            if (_encryptedFileCount > 0)
+            {
+                percent = ProjectScanResult.ScaleProgressToCoverage(percent, _readableAssetFileCount, _encryptedFileCount);
+            }
 
             var isStageProgress = IsStageProgressStatus(rawStatus);
             var currentFile = snapshot.CurrentFile ?? string.Empty;
@@ -562,6 +611,9 @@ namespace AssetStudio.Avalonia.ViewModels
                 ? $"{safeProcessed:N0}/{safeTotal:N0} {unitLabel}"
                 : $"{safeProcessed:N0} {unitLabel}";
             var pendingText = safePending > 0 ? $" | {safePending:N0} pending" : string.Empty;
+            var encryptedText = _encryptedFileCount > 0
+                ? $" | {_encryptedFileCount:N0} encrypted (key needed)"
+                : string.Empty;
             var fileText = isStageProgress
                 ? (string.IsNullOrWhiteSpace(progressDetail) ? string.Empty : $" | {progressDetail}")
                 : (string.IsNullOrWhiteSpace(fileName)
@@ -571,9 +623,11 @@ namespace AssetStudio.Avalonia.ViewModels
                 ? $" | Updated {snapshot.UpdatedAt.Value.ToLocalTime():HH:mm:ss}"
                 : string.Empty;
 
-            var title = BuildIndexingProgressTitle(rawStatus, resolvedStatus);
-            var primaryText = $"{title}: {countText}{pendingText}{fileText}{updatedText}";
-            var detailText = $"{countText}{pendingText}{fileText}{updatedText}";
+            var title = _encryptedFileCount > 0 && resolvedStatus == IndexingStatus.Completed
+                ? BuildPartialCompletedTitle(rawStatus)
+                : BuildIndexingProgressTitle(rawStatus, resolvedStatus);
+            var primaryText = $"{title}: {countText}{pendingText}{encryptedText}{fileText}{updatedText}";
+            var detailText = $"{countText}{pendingText}{encryptedText}{fileText}{updatedText}";
             var decimals = Math.Max(0, snapshot.PercentDecimals);
             var formattedPercent = percent.ToString("0." + new string('#', decimals), CultureInfo.InvariantCulture) + "%";
 
@@ -646,6 +700,19 @@ namespace AssetStudio.Avalonia.ViewModels
             CanCancel = false;
             HasPreviousIncompleteSession = false;
             IncompleteSessionSummary = string.Empty;
+            EncryptedFileCount = 0;
+            ReadableAssetFileCount = 0;
+            CoverageCapPercent = 100.0;
+        }
+
+        private static string BuildPartialCompletedTitle(string? rawStatus)
+        {
+            return (rawStatus ?? string.Empty).Trim().ToLowerInvariant() switch
+            {
+                "structure_completed" => "Asset structure (partial)",
+                "connections_completed" => "Connections (partial)",
+                _ => "Partial load",
+            };
         }
 
         public static IndexingStatus ParseStatus(string? status)

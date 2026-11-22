@@ -201,6 +201,21 @@ namespace AssetStudio.Avalonia.Services
                 : new ProjectManagerDialogResult(projectPath: activeProjectPath);
         }
 
+        public async Task<ViewModels.DecryptionKeyDialogResult?> ShowDecryptionKeyDialogAsync(ViewModels.DecryptionDialogContext context)
+        {
+            ArgumentNullException.ThrowIfNull(context);
+
+            var owner = GetOwner();
+            if (owner == null || !owner.IsVisible)
+            {
+                return null;
+            }
+
+            var vm = new ViewModels.DecryptionKeyDialogViewModel(context, this);
+            var dialog = new DecryptionKeyDialog(vm);
+            return await dialog.ShowDialog<ViewModels.DecryptionKeyDialogResult?>(owner);
+        }
+
         public async Task<bool> CopyTextToClipboardAsync(string text)
         {
             var clipboard = GetTopLevel()?.Clipboard;

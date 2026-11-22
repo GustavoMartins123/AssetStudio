@@ -218,6 +218,7 @@ public partial class MainWindow : Window
         SpecifyUnityVersionTextBox.LostFocus += _specifyUnityVersionLostFocusHandler;
         ApplyUnityVersionOption();
         WireViewModelCommandsAndOptions();
+        EnsureLocalDecryptionLoaded(projectContext?.Project.ProjectRoot);
         assetsManager.ProjectRoot = appSettings.ProjectRoot;
         _shouldYieldForUserInteractionDelegate = ShouldPauseBackgroundWork;
         AssetsManager.ShouldYieldForUserInteraction = _shouldYieldForUserInteractionDelegate;
@@ -392,6 +393,7 @@ public partial class MainWindow : Window
         handlers.OpenProjectManagerAsync = ReturnToProjectManagerCommandHandlerAsync;
 
         handlers.SetProjectRootAsync = SetProjectRootCommandHandlerAsync;
+        handlers.OpenDecryptionSettingsAsync = OpenDecryptionSettingsCommandHandlerAsync;
         handlers.ShowExportOptionsAsync = ShowExportOptionsCommandHandlerAsync;
         handlers.ClearProjectCacheAsync = ClearCurrentProjectCacheCommandHandlerAsync;
 
@@ -511,36 +513,53 @@ public partial class MainWindow : Window
 
         if (files.Count > 0)
         {
-            var filePaths = files.ToArray();
-            currentScanResult = null;
-            SaveLoadFolder(filePaths[0]);
-            ResetForm();
-            StatusStripUpdate("Loading files...");
-            assetsManager.Clear();
-            assetsManager.LazyLoading = false;
-            assetsManager.DecompressionCache = null;
-            ApplyUnityVersionOption();
-            try
-            {
-                await Task.Run(() => assetsManager.LoadFiles(filePaths));
-            }
-            catch (MemoryPressureException ex)
-            {
-                if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
-                ShowMemoryPressureError(ex);
-                return;
-            }
-            catch (Exception ex)
-            {
-                if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
-                await ViewModel.DialogService.ShowErrorAsync("Load failed", $"Error loading files:\n{ex.Message}");
-                StatusStripUpdate("Load failed.");
-                return;
-            }
-
-            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
-            BuildAssetStructures();
+            await LoadSingleFilesCoreAsync(files.ToArray(), allowPrompt: true, statusPrefix: "Loading files");
         }
+    }
+
+    private async Task LoadSingleFilesCoreAsync(string[] filePaths, bool allowPrompt, string statusPrefix)
+    {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager || filePaths == null || filePaths.Length == 0)
+        {
+            return;
+        }
+
+        var parentFolder = Path.GetDirectoryName(filePaths[0]);
+        EnsureLocalDecryptionLoaded(parentFolder);
+        RecordLoadedSourcePaths(filePaths, isEager: true, isSingleFiles: true, statusPrefix: statusPrefix);
+
+        var (readableCount, encryptedCount, barriers) = await InspectSingleFilesForEncryptionAsync(filePaths, allowPrompt);
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
+        currentScanResult = null;
+        SaveLoadFolder(filePaths[0]);
+        ResetForm();
+        ApplyManualCoverageToUi(readableCount, encryptedCount, barriers);
+        StatusStripUpdate($"{statusPrefix}...");
+        assetsManager.Clear();
+        assetsManager.LazyLoading = false;
+        assetsManager.DecompressionCache = null;
+        ApplyUnityVersionOption();
+        try
+        {
+            await Task.Run(() => assetsManager.LoadFiles(filePaths));
+        }
+        catch (MemoryPressureException ex)
+        {
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+            ShowMemoryPressureError(ex);
+            return;
+        }
+        catch (Exception ex)
+        {
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+            await ViewModel.DialogService.ShowErrorAsync("Load failed", $"Error loading files:\n{ex.Message}");
+            StatusStripUpdate("Load failed.");
+            return;
+        }
+
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+        await BuildAssetStructuresAsync();
     }
 
     private async Task LoadFolderCommandHandlerAsync()
@@ -569,9 +588,15 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task LoadFolderEagerAsync(string folderPath)
+    private async Task LoadFolderEagerAsync(
+        string folderPath,
+        bool promptForDecryptionKey = true,
+        bool forceProjectAnalysisRefresh = false)
     {
         if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+
+        EnsureLocalDecryptionLoaded(folderPath);
+        RecordLoadedSourcePaths(new[] { folderPath }, isEager: true, isSingleFiles: false, statusPrefix: "Loading folder (Full / Scene Hierarchy)");
 
         var choice = await ConfirmFolderLoadIfRisky(folderPath);
         if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
@@ -582,14 +607,22 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (promptForDecryptionKey && currentScanResult != null && currentScanResult.HasEncryptedFiles)
+        {
+            currentScanResult = await PromptForDecryptionKeyOnScanIfNeededAsync(folderPath, currentScanResult, "Loading folder");
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
+        }
+
         if (choice == RiskyLoadChoice.LazyLoad)
         {
-            LoadPathsProgressiveAsync(new[] { folderPath });
+            RecordLoadedSourcePaths(new[] { folderPath }, isEager: false, isSingleFiles: false, statusPrefix: "Indexing folder");
+            LoadPathsProgressiveAsync(new[] { folderPath }, forceProjectAnalysisRefresh);
             return;
         }
 
         SaveLoadFolder(folderPath);
         ResetForm();
+        ApplyScanCoverageToUi(currentScanResult);
         StatusStripUpdate("Loading folder (Full / Scene Hierarchy)...");
         assetsManager.Clear();
         assetsManager.LazyLoading = false;
@@ -598,7 +631,7 @@ public partial class MainWindow : Window
             ? appSettings.ProjectRoot
             : folderPath;
         ApplyUnityVersionOption();
-        StartProjectAnalysisAsync(folderPath);
+        StartProjectAnalysisAsync(folderPath, forceProjectAnalysisRefresh);
         try
         {
             await Task.Run(() => assetsManager.LoadFolderAsync(folderPath));
@@ -655,27 +688,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        currentScanResult = null;
-        ResetForm();
-        assetsManager.Clear();
-        assetsManager.LazyLoading = false;
-        assetsManager.DecompressionCache = null;
-        ApplyUnityVersionOption();
-        StatusStripUpdate("Loading dropped files...");
-
-        try
-        {
-            await Task.Run(() => assetsManager.LoadFiles(paths));
-        }
-        catch (MemoryPressureException ex)
-        {
-            if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
-            ShowMemoryPressureError(ex);
-            return;
-        }
-
-        if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
-        BuildAssetStructures();
+        await LoadSingleFilesCoreAsync(paths, allowPrompt: true, statusPrefix: "Loading dropped files");
     }
 
     private void CancelProgressiveScan()
@@ -697,17 +710,36 @@ public partial class MainWindow : Window
         previous.Dispose();
     }
 
-    private async Task BeginProgressiveLoadAsync(string[] paths, string statusPrefix)
+    private async Task BeginProgressiveLoadAsync(
+        string[] paths,
+        string statusPrefix,
+        bool promptForDecryptionKey = true,
+        bool forceProjectAnalysisRefresh = false)
     {
         if (IsWindowClosingOrClosed || _isReturningToProjectManager)
         {
             return;
         }
 
+        string? projectRoot = paths.Length == 1 && Directory.Exists(paths[0])
+            ? paths[0]
+            : (paths.Length > 0 ? Path.GetDirectoryName(Path.GetFullPath(paths[0])) : null);
+        EnsureLocalDecryptionLoaded(projectRoot);
+        RecordLoadedSourcePaths(paths, isEager: false, isSingleFiles: false, statusPrefix: statusPrefix);
+
         currentScanResult = null;
         if (paths.Length == 1 && Directory.Exists(paths[0]))
         {
             currentScanResult = await ScanFolderForProgressiveIndexAsync(paths[0], statusPrefix);
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+            {
+                return;
+            }
+
+            if (promptForDecryptionKey && currentScanResult != null && currentScanResult.HasEncryptedFiles)
+            {
+                currentScanResult = await PromptForDecryptionKeyOnScanIfNeededAsync(paths[0], currentScanResult, statusPrefix);
+            }
         }
 
         if (IsWindowClosingOrClosed || _isReturningToProjectManager)
@@ -715,7 +747,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        LoadPathsProgressiveAsync(paths);
+        LoadPathsProgressiveAsync(paths, forceProjectAnalysisRefresh);
     }
 
     private async Task<ProjectScanResult?> ScanFolderForProgressiveIndexAsync(string folderPath, string statusPrefix)
@@ -748,7 +780,10 @@ public partial class MainWindow : Window
             var scanResult = await Task.Run(() => ProjectScanner.ScanFolder(folderPath, token, scanProgress), token);
             if (!token.IsCancellationRequested && !IsWindowClosingOrClosed)
             {
-                StatusStripUpdate($"{statusPrefix}: scan complete. {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles.");
+                var encryptedPart = scanResult.EncryptedFileCount > 0
+                    ? $", {scanResult.EncryptedFileCount:N0} encrypted ({scanResult.CoveragePercent:0.#}% readable)"
+                    : string.Empty;
+                StatusStripUpdate($"{statusPrefix}: scan complete. {scanResult.TotalFiles:N0} files, {FormatBytes(scanResult.TotalBytes)}, {scanResult.UnityBundleCount:N0} bundles{encryptedPart}.");
             }
             return scanResult;
         }
@@ -808,7 +843,7 @@ public partial class MainWindow : Window
         return ImportHelper.ProcessingSplitFiles(enumerated).ToList();
     }
 
-    private async void LoadPathsProgressiveAsync(string[] paths)
+    private async void LoadPathsProgressiveAsync(string[] paths, bool forceProjectAnalysisRefresh = false)
     {
         if (IsWindowClosingOrClosed || _isReturningToProjectManager)
         {
@@ -816,6 +851,7 @@ public partial class MainWindow : Window
         }
 
         ResetForm();
+        ApplyScanCoverageToUi(currentScanResult);
         assetsManager.Clear();
         assetsManager.LazyLoading = true;
         _isArenaAssetListMode = true;
@@ -838,7 +874,7 @@ public partial class MainWindow : Window
             assetsManager.DecompressionCache = appSettings.UseDiskDecompressionCache
                 ? new DecompressedBundleCache(gameScopePath: cacheTargetFolder)
                 : null;
-            StartProjectAnalysisAsync(cacheTargetFolder);
+            StartProjectAnalysisAsync(cacheTargetFolder, forceProjectAnalysisRefresh);
         }
         else
         {
@@ -981,8 +1017,8 @@ public partial class MainWindow : Window
                             EnsureAssetListItemsSource();
                             FilterAssetClasses();
 
-                            ViewModel.LoadingProgress = 100;
-                            StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.");
+                            ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
+                            StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.{FormatPartialCoverageSuffix()}");
 
                             await BuildLazyConnectionsIfNeededAsync(paths);
                             if (sessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
@@ -1120,11 +1156,11 @@ public partial class MainWindow : Window
                         return;
                     }
 
-                    ViewModel.LoadingProgress = progressPercent;
+                    ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(progressPercent);
                     var addedAssets = AppendNewLazyAssetsFromProjectIndex();
                     StatusStripUpdate(addedAssets > 0
-                        ? $"{statusText} | Showing {VisibleAssetCount:N0} assets (+{addedAssets:N0})"
-                        : $"{statusText} | Showing {VisibleAssetCount:N0} assets");
+                        ? $"{statusText} | Showing {VisibleAssetCount:N0} assets (+{addedAssets:N0}){FormatPartialCoverageSuffix()}"
+                        : $"{statusText} | Showing {VisibleAssetCount:N0} assets{FormatPartialCoverageSuffix()}");
                 });
             },
             (ex) =>
@@ -1180,11 +1216,12 @@ public partial class MainWindow : Window
                     try
                     {
                         ViewModel.IsIndexingActive = false;
-                        var finalPercent = originalTotal == 0 ? 100 : (int)((double)finalLoadedCount / originalTotal * 100);
-                        ViewModel.LoadingProgress = wasCancelled ? finalPercent : 100;
+                        var rawFinalPercent = originalTotal == 0 ? 100.0 : (double)finalLoadedCount / originalTotal * 100.0;
+                        var effectiveFinalPercent = ComputeEffectiveLoadingProgress(wasCancelled ? rawFinalPercent : 100.0);
+                        ViewModel.LoadingProgress = effectiveFinalPercent;
                         StatusStripUpdate(wasCancelled
-                            ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({finalPercent}%)"
-                            : $"Indexing finished. Total files: {originalTotal:N0}");
+                            ? $"Indexing cancelled. Indexed: {finalLoadedCount:N0} / {originalTotal:N0} files ({effectiveFinalPercent:0.#}%){FormatPartialCoverageSuffix()}"
+                            : $"Indexing finished. Total files: {originalTotal:N0}{FormatPartialCoverageSuffix()}");
                         AppendNewLazyAssetsFromProjectIndex();
 
                         if (!wasCancelled)
@@ -1370,7 +1407,24 @@ public partial class MainWindow : Window
         {
             if (assetsManager.assetsFileList.Count == 0 && (!assetsManager.LazyLoading || assetsManager.ProjectIndex.Count == 0))
             {
-                StatusStripUpdate("No Unity file can be loaded.");
+                if (_lastEncryptedFileCount > 0)
+                {
+                    ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
+                    ShowIndexingProgressPanel(
+                        "completed",
+                        _lastReadableAssetFileCount,
+                        _lastReadableAssetFileCount + _lastEncryptedFileCount,
+                        0,
+                        0,
+                        "Encrypted files require a decryption key",
+                        string.Empty,
+                        null);
+                    StatusStripUpdate($"0% loaded — {_lastEncryptedFileCount:N0} encrypted file(s) skipped. Use 'Set Decryption Key...' to unlock and re-analyze.");
+                }
+                else
+                {
+                    StatusStripUpdate("No Unity file can be loaded.");
+                }
                 return;
             }
 
@@ -1530,6 +1584,8 @@ public partial class MainWindow : Window
             {
                 lazyLog += $" ({lazyObjCount:N0} indexed in arena)";
             }
+            lazyLog += FormatPartialCoverageSuffix();
+            ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
             StatusStripUpdate(lazyLog);
 
             if (assetsManager.assetsFileList.Count > 0)
@@ -1776,6 +1832,8 @@ public partial class MainWindow : Window
             var deferredCount = m_ObjectsCount - objectsCount;
             log += $" and {deferredCount:N0} assets failed to read";
         }
+        log += FormatPartialCoverageSuffix();
+        ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
         StatusStripUpdate(log);
 
         if (assetsManager.assetsFileList.Count > 0)
@@ -2210,6 +2268,10 @@ public partial class MainWindow : Window
         assetContextCellText = string.Empty;
         _currentlySelectedUniqueID = null;
         currentScanResult = null;
+        _lastLoadedPaths = null;
+        _lastDetectedBarriers.Clear();
+        _lastEncryptedFileCount = 0;
+        _lastReadableAssetFileCount = 0;
         resolvedSourcePathCache.Clear();
         lazySourcePathBySerializedFile.Clear();
         lazySourceFileSearchCache.Clear();

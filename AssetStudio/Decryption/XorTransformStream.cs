@@ -18,6 +18,7 @@ namespace AssetStudio
         public long HeaderSkipBytes => headerSkipBytes;
         public long RangeStart => rangeStart;
         public long RangeLength => rangeLength;
+        internal bool LeaveBaseStreamOpen { get; set; }
 
         public XorTransformStream(
             Stream baseStream,
@@ -141,7 +142,7 @@ namespace AssetStudio
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && !LeaveBaseStreamOpen)
             {
                 BaseStream.Dispose();
             }

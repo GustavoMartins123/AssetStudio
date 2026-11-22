@@ -567,8 +567,8 @@ namespace AssetStudio
             // 4. Check for partial-header-encrypted .bundle files (high-entropy encrypted header/blocksInfo prefix
             //    followed by zero-padded or structured payload pages)
             if (string.Equals(ext, ".bundle", StringComparison.OrdinalIgnoreCase)
-                && totalStreamLength >= 512
-                && probeBuffer.Length >= 512
+                && totalStreamLength >= 128
+                && probeBuffer.Length >= 128
                 && !TryParseUnityBundleHeader(probeBuffer, 0, totalStreamLength, out _, out _, out _, out _)
                 && !IsSerializedFileHeader(probeBuffer, totalStreamLength)
                 && !HasKnownPlainMediaOrArchiveSignature(probeBuffer)

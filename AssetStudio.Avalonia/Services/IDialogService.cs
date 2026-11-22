@@ -167,5 +167,8 @@ namespace AssetStudio.Avalonia.Services
 
         Task<bool> RevealFileInExplorerAsync(string filePath)
             => OpenPathInExplorerAsync(filePath);
+
+        Task<ViewModels.DecryptionKeyDialogResult?> ShowDecryptionKeyDialogAsync(ViewModels.DecryptionDialogContext context)
+            => Task.FromResult<ViewModels.DecryptionKeyDialogResult?>(null);
     }
 }

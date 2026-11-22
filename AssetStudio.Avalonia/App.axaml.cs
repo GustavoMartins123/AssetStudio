@@ -64,6 +64,14 @@ public partial class App : Application
             e.Handled = true;
         };
 
+        try
+        {
+            DecryptionHelper.LoadLocalProfilesAndPlugins();
+        }
+        catch
+        {
+        }
+
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;

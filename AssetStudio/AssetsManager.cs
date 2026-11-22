@@ -1990,7 +1990,7 @@ namespace AssetStudio
 
             assetsFileIndexCache.Clear();
             inferredUnityVersion = "";
-            DecryptionHelper.Clear();
+            DecryptionHelper.ClearSessionCaches();
             AssetHandle.ClearSourceHashCache();
         }
 

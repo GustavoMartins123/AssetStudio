@@ -17,6 +17,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? OpenProjectManagerAsync { get; set; }
 
         public Func<Task>? SetProjectRootAsync { get; set; }
+        public Func<Task>? OpenDecryptionSettingsAsync { get; set; }
         public Func<Task>? ShowExportOptionsAsync { get; set; }
         public Func<Task>? ClearProjectCacheAsync { get; set; }
 
@@ -92,6 +93,7 @@ namespace AssetStudio.Avalonia.ViewModels
             OpenProjectManagerAsync = null;
 
             SetProjectRootAsync = null;
+            OpenDecryptionSettingsAsync = null;
             ShowExportOptionsAsync = null;
             ClearProjectCacheAsync = null;
 
@@ -228,6 +230,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 onException: HandleCommandException);
 
             SetProjectRootCommand = new AsyncRelayCommand(ExecuteSetProjectRootAsync, onException: HandleCommandException);
+            OpenDecryptionSettingsCommand = new AsyncRelayCommand(ExecuteOpenDecryptionSettingsAsync, onException: HandleCommandException);
             ShowExportOptionsCommand = new AsyncRelayCommand(ExecuteShowExportOptionsAsync, onException: HandleCommandException);
             ClearProjectCacheCommand = new AsyncRelayCommand(ExecuteClearProjectCacheAsync, onException: HandleCommandException);
 
@@ -343,6 +346,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand OpenProjectManagerCommand { get; }
 
         public AsyncRelayCommand SetProjectRootCommand { get; }
+        public AsyncRelayCommand OpenDecryptionSettingsCommand { get; }
         public AsyncRelayCommand ShowExportOptionsCommand { get; }
         public AsyncRelayCommand ClearProjectCacheCommand { get; }
 
@@ -737,6 +741,28 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 ProjectSession.SetLoadedProject(folder, isLazyMode: ProjectSession.IsLazyMode);
                 StatusText = $"Project root set to: {folder}";
+            }
+        }
+
+        private async Task ExecuteOpenDecryptionSettingsAsync()
+        {
+            if (CommandHandlers.OpenDecryptionSettingsAsync != null)
+            {
+                await CommandHandlers.OpenDecryptionSettingsAsync();
+                return;
+            }
+
+            var ctx = new DecryptionDialogContext(
+                IsInitialLoadPrompt: false,
+                ProjectRoot: ProjectSession.ProjectFolderPath,
+                ReadableAssetFileCount: ProjectSession.ReadableAssetFileCount,
+                EncryptedFileCount: ProjectSession.EncryptedFileCount,
+                CoveragePercent: ProjectSession.CoveragePercent,
+                DetectedBarriers: Array.Empty<StreamEncryptionBarrier>());
+            var result = await _dialogService.ShowDecryptionKeyDialogAsync(ctx);
+            if (result?.Action == DecryptionDialogAction.ApplyAndReanalyze)
+            {
+                StatusText = "Decryption settings updated.";
             }
         }
 

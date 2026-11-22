@@ -35,6 +35,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private int _il2CppScriptCount;
         private int _addressablesBundleCount;
         private int _decryptionHintCount;
+        private int _encryptedFileCount;
+        private int _readableAssetFileCount;
+        private double _coveragePercent = 100.0;
 
         public ProjectSessionViewModel(Action<Action>? dispatchToUi = null)
         {
@@ -195,7 +198,87 @@ namespace AssetStudio.Avalonia.ViewModels
         public int DecryptionHintCount
         {
             get => _decryptionHintCount;
-            private set => SetProperty(ref _decryptionHintCount, value);
+            private set
+            {
+                if (SetProperty(ref _decryptionHintCount, value))
+                {
+                    OnPropertyChanged(nameof(ShowDecryptionKeyButton));
+                }
+            }
+        }
+
+        public int EncryptedFileCount
+        {
+            get => _encryptedFileCount;
+            private set
+            {
+                if (SetProperty(ref _encryptedFileCount, value))
+                {
+                    OnPropertyChanged(nameof(HasEncryptedFiles));
+                    OnPropertyChanged(nameof(ShowDecryptionKeyButton));
+                    OnPropertyChanged(nameof(TotalAssetFileCount));
+                    OnPropertyChanged(nameof(CoverageSummaryText));
+                }
+            }
+        }
+
+        public int ReadableAssetFileCount
+        {
+            get => _readableAssetFileCount;
+            private set
+            {
+                if (SetProperty(ref _readableAssetFileCount, value))
+                {
+                    OnPropertyChanged(nameof(TotalAssetFileCount));
+                    OnPropertyChanged(nameof(CoverageSummaryText));
+                }
+            }
+        }
+
+        public int TotalAssetFileCount => _readableAssetFileCount + _encryptedFileCount;
+
+        public double CoveragePercent
+        {
+            get => _coveragePercent;
+            private set
+            {
+                if (SetProperty(ref _coveragePercent, value))
+                {
+                    OnPropertyChanged(nameof(CoverageSummaryText));
+                }
+            }
+        }
+
+        public bool HasEncryptedFiles => _encryptedFileCount > 0;
+
+        public bool ShowDecryptionKeyButton => _encryptedFileCount > 0 || _decryptionHintCount > 0;
+
+        public string CoverageSummaryText
+        {
+            get
+            {
+                if (_encryptedFileCount <= 0)
+                {
+                    return string.Empty;
+                }
+
+                return string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Coverage: {_coveragePercent:0.#}% ({_readableAssetFileCount:N0}/{TotalAssetFileCount:N0} files readable, {_encryptedFileCount:N0} encrypted — key needed)");
+            }
+        }
+
+        public void UpdateEncryptionCoverage(int readableAssetFiles, int encryptedFiles)
+        {
+            _dispatchToUi(() =>
+            {
+                int safeReadable = Math.Max(0, readableAssetFiles);
+                int safeEncrypted = Math.Max(0, encryptedFiles);
+                ReadableAssetFileCount = safeReadable;
+                EncryptedFileCount = safeEncrypted;
+                CoveragePercent = ProjectScanResult.ComputeCoveragePercent(safeReadable, safeEncrypted);
+                RuntimeBannerText = FormatEffectiveRuntimeBannerText(_currentAnalysisReport, safeReadable, safeEncrypted);
+            });
         }
 
         public void SetLoadedProject(
@@ -362,7 +445,7 @@ namespace AssetStudio.Avalonia.ViewModels
             Il2CppScriptCount = snapshot.Il2CppScriptCount;
             AddressablesBundleCount = snapshot.AddressablesBundleCount;
             DecryptionHintCount = snapshot.DecryptionHintCount;
-            RuntimeBannerText = FormatRuntimeBannerText(snapshot);
+            RuntimeBannerText = FormatEffectiveRuntimeBannerText(snapshot, _readableAssetFileCount, _encryptedFileCount);
 
             if (_selectedProjectRecord != null && IsSameProjectRoot(_selectedProjectRecord.ProjectRoot, snapshot.ProjectRoot))
             {
@@ -374,13 +457,13 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             CurrentAnalysisReport = null;
             AnalysisStatus = ProjectAnalysisStatus.Pending;
-            RuntimeBannerText = string.Empty;
             Il2CppMetadataVersion = null;
             Il2CppMetadataObfuscated = false;
             HasAddressables = false;
             Il2CppScriptCount = 0;
             AddressablesBundleCount = 0;
             DecryptionHintCount = 0;
+            RuntimeBannerText = FormatEffectiveRuntimeBannerText(null, _readableAssetFileCount, _encryptedFileCount);
         }
 
         public string UpdateWindowTitle(string? projectDisplayName = null)
@@ -534,6 +617,9 @@ namespace AssetStudio.Avalonia.ViewModels
                 CacheStatusSummary = string.Empty;
                 ProductName = string.Empty;
                 TargetPlatform = string.Empty;
+                ReadableAssetFileCount = 0;
+                EncryptedFileCount = 0;
+                CoveragePercent = 100.0;
                 CurrentAnalysisResult = null;
                 ClearAnalysisCore();
                 SelectedProjectRecord = null;
@@ -615,6 +701,29 @@ namespace AssetStudio.Avalonia.ViewModels
                 default:
                     return "Analysis: Unknown";
             }
+        }
+
+        public static string FormatEffectiveRuntimeBannerText(
+            ProjectAnalysisReport? report,
+            int readableAssetFiles,
+            int encryptedFiles)
+        {
+            var baseText = FormatRuntimeBannerText(report);
+            if (encryptedFiles <= 0)
+            {
+                return baseText;
+            }
+
+            int safeReadable = Math.Max(0, readableAssetFiles);
+            int total = safeReadable + encryptedFiles;
+            double pct = ProjectScanResult.ComputeCoveragePercent(safeReadable, encryptedFiles);
+            var coverageText = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Partial load: {pct:0.#}% ({safeReadable:N0}/{total:N0} files readable, {encryptedFiles:N0} encrypted — key needed)");
+
+            return string.IsNullOrWhiteSpace(baseText)
+                ? coverageText
+                : $"{baseText} \u2022 {coverageText}";
         }
 
         internal static bool IsSameProjectRoot(string? left, string? right)

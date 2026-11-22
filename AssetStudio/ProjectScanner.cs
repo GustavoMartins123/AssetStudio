@@ -14,7 +14,8 @@ namespace AssetStudio
         Other,
         UnityBundle,
         SerializedFile,
-        ResourceFile
+        ResourceFile,
+        Encrypted
     }
 
     public sealed class ScannedFileInfo
@@ -26,6 +27,8 @@ namespace AssetStudio
         public uint BundleVersion { get; internal set; }
         public string? BundleUnityVersion { get; internal set; }
         public string? AddressablesGroup { get; internal set; }
+        public string? AppliedDecryptionProvider { get; internal set; }
+        public StreamEncryptionBarrier? EncryptionBarrier { get; internal set; }
     }
 
     public struct ScanProgress
@@ -35,6 +38,7 @@ namespace AssetStudio
         public int TotalFiles { get; set; }
         public long ScannedBytes { get; set; }
         public int UnityBundleCount { get; set; }
+        public int EncryptedFileCount { get; set; }
     }
 
     public sealed class ProjectScanResult
@@ -45,10 +49,70 @@ namespace AssetStudio
         public int UnityBundleCount { get; internal set; }
         public int SerializedFileCount { get; internal set; }
         public int ResourceFileCount { get; internal set; }
+        public int EncryptedFileCount { get; internal set; }
         public int OtherFileCount { get; internal set; }
         public int ErrorCount { get; internal set; }
         public List<string> SampleUnityBundles { get; } = new List<string>();
+        public List<StreamEncryptionBarrier> EncryptionBarriers { get; } = new List<StreamEncryptionBarrier>();
         public List<ScannedFileInfo> Files { get; } = new List<ScannedFileInfo>();
+
+        /// <summary>
+        /// Number of Unity asset container files (bundles + serialized files) that can be read.
+        /// </summary>
+        public int ReadableAssetFileCount => UnityBundleCount + SerializedFileCount;
+
+        /// <summary>
+        /// Total Unity asset container files discovered, including unreadable encrypted files.
+        /// </summary>
+        public int TotalAssetFileCount => ReadableAssetFileCount + EncryptedFileCount;
+
+        public bool HasEncryptedFiles => EncryptedFileCount > 0;
+
+        /// <summary>
+        /// Percentage of discovered asset files that are readable.
+        /// Guaranteed to be strictly less than 100.0 whenever any encrypted files remain unreadable.
+        /// </summary>
+        public double CoveragePercent => ComputeCoveragePercent(ReadableAssetFileCount, EncryptedFileCount);
+
+        public static double ComputeCoveragePercent(int readableAssetFiles, int encryptedFiles)
+        {
+            int safeReadable = Math.Max(0, readableAssetFiles);
+            int safeEncrypted = Math.Max(0, encryptedFiles);
+            if (safeEncrypted <= 0)
+            {
+                return 100.0;
+            }
+
+            int total = safeReadable + safeEncrypted;
+            if (total <= 0 || safeReadable <= 0)
+            {
+                return 0.0;
+            }
+
+            double raw = safeReadable * 100.0 / total;
+            // Never round up to 100% while encrypted files remain locked.
+            double flooredToTenth = Math.Floor(raw * 10.0) / 10.0;
+            return Math.Clamp(flooredToTenth, 0.0, 99.9);
+        }
+
+        public static double ScaleProgressToCoverage(double stagePercent, int readableAssetFiles, int encryptedFiles)
+        {
+            double clampedStage = Math.Clamp(stagePercent, 0.0, 100.0);
+            if (encryptedFiles <= 0)
+            {
+                return clampedStage;
+            }
+
+            double cap = ComputeCoveragePercent(readableAssetFiles, encryptedFiles);
+            if (cap <= 0.0)
+            {
+                return 0.0;
+            }
+
+            double scaled = (clampedStage / 100.0) * cap;
+            double flooredToTenth = Math.Floor(scaled * 10.0) / 10.0;
+            return Math.Clamp(flooredToTenth, 0.0, Math.Min(99.9, cap));
+        }
 
         /// <summary>
         /// Estimated RAM needed to load all Unity bundles in this project.
@@ -101,12 +165,14 @@ namespace AssetStudio
 
             var filesBag = new ConcurrentBag<ScannedFileInfo>();
             var sampleBundles = new ConcurrentBag<string>();
+            var encryptionBarriers = new ConcurrentBag<StreamEncryptionBarrier>();
 
             int totalFiles = 0;
             long totalBytes = 0;
             int unityBundleCount = 0;
             int serializedFileCount = 0;
             int resourceFileCount = 0;
+            int encryptedFileCount = 0;
             int otherFileCount = 0;
             int errorCount = 0;
             long bundleBytesOnDisk = 0;
@@ -131,6 +197,8 @@ namespace AssetStudio
                 string? bundleSig = null;
                 uint bundleVer = 0;
                 string? bundleUnityVer = null;
+                string? appliedProvider = null;
+                StreamEncryptionBarrier? barrier = null;
 
                 try
                 {
@@ -142,6 +210,8 @@ namespace AssetStudio
                     bundleSig = detection.BundleSignature;
                     bundleVer = detection.BundleVersion;
                     bundleUnityVer = detection.BundleUnityVersion;
+                    appliedProvider = detection.AppliedDecryptionProvider;
+                    barrier = detection.EncryptionBarrier;
                 }
                 catch (IOException)
                 {
@@ -158,6 +228,8 @@ namespace AssetStudio
                 fileInfo.BundleVersion = bundleVer;
                 fileInfo.BundleUnityVersion = bundleUnityVer;
                 fileInfo.AddressablesGroup = InferAddressablesGroup(file);
+                fileInfo.AppliedDecryptionProvider = appliedProvider;
+                fileInfo.EncryptionBarrier = barrier;
 
                 filesBag.Add(fileInfo);
 
@@ -185,6 +257,13 @@ namespace AssetStudio
                         case ProjectFileKind.ResourceFile:
                             Interlocked.Increment(ref resourceFileCount);
                             break;
+                        case ProjectFileKind.Encrypted:
+                            Interlocked.Increment(ref encryptedFileCount);
+                            if (barrier.HasValue && encryptionBarriers.Count < 200)
+                            {
+                                encryptionBarriers.Add(barrier.Value);
+                            }
+                            break;
                         default:
                             Interlocked.Increment(ref otherFileCount);
                             break;
@@ -204,7 +283,8 @@ namespace AssetStudio
                                 ScannedFiles = currentScanned,
                                 TotalFiles = totalFilesCount,
                                 ScannedBytes = Volatile.Read(ref totalBytes),
-                                UnityBundleCount = Volatile.Read(ref unityBundleCount)
+                                UnityBundleCount = Volatile.Read(ref unityBundleCount),
+                                EncryptedFileCount = Volatile.Read(ref encryptedFileCount)
                             });
                         }
                     }
@@ -216,11 +296,14 @@ namespace AssetStudio
             result.UnityBundleCount = unityBundleCount;
             result.SerializedFileCount = serializedFileCount;
             result.ResourceFileCount = resourceFileCount;
+            result.EncryptedFileCount = encryptedFileCount;
             result.OtherFileCount = otherFileCount;
             result.ErrorCount = errorCount;
 
             result.Files.AddRange(filesBag);
             result.SampleUnityBundles.AddRange(sampleBundles.Take(MaxSamples));
+            result.EncryptionBarriers.AddRange(
+                encryptionBarriers.OrderBy(static b => b.FilePath, StringComparer.OrdinalIgnoreCase));
 
             result.EstimatedMemoryBytes = (long)(bundleBytesOnDisk * MemoryMultiplier);
             result.AvailableMemoryBytes = GetAvailableMemoryBytes();
@@ -232,7 +315,8 @@ namespace AssetStudio
                 ScannedFiles = totalFiles,
                 TotalFiles = totalFiles,
                 ScannedBytes = totalBytes,
-                UnityBundleCount = unityBundleCount
+                UnityBundleCount = unityBundleCount,
+                EncryptedFileCount = encryptedFileCount
             });
 
             return result;
@@ -282,6 +366,8 @@ namespace AssetStudio
             public string? BundleSignature;
             public uint BundleVersion;
             public string? BundleUnityVersion;
+            public string? AppliedDecryptionProvider;
+            public StreamEncryptionBarrier? EncryptionBarrier;
         }
 
         private static FileDetectionResult DetectFileKindExtended(string path, long fileSize)
@@ -295,15 +381,11 @@ namespace AssetStudio
             var header = ArrayPool<byte>.Shared.Rent(headerSize);
             try
             {
-                int read;
-                using (var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                {
-                    read = stream.Read(header, 0, headerSize);
-                }
+                using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                int read = stream.Read(header, 0, headerSize);
 
                 var span = header.AsSpan(0, read);
-                if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, fileSize, out var sig, out var ver, out var unityVer, out _)
-                    || UnityHeaderProbe.TryFindOffsetUnityBundleHeader(span, fileSize, out _, out sig, out ver, out unityVer))
+                if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, fileSize, out var sig, out var ver, out var unityVer, out _))
                 {
                     result.Kind = ProjectFileKind.UnityBundle;
                     result.BundleSignature = sig;
@@ -312,25 +394,64 @@ namespace AssetStudio
                     return result;
                 }
 
-                if (UnityHeaderProbe.TryDetectRepeatingXorUnityFsKey(span, fileSize, out _, out var xorVer, out var xorUnityVer))
+                if (UnityHeaderProbe.IsSerializedFileHeader(span, fileSize))
                 {
-                    result.Kind = ProjectFileKind.UnityBundle;
-                    result.BundleSignature = "UnityFS";
-                    result.BundleVersion = xorVer;
-                    result.BundleUnityVersion = xorUnityVer;
+                    result.Kind = ProjectFileKind.SerializedFile;
                     return result;
                 }
 
-                if (read >= 26 && UnityHeaderProbe.MatchesAt(span, 0, DecryptionHelper.EncryptionMagicBytes))
+                // Check active decryption pipeline (Block512 catalog, declarative profiles, offset skip, repeating XOR, local plugins)
+                // and barrier detection using the already-open stream.
+                stream.Position = 0;
+                var transformed = DecryptionHelper.CheckAndDecryptStream(stream, path, out var providerId, out var barrier);
+                if (transformed != null && !ReferenceEquals(transformed, stream))
                 {
+                    try
+                    {
+                        transformed.Position = 0;
+                        int decProbeLen = (int)Math.Min(headerSize, transformed.Length);
+                        int decRead = 0;
+                        while (decRead < decProbeLen)
+                        {
+                            int n = transformed.Read(header, decRead, decProbeLen - decRead);
+                            if (n <= 0) break;
+                            decRead += n;
+                        }
+
+                        var decSpan = header.AsSpan(0, decRead);
+                        if (UnityHeaderProbe.TryParseUnityBundleHeader(decSpan, 0, transformed.Length, out sig, out ver, out unityVer, out _))
+                        {
+                            result.Kind = ProjectFileKind.UnityBundle;
+                            result.BundleSignature = sig;
+                            result.BundleVersion = ver;
+                            result.BundleUnityVersion = unityVer;
+                            result.AppliedDecryptionProvider = providerId;
+                            return result;
+                        }
+
+                        if (UnityHeaderProbe.IsSerializedFileHeader(decSpan, transformed.Length))
+                        {
+                            result.Kind = ProjectFileKind.SerializedFile;
+                            result.AppliedDecryptionProvider = providerId;
+                            return result;
+                        }
+                    }
+                    finally
+                    {
+                        transformed.Dispose();
+                    }
+                }
+                else if (read >= 26 && UnityHeaderProbe.MatchesAt(span, 0, DecryptionHelper.EncryptionMagicBytes))
+                {
+                    // Legacy Block512 container header when catalog.json is not adjacent
                     result.Kind = ProjectFileKind.UnityBundle;
                     result.BundleSignature = "Encryption";
                     return result;
                 }
-
-                if (UnityHeaderProbe.IsSerializedFileHeader(span, fileSize))
+                else if (barrier.HasValue)
                 {
-                    result.Kind = ProjectFileKind.SerializedFile;
+                    result.Kind = ProjectFileKind.Encrypted;
+                    result.EncryptionBarrier = barrier.Value;
                     return result;
                 }
             }

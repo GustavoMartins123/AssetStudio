@@ -129,6 +129,12 @@ namespace AssetStudio
                 var newXorStream = xorStream.Clone(clonedUnderlying);
                 return new FileReader(FullPath, newXorStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
             }
+            else if (BaseStream is CipherTransformStream cipherStream)
+            {
+                var clonedUnderlying = CloneStream(cipherStream.BaseStream);
+                var newCipherStream = cipherStream.Clone(clonedUnderlying);
+                return new FileReader(FullPath, newCipherStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+            }
             else if (BaseStream is SubStream subStream)
             {
                 Stream newStream = !string.IsNullOrEmpty(subStream.FilePath)

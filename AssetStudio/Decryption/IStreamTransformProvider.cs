@@ -4,6 +4,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Enumeration;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace AssetStudio
@@ -20,8 +22,30 @@ namespace AssetStudio
         [JsonPropertyName("id")]
         public string Id { get; set; } = string.Empty;
 
+        [JsonPropertyName("description")]
+        public string? Description { get; set; }
+
+        [JsonPropertyName("enabled")]
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", or "none" (header skip only).
+        /// When omitted, defaults to "xor" if xorKeyHex/keyHex/keyUtf8 is provided, else "none".
+        /// </summary>
+        [JsonPropertyName("algorithm")]
+        public string? Algorithm { get; set; }
+
+        /// <summary>
+        /// Wildcard filename matcher. Multiple patterns may be separated with ';' or ','.
+        /// </summary>
         [JsonPropertyName("fileNamePattern")]
         public string? FileNamePattern { get; set; }
+
+        /// <summary>
+        /// Optional wildcard matcher evaluated against the full normalized path (forward slashes).
+        /// </summary>
+        [JsonPropertyName("pathPattern")]
+        public string? PathPattern { get; set; }
 
         [JsonPropertyName("magicHex")]
         public string? MagicHex { get; set; }
@@ -29,17 +53,225 @@ namespace AssetStudio
         [JsonPropertyName("magicOffset")]
         public int MagicOffset { get; set; }
 
+        [JsonPropertyName("minFileSize")]
+        public long MinFileSize { get; set; }
+
+        [JsonPropertyName("sizeMultiple")]
+        public int SizeMultiple { get; set; }
+
         [JsonPropertyName("skipBytes")]
         public long SkipBytes { get; set; }
 
         [JsonPropertyName("xorKeyHex")]
         public string? XorKeyHex { get; set; }
 
+        [JsonPropertyName("keyHex")]
+        public string? KeyHex { get; set; }
+
+        [JsonPropertyName("keyUtf8")]
+        public string? KeyUtf8 { get; set; }
+
+        [JsonPropertyName("ivHex")]
+        public string? IvHex { get; set; }
+
+        [JsonPropertyName("nonceHex")]
+        public string? NonceHex { get; set; }
+
+        [JsonPropertyName("ivUtf8")]
+        public string? IvUtf8 { get; set; }
+
+        /// <summary>
+        /// When true, reads the IV/nonce (16 bytes for AES-CBC/CTR, 12 bytes for ChaCha20)
+        /// from the stream immediately after skipBytes, and advances the payload start past it.
+        /// </summary>
+        [JsonPropertyName("ivFromStreamPrefix")]
+        public bool IvFromStreamPrefix { get; set; }
+
+        /// <summary>
+        /// Block cipher padding: "none" (default) or "pkcs7".
+        /// </summary>
+        [JsonPropertyName("padding")]
+        public string? Padding { get; set; }
+
+        [JsonPropertyName("counterStart")]
+        public uint CounterStart { get; set; }
+
+        [JsonPropertyName("counterLittleEndian")]
+        public bool CounterLittleEndian { get; set; }
+
+        /// <summary>
+        /// Optional key derivation: "none" (default), "sha256", "md5", "pbkdf2-sha1", or "pbkdf2-sha256".
+        /// </summary>
+        [JsonPropertyName("keyDerivation")]
+        public string? KeyDerivation { get; set; }
+
+        [JsonPropertyName("saltHex")]
+        public string? SaltHex { get; set; }
+
+        [JsonPropertyName("saltUtf8")]
+        public string? SaltUtf8 { get; set; }
+
+        [JsonPropertyName("kdfIterations")]
+        public int KdfIterations { get; set; }
+
+        [JsonPropertyName("derivedKeyLength")]
+        public int DerivedKeyLength { get; set; }
+
         [JsonPropertyName("rangeStart")]
         public long RangeStart { get; set; }
 
         [JsonPropertyName("rangeLength")]
         public long RangeLength { get; set; } = -1;
+
+        /// <summary>
+        /// When true, skips already-plaintext Unity files and verifies that the transformed stream
+        /// begins with a recognizable Unity bundle, SerializedFile, WebFile, or compressed container header.
+        /// </summary>
+        [JsonPropertyName("validateUnityHeader")]
+        public bool ValidateUnityHeader { get; set; }
+
+        public DecryptionProfile Clone()
+        {
+            return new DecryptionProfile
+            {
+                Id = Id,
+                Description = Description,
+                Enabled = Enabled,
+                Algorithm = Algorithm,
+                FileNamePattern = FileNamePattern,
+                PathPattern = PathPattern,
+                MagicHex = MagicHex,
+                MagicOffset = MagicOffset,
+                MinFileSize = MinFileSize,
+                SizeMultiple = SizeMultiple,
+                SkipBytes = SkipBytes,
+                XorKeyHex = XorKeyHex,
+                KeyHex = KeyHex,
+                KeyUtf8 = KeyUtf8,
+                IvHex = IvHex,
+                NonceHex = NonceHex,
+                IvUtf8 = IvUtf8,
+                IvFromStreamPrefix = IvFromStreamPrefix,
+                Padding = Padding,
+                CounterStart = CounterStart,
+                CounterLittleEndian = CounterLittleEndian,
+                KeyDerivation = KeyDerivation,
+                SaltHex = SaltHex,
+                SaltUtf8 = SaltUtf8,
+                KdfIterations = KdfIterations,
+                DerivedKeyLength = DerivedKeyLength,
+                RangeStart = RangeStart,
+                RangeLength = RangeLength,
+                ValidateUnityHeader = ValidateUnityHeader
+            };
+        }
+
+        public StreamCipherAlgorithm ResolveAlgorithm()
+        {
+            var raw = (Algorithm ?? string.Empty).Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(raw))
+            {
+                if (!string.IsNullOrWhiteSpace(XorKeyHex)
+                    || !string.IsNullOrWhiteSpace(KeyHex)
+                    || !string.IsNullOrEmpty(KeyUtf8))
+                {
+                    return StreamCipherAlgorithm.Xor;
+                }
+                return StreamCipherAlgorithm.None;
+            }
+
+            return raw switch
+            {
+                "xor" => StreamCipherAlgorithm.Xor,
+                "aes" or "aes-cbc" or "aescbc" or "aes_cbc" => StreamCipherAlgorithm.AesCbc,
+                "aes-ecb" or "aesecb" or "aes_ecb" => StreamCipherAlgorithm.AesEcb,
+                "aes-ctr" or "aesctr" or "aes_ctr" => StreamCipherAlgorithm.AesCtr,
+                "chacha20" or "chacha" or "chacha-20" => StreamCipherAlgorithm.ChaCha20,
+                "none" or "skip" or "offset" => StreamCipherAlgorithm.None,
+                _ => throw new ArgumentException($"Unsupported decryption algorithm '{Algorithm}'.")
+            };
+        }
+
+        public bool Validate(out string? error)
+        {
+            error = null;
+            StreamCipherAlgorithm algo;
+            try
+            {
+                algo = ResolveAlgorithm();
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+
+            if (SkipBytes < 0)
+            {
+                error = "Skip bytes cannot be negative.";
+                return false;
+            }
+
+            if (RangeStart < 0)
+            {
+                error = "Range start cannot be negative.";
+                return false;
+            }
+
+            if (algo == StreamCipherAlgorithm.None)
+            {
+                if (SkipBytes <= 0)
+                {
+                    error = "Offset-skip profile requires SkipBytes > 0.";
+                    return false;
+                }
+                return true;
+            }
+
+            byte[]? keyBytes = DeclarativeProfileTransformProvider.TryResolveKeyBytes(this, algo, out string? keyError);
+            if (keyBytes == null || keyBytes.Length == 0)
+            {
+                error = keyError ?? "A valid decryption key is required.";
+                return false;
+            }
+
+            switch (algo)
+            {
+                case StreamCipherAlgorithm.AesCbc:
+                case StreamCipherAlgorithm.AesEcb:
+                case StreamCipherAlgorithm.AesCtr:
+                    if (keyBytes.Length is not (16 or 24 or 32))
+                    {
+                        error = $"AES key must be 16, 24, or 32 bytes (got {keyBytes.Length} bytes).";
+                        return false;
+                    }
+                    break;
+                case StreamCipherAlgorithm.ChaCha20:
+                    if (keyBytes.Length != 32)
+                    {
+                        error = $"ChaCha20 key must be 32 bytes (got {keyBytes.Length} bytes).";
+                        return false;
+                    }
+                    break;
+            }
+
+            if (!IvFromStreamPrefix)
+            {
+                if (!DeclarativeProfileTransformProvider.TryParseExplicitIvOrNonce(this, algo, out _, out string? ivError))
+                {
+                    error = ivError ?? "Invalid IV/nonce format.";
+                    return false;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(MagicHex) && DeclarativeProfileTransformProvider.TryParseHexBytes(MagicHex) == null)
+            {
+                error = "Magic hex contains invalid hexadecimal characters.";
+                return false;
+            }
+
+            return true;
+        }
     }
 
     public sealed class DeclarativeProfileTransformProvider : IStreamTransformProvider
@@ -62,38 +294,416 @@ namespace AssetStudio
                 return null;
             }
 
+            bool alreadyPlaintextUnity = UnityHeaderProbe.TryParseUnityBundleHeader(initialHeader, 0, stream.Length, out _, out _, out _, out _)
+                || UnityHeaderProbe.IsSerializedFileHeader(initialHeader, stream.Length);
+
             string fileName = Path.GetFileName(filePath);
+            string normalizedPath = (filePath ?? string.Empty).Replace('\\', '/');
+            long originalPos = stream.Position;
+
             for (int i = 0; i < profiles.Count; i++)
             {
                 var profile = profiles[i];
-                if (!MatchesProfile(profile, fileName, initialHeader, stream.Length))
+                if (!profile.Enabled)
                 {
                     continue;
                 }
 
-                byte[]? xorKey = TryParseHexBytes(profile.XorKeyHex);
-                if (xorKey != null && xorKey.Length > 0)
+                if (profile.ValidateUnityHeader && alreadyPlaintextUnity)
                 {
-                    return new XorTransformStream(
-                        stream,
-                        xorKey,
-                        headerSkipBytes: Math.Max(0, profile.SkipBytes),
-                        rangeStart: Math.Max(0, profile.RangeStart),
-                        rangeLength: profile.RangeLength);
+                    continue;
                 }
 
-                if (profile.SkipBytes > 0 && profile.SkipBytes < stream.Length)
+                if (!MatchesProfile(profile, fileName, normalizedPath, initialHeader, stream.Length))
                 {
-                    return new SubStream(stream, profile.SkipBytes, stream.Length - profile.SkipBytes, leaveOpen: false);
+                    continue;
                 }
+
+                stream.Position = originalPos;
+                var candidate = TryCreateTransformedStream(profile, stream, originalPos);
+                if (candidate == null)
+                {
+                    stream.Position = originalPos;
+                    continue;
+                }
+
+                if (!profile.ValidateUnityHeader)
+                {
+                    return candidate;
+                }
+
+                if (ValidateDecryptedUnityHeader(candidate))
+                {
+                    if (candidate is SubStream sub && profile.SkipBytes > 0 && profile.SkipBytes < stream.Length)
+                    {
+                        sub.Dispose();
+                        var finalSub = new SubStream(stream, profile.SkipBytes, stream.Length - profile.SkipBytes, leaveOpen: false);
+                        finalSub.Position = 0;
+                        return finalSub;
+                    }
+
+                    SetLeaveBaseStreamOpen(candidate, leaveOpen: false);
+                    candidate.Position = 0;
+                    return candidate;
+                }
+
+                SetLeaveBaseStreamOpen(candidate, leaveOpen: true);
+                candidate.Dispose();
+                stream.Position = originalPos;
             }
 
             return null;
         }
 
+        private static Stream? TryCreateTransformedStream(DecryptionProfile profile, Stream stream, long originalPos)
+        {
+            StreamCipherAlgorithm algo;
+            try
+            {
+                algo = profile.ResolveAlgorithm();
+            }
+            catch
+            {
+                return null;
+            }
+
+            long skipBytes = Math.Max(0, profile.SkipBytes);
+            if (skipBytes >= stream.Length)
+            {
+                return null;
+            }
+
+            if (algo == StreamCipherAlgorithm.None)
+            {
+                if (skipBytes > 0)
+                {
+                    return new SubStream(stream, skipBytes, stream.Length - skipBytes, leaveOpen: profile.ValidateUnityHeader);
+                }
+                return null;
+            }
+
+            byte[]? keyBytes = TryResolveKeyBytes(profile, algo, out _);
+            if (keyBytes == null || keyBytes.Length == 0)
+            {
+                return null;
+            }
+
+            if (algo == StreamCipherAlgorithm.Xor)
+            {
+                var xorStream = new XorTransformStream(
+                    stream,
+                    keyBytes,
+                    headerSkipBytes: skipBytes,
+                    rangeStart: Math.Max(0, profile.RangeStart),
+                    rangeLength: profile.RangeLength);
+                if (profile.ValidateUnityHeader)
+                {
+                    xorStream.LeaveBaseStreamOpen = true;
+                }
+                return xorStream;
+            }
+
+            byte[]? ivOrNonce = null;
+            long effectiveSkip = skipBytes;
+
+            if (profile.IvFromStreamPrefix && algo is StreamCipherAlgorithm.AesCbc or StreamCipherAlgorithm.AesCtr or StreamCipherAlgorithm.ChaCha20)
+            {
+                int ivLen = algo == StreamCipherAlgorithm.ChaCha20 ? 12 : 16;
+                if (skipBytes + ivLen >= stream.Length)
+                {
+                    return null;
+                }
+
+                ivOrNonce = new byte[ivLen];
+                stream.Position = skipBytes;
+                int read = 0;
+                while (read < ivLen)
+                {
+                    int n = stream.Read(ivOrNonce, read, ivLen - read);
+                    if (n <= 0) break;
+                    read += n;
+                }
+                stream.Position = originalPos;
+                if (read < ivLen)
+                {
+                    return null;
+                }
+
+                effectiveSkip += ivLen;
+            }
+            else
+            {
+                if (!TryParseExplicitIvOrNonce(profile, algo, out ivOrNonce, out _))
+                {
+                    return null;
+                }
+            }
+
+            bool pkcs7 = string.Equals(profile.Padding?.Trim(), "pkcs7", StringComparison.OrdinalIgnoreCase);
+
+            try
+            {
+                var cipherStream = new CipherTransformStream(
+                    stream,
+                    algo,
+                    keyBytes,
+                    ivOrNonce,
+                    headerSkipBytes: effectiveSkip,
+                    rangeStart: Math.Max(0, profile.RangeStart),
+                    rangeLength: profile.RangeLength,
+                    pkcs7Padding: pkcs7,
+                    counterStart: profile.CounterStart,
+                    counterLittleEndian: profile.CounterLittleEndian);
+                if (profile.ValidateUnityHeader)
+                {
+                    cipherStream.LeaveBaseStreamOpen = true;
+                }
+                return cipherStream;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool ValidateDecryptedUnityHeader(Stream candidate)
+        {
+            try
+            {
+                if (candidate.Length < 20)
+                {
+                    return false;
+                }
+
+                candidate.Position = 0;
+                int probeLen = (int)Math.Min(256, candidate.Length);
+                Span<byte> buf = stackalloc byte[probeLen];
+                int read = 0;
+                while (read < probeLen)
+                {
+                    int n = candidate.Read(buf.Slice(read));
+                    if (n <= 0) break;
+                    read += n;
+                }
+
+                if (read < 20)
+                {
+                    return false;
+                }
+
+                var span = buf.Slice(0, read);
+                if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, candidate.Length, out _, out _, out _, out _, requireStrictValidation: true))
+                {
+                    return true;
+                }
+
+                if (UnityHeaderProbe.IsSerializedFileHeader(span, candidate.Length))
+                {
+                    return true;
+                }
+
+                string sig = UnityHeaderProbe.ReadNullTerminatedAscii(span, 0, 20, out _);
+                if (string.Equals(sig, "UnityWebData1.0", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                // GZip magic (1F 8B) or Brotli marker at 0x20
+                if (span[0] == 0x1F && span[1] == 0x8B)
+                {
+                    return true;
+                }
+                if (span.Length >= 0x26
+                    && span[0x20] == 'b' && span[0x21] == 'r' && span[0x22] == 'o'
+                    && span[0x23] == 't' && span[0x24] == 'l' && span[0x25] == 'i')
+                {
+                    return true;
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void SetLeaveBaseStreamOpen(Stream stream, bool leaveOpen)
+        {
+            if (stream is CipherTransformStream cipher)
+            {
+                cipher.LeaveBaseStreamOpen = leaveOpen;
+            }
+            else if (stream is XorTransformStream xor)
+            {
+                xor.LeaveBaseStreamOpen = leaveOpen;
+            }
+        }
+
+        internal static byte[]? TryResolveKeyBytes(DecryptionProfile profile, StreamCipherAlgorithm algo, out string? error)
+        {
+            error = null;
+            byte[]? rawKey = null;
+
+            if (!string.IsNullOrWhiteSpace(profile.KeyHex))
+            {
+                rawKey = TryParseHexBytes(profile.KeyHex);
+                if (rawKey == null)
+                {
+                    error = "Key (Hex) is not a valid even-length hexadecimal string.";
+                    return null;
+                }
+            }
+            else if (!string.IsNullOrEmpty(profile.KeyUtf8))
+            {
+                rawKey = Encoding.UTF8.GetBytes(profile.KeyUtf8);
+            }
+            else if (!string.IsNullOrWhiteSpace(profile.XorKeyHex))
+            {
+                rawKey = TryParseHexBytes(profile.XorKeyHex);
+                if (rawKey == null)
+                {
+                    error = "XOR Key (Hex) is not a valid even-length hexadecimal string.";
+                    return null;
+                }
+            }
+
+            if (rawKey == null || rawKey.Length == 0)
+            {
+                error = "Key is required.";
+                return null;
+            }
+
+            var kdf = (profile.KeyDerivation ?? string.Empty).Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(kdf) || kdf == "none")
+            {
+                return rawKey;
+            }
+
+            int targetLen = profile.DerivedKeyLength > 0
+                ? profile.DerivedKeyLength
+                : algo switch
+                {
+                    StreamCipherAlgorithm.ChaCha20 => 32,
+                    StreamCipherAlgorithm.AesCbc or StreamCipherAlgorithm.AesEcb or StreamCipherAlgorithm.AesCtr => 32,
+                    _ => 32
+                };
+
+            switch (kdf)
+            {
+                case "sha256":
+                case "sha-256":
+                {
+                    byte[] hash = SHA256.HashData(rawKey);
+                    if (targetLen > 0 && targetLen < hash.Length)
+                    {
+                        return hash.AsSpan(0, targetLen).ToArray();
+                    }
+                    return hash;
+                }
+                case "md5":
+                {
+                    byte[] hash = MD5.HashData(rawKey);
+                    if (targetLen > 0 && targetLen < hash.Length)
+                    {
+                        return hash.AsSpan(0, targetLen).ToArray();
+                    }
+                    return hash;
+                }
+                case "pbkdf2":
+                case "pbkdf2-sha1":
+                case "pbkdf2-sha256":
+                {
+                    byte[] salt = Array.Empty<byte>();
+                    if (!string.IsNullOrWhiteSpace(profile.SaltHex))
+                    {
+                        byte[]? parsedSalt = TryParseHexBytes(profile.SaltHex);
+                        if (parsedSalt == null)
+                        {
+                            error = "KDF Salt (Hex) is not a valid hexadecimal string.";
+                            return null;
+                        }
+                        salt = parsedSalt;
+                    }
+                    else if (!string.IsNullOrEmpty(profile.SaltUtf8))
+                    {
+                        salt = Encoding.UTF8.GetBytes(profile.SaltUtf8);
+                    }
+
+                    int iterations = profile.KdfIterations > 0 ? profile.KdfIterations : 1000;
+                    var hashAlg = kdf == "pbkdf2-sha1" ? HashAlgorithmName.SHA1 : HashAlgorithmName.SHA256;
+                    return Rfc2898DeriveBytes.Pbkdf2(rawKey, salt, iterations, hashAlg, targetLen);
+                }
+                default:
+                    error = $"Unsupported key derivation '{profile.KeyDerivation}'.";
+                    return null;
+            }
+        }
+
+        internal static bool TryParseExplicitIvOrNonce(
+            DecryptionProfile profile,
+            StreamCipherAlgorithm algo,
+            out byte[]? ivOrNonce,
+            out string? error)
+        {
+            ivOrNonce = null;
+            error = null;
+
+            string? hexSource = !string.IsNullOrWhiteSpace(profile.IvHex)
+                ? profile.IvHex
+                : (!string.IsNullOrWhiteSpace(profile.NonceHex) ? profile.NonceHex : null);
+
+            if (!string.IsNullOrWhiteSpace(hexSource))
+            {
+                ivOrNonce = TryParseHexBytes(hexSource);
+                if (ivOrNonce == null)
+                {
+                    error = "IV/Nonce (Hex) is not a valid even-length hexadecimal string.";
+                    return false;
+                }
+            }
+            else if (!string.IsNullOrEmpty(profile.IvUtf8))
+            {
+                ivOrNonce = Encoding.UTF8.GetBytes(profile.IvUtf8);
+            }
+
+            if (ivOrNonce == null || ivOrNonce.Length == 0)
+            {
+                return true; // Defaults to all-zero IV/nonce when omitted
+            }
+
+            switch (algo)
+            {
+                case StreamCipherAlgorithm.AesCbc:
+                    if (ivOrNonce.Length != 16)
+                    {
+                        error = $"AES-CBC IV must be 16 bytes (got {ivOrNonce.Length} bytes).";
+                        return false;
+                    }
+                    break;
+                case StreamCipherAlgorithm.AesCtr:
+                    if (ivOrNonce.Length is not (12 or 16))
+                    {
+                        error = $"AES-CTR IV/nonce must be 12 or 16 bytes (got {ivOrNonce.Length} bytes).";
+                        return false;
+                    }
+                    break;
+                case StreamCipherAlgorithm.ChaCha20:
+                    if (ivOrNonce.Length != 12)
+                    {
+                        error = $"ChaCha20 nonce must be 12 bytes (got {ivOrNonce.Length} bytes).";
+                        return false;
+                    }
+                    break;
+            }
+
+            return true;
+        }
+
         private static bool MatchesProfile(
             DecryptionProfile profile,
             string fileName,
+            string normalizedPath,
             ReadOnlySpan<byte> initialHeader,
             long streamLength)
         {
@@ -102,12 +712,31 @@ namespace AssetStudio
                 return false;
             }
 
-            bool hasMatcher = false;
+            if (profile.MinFileSize > 0 && streamLength < profile.MinFileSize)
+            {
+                return false;
+            }
+
+            if (profile.SizeMultiple > 1 && ((streamLength - profile.SkipBytes) % profile.SizeMultiple) != 0)
+            {
+                return false;
+            }
+
+            bool hasMatcher = profile.ValidateUnityHeader;
 
             if (!string.IsNullOrWhiteSpace(profile.FileNamePattern))
             {
                 hasMatcher = true;
-                if (!MatchesWildcard(fileName, profile.FileNamePattern!))
+                if (!MatchesAnyWildcard(fileName, profile.FileNamePattern!))
+                {
+                    return false;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(profile.PathPattern))
+            {
+                hasMatcher = true;
+                if (!MatchesAnyWildcard(normalizedPath, profile.PathPattern!))
                 {
                     return false;
                 }
@@ -126,8 +755,19 @@ namespace AssetStudio
             return hasMatcher;
         }
 
-        private static bool MatchesWildcard(string fileName, string pattern)
-            => FileSystemName.MatchesSimpleExpression(pattern, fileName, ignoreCase: true);
+        private static bool MatchesAnyWildcard(string text, string patternList)
+        {
+            var parts = patternList.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                var p = parts[i].Trim();
+                if (p.Length > 0 && FileSystemName.MatchesSimpleExpression(p, text, ignoreCase: true))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
 
         internal static byte[]? TryParseHexBytes(string? hex)
         {
@@ -136,12 +776,18 @@ namespace AssetStudio
                 return null;
             }
 
-            Span<char> cleaned = stackalloc char[hex.Length];
-            int len = 0;
-            for (int i = 0; i < hex.Length; i++)
+            string trimmed = hex.Trim();
+            if (trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
             {
-                char c = hex[i];
-                if (!char.IsWhiteSpace(c) && c != '-')
+                trimmed = trimmed.Substring(2);
+            }
+
+            Span<char> cleaned = trimmed.Length <= 512 ? stackalloc char[trimmed.Length] : new char[trimmed.Length];
+            int len = 0;
+            for (int i = 0; i < trimmed.Length; i++)
+            {
+                char c = trimmed[i];
+                if (!char.IsWhiteSpace(c) && c != '-' && c != ':')
                 {
                     cleaned[len++] = c;
                 }

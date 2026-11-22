@@ -280,8 +280,8 @@ public partial class MainWindow : Window
                         {
                             return;
                         }
-                        ViewModel.LoadingProgress = (int)percent;
-                        StatusStripUpdate($"Building connections... {processedFiles:N0}/{sourcePaths.Count:N0} files ({percent:0.#}%)");
+                        ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(percent);
+                        StatusStripUpdate($"Building connections... {processedFiles:N0}/{sourcePaths.Count:N0} files ({ComputeEffectiveLoadingProgress(percent):0.#}%){FormatPartialCoverageSuffix()}");
                     }, DispatcherPriority.Background);
                 },
                 stagingSession,
@@ -320,9 +320,9 @@ public partial class MainWindow : Window
             }
 
             PublishLazyConnectionProgress(folderPath, scanResult, "connections_completed", sourcePaths.Count, sourcePaths.Count, string.Empty, lastSourcePath);
-            ViewModel.LoadingProgress = 100;
+            ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
             StatusStripUpdate(
-                $"Connections complete. Model groups: {diagnostics.ModelGroups:N0}, group meshes: {diagnostics.ModelGroupMeshes:N0}, edges: {diagnostics.AssetEdges:N0}, mesh materials: {diagnostics.MeshMaterials:N0}, material textures: {diagnostics.MaterialTextures:N0}.");
+                $"Connections complete. Model groups: {diagnostics.ModelGroups:N0}, group meshes: {diagnostics.ModelGroupMeshes:N0}, edges: {diagnostics.AssetEdges:N0}, mesh materials: {diagnostics.MeshMaterials:N0}, material textures: {diagnostics.MaterialTextures:N0}.{FormatPartialCoverageSuffix()}");
             TriggerAutoRefreshActivePreviewIfNeeded();
         }
         catch (MemoryPressureException ex)
