@@ -1367,7 +1367,16 @@ namespace AssetStudio
                 return;
             }
 
-            var stream = m_Texture2D.ConvertToStream(imageFormat, true, unpackNormalMap: true, forceNormalMapUnpack: forceNormalMapUnpack);
+            System.IO.MemoryStream? stream;
+            try
+            {
+                stream = m_Texture2D.ConvertToStream(imageFormat, true, unpackNormalMap: true, forceNormalMapUnpack: forceNormalMapUnpack);
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or BadImageFormatException)
+            {
+                Logger.Warning($"Unable to decode texture {m_Texture2D.m_Name} for material {materialName}, property {propertyName}: native texture decoder unavailable ({ex.GetType().Name}).");
+                return;
+            }
             if (stream == null)
             {
                 Logger.Warning($"Unable to convert texture {m_Texture2D.m_Name} for material {materialName}, property {propertyName}.");
