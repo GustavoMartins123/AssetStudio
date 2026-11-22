@@ -22,6 +22,8 @@ namespace AssetStudio
 
         public SafeFileHandle? SafeFileHandle => sharedHandle?.SafeFileHandle;
 
+        public Stream? BaseStream => baseStream;
+
         public SubStream(string filePath, long offset, long length)
         {
             if (string.IsNullOrWhiteSpace(filePath))

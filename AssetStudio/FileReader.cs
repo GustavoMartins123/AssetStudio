@@ -10,6 +10,8 @@ namespace AssetStudio
         public string FullPath;
         public string FileName;
         public FileType FileType;
+        public string? AppliedDecryptionProvider { get; }
+        public StreamEncryptionBarrier? EncryptionBarrier { get; }
         private byte[]? cachedMemoryBuffer;
         private readonly object cachedMemoryBufferLock = new object();
 
@@ -21,20 +23,36 @@ namespace AssetStudio
 
         public FileReader(string path) : this(path, File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { }
 
-        public FileReader(string path, Stream stream) : base(DecryptionHelper.CheckAndDecryptStream(stream, path) ?? stream, EndianType.BigEndian)
+        public FileReader(string path, Stream stream)
+            : this(path, PrepareStream(stream, path), EndianType.BigEndian, isInitialOpen: true)
+        {
+        }
+
+        private FileReader(string path, (Stream Stream, string? ProviderId, StreamEncryptionBarrier? Barrier) prepared, EndianType endian, bool isInitialOpen)
+            : base(prepared.Stream, endian)
         {
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
+            AppliedDecryptionProvider = prepared.ProviderId;
+            EncryptionBarrier = prepared.Barrier;
             FileType = CheckFileType();
         }
 
-        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[]? cachedMemoryBuffer) : base(stream, endian)
+        private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[]? cachedMemoryBuffer, string? appliedDecryptionProvider = null, StreamEncryptionBarrier? encryptionBarrier = null) : base(stream, endian)
         {
             FullPath = Path.GetFullPath(path);
             FileName = Path.GetFileName(path);
             FileType = fileType;
+            AppliedDecryptionProvider = appliedDecryptionProvider;
+            EncryptionBarrier = encryptionBarrier;
             this.cachedMemoryBuffer = cachedMemoryBuffer;
             Position = 0;
+        }
+
+        private static (Stream Stream, string? ProviderId, StreamEncryptionBarrier? Barrier) PrepareStream(Stream stream, string path)
+        {
+            var resolved = DecryptionHelper.CheckAndDecryptStream(stream, path, out var providerId, out var barrier) ?? stream;
+            return (resolved, providerId, barrier);
         }
 
         private FileType CheckFileType()
@@ -44,7 +62,7 @@ namespace AssetStudio
             var header = ReadBytes(headerLength);
             Position = 0;
 
-            var signature = ReadNullTerminatedAscii(header, 20);
+            var signature = UnityHeaderProbe.ReadNullTerminatedAscii(header, 0, 20, out _);
             switch (signature)
             {
                 case "UnityWeb":
@@ -56,112 +74,23 @@ namespace AssetStudio
                     return FileType.WebFile;
                 default:
                     {
-                        if (StartsWith(header, gzipMagic))
+                        if (UnityHeaderProbe.MatchesAt(header, 0, gzipMagic))
                         {
                             return FileType.GZipFile;
                         }
-                        if (MatchesAt(header, 0x20, brotliMagic))
+                        if (UnityHeaderProbe.MatchesAt(header, 0x20, brotliMagic))
                         {
                             return FileType.BrotliFile;
                         }
-                        if (IsSerializedFile(header))
+                        if (UnityHeaderProbe.IsSerializedFileHeader(header, BaseStream.Length))
                         {
                             return FileType.AssetsFile;
                         }
-                        if (StartsWith(header, zipMagic) || StartsWith(header, zipSpannedMagic))
+                        if (UnityHeaderProbe.MatchesAt(header, 0, zipMagic) || UnityHeaderProbe.MatchesAt(header, 0, zipSpannedMagic))
                             return FileType.ZipFile;
                         return FileType.ResourceFile;
                     }
             }
-        }
-
-        private bool IsSerializedFile(byte[] header)
-        {
-            var fileSize = BaseStream.Length;
-            if (fileSize < 20 || header.Length < 20)
-            {
-                return false;
-            }
-            var m_MetadataSize = ReadUInt32BigEndian(header, 0);
-            long m_FileSize = ReadUInt32BigEndian(header, 4);
-            var m_Version = ReadUInt32BigEndian(header, 8);
-            long m_DataOffset = ReadUInt32BigEndian(header, 12);
-            if (m_Version >= 22)
-            {
-                if (fileSize < 48 || header.Length < 40)
-                {
-                    return false;
-                }
-                m_MetadataSize = ReadUInt32BigEndian(header, 20);
-                m_FileSize = ReadInt64BigEndian(header, 24);
-                m_DataOffset = ReadInt64BigEndian(header, 32);
-            }
-            if (m_FileSize != fileSize)
-            {
-                return false;
-            }
-            if (m_DataOffset > fileSize)
-            {
-                return false;
-            }
-            return true;
-        }
-
-        private static string ReadNullTerminatedAscii(byte[] buffer, int maxLength)
-        {
-            var length = System.Math.Min(buffer.Length, maxLength);
-            for (int i = 0; i < length; i++)
-            {
-                if (buffer[i] == 0)
-                {
-                    length = i;
-                    break;
-                }
-            }
-            return Encoding.ASCII.GetString(buffer, 0, length);
-        }
-
-        private static bool StartsWith(byte[] buffer, byte[] value)
-        {
-            return MatchesAt(buffer, 0, value);
-        }
-
-        private static bool MatchesAt(byte[] buffer, int offset, byte[] value)
-        {
-            if (offset < 0 || buffer.Length - offset < value.Length)
-            {
-                return false;
-            }
-
-            for (int i = 0; i < value.Length; i++)
-            {
-                if (buffer[offset + i] != value[i])
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private static uint ReadUInt32BigEndian(byte[] buffer, int offset)
-        {
-            return ((uint)buffer[offset] << 24)
-                | ((uint)buffer[offset + 1] << 16)
-                | ((uint)buffer[offset + 2] << 8)
-                | buffer[offset + 3];
-        }
-
-        private static long ReadInt64BigEndian(byte[] buffer, int offset)
-        {
-            var value = ((ulong)buffer[offset] << 56)
-                | ((ulong)buffer[offset + 1] << 48)
-                | ((ulong)buffer[offset + 2] << 40)
-                | ((ulong)buffer[offset + 3] << 32)
-                | ((ulong)buffer[offset + 4] << 24)
-                | ((ulong)buffer[offset + 5] << 16)
-                | ((ulong)buffer[offset + 6] << 8)
-                | buffer[offset + 7];
-            return unchecked((long)value);
         }
 
         public FileReader Clone()
@@ -171,7 +100,7 @@ namespace AssetStudio
                 if (memStream.TryGetBuffer(out var segment) && segment.Array != null)
                 {
                     var segmentStream = PooledReadOnlyMemoryStream.Rent(segment.Array, segment.Offset, segment.Count);
-                    return new FileReader(FullPath, segmentStream, Endian, FileType, cachedMemoryBuffer);
+                    return new FileReader(FullPath, segmentStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
                 }
 
                 if (cachedMemoryBuffer == null)
@@ -186,18 +115,28 @@ namespace AssetStudio
                 }
 
                 var newStream = PooledReadOnlyMemoryStream.Rent(cachedMemoryBuffer, 0, cachedMemoryBuffer.Length);
-                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer);
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
             }
             else if (BaseStream is DecryptedStream decStream)
             {
                 var clonedUnderlying = CloneStream(decStream.BaseStream);
                 var newDecStream = new DecryptedStream(clonedUnderlying, decStream.Token);
-                return new FileReader(FullPath, newDecStream, Endian, FileType, cachedMemoryBuffer);
+                return new FileReader(FullPath, newDecStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
+            }
+            else if (BaseStream is XorTransformStream xorStream)
+            {
+                var clonedUnderlying = CloneStream(xorStream.BaseStream);
+                var newXorStream = xorStream.Clone(clonedUnderlying);
+                return new FileReader(FullPath, newXorStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
             }
             else if (BaseStream is SubStream subStream)
             {
-                var newStream = new SubStream(subStream.FilePath, subStream.Offset, subStream.Length);
-                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer);
+                Stream newStream = !string.IsNullOrEmpty(subStream.FilePath)
+                    ? new SubStream(subStream.FilePath, subStream.Offset, subStream.Length)
+                    : subStream.BaseStream != null
+                        ? new SubStream(CloneStream(subStream.BaseStream), subStream.Offset, subStream.Length, leaveOpen: false)
+                        : throw new NotSupportedException("Cannot clone detached SubStream.");
+                return new FileReader(FullPath, newStream, Endian, FileType, cachedMemoryBuffer, AppliedDecryptionProvider, EncryptionBarrier);
             }
             else if (BaseStream is FileStream fileStream)
             {

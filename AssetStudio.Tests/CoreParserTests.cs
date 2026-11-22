@@ -430,6 +430,133 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void DecryptionPipeline_OffsetSkip_KnownPlaintextXor_DeclarativeProfile_AndBarrierDetection_WorkAndCloneCleanly()
+        {
+            DecryptionHelper.Clear();
+            try
+            {
+                byte[] validUnityFsBundle = BuildSyntheticUnityFsHeaderPayload(totalSize: 128);
+
+                // 1. OffsetHeaderSkipTransformProvider: 96-byte fake prefix before valid UnityFS header
+                byte[] prefixedBytes = new byte[96 + validUnityFsBundle.Length];
+                for (int i = 0; i < 96; i++)
+                {
+                    prefixedBytes[i] = (byte)(0xA0 + (i % 23));
+                }
+                Buffer.BlockCopy(validUnityFsBundle, 0, prefixedBytes, 96, validUnityFsBundle.Length);
+
+                using (var prefixedReader = new FileReader("prefixed_sample.bundle", new MemoryStream(prefixedBytes)))
+                {
+                    Assert.Equal("OffsetHeaderSkip", prefixedReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, prefixedReader.FileType);
+                    Assert.Equal(validUnityFsBundle.Length, prefixedReader.BaseStream.Length);
+
+                    using var clonedReader = prefixedReader.Clone();
+                    Assert.Equal(FileType.BundleFile, clonedReader.FileType);
+                    Assert.Equal("UnityFS", clonedReader.ReadStringToNull());
+                }
+
+                // 2. KnownPlaintextXorTransformProvider: repeating 4-byte XOR key over valid UnityFS header
+                byte[] xorKey4 = { 0x12, 0x34, 0x56, 0x78 };
+                byte[] xorBundle = (byte[])validUnityFsBundle.Clone();
+                UnityHeaderProbe.XorBytesRepeating(xorBundle, 0, xorKey4);
+
+                using (var xorReader = new FileReader("xor_sample.bundle", new MemoryStream(xorBundle)))
+                {
+                    Assert.Equal("KnownPlaintextXor", xorReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, xorReader.FileType);
+
+                    using var clonedXor = xorReader.Clone();
+                    Assert.Equal(FileType.BundleFile, clonedXor.FileType);
+                    byte[] roundtrip = clonedXor.ReadBytes(validUnityFsBundle.Length);
+                    Assert.Equal(validUnityFsBundle, roundtrip);
+                }
+
+                // 3. DeclarativeProfileTransformProvider: range-limited XOR on first 64 bytes
+                byte[] rangeXorKey = { 0x4E, 0x50, 0x91, 0x0F };
+                byte[] rangeEncrypted = (byte[])validUnityFsBundle.Clone();
+                UnityHeaderProbe.XorBytesRepeating(rangeEncrypted.AsSpan(0, 64), 0, rangeXorKey);
+
+                DecryptionHelper.RegisterProfile(new DecryptionProfile
+                {
+                    Id = "range-header-xor-64",
+                    FileNamePattern = "range_*.bundle",
+                    XorKeyHex = "4E50910F",
+                    RangeStart = 0,
+                    RangeLength = 64
+                });
+
+                using (var profileReader = new FileReader("range_test.bundle", new MemoryStream(rangeEncrypted)))
+                {
+                    Assert.Equal("DeclarativeProfile", profileReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, profileReader.FileType);
+                    byte[] roundtrip = profileReader.ReadBytes(validUnityFsBundle.Length);
+                    Assert.Equal(validUnityFsBundle, roundtrip);
+                }
+
+                // 4. Barrier detection: PartialHeaderEncryptedSerializedFile & VfsChunkContainer
+                byte[] partialHeaderAsset = new byte[0x1200];
+                for (int i = 0; i < 0x400; i++)
+                {
+                    partialHeaderAsset[i] = (byte)(((i * 73) + 0x4E) | 1); // non-zero high-density encrypted header
+                }
+                // 0x400..0x11FF remains zero-heavy structured table data
+                partialHeaderAsset[0x400] = 0x0F;
+                partialHeaderAsset[0x404] = 0x19;
+
+                using (var barrierReader = new FileReader("globalgamemanagers", new MemoryStream(partialHeaderAsset)))
+                {
+                    Assert.Null(barrierReader.AppliedDecryptionProvider);
+                    Assert.True(barrierReader.EncryptionBarrier.HasValue);
+                    Assert.Equal("PartialHeaderEncryptedSerializedFile", barrierReader.EncryptionBarrier!.Value.ProviderId);
+                }
+
+                byte[] vfsChunk = CreateDeterministicPayload(256);
+                using (var vfsReader = new FileReader("00ADE886AE9CC1BC.chk", new MemoryStream(vfsChunk)))
+                {
+                    Assert.True(vfsReader.EncryptionBarrier.HasValue);
+                    Assert.Equal("VfsChunkContainer", vfsReader.EncryptionBarrier!.Value.ProviderId);
+                }
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+            }
+        }
+
+        private static byte[] BuildSyntheticUnityFsHeaderPayload(int totalSize)
+        {
+            using var ms = new MemoryStream();
+            using (var bw = new BinaryWriter(ms, Encoding.ASCII, leaveOpen: true))
+            {
+                bw.Write(Encoding.ASCII.GetBytes("UnityFS\0"));
+                Span<byte> be32 = stackalloc byte[4];
+                BinaryPrimitives.WriteUInt32BigEndian(be32, 7u);
+                bw.Write(be32);
+                bw.Write(Encoding.ASCII.GetBytes("5.x.x\0"));
+                bw.Write(Encoding.ASCII.GetBytes("2021.3.34f1\0"));
+                Span<byte> be64 = stackalloc byte[8];
+                BinaryPrimitives.WriteInt64BigEndian(be64, totalSize);
+                bw.Write(be64);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, 32u); // compressedBlocksInfoSize
+                bw.Write(be32);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, 32u); // uncompressedBlocksInfoSize
+                bw.Write(be32);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, 0x40u); // flags
+                bw.Write(be32);
+            }
+
+            byte[] result = new byte[totalSize];
+            byte[] headerBytes = ms.ToArray();
+            Buffer.BlockCopy(headerBytes, 0, result, 0, headerBytes.Length);
+            for (int i = headerBytes.Length; i < totalSize; i++)
+            {
+                result[i] = (byte)(i & 0xFF);
+            }
+            return result;
+        }
+
         private static SerializedFile CreateMinimalSerializedFile(string initialUnityVersion)
         {
             // Build metadata (LittleEndian, format version 17 = RefactorTypeData)

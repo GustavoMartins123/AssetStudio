@@ -355,5 +355,6 @@ public sealed class ProjectRuntimeDetectionResult
     public bool HasAddressables { get; set; }
     public List<string> AddressablesCatalogPaths { get; set; } = new();
     public List<string> Il2CppDumperArtifactPaths { get; set; } = new();
+    public List<StreamEncryptionBarrier> EncryptionBarriers { get; set; } = new();
     public List<string> Warnings { get; set; } = new();
 }

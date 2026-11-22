@@ -295,6 +295,19 @@ public sealed class ProjectAnalysisService
                 });
             }
 
+            foreach (var barrier in detection.EncryptionBarriers)
+            {
+                decryptionHints.Hints.Add(new DecryptionHintEntry
+                {
+                    Provider = barrier.ProviderId,
+                    CatalogPath = barrier.FilePath,
+                    Bundle = Path.GetFileName(barrier.FilePath),
+                    Reason = barrier.Reason,
+                    Confidence = barrier.Confidence,
+                    MetadataSummary = $"Header prefix: {barrier.HeaderPrefixHex}"
+                });
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
 
             var finalReport = BuildReportFromDetection(detection, ProjectAnalysisStatus.Ready);

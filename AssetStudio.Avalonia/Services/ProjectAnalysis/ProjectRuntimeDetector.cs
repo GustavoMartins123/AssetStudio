@@ -221,6 +221,9 @@ public sealed class ProjectRuntimeDetector
             signatureFiles.Add(artifact);
         }
 
+        // 8. Probe core data files and VFS containers for stream encryption barriers
+        result.EncryptionBarriers.AddRange(DetectStreamEncryptionBarriers(fullRoot, dataDirectories, cancellationToken));
+
         // 8. Compute deterministic SHA-256 signature over detected artifacts
         result.Signature = ComputeSignature(fullRoot, signatureFiles);
         return result;
@@ -712,6 +715,80 @@ public sealed class ProjectRuntimeDetector
 
         artifacts.Sort(StringComparer.OrdinalIgnoreCase);
         return artifacts;
+    }
+
+    private static List<StreamEncryptionBarrier> DetectStreamEncryptionBarriers(
+        string fullRoot,
+        IReadOnlyList<string> dataDirectories,
+        CancellationToken cancellationToken)
+    {
+        var barriers = new List<StreamEncryptionBarrier>();
+        var seenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string[] coreFiles =
+        {
+            "globalgamemanagers",
+            "globalgamemanagers.assets",
+            "level0",
+            "resources.assets",
+            "sharedassets0.assets"
+        };
+
+        var searchDirs = dataDirectories.Count > 0 ? dataDirectories : new[] { fullRoot };
+        foreach (var dir in searchDirs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!Directory.Exists(dir))
+            {
+                continue;
+            }
+
+            foreach (var name in coreFiles)
+            {
+                var candidate = Path.Combine(dir, name);
+                if (File.Exists(candidate)
+                    && seenFiles.Add(candidate)
+                    && DecryptionHelper.InspectFileBarrier(candidate, out var barrier))
+                {
+                    barriers.Add(barrier);
+                }
+            }
+
+            string[] vfsRoots =
+            {
+                Path.Combine(dir, "StreamingAssets", "VFS"),
+                Path.Combine(dir, "Persistent", "VFS")
+            };
+            foreach (var vfsRoot in vfsRoots)
+            {
+                if (!Directory.Exists(vfsRoot))
+                {
+                    continue;
+                }
+
+                int vfsSamples = 0;
+                foreach (var file in Directory.EnumerateFiles(vfsRoot, "*.*", SearchOption.AllDirectories))
+                {
+                    var ext = Path.GetExtension(file);
+                    if (!string.Equals(ext, ".blc", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(ext, ".chk", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (seenFiles.Add(file) && DecryptionHelper.InspectFileBarrier(file, out var vfsBarrier))
+                    {
+                        barriers.Add(vfsBarrier);
+                        vfsSamples++;
+                        if (vfsSamples >= 4)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        return barriers;
     }
 
     private static bool StartsWithAscii(ReadOnlySpan<byte> data, string ascii)

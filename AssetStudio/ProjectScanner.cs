@@ -291,7 +291,7 @@ namespace AssetStudio
             if (fileSize < 4)
                 return result;
 
-            var headerSize = (int)Math.Min(128, fileSize);
+            var headerSize = (int)Math.Min(UnityHeaderProbe.DefaultProbeBufferSize, fileSize);
             var header = ArrayPool<byte>.Shared.Rent(headerSize);
             try
             {
@@ -301,33 +301,34 @@ namespace AssetStudio
                     read = stream.Read(header, 0, headerSize);
                 }
 
-                string? detectedSignature = null;
-                if (StartsWithAscii(header, read, "UnityFS"))
-                    detectedSignature = "UnityFS";
-                else if (StartsWithAscii(header, read, "UnityWeb"))
-                    detectedSignature = "UnityWeb";
-                else if (StartsWithAscii(header, read, "UnityRaw"))
-                    detectedSignature = "UnityRaw";
-                else if (StartsWithAscii(header, read, "UnityArchive"))
-                    detectedSignature = "UnityArchive";
-
-                if (detectedSignature != null)
+                var span = header.AsSpan(0, read);
+                if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, fileSize, out var sig, out var ver, out var unityVer, out _)
+                    || UnityHeaderProbe.TryFindOffsetUnityBundleHeader(span, fileSize, out _, out sig, out ver, out unityVer))
                 {
                     result.Kind = ProjectFileKind.UnityBundle;
-                    result.BundleSignature = detectedSignature;
-
-                    int pos = detectedSignature.Length + 1; // signature + null terminator
-                    if (pos + 4 <= read)
-                    {
-                        result.BundleVersion = (uint)ReadUInt32BigEndian(header, pos);
-                        pos += 4;
-                        result.BundleUnityVersion = ReadNullTerminatedAscii(header, read, pos);
-                    }
-
+                    result.BundleSignature = sig;
+                    result.BundleVersion = ver;
+                    result.BundleUnityVersion = unityVer;
                     return result;
                 }
 
-                if (IsSerializedFileHeader(header, read, fileSize))
+                if (UnityHeaderProbe.TryDetectRepeatingXorUnityFsKey(span, fileSize, out _, out var xorVer, out var xorUnityVer))
+                {
+                    result.Kind = ProjectFileKind.UnityBundle;
+                    result.BundleSignature = "UnityFS";
+                    result.BundleVersion = xorVer;
+                    result.BundleUnityVersion = xorUnityVer;
+                    return result;
+                }
+
+                if (read >= 26 && UnityHeaderProbe.MatchesAt(span, 0, DecryptionHelper.EncryptionMagicBytes))
+                {
+                    result.Kind = ProjectFileKind.UnityBundle;
+                    result.BundleSignature = "Encryption";
+                    return result;
+                }
+
+                if (UnityHeaderProbe.IsSerializedFileHeader(span, fileSize))
                 {
                     result.Kind = ProjectFileKind.SerializedFile;
                     return result;
@@ -382,85 +383,6 @@ namespace AssetStudio
             }
 
             return null;
-        }
-
-        #endregion
-
-        #region Binary helpers
-
-        private static bool StartsWithAscii(byte[] bytes, int length, string value)
-        {
-            if (length < value.Length)
-                return false;
-
-            for (int i = 0; i < value.Length; i++)
-            {
-                if (bytes[i] != (byte)value[i])
-                    return false;
-            }
-
-            return true;
-        }
-
-        private static string? ReadNullTerminatedAscii(byte[] bytes, int length, int offset)
-        {
-            if (offset >= length)
-                return null;
-
-            int end = offset;
-            while (end < length && bytes[end] != 0)
-                end++;
-
-            if (end == offset || end >= length)
-                return null;
-
-            return System.Text.Encoding.ASCII.GetString(bytes, offset, end - offset);
-        }
-
-        private static bool IsSerializedFileHeader(byte[] header, int length, long actualFileSize)
-        {
-            if (length < 20)
-                return false;
-
-            var metadataSize = ReadUInt32BigEndian(header, 0);
-            var fileSize = ReadUInt32BigEndian(header, 4);
-            var version = ReadUInt32BigEndian(header, 8);
-            var dataOffset = ReadUInt32BigEndian(header, 12);
-
-            if (version >= 22)
-            {
-                if (length < 48)
-                    return false;
-
-                metadataSize = ReadUInt32BigEndian(header, 20);
-                fileSize = ReadInt64BigEndian(header, 24);
-                dataOffset = ReadInt64BigEndian(header, 32);
-            }
-
-            return metadataSize > 0
-                && fileSize == actualFileSize
-                && dataOffset > 0
-                && dataOffset <= actualFileSize;
-        }
-
-        private static long ReadUInt32BigEndian(byte[] bytes, int offset)
-        {
-            return ((long)bytes[offset] << 24)
-                | ((long)bytes[offset + 1] << 16)
-                | ((long)bytes[offset + 2] << 8)
-                | bytes[offset + 3];
-        }
-
-        private static long ReadInt64BigEndian(byte[] bytes, int offset)
-        {
-            return ((long)bytes[offset] << 56)
-                | ((long)bytes[offset + 1] << 48)
-                | ((long)bytes[offset + 2] << 40)
-                | ((long)bytes[offset + 3] << 32)
-                | ((long)bytes[offset + 4] << 24)
-                | ((long)bytes[offset + 5] << 16)
-                | ((long)bytes[offset + 6] << 8)
-                | bytes[offset + 7];
         }
 
         #endregion
