@@ -375,6 +375,25 @@ namespace AssetStudio
                 return;
             }
 
+            if (reader is EndianBinaryReader && reader.BaseStream.CanSeek)
+            {
+                if (length > Array.MaxLength || byteCount > Array.MaxLength)
+                {
+                    throw new OverflowException($"Invalid array length: {length}");
+                }
+
+                long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
+                if (byteCount > remainingStream)
+                {
+                    if (length > MaxArrayLength || byteCount > MaxByteArrayLength)
+                    {
+                        throw new OverflowException($"Invalid array length: {length}");
+                    }
+                    throw new EndOfStreamException($"Array length {length} ({byteCount} bytes) exceeds remaining stream length {remainingStream}");
+                }
+                return;
+            }
+
             if (byteCount > MaxByteArrayLength)
             {
                 throw new OverflowException($"Invalid array length: {length}");

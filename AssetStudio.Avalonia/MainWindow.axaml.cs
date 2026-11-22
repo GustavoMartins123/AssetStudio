@@ -489,6 +489,7 @@ public partial class MainWindow : Window
         ViewModel.Options.DisplayInfoChanged += OnDisplayInfoOptionChanged;
         ViewModel.Options.UseDiskDecompressionCacheChanged += OnUseDiskDecompressionCacheOptionChanged;
         ViewModel.Options.AutoLoadCatalogDependenciesChanged += OnAutoLoadCatalogDependenciesOptionChanged;
+        ViewModel.Options.AutoLoadExternalDependenciesChanged += OnAutoLoadExternalDependenciesOptionChanged;
         ViewModel.Options.ShowErrorMessageChanged += OnShowErrorMessageOptionChanged;
         ViewModel.Options.ThemeChanged += OnThemeOptionChanged;
     }
@@ -500,6 +501,7 @@ public partial class MainWindow : Window
         ViewModel.Options.DisplayInfoChanged -= OnDisplayInfoOptionChanged;
         ViewModel.Options.UseDiskDecompressionCacheChanged -= OnUseDiskDecompressionCacheOptionChanged;
         ViewModel.Options.AutoLoadCatalogDependenciesChanged -= OnAutoLoadCatalogDependenciesOptionChanged;
+        ViewModel.Options.AutoLoadExternalDependenciesChanged -= OnAutoLoadExternalDependenciesOptionChanged;
         ViewModel.Options.ShowErrorMessageChanged -= OnShowErrorMessageOptionChanged;
         ViewModel.Options.ThemeChanged -= OnThemeOptionChanged;
     }
@@ -540,6 +542,7 @@ public partial class MainWindow : Window
         assetsManager.LazyLoading = false;
         assetsManager.DecompressionCache = null;
         ApplyUnityVersionOption();
+        assetsManager.ConfirmExternalCascadeCallback = allowPrompt ? PromptConfirmExternalCascade : null;
         try
         {
             await Task.Run(() => assetsManager.LoadFiles(filePaths));
@@ -557,9 +560,53 @@ public partial class MainWindow : Window
             StatusStripUpdate("Load failed.");
             return;
         }
+        finally
+        {
+            assetsManager.ConfirmExternalCascadeCallback = null;
+        }
 
         if (IsWindowClosingOrClosed || _isReturningToProjectManager) return;
         await BuildAssetStructuresAsync();
+    }
+
+    private bool PromptConfirmExternalCascade(int enqueuedSoFar, int currentFileExternalsCount)
+    {
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return false;
+        }
+
+        var message =
+            $"The opened .assets file is pulling a large chain of external .assets dependencies " +
+            $"({enqueuedSoFar:N0} external files already queued; current file references {currentFileExternalsCount:N0} externals).\n\n" +
+            $"Loading the full cascade can take significant time and memory (similar to Load folder).\n\n" +
+            $"Do you want to continue loading all remaining external .assets dependencies?\n" +
+            $"(Click No to keep only the files queued so far. You can also toggle Options -> Auto-load .assets external dependencies.)";
+
+        try
+        {
+            if (global::Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                return false;
+            }
+
+            return global::Avalonia.Threading.Dispatcher.UIThread
+                .InvokeAsync(async () =>
+                {
+                    if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+                    {
+                        return false;
+                    }
+
+                    return await ViewModel.DialogService.ConfirmAsync("External .assets cascade detected", message);
+                })
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task LoadFolderCommandHandlerAsync()
@@ -1832,6 +1879,10 @@ public partial class MainWindow : Window
             var deferredCount = m_ObjectsCount - objectsCount;
             log += $" and {deferredCount:N0} assets failed to read";
         }
+        if (assetsManager.LastSkippedExternalDependencyCount > 0)
+        {
+            log += $" | Skipped {assetsManager.LastSkippedExternalDependencyCount:N0} external .assets dependencies";
+        }
         log += FormatPartialCoverageSuffix();
         ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
         StatusStripUpdate(log);
@@ -2294,6 +2345,7 @@ public partial class MainWindow : Window
         }
 
         assetsManager.ShouldKeepFileCallback = null;
+        assetsManager.ConfirmExternalCascadeCallback = null;
         assetsManager.DecompressionCache = null;
         BundleFile.CacheDirectory = string.Empty;
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);

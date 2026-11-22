@@ -83,6 +83,11 @@ namespace AssetStudio
         public bool LazyLoading = false;
         public bool AutoLoadCatalogDependencies { get; set; } = true;
         public int MaxAutoLoadCatalogDependencies { get; set; } = AddressablesCatalogDependencyResolver.DefaultMaxDependencyBundles;
+        public bool AutoLoadExternalDependencies { get; set; } = true;
+        public int MaxAutoLoadExternalDependencies { get; set; } = 0;
+        public int ExternalCascadePromptThreshold { get; set; } = 16;
+        public Func<int, int, bool>? ConfirmExternalCascadeCallback { get; set; }
+        public int LastSkippedExternalDependencyCount { get; private set; }
         public DecompressedBundleCache? DecompressionCache { get; set; }
 
         private readonly object unityVersionInferenceLock = new object();
@@ -112,13 +117,19 @@ namespace AssetStudio
             public readonly ConcurrentDictionary<string, byte> NoExistFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
             public readonly ConcurrentBag<Stream> BundleStreams = new ConcurrentBag<Stream>();
             public readonly ConcurrentBag<BinaryReader> IsolatedResourceReaders = new ConcurrentBag<BinaryReader>();
+            public readonly ConcurrentDictionary<string, byte> SkippedExternalFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
             public readonly bool IsolateStreams;
+            public readonly bool AllowExternalCascadeGuard;
+            public readonly object CascadePromptLock = new object();
             public int TotalCount;
+            public int EnqueuedExternalCount;
+            public int CascadeDecision; // 0 = undecided, 1 = allow, -1 = stop
 
-            public LoadContext(int totalCount, bool isolateStreams = false)
+            public LoadContext(int totalCount, bool isolateStreams = false, bool allowExternalCascadeGuard = false)
             {
                 TotalCount = totalCount;
                 IsolateStreams = isolateStreams;
+                AllowExternalCascadeGuard = allowExternalCascadeGuard;
             }
         }
 
@@ -330,7 +341,11 @@ namespace AssetStudio
                 MergeSplitAssets(dir);
             }
             var toReadFile = ProcessingSplitFiles(nonEmptyFiles);
-            await LoadAsync(toReadFile, highPriority, allowAutoDependencies: AutoLoadCatalogDependencies && !LazyLoading);
+            await LoadAsync(
+                toReadFile,
+                highPriority,
+                allowAutoDependencies: AutoLoadCatalogDependencies && !LazyLoading,
+                allowExternalCascadeGuard: !LazyLoading);
         }
 
         public void LoadFolder(string path)
@@ -349,7 +364,7 @@ namespace AssetStudio
             MergeSplitAssets(path, true);
             var files = ImportHelper.GetFilesSafe(path, "*.*", true);
             var toReadFile = ProcessingSplitFiles(files);
-            await LoadAsync(toReadFile, highPriority: false, allowAutoDependencies: false);
+            await LoadAsync(toReadFile, highPriority: false, allowAutoDependencies: false, allowExternalCascadeGuard: false);
         }
 
         private async System.Threading.Tasks.Task YieldForUserInteractionIfNeededAsync(bool highPriority = false)
@@ -371,9 +386,14 @@ namespace AssetStudio
             }
         }
 
-        private async System.Threading.Tasks.Task LoadAsync(string[] files, bool highPriority, bool allowAutoDependencies = false)
+        private async System.Threading.Tasks.Task LoadAsync(
+            string[] files,
+            bool highPriority,
+            bool allowAutoDependencies = false,
+            bool allowExternalCascadeGuard = false)
         {
-            var context = new LoadContext(files.Length);
+            LastSkippedExternalDependencyCount = 0;
+            var context = new LoadContext(files.Length, isolateStreams: false, allowExternalCascadeGuard: allowExternalCascadeGuard);
 
             foreach (var file in files)
             {
@@ -394,6 +414,12 @@ namespace AssetStudio
             if (allowAutoDependencies && AutoLoadCatalogDependencies && !LazyLoading && !ShouldStopLoading)
             {
                 await ResolveAndLoadAutoDependenciesAsync(files, context, highPriority, configuredThreadCount, () => System.Threading.Interlocked.Increment(ref completedCount));
+            }
+
+            LastSkippedExternalDependencyCount = context.SkippedExternalFiles.Count;
+            if (LastSkippedExternalDependencyCount > 0)
+            {
+                Logger.Info($"Skipped {LastSkippedExternalDependencyCount} external .assets dependency file(s) due to cascade settings.");
             }
 
             await ReadAssetsAsync(highPriority, context);
@@ -532,6 +558,10 @@ namespace AssetStudio
             {
                 int remainingBudget = maxDeps - totalAutoLoaded;
                 var loadedFileNames = new HashSet<string>(assetsFileListHash.Keys, StringComparer.OrdinalIgnoreCase);
+                foreach (var skippedExternal in context.SkippedExternalFiles.Keys)
+                {
+                    loadedFileNames.Add(skippedExternal);
+                }
                 var resolvedDeps = AddressablesCatalogDependencyResolver.ResolveDependenciesForLoadedFiles(
                     currentSeedFiles,
                     context.LoadedAssetsFiles.ToArray(),
@@ -564,6 +594,7 @@ namespace AssetStudio
 
                     var depFileName = Path.GetFileName(fullDepPath);
                     if (string.IsNullOrEmpty(depFileName)
+                        || context.SkippedExternalFiles.ContainsKey(depFileName)
                         || existingImports.Contains(fullDepPath)
                         || !context.ImportFilesHash.TryAdd(depFileName, 0))
                     {
@@ -670,6 +701,15 @@ namespace AssetStudio
                             {
                                 continue;
                             }
+
+                            if (!AutoLoadExternalDependencies)
+                            {
+                                if (File.Exists(sharedFilePath))
+                                {
+                                    context.SkippedExternalFiles.TryAdd(sharedFileName, 0);
+                                }
+                                continue;
+                            }
                             
                             bool containsNoExist = context.NoExistFiles.ContainsKey(sharedFilePath);
 
@@ -685,10 +725,12 @@ namespace AssetStudio
                                 }
                                 if (File.Exists(sharedFilePath) && IsPathWithinDirectory(sharedFilePath, readerDir))
                                 {
-                                    context.ImportFiles.Add(sharedFilePath);
-                                    context.ImportFilesHash.TryAdd(sharedFileName, 0);
-                                    context.Queue.Enqueue(sharedFilePath);
-                                    System.Threading.Interlocked.Increment(ref context.TotalCount);
+                                    if (TryReserveExternalDependencySlot(context, sharedFileName, assetsFile.m_Externals.Count))
+                                    {
+                                        context.ImportFiles.Add(sharedFilePath);
+                                        context.Queue.Enqueue(sharedFilePath);
+                                        System.Threading.Interlocked.Increment(ref context.TotalCount);
+                                    }
                                 }
                                 else
                                 {
@@ -711,6 +753,65 @@ namespace AssetStudio
             {
                 Logger.Info($"Skipping {reader.FullPath}");
                 reader.Dispose();
+            }
+        }
+
+        private bool TryReserveExternalDependencySlot(LoadContext context, string sharedFileName, int currentFileExternalsCount)
+        {
+            if (!AutoLoadExternalDependencies)
+            {
+                context.SkippedExternalFiles.TryAdd(sharedFileName, 0);
+                return false;
+            }
+
+            lock (context.CascadePromptLock)
+            {
+                if (context.ImportFilesHash.ContainsKey(sharedFileName))
+                {
+                    return false;
+                }
+
+                if (MaxAutoLoadExternalDependencies > 0 && context.EnqueuedExternalCount >= MaxAutoLoadExternalDependencies)
+                {
+                    context.SkippedExternalFiles.TryAdd(sharedFileName, 0);
+                    return false;
+                }
+
+                var callback = ConfirmExternalCascadeCallback;
+                if (context.AllowExternalCascadeGuard
+                    && callback != null
+                    && ExternalCascadePromptThreshold > 0
+                    && context.EnqueuedExternalCount >= ExternalCascadePromptThreshold)
+                {
+                    if (context.CascadeDecision == 0)
+                    {
+                        bool allow;
+                        try
+                        {
+                            allow = callback(context.EnqueuedExternalCount, currentFileExternalsCount);
+                        }
+                        catch
+                        {
+                            allow = false;
+                        }
+
+                        context.CascadeDecision = allow ? 1 : -1;
+                    }
+
+                    if (context.CascadeDecision < 0)
+                    {
+                        context.SkippedExternalFiles.TryAdd(sharedFileName, 0);
+                        return false;
+                    }
+                }
+
+                if (!context.ImportFilesHash.TryAdd(sharedFileName, 0))
+                {
+                    return false;
+                }
+
+                context.EnqueuedExternalCount++;
+                return true;
             }
         }
 
@@ -1172,6 +1273,39 @@ namespace AssetStudio
                         }
                     }
 
+                    var plainDataChild = Path.Combine(directory, "Data");
+                    if (Directory.Exists(plainDataChild) && TryAddUnityDataDirectoryCandidate(plainDataChild, seen, out candidate))
+                    {
+                        yield return candidate;
+                    }
+
+                    // Bounded depth-2 fallback for nested build subfolders (<Root>/<Sub>/<Game>_Data or Data)
+                    if (depth == 0)
+                    {
+                        int scannedSubdirs = 0;
+                        foreach (var subDir in EnumerateDirectoriesSafe(directory, "*"))
+                        {
+                            if (++scannedSubdirs > 64)
+                            {
+                                break;
+                            }
+
+                            foreach (var nestedData in EnumerateDirectoriesSafe(subDir, "*_Data"))
+                            {
+                                if (TryAddUnityDataDirectoryCandidate(nestedData, seen, out candidate))
+                                {
+                                    yield return candidate;
+                                }
+                            }
+
+                            var nestedPlainData = Path.Combine(subDir, "Data");
+                            if (Directory.Exists(nestedPlainData) && TryAddUnityDataDirectoryCandidate(nestedPlainData, seen, out candidate))
+                            {
+                                yield return candidate;
+                            }
+                        }
+                    }
+
                     try
                     {
                         directory = Directory.GetParent(directory)?.FullName ?? string.Empty;
@@ -1398,6 +1532,22 @@ namespace AssetStudio
                 if (!string.IsNullOrEmpty(fallback))
                 {
                     return fallback;
+                }
+            }
+
+            // Bounded depth-2 fallback for nested game builds (<Root>/<Sub>/UnityPlayer.dll)
+            int scanned = 0;
+            foreach (var subDir in EnumerateDirectoriesSafe(directory, "*"))
+            {
+                if (++scanned > 64)
+                {
+                    break;
+                }
+
+                var nestedDllVersion = TryReadUnityVersionFromFileVersionInfo(Path.Combine(subDir, "UnityPlayer.dll"));
+                if (!string.IsNullOrEmpty(nestedDllVersion))
+                {
+                    return nestedDllVersion;
                 }
             }
 
@@ -1894,8 +2044,13 @@ namespace AssetStudio
             {
                 using (var reader = new FileReader(path))
                 {
+                    if (reader.FileType != FileType.AssetsFile)
+                    {
+                        return "";
+                    }
+
                     var assetsFile = new SerializedFile(reader, this);
-                    if (!assetsFile.IsVersionStripped && !string.IsNullOrWhiteSpace(assetsFile.unityVersion))
+                    if (!assetsFile.IsVersionStripped && IsConcreteUnityVersion(assetsFile.unityVersion))
                     {
                         return assetsFile.unityVersion.Trim();
                     }
@@ -1919,15 +2074,22 @@ namespace AssetStudio
             try
             {
                 using (var reader = new FileReader(path))
-                using (var bundleFile = new BundleFile(reader, DecompressionCache))
                 {
-                    if (!string.IsNullOrWhiteSpace(bundleFile.m_Header.unityRevision))
+                    if (reader.FileType != FileType.BundleFile)
                     {
-                        return bundleFile.m_Header.unityRevision.Trim();
+                        return "";
                     }
-                    if (!string.IsNullOrWhiteSpace(bundleFile.m_Header.unityVersion))
+
+                    using (var bundleFile = new BundleFile(reader, DecompressionCache))
                     {
-                        return bundleFile.m_Header.unityVersion.Trim();
+                        if (IsConcreteUnityVersion(bundleFile.m_Header.unityRevision))
+                        {
+                            return bundleFile.m_Header.unityRevision.Trim();
+                        }
+                        if (IsConcreteUnityVersion(bundleFile.m_Header.unityVersion))
+                        {
+                            return bundleFile.m_Header.unityVersion.Trim();
+                        }
                     }
                 }
             }
@@ -1937,6 +2099,23 @@ namespace AssetStudio
             }
 
             return "";
+        }
+
+        private static bool IsConcreteUnityVersion(string? version)
+        {
+            if (string.IsNullOrWhiteSpace(version))
+            {
+                return false;
+            }
+
+            var trimmed = version.Trim();
+            if (trimmed.StartsWith("0.0.0", StringComparison.Ordinal)
+                || trimmed.Contains('x', StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return !string.IsNullOrEmpty(TryNormalizeUnityVersionToken(trimmed));
         }
 
         public void CheckStrippedVersion(SerializedFile assetsFile)
@@ -1990,6 +2169,7 @@ namespace AssetStudio
 
             assetsFileIndexCache.Clear();
             inferredUnityVersion = "";
+            LastSkippedExternalDependencyCount = 0;
             DecryptionHelper.ClearSessionCaches();
             AssetHandle.ClearSourceHashCache();
         }

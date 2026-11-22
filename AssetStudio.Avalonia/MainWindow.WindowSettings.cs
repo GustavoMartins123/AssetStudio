@@ -123,6 +123,7 @@ public partial class MainWindow
     {
         assetsManager.SpecifyUnityVersion = ViewModel.Options.SpecifyUnityVersion?.Trim() ?? string.Empty;
         assetsManager.AutoLoadCatalogDependencies = ViewModel.Options.AutoLoadCatalogDependencies;
+        assetsManager.AutoLoadExternalDependencies = ViewModel.Options.AutoLoadExternalDependencies;
         if (appSettings.SpecifyUnityVersion != assetsManager.SpecifyUnityVersion)
         {
             appSettings.SpecifyUnityVersion = assetsManager.SpecifyUnityVersion;
@@ -318,6 +319,16 @@ public partial class MainWindow
         StatusStripUpdate(enabled
             ? "Auto-load Addressables catalog dependencies enabled."
             : "Auto-load Addressables catalog dependencies disabled.");
+    }
+
+    private void OnAutoLoadExternalDependenciesOptionChanged(bool enabled)
+    {
+        appSettings.AutoLoadExternalDependencies = enabled;
+        assetsManager.AutoLoadExternalDependencies = enabled;
+        SaveAppSettings();
+        StatusStripUpdate(enabled
+            ? "Auto-load .assets external dependencies (cascade) enabled."
+            : "Auto-load .assets external dependencies (cascade) disabled.");
     }
 
     private void OnShowErrorMessageOptionChanged(bool showErrorMessage)
