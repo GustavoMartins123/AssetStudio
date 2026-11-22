@@ -1162,8 +1162,10 @@ public partial class MainWindow
         string actualExportFile = exportFile;
         string? errorMessage = null;
 
+        var preferFullModelGroup = target.ExportFullModelGroup || MeshPreview.ShowFullModelGroup;
         await Task.Run(() =>
         {
+            using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
             try
             {
                 if (target.SelectedAsset != null && target.SelectedAsset.Asset == null)
@@ -1176,16 +1178,16 @@ public partial class MainWindow
                     ? new[] { target.AnimationClip }
                     : (!exportOptions.ExportAnimations ? Array.Empty<AnimationClip>() : null);
 
-                if (target.ExportFullModelGroup)
+                if (preferFullModelGroup)
                 {
                     success = ExportPreviewModelGroupCore(target, clipArg, exportFile, ReportStage);
                 }
 
-                if (!success && target.PrimaryMesh != null && !target.ExportFullModelGroup)
+                if (!success && target.PrimaryMesh != null && !preferFullModelGroup)
                 {
                     success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile, ReportStage);
                 }
-                else if (!success && target.ExportFullModelGroup && target.PrimaryMesh != null)
+                else if (!success && preferFullModelGroup && target.PrimaryMesh != null)
                 {
                     // Graceful fallback to primary mesh if group metadata could not be materialized.
                     success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile, ReportStage);
@@ -1256,25 +1258,81 @@ public partial class MainWindow
         Mesh mesh,
         Renderer? renderer,
         HashSet<Material> visitedMaterials,
-        HashSet<string> visitedTextures)
+        HashSet<string> visitedTextures,
+        string? rendererAssetId = null)
     {
         var materials = new List<Material?>();
 
-        // Fast path: reuse materials already referenced directly by the part's Renderer
-        // instead of triggering a full FindMaterialsForMesh / BuildAssetReferenceIndexes scan.
+        // Fast path: reuse materials referenced directly by the part's Renderer,
+        // materializing lazy cross-bundle Material PPtrs when needed.
         if (renderer?.m_Materials != null && renderer.m_Materials.Length > 0)
         {
             for (var i = 0; i < renderer.m_Materials.Length; i++)
             {
                 var matPtr = renderer.m_Materials[i];
-                if (matPtr != null && !matPtr.IsNull && matPtr.TryGet(out var mat) && mat != null)
+                if (matPtr == null || matPtr.IsNull)
                 {
-                    materials.Add(mat);
+                    materials.Add(null);
+                    continue;
+                }
+
+                Material? mat = null;
+                if (!matPtr.TryGet(out mat) && assetsManager.LazyLoading)
+                {
+                    var matHandle = FindMaterialHandleForPPtr(renderer, matPtr);
+                    if (matHandle != null)
+                    {
+                        mat = ResolveSemanticRelationHandleForPreview(matHandle) as Material;
+                    }
+                }
+                materials.Add(mat);
+            }
+        }
+
+        // Fill any missing slots from the exact same SQLite v15 per-renderer resolution used by 3D Preview.
+        if (assetsManager.LazyLoading && !materials.Any(static m => m != null))
+        {
+            var effectiveRendererId = !string.IsNullOrWhiteSpace(rendererAssetId)
+                ? rendererAssetId
+                : (renderer != null ? GetPreviewObjectKey(renderer) : null);
+            var resolvedSlots = TryLoadResolvedMeshMaterialsForPreview(mesh, effectiveRendererId);
+            if (resolvedSlots.Count > 0)
+            {
+                var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, resolvedSlots.Max(static s => s.SubMeshIndex) + 1);
+                var bySubMesh = new Dictionary<int, ResolvedMeshSubMeshMaterial>(resolvedSlots.Count);
+                for (var s = 0; s < resolvedSlots.Count; s++)
+                {
+                    var slot = resolvedSlots[s];
+                    if (slot.SubMeshIndex >= 0 && !bySubMesh.ContainsKey(slot.SubMeshIndex))
+                    {
+                        bySubMesh[slot.SubMeshIndex] = slot;
+                    }
+                }
+
+                materials.Clear();
+                for (var s = 0; s < slotCount; s++)
+                {
+                    if (bySubMesh.TryGetValue(s, out var slot))
+                    {
+                        var resolvedMat = !string.IsNullOrWhiteSpace(slot.MaterialAssetId)
+                            ? ResolvePreviewCandidateAsset(slot.MaterialAssetId) as Material
+                            : null;
+                        if (!string.IsNullOrWhiteSpace(slot.MainTextureAssetId)
+                            && visitedTextures.Add($"resolvedTex|{slot.MainTextureAssetId}"))
+                        {
+                            _ = ResolvePreviewCandidateAsset(slot.MainTextureAssetId);
+                        }
+                        materials.Add(resolvedMat);
+                    }
+                    else
+                    {
+                        materials.Add(null);
+                    }
                 }
             }
         }
 
-        if (materials.Count == 0)
+        if (!materials.Any(static m => m != null))
         {
             materials = FindMaterialsForMesh(mesh);
         }
@@ -1369,7 +1427,7 @@ public partial class MainWindow
                     ? ResolvePreviewCandidateAsset(info!.RendererAssetId) as Renderer
                     : FindSingleRendererForMeshForExport(mesh);
 
-                var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures);
+                var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures, info?.RendererAssetId);
                 resolvedRenderers.Add(renderer!);
                 partMaterials.Add(materials.Where(m => m != null).Cast<Material>().ToList());
                 partNames.Add(!string.IsNullOrWhiteSpace(info?.GameObjectName) ? info!.GameObjectName : (mesh.m_Name ?? $"Part_{i}"));
@@ -1501,7 +1559,7 @@ public partial class MainWindow
                 ? ResolvePreviewCandidateAsset(part.RendererAssetId) as Renderer
                 : null;
 
-            var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures);
+            var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures, part.RendererAssetId);
 
             resolvedMeshes.Add(mesh);
             resolvedRenderers.Add(renderer!);
@@ -2294,7 +2352,16 @@ public partial class MainWindow
         {
             var matPtr = renderer.m_Materials[i];
             if (matPtr == null || matPtr.IsNull) continue;
-            if (matPtr.TryGet(out var mat) && mat != null)
+            Material? mat = null;
+            if (!matPtr.TryGet(out mat) && assetsManager.LazyLoading)
+            {
+                var matHandle = FindMaterialHandleForPPtr(renderer, matPtr);
+                if (matHandle != null)
+                {
+                    mat = ResolveSemanticRelationHandleForPreview(matHandle) as Material;
+                }
+            }
+            if (mat != null)
             {
                 loadedMaterials.Add(mat);
             }
@@ -2314,30 +2381,65 @@ public partial class MainWindow
 
         for (int i = 0; i < materials.Count; i++)
         {
-            var mat = materials[i];
-            if (mat == null || (visitedMaterials != null && !visitedMaterials.Add(mat)))
+            var rootMat = materials[i];
+            if (rootMat == null)
             {
                 continue;
             }
 
-            var texEnvs = mat.m_SavedProperties?.m_TexEnvs;
-            if (texEnvs == null)
+            // Walk m_Parent Material Variant chain so parent materials and their textures are materialized too.
+            Material? currentMat = rootMat;
+            int depth = 0;
+            while (currentMat != null && depth++ < 8)
             {
-                continue;
-            }
-
-            var matFile = mat.assetsFile?.fileName ?? string.Empty;
-            foreach (var texEnv in texEnvs)
-            {
-                var texRef = texEnv.Value?.m_Texture;
-                if (texRef != null && !texRef.IsNull)
+                if (visitedMaterials != null && !visitedMaterials.Add(currentMat))
                 {
-                    if (visitedTextures != null && !visitedTextures.Add($"{matFile}|{texRef.m_FileID}|{texRef.m_PathID}"))
-                    {
-                        continue;
-                    }
+                    break;
+                }
 
-                    _ = ResolveTexturePPtrForPreview(mat, texRef);
+                var texEnvs = currentMat.m_SavedProperties?.m_TexEnvs;
+                bool resolvedAnyTexture = false;
+                if (texEnvs != null)
+                {
+                    var matFile = currentMat.assetsFile?.fileName ?? string.Empty;
+                    foreach (var texEnv in texEnvs)
+                    {
+                        var texRef = texEnv.Value?.m_Texture;
+                        if (texRef != null && !texRef.IsNull)
+                        {
+                            if (visitedTextures != null && !visitedTextures.Add($"{matFile}|{texRef.m_FileID}|{texRef.m_PathID}"))
+                            {
+                                resolvedAnyTexture = true;
+                                continue;
+                            }
+
+                            if (ResolveTexturePPtrForPreview(currentMat, texRef) != null)
+                            {
+                                resolvedAnyTexture = true;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: materialize textures indexed in SQLite MaterialCache / MaterialTextureRelations
+                // when cross-bundle m_Externals filenames didn't resolve directly via PPtr.
+                if (assetsManager.LazyLoading && !resolvedAnyTexture)
+                {
+                    _ = TryLoadTextureForMaterialFromSemanticCache(currentMat);
+                }
+
+                if (currentMat.m_Parent != null && !currentMat.m_Parent.IsNull)
+                {
+                    if (!currentMat.m_Parent.TryGet(out var parentMat) && assetsManager.LazyLoading)
+                    {
+                        var parentHandle = FindMaterialHandleForPPtr(currentMat, currentMat.m_Parent);
+                        parentMat = parentHandle != null ? ResolveSemanticRelationHandleForPreview(parentHandle) as Material : null;
+                    }
+                    currentMat = parentMat;
+                }
+                else
+                {
+                    break;
                 }
             }
         }

@@ -3157,6 +3157,400 @@ if __name__ == "__main__":
             AssertJsonFloatNear(arrayElem[2], ez, tolerance);
         }
 
+        [Fact]
+        public void CreateFromModelGroup_WithRendererAndAvatarAndClip_AvoidsDuplicateSkeletonAndPreservesAnimationAndParentMaterialTexture()
+        {
+            var manager = new AssetsManager();
+            var mainFile = CreateSyntheticSerializedFile(manager, "character.assets");
+            var texFile = CreateSyntheticSerializedFile(manager, "textures.assets");
+            mainFile.m_Externals.Add(new FileIdentifier
+            {
+                fileName = "textures.assets",
+                pathName = "archive:/textures/textures.assets"
+            });
+
+            // 1. Verify PPtr lazy external recovery: probe BEFORE texFile is added to assetsFileList,
+            //    then add texFile and confirm TryGet resolves the Texture2D cleanly (no stale -1 cache).
+            var tex = CreateSyntheticRgbaTexture(texFile, pathId: 500, name: "HeroAlbedo", width: 4, height: 4);
+            var texPtr = new PPtr<Texture>(fileID: 1, pathID: 500, mainFile);
+            Assert.False(texPtr.TryGet<Texture2D>(out _));
+
+            manager.assetsFileList.Add(mainFile);
+            manager.assetsFileList.Add(texFile);
+            Assert.True(texPtr.TryGet<Texture2D>(out var resolvedTex));
+            Assert.Same(tex, resolvedTex);
+
+            // 2. Build Material Variant (child m_Parent -> parentMat holding _BaseMap)
+            var texEnv = CreateUninitialized<UnityTexEnv>();
+            texEnv.m_Texture = texPtr;
+            texEnv.m_Scale = new Vector2(1f, 1f);
+            texEnv.m_Offset = new Vector2(0f, 0f);
+            var parentMat = CreateSyntheticMaterial(mainFile, pathId: 400, name: "HeroBaseMat", new[]
+            {
+                new KeyValuePair<string, UnityTexEnv>("_BaseMap", texEnv)
+            });
+            var variantMat = CreateSyntheticMaterial(mainFile, pathId: 401, name: "HeroVariantMat", Array.Empty<KeyValuePair<string, UnityTexEnv>>());
+            variantMat.m_Parent = new PPtr<Material>(0, 400, mainFile);
+
+            // 3. Build scene Transform hierarchy: CharRoot -> Hips -> Spine + BodyMeshGO
+            var charRootGo = CreateSyntheticGameObject(mainFile, pathId: 10, name: "CharRoot", out var charRootTr);
+            var hipsGo = CreateSyntheticGameObject(mainFile, pathId: 11, name: "Hips", out var hipsTr, parent: charRootTr, localPos: new Vector3(0f, 1f, 0f));
+            var spineGo = CreateSyntheticGameObject(mainFile, pathId: 12, name: "Spine", out var spineTr, parent: hipsTr, localPos: new Vector3(0f, 0.5f, 0f));
+            var bodyGo = CreateSyntheticGameObject(mainFile, pathId: 13, name: "BodyMesh", out var bodyTr, parent: charRootTr);
+
+            // 4. Build skinned Mesh bound to [Hips, Spine]
+            var mesh = CreateSyntheticSkinnedMesh(mainFile, pathId: 200, name: "HeroBody", bonePaths: new[] { "Hips", "Hips/Spine" });
+
+            var smr = CreateUninitialized<SkinnedMeshRenderer>();
+            smr.assetsFile = mainFile;
+            smr.m_PathID = 300;
+            smr.m_GameObject = new PPtr<GameObject>(0, 13, mainFile);
+            smr.m_Mesh = new PPtr<Mesh>(0, 200, mainFile);
+            smr.m_Materials = new[] { new PPtr<Material>(0, 401, mainFile) };
+            smr.m_Bones = new[]
+            {
+                new PPtr<Transform>(0, hipsTr.m_PathID, mainFile),
+                new PPtr<Transform>(0, spineTr.m_PathID, mainFile)
+            };
+            mainFile.AddObject(smr);
+            bodyGo.m_SkinnedMeshRenderer = smr;
+
+            // 5. Build Avatar with m_AvatarSkeletonPose (and null m_DefaultPose!)
+            uint hipsCrc = ComputeUnityCrc32("Hips");
+            uint spineCrc = ComputeUnityCrc32("Hips/Spine");
+            var avatar = CreateUninitialized<Avatar>();
+            avatar.assetsFile = mainFile;
+            avatar.m_PathID = 600;
+            avatar.m_Name = "HeroAvatar";
+            avatar.m_TOS = new[]
+            {
+                new KeyValuePair<uint, string>(0u, string.Empty),
+                new KeyValuePair<uint, string>(hipsCrc, "Hips"),
+                new KeyValuePair<uint, string>(spineCrc, "Hips/Spine")
+            };
+            var avSkel = CreateUninitialized<Skeleton>();
+            avSkel.m_Node = new[]
+            {
+                CreateNode(-1),
+                CreateNode(0),
+                CreateNode(1)
+            };
+            avSkel.m_ID = new[] { 0u, hipsCrc, spineCrc };
+            var avPose = CreateUninitialized<SkeletonPose>();
+            avPose.m_X = new[]
+            {
+                CreateXForm(Vector3.Zero),
+                CreateXForm(new Vector3(0, 1, 0)),
+                CreateXForm(new Vector3(0, 0.5f, 0))
+            };
+            var avConst = CreateUninitialized<AvatarConstant>();
+            avConst.m_AvatarSkeleton = avSkel;
+            avConst.m_DefaultPose = null;
+            avConst.m_AvatarSkeletonPose = avPose;
+            avatar.m_Avatar = avConst;
+            mainFile.AddObject(avatar);
+
+            // 6. Build AnimationClip animating Hips/Spine via DenseClip
+            var clip = CreateUninitialized<AnimationClip>();
+            clip.assetsFile = mainFile;
+            clip.m_PathID = 700;
+            clip.m_Name = "SpineWave";
+            clip.m_SampleRate = 30f;
+            clip.m_Legacy = false;
+            clip.m_ClipBindingConstant = new AnimationClipBindingConstant
+            {
+                genericBindings = new[]
+                {
+                    new GenericBinding { path = spineCrc, attribute = 2, typeID = ClassIDType.Transform }
+                },
+                pptrCurveMapping = Array.Empty<PPtr<AssetStudio.Object>>()
+            };
+            var streamed = CreateUninitialized<StreamedClip>();
+            streamed.curveCount = 0;
+            streamed.data = Array.Empty<uint>();
+            var dense = CreateUninitialized<DenseClip>();
+            dense.m_FrameCount = 2;
+            dense.m_CurveCount = 4;
+            dense.m_SampleRate = 1f;
+            dense.m_BeginTime = 0f;
+            dense.m_SampleArray = new[]
+            {
+                0f, 0f, 0f, 1f,
+                0f, 0.3826834f, 0f, 0.9238795f // 45 deg around Y
+            };
+            var constant = CreateUninitialized<ConstantClip>();
+            constant.data = Array.Empty<float>();
+            var innerClip = CreateUninitialized<Clip>();
+            innerClip.m_StreamedClip = streamed;
+            innerClip.m_DenseClip = dense;
+            innerClip.m_ConstantClip = constant;
+            var muscleClip = CreateUninitialized<ClipMuscleConstant>();
+            muscleClip.m_StartTime = 0f;
+            muscleClip.m_StopTime = 1f;
+            muscleClip.m_Clip = innerClip;
+            clip.m_MuscleClip = muscleClip;
+            mainFile.AddObject(clip);
+
+            // 7. Convert via CreateFromModelGroup(rootGameObject: null, renderers: [smr], avatar, [clip])
+            var converter = ModelConverter.CreateFromModelGroup(
+                "HeroGroup",
+                rootGameObject: null,
+                new[] { mesh },
+                new Renderer[] { smr },
+                avatar,
+                new[] { clip },
+                ImageFormat.Png,
+                combineMeshes: false,
+                partTransforms: null,
+                partMaterials: new IReadOnlyList<Material>[] { new[] { variantMat } },
+                partNames: new[] { "BodyMesh" });
+
+            // Assert NO duplicate "Spine" frame under RootFrame
+            var allSpines = converter.RootFrame.FindChilds("Spine").ToList();
+            Assert.Single(allSpines);
+
+            // Assert skinned bone path AND animation track path point to the EXACT same Spine frame!
+            Assert.Single(converter.MeshList);
+            var spineBone = converter.MeshList[0].BoneList!.FirstOrDefault(b => b.Path != null && b.Path.EndsWith("/Spine", StringComparison.Ordinal));
+            Assert.NotNull(spineBone);
+            Assert.Equal(allSpines[0].Path, spineBone!.Path);
+
+            Assert.Single(converter.AnimationList);
+            var spineTrack = converter.AnimationList[0].TrackList.FirstOrDefault(t => t.Path == allSpines[0].Path);
+            Assert.NotNull(spineTrack);
+            Assert.Equal(2, spineTrack!.Rotations.Count);
+
+            // Assert Material Variant inherited parent texture cleanly
+            Assert.Single(converter.MaterialList);
+            Assert.Single(converter.MaterialList[0].Textures);
+            Assert.Single(converter.TextureList);
+
+            // Assert GLB export binds animation channel directly to the actual skinned Spine joint node AND exports texture!
+            var tempDir = CreateTempDirectory("AnimClipModelGroupFix");
+            try
+            {
+                var glbPath = Path.Combine(tempDir, "hero_anim.glb");
+                ModelExporter.ExportGltf(glbPath, converter, binary: true, skins: true, animation: true, blendShape: true, scaleFactor: 1f, combineMeshes: false);
+
+                var doc = ValidateGltfOrGlbFile(glbPath, expectBinary: true);
+                var root = doc.RootElement;
+                Assert.True(root.TryGetProperty("textures", out var textures) && textures.GetArrayLength() == 1);
+                Assert.True(root.TryGetProperty("skins", out var skins) && skins.GetArrayLength() == 1);
+                var skinJoints = skins[0].GetProperty("joints").EnumerateArray().Select(e => e.GetInt32()).ToHashSet();
+
+                Assert.True(root.TryGetProperty("animations", out var anims) && anims.GetArrayLength() == 1);
+                var channels = anims[0].GetProperty("channels").EnumerateArray().ToList();
+                Assert.Single(channels);
+                int animatedNodeIdx = channels[0].GetProperty("target").GetProperty("node").GetInt32();
+                Assert.Contains(animatedNodeIdx, skinJoints);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempDir);
+            }
+            // Also verify custom/ShaderGraph/packed-alpha diffuse slot names (_Color_Texture, _AlbedoRGBAlphaA, Texture2D_XXXX) bind as Dest=0
+            var customTexEnv = CreateUninitialized<UnityTexEnv>();
+            customTexEnv.m_Texture = new PPtr<Texture>(1, 100, mainFile);
+            customTexEnv.m_Scale = new Vector2(1f, 1f);
+            customTexEnv.m_Offset = Vector2.Zero;
+            var customMat = CreateSyntheticMaterial(mainFile, pathId: 402, name: "CustomShaderMat", new[]
+            {
+                new KeyValuePair<string, UnityTexEnv>("_RampTex", customTexEnv),
+                new KeyValuePair<string, UnityTexEnv>("_Color_Texture", customTexEnv)
+            });
+            var packedAlphaMat = CreateSyntheticMaterial(mainFile, pathId: 403, name: "PackedAlphaMat", new[]
+            {
+                new KeyValuePair<string, UnityTexEnv>("_AlbedoRGBAlphaA", customTexEnv)
+            });
+            var shaderGraphMat = CreateSyntheticMaterial(mainFile, pathId: 404, name: "ShaderGraphMat", new[]
+            {
+                new KeyValuePair<string, UnityTexEnv>("_OutlineMask", customTexEnv),
+                new KeyValuePair<string, UnityTexEnv>("Texture2D_9F3A10B2", customTexEnv)
+            });
+            foreach (var testMat in new[] { customMat, packedAlphaMat, shaderGraphMat })
+            {
+                var matConv = ModelConverter.CreateFromModelGroup(
+                    groupName: testMat.m_Name,
+                    rootGameObject: null,
+                    meshes: new[] { mesh },
+                    renderers: new Renderer[] { smr },
+                    avatar: null,
+                    animationClips: null,
+                    imageFormat: ImageFormat.Png,
+                    combineMeshes: false,
+                    partTransforms: null,
+                    partMaterials: new IReadOnlyList<Material>[] { new Material[] { testMat } },
+                    partNames: null);
+                Assert.Single(matConv.MaterialList);
+                Assert.Contains(matConv.MaterialList[0].Textures, t => t.Dest == 0);
+            }
+        }
+
+        private static T CreateUninitialized<T>() where T : class
+            => (T)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(T));
+
+        private static Node CreateNode(int parentId)
+        {
+            var n = CreateUninitialized<Node>();
+            n.m_ParentId = parentId;
+            n.m_AxesId = -1;
+            return n;
+        }
+
+        private static XForm CreateXForm(Vector3 t)
+        {
+            var x = CreateUninitialized<XForm>();
+            x.t = t;
+            x.q = new Quaternion(0, 0, 0, 1);
+            x.s = Vector3.One;
+            return x;
+        }
+
+        private static SerializedFile CreateSyntheticSerializedFile(AssetsManager manager, string fileName)
+        {
+            var sf = (SerializedFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SerializedFile));
+            typeof(SerializedFile)
+                .GetField("objectCollectionLock", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .SetValue(sf, new object());
+            sf.assetsManager = manager;
+            sf.fileName = fileName;
+            sf.fullName = fileName;
+            sf.originalPath = fileName;
+            sf.m_Externals = new List<FileIdentifier>();
+            sf.Objects = new List<AssetStudio.Object>();
+            sf.ObjectsDic = new Dictionary<long, AssetStudio.Object>();
+            sf.version = new[] { 2022, 3, 10, 1 };
+            return sf;
+        }
+
+        private static GameObject CreateSyntheticGameObject(
+            SerializedFile sf,
+            long pathId,
+            string name,
+            out Transform tr,
+            Transform? parent = null,
+            Vector3? localPos = null)
+        {
+            var go = (GameObject)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GameObject));
+            go.assetsFile = sf;
+            go.m_PathID = pathId;
+            go.m_Name = name;
+
+            tr = (Transform)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Transform));
+            tr.assetsFile = sf;
+            tr.m_PathID = pathId + 1000;
+            tr.m_GameObject = new PPtr<GameObject>(0, pathId, sf);
+            tr.m_LocalPosition = localPos ?? Vector3.Zero;
+            tr.m_LocalRotation = new Quaternion(0, 0, 0, 1);
+            tr.m_LocalScale = Vector3.One;
+            tr.m_Father = parent != null ? new PPtr<Transform>(0, parent.m_PathID, sf) : new PPtr<Transform>(0, 0, sf);
+            tr.m_Children = Array.Empty<PPtr<Transform>>();
+
+            go.m_Transform = tr;
+            go.m_Components = new[] { new PPtr<Component>(0, tr.m_PathID, sf) };
+
+            sf.AddObject(go);
+            sf.AddObject(tr);
+
+            if (parent != null)
+            {
+                var children = parent.m_Children.ToList();
+                children.Add(new PPtr<Transform>(0, tr.m_PathID, sf));
+                parent.m_Children = children.ToArray();
+            }
+
+            return go;
+        }
+
+        private static Texture2D CreateSyntheticRgbaTexture(SerializedFile sf, long pathId, string name, int width, int height)
+        {
+            var tex = (Texture2D)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Texture2D));
+            tex.assetsFile = sf;
+            tex.m_PathID = pathId;
+            tex.m_Name = name;
+            tex.m_Width = width;
+            tex.m_Height = height;
+            tex.m_TextureFormat = TextureFormat.RGBA32;
+            tex.m_MipCount = 1;
+            tex.version = sf.version;
+            var pixels = new byte[width * height * 4];
+            for (int i = 0; i < pixels.Length; i += 4)
+            {
+                pixels[i + 0] = 220;
+                pixels[i + 1] = 120;
+                pixels[i + 2] = 60;
+                pixels[i + 3] = 255;
+            }
+            var rr = (ResourceReader)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(ResourceReader));
+            typeof(ResourceReader).GetField("needSearch", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(rr, false);
+            typeof(ResourceReader).GetField("reader", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(rr, new EndianBinaryReader(new MemoryStream(pixels)));
+            typeof(ResourceReader).GetField("offset", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(rr, 0L);
+            typeof(ResourceReader).GetField("size", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(rr, (long)pixels.Length);
+            tex.image_data = rr;
+            sf.AddObject(tex);
+            return tex;
+        }
+
+        private static Material CreateSyntheticMaterial(SerializedFile sf, long pathId, string name, KeyValuePair<string, UnityTexEnv>[] texEnvs)
+        {
+            var mat = (Material)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Material));
+            mat.assetsFile = sf;
+            mat.m_PathID = pathId;
+            mat.m_Name = name;
+            mat.m_SavedProperties = new UnityPropertySheet
+            {
+                m_TexEnvs = texEnvs,
+                m_Floats = Array.Empty<KeyValuePair<string, float>>(),
+                m_Colors = new[] { new KeyValuePair<string, Color>("_BaseColor", new Color(1f, 1f, 1f, 1f)) }
+            };
+            sf.AddObject(mat);
+            return mat;
+        }
+
+        private static Mesh CreateSyntheticSkinnedMesh(SerializedFile sf, long pathId, string name, string[] bonePaths)
+        {
+            var mesh = (Mesh)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            mesh.assetsFile = sf;
+            mesh.m_PathID = pathId;
+            mesh.m_Name = name;
+            mesh.m_VertexCount = 3;
+            mesh.m_Vertices = new[] { 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f };
+            mesh.m_Normals = new[] { 0f, 0f, 1f, 0f, 0f, 1f, 0f, 0f, 1f };
+            mesh.m_UV0 = new[] { 0f, 0f, 1f, 0f, 0f, 1f };
+            mesh.m_Indices = new List<uint> { 0, 1, 2 };
+            var subMesh = CreateUninitialized<SubMesh>();
+            subMesh.firstByte = 0;
+            subMesh.indexCount = 3;
+            subMesh.firstVertex = 0;
+            subMesh.vertexCount = 3;
+            subMesh.baseVertex = 0;
+            mesh.m_SubMeshes = new[] { subMesh };
+            mesh.m_BoneNameHashes = bonePaths.Select(ComputeUnityCrc32).ToArray();
+            mesh.m_BindPose = new[]
+            {
+                Matrix4x4.Scale(Vector3.One),
+                Matrix4x4.Scale(Vector3.One)
+            };
+            mesh.m_Skin = new[]
+            {
+                new BoneWeights4 { boneIndex = new[] { 0, 1, 0, 0 }, weight = new[] { 0.5f, 0.5f, 0f, 0f } },
+                new BoneWeights4 { boneIndex = new[] { 1, 0, 0, 0 }, weight = new[] { 1f, 0f, 0f, 0f } },
+                new BoneWeights4 { boneIndex = new[] { 1, 0, 0, 0 }, weight = new[] { 1f, 0f, 0f, 0f } }
+            };
+            typeof(Mesh).GetField("m_DataProcessed", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(mesh, true);
+            typeof(Mesh).GetField("m_ProcessLock", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(mesh, new object());
+            sf.AddObject(mesh);
+            return mesh;
+        }
+
+        private static uint ComputeUnityCrc32(string path)
+        {
+            var crc = new SevenZip.CRC();
+            var bytes = Encoding.UTF8.GetBytes(path);
+            crc.Update(bytes, 0, (uint)bytes.Length);
+            return crc.GetDigest();
+        }
+
         private sealed class SimpleImported : IImported
         {
             public ImportedFrame RootFrame { get; }

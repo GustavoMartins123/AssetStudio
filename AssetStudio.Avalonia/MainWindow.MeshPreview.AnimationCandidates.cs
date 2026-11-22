@@ -279,6 +279,7 @@ public partial class MainWindow
 
             var hasCompletePreIndexedTarget = false;
             var addedClipLinkedCandidate = false;
+            var preIndexedAvatarsMissingModelGroup = new HashSet<string>(StringComparer.Ordinal);
             foreach (var target in preIndexedTargets)
             {
                 if (!string.IsNullOrWhiteSpace(target.ModelGroupId))
@@ -343,6 +344,12 @@ public partial class MainWindow
                     continue;
                 }
 
+                if (!string.IsNullOrWhiteSpace(target.AvatarAssetId)
+                    && !avatarIdsCoveredByModelGroup.Contains(target.AvatarAssetId))
+                {
+                    preIndexedAvatarsMissingModelGroup.Add(target.AvatarAssetId);
+                }
+
                 var relationSource = target.RelationKind switch
                 {
                     "BoneHashMatch" => "Bone match",
@@ -367,6 +374,72 @@ public partial class MainWindow
                     !string.IsNullOrWhiteSpace(target.AvatarName) ? target.AvatarName : null,
                     !string.IsNullOrWhiteSpace(target.MeshName) ? target.MeshName : null);
                 addedClipLinkedCandidate = true;
+            }
+
+            // Enrich pre-indexed Avatar targets that lacked ModelGroupId so AnimationClip preview & export use the full multi-part ModelGroup.
+            if (preIndexedAvatarsMissingModelGroup.Count > 0)
+            {
+                var missingIds = preIndexedAvatarsMissingModelGroup.Where(id => !avatarIdsCoveredByModelGroup.Contains(id)).ToList();
+                if (missingIds.Count > 0)
+                {
+                    var extraGroupsByAvatar = LoadModelGroupsByAvatarIdsForPreview(missingIds);
+                    var extraGroupIds = extraGroupsByAvatar.Values
+                        .SelectMany(list => list.Select(g => g.GroupId))
+                        .Where(id => !string.IsNullOrWhiteSpace(id))
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+                    var extraGroupMeshes = extraGroupIds.Count > 0
+                        ? LoadModelGroupMeshesByGroupIdsForPreview(extraGroupIds)
+                        : new Dictionary<string, List<ModelGroupMeshInfo>>(StringComparer.Ordinal);
+
+                    foreach (var avatarId in missingIds)
+                    {
+                        if (!extraGroupsByAvatar.TryGetValue(avatarId, out var groups) || groups.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        foreach (var group in groups)
+                        {
+                            extraGroupMeshes.TryGetValue(group.GroupId, out var groupMeshes);
+                            groupMeshes ??= new List<ModelGroupMeshInfo>();
+                            var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+                            if (representative == null)
+                            {
+                                continue;
+                            }
+
+                            var meshIds = groupMeshes
+                                .Select(mesh => mesh.MeshAssetId)
+                                .Where(meshId => !string.IsNullOrWhiteSpace(meshId))
+                                .ToArray();
+                            var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+                                ? group.GroupName
+                                : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                                    ? group.RootGameObjectName
+                                    : GetPreviewHandleName(representative.MeshAssetId, "Model");
+                            var meshName = !string.IsNullOrWhiteSpace(representative.MeshName)
+                                ? representative.MeshName
+                                : GetPreviewHandleName(representative.MeshAssetId, "Mesh");
+
+                            AddCandidate(
+                                null,
+                                null,
+                                avatarId,
+                                representative.MeshAssetId,
+                                "Model group",
+                                GetPreviewHandleName(avatarId, "Avatar"),
+                                meshName,
+                                group.GroupId,
+                                groupName,
+                                meshIds,
+                                groupMeshes,
+                                group.Confidence);
+                            avatarIdsCoveredByModelGroup.Add(avatarId);
+                            addedClipLinkedCandidate = true;
+                        }
+                    }
+                }
             }
 
             // Only run legacy multi-query fallback when AnimationClipTargets did not already provide a complete target.

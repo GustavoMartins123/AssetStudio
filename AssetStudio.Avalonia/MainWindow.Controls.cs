@@ -532,9 +532,31 @@ public partial class MainWindow
 
             if (PreviewCandidateSelector != null && previewCandidateItems.Count > 0)
             {
-                var selectedIndex = selectedCandidate == null
-                    ? 0
-                    : previewCandidateItems.IndexOf(selectedCandidate);
+                var selectedIndex = -1;
+                if (selectedCandidate != null)
+                {
+                    selectedIndex = previewCandidateItems.IndexOf(selectedCandidate);
+                    if (selectedIndex < 0)
+                    {
+                        for (var i = 0; i < previewCandidateItems.Count; i++)
+                        {
+                            var item = previewCandidateItems[i];
+                            bool groupMatch = !string.IsNullOrWhiteSpace(selectedCandidate.ModelGroupId)
+                                && string.Equals(item.ModelGroupId, selectedCandidate.ModelGroupId, StringComparison.Ordinal);
+                            bool pairMatch = string.Equals(item.AvatarId, selectedCandidate.AvatarId, StringComparison.Ordinal)
+                                && string.Equals(item.MeshId, selectedCandidate.MeshId, StringComparison.Ordinal)
+                                && (!string.IsNullOrWhiteSpace(selectedCandidate.AvatarId) || !string.IsNullOrWhiteSpace(selectedCandidate.MeshId));
+                            bool labelMatch = !string.IsNullOrWhiteSpace(selectedCandidate.Label)
+                                && string.Equals(item.Label, selectedCandidate.Label, StringComparison.Ordinal);
+                            if (groupMatch || pairMatch || labelMatch)
+                            {
+                                previewCandidateItems[i] = selectedCandidate;
+                                selectedIndex = i;
+                                break;
+                            }
+                        }
+                    }
+                }
                 PreviewCandidateSelector.SelectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
             }
         }

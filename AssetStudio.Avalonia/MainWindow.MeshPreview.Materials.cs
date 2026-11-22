@@ -796,9 +796,9 @@ public partial class MainWindow
         return null;
     }
 
-    private AssetHandle? FindMaterialHandleForPPtr(Material material, PPtr<Material> materialRef)
+    private AssetHandle? FindMaterialHandleForPPtr(AssetStudio.Object owner, PPtr<Material> materialRef)
     {
-        if (material.assetsFile == null || materialRef == null || materialRef.IsNull)
+        if (owner?.assetsFile == null || materialRef == null || materialRef.IsNull)
         {
             return null;
         }
@@ -815,13 +815,13 @@ public partial class MainWindow
         var candidateFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (materialRef.m_FileID == 0)
         {
-            candidateFileNames.Add(material.assetsFile.fileName);
+            candidateFileNames.Add(owner.assetsFile.fileName);
         }
         else if (materialRef.m_FileID > 0
-            && material.assetsFile.m_Externals != null
-            && materialRef.m_FileID - 1 < material.assetsFile.m_Externals.Count)
+            && owner.assetsFile.m_Externals != null
+            && materialRef.m_FileID - 1 < owner.assetsFile.m_Externals.Count)
         {
-            var external = material.assetsFile.m_Externals[materialRef.m_FileID - 1];
+            var external = owner.assetsFile.m_Externals[materialRef.m_FileID - 1];
             AddCandidateFileName(candidateFileNames, external.fileName);
             AddCandidateFileName(candidateFileNames, external.pathName);
 

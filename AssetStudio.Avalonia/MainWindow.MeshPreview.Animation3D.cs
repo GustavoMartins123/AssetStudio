@@ -685,6 +685,11 @@ public partial class MainWindow
             }
         }
 
+        if (outcome.SelectedCandidate != null)
+        {
+            PreviewSession.SelectedPreviewCandidate = outcome.SelectedCandidate;
+        }
+
         if (outcome.GlData != null && GLPreviewControl != null)
         {
             UpdateModelGroupToggleContext(

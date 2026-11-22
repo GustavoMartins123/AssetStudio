@@ -1270,9 +1270,11 @@ namespace AssetStudio
                     }
                 }
 
-                //textures
+                //textures (inherit from m_Parent Material Variant chain when child slots are empty/unset)
                 iMat.Textures = new List<ImportedMaterialTexture>();
-                foreach (var texEnv in mat.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>())
+                var effectiveTexEnvs = CollectEffectiveMaterialTexEnvs(mat);
+                ImportedMaterialTexture? fallbackDiffuseCandidate = null;
+                foreach (var texEnv in effectiveTexEnvs)
                 {
                     if (texEnv.Value == null)
                     {
@@ -1282,13 +1284,17 @@ namespace AssetStudio
                     Texture2D? m_Texture2D = null;
                     if (textureRef != null && !textureRef.IsNull && !textureRef.TryGet<Texture2D>(out m_Texture2D)) //TODO other Texture
                     {
-                        foreach (var sf in mat.assetsFile.assetsManager.assetsFileList)
+                        var files = mat.assetsFile?.assetsManager?.assetsFileList;
+                        if (files != null)
                         {
-                            if (sf.ObjectsDic.TryGetValue(textureRef.m_PathID, out var obj) && obj is Texture2D foundTex)
+                            foreach (var sf in files)
                             {
-                                m_Texture2D = foundTex;
-                                Logger.Info($"Found texture '{foundTex.m_Name}' by PathID fallback in file '{sf.fileName}'.");
-                                break;
+                                if (sf.TryGetObject(textureRef.m_PathID, out var obj) && obj is Texture2D foundTex)
+                                {
+                                    m_Texture2D = foundTex;
+                                    Logger.Info($"Found texture '{foundTex.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1306,6 +1312,10 @@ namespace AssetStudio
                     iMat.Textures.Add(texture);
 
                     texture.Dest = GetTextureDestination(texEnv.Key);
+                    if (texture.Dest < 0 && fallbackDiffuseCandidate == null && !IsLikelyAuxiliaryTextureProperty(texEnv.Key))
+                    {
+                        fallbackDiffuseCandidate = texture;
+                    }
 
                     var ext = $".{imageFormat.ToString().ToLower()}";
                     if (textureNameDictionary.TryGetValue(m_Texture2D, out var textureName))
@@ -1336,6 +1346,13 @@ namespace AssetStudio
                     ConvertTexture2D(m_Texture2D, texture.Name, mat.m_Name, texEnv.Key, forceNormalMapUnpack: texture.Dest == 1);
                 }
 
+                // Custom/ShaderGraph shaders often name their primary color map generically (e.g. _Texture, Texture2D_XXXX).
+                // If no standard diffuse slot was matched, promote the first non-auxiliary texture to diffuse (Dest = 0).
+                if (fallbackDiffuseCandidate != null && !iMat.Textures.Any(t => t.Dest == 0))
+                {
+                    fallbackDiffuseCandidate.Dest = 0;
+                }
+
                 MaterialList.Add(iMat);
             }
             else
@@ -1357,6 +1374,46 @@ namespace AssetStudio
                 }
             }
             return iMat;
+        }
+
+        private static List<KeyValuePair<string, UnityTexEnv>> CollectEffectiveMaterialTexEnvs(Material mat)
+        {
+            var result = new List<KeyValuePair<string, UnityTexEnv>>();
+            var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var visitedMats = new HashSet<Material>();
+            Material? current = mat;
+            int depth = 0;
+
+            while (current != null && depth++ < 8 && visitedMats.Add(current))
+            {
+                var texEnvs = current.m_SavedProperties?.m_TexEnvs;
+                if (texEnvs != null)
+                {
+                    for (int i = 0; i < texEnvs.Length; i++)
+                    {
+                        var kv = texEnvs[i];
+                        if (kv.Value?.m_Texture == null || kv.Value.m_Texture.IsNull)
+                        {
+                            continue;
+                        }
+                        if (seenKeys.Add(kv.Key))
+                        {
+                            result.Add(kv);
+                        }
+                    }
+                }
+
+                if (current.m_Parent != null && !current.m_Parent.IsNull && current.m_Parent.TryGet(out var parentMat))
+                {
+                    current = parentMat;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            return result;
         }
 
         private void ConvertTexture2D(Texture2D m_Texture2D, string name, string materialName, string propertyName, bool forceNormalMapUnpack = false)
@@ -1396,13 +1453,27 @@ namespace AssetStudio
             {
                 case "_BaseMap":
                 case "_MainTex":
+                case "_MainTexture":
+                case "_Main_Tex":
                 case "_BaseColorMap":
                 case "_BaseColorTexture":
+                case "_BaseTex":
+                case "_BaseTexture":
+                case "_Base_Texture":
                 case "_Albedo":
                 case "_AlbedoMap":
+                case "_AlbedoTex":
+                case "_AlbedoTexture":
                 case "_Diffuse":
                 case "_DiffuseMap":
+                case "_DiffuseTex":
+                case "_DiffuseTexture":
                 case "_ColorMap":
+                case "_ColorTex":
+                case "_ColorTexture":
+                case "_Color_Texture":
+                case "_Texture":
+                case "_Tex":
                     return 0;
                 case "_BumpMap":
                 case "_NormalMap":
@@ -1476,22 +1547,57 @@ namespace AssetStudio
             {
                 return 8;
             }
+            if (propertyName.IndexOf("Albedo", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("BaseColor", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("BaseMap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("BaseTex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("MainTex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Main_Tex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("ColorTex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Color_Tex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Diffuse", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 0;
+            }
             if (propertyName.IndexOf("Alpha", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Opacity", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Transparen", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return 9;
             }
-            if (propertyName.IndexOf("Albedo", StringComparison.OrdinalIgnoreCase) >= 0
-                || propertyName.IndexOf("BaseColor", StringComparison.OrdinalIgnoreCase) >= 0
-                || propertyName.IndexOf("BaseMap", StringComparison.OrdinalIgnoreCase) >= 0
-                || propertyName.IndexOf("MainTex", StringComparison.OrdinalIgnoreCase) >= 0
-                || propertyName.IndexOf("Diffuse", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                return 0;
-            }
 
             return -1;
+        }
+
+        private static bool IsLikelyAuxiliaryTextureProperty(string propertyName)
+        {
+            if (string.IsNullOrWhiteSpace(propertyName))
+            {
+                return true;
+            }
+
+            return propertyName.IndexOf("Ramp", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Lut", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Matcap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Shadow", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Shade", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Cube", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Refl", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Noise", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Dissolve", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Flow", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Distort", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Rim", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Fresnel", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Outline", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("PBR", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("ORM", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("ARM", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Sdf", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Env", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("LightMap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Gradient", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Splat", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private void ConvertAnimations()
@@ -2179,24 +2285,50 @@ namespace AssetStudio
             {
                 return;
             }
-            var name = GetTransformPathByFather(m_Transform);
-            var crc = new SevenZip.CRC();
-            var bytes = Encoding.UTF8.GetBytes(name);
-            crc.Update(bytes, 0, (uint)bytes.Length);
-            bonePathHash[crc.GetDigest()] = name;
-            int index;
-            while ((index = name.IndexOf("/", StringComparison.Ordinal)) >= 0)
+            var fullFramePath = GetTransformPath(m_Transform);
+            var fatherPath = GetTransformPathByFather(m_Transform);
+            var canonicalPath = !string.IsNullOrEmpty(fullFramePath) ? fullFramePath : fatherPath;
+
+            RegisterPathAndSuffixHashes(fatherPath, canonicalPath, overwriteExact: true);
+            if (!string.IsNullOrEmpty(fullFramePath) && !string.Equals(fullFramePath, fatherPath, StringComparison.Ordinal))
             {
-                name = name.Substring(index + 1);
-                crc = new SevenZip.CRC();
-                bytes = Encoding.UTF8.GetBytes(name);
-                crc.Update(bytes, 0, (uint)bytes.Length);
-                bonePathHash[crc.GetDigest()] = name;
+                RegisterPathAndSuffixHashes(fullFramePath, canonicalPath, overwriteExact: true);
             }
+
             foreach (var pptr in m_Transform.m_Children)
             {
                 if (pptr.TryGet(out var child))
                     CreateBonePathHash(child, visited);
+            }
+        }
+
+        private void RegisterPathAndSuffixHashes(string? pathToHash, string canonicalFramePath, bool overwriteExact)
+        {
+            if (string.IsNullOrEmpty(pathToHash) || string.IsNullOrEmpty(canonicalFramePath))
+            {
+                return;
+            }
+
+            var exactCrc = ComputeCrc32(pathToHash);
+            if (overwriteExact || !bonePathHash.ContainsKey(exactCrc))
+            {
+                bonePathHash[exactCrc] = canonicalFramePath;
+            }
+
+            var suffix = pathToHash;
+            int index;
+            while ((index = suffix.IndexOf("/", StringComparison.Ordinal)) >= 0)
+            {
+                suffix = suffix.Substring(index + 1);
+                if (string.IsNullOrEmpty(suffix))
+                {
+                    break;
+                }
+                var suffixCrc = ComputeCrc32(suffix);
+                if (!bonePathHash.ContainsKey(suffixCrc))
+                {
+                    bonePathHash[suffixCrc] = canonicalFramePath;
+                }
             }
         }
 
@@ -2206,16 +2338,18 @@ namespace AssetStudio
                 throw new Exception("Transform hierarchy has been optimized, but can't find Avatar to deoptimize.");
 
             var skeleton = avatar.m_Avatar.m_AvatarSkeleton;
-            var skeletonPose = avatar.m_Avatar.m_DefaultPose;
+            var skeletonPose = avatar.m_Avatar.m_DefaultPose?.m_X is { Length: > 0 }
+                ? avatar.m_Avatar.m_DefaultPose
+                : avatar.m_Avatar.m_AvatarSkeletonPose;
             var nodes = skeleton?.m_Node;
 
             if (skeleton == null || nodes == null || nodes.Length == 0 || skeleton.m_ID == null)
                 return;
 
-            BuildSkeletonFramesFromDefaultPose(skeleton, skeletonPose, fallbackMeshes: null);
+            BuildSkeletonFramesFromDefaultPose(skeleton, skeletonPose, fallbackMeshes: null, preserveExistingTransformFrames: false);
         }
 
-        private void BuildSkeletonFramesFromDefaultPose(Skeleton skeleton, SkeletonPose? skeletonPose, IReadOnlyList<Mesh>? fallbackMeshes)
+        private void BuildSkeletonFramesFromDefaultPose(Skeleton skeleton, SkeletonPose? skeletonPose, IReadOnlyList<Mesh>? fallbackMeshes, bool preserveExistingTransformFrames)
         {
             var nodes = skeleton.m_Node;
             var skelIds = skeleton.m_ID;
@@ -2304,6 +2438,7 @@ namespace AssetStudio
                 }
             }
 
+            var existingTransformFrames = new HashSet<ImportedFrame>(transformDictionary.Values);
             var frames = new ImportedFrame[skelCount];
             for (int i = 0; i < skelCount; i++)
             {
@@ -2358,16 +2493,22 @@ namespace AssetStudio
                 ImportedFrame? frame = null;
                 if (!string.IsNullOrEmpty(fullPath))
                 {
-                    frame = RootFrame.FindRelativeFrameWithPath(fullPath);
+                    frame = RootFrame.FindRelativeFrameWithPath(fullPath) ?? RootFrame.FindFrameByPath(fullPath);
                 }
                 frame ??= parentFrame.FindChild(name, recursive: false) ?? RootFrame.FindChild(name, recursive: false);
 
                 if (frame != null && !ReferenceEquals(frame, RootFrame))
                 {
-                    SetFrame(frame, tVec, qQuat, sVec);
-                    if (!ReferenceEquals(frame.Parent, parentFrame))
+                    // Preserve real scene Transform pose & parenting when building Avatar fallback frames on an unoptimized hierarchy.
+                    // For DeoptimizeTransformHierarchy (m_HasTransformHierarchy == false), exposed transforms were flattened under RootFrame
+                    // by Unity and MUST be reparented back into the Avatar skeleton.
+                    if (!preserveExistingTransformFrames || !existingTransformFrames.Contains(frame))
                     {
-                        parentFrame.AddChild(frame);
+                        SetFrame(frame, tVec, qQuat, sVec);
+                        if (!ReferenceEquals(frame.Parent, parentFrame))
+                        {
+                            parentFrame.AddChild(frame);
+                        }
                     }
                 }
                 else
@@ -2401,18 +2542,25 @@ namespace AssetStudio
                 {
                     var fullFramePath = frame.Path;
                     bonePathHash[skelIds[i]] = fullFramePath;
+                    RegisterPathAndSuffixHashes(fullFramePath, fullFramePath, overwriteExact: true);
+                }
+            }
 
-                    // Also register CRC32 of full path and relative suffixes in bonePathHash
-                    var suffix = fullFramePath;
-                    while (!string.IsNullOrEmpty(suffix))
+            // Register additional Avatar m_TOS hashes (e.g. non-skeleton transform paths used by animation bindings)
+            if (avatar?.m_TOS != null)
+            {
+                for (int i = 0; i < avatar.m_TOS.Length; i++)
+                {
+                    var entry = avatar.m_TOS[i];
+                    if (entry.Key == 0 || string.IsNullOrEmpty(entry.Value) || bonePathHash.ContainsKey(entry.Key))
                     {
-                        var crc = new SevenZip.CRC();
-                        var bytes = Encoding.UTF8.GetBytes(suffix);
-                        crc.Update(bytes, 0, (uint)bytes.Length);
-                        bonePathHash[crc.GetDigest()] = fullFramePath;
-                        int slash = suffix.IndexOf('/');
-                        if (slash < 0) break;
-                        suffix = suffix.Substring(slash + 1);
+                        continue;
+                    }
+
+                    var matched = RootFrame.FindRelativeFrameWithPath(entry.Value) ?? RootFrame.FindFrameByPath(entry.Value);
+                    if (matched != null)
+                    {
+                        bonePathHash[entry.Key] = matched.Path;
                     }
                 }
             }
@@ -2610,7 +2758,18 @@ namespace AssetStudio
                     continue;
                 }
 
-                string fixedPath = FixBonePath(animationClip, decoded.BonePath) ?? decoded.BonePath;
+                string? resolvedPath = null;
+                var skelIds = avatar.m_Avatar?.m_AvatarSkeleton?.m_ID;
+                if (skelIds != null && decoded.AvatarNodeIndex >= 0 && decoded.AvatarNodeIndex < skelIds.Length)
+                {
+                    if (bonePathHash.TryGetValue(skelIds[decoded.AvatarNodeIndex], out var hashedPath)
+                        && !string.IsNullOrEmpty(hashedPath))
+                    {
+                        resolvedPath = FixBonePath(animationClip, hashedPath);
+                    }
+                }
+
+                string fixedPath = resolvedPath ?? FixBonePath(animationClip, decoded.BonePath) ?? decoded.BonePath;
                 var track = iAnim.FindTrack(fixedPath);
 
                 if (track.Translations.Count == 0 && decoded.Translations.Count > 0)
@@ -2742,13 +2901,46 @@ namespace AssetStudio
                 CollectConvertedRenderersAndMeshesFromHierarchy(rootGameObject.m_Transform, convertedRenderers, convertedMeshes);
             }
 
+            bool needsAvatarSkeletonBuild = false;
             if (!hasRootFrame)
             {
                 SetRootFrame(CreateFrame(effectiveGroupName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One));
-                if (avatar != null)
+                needsAvatarSkeletonBuild = avatar != null;
+            }
+
+            // First hydrate real scene Transforms for renderers & their bones BEFORE falling back to Avatar skeleton frames,
+            // preventing duplicate bone hierarchies under RootFrame (where mesh binds to Copy 2 while animation targets Copy 1).
+            if (renderers != null)
+            {
+                for (int i = 0; i < renderers.Count; i++)
                 {
-                    TryBuildAvatarSkeletonFrames(meshes);
+                    var renderer = renderers[i];
+                    if (renderer == null || convertedRenderers.Contains(renderer))
+                    {
+                        continue;
+                    }
+
+                    var rendererGo = ResolveRendererGameObject(renderer);
+                    if (rendererGo != null)
+                    {
+                        HydrateGameObjectHierarchy(rendererGo);
+                        if (rendererGo.m_Transform != null && !transformDictionary.ContainsKey(rendererGo.m_Transform))
+                        {
+                            ConvertTransforms(rendererGo.m_Transform, RootFrame);
+                            CreateBonePathHash(rendererGo.m_Transform);
+                        }
+                    }
+
+                    if (renderer is SkinnedMeshRenderer smr && smr.m_Bones != null)
+                    {
+                        EnsureBoneTransformsInHierarchy(smr);
+                    }
                 }
+            }
+
+            if (needsAvatarSkeletonBuild && avatar != null)
+            {
+                TryBuildAvatarSkeletonFrames(meshes);
             }
 
             if (renderers != null)
@@ -2773,21 +2965,6 @@ namespace AssetStudio
                     }
 
                     var rendererGo = ResolveRendererGameObject(renderer);
-                    if (rendererGo != null)
-                    {
-                        HydrateGameObjectHierarchy(rendererGo);
-                        if (rendererGo.m_Transform != null && !transformDictionary.ContainsKey(rendererGo.m_Transform))
-                        {
-                            ConvertTransforms(rendererGo.m_Transform, RootFrame);
-                            CreateBonePathHash(rendererGo.m_Transform);
-                        }
-                    }
-
-                    if (renderer is SkinnedMeshRenderer smr && smr.m_Bones != null)
-                    {
-                        EnsureBoneTransformsInHierarchy(smr);
-                    }
-
                     var fallbackMats = partMaterials != null && i < partMaterials.Count ? partMaterials[i] : null;
                     var partTransform = partTransforms != null && i < partTransforms.Count ? partTransforms[i] : null;
                     var explicitName = partNames != null && i < partNames.Count ? partNames[i] : null;
@@ -3131,14 +3308,16 @@ namespace AssetStudio
         private void TryBuildAvatarSkeletonFrames(IReadOnlyList<Mesh>? meshes)
         {
             var skeleton = avatar?.m_Avatar?.m_AvatarSkeleton;
-            var skeletonPose = avatar?.m_Avatar?.m_DefaultPose;
+            var skeletonPose = avatar?.m_Avatar?.m_DefaultPose?.m_X is { Length: > 0 }
+                ? avatar.m_Avatar.m_DefaultPose
+                : avatar?.m_Avatar?.m_AvatarSkeletonPose;
             var nodes = skeleton?.m_Node;
             if (avatar == null || skeleton == null || nodes == null || nodes.Length == 0 || skeleton.m_ID == null)
             {
                 return;
             }
 
-            BuildSkeletonFramesFromDefaultPose(skeleton, skeletonPose, meshes);
+            BuildSkeletonFramesFromDefaultPose(skeleton, skeletonPose, meshes, preserveExistingTransformFrames: true);
         }
 
         private ImportedFrame CreatePartFrameUnderRoot(string? preferredName, float[]? unityRowMajorMatrix)

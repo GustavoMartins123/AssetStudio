@@ -9,6 +9,7 @@ namespace AssetStudio
 
         private SerializedFile assetsFile;
         private int index = -2; //-2 - Prepare, -1 - Missing
+        private int cachedAssetsFileCount = -1;
 
         public PPtr(int fileID, long pathID, SerializedFile assetsFile)
         {
@@ -41,16 +42,20 @@ namespace AssetStudio
                     var assetsFileList = assetsManager.assetsFileList;
                     var assetsFileIndexCache = assetsManager.assetsFileIndexCache;
 
-                    if (index == -2)
+                    if (index == -2 || (index == -1 && cachedAssetsFileCount != assetsFileList.Count))
                     {
                         var m_External = assetsFile.m_Externals[m_FileID - 1];
                         var name = m_External.fileName;
                         var cacheKey = name + "|" + m_External.pathName;
-                        if (!assetsFileIndexCache.TryGetValue(cacheKey, out index))
+                        if (!assetsFileIndexCache.TryGetValue(cacheKey, out index) || index < 0)
                         {
                             index = assetsFileList.FindIndex(x => IsExternalFileMatch(x, m_External));
-                            assetsFileIndexCache[cacheKey] = index;
+                            if (index >= 0)
+                            {
+                                assetsFileIndexCache[cacheKey] = index;
+                            }
                         }
+                        cachedAssetsFileCount = assetsFileList.Count;
                     }
 
                     if (index >= 0 && index < assetsFileList.Count)
@@ -97,6 +102,7 @@ namespace AssetStudio
         public void ResetCache()
         {
             index = -2;
+            cachedAssetsFileCount = -1;
         }
 
         private bool TryGetObject<TObject>(SerializedFile sourceFile, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out TObject result) where TObject : Object
