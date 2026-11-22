@@ -250,13 +250,107 @@ public partial class MainWindow
 
         // Read directly via WAL without blocking on full connections_completed so lazy_backfill and partial caches work immediately.
         var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        if (!string.IsNullOrWhiteSpace(rendererAssetId)
+            && !string.IsNullOrWhiteSpace(mesh.assetsFile.fileName)
+            && !rendererAssetId.StartsWith(mesh.assetsFile.fileName + "#", StringComparison.OrdinalIgnoreCase))
+        {
+            var crossBundleRendererSlots = TryBuildResolvedSlotsFromRendererHandleForPreview(
+                meshAssetId,
+                rendererAssetId,
+                folderPath,
+                signature);
+            if (crossBundleRendererSlots.Count > 0)
+            {
+                return EnrichResolvedMeshMaterialsForPreview(crossBundleRendererSlots, folderPath, signature);
+            }
+        }
+
         var slots = _sqliteCache.LoadResolvedMeshMaterials(folderPath, signature, meshAssetId, rendererAssetId);
+        if (slots.Count == 0 && !string.IsNullOrWhiteSpace(rendererAssetId))
+        {
+            slots = TryBuildResolvedSlotsFromRendererHandleForPreview(
+                meshAssetId,
+                rendererAssetId,
+                folderPath,
+                signature);
+        }
+
         if (slots.Count == 0)
         {
             return slots;
         }
 
         return EnrichResolvedMeshMaterialsForPreview(slots, folderPath, signature);
+    }
+
+    private List<ResolvedMeshSubMeshMaterial> TryBuildResolvedSlotsFromRendererHandleForPreview(
+        string meshAssetId,
+        string rendererAssetId,
+        string folderPath,
+        string signature)
+    {
+        var result = new List<ResolvedMeshSubMeshMaterial>();
+        var rHandle = assetsManager.ProjectIndex?.GetHandle(rendererAssetId);
+        var renderer = (rHandle?.RealObject ?? (rHandle != null ? ResolveSemanticRelationHandleForPreview(rHandle) : null)) as Renderer;
+        if (renderer?.m_Materials == null || renderer.m_Materials.Length == 0)
+        {
+            return result;
+        }
+
+        var rendererType = renderer is SkinnedMeshRenderer ? "SkinnedMeshRenderer" : "MeshRenderer";
+        for (int subIdx = 0; subIdx < renderer.m_Materials.Length; subIdx++)
+        {
+            var matPtr = renderer.m_Materials[subIdx];
+            if (matPtr == null || matPtr.IsNull)
+            {
+                continue;
+            }
+
+            var matHandle = FindMaterialHandleForPPtr(renderer, matPtr);
+            var matAssetId = matHandle?.UniqueID;
+            if (string.IsNullOrWhiteSpace(matAssetId))
+            {
+                continue;
+            }
+
+            var cachedMat = _sqliteCache.LoadMaterialCacheEntry(folderPath, signature, matAssetId);
+            if (cachedMat != null)
+            {
+                result.Add(new ResolvedMeshSubMeshMaterial(
+                    meshAssetId,
+                    subIdx,
+                    matAssetId,
+                    rendererAssetId,
+                    rendererType,
+                    !string.IsNullOrWhiteSpace(cachedMat.MaterialName) ? cachedMat.MaterialName : (matHandle?.Name ?? string.Empty),
+                    cachedMat.MainTextureAssetId ?? string.Empty,
+                    cachedMat.MainTextureSlotName ?? string.Empty,
+                    cachedMat.BaseColorR,
+                    cachedMat.BaseColorG,
+                    cachedMat.BaseColorB,
+                    cachedMat.BaseColorA,
+                    "cross_bundle_renderer_cache"));
+            }
+            else
+            {
+                result.Add(new ResolvedMeshSubMeshMaterial(
+                    meshAssetId,
+                    subIdx,
+                    matAssetId,
+                    rendererAssetId,
+                    rendererType,
+                    matHandle?.Name ?? string.Empty,
+                    string.Empty,
+                    string.Empty,
+                    1f,
+                    1f,
+                    1f,
+                    1f,
+                    "cross_bundle_renderer_handle"));
+            }
+        }
+
+        return result;
     }
 
     private List<ResolvedMeshSubMeshMaterial> EnrichResolvedMeshMaterialsForPreview(
@@ -372,11 +466,17 @@ public partial class MainWindow
         height = image.Height;
         var rgba = new byte[width * height * 4];
         image.CopyBgraPixelsTo(rgba);
-        ConvertBgraToPreviewRgbaInPlace(rgba, preserveAlpha);
+        ConvertBgraToPreviewRgbaInPlace(
+            rgba,
+            preserveAlpha,
+            unpremultiplyAlpha: image.AlphaType == SkiaSharp.SKAlphaType.Premul);
         return rgba;
     }
 
-    internal static void ConvertBgraToPreviewRgbaInPlace(byte[] rgba, bool preserveAlpha)
+    internal static void ConvertBgraToPreviewRgbaInPlace(
+        byte[] rgba,
+        bool preserveAlpha,
+        bool unpremultiplyAlpha = false)
     {
         if (rgba == null || rgba.Length < 4)
         {
@@ -386,14 +486,26 @@ public partial class MainWindow
         byte maxAlpha = 0;
         for (int p = 0; p + 3 < rgba.Length; p += 4)
         {
-            byte temp = rgba[p];
-            rgba[p] = rgba[p + 2];
-            rgba[p + 2] = temp;
+            byte b = rgba[p];
+            byte g = rgba[p + 1];
+            byte r = rgba[p + 2];
+            byte a = rgba[p + 3];
+            if (unpremultiplyAlpha && a > 0 && a < byte.MaxValue)
+            {
+                int half = a / 2;
+                r = (byte)Math.Min(255, (r * 255 + half) / a);
+                g = (byte)Math.Min(255, (g * 255 + half) / a);
+                b = (byte)Math.Min(255, (b * 255 + half) / a);
+            }
+
+            rgba[p] = r;
+            rgba[p + 1] = g;
+            rgba[p + 2] = b;
             if (preserveAlpha)
             {
-                if (rgba[p + 3] > maxAlpha)
+                if (a > maxAlpha)
                 {
-                    maxAlpha = rgba[p + 3];
+                    maxAlpha = a;
                 }
             }
             else
@@ -411,13 +523,87 @@ public partial class MainWindow
         }
     }
 
+    internal static void CompositeEyeIrisOverScleraInPlace(
+        byte[] irisRgba,
+        int irisWidth,
+        int irisHeight,
+        byte[]? scleraBgra = null,
+        int scleraWidth = 0,
+        int scleraHeight = 0)
+    {
+        if (irisRgba == null || irisWidth <= 0 || irisHeight <= 0 || irisRgba.Length < irisWidth * irisHeight * 4)
+        {
+            return;
+        }
+
+        const byte DefaultScleraR = 236;
+        const byte DefaultScleraG = 218;
+        const byte DefaultScleraB = 214;
+
+        bool hasScleraMap = scleraBgra != null
+            && scleraWidth > 0
+            && scleraHeight > 0
+            && scleraBgra.Length >= scleraWidth * scleraHeight * 4;
+        bool sameSize = hasScleraMap && irisWidth == scleraWidth && irisHeight == scleraHeight;
+
+        for (int y = 0; y < irisHeight; y++)
+        {
+            int dstRow = y * irisWidth * 4;
+            int srcRow = 0;
+            if (hasScleraMap)
+            {
+                int sy = sameSize ? y : Math.Min(scleraHeight - 1, (int)((long)y * scleraHeight / irisHeight));
+                srcRow = sy * scleraWidth * 4;
+            }
+
+            for (int x = 0; x < irisWidth; x++)
+            {
+                int dp = dstRow + x * 4;
+                byte ia = irisRgba[dp + 3];
+                if (ia == byte.MaxValue)
+                {
+                    continue;
+                }
+
+                byte wr = DefaultScleraR;
+                byte wg = DefaultScleraG;
+                byte wb = DefaultScleraB;
+                if (hasScleraMap)
+                {
+                    int sx = sameSize ? x : Math.Min(scleraWidth - 1, (int)((long)x * scleraWidth / irisWidth));
+                    int sp = srcRow + sx * 4;
+                    wb = scleraBgra![sp];
+                    wg = scleraBgra[sp + 1];
+                    wr = scleraBgra[sp + 2];
+                }
+
+                if (ia == 0)
+                {
+                    irisRgba[dp] = wr;
+                    irisRgba[dp + 1] = wg;
+                    irisRgba[dp + 2] = wb;
+                }
+                else
+                {
+                    int invA = 255 - ia;
+                    irisRgba[dp] = (byte)((irisRgba[dp] * ia + wr * invA + 127) / 255);
+                    irisRgba[dp + 1] = (byte)((irisRgba[dp + 1] * ia + wg * invA + 127) / 255);
+                    irisRgba[dp + 2] = (byte)((irisRgba[dp + 2] * ia + wb * invA + 127) / 255);
+                }
+
+                irisRgba[dp + 3] = byte.MaxValue;
+            }
+        }
+    }
+
     internal static void CompositeBgraOverlayOntoRgbaInPlace(
         byte[] dstRgba,
         int dstWidth,
         int dstHeight,
         byte[] overlayBgra,
         int ovWidth,
-        int ovHeight)
+        int ovHeight,
+        bool overlayIsPremul = false)
     {
         if (dstRgba == null || overlayBgra == null || dstWidth <= 0 || dstHeight <= 0 || ovWidth <= 0 || ovHeight <= 0)
         {
@@ -454,6 +640,13 @@ public partial class MainWindow
                     dstRgba[dp] = sr;
                     dstRgba[dp + 1] = sg;
                     dstRgba[dp + 2] = sb;
+                }
+                else if (overlayIsPremul)
+                {
+                    int invA = 255 - sa;
+                    dstRgba[dp] = (byte)Math.Min(255, sr + (dstRgba[dp] * invA + 127) / 255);
+                    dstRgba[dp + 1] = (byte)Math.Min(255, sg + (dstRgba[dp + 1] * invA + 127) / 255);
+                    dstRgba[dp + 2] = (byte)Math.Min(255, sb + (dstRgba[dp + 2] * invA + 127) / 255);
                 }
                 else
                 {
@@ -502,8 +695,14 @@ public partial class MainWindow
         HashSet<string> seenFileNames,
         List<string> loadedTextureFileNames)
     {
-        if (material == null || baseRgba == null || baseWidth <= 0 || baseHeight <= 0)
+        if (baseRgba == null || baseWidth <= 0 || baseHeight <= 0)
         {
+            return;
+        }
+
+        if (material == null)
+        {
+            CompositeEyeIrisOverScleraInPlace(baseRgba, baseWidth, baseHeight);
             return;
         }
 
@@ -511,6 +710,7 @@ public partial class MainWindow
         var texEnvs = displayMat.m_SavedProperties?.m_TexEnvs;
         if (texEnvs == null || texEnvs.Length == 0)
         {
+            CompositeEyeIrisOverScleraInPlace(baseRgba, baseWidth, baseHeight);
             return;
         }
 
@@ -529,14 +729,66 @@ public partial class MainWindow
             return null;
         }
 
-        // Composite pupil then specular highlight layers over the opaque sclera+iris base when distinct textures exist.
-        var overlaySlots = new[] { "_BaseEyePupilMap", "_EyePupilMap", "_PupilMap", "_BaseEyeHighlightMap", "_EyeHighlightMap" };
         var appliedTextureIds = new HashSet<string>(StringComparer.Ordinal);
         if (!string.IsNullOrWhiteSpace(baseTextureAssetId))
         {
             appliedTextureIds.Add(baseTextureAssetId);
         }
 
+        // First composite the iris texture over the eye-white (sclera) base layer so transparent regions
+        // surrounding the iris disc never render as dark background or premultiplied black rectangles.
+        byte[]? scleraBgra = null;
+        int scleraWidth = 0;
+        int scleraHeight = 0;
+        var scleraSlots = new[] { "_BaseEyeWhiteMap", "_EyeWhiteMap", "_EyeWhiteTex", "_ScleraMap" };
+        foreach (var scleraSlot in scleraSlots)
+        {
+            var scleraEnv = FindTexEnv(texEnvs, scleraSlot);
+            if (scleraEnv == null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var scleraTex = ResolveTexturePPtrForPreview(displayMat, scleraEnv.m_Texture);
+                if (scleraTex == null)
+                {
+                    continue;
+                }
+
+                var scleraKey = GetPreviewObjectKey(scleraTex);
+                if (!string.IsNullOrWhiteSpace(scleraKey) && !appliedTextureIds.Add(scleraKey))
+                {
+                    continue;
+                }
+
+                var fileName = scleraTex.assetsFile?.fileName;
+                if (!string.IsNullOrWhiteSpace(fileName) && seenFileNames.Add(fileName))
+                {
+                    loadedTextureFileNames.Add(fileName);
+                }
+
+                using var scleraImg = LoadTexturePreviewThumbnail(scleraTex, MaxCachedPreviewTextureDimension);
+                var scleraBmp = scleraImg?.Image;
+                if (scleraBmp != null && scleraBmp.Width > 0 && scleraBmp.Height > 0)
+                {
+                    scleraWidth = scleraBmp.Width;
+                    scleraHeight = scleraBmp.Height;
+                    scleraBgra = new byte[scleraWidth * scleraHeight * 4];
+                    scleraBmp.CopyBgraPixelsTo(scleraBgra);
+                    break;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        CompositeEyeIrisOverScleraInPlace(baseRgba, baseWidth, baseHeight, scleraBgra, scleraWidth, scleraHeight);
+
+        // Next composite pupil then specular highlight layers over the opaque sclera+iris base.
+        var overlaySlots = new[] { "_BaseEyePupilMap", "_EyePupilMap", "_PupilMap", "_BaseEyeHighlightMap", "_EyeHighlightMap" };
         foreach (var overlaySlot in overlaySlots)
         {
             var texEnv = FindTexEnv(texEnvs, overlaySlot);
@@ -574,7 +826,14 @@ public partial class MainWindow
 
                 var ovBgra = new byte[bmp.Width * bmp.Height * 4];
                 bmp.CopyBgraPixelsTo(ovBgra);
-                CompositeBgraOverlayOntoRgbaInPlace(baseRgba, baseWidth, baseHeight, ovBgra, bmp.Width, bmp.Height);
+                CompositeBgraOverlayOntoRgbaInPlace(
+                    baseRgba,
+                    baseWidth,
+                    baseHeight,
+                    ovBgra,
+                    bmp.Width,
+                    bmp.Height,
+                    overlayIsPremul: bmp.AlphaType == SkiaSharp.SKAlphaType.Premul);
             }
             catch
             {
@@ -701,7 +960,7 @@ public partial class MainWindow
             }
 
             var texId = uniqueTexIds[i];
-            var preserveAlpha = uniquePreserveAlpha[i];
+            var preserveAlpha = uniquePreserveAlpha[i] || !string.IsNullOrWhiteSpace(uniqueEyeMatIds[i]);
             try
             {
                 using var cachedThumb = TryLoadCachedTexturePreviewThumbnailByAssetId(texId, MaxCachedPreviewTextureDimension);
@@ -768,7 +1027,7 @@ public partial class MainWindow
             }
         }
 
-        // Pass 3: composite pupil + highlight overlays onto multi-layer iris eye textures.
+        // Pass 3: composite sclera + pupil + highlight overlays onto multi-layer iris eye textures.
         for (int i = 0; i < uniqueEyeMatIds.Length; i++)
         {
             if (isCancelled?.Invoke() == true)
@@ -783,30 +1042,32 @@ public partial class MainWindow
                 continue;
             }
 
+            Material? eyeMat = null;
             try
             {
                 var matHandle = ResolveMaterialHandleByAssetIdForPreview(eyeMatId);
-                if (matHandle != null && ResolveSemanticRelationHandleForPreview(matHandle) is Material eyeMat)
+                eyeMat = matHandle != null ? ResolveSemanticRelationHandleForPreview(matHandle) as Material : null;
+                if (eyeMat != null)
                 {
                     var matFile = eyeMat.assetsFile?.fileName;
                     if (!string.IsNullOrWhiteSpace(matFile) && seenFileNames.Add(matFile))
                     {
                         loadedTextureFileNames.Add(matFile);
                     }
-
-                    TryApplyMultiLayerEyeOverlaysForPreview(
-                        eyeMat,
-                        uniqueTexIds[i],
-                        baseRgba,
-                        uniqueWidths[i],
-                        uniqueHeights[i],
-                        seenFileNames,
-                        loadedTextureFileNames);
                 }
             }
             catch
             {
             }
+
+            TryApplyMultiLayerEyeOverlaysForPreview(
+                eyeMat,
+                uniqueTexIds[i],
+                baseRgba,
+                uniqueWidths[i],
+                uniqueHeights[i],
+                seenFileNames,
+                loadedTextureFileNames);
         }
     }
 
@@ -899,7 +1160,11 @@ public partial class MainWindow
                 try
                 {
                     using var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension);
-                    tb = ConvertPreviewImageToRgbaBytes(previewImage, out tw, out th, spec.PreserveAlpha);
+                    tb = ConvertPreviewImageToRgbaBytes(
+                        previewImage,
+                        out tw,
+                        out th,
+                        spec.PreserveAlpha || spec.EyeMaterial != null);
                     if (tb != null && spec.EyeMaterial != null)
                     {
                         TryApplyMultiLayerEyeOverlaysForPreview(

@@ -252,6 +252,203 @@ namespace AssetStudio.Tests
         }
 
         [Fact]
+        public void MultiLayerEyeCompositing_CompositesIrisOverSclera_EliminatingDarkAndPremultipliedBlackBorderPixels()
+        {
+            // Case 1: Unpremultiplied iris texture whose alpha=0 outer sclera region contains dark RGB (31, 31, 51, 0)
+            // Pixel 0: outer sclera region with dark hidden RGB and alpha=0
+            // Pixel 1: semi-transparent iris rim (100, 160, 220, 128)
+            // Pixel 2: opaque iris center (80, 140, 240, 255)
+            using var darkBgIrisBitmap = new SKBitmap(3, 1, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            var darkBgIrisBgra = new byte[]
+            {
+                51, 31, 31, 0,
+                220, 160, 100, 128,
+                240, 140, 80, 255
+            };
+            Marshal.Copy(darkBgIrisBgra, 0, darkBgIrisBitmap.GetPixels(), darkBgIrisBgra.Length);
+
+            var irisRgba = MainWindow.ConvertPreviewBitmapToRgbaBytes(darkBgIrisBitmap, out var iw, out var ih, preserveAlpha: true);
+            Assert.NotNull(irisRgba);
+            Assert.Equal(3, iw);
+            Assert.Equal(1, ih);
+
+            // 1x1 off-white sclera texture (BGRA: B=198, G=207, R=231, A=255)
+            var scleraBgra = new byte[] { 198, 207, 231, 255 };
+            MainWindow.CompositeEyeIrisOverScleraInPlace(irisRgba!, iw, ih, scleraBgra, 1, 1);
+
+            // Pixel 0 must take sclera color (231, 207, 198, 255) instead of dark (31, 31, 51, 255)
+            Assert.Equal(231, irisRgba![0]);
+            Assert.Equal(207, irisRgba[1]);
+            Assert.Equal(198, irisRgba[2]);
+            Assert.Equal(255, irisRgba[3]);
+
+            // Pixel 1 must blend iris rim over sclera with alpha=255
+            Assert.InRange(irisRgba[4], 160, 170);
+            Assert.InRange(irisRgba[5], 180, 190);
+            Assert.InRange(irisRgba[6], 205, 215);
+            Assert.Equal(255, irisRgba[7]);
+
+            // Pixel 2 must preserve opaque iris center (80, 140, 240, 255)
+            Assert.Equal(80, irisRgba[8]);
+            Assert.Equal(140, irisRgba[9]);
+            Assert.Equal(240, irisRgba[10]);
+            Assert.Equal(255, irisRgba[11]);
+            Assert.False(MeshPreviewControl.HasTransparentPixels(irisRgba));
+
+            // Case 2: PNG-cached SKAlphaType.Premul round-trip (alpha=0 pixels have RGB zeroed to (0,0,0,0),
+            // and semi-transparent pixels have RGB premultiplied by alpha/255)
+            using var pngData = SKImage.FromBitmap(darkBgIrisBitmap).Encode(SKEncodedImageFormat.Png, 90);
+            using var decodedPremulBitmap = SKBitmap.Decode(pngData);
+            Assert.NotNull(decodedPremulBitmap);
+            Assert.Equal(SKAlphaType.Premul, decodedPremulBitmap!.AlphaType);
+
+            var cachedIrisRgba = MainWindow.ConvertPreviewBitmapToRgbaBytes(decodedPremulBitmap, out var cw, out var ch, preserveAlpha: true);
+            Assert.NotNull(cachedIrisRgba);
+            // Unpremultiplying restores straight RGB on semi-transparent pixel 1 instead of darkening it
+            Assert.InRange(cachedIrisRgba![4], 96, 104);
+            Assert.InRange(cachedIrisRgba[5], 156, 164);
+            Assert.InRange(cachedIrisRgba[6], 216, 224);
+            Assert.Equal(128, cachedIrisRgba[7]);
+
+            // Compositing over fallback sclera (null scleraBgra) removes black (0,0,0) outer pixels cleanly
+            MainWindow.CompositeEyeIrisOverScleraInPlace(cachedIrisRgba, cw, ch);
+            Assert.Equal(236, cachedIrisRgba[0]);
+            Assert.Equal(218, cachedIrisRgba[1]);
+            Assert.Equal(214, cachedIrisRgba[2]);
+            Assert.Equal(255, cachedIrisRgba[3]);
+
+            // Premultiplied highlight overlay must not double-multiply alpha
+            var premulHighlightBgra = new byte[]
+            {
+                0, 0, 0, 0,
+                128, 128, 128, 128, // premultiplied 50% white -> straight (255,255,255,128)
+                255, 255, 255, 255
+            };
+            MainWindow.CompositeBgraOverlayOntoRgbaInPlace(cachedIrisRgba, cw, ch, premulHighlightBgra, 3, 1, overlayIsPremul: true);
+            // Pixel 1 should brighten toward white (~210+), not darken toward ~140
+            Assert.True(cachedIrisRgba[4] >= 200);
+            Assert.True(cachedIrisRgba[5] >= 210);
+            Assert.True(cachedIrisRgba[6] >= 225);
+            // Pixel 2 becomes pure specular white
+            Assert.Equal(255, cachedIrisRgba[8]);
+            Assert.Equal(255, cachedIrisRgba[9]);
+            Assert.Equal(255, cachedIrisRgba[10]);
+        }
+
+        [Fact]
+        public void CharacterModelGroupStemAndSiblingEyeFallback_SupplementsMissingExternalEyeMeshesWithoutGraftingOutfitParts()
+        {
+            Assert.Equal("P_C01_ALPHA", MainWindow.ExtractCharacterModelGroupBaseStem("P_C01_ALPHA_06_fbx"));
+            Assert.Equal("P_C01_ALPHA", MainWindow.ExtractCharacterModelGroupBaseStem("P_C01_ALPHA_fbx"));
+            Assert.Equal("P_C01_ALPHA", MainWindow.ExtractCharacterModelGroupBaseStem("P_C01_ALPHA_06_Combined"));
+            Assert.Equal("P_C02_HERO", MainWindow.ExtractCharacterModelGroupBaseStem("P_C02_HERO_00_B_fbx"));
+            Assert.Equal("P_C02_HERO", MainWindow.ExtractCharacterModelGroupBaseStem("P_C02_HERO_00_C_fbx"));
+            Assert.Equal("P_C02_HEROINE", MainWindow.ExtractCharacterModelGroupBaseStem("P_C02_HEROINE_03_fbx"));
+            Assert.Equal("P_C03_NPC_A", MainWindow.ExtractCharacterModelGroupBaseStem("P_C03_NPC_A_01_fbx"));
+            Assert.Equal("P_C03_NPC_B", MainWindow.ExtractCharacterModelGroupBaseStem("P_C03_NPC_B_05_fbx"));
+            Assert.NotEqual(
+                MainWindow.ExtractCharacterModelGroupBaseStem("P_C02_HERO_06_fbx"),
+                MainWindow.ExtractCharacterModelGroupBaseStem("P_C02_HEROINE_06_fbx"));
+
+            Assert.True(MainWindow.IsEyeOrEyelashPartName("M_L_Eye"));
+            Assert.True(MainWindow.IsEyeOrEyelashPartName("M_R_Eye"));
+            Assert.True(MainWindow.IsEyeOrEyelashPartName("P_Eyelashes_L"));
+            Assert.False(MainWindow.IsEyeOrEyelashPartName("M_CoatBK"));
+            Assert.False(MainWindow.IsEyeOrEyelashPartName("combined"));
+
+            var variantGroupId = "modelgroup:animator:CAB-variant#1";
+            var variantBodyPart = new ModelGroupMeshInfo(
+                variantGroupId,
+                "CAB-variant#100",
+                "CAB-variant#200",
+                "SkinnedMeshRenderer",
+                "CAB-variant#300",
+                "combined",
+                0,
+                100,
+                "Animator descendant",
+                null,
+                "P_C01_ALPHA_06_Combined",
+                100,
+                1_200_000,
+                (int)ClassIDType.Mesh);
+
+            var siblingParts = new List<ModelGroupMeshInfo>
+            {
+                new ModelGroupMeshInfo(
+                    "modelgroup:animator:CAB-base#1",
+                    "CAB-base#501",
+                    "CAB-base#601",
+                    "SkinnedMeshRenderer",
+                    "CAB-base#701",
+                    "M_L_Eye",
+                    1,
+                    100,
+                    "Animator descendant",
+                    null,
+                    "M_L_Eye",
+                    501,
+                    8_000,
+                    (int)ClassIDType.Mesh),
+                new ModelGroupMeshInfo(
+                    "modelgroup:animator:CAB-base#1",
+                    "CAB-base#502",
+                    "CAB-base#602",
+                    "SkinnedMeshRenderer",
+                    "CAB-base#702",
+                    "M_R_Eye",
+                    2,
+                    100,
+                    "Animator descendant",
+                    null,
+                    "M_R_Eye",
+                    502,
+                    8_000,
+                    (int)ClassIDType.Mesh),
+                new ModelGroupMeshInfo(
+                    "modelgroup:animator:CAB-base#1",
+                    "CAB-base#503",
+                    "CAB-base#603",
+                    "SkinnedMeshRenderer",
+                    "CAB-base#703",
+                    "M_CoatBK",
+                    3,
+                    100,
+                    "Animator descendant",
+                    null,
+                    "M_CoatBK",
+                    503,
+                    50_000,
+                    (int)ClassIDType.Mesh)
+            };
+
+            var unresolvedLocalRenderers = new List<(string GameObjectName, string GameObjectAssetId, string RendererAssetId, string RendererType)>
+            {
+                ("M_L_Eye", "CAB-variant#801", "CAB-variant#901", "SkinnedMeshRenderer"),
+                ("M_R_Eye", "CAB-variant#802", "CAB-variant#902", "SkinnedMeshRenderer"),
+                ("M_CoatBK", "CAB-variant#803", "CAB-variant#903", "SkinnedMeshRenderer")
+            };
+
+            var supplemented = MainWindow.SupplementMissingEyePartsFromSiblingParts(
+                variantGroupId,
+                new[] { variantBodyPart },
+                unresolvedLocalRenderers,
+                siblingParts);
+
+            // Must add M_L_Eye and M_R_Eye using sibling MeshAssetIds while keeping variant's RendererAssetIds,
+            // and must NEVER graft non-eye outfit mesh M_CoatBK onto the variant.
+            Assert.Equal(3, supplemented.Count);
+            Assert.Equal("CAB-variant#100", supplemented[0].MeshAssetId);
+            Assert.Equal("M_L_Eye", supplemented[1].GameObjectName);
+            Assert.Equal("CAB-base#501", supplemented[1].MeshAssetId);
+            Assert.Equal("CAB-variant#901", supplemented[1].RendererAssetId);
+            Assert.Equal("M_R_Eye", supplemented[2].GameObjectName);
+            Assert.Equal("CAB-base#502", supplemented[2].MeshAssetId);
+            Assert.Equal("CAB-variant#902", supplemented[2].RendererAssetId);
+            Assert.DoesNotContain(supplemented, p => string.Equals(p.GameObjectName, "M_CoatBK", StringComparison.OrdinalIgnoreCase));
+        }
+
+        [Fact]
         public void SelectRepresentativeModelGroupMesh_PrefersMainBodyMeshOverLargerDecalMesh_AndPartitionsDrawOrder()
         {
             var decalPartFirst = new ModelGroupMeshInfo(
