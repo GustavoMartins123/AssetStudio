@@ -34,14 +34,24 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     private static extern int D3D11CreateDevice(nint adapter, uint driverType, nint software, uint flags,
         uint* featureLevels, uint featureLevelCount, uint sdkVersion, nint* device, uint* featureLevel, nint* context);
 
-    internal nint CreateBuffer<T>(ReadOnlySpan<T> data, uint flags, bool mutable = false) where T : unmanaged
+    internal nint CreateBuffer<T>(ReadOnlySpan<T> data, uint flags, bool mutable = false, bool structured = false) where T : unmanaged
     {
-        var desc = new BufferDesc { ByteWidth = checked((uint)(data.Length * sizeof(T))), Usage = mutable ? 0u : 1u, BindFlags = flags };
+        var desc = new BufferDesc
+        {
+            ByteWidth = checked((uint)(data.Length * sizeof(T))), Usage = mutable ? 0u : 1u, BindFlags = flags,
+            StructureStride = structured ? (uint)sizeof(T) : 0, MiscFlags = structured ? 0x40u : 0
+        };
         fixed (T* pixels = data)
         {
             var initialData = new SubresourceData { Data = pixels };
             return CreateBuffer(desc, &initialData);
         }
+    }
+
+    internal nint CreateStructuredView(nint buffer, uint count)
+    {
+        var desc = new ShaderViewDesc { Dimension = 1, MipLevels = count }; // BUFFER union: first element, number of elements.
+        return CreateView(7, buffer, "create a structured buffer view", &desc);
     }
 
     private nint CreateBuffer(BufferDesc desc, SubresourceData* initialData = null)
@@ -58,12 +68,11 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
             ByteWidth = checked(capacity * stride), StructureStride = stride,
             BindFlags = 0x88, MiscFlags = 0x40 // Shader resource, unordered access and structured buffer.
         });
-        var shader = new ShaderViewDesc { Dimension = 1, MipLevels = capacity }; // BUFFER union: first element, number of elements.
         var append = new BufferUavDesc { Dimension = 1, Count = capacity, Flags = 2 }; // D3D11_BUFFER_UAV_FLAG_APPEND.
         uint* args = stackalloc uint[] { 0, 1, 0, 0 };
         var initial = new SubresourceData { Data = args };
         nint indirect = CreateBuffer(new BufferDesc { ByteWidth = 16, MiscFlags = 0x10 }, &initial);
-        return (CreateView(7, points, "create the structured buffer view", &shader),
+        return (CreateStructuredView(points, capacity),
             CreateView(8, points, "create the append buffer view", &append), indirect);
     }
 
@@ -211,9 +220,11 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         }
     }
 
-    internal void SetPass(nint surface, nint depth, nint blendState, nint depthState, byte stencilReference, nint rasterizerState, int size)
+    internal void SetPass(nint surface, nint depth, nint blendState, nint depthState, byte stencilReference, nint rasterizerState,
+        int size, nint secondarySurface = 0)
     {
-        ((delegate* unmanaged[Stdcall]<nint, uint, nint*, nint, void>)Slot(_context, 33))(_context, 1, &surface, depth);
+        nint* outputs = stackalloc nint[] { surface, secondarySurface };
+        ((delegate* unmanaged[Stdcall]<nint, uint, nint*, nint, void>)Slot(_context, 33))(_context, secondarySurface == 0 ? 1u : 2u, outputs, depth);
         ((delegate* unmanaged[Stdcall]<nint, nint, float*, uint, void>)Slot(_context, 35))(_context, blendState, null, uint.MaxValue);
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 36))(_context, depthState, stencilReference);
         ((delegate* unmanaged[Stdcall]<nint, nint, void>)Slot(_context, 43))(_context, rasterizerState);

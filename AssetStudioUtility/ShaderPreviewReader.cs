@@ -14,6 +14,7 @@ namespace AssetStudio
         public abstract IReadOnlyDictionary<string, string> TextureDefaults { get; }
         public abstract IReadOnlyDictionary<string, string> Dependencies { get; }
         public abstract IReadOnlySet<string> PropertyKeywords { get; }
+        public virtual IReadOnlyList<string> DefaultKeywords => [];
         public abstract IReadOnlyList<ShaderPreviewSubShader> SubShaders { get; }
 
         public static bool SupportsVersion(int[] version) => version is [5, 3, ..] or [2017, 4, ..] or [2018, 2, ..];
@@ -68,20 +69,33 @@ namespace AssetStudio
 
         private static string FormatKeywords(IEnumerable<string> keywords) => string.Join(", ", keywords.Order(StringComparer.Ordinal));
 
-        internal static void AddPropertyKeywords(HashSet<string> keywords, string name, string attribute, IReadOnlyList<string> arguments)
+        internal static string? AddPropertyKeywords(HashSet<string> keywords, string name, string attribute, IReadOnlyList<string> arguments,
+            float? defaultValue = null)
         {
             string property = name.ToUpperInvariant();
             if (attribute == "KeywordEnum")
             {
-                foreach (string argument in arguments)
+                int selected = defaultValue is { } value && float.IsFinite(value) ? (int)value : -1;
+                string? enabled = null;
+                for (int option = 0; option < arguments.Count; option++)
                 {
-                    keywords.Add(property + "_" + argument.ToUpperInvariant());
+                    string keyword = property + "_" + arguments[option].Replace(' ', '_').ToUpperInvariant();
+                    keywords.Add(keyword);
+                    if (option == selected)
+                    {
+                        enabled = keyword;
+                    }
                 }
+                return enabled;
             }
-            else if (attribute is "Toggle" or "ToggleOff")
+            if (attribute is "Toggle" or "ToggleOff")
             {
-                keywords.Add(arguments.Count == 1 ? arguments[0].Trim('"') : property + (attribute == "ToggleOff" ? "_OFF" : "_ON"));
+                bool toggleOff = attribute == "ToggleOff";
+                string keyword = arguments.Count == 1 ? arguments[0].Trim('"') : property + (toggleOff ? "_OFF" : "_ON");
+                keywords.Add(keyword);
+                return defaultValue is { } value && (MathF.Abs(value) > 0.001f) != toggleOff ? keyword : null;
             }
+            return null;
         }
     }
 }

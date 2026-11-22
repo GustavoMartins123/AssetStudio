@@ -13,7 +13,9 @@ internal enum ImageEffectPass
 {
     BrightFilter, LensFlare, BloomComposite, BloomStretch,
     Vignette, ChromaticAberration, SeparableBlur, Antialiasing, GlobalFog, Overlay, RenderTargetDisplay,
-    SunShafts, DepthOfField, Bokeh, ReprojectionMotion, ObjectMotion, MotionBlur, Thicken, Noise, SkinDeformation
+    SunShafts, DepthOfField, Bokeh, ReprojectionMotion, ObjectMotion, MotionBlur, Thicken, Noise, SkinDeformation,
+    PostProcessingGrain, PostProcessingBloom, PostProcessingMotionBlur, VideoDecode, ExposureHistogram, TemporalAntialiasing,
+    ScreenSpaceReflection
 }
 
 internal sealed class ImageEffectPreview
@@ -35,6 +37,11 @@ internal sealed class ImageEffectPreview
     {
         _pass = pass;
         int inputSize = frameSize / 4;
+        if (pass == ImageEffectPass.VideoDecode)
+        {
+            SerializedVideoShaderPreview.CreatePlanes(_textures, frameSize);
+            return;
+        }
         _textures.Add(MainTexture, CreateTexture(inputSize));
         if (pass == ImageEffectPass.BloomComposite)
         {
@@ -265,10 +272,11 @@ internal sealed class ImageEffectPreview
     }
 
     internal static bool HasAnimatedInput(ImageEffectPass? pass) =>
-        pass is ImageEffectPass.BrightFilter or ImageEffectPass.LensFlare or ImageEffectPass.BloomComposite or ImageEffectPass.BloomStretch;
+        pass is ImageEffectPass.BrightFilter or ImageEffectPass.LensFlare or ImageEffectPass.BloomComposite or ImageEffectPass.BloomStretch or ImageEffectPass.VideoDecode;
 
     internal static bool ProvidesTexture(ImageEffectPass? pass, string name) =>
-        HasAnimatedInput(pass) && (name == MainTexture || (pass == ImageEffectPass.BloomComposite && name == CameraColor));
+        HasAnimatedInput(pass) && (name == MainTexture || (pass == ImageEffectPass.BloomComposite && name == CameraColor) ||
+            (pass == ImageEffectPass.VideoDecode && name is SerializedVideoShaderPreview.BlueDifference or SerializedVideoShaderPreview.RedDifference));
 
     internal static void SetParameters(ImageEffectPass pass, IDictionary<string, NumericsVector4> values, int frameSize)
     {
@@ -349,6 +357,11 @@ internal sealed class ImageEffectPreview
 
     internal void RenderInputs(ShaderPreviewCamera camera, float time, CancellationToken cancellationToken)
     {
+        if (_pass == ImageEffectPass.VideoDecode)
+        {
+            SerializedVideoShaderPreview.Render(_textures, time, cancellationToken);
+            return;
+        }
         float phase = time * (MathF.Tau / 4) + camera.Yaw;
         float lightX = 0.27f + 0.08f * MathF.Sin(phase);
         float lightY = 0.37f + 0.1f * MathF.Sin(camera.Pitch * 0.5f + phase);

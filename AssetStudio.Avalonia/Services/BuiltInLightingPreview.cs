@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using NumericsMatrix = System.Numerics.Matrix4x4;
+using NumericsVector2 = System.Numerics.Vector2;
 using NumericsVector3 = System.Numerics.Vector3;
 using NumericsVector4 = System.Numerics.Vector4;
 
@@ -13,6 +14,7 @@ internal enum BuiltInLightingPass { None, CollectShadows, DeferredLighting }
 internal sealed class BuiltInLightingPreview
 {
     internal const string CameraDepth = "_CameraDepthTexture";
+    internal const string CameraDepthNormals = "_CameraDepthNormalsTexture";
     internal const string ShadowMap = "_ShadowMapTexture";
     private const string CameraNormals = "_CameraNormalsTexture";
     private const string Diffuse = "_CameraGBufferTexture0";
@@ -29,11 +31,16 @@ internal sealed class BuiltInLightingPreview
     private readonly NumericsMatrix _shadowProjection;
     private readonly NumericsVector3 _lightDirection;
     private bool _hasShadowMap;
+    private readonly bool _reversedDepth;
+    private readonly NumericsVector3 _ambientLinear;
 
-    internal BuiltInLightingPreview(IReadOnlySet<string> inputs, ShaderPreviewLight light, int size, ImageEffectPass? effect)
+    internal BuiltInLightingPreview(IReadOnlySet<string> inputs, ShaderPreviewLight light, int size, ImageEffectPass? effect,
+        bool reversedDepth = false, NumericsVector3 ambientLinear = default)
     {
         _size = size;
         _effect = effect;
+        _reversedDepth = reversedDepth;
+        _ambientLinear = ambientLinear;
         _lightDirection = light.Direction;
         if (effect == ImageEffectPass.SkinDeformation)
         {
@@ -46,11 +53,15 @@ internal sealed class BuiltInLightingPreview
             {
                 CameraDepth => NewTexture(size, 41 /* R32_FLOAT */),
                 ShadowMap => NewTexture(size * 2, 41, comparison: true),
-                CameraNormals or Diffuse or Specular or Normal => NewTexture(size, 28 /* R8G8B8A8_UNORM */),
+                CameraDepthNormals or CameraNormals or Diffuse or Specular or Normal => NewTexture(size, 28 /* R8G8B8A8_UNORM */),
                 MotionPreview.MotionTexture when effect == ImageEffectPass.MotionBlur => NewTexture(size, 28),
-                ImageEffectPreview.MainTexture when effect != ImageEffectPass.Bokeh => NewTexture(size, 28) with { Filter = 1 },
-                ImageEffectPreview.MainTexture or ImageEffectPreview.BokehBlurredColor when effect == ImageEffectPass.Bokeh =>
-                    new ShaderPreviewTexture(size, size, 1, 10, 8, false, new byte[size * size * 8], 1, 1, 1, 0),
+                MotionPreview.UnityMotionTexture when MotionPreview.UsesUnityMotionTexture(effect) => NewTexture(size, 34 /* R16G16_FLOAT */),
+                ScreenSpaceReflectionPreview.CameraReflections when effect == ImageEffectPass.ScreenSpaceReflection => CreateHdrTexture(size),
+                ImageEffectPreview.MainTexture when UsesHdrColor(effect) =>
+                    CreateHdrTexture(size),
+                ImageEffectPreview.MainTexture => NewTexture(size, 28) with { Filter = 1 },
+                ImageEffectPreview.BokehBlurredColor when effect == ImageEffectPass.Bokeh =>
+                    CreateHdrTexture(size),
                 _ => throw new ArgumentException($"Unknown Built-in camera texture '{input}'.", nameof(inputs))
             });
         }
@@ -66,10 +77,27 @@ internal sealed class BuiltInLightingPreview
     internal IReadOnlyDictionary<string, ShaderPreviewTexture> Textures => _textures;
     internal NumericsMatrix WorldToShadow { get; }
 
-    internal static bool IsSurfaceTexture(string name) => name is CameraNormals or Diffuse or Specular or Normal;
+    internal static bool IsSurfaceTexture(string name) => name is CameraDepthNormals or CameraNormals or Diffuse or Specular or Normal;
+
+    private static bool UsesHdrColor(ImageEffectPass? effect) => effect is ImageEffectPass.Bokeh or
+        ImageEffectPass.PostProcessingBloom or ImageEffectPass.ExposureHistogram or ImageEffectPass.TemporalAntialiasing or
+        ImageEffectPass.ScreenSpaceReflection;
+
+    private static ShaderPreviewTexture CreateHdrTexture(int size) =>
+        new(size, size, 1, 10, 8, false, new byte[size * size * 8], 1, 1, 1, 0);
+
+    internal static NumericsMatrix DepthProjection(NumericsMatrix projection, bool reversedDepth) => reversedDepth
+        ? projection * NumericsMatrix.CreateScale(1, 1, -1) * NumericsMatrix.CreateTranslation(0, 0, 1) : projection;
+
+    internal static NumericsVector4 DepthParameters(bool reversedDepth)
+    {
+        const float near = ShaderPreviewCamera.Near, far = ShaderPreviewCamera.Far;
+        return reversedDepth ? new NumericsVector4(far / near - 1, 1, (far / near - 1) / far, 1 / far) :
+            new NumericsVector4(1 - far / near, far / near, (1 - far / near) / far, 1 / near);
+    }
 
     internal void RenderInputs(NumericsMatrix view, NumericsMatrix projection, NumericsVector3 eye, float time,
-        MotionPreviewFrame? motion, CancellationToken token)
+        MotionPreviewFrame? motion, CancellationToken token, NumericsVector2 jitter = default)
     {
         if (_effect == ImageEffectPass.SkinDeformation)
         {
@@ -83,29 +111,34 @@ internal sealed class BuiltInLightingPreview
         var specular = GetPixels(Specular);
         var normals = GetPixels(Normal);
         var cameraNormals = GetPixels(CameraNormals);
+        var depthNormals = GetPixels(CameraDepthNormals);
+        var reflections = MemoryMarshal.Cast<byte, Half>(GetPixels(ScreenSpaceReflectionPreview.CameraReflections));
         var color = GetPixels(ImageEffectPreview.MainTexture);
         var motionVectors = GetPixels(MotionPreview.MotionTexture);
-        bool motionBlur = _effect == ImageEffectPass.MotionBlur;
+        var unityMotionVectors = MemoryMarshal.Cast<byte, Half>(GetPixels(MotionPreview.UnityMotionTexture));
+        bool motionBlur = MotionPreview.IsMotionBlur(_effect);
         if (motionBlur && !motion.HasValue)
         {
             throw new InvalidOperationException("The motion blur preview needs a camera and mesh pose for the current frame.");
         }
         var sphereCenter = motionBlur ? motion!.Value.Model.Translation : NumericsVector3.Zero;
         var sphereScale = motionBlur ? motion!.Value.Deformation : NumericsVector3.One;
-        bool needsNormal = !normals.IsEmpty || !cameraNormals.IsEmpty || !color.IsEmpty;
+        bool needsNormal = !normals.IsEmpty || !cameraNormals.IsEmpty || !depthNormals.IsEmpty || !color.IsEmpty;
         bool needsAlbedo = !diffuse.IsEmpty || !color.IsEmpty;
         var sun = _effect == ImageEffectPass.SunShafts ? ImageEffectPreview.SunPosition(view, projection, time) : default;
         bool bokeh = _effect == ImageEffectPass.Bokeh;
         var curve = bokeh ? ImageEffectPreview.DepthOfFieldCurve(view) : default;
-        var hdr = bokeh ? MemoryMarshal.Cast<byte, Half>(color) : Span<Half>.Empty;
+        var hdr = UsesHdrColor(_effect) ? MemoryMarshal.Cast<byte, Half>(color) : Span<Half>.Empty;
 
         for (int y = 0; y < _size; y++)
         {
             token.ThrowIfCancellationRequested();
-            float rayY = ClipY(y, _size) / projection.M22;
+            float clipY = ClipY(y, _size) - 2 * jitter.Y;
+            float rayY = clipY / projection.M22;
             for (int x = 0; x < _size; x++)
             {
-                float rayX = ClipX(x, _size) / projection.M11;
+                float clipX = ClipX(x, _size) + 2 * jitter.X;
+                float rayX = clipX / projection.M11;
                 var ray = NumericsVector3.TransformNormal(new NumericsVector3(rayX, rayY, -1), viewToWorld);
                 int index = y * _size + x;
                 int offset = index * 4;
@@ -115,11 +148,11 @@ internal sealed class BuiltInLightingPreview
                 byte objectId = sphere && visible ? (byte)1 : (byte)0;
                 if (!depths.IsEmpty)
                 {
-                    depths[index] = depth;
+                    depths[index] = _reversedDepth ? 1 - depth : depth;
                 }
-                if (!motionVectors.IsEmpty && motion is { } motionFrame)
+                if ((!motionVectors.IsEmpty || !unityMotionVectors.IsEmpty) && motion is { } motionFrame)
                 {
-                    var clip = new NumericsVector4(ClipX(x, _size), -ClipY(y, _size), depth, 1);
+                    var clip = new NumericsVector4(clipX, -clipY, depth, 1);
                     NumericsVector4 oldClip;
                     if (objectId != 0)
                     {
@@ -131,12 +164,22 @@ internal sealed class BuiltInLightingPreview
                     {
                         oldClip = NumericsVector4.Transform(clip, motionFrame.Reprojection);
                     }
-                    float dx = (clip.X - oldClip.X / oldClip.W) * motionFrame.Scale;
-                    float dy = (clip.Y - oldClip.Y / oldClip.W) * motionFrame.Scale;
-                    float speed = MathF.Sqrt(dx * dx + dy * dy);
-                    float velocity = Math.Clamp((speed - MotionPreview.MinVelocity) / (MotionPreview.MaxVelocity - MotionPreview.MinVelocity), 0, 1);
-                    WriteRgba(motionVectors[offset..], EncodeNormal(speed == 0 ? 0 : dx / speed),
-                        EncodeNormal(speed == 0 ? 0 : dy / speed), (byte)MathF.Round(velocity * 255), objectId);
+                    float dx = clip.X - oldClip.X / oldClip.W;
+                    float dy = clip.Y - oldClip.Y / oldClip.W;
+                    if (!motionVectors.IsEmpty)
+                    {
+                        dx *= motionFrame.Scale;
+                        dy *= motionFrame.Scale;
+                        float speed = MathF.Sqrt(dx * dx + dy * dy);
+                        float velocity = Math.Clamp((speed - MotionPreview.MinVelocity) / (MotionPreview.MaxVelocity - MotionPreview.MinVelocity), 0, 1);
+                        WriteRgba(motionVectors[offset..], EncodeNormal(speed == 0 ? 0 : dx / speed),
+                            EncodeNormal(speed == 0 ? 0 : dy / speed), (byte)MathF.Round(velocity * 255), objectId);
+                    }
+                    else
+                    {
+                        unityMotionVectors[index * 2] = (Half)(dx * 0.5f);
+                        unityMotionVectors[index * 2 + 1] = (Half)(dy * 0.5f);
+                    }
                 }
                 byte gloss = sphere ? (byte)160 : (byte)42;
                 var normal = -_lightDirection;
@@ -162,6 +205,15 @@ internal sealed class BuiltInLightingPreview
                     WriteRgba(specular[offset..], visible ? reflectance : (byte)0, visible ? reflectance : (byte)0,
                         visible ? reflectance : (byte)0, visible ? gloss : (byte)0);
                 }
+                if (!reflections.IsEmpty)
+                {
+                    // The camera's ambient probe is uniform. Apply the same surface reflectance carried by GBuffer1.
+                    var reflection = visible ? _ambientLinear * ((sphere ? 52 : 9) / 255f) : NumericsVector3.Zero;
+                    reflections[offset] = (Half)reflection.X;
+                    reflections[offset + 1] = (Half)reflection.Y;
+                    reflections[offset + 2] = (Half)reflection.Z;
+                    reflections[offset + 3] = (Half)1;
+                }
                 if (!normals.IsEmpty)
                 {
                     WriteRgba(normals[offset..], EncodeNormal(normal.X), EncodeNormal(normal.Y), EncodeNormal(normal.Z), 255);
@@ -171,7 +223,17 @@ internal sealed class BuiltInLightingPreview
                     WriteRgba(cameraNormals[offset..], EncodeNormal(normal.X), EncodeNormal(normal.Y), EncodeNormal(normal.Z),
                         visible ? gloss : (byte)0);
                 }
-                if (bokeh)
+                if (!depthNormals.IsEmpty)
+                {
+                    var viewNormal = visible ? NumericsVector3.TransformNormal(normal, view) : NumericsVector3.UnitZ;
+                    // EncodeDepthNormal packs the perspective normal in RG and linear depth in BA.
+                    float linearDepth = visible ? -NumericsVector3.Transform(point, view).Z / ShaderPreviewCamera.Far : 1 - 1f / 65025;
+                    float scaledDepth = Math.Clamp(linearDepth, 0, 1 - 1f / 65025) * 255;
+                    float scale = 0.5f / (1.7777f * MathF.Max(0.00001f, 1 + viewNormal.Z));
+                    WriteRgba(depthNormals[offset..], EncodeNormal(viewNormal.X * scale * 2), EncodeNormal(viewNormal.Y * scale * 2),
+                        (byte)scaledDepth, (byte)MathF.Round((scaledDepth - MathF.Floor(scaledDepth)) * 255));
+                }
+                if (!hdr.IsEmpty)
                 {
                     var rgb = new NumericsVector3(0.12f, 0.16f, 0.22f);
                     if (visible)
@@ -191,7 +253,7 @@ internal sealed class BuiltInLightingPreview
                     hdr[offset] = (Half)rgb.X;
                     hdr[offset + 1] = (Half)rgb.Y;
                     hdr[offset + 2] = (Half)rgb.Z;
-                    hdr[offset + 3] = (Half)coc;
+                    hdr[offset + 3] = bokeh ? (Half)coc : (Half)1;
                 }
                 else if (!color.IsEmpty)
                 {
@@ -199,7 +261,7 @@ internal sealed class BuiltInLightingPreview
                     {
                         float lighting = 0.35f + 0.65f * Math.Max(0, NumericsVector3.Dot(normal, _lightDirection));
                         WriteRgba(color[offset..], (byte)(r * lighting), (byte)(g * lighting), (byte)(b * lighting),
-                            motionBlur ? objectId : (byte)255);
+                            _effect == ImageEffectPass.MotionBlur ? objectId : (byte)255);
                     }
                     else
                     {
@@ -216,7 +278,7 @@ internal sealed class BuiltInLightingPreview
                         else
                         {
                             WriteRgba(color[offset..], sky, (byte)(sky + 12), (byte)(sky + 28),
-                                motionBlur ? (byte)0 : (byte)255);
+                                _effect == ImageEffectPass.MotionBlur ? (byte)0 : (byte)255);
                         }
                     }
                 }

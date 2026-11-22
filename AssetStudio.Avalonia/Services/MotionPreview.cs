@@ -14,6 +14,7 @@ internal readonly record struct MotionPreviewFrame(NumericsMatrix Model, Numeric
 internal static class MotionPreview
 {
     internal const string MotionTexture = "_MotionTex";
+    internal const string UnityMotionTexture = "_CameraMotionVectorsTexture";
     internal const string BoneTexture = "_AM_BONE_TEX";
     internal const string BoneIndices = "_AM_BONE_INDEX_TEX";
     internal const string BaseVertices = "_AM_BASE_VERTEX0_TEX";
@@ -22,7 +23,15 @@ internal static class MotionPreview
     internal const float FrameInterval = 1f / ShaderPreviewService.FramesPerSecond;
 
     internal static bool UsesHistory(ImageEffectPass? effect) =>
-        effect is ImageEffectPass.ReprojectionMotion or ImageEffectPass.ObjectMotion or ImageEffectPass.MotionBlur;
+        UsesCameraHistory(effect) || effect == ImageEffectPass.ObjectMotion;
+
+    internal static bool UsesCameraHistory(ImageEffectPass? effect) => effect is ImageEffectPass.ReprojectionMotion or
+        ImageEffectPass.TemporalAntialiasing || IsMotionBlur(effect);
+
+    internal static bool UsesUnityMotionTexture(ImageEffectPass? effect) => effect is ImageEffectPass.PostProcessingMotionBlur or
+        ImageEffectPass.TemporalAntialiasing;
+
+    internal static bool IsMotionBlur(ImageEffectPass? effect) => effect is ImageEffectPass.MotionBlur or ImageEffectPass.PostProcessingMotionBlur;
 
     internal static bool IsSkinTexture(string name) => name is BoneTexture or BoneIndices or BaseVertices;
 

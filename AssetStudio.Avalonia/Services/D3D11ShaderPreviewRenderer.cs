@@ -24,6 +24,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         ShaderPreviewCamera.Near, ShaderPreviewCamera.Far);
 
     private static readonly (Vertex[] Vertices, uint[] Indices) Plane = BuildPlane();
+    private static readonly (Vertex[] Vertices, uint[] Indices) TextPlane = BuildTextPlane();
     private static readonly (Vertex[] Vertices, uint[] Indices) ScreenQuad = BuildScreenQuad();
     private static readonly (Vertex[] Vertices, uint[] Indices) FogQuad = BuildScreenQuad(includeCornerIndices: true);
     private static readonly (Vertex[] Vertices, uint[] Indices) Sphere = BuildSphere();
@@ -56,6 +57,12 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private readonly Dictionary<(ShaderPreviewGeometry Geometry, NumericsVector4? Color), (nint Vertices, nint Indices, int Count)> _drawMeshes = new();
     private nint _billboardVertices;
     private nint _grabSampler;
+    private nint _exposureHistogram, _exposureHistogramView;
+    private static readonly ShaderPreviewRenderTarget[] TemporalHistory =
+        [new("Temporal antialiasing history A", FrameSize), new("Temporal antialiasing history B", FrameSize)];
+    private int _historyReadIndex;
+    private bool _historyReady;
+    private System.Numerics.Vector2 _lightingJitter;
 
     internal D3D11ShaderPreviewRenderer(ShaderPreviewScene scene)
     {
@@ -114,7 +121,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             }
             if (scene.CameraTextures.Count != 0)
             {
-                _lighting = new BuiltInLightingPreview(scene.CameraTextures, scene.Lights[0], FrameSize, scene.ImageEffect);
+                _lighting = new BuiltInLightingPreview(scene.CameraTextures, scene.Lights[0], FrameSize, scene.ImageEffect,
+                    scene.SerializedShader, scene.AmbientLinear);
                 _cameraTextures = _lighting.Textures;
             }
             else if (scene.ImageEffect is { } effect && ImageEffectPreview.HasAnimatedInput(effect))
@@ -136,7 +144,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         token.ThrowIfCancellationRequested();
         const float motionStart = 0.42f;
         float motionTime = time + motionStart;
-        bool reproject = _scene.ImageEffect is ImageEffectPass.ReprojectionMotion or ImageEffectPass.MotionBlur;
+        bool motionBlur = MotionPreview.IsMotionBlur(_scene.ImageEffect);
+        bool reproject = MotionPreview.UsesCameraHistory(_scene.ImageEffect);
+        bool temporal = _scene.ImageEffect == ImageEffectPass.TemporalAntialiasing;
+        var jitter = temporal ? TemporalAntialiasingPreview.Jitter(time, FrameSize) : default;
         var renderCamera = reproject ? MotionPreview.CameraAtTime(camera, motionTime) : camera;
         var (view, eye) = CameraView(renderCamera, _scene.Geometry == ShaderPreviewGeometry.Skybox);
         MotionPreviewFrame? motion = null;
@@ -154,7 +165,6 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 previousCamera = MotionPreview.CameraAtTime(previousCamera, previousTime + motionStart);
             }
             var (previousView, _) = CameraView(previousCamera, skybox: false);
-            bool motionBlur = _scene.ImageEffect == ImageEffectPass.MotionBlur;
             var frame = MotionPreview.CreateFrame(view, previousView, Projection, motionTime, previousTime + motionStart, scale,
                 motionBlur || _scene.ImageEffect == ImageEffectPass.ObjectMotion, motionBlur || _motionVertices != null);
             motion = frame;
@@ -182,13 +192,25 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         }
         if (_lighting is { } lighting && (_lightingCamera != renderCamera ||
             (_scene.ImageEffect is ImageEffectPass.SunShafts or ImageEffectPass.SkinDeformation && _lightingTime != time) ||
-            (_scene.ImageEffect == ImageEffectPass.MotionBlur && _lightingMotion != motion)))
+            (MotionPreview.UsesUnityMotionTexture(_scene.ImageEffect) || motionBlur) && _lightingMotion != motion ||
+            _lightingJitter != jitter))
         {
-            lighting.RenderInputs(view, Projection, eye, time, motion, token);
+            lighting.RenderInputs(view, Projection, eye, time, motion, token, jitter);
             UploadCameraTextures(lighting.Textures);
+            if (_scene.ImageEffect == ImageEffectPass.ExposureHistogram)
+            {
+                UpdateExposureHistogram(lighting.Textures[ImageEffectPreview.MainTexture], token);
+            }
             _lightingCamera = renderCamera;
             _lightingTime = time;
             _lightingMotion = motion;
+            _lightingJitter = jitter;
+        }
+        if (temporal && (!_historyReady || resetMotionHistory || time < _lastMotionTime))
+        {
+            _device.ClearBindings();
+            var history = GetRenderTarget(TemporalHistory[_historyReadIndex]).Texture;
+            _device.CopyColor(_textures[ImageEffectPreview.MainTexture].Image, history.Image, 10, multisampled: false);
         }
         if (_animatedEffect is { } effect)
         {
@@ -255,10 +277,19 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             _lastMotionCamera = camera;
             _lastMotionTime = time;
         }
+        if (temporal)
+        {
+            _historyReadIndex ^= 1;
+            _historyReady = true;
+        }
         return new ShaderPreviewFrame(FrameSize, FrameSize, pixels);
 
         void DrawPass(ShaderPreviewDraw draw)
         {
+            if (temporal)
+            {
+                draw = draw with { Values = new Dictionary<string, NumericsVector4> { ["_Jitter"] = new(jitter, 0, 0) } };
+            }
             LegacyShaderPreviewPass pass = draw.Pass;
             NumericsMatrix4x4? billboardTransform = null;
             NumericsVector4 billboardColor = default;
@@ -288,7 +319,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     ValidateStage(stage, ShaderPreviewProgramKind.Geometry, draw);
                     geometry = _device.CreateShader(stage.Bytecode, ShaderPreviewProgramKind.Geometry);
                 }
-                gpu = (CreateInputLayout(_device, pass.Vertex.Bytecode), _device.CreateShader(pass.Vertex.Bytecode, ShaderPreviewProgramKind.Vertex),
+                bool usesSecondaryUv = (draw.Geometry ?? _scene.Geometry) == ShaderPreviewGeometry.Text ||
+                    _scene.SerializedShader && _scene.LightingPass == BuiltInLightingPass.CollectShadows;
+                gpu = (CreateInputLayout(_device, pass.Vertex.Bytecode, usesSecondaryUv),
+                    _device.CreateShader(pass.Vertex.Bytecode, ShaderPreviewProgramKind.Vertex),
                     _device.CreateShader(pass.Fragment.Bytecode, ShaderPreviewProgramKind.Pixel), geometry, CreateBlend(_device, pass.State),
                     CreateDepth(_device, pass.State), _device.CreateRasterizerState(new RasterizerDesc
                     {
@@ -308,8 +342,9 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 _device.ClearColor(targetView);
             }
             nint depthView = draw.Output == null ? _depth : 0;
+            nint secondaryView = temporal ? GetRenderTarget(TemporalHistory[_historyReadIndex ^ 1]).View : 0;
             _device.SetPass(targetView, depthView, gpu.Blend, gpu.Depth,
-                pass.State.Stencil?.Reference ?? 0, gpu.Rasterizer, size);
+                pass.State.Stencil?.Reference ?? 0, gpu.Rasterizer, size, secondaryView);
             if (draw.PointPass == ShaderPreviewPointPass.Collect)
             {
                 _device.SetAppendTarget(targetView, depthView, _bokehPoints.AppendView);
@@ -367,12 +402,17 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             var slots = new HashSet<int>();
             foreach (var binding in stage.StructuredBuffers)
             {
-                if (draw.PointPass != ShaderPreviewPointPass.Draw || kind != ShaderPreviewProgramKind.Vertex ||
-                    binding.Name != "pointBuffer" || binding.Slot != 0 || !slots.Add(binding.Slot))
+                nint view = binding.Name switch
+                {
+                    "pointBuffer" when draw.PointPass == ShaderPreviewPointPass.Draw && kind == ShaderPreviewProgramKind.Vertex => _bokehPoints.ShaderView,
+                    ExposureHistogramPreview.BufferName when _scene.ImageEffect == ImageEffectPass.ExposureHistogram => _exposureHistogramView,
+                    _ => 0
+                };
+                if (view == 0 || binding.Slot != 0 || !slots.Add(binding.Slot))
                 {
                     throw new NotSupportedException($"Unsupported structured buffer '{binding.Name}'.");
                 }
-                _device.SetTexture(_bokehPoints.ShaderView, binding.Slot, kind);
+                _device.SetTexture(view, binding.Slot, kind);
             }
             var samplers = new Dictionary<int, (int Filter, int Wrap, int Anisotropy, float Bias, bool Comparison)>();
             foreach (var binding in stage.Textures)
@@ -391,11 +431,16 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                         throw new InvalidDataException($"Render target '{input.Name}' is unavailable before this pass.");
                     }
                     gpu = GetRenderTarget(input).Texture;
-                    sampling = (1, 1, 1, 0, false);
+                    sampling = (input.Filter, 1, 1, 0, false);
                 }
                 else if (capturedNames.Contains(binding.Name) && _grabs.TryGetValue(binding.Name, out var grab))
                 {
                     gpu = new GpuTexture(grab.Texture, grab.View, _grabSampler);
+                    sampling = (1, 1, 1, 0, false);
+                }
+                else if (temporal && binding.Name == TemporalAntialiasingPreview.HistoryTexture)
+                {
+                    gpu = GetRenderTarget(TemporalHistory[_historyReadIndex]).Texture;
                     sampling = (1, 1, 1, 0, false);
                 }
                 else
@@ -434,6 +479,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     {
         ShaderPreviewGeometry.Particles => (new Vertex[ParticleCount * 4], ParticleIndices),
         ShaderPreviewGeometry.Plane => Plane,
+        ShaderPreviewGeometry.Text => TextPlane,
         ShaderPreviewGeometry.ScreenQuad => _scene.ImageEffect == ImageEffectPass.GlobalFog ? FogQuad : ScreenQuad,
         ShaderPreviewGeometry.Skybox or ShaderPreviewGeometry.Volume => Skybox,
         ShaderPreviewGeometry.Sphere => Sphere,
@@ -640,7 +686,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 Format = 10, // R16G16B16A16_FLOAT, to retain signed focus values and HDR color.
                 SampleCount = 1, BindFlags = BindShaderResource | BindRenderTarget
             });
-            var texture = new GpuTexture(image, _device.CreateShaderView(image), CreateSampler(_device, 1, 1, 1, 0));
+            var texture = new GpuTexture(image, _device.CreateShaderView(image), CreateSampler(_device, target.Filter, 1, 1, 0));
             resource = (texture, _device.CreateRenderView(image));
             _renderTargets.Add(target, resource);
         }
@@ -660,6 +706,21 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             {
                 _device.UpdateTexture2D(gpu.Image, texture.Pixels, checked((uint)(texture.Width * texture.BytesPerBlock)));
             }
+        }
+    }
+
+    private void UpdateExposureHistogram(ShaderPreviewTexture source, CancellationToken token)
+    {
+        Span<uint> bins = stackalloc uint[ExposureHistogramPreview.BinCount];
+        ExposureHistogramPreview.Count(source, bins, token);
+        if (_exposureHistogram == 0)
+        {
+            _exposureHistogram = _device.CreateBuffer<uint>(bins, BindShaderResource, mutable: true, structured: true);
+            _exposureHistogramView = _device.CreateStructuredView(_exposureHistogram, ExposureHistogramPreview.BinCount);
+        }
+        else
+        {
+            _device.UpdateBuffer<uint>(_exposureHistogram, bins);
         }
     }
 
@@ -793,16 +854,25 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         {
             var signature = FindChunk(bytecode, "OSGN"u8);
             int outputs = ReadSignatureCount(signature);
+            bool historyOutput = false;
             for (int i = 0; i < outputs; i++)
             {
                 int start = 8 + i * 24;
                 string semantic = ReadSemantic(signature, start);
-                if ((semantic.Equals("SV_Target", StringComparison.OrdinalIgnoreCase) && ReadUInt(signature, start + 4) == 0)
-                    || semantic.Equals("SV_Depth", StringComparison.OrdinalIgnoreCase))
+                uint index = ReadUInt(signature, start + 4);
+                bool color = semantic.Equals("SV_Target", StringComparison.OrdinalIgnoreCase);
+                if (color && index == 1 && _scene.ImageEffect == ImageEffectPass.TemporalAntialiasing)
                 {
-                    continue;
+                    historyOutput = true;
                 }
-                throw new NotSupportedException($"Unsupported DXBC pixel output '{semantic}'.");
+                else if (!(color && index == 0) && !semantic.Equals("SV_Depth", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new NotSupportedException($"Unsupported DXBC pixel output '{semantic}{index}'.");
+                }
+            }
+            if (_scene.ImageEffect == ImageEffectPass.TemporalAntialiasing && !historyOutput)
+            {
+                throw new NotSupportedException("The temporal pass has no history render target output.");
             }
         }
     }
@@ -836,6 +906,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 }
                 uint slot = ReadUInt(program, offset + 8);
                 uint flags = (token >> 11) & 0x1f;
+                if (opcode == declareTexture && flags is 4 or 9)
+                {
+                    throw new NotSupportedException($"Direct3D 11 texture t{slot} requires a multisampled scene input.");
+                }
                 bool bound = opcode switch
                 {
                     declareTexture => Array.Exists(stage.Textures, texture => texture.Slot == slot && flags == (texture.Dimension switch
@@ -857,11 +931,20 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             }
             else if (opcode is 158 or 162)
             {
-                bool supported = words == 4 && (token & 0x80000000) == 0 && ReadUInt(program, offset + 12) == BokehPointStride &&
-                    ((opcode == 158 && draw.PointPass == ShaderPreviewPointPass.Collect && kind == ShaderPreviewProgramKind.Pixel &&
-                      ReadUInt(program, offset + 8) == 1) ||
-                     (opcode == 162 && draw.PointPass == ShaderPreviewPointPass.Draw && kind == ShaderPreviewProgramKind.Vertex &&
-                      ReadUInt(program, offset + 8) == 0 && Array.Exists(stage.StructuredBuffers, item => item is { Name: "pointBuffer", Slot: 0 })));
+                bool supported = false;
+                if (words == 4 && (token & 0x80000000) == 0)
+                {
+                    uint stride = ReadUInt(program, offset + 12), slot = ReadUInt(program, offset + 8);
+                    supported = opcode switch
+                    {
+                        158 => stride == BokehPointStride && slot == 1 && draw.PointPass == ShaderPreviewPointPass.Collect &&
+                            kind == ShaderPreviewProgramKind.Pixel,
+                        162 when _scene.ImageEffect == ImageEffectPass.ExposureHistogram => stride == sizeof(uint) && slot == 0 &&
+                            Array.Exists(stage.StructuredBuffers, item => item is { Name: ExposureHistogramPreview.BufferName, Slot: 0 }),
+                        _ => stride == BokehPointStride && slot == 0 && draw.PointPass == ShaderPreviewPointPass.Draw &&
+                            kind == ShaderPreviewProgramKind.Vertex && Array.Exists(stage.StructuredBuffers, item => item is { Name: "pointBuffer", Slot: 0 })
+                    };
+                }
                 if (!supported)
                 {
                     throw new NotSupportedException("The structured buffer has no matching resource in the preview pass.");
@@ -875,7 +958,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         }
     }
 
-    private static nint CreateInputLayout(D3D11PreviewDevice device, byte[] bytecode)
+    private static nint CreateInputLayout(D3D11PreviewDevice device, byte[] bytecode, bool usesSecondaryUv)
     {
         var signature = FindChunk(bytecode, "ISGN"u8);
         int count = ReadSignatureCount(signature);
@@ -900,7 +983,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             }
             uint offset = name.ToUpperInvariant() switch
             {
-                "POSITION" => 0, "NORMAL" => 16, "TANGENT" => 32, "COLOR" => 48, "TEXCOORD" => 64,
+                "POSITION" => 0, "NORMAL" => 16, "TANGENT" => 32, "COLOR" => 48,
+                "TEXCOORD" => usesSecondaryUv && semanticIndex == 1 ? 80u : 64u,
                 _ => throw new NotSupportedException($"Unsupported DXBC vertex attribute '{name}'.")
             };
             uint format = signature[start + 20] switch
@@ -984,20 +1068,26 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct Vertex(NumericsVector4 Position, NumericsVector4 Normal, NumericsVector4 Tangent,
-        NumericsVector4 Color, NumericsVector4 Uv);
+        NumericsVector4 Color, NumericsVector4 Uv, NumericsVector4 Uv1 = default);
 
     private static (Vertex[], uint[]) BuildPlane() =>
         ([PlaneVertex(-1, -1, 0, 0), PlaneVertex(1, -1, 1, 0), PlaneVertex(1, 1, 1, 1), PlaneVertex(-1, 1, 0, 1)],
          [0, 1, 2, 0, 2, 3]);
 
+    private static (Vertex[], uint[]) BuildTextPlane() => (Array.ConvertAll(Plane.Vertices, vertex => vertex with
+    {
+        // TextMeshPro's second UV includes packed face UVs and the signed glyph scale.
+        Uv1 = new NumericsVector4(512 * (4096 * vertex.Uv.X + vertex.Uv.Y), 1, 0, 0)
+    }), Plane.Indices);
+
     private static (Vertex[], uint[]) BuildScreenQuad(bool includeCornerIndices = false)
     {
         const float far = ShaderPreviewCamera.Far;
-        var vertices = Array.ConvertAll(Plane.Vertices, vertex => vertex with
+        var vertices = Array.ConvertAll(Plane.Vertices, vertex =>
         {
             // Unity stores the perspective ray in NORMAL on its internal full-screen quad.
-            Normal = new NumericsVector4(vertex.Position.X * far / Projection.M11, vertex.Position.Y * far / Projection.M22, far, 0),
-            Uv = vertex.Uv with { Y = 1 - vertex.Uv.Y }
+            var ray = new NumericsVector4(vertex.Position.X * far / Projection.M11, vertex.Position.Y * far / Projection.M22, far, 0);
+            return vertex with { Normal = ray, Uv1 = ray, Uv = vertex.Uv with { Y = 1 - vertex.Uv.Y } };
         });
         if (includeCornerIndices)
         {

@@ -17,6 +17,7 @@ namespace AssetStudio
         private readonly Dictionary<string, NumericsVector4> _values = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _textureDefaults = new(StringComparer.Ordinal);
         private readonly HashSet<string> _propertyKeywords = new(StringComparer.Ordinal);
+        private readonly List<string> _defaultKeywords = [];
         private readonly Lazy<byte[]> _blob;
 
         internal SerializedShaderPreview(Shader shader)
@@ -54,7 +55,12 @@ namespace AssetStudio
                     string attribute = open >= 0 ? raw[..open].TrimEnd() : raw;
                     string[] arguments = open >= 0 && raw.EndsWith(')')
                         ? raw[(open + 1)..^1].Split(',', StringSplitOptions.TrimEntries) : [];
-                    AddPropertyKeywords(_propertyKeywords, property.m_Name, attribute, arguments);
+                    float? defaultValue = property.m_Type is SerializedPropertyType.Float or SerializedPropertyType.Range or SerializedPropertyType.Int
+                        ? property.m_DefValue[0] : null;
+                    if (AddPropertyKeywords(_propertyKeywords, property.m_Name, attribute, arguments, defaultValue) is { } keyword)
+                    {
+                        _defaultKeywords.Add(keyword);
+                    }
                 }
             }
 
@@ -69,6 +75,7 @@ namespace AssetStudio
         public override IReadOnlyDictionary<string, string> TextureDefaults => _textureDefaults;
         public override IReadOnlyDictionary<string, string> Dependencies { get; }
         public override IReadOnlySet<string> PropertyKeywords => _propertyKeywords;
+        public override IReadOnlyList<string> DefaultKeywords => _defaultKeywords;
         public override IReadOnlyList<ShaderPreviewSubShader> SubShaders { get; }
 
         private sealed record Variant(SerializedSubProgram Program, string[] Keywords);
