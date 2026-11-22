@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using static AssetStudio.ImportHelper;
 
 namespace AssetStudio
@@ -950,6 +952,24 @@ namespace AssetStudio
             return string.IsNullOrWhiteSpace(SpecifyUnityVersion) ? "" : SpecifyUnityVersion.Trim();
         }
 
+        private static readonly Regex UnityVersionWithSuffixRegex = new Regex(
+            @"^(?<major>\d+)\.(?<minor>\d+)\.(?<build>\d+)(?<suffix>[abcfpt]\d+)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        private static readonly Regex UnityVersionNumericRegex = new Regex(
+            @"^(?<major>\d+)\.(?<minor>\d+)\.(?<build>\d+)(?:\.\d+)?$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+        private static readonly string[] IgnoredFallbackExecutablePrefixes =
+        {
+            "UnityCrashHandler",
+            "crashpad_handler",
+            "unins",
+            "KernelDumpAnalyzer",
+            "ZFGameBrowser",
+            "createdump"
+        };
+
         private string GetUnityVersionFallback(string sourcePath)
         {
             lock (unityVersionInferenceLock)
@@ -971,9 +991,50 @@ namespace AssetStudio
                     Logger.Info($"Inferred Unity version {version} from {dataDirectory}");
                     return inferredUnityVersion;
                 }
+
+                // Fallback when no globalgamemanagers/data.unity3d is present: check ancestor
+                // game directories directly for UnityPlayer.dll or paired *_Data executables.
+                foreach (var directory in EnumerateUnityVersionSearchDirectories(sourcePath))
+                {
+                    var version = TryReadUnityVersionFromUnityPlayerDirectory(directory);
+                    if (string.IsNullOrEmpty(version))
+                    {
+                        continue;
+                    }
+
+                    inferredUnityVersion = version;
+                    Logger.Info($"Inferred Unity version {version} from {directory}");
+                    return inferredUnityVersion;
+                }
             }
 
             return "";
+        }
+
+        private IEnumerable<string> EnumerateUnityVersionSearchDirectories(string sourcePath)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var root in EnumerateUnityVersionSearchRoots(sourcePath))
+            {
+                var directory = NormalizeUnityVersionSearchRoot(root);
+                for (var depth = 0; depth < 8 && !string.IsNullOrEmpty(directory); depth++)
+                {
+                    if (seen.Add(directory))
+                    {
+                        yield return directory;
+                    }
+
+                    try
+                    {
+                        directory = Directory.GetParent(directory)?.FullName ?? string.Empty;
+                    }
+                    catch
+                    {
+                        break;
+                    }
+                }
+            }
         }
 
         private IEnumerable<string> EnumerateUnityDataDirectoryCandidates(string sourcePath)
@@ -1105,7 +1166,227 @@ namespace AssetStudio
                 return version;
             }
 
-            return TryReadUnityVersionFromBundleFile(Path.Combine(dataDirectory, "data.unity3d"));
+            version = TryReadUnityVersionFromBundleFile(Path.Combine(dataDirectory, "data.unity3d"));
+            if (!string.IsNullOrEmpty(version))
+            {
+                return version;
+            }
+
+            return TryReadUnityVersionFromUnityPlayerFallback(dataDirectory);
+        }
+
+        private static string TryReadUnityVersionFromUnityPlayerFallback(string dataDirectory)
+        {
+            if (string.IsNullOrEmpty(dataDirectory))
+            {
+                return "";
+            }
+
+            string? parentDir = null;
+            try
+            {
+                parentDir = Directory.GetParent(dataDirectory)?.FullName;
+            }
+            catch
+            {
+            }
+
+            if (!string.IsNullOrEmpty(parentDir))
+            {
+                var version = TryReadUnityVersionFromFileVersionInfo(Path.Combine(parentDir, "UnityPlayer.dll"));
+                if (!string.IsNullOrEmpty(version))
+                {
+                    return version;
+                }
+            }
+
+            var dataDirDllVersion = TryReadUnityVersionFromFileVersionInfo(Path.Combine(dataDirectory, "UnityPlayer.dll"));
+            if (!string.IsNullOrEmpty(dataDirDllVersion))
+            {
+                return dataDirDllVersion;
+            }
+
+            if (!string.IsNullOrEmpty(parentDir))
+            {
+                var folderName = Path.GetFileName(dataDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (!string.IsNullOrEmpty(folderName) && folderName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase) && folderName.Length > 5)
+                {
+                    var matchingExe = Path.Combine(parentDir, folderName.Substring(0, folderName.Length - 5) + ".exe");
+                    var exeVersion = TryReadUnityVersionFromFileVersionInfo(matchingExe);
+                    if (!string.IsNullOrEmpty(exeVersion))
+                    {
+                        return exeVersion;
+                    }
+                }
+
+                try
+                {
+                    foreach (var exePath in Directory.EnumerateFiles(parentDir, "*.exe", SearchOption.TopDirectoryOnly)
+                        .OrderBy(static p => p, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (IsIgnoredFallbackExecutable(Path.GetFileName(exePath)))
+                        {
+                            continue;
+                        }
+
+                        var exeVersion = TryReadUnityVersionFromFileVersionInfo(exePath);
+                        if (!string.IsNullOrEmpty(exeVersion))
+                        {
+                            return exeVersion;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return "";
+        }
+
+        private static string TryReadUnityVersionFromUnityPlayerDirectory(string directory)
+        {
+            if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+            {
+                return "";
+            }
+
+            var directDllVersion = TryReadUnityVersionFromFileVersionInfo(Path.Combine(directory, "UnityPlayer.dll"));
+            if (!string.IsNullOrEmpty(directDllVersion))
+            {
+                return directDllVersion;
+            }
+
+            var folderName = Path.GetFileName(directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            if (!string.IsNullOrEmpty(folderName) && folderName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase))
+            {
+                var fallback = TryReadUnityVersionFromUnityPlayerFallback(directory);
+                if (!string.IsNullOrEmpty(fallback))
+                {
+                    return fallback;
+                }
+            }
+
+            foreach (var childDataDir in EnumerateDirectoriesSafe(directory, "*_Data"))
+            {
+                var fallback = TryReadUnityVersionFromUnityPlayerFallback(childDataDir);
+                if (!string.IsNullOrEmpty(fallback))
+                {
+                    return fallback;
+                }
+            }
+
+            return "";
+        }
+
+        private static bool IsIgnoredFallbackExecutable(string? fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                return true;
+            }
+
+            foreach (var prefix in IgnoredFallbackExecutablePrefixes)
+            {
+                if (fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public static string TryReadUnityVersionFromFileVersionInfo(string binaryPath)
+        {
+            if (string.IsNullOrEmpty(binaryPath) || !File.Exists(binaryPath))
+            {
+                return "";
+            }
+
+            try
+            {
+                var info = FileVersionInfo.GetVersionInfo(binaryPath);
+                return TryNormalizeUnityVersionFromFileVersionInfo(
+                    info.ProductVersion,
+                    info.FileVersion,
+                    info.FileMajorPart,
+                    info.FileMinorPart,
+                    info.FileBuildPart);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Could not infer Unity version from {binaryPath}: {ex.Message}");
+                return "";
+            }
+        }
+
+        public static string TryNormalizeUnityVersionFromFileVersionInfo(
+            string? productVersion,
+            string? fileVersion,
+            int fileMajorPart,
+            int fileMinorPart,
+            int fileBuildPart)
+        {
+            var normalized = TryNormalizeUnityVersionToken(productVersion);
+            if (!string.IsNullOrEmpty(normalized))
+            {
+                return normalized;
+            }
+
+            normalized = TryNormalizeUnityVersionToken(fileVersion);
+            if (!string.IsNullOrEmpty(normalized))
+            {
+                return normalized;
+            }
+
+            if (IsPlausibleUnityMajorVersion(fileMajorPart) && fileMinorPart >= 0 && fileBuildPart >= 0)
+            {
+                return $"{fileMajorPart}.{fileMinorPart}.{fileBuildPart}f1";
+            }
+
+            return "";
+        }
+
+        private static string TryNormalizeUnityVersionToken(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return "";
+            }
+
+            var trimmed = raw.Trim();
+            var splitIdx = trimmed.IndexOfAny(new[] { ' ', '\t', '(', '_' });
+            var token = (splitIdx > 0 ? trimmed.Substring(0, splitIdx) : trimmed).Trim();
+            if (string.IsNullOrEmpty(token))
+            {
+                return "";
+            }
+
+            var suffixMatch = UnityVersionWithSuffixRegex.Match(token);
+            if (suffixMatch.Success
+                && int.TryParse(suffixMatch.Groups["major"].Value, out var suffixedMajor)
+                && IsPlausibleUnityMajorVersion(suffixedMajor))
+            {
+                return $"{suffixedMajor}.{suffixMatch.Groups["minor"].Value}.{suffixMatch.Groups["build"].Value}{suffixMatch.Groups["suffix"].Value.ToLowerInvariant()}";
+            }
+
+            var numericMatch = UnityVersionNumericRegex.Match(token);
+            if (numericMatch.Success
+                && int.TryParse(numericMatch.Groups["major"].Value, out var numericMajor)
+                && IsPlausibleUnityMajorVersion(numericMajor))
+            {
+                return $"{numericMajor}.{numericMatch.Groups["minor"].Value}.{numericMatch.Groups["build"].Value}f1";
+            }
+
+            return "";
+        }
+
+        private static bool IsPlausibleUnityMajorVersion(int major)
+        {
+            return (major >= 4 && major <= 5)
+                || (major >= 2017 && major <= 2030)
+                || (major >= 6000 && major <= 9999);
         }
 
         private string TryReadUnityVersionFromSerializedFile(string path)
@@ -1179,7 +1460,7 @@ namespace AssetStudio
                 var fallbackUnityVersion = GetUnityVersionFallback(sourcePath);
                 if (string.IsNullOrEmpty(fallbackUnityVersion))
                 {
-                    throw new Exception("The Unity version has been stripped and could not be inferred from globalgamemanagers or data.unity3d; please set the version in the options");
+                    throw new Exception("The Unity version has been stripped and could not be inferred from globalgamemanagers, data.unity3d, or UnityPlayer.dll; please set the version in the options");
                 }
                 assetsFile.SetVersion(fallbackUnityVersion);
             }

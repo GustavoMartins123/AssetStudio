@@ -1,5 +1,6 @@
 ﻿using K4os.Compression.LZ4;
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -71,14 +72,54 @@ namespace AssetStudio
             }
 
             var length = shader.platforms.Length;
-            var shaderPrograms = new ShaderProgram[length];
+            var shaderPrograms = new ShaderProgram?[length];
+            CollectProgramBlobIndices(
+                shader.m_ParsedForm,
+                shader.platforms,
+                out var executableIndicesByPlatform,
+                out var parameterIndicesByPlatform,
+                out var hasAnyProgramRefs);
+
             for (var i = 0; i < length; i++)
             {
-                for (var j = 0; j < shader.offsets[i].Length; j++)
+                if (i >= shader.offsets.Length || i >= shader.compressedLengths.Length || i >= shader.decompressedLengths.Length)
                 {
-                    var offset = shader.offsets[i][j];
-                    var compressedLength = shader.compressedLengths[i][j];
-                    var decompressedLength = shader.decompressedLengths[i][j];
+                    break;
+                }
+
+                var platformOffsets = shader.offsets[i];
+                var platformCompressed = shader.compressedLengths[i];
+                var platformDecompressed = shader.decompressedLengths[i];
+                var segmentCount = Math.Min(platformOffsets.Length, Math.Min(platformCompressed.Length, platformDecompressed.Length));
+                if (segmentCount == 0)
+                {
+                    continue;
+                }
+
+                // On Unity >= 2021.3.10f1, compressed blobs contain both executable subprograms and
+                // parameter reflection blobs (m_ParameterBlobIndices). Only parse executable subprogram
+                // entries when program references are present so parameter blobs never trigger read failures.
+                HashSet<uint>? allowedIndices = null;
+                HashSet<uint>? excludedIndices = parameterIndicesByPlatform[i].Count > 0 ? parameterIndicesByPlatform[i] : null;
+                if (executableIndicesByPlatform[i].Count > 0)
+                {
+                    allowedIndices = executableIndicesByPlatform[i];
+                }
+                else if (hasAnyProgramRefs || excludedIndices != null)
+                {
+                    allowedIndices = executableIndicesByPlatform[i]; // empty: skip non-executable entries
+                }
+
+                for (var j = 0; j < segmentCount; j++)
+                {
+                    var offset = platformOffsets[j];
+                    var compressedLength = platformCompressed[j];
+                    var decompressedLength = platformDecompressed[j];
+                    if (decompressedLength == 0 || (long)offset + compressedLength > shader.compressedBlob.Length)
+                    {
+                        continue;
+                    }
+
                     var decompressedBytes = new byte[decompressedLength];
                     LZ4Codec.Decode(shader.compressedBlob, (int)offset, (int)compressedLength, decompressedBytes, 0, (int)decompressedLength);
                     using (var blobReader = new BinaryReader(new MemoryStream(decompressedBytes)))
@@ -87,7 +128,7 @@ namespace AssetStudio
                         {
                             shaderPrograms[i] = new ShaderProgram(blobReader, shader.version);
                         }
-                        shaderPrograms[i].Read(blobReader, j);
+                        shaderPrograms[i]?.Read(blobReader, j, allowedIndices, excludedIndices);
                     }
                 }
             }
@@ -95,16 +136,192 @@ namespace AssetStudio
             return ConvertSerializedShader(shader.m_ParsedForm, shader.platforms, shaderPrograms);
         }
 
-        private static string ConvertSerializedShader(SerializedShader m_ParsedForm, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        private static void CollectProgramBlobIndices(
+            SerializedShader parsedForm,
+            ShaderCompilerPlatform[] platforms,
+            out HashSet<uint>[] executableIndicesByPlatform,
+            out HashSet<uint>[] parameterIndicesByPlatform,
+            out bool hasAnyProgramRefs)
+        {
+            var platformCount = platforms.Length;
+            executableIndicesByPlatform = new HashSet<uint>[platformCount];
+            parameterIndicesByPlatform = new HashSet<uint>[platformCount];
+            for (var i = 0; i < platformCount; i++)
+            {
+                executableIndicesByPlatform[i] = new HashSet<uint>();
+                parameterIndicesByPlatform[i] = new HashSet<uint>();
+            }
+
+            hasAnyProgramRefs = false;
+            if (parsedForm.m_SubShaders == null || platformCount == 0)
+            {
+                return;
+            }
+
+            var unmatchedParameterIndices = new HashSet<uint>();
+
+            foreach (var subShader in parsedForm.m_SubShaders)
+            {
+                if (subShader?.m_Passes == null)
+                {
+                    continue;
+                }
+
+                foreach (var pass in subShader.m_Passes)
+                {
+                    if (pass == null)
+                    {
+                        continue;
+                    }
+
+                    CollectStageBlobIndices(pass.progVertex, platforms, executableIndicesByPlatform, parameterIndicesByPlatform, unmatchedParameterIndices, ref hasAnyProgramRefs);
+                    CollectStageBlobIndices(pass.progFragment, platforms, executableIndicesByPlatform, parameterIndicesByPlatform, unmatchedParameterIndices, ref hasAnyProgramRefs);
+                    CollectStageBlobIndices(pass.progGeometry, platforms, executableIndicesByPlatform, parameterIndicesByPlatform, unmatchedParameterIndices, ref hasAnyProgramRefs);
+                    CollectStageBlobIndices(pass.progHull, platforms, executableIndicesByPlatform, parameterIndicesByPlatform, unmatchedParameterIndices, ref hasAnyProgramRefs);
+                    CollectStageBlobIndices(pass.progDomain, platforms, executableIndicesByPlatform, parameterIndicesByPlatform, unmatchedParameterIndices, ref hasAnyProgramRefs);
+                    CollectStageBlobIndices(pass.progRayTracing, platforms, executableIndicesByPlatform, parameterIndicesByPlatform, unmatchedParameterIndices, ref hasAnyProgramRefs);
+                }
+            }
+
+            if (unmatchedParameterIndices.Count > 0)
+            {
+                for (var i = 0; i < platformCount; i++)
+                {
+                    foreach (var paramIdx in unmatchedParameterIndices)
+                    {
+                        if (!executableIndicesByPlatform[i].Contains(paramIdx))
+                        {
+                            parameterIndicesByPlatform[i].Add(paramIdx);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void CollectStageBlobIndices(
+            SerializedProgram? program,
+            ShaderCompilerPlatform[] platforms,
+            HashSet<uint>[] executableIndicesByPlatform,
+            HashSet<uint>[] parameterIndicesByPlatform,
+            HashSet<uint> unmatchedParameterIndices,
+            ref bool hasAnyProgramRefs)
+        {
+            if (program == null)
+            {
+                return;
+            }
+
+            if (program.m_SubPrograms != null)
+            {
+                foreach (var subProgram in program.m_SubPrograms)
+                {
+                    if (subProgram == null)
+                    {
+                        continue;
+                    }
+
+                    hasAnyProgramRefs = true;
+                    var platformIndex = FindPlatformIndex(platforms, subProgram.m_GpuProgramType);
+                    if (platformIndex >= 0)
+                    {
+                        executableIndicesByPlatform[platformIndex].Add(subProgram.m_BlobIndex);
+                    }
+                    else if (platforms.Length == 1)
+                    {
+                        executableIndicesByPlatform[0].Add(subProgram.m_BlobIndex);
+                    }
+                }
+            }
+
+            var playerTiers = program.m_PlayerSubPrograms;
+            var paramTiers = program.m_ParameterBlobIndices;
+            if (playerTiers != null)
+            {
+                for (var tier = 0; tier < playerTiers.Length; tier++)
+                {
+                    var tierSubPrograms = playerTiers[tier];
+                    var tierParamIndices = paramTiers != null && tier < paramTiers.Length ? paramTiers[tier] : null;
+                    if (tierSubPrograms == null)
+                    {
+                        continue;
+                    }
+
+                    for (var k = 0; k < tierSubPrograms.Length; k++)
+                    {
+                        var playerSub = tierSubPrograms[k];
+                        if (playerSub == null)
+                        {
+                            continue;
+                        }
+
+                        hasAnyProgramRefs = true;
+                        var platformIndex = FindPlatformIndex(platforms, playerSub.m_GpuProgramType);
+                        if (platformIndex < 0 && platforms.Length == 1)
+                        {
+                            platformIndex = 0;
+                        }
+
+                        if (platformIndex >= 0)
+                        {
+                            executableIndicesByPlatform[platformIndex].Add(playerSub.m_BlobIndex);
+                            if (tierParamIndices != null && k < tierParamIndices.Length)
+                            {
+                                parameterIndicesByPlatform[platformIndex].Add(tierParamIndices[k]);
+                            }
+                        }
+                        else if (tierParamIndices != null && k < tierParamIndices.Length)
+                        {
+                            unmatchedParameterIndices.Add(tierParamIndices[k]);
+                        }
+                    }
+                }
+            }
+
+            if (paramTiers != null)
+            {
+                for (var tier = 0; tier < paramTiers.Length; tier++)
+                {
+                    var tierParams = paramTiers[tier];
+                    if (tierParams == null || tierParams.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    var matchedCount = playerTiers != null && tier < playerTiers.Length && playerTiers[tier] != null
+                        ? playerTiers[tier].Length
+                        : 0;
+                    for (var k = matchedCount; k < tierParams.Length; k++)
+                    {
+                        unmatchedParameterIndices.Add(tierParams[k]);
+                    }
+                }
+            }
+        }
+
+        private static int FindPlatformIndex(ShaderCompilerPlatform[] platforms, ShaderGpuProgramType programType)
+        {
+            for (var i = 0; i < platforms.Length; i++)
+            {
+                if (CheckGpuProgramUsable(platforms[i], programType))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static string ConvertSerializedShader(SerializedShader m_ParsedForm, ShaderCompilerPlatform[] platforms, ShaderProgram?[] shaderPrograms)
         {
             var sb = new StringBuilder();
             sb.Append($"Shader \"{m_ParsedForm.m_Name}\" {{\n");
 
             sb.Append(ConvertSerializedProperties(m_ParsedForm.m_PropInfo));
 
+            var keywordNames = m_ParsedForm.m_KeywordNames ?? Array.Empty<string>();
             foreach (var m_SubShader in m_ParsedForm.m_SubShaders)
             {
-                sb.Append(ConvertSerializedSubShader(m_SubShader, platforms, shaderPrograms));
+                sb.Append(ConvertSerializedSubShader(m_SubShader, keywordNames, platforms, shaderPrograms));
             }
 
             if (!string.IsNullOrEmpty(m_ParsedForm.m_FallbackName))
@@ -143,7 +360,7 @@ namespace AssetStudio
             return sb.ToString();
         }
 
-        private static string ConvertSerializedSubShader(SerializedSubShader m_SubShader, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        private static string ConvertSerializedSubShader(SerializedSubShader m_SubShader, string[] keywordNames, ShaderCompilerPlatform[] platforms, ShaderProgram?[] shaderPrograms)
         {
             var sb = new StringBuilder();
             sb.Append("SubShader {\n");
@@ -156,13 +373,13 @@ namespace AssetStudio
 
             foreach (var m_Passe in m_SubShader.m_Passes)
             {
-                sb.Append(ConvertSerializedPass(m_Passe, platforms, shaderPrograms));
+                sb.Append(ConvertSerializedPass(m_Passe, keywordNames, platforms, shaderPrograms));
             }
             sb.Append("}\n");
             return sb.ToString();
         }
 
-        private static string ConvertSerializedPass(SerializedPass m_Passe, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        private static string ConvertSerializedPass(SerializedPass m_Passe, string[] keywordNames, ShaderCompilerPlatform[] platforms, ShaderProgram?[] shaderPrograms)
         {
             var sb = new StringBuilder();
             switch (m_Passe.m_Type)
@@ -201,54 +418,62 @@ namespace AssetStudio
 
                     sb.Append(ConvertSerializedShaderState(m_Passe.m_State));
 
-                    if (m_Passe.progVertex.m_SubPrograms.Length > 0)
-                    {
-                        sb.Append("Program \"vp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progVertex.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progFragment.m_SubPrograms.Length > 0)
-                    {
-                        sb.Append("Program \"fp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progFragment.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progGeometry.m_SubPrograms.Length > 0)
-                    {
-                        sb.Append("Program \"gp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progGeometry.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progHull.m_SubPrograms.Length > 0)
-                    {
-                        sb.Append("Program \"hp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progHull.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progDomain.m_SubPrograms.Length > 0)
-                    {
-                        sb.Append("Program \"dp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progDomain.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progRayTracing?.m_SubPrograms.Length > 0)
-                    {
-                        sb.Append("Program \"rtp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progRayTracing.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
+                    sb.Append(ConvertSerializedProgram(m_Passe.progVertex, "vp", keywordNames, platforms, shaderPrograms));
+                    sb.Append(ConvertSerializedProgram(m_Passe.progFragment, "fp", keywordNames, platforms, shaderPrograms));
+                    sb.Append(ConvertSerializedProgram(m_Passe.progGeometry, "gp", keywordNames, platforms, shaderPrograms));
+                    sb.Append(ConvertSerializedProgram(m_Passe.progHull, "hp", keywordNames, platforms, shaderPrograms));
+                    sb.Append(ConvertSerializedProgram(m_Passe.progDomain, "dp", keywordNames, platforms, shaderPrograms));
+                    sb.Append(ConvertSerializedProgram(m_Passe.progRayTracing, "rtp", keywordNames, platforms, shaderPrograms));
                 }
                 sb.Append("}\n");
             }
             return sb.ToString();
         }
 
-        private static string ConvertSerializedSubPrograms(SerializedSubProgram[] m_SubPrograms, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        private static string ConvertSerializedProgram(
+            SerializedProgram? program,
+            string programStage,
+            string[] keywordNames,
+            ShaderCompilerPlatform[] platforms,
+            ShaderProgram?[] shaderPrograms)
+        {
+            if (program == null)
+            {
+                return string.Empty;
+            }
+
+            var hasSubPrograms = program.m_SubPrograms != null && program.m_SubPrograms.Length > 0;
+            var hasPlayerSubPrograms = program.m_PlayerSubPrograms != null
+                && program.m_PlayerSubPrograms.Any(static tier => tier != null && tier.Length > 0);
+            if (!hasSubPrograms && !hasPlayerSubPrograms)
+            {
+                return string.Empty;
+            }
+
+            var sb = new StringBuilder();
+            sb.Append($"Program \"{programStage}\" {{\n");
+            HashSet<(int PlatformIndex, uint BlobIndex)>? exported = null;
+            if (hasSubPrograms)
+            {
+                if (hasPlayerSubPrograms)
+                {
+                    exported = new HashSet<(int, uint)>();
+                }
+                sb.Append(ConvertSerializedSubPrograms(program.m_SubPrograms!, platforms, shaderPrograms, exported));
+            }
+            if (hasPlayerSubPrograms)
+            {
+                sb.Append(ConvertSerializedPlayerSubPrograms(program.m_PlayerSubPrograms!, keywordNames, platforms, shaderPrograms, exported));
+            }
+            sb.Append("}\n");
+            return sb.ToString();
+        }
+
+        private static string ConvertSerializedSubPrograms(
+            SerializedSubProgram[] m_SubPrograms,
+            ShaderCompilerPlatform[] platforms,
+            ShaderProgram?[] shaderPrograms,
+            HashSet<(int PlatformIndex, uint BlobIndex)>? exported = null)
         {
             var sb = new StringBuilder();
             var groups = m_SubPrograms.GroupBy(x => x.m_BlobIndex);
@@ -266,13 +491,14 @@ namespace AssetStudio
                             var isTier = subPrograms.Count > 1;
                             foreach (var subProgram in subPrograms)
                             {
+                                exported?.Add((i, subProgram.m_BlobIndex));
                                 sb.Append($"SubProgram \"{GetPlatformString(platform)} ");
                                 if (isTier)
                                 {
                                     sb.Append($"hw_tier{subProgram.m_ShaderHardwareTier:00} ");
                                 }
                                 sb.Append("\" {\n");
-                                sb.Append(shaderPrograms[i].m_SubPrograms[subProgram.m_BlobIndex].Export());
+                                sb.Append(ExportSubProgramOrFallback(shaderPrograms, i, subProgram.m_BlobIndex, null, Array.Empty<string>()));
                                 sb.Append("\n}\n");
                             }
                             break;
@@ -281,6 +507,124 @@ namespace AssetStudio
                 }
             }
             return sb.ToString();
+        }
+
+        private static string ConvertSerializedPlayerSubPrograms(
+            SerializedPlayerSubProgram[][] playerSubPrograms,
+            string[] keywordNames,
+            ShaderCompilerPlatform[] platforms,
+            ShaderProgram?[] shaderPrograms,
+            HashSet<(int PlatformIndex, uint BlobIndex)>? alreadyExported)
+        {
+            var sb = new StringBuilder();
+            var nonEmptyTierCount = 0;
+            for (int t = 0; t < playerSubPrograms.Length; t++)
+            {
+                if (playerSubPrograms[t] != null && playerSubPrograms[t].Length > 0)
+                {
+                    nonEmptyTierCount++;
+                }
+            }
+
+            var isTier = nonEmptyTierCount > 1;
+            for (int tier = 0; tier < playerSubPrograms.Length; tier++)
+            {
+                var tierSubPrograms = playerSubPrograms[tier];
+                if (tierSubPrograms == null || tierSubPrograms.Length == 0)
+                {
+                    continue;
+                }
+
+                foreach (var playerSub in tierSubPrograms)
+                {
+                    if (playerSub == null)
+                    {
+                        continue;
+                    }
+
+                    var platformIndex = FindPlatformIndex(platforms, playerSub.m_GpuProgramType);
+                    if (platformIndex < 0 && platforms.Length == 1)
+                    {
+                        platformIndex = 0;
+                    }
+
+                    if (platformIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    if (alreadyExported != null && alreadyExported.Contains((platformIndex, playerSub.m_BlobIndex)))
+                    {
+                        continue;
+                    }
+
+                    sb.Append($"SubProgram \"{GetPlatformString(platforms[platformIndex])} ");
+                    if (isTier)
+                    {
+                        sb.Append($"hw_tier{tier:00} ");
+                    }
+                    sb.Append("\" {\n");
+                    sb.Append(ExportSubProgramOrFallback(shaderPrograms, platformIndex, playerSub.m_BlobIndex, playerSub.m_KeywordIndices, keywordNames));
+                    sb.Append("\n}\n");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static string ExportSubProgramOrFallback(
+            ShaderProgram?[] shaderPrograms,
+            int platformIndex,
+            uint blobIndex,
+            ushort[]? fallbackKeywordIndices,
+            string[] keywordNames)
+        {
+            if (platformIndex < 0 || platformIndex >= shaderPrograms.Length)
+            {
+                return "\"// subprogram blob unavailable\"";
+            }
+
+            var shaderProgram = shaderPrograms[platformIndex];
+            if (shaderProgram == null || blobIndex >= (uint)shaderProgram.m_SubPrograms.Length)
+            {
+                return "\"// subprogram blob unavailable\"";
+            }
+
+            var subProgram = shaderProgram.m_SubPrograms[blobIndex];
+            if (subProgram == null)
+            {
+                return "\"// subprogram blob unavailable\"";
+            }
+
+            var exported = subProgram.Export();
+            if (subProgram.m_Keywords.Length == 0
+                && fallbackKeywordIndices != null
+                && fallbackKeywordIndices.Length > 0
+                && keywordNames.Length > 0)
+            {
+                var kwBuilder = new StringBuilder();
+                var anyKeyword = false;
+                foreach (var kwIndex in fallbackKeywordIndices)
+                {
+                    if (kwIndex < keywordNames.Length && !string.IsNullOrEmpty(keywordNames[kwIndex]))
+                    {
+                        if (!anyKeyword)
+                        {
+                            kwBuilder.Append("Keywords { ");
+                            anyKeyword = true;
+                        }
+                        kwBuilder.Append($"\"{keywordNames[kwIndex]}\" ");
+                    }
+                }
+                if (anyKeyword)
+                {
+                    kwBuilder.Append("}\n");
+                    kwBuilder.Append(exported);
+                    return kwBuilder.ToString();
+                }
+            }
+
+            return exported;
         }
 
         private static string ConvertSerializedShaderState(SerializedShaderState m_State)
@@ -917,7 +1261,8 @@ namespace AssetStudio
                         || programType == ShaderGpuProgramType.ConsoleFS
                         || programType == ShaderGpuProgramType.ConsoleHS
                         || programType == ShaderGpuProgramType.ConsoleDS
-                        || programType == ShaderGpuProgramType.ConsoleGS;
+                        || programType == ShaderGpuProgramType.ConsoleGS
+                        || programType == ShaderGpuProgramType.RayTracing;
                 case ShaderCompilerPlatform.PS5NGGC:
                     return programType == ShaderGpuProgramType.PS5NGGC;
                 case ShaderCompilerPlatform.D3D11:
@@ -928,7 +1273,8 @@ namespace AssetStudio
                         || programType == ShaderGpuProgramType.DX11GeometrySM40
                         || programType == ShaderGpuProgramType.DX11GeometrySM50
                         || programType == ShaderGpuProgramType.DX11HullSM50
-                        || programType == ShaderGpuProgramType.DX11DomainSM50;
+                        || programType == ShaderGpuProgramType.DX11DomainSM50
+                        || programType == ShaderGpuProgramType.RayTracing;
                 case ShaderCompilerPlatform.GLES20:
                     return programType == ShaderGpuProgramType.GLES;
                 case ShaderCompilerPlatform.NaCl: //Obsolete
@@ -952,7 +1298,8 @@ namespace AssetStudio
                         || programType == ShaderGpuProgramType.GLCore41
                         || programType == ShaderGpuProgramType.GLCore43;
                 case ShaderCompilerPlatform.Vulkan:
-                    return programType == ShaderGpuProgramType.SPIRV;
+                    return programType == ShaderGpuProgramType.SPIRV
+                        || programType == ShaderGpuProgramType.RayTracing;
                 default:
                     return false;
             }
@@ -1044,28 +1391,59 @@ namespace AssetStudio
     public class ShaderProgram
     {
         public ShaderSubProgramEntry[] entries;
-        public ShaderSubProgram[] m_SubPrograms;
+        public ShaderSubProgram?[] m_SubPrograms;
 
         public ShaderProgram(BinaryReader reader, int[] version)
         {
             var subProgramsCapacity = reader.ReadInt32();
+            if (subProgramsCapacity < 0)
+            {
+                throw new InvalidDataException($"Invalid shader subprogram entry count: {subProgramsCapacity}");
+            }
             entries = new ShaderSubProgramEntry[subProgramsCapacity];
             for (int i = 0; i < subProgramsCapacity; i++)
             {
                 entries[i] = new ShaderSubProgramEntry(reader, version);
             }
-            m_SubPrograms = new ShaderSubProgram[subProgramsCapacity];
+            m_SubPrograms = new ShaderSubProgram?[subProgramsCapacity];
         }
 
         public void Read(BinaryReader reader, int segment)
         {
+            Read(reader, segment, null, null);
+        }
+
+        public void Read(BinaryReader reader, int segment, HashSet<uint>? allowedIndices, HashSet<uint>? excludedIndices = null)
+        {
             for (int i = 0; i < entries.Length; i++)
             {
+                if (allowedIndices != null && !allowedIndices.Contains((uint)i))
+                {
+                    continue;
+                }
+                if (excludedIndices != null && excludedIndices.Contains((uint)i))
+                {
+                    continue;
+                }
+
                 var entry = entries[i];
                 if (entry.Segment == segment)
                 {
+                    if (entry.Offset < 0 || entry.Length < 0 || (long)entry.Offset + entry.Length > reader.BaseStream.Length)
+                    {
+                        continue;
+                    }
+
                     reader.BaseStream.Position = entry.Offset;
-                    m_SubPrograms[i] = new ShaderSubProgram(reader);
+                    try
+                    {
+                        m_SubPrograms[i] = new ShaderSubProgram(reader, (long)entry.Offset + entry.Length);
+                    }
+                    catch (Exception ex) when (ex is EndOfStreamException || ex is OverflowException || ex is InvalidDataException)
+                    {
+                        // Skip non-subprogram / unsupported future blob entries rather than failing the whole shader.
+                        m_SubPrograms[i] = null;
+                    }
                 }
             }
         }
@@ -1074,8 +1452,12 @@ namespace AssetStudio
         {
             var evaluator = new MatchEvaluator(match =>
             {
-                var index = int.Parse(match.Groups[1].Value);
-                return m_SubPrograms[index].Export();
+                var index = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+                if (index < 0 || index >= m_SubPrograms.Length || m_SubPrograms[index] == null)
+                {
+                    return "\"// subprogram blob unavailable\"";
+                }
+                return m_SubPrograms[index]!.Export();
             });
             shader = Regex.Replace(shader, "GpuProgramIndex (.+)", evaluator);
             return shader;
@@ -1091,6 +1473,11 @@ namespace AssetStudio
         public byte[] m_ProgramCode;
 
         public ShaderSubProgram(BinaryReader reader)
+            : this(reader, reader.BaseStream.Length)
+        {
+        }
+
+        internal ShaderSubProgram(BinaryReader reader, long entryEnd)
         {
             //LoadGpuProgramFromData
             //201509030 - Unity 5.3
@@ -1100,31 +1487,81 @@ namespace AssetStudio
             //201708220 - Unity 2017.3, Unity 2017.4 & Unity 2018.1
             //201802150 - Unity 2018.2 & Unity 2018.3
             //201806140 - Unity 2019.1~2021.1
-            //202012090 - Unity 2021.2
+            //202012090 - Unity 2021.2+
+            var limit = Math.Min(entryEnd, reader.BaseStream.Length);
+            if (limit - reader.BaseStream.Position < 24)
+            {
+                throw new EndOfStreamException("ShaderSubProgram header truncated.");
+            }
+
             m_Version = reader.ReadInt32();
             m_ProgramType = (ShaderGpuProgramType)reader.ReadInt32();
             reader.BaseStream.Position += 12;
             if (m_Version >= 201608170)
             {
+                if (limit - reader.BaseStream.Position < 8)
+                {
+                    throw new EndOfStreamException("ShaderSubProgram extended header truncated.");
+                }
                 reader.BaseStream.Position += 4;
             }
             var m_KeywordsSize = reader.ReadInt32();
+            if (m_KeywordsSize < 0 || (long)m_KeywordsSize * 4 > limit - reader.BaseStream.Position)
+            {
+                throw new InvalidDataException($"Invalid ShaderSubProgram keyword count: {m_KeywordsSize}");
+            }
             m_Keywords = new string[m_KeywordsSize];
             for (int i = 0; i < m_KeywordsSize; i++)
             {
+                if (limit - reader.BaseStream.Position < 4)
+                {
+                    throw new EndOfStreamException("ShaderSubProgram keyword entry truncated.");
+                }
                 m_Keywords[i] = reader.ReadAlignedString();
+                if (reader.BaseStream.Position > limit)
+                {
+                    throw new EndOfStreamException("ShaderSubProgram keyword exceeds entry boundary.");
+                }
             }
             if (m_Version >= 201806140 && m_Version < 202012090)
             {
+                if (limit - reader.BaseStream.Position < 4)
+                {
+                    throw new EndOfStreamException("ShaderSubProgram local keyword header truncated.");
+                }
                 var m_LocalKeywordsSize = reader.ReadInt32();
+                if (m_LocalKeywordsSize < 0 || (long)m_LocalKeywordsSize * 4 > limit - reader.BaseStream.Position)
+                {
+                    throw new InvalidDataException($"Invalid ShaderSubProgram local keyword count: {m_LocalKeywordsSize}");
+                }
                 m_LocalKeywords = new string[m_LocalKeywordsSize];
                 for (int i = 0; i < m_LocalKeywordsSize; i++)
                 {
+                    if (limit - reader.BaseStream.Position < 4)
+                    {
+                        throw new EndOfStreamException("ShaderSubProgram local keyword entry truncated.");
+                    }
                     m_LocalKeywords[i] = reader.ReadAlignedString();
+                    if (reader.BaseStream.Position > limit)
+                    {
+                        throw new EndOfStreamException("ShaderSubProgram local keyword exceeds entry boundary.");
+                    }
                 }
             }
-            m_ProgramCode = reader.ReadUInt8Array();
-            reader.AlignStream();
+            if (limit - reader.BaseStream.Position < 4)
+            {
+                throw new EndOfStreamException("ShaderSubProgram program code length truncated.");
+            }
+            var programCodeLength = reader.ReadInt32();
+            if (programCodeLength < 0 || programCodeLength > limit - reader.BaseStream.Position)
+            {
+                throw new InvalidDataException($"Invalid ShaderSubProgram code length {programCodeLength} for entry boundary.");
+            }
+            m_ProgramCode = reader.ReadUInt8Array(programCodeLength);
+            if (reader.BaseStream.Position < limit)
+            {
+                reader.AlignStream();
+            }
 
             // Unity 5.5+ stores source map, bind channels, and parameters on SerializedSubProgram;
             // Unity 5.3-5.4 trailing channel/parameter blocks are skipped by ShaderProgram.Read via entry.Offset.

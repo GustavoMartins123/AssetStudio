@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -12,6 +13,7 @@ public sealed class AddressablesCatalogAnalyzer
 {
     private const long MaxJsonCatalogBytes = 256L * 1024 * 1024;
     private const int MaxBinaryCatalogScanBytes = 4 * 1024 * 1024;
+    private const uint BinaryCatalogMagic = 0x0DE38942u;
     private const int MaxIndexedBundles = 50_000;
     private const int MaxBundleDecryptionHintsPerCatalog = 50;
     private const int MaxLocalBundleMagicProbes = 8;
@@ -341,7 +343,7 @@ public sealed class AddressablesCatalogAnalyzer
                 totalRead += read;
             }
 
-            var asciiTokens = ExtractPrintableAsciiStrings(buffer.AsSpan(0, totalRead), minLength: 6);
+            var asciiTokens = ExtractBinaryCatalogStrings(buffer.AsSpan(0, totalRead), minLength: 6);
             var catalogProviders = new HashSet<string>(StringComparer.Ordinal);
             var seenBundles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -937,6 +939,59 @@ public sealed class AddressablesCatalogAnalyzer
         }
     }
 
+    private static List<string> ExtractBinaryCatalogStrings(ReadOnlySpan<byte> data, int minLength)
+    {
+        if (data.Length >= 8 && BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0, 4)) == BinaryCatalogMagic)
+        {
+            var lengthPrefixed = ExtractLengthPrefixedAsciiStrings(data.Slice(8), minLength, maxLength: 2048);
+            if (lengthPrefixed.Count > 0)
+            {
+                return lengthPrefixed;
+            }
+        }
+
+        return ExtractPrintableAsciiStrings(data, minLength);
+    }
+
+    private static List<string> ExtractLengthPrefixedAsciiStrings(ReadOnlySpan<byte> data, int minLength, int maxLength)
+    {
+        var results = new List<string>();
+        var i = 0;
+
+        while (i <= data.Length - 4)
+        {
+            var length = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(i, 4));
+            if (length >= minLength && length <= maxLength && i + 4 + length <= data.Length)
+            {
+                var slice = data.Slice(i + 4, length);
+                if (IsAllPrintableAscii(slice))
+                {
+                    results.Add(Encoding.ASCII.GetString(slice));
+                    i += 4 + length;
+                    continue;
+                }
+            }
+
+            i++;
+        }
+
+        return results;
+    }
+
+    private static bool IsAllPrintableAscii(ReadOnlySpan<byte> slice)
+    {
+        for (var i = 0; i < slice.Length; i++)
+        {
+            var b = slice[i];
+            if (b < 0x20 || b > 0x7E)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static List<string> ExtractPrintableAsciiStrings(ReadOnlySpan<byte> data, int minLength)
     {
         var results = new List<string>();
@@ -955,26 +1010,48 @@ public sealed class AddressablesCatalogAnalyzer
             }
             else if (start >= 0)
             {
-                var length = i - start;
-                if (length >= minLength && length <= 512)
-                {
-                    results.Add(Encoding.ASCII.GetString(data.Slice(start, length)));
-                }
-
+                TryEmitBoundedAsciiRun(data, start, i - start, minLength, results);
                 start = -1;
             }
         }
 
         if (start >= 0)
         {
-            var length = data.Length - start;
-            if (length >= minLength && length <= 512)
-            {
-                results.Add(Encoding.ASCII.GetString(data.Slice(start, length)));
-            }
+            TryEmitBoundedAsciiRun(data, start, data.Length - start, minLength, results);
         }
 
         return results;
+    }
+
+    private static void TryEmitBoundedAsciiRun(
+        ReadOnlySpan<byte> data,
+        int start,
+        int runLength,
+        int minLength,
+        List<string> results)
+    {
+        var effectiveLength = runLength;
+
+        // Respect 4-byte little-endian length-prefixed strings even in binary catalogs without
+        // the standard 0x0DE38942 header, avoiding trailing length/offset bytes merging into tokens.
+        if (start >= 4)
+        {
+            var declaredLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(start - 4, 4));
+            var trailingBytes = runLength - declaredLength;
+            if (declaredLength >= minLength
+                && declaredLength <= 512
+                && trailingBytes > 0
+                && trailingBytes <= 4
+                && start + declaredLength + 4 <= data.Length)
+            {
+                effectiveLength = declaredLength;
+            }
+        }
+
+        if (effectiveLength >= minLength && effectiveLength <= 512)
+        {
+            results.Add(Encoding.ASCII.GetString(data.Slice(start, effectiveLength)));
+        }
     }
 
     private static bool TryGetPropertyCaseInsensitive(JsonElement obj, string name, out JsonElement value)

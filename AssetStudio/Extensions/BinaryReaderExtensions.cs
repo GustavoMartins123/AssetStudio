@@ -325,6 +325,16 @@ namespace AssetStudio
             CheckBlittableArrayLength(reader, length, 1);
         }
 
+        public static void CheckArrayLength(this BinaryReader reader, int length, int elementSize)
+        {
+            if (elementSize <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(elementSize), "Element size must be positive.");
+            }
+
+            CheckBlittableArrayLength(reader, length, elementSize);
+        }
+
         private static void CheckBlittableArrayLength(BinaryReader reader, int length, int elementSize)
         {
             if (length < 0)
@@ -333,6 +343,38 @@ namespace AssetStudio
             }
 
             long byteCount = (long)length * elementSize;
+
+            if (reader is ObjectReader objReader)
+            {
+                if (length > Array.MaxLength || byteCount > Array.MaxLength)
+                {
+                    throw new OverflowException($"Invalid array length: {length}");
+                }
+
+                long remainingObj = (long)objReader.byteSize - (objReader.Position - objReader.byteStart);
+                if (remainingObj < 0 || byteCount > remainingObj)
+                {
+                    throw new EndOfStreamException($"Array length {length} ({byteCount} bytes) exceeds remaining object size {remainingObj}");
+                }
+
+                if (!reader.BaseStream.CanSeek)
+                {
+                    if (byteCount > MaxByteArrayLength)
+                    {
+                        throw new OverflowException($"Invalid array length: {length}");
+                    }
+                    return;
+                }
+
+                long remainingObjectStream = reader.BaseStream.Length - reader.BaseStream.Position;
+                if (byteCount > remainingObjectStream)
+                {
+                    throw new EndOfStreamException($"Array length {length} ({byteCount} bytes) exceeds remaining stream length {remainingObjectStream}");
+                }
+
+                return;
+            }
+
             if (byteCount > MaxByteArrayLength)
             {
                 throw new OverflowException($"Invalid array length: {length}");
@@ -343,18 +385,12 @@ namespace AssetStudio
                 throw new OverflowException($"Invalid array length: {length}");
             }
 
-            long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
-            if (byteCount > remainingStream)
+            if (reader.BaseStream.CanSeek)
             {
-                throw new EndOfStreamException($"Array length {length} ({byteCount} bytes) exceeds remaining stream length {remainingStream}");
-            }
-
-            if (reader is ObjectReader objReader)
-            {
-                long remainingObj = objReader.byteSize - (objReader.Position - objReader.byteStart);
-                if (byteCount > remainingObj)
+                long remainingStream = reader.BaseStream.Length - reader.BaseStream.Position;
+                if (byteCount > remainingStream)
                 {
-                    throw new EndOfStreamException($"Array length {length} ({byteCount} bytes) exceeds remaining object size {remainingObj}");
+                    throw new EndOfStreamException($"Array length {length} ({byteCount} bytes) exceeds remaining stream length {remainingStream}");
                 }
             }
         }
