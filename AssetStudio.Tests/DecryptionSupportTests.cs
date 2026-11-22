@@ -225,7 +225,45 @@ namespace AssetStudio.Tests
                     Assert.Equal(nodePayload, ms.ToArray());
                 }
 
-                // 3. AssetsManager.Clear() must preserve registered decryption profiles (uses ClearSessionCaches)
+                // 3. Per-file filename-derived key salt + filename-MD5 IV
+                DecryptionHelper.Clear();
+                string sampleFileName = "pack_0042.bundle";
+                string sampleStem = "pack_0042";
+                byte[] masterKeyBytes = Encoding.UTF8.GetBytes("master-secret");
+                byte[] stemBytes = Encoding.UTF8.GetBytes(sampleStem);
+                byte[] combinedForKey = new byte[masterKeyBytes.Length + stemBytes.Length];
+                Buffer.BlockCopy(masterKeyBytes, 0, combinedForKey, 0, masterKeyBytes.Length);
+                Buffer.BlockCopy(stemBytes, 0, combinedForKey, masterKeyBytes.Length, stemBytes.Length);
+                byte[] perFileKey32 = SHA256.HashData(combinedForKey);
+                byte[] perFileIv16 = MD5.HashData(stemBytes);
+                byte[] perFileEncrypted = EncryptAes(plainBundle, perFileKey32, perFileIv16, CipherMode.CBC, PaddingMode.PKCS7);
+
+                DecryptionHelper.RegisterProfile(new DecryptionProfile
+                {
+                    Id = "per-file-stem-kdf",
+                    Algorithm = "aes-cbc",
+                    FileNamePattern = "*.bundle",
+                    KeyUtf8 = "master-secret",
+                    KeyDerivation = "sha256",
+                    UseFileNameAsSalt = true,
+                    UseFileNameWithoutExtension = true,
+                    IvFromFileNameHash = "md5",
+                    Padding = "pkcs7",
+                    ValidateUnityHeader = true
+                });
+
+                using (var perFileReader = new FileReader(sampleFileName, new MemoryStream(perFileEncrypted)))
+                {
+                    Assert.Equal("DeclarativeProfile", perFileReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, perFileReader.FileType);
+                    using var bundle = new BundleFile(perFileReader);
+                    Assert.Single(bundle.fileList);
+                    using var ms = new MemoryStream();
+                    bundle.fileList[0].stream.CopyTo(ms);
+                    Assert.Equal(nodePayload, ms.ToArray());
+                }
+
+                // 4. AssetsManager.Clear() must preserve registered decryption profiles (uses ClearSessionCaches)
                 using (var manager = new AssetsManager())
                 {
                     manager.Clear();

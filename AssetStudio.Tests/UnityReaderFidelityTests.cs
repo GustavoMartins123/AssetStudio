@@ -638,10 +638,6 @@ namespace AssetStudio.Tests
                 WriteInt32(ms, 0); // m_IntValues
                 WriteInt32(ms, 0); // m_BoolValues
                 WriteInt32(ms, 1); WriteInt32(ms, 42); // m_EntityIdValues (6000.3+)
-                if (minor >= 4)
-                {
-                    WriteInt32(ms, 0); // 6000.4 extra array
-                }
                 // m_TOS (1 entry)
                 WriteInt32(ms, 1);
                 WriteUInt32(ms, 12345u);

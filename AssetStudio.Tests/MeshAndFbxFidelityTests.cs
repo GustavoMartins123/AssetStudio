@@ -653,7 +653,7 @@ namespace AssetStudio.Tests
             pose.m_X = new[] { x0, x1, x2 };
 
             var converter = new TestModelConverter(root);
-            InvokePrivateMethod(converter, "BuildSkeletonFramesFromDefaultPose", new object?[] { skel, pose, null });
+            InvokePrivateMethod(converter, "BuildSkeletonFramesFromDefaultPose", new object?[] { skel, pose, null, false });
 
             // Node 0 (m_ParentId = -1, id = 0) mapped to RootFrame without creating a bogus "Bone_0" child!
             Assert.Null(root.FindChild("Bone_0", recursive: false));

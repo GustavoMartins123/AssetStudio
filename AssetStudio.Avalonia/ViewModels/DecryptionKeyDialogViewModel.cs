@@ -128,7 +128,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 "Offset Skip (None)"
             };
             KeyFormatOptions = new[] { "Hex", "UTF-8 Text" };
-            IvModeOptions = new[] { "Hex", "UTF-8 Text", "Read from Stream Prefix", "None (All Zeros)" };
+            IvModeOptions = new[] { "Hex", "UTF-8 Text", "Read from Stream Prefix", "None (All Zeros)", "Derive from Filename (MD5)" };
             PaddingOptions = new[] { "None", "PKCS7" };
             KdfOptions = new[] { "None", "SHA-256", "MD5", "PBKDF2-SHA256", "PBKDF2-SHA1" };
             SaltFormatOptions = new[] { "UTF-8 Text", "Hex" };
@@ -618,6 +618,9 @@ namespace AssetStudio.Avalonia.ViewModels
                     case 3:
                         // All zeros
                         break;
+                    case 4:
+                        candidate.IvFromFileNameHash = "md5";
+                        break;
                 }
             }
 
@@ -725,6 +728,11 @@ namespace AssetStudio.Avalonia.ViewModels
             if (p.IvFromStreamPrefix)
             {
                 SelectedIvModeIndex = 2;
+                IvInput = string.Empty;
+            }
+            else if (!string.IsNullOrWhiteSpace(p.IvFromFileNameHash))
+            {
+                SelectedIvModeIndex = 4;
                 IvInput = string.Empty;
             }
             else if (!string.IsNullOrWhiteSpace(p.IvHex) || !string.IsNullOrWhiteSpace(p.NonceHex))

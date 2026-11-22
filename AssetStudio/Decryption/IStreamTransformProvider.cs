@@ -88,6 +88,25 @@ namespace AssetStudio
         public bool IvFromStreamPrefix { get; set; }
 
         /// <summary>
+        /// Optional per-file IV derivation from filename: "md5" or "sha256".
+        /// </summary>
+        [JsonPropertyName("ivFromFileNameHash")]
+        public string? IvFromFileNameHash { get; set; }
+
+        /// <summary>
+        /// When true, uses the target file's name (or stem when useFileNameWithoutExtension is true)
+        /// as the KDF salt (or appends it to the key material before SHA256/MD5 hashing).
+        /// </summary>
+        [JsonPropertyName("useFileNameAsSalt")]
+        public bool UseFileNameAsSalt { get; set; }
+
+        /// <summary>
+        /// When true, per-file filename derivation uses Path.GetFileNameWithoutExtension(filePath).
+        /// </summary>
+        [JsonPropertyName("useFileNameWithoutExtension")]
+        public bool UseFileNameWithoutExtension { get; set; }
+
+        /// <summary>
         /// Block cipher padding: "none" (default) or "pkcs7".
         /// </summary>
         [JsonPropertyName("padding")]
@@ -152,6 +171,9 @@ namespace AssetStudio
                 NonceHex = NonceHex,
                 IvUtf8 = IvUtf8,
                 IvFromStreamPrefix = IvFromStreamPrefix,
+                IvFromFileNameHash = IvFromFileNameHash,
+                UseFileNameAsSalt = UseFileNameAsSalt,
+                UseFileNameWithoutExtension = UseFileNameWithoutExtension,
                 Padding = Padding,
                 CounterStart = CounterStart,
                 CounterLittleEndian = CounterLittleEndian,
@@ -320,7 +342,7 @@ namespace AssetStudio
                 }
 
                 stream.Position = originalPos;
-                var candidate = TryCreateTransformedStream(profile, stream, originalPos);
+                var candidate = TryCreateTransformedStream(profile, stream, fileName, originalPos);
                 if (candidate == null)
                 {
                     stream.Position = originalPos;
@@ -355,7 +377,7 @@ namespace AssetStudio
             return null;
         }
 
-        private static Stream? TryCreateTransformedStream(DecryptionProfile profile, Stream stream, long originalPos)
+        private static Stream? TryCreateTransformedStream(DecryptionProfile profile, Stream stream, string fileName, long originalPos)
         {
             StreamCipherAlgorithm algo;
             try
@@ -382,7 +404,8 @@ namespace AssetStudio
                 return null;
             }
 
-            byte[]? keyBytes = TryResolveKeyBytes(profile, algo, out _);
+            string fileToken = ResolveFileToken(profile, fileName);
+            byte[]? keyBytes = TryResolveKeyBytes(profile, algo, out _, fileToken);
             if (keyBytes == null || keyBytes.Length == 0)
             {
                 return null;
@@ -430,6 +453,14 @@ namespace AssetStudio
                 }
 
                 effectiveSkip += ivLen;
+            }
+            else if (!string.IsNullOrWhiteSpace(profile.IvFromFileNameHash))
+            {
+                ivOrNonce = DeriveIvFromFileToken(profile.IvFromFileNameHash!, fileToken, algo);
+                if (ivOrNonce == null)
+                {
+                    return null;
+                }
             }
             else
             {
@@ -540,7 +571,39 @@ namespace AssetStudio
             }
         }
 
-        internal static byte[]? TryResolveKeyBytes(DecryptionProfile profile, StreamCipherAlgorithm algo, out string? error)
+        private static string ResolveFileToken(DecryptionProfile profile, string fileName)
+        {
+            if (string.IsNullOrEmpty(fileName))
+            {
+                return string.Empty;
+            }
+
+            return profile.UseFileNameWithoutExtension
+                ? Path.GetFileNameWithoutExtension(fileName)
+                : fileName;
+        }
+
+        private static byte[]? DeriveIvFromFileToken(string hashKind, string fileToken, StreamCipherAlgorithm algo)
+        {
+            byte[] tokenBytes = Encoding.UTF8.GetBytes(fileToken ?? string.Empty);
+            int targetLen = algo == StreamCipherAlgorithm.ChaCha20 ? 12 : 16;
+            string mode = hashKind.Trim().ToLowerInvariant();
+            byte[] hash = mode switch
+            {
+                "md5" => MD5.HashData(tokenBytes),
+                "sha256" or "sha-256" => SHA256.HashData(tokenBytes),
+                _ => Array.Empty<byte>()
+            };
+
+            if (hash.Length < targetLen)
+            {
+                return null;
+            }
+
+            return hash.AsSpan(0, targetLen).ToArray();
+        }
+
+        internal static byte[]? TryResolveKeyBytes(DecryptionProfile profile, StreamCipherAlgorithm algo, out string? error, string? fileToken = null)
         {
             error = null;
             byte[]? rawKey = null;
@@ -589,12 +652,21 @@ namespace AssetStudio
                     _ => 32
                 };
 
+            byte[] effectiveInput = rawKey;
+            if (profile.UseFileNameAsSalt && !string.IsNullOrEmpty(fileToken) && (kdf is "sha256" or "sha-256" or "md5"))
+            {
+                byte[] tokenBytes = Encoding.UTF8.GetBytes(fileToken);
+                effectiveInput = new byte[rawKey.Length + tokenBytes.Length];
+                Buffer.BlockCopy(rawKey, 0, effectiveInput, 0, rawKey.Length);
+                Buffer.BlockCopy(tokenBytes, 0, effectiveInput, rawKey.Length, tokenBytes.Length);
+            }
+
             switch (kdf)
             {
                 case "sha256":
                 case "sha-256":
                 {
-                    byte[] hash = SHA256.HashData(rawKey);
+                    byte[] hash = SHA256.HashData(effectiveInput);
                     if (targetLen > 0 && targetLen < hash.Length)
                     {
                         return hash.AsSpan(0, targetLen).ToArray();
@@ -603,7 +675,7 @@ namespace AssetStudio
                 }
                 case "md5":
                 {
-                    byte[] hash = MD5.HashData(rawKey);
+                    byte[] hash = MD5.HashData(effectiveInput);
                     if (targetLen > 0 && targetLen < hash.Length)
                     {
                         return hash.AsSpan(0, targetLen).ToArray();
@@ -615,7 +687,11 @@ namespace AssetStudio
                 case "pbkdf2-sha256":
                 {
                     byte[] salt = Array.Empty<byte>();
-                    if (!string.IsNullOrWhiteSpace(profile.SaltHex))
+                    if (profile.UseFileNameAsSalt && !string.IsNullOrEmpty(fileToken))
+                    {
+                        salt = Encoding.UTF8.GetBytes(fileToken);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(profile.SaltHex))
                     {
                         byte[]? parsedSalt = TryParseHexBytes(profile.SaltHex);
                         if (parsedSalt == null)

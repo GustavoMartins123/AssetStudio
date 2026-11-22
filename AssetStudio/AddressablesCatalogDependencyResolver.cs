@@ -1357,7 +1357,7 @@ namespace AssetStudio
 
                 var primaryKey = ReadBinaryCatalogString(data, primaryKeyOff, '/') ?? string.Empty;
                 var internalId = ReadBinaryCatalogString(data, internalIdOff, '/') ?? string.Empty;
-                var providerId = ReadBinaryCatalogString(data, providerOff, '.') ?? string.Empty;
+                var providerId = NormalizeBinaryProviderId(ReadBinaryCatalogString(data, providerOff, '.') ?? string.Empty);
 
                 if (!string.IsNullOrWhiteSpace(providerId) && providerSet.Add(providerId))
                 {
@@ -1576,6 +1576,24 @@ namespace AssetStudio
             }
 
             return prefix + Path.Combine(catalogDirectory, NormalizeRelativeSeparators(suffix));
+        }
+
+        private static string NormalizeBinaryProviderId(string providerId)
+        {
+            if (string.IsNullOrWhiteSpace(providerId))
+            {
+                return string.Empty;
+            }
+
+            if (providerId.EndsWith(".UnityEngine", StringComparison.Ordinal)
+                && !providerId.StartsWith("UnityEngine.", StringComparison.Ordinal))
+            {
+                var segments = providerId.Split('.');
+                Array.Reverse(segments);
+                return string.Join('.', segments);
+            }
+
+            return providerId;
         }
 
         public static string? ReadBinaryCatalogString(ReadOnlySpan<byte> data, uint id, char separator)
