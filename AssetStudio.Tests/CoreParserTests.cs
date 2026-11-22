@@ -628,6 +628,53 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void StreamedClip_ReadData_LinearSlopePass_MatchesReferenceAndHandlesLargeFrameCountsQuickly()
+        {
+            // Build 400 streamed frames x 40 curves = 16,000 keys (would be slow under O(F^2 * K), <50ms under O(totalKeys))
+            const int frameCount = 400;
+            const int curvesPerFrame = 40;
+            using var ms = new MemoryStream();
+            using (var bw = new BinaryWriter(ms, Encoding.ASCII, leaveOpen: true))
+            {
+                for (int f = 0; f < frameCount; f++)
+                {
+                    float t = f == 0 ? float.NegativeInfinity : (f == frameCount - 1 ? float.PositiveInfinity : (f - 1) * 0.033f);
+                    bw.Write(t);
+                    bw.Write(curvesPerFrame);
+                    for (int c = 0; c < curvesPerFrame; c++)
+                    {
+                        bw.Write(c); // curve index
+                        bw.Write(0.1f); // coeff0
+                        bw.Write(0.2f); // coeff1
+                        bw.Write(0.3f); // coeff2
+                        bw.Write(f * 0.5f + c); // coeff3 (value)
+                    }
+                }
+            }
+
+            byte[] rawBytes = ms.ToArray();
+            uint[] words = new uint[rawBytes.Length / 4];
+            Buffer.BlockCopy(rawBytes, 0, words, 0, rawBytes.Length);
+
+            var streamed = (StreamedClip)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(StreamedClip));
+            streamed.data = words;
+            streamed.curveCount = curvesPerFrame;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var frames = streamed.ReadData();
+            sw.Stop();
+
+            Assert.Equal(frameCount, frames.Count);
+            Assert.True(sw.ElapsedMilliseconds < 2000, $"StreamedClip.ReadData took {sw.ElapsedMilliseconds}ms");
+
+            // Verify frame[2] curve[0] inSlope matches CalculateNextInSlope from frame[1]
+            var prevKey = frames[1].keyList[0];
+            var curKey = frames[2].keyList[0];
+            float expectedInSlope = prevKey.CalculateNextInSlope(frames[2].time - frames[1].time, curKey);
+            Assert.Equal(expectedInSlope, curKey.inSlope, precision: 5);
+        }
+
         private static byte[] BuildValidLz4UnityFsBundle(string nodePath, byte[] nodePayload)
         {
             // Split payload into 2 LZ4 blocks so prefix-cutoff boundary validation exercises multiple blocks

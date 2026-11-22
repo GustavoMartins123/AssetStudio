@@ -322,6 +322,37 @@ public sealed class ProjectRuntimeDetector
         TryAdd(Path.Combine(fullRoot, "assets", "bin", "Data"));
         TryAdd(Path.Combine(fullRoot, "Contents", "Resources", "Data"));
 
+        // Bounded depth-2 fallback when a Unity build is packaged under a nested subfolder (<Root>/<Sub>/<Game>_Data)
+        if (directories.Count == 0)
+        {
+            try
+            {
+                foreach (var childDir in Directory.EnumerateDirectories(fullRoot, "*", SearchOption.TopDirectoryOnly)
+                    .OrderBy(static d => d, StringComparer.OrdinalIgnoreCase)
+                    .Take(64))
+                {
+                    foreach (var nestedData in Directory.EnumerateDirectories(childDir, "*_Data", SearchOption.TopDirectoryOnly)
+                        .OrderBy(static d => d, StringComparer.OrdinalIgnoreCase))
+                    {
+                        TryAdd(nestedData);
+                    }
+
+                    var nestedPlainData = Path.Combine(childDir, "Data");
+                    if (Directory.Exists(nestedPlainData)
+                        && (File.Exists(Path.Combine(nestedPlainData, "globalgamemanagers"))
+                            || File.Exists(Path.Combine(nestedPlainData, "data.unity3d"))
+                            || Directory.Exists(Path.Combine(nestedPlainData, "Managed"))
+                            || Directory.Exists(Path.Combine(nestedPlainData, "il2cpp_data"))))
+                    {
+                        TryAdd(nestedPlainData);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
         return directories;
     }
 
@@ -341,6 +372,11 @@ public sealed class ProjectRuntimeDetector
         {
             probeDirectories.Add(dataDir);
             probeDirectories.Add(Path.Combine(dataDir, "Native"));
+            var parentDir = Path.GetDirectoryName(dataDir);
+            if (!string.IsNullOrEmpty(parentDir))
+            {
+                probeDirectories.Add(parentDir);
+            }
         }
 
         foreach (var dir in probeDirectories.Distinct(StringComparer.OrdinalIgnoreCase))
@@ -461,13 +497,26 @@ public sealed class ProjectRuntimeDetector
             }
         }
 
-        var unityPlayerDll = Path.Combine(fullRoot, "UnityPlayer.dll");
-        if (File.Exists(unityPlayerDll))
+        var unityPlayerProbeDirs = new List<string> { fullRoot };
+        foreach (var dataDir in dataDirectories)
         {
-            var version = TryReadUnityVersionFromFileVersionInfo(unityPlayerDll);
-            if (!string.IsNullOrEmpty(version))
+            var parentDir = Path.GetDirectoryName(dataDir);
+            if (!string.IsNullOrEmpty(parentDir))
             {
-                return (version, unityPlayerDll);
+                unityPlayerProbeDirs.Add(parentDir);
+            }
+        }
+
+        foreach (var probeDir in unityPlayerProbeDirs.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var unityPlayerDll = Path.Combine(probeDir, "UnityPlayer.dll");
+            if (File.Exists(unityPlayerDll))
+            {
+                var version = TryReadUnityVersionFromFileVersionInfo(unityPlayerDll);
+                if (!string.IsNullOrEmpty(version))
+                {
+                    return (version, unityPlayerDll);
+                }
             }
         }
 

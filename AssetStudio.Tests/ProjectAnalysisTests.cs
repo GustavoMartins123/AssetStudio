@@ -625,6 +625,25 @@ namespace AssetStudio.Tests
                 Assert.Equal("6000.0.61f1", fromDataDir.UnityVersion);
                 Assert.True(fromDataDir.HasManagedAssemblies);
                 Assert.Equal(1, fromDataDir.ManagedAssemblyCount);
+
+                // Nested subfolder layout (<Root>/<Sub>/<App>_Data + nested GameAssembly.dll + aa/catalog.bin)
+                var nestedRoot = Path.Combine(tempRoot, "NestedBuildRoot");
+                var nestedSub = Path.Combine(nestedRoot, "Build");
+                var nestedData = Path.Combine(nestedSub, "App_Data");
+                var nestedAa = Path.Combine(nestedData, "StreamingAssets", "aa");
+                Directory.CreateDirectory(Path.Combine(nestedData, "il2cpp_data", "Metadata"));
+                Directory.CreateDirectory(nestedAa);
+                File.WriteAllBytes(Path.Combine(nestedSub, "GameAssembly.dll"), new byte[64]);
+                WriteIl2CppMetadataHeader(Path.Combine(nestedData, "il2cpp_data", "Metadata", "global-metadata.dat"), ProjectRuntimeDetector.Il2CppMetadataSanity, 39, 64);
+                WriteSerializedFileVersionHeader(Path.Combine(nestedData, "globalgamemanagers"), formatVersion: 22, unityVersion: "6000.3.22f1");
+                File.WriteAllBytes(Path.Combine(nestedAa, "catalog.bin"), new byte[64]);
+
+                var fromNested = detector.Detect(nestedRoot);
+                Assert.Equal(UnityScriptingBackend.Il2Cpp, fromNested.ScriptingBackend);
+                Assert.True(fromNested.HasGameAssembly);
+                Assert.Equal(39, fromNested.Il2CppMetadataVersion);
+                Assert.Equal("6000.3.22f1", fromNested.UnityVersion);
+                Assert.Single(fromNested.AddressablesCatalogPaths);
             }
             finally
             {

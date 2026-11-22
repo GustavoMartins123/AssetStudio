@@ -504,6 +504,11 @@ namespace AssetStudio
 
             m_DefaultState = reader.ReadUInt32();
             m_MotionSetCount = reader.ReadUInt32();
+            if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 4)) //6000.4 and up
+            {
+                var m_EvaluateTransitionsOnStart = reader.ReadBoolean();
+                reader.AlignStream();
+            }
         }
     }
 
@@ -563,10 +568,6 @@ namespace AssetStudio
                     if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 3)) //6000.3 and up
                     {
                         var m_EntityIdValues = reader.ReadInt32Array();
-                    }
-                    if (version[0] > 6000 || (version[0] == 6000 && version[1] >= 4)) //6000.4 and up
-                    {
-                        var m_ExtraValues = reader.ReadInt32Array();
                     }
                 }
             }

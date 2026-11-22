@@ -659,20 +659,39 @@ namespace AssetStudio
                 }
             }
 
-            for (int frameIndex = 2; frameIndex < frameList.Count - 1; frameIndex++)
+            // Track the most recent keyframe per curve index in O(totalKeys) instead of O(frames^2 * keys)
+            if (frameList.Count > 3)
             {
-                var frame = frameList[frameIndex];
-                foreach (var curveKey in frame.keyList)
+                var lastKeyByIndex = new Dictionary<int, (float Time, StreamedCurveKey Key)>();
+                int seedFrames = Math.Min(2, frameList.Count);
+                for (int f = 0; f < seedFrames; f++)
                 {
-                    for (int i = frameIndex - 1; i >= 0; i--)
+                    var seedFrame = frameList[f];
+                    for (int k = seedFrame.keyList.Length - 1; k >= 0; k--)
                     {
-                        var preFrame = frameList[i];
-                        var preCurveKey = preFrame.keyList.FirstOrDefault(x => x.index == curveKey.index);
-                        if (preCurveKey != null)
+                        var ck = seedFrame.keyList[k];
+                        lastKeyByIndex[ck.index] = (seedFrame.time, ck);
+                    }
+                }
+
+                for (int frameIndex = 2; frameIndex < frameList.Count - 1; frameIndex++)
+                {
+                    var frame = frameList[frameIndex];
+                    var keys = frame.keyList;
+                    for (int k = 0; k < keys.Length; k++)
+                    {
+                        var curveKey = keys[k];
+                        if (lastKeyByIndex.TryGetValue(curveKey.index, out var prev))
                         {
-                            curveKey.inSlope = preCurveKey.CalculateNextInSlope(frame.time - preFrame.time, curveKey);
-                            break;
+                            curveKey.inSlope = prev.Key.CalculateNextInSlope(frame.time - prev.Time, curveKey);
                         }
+                    }
+
+                    // Walk backwards so the first key for a duplicate curve index in this frame wins (matching FirstOrDefault).
+                    for (int k = keys.Length - 1; k >= 0; k--)
+                    {
+                        var ck = keys[k];
+                        lastKeyByIndex[ck.index] = (frame.time, ck);
                     }
                 }
             }
@@ -1210,6 +1229,15 @@ namespace AssetStudio
 
             // If m_PPtrCurves already has items, no need to reconstruct
             if (m_PPtrCurves != null && m_PPtrCurves.Length > 0)
+            {
+                return;
+            }
+
+            // Skip expensive StreamedClip/DenseClip decoding when the clip has no PPtr curves
+            if (m_ClipBindingConstant.pptrCurveMapping == null
+                || m_ClipBindingConstant.pptrCurveMapping.Length == 0
+                || m_ClipBindingConstant.genericBindings == null
+                || !m_ClipBindingConstant.genericBindings.Any(b => b.isPPtrCurve == 1))
             {
                 return;
             }
