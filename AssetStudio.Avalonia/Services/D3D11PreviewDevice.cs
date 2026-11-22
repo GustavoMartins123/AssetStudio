@@ -7,7 +7,7 @@ namespace AssetStudio.Avalonia.Services;
 
 internal sealed unsafe class D3D11PreviewDevice : IDisposable
 {
-    internal const int R32Typeless = 39, D32Float = 40, R32Float = 41;
+    internal const int Rgba16Float = 10, R32Typeless = 39, D32Float = 40, R32Float = 41, R16Float = 54, R8Unorm = 61;
 
     // Slots are from the Windows SDK definitions of ID3D11Device and ID3D11DeviceContext.
     private readonly nint _device;
@@ -99,17 +99,17 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         }
     }
 
-    internal void UpdateTexture2D(nint texture, ReadOnlySpan<byte> pixels, uint rowPitch)
+    internal void UpdateTexture2D(nint texture, ReadOnlySpan<byte> pixels, uint rowPitch, uint subresource)
     {
         fixed (byte* bytes = pixels)
         {
-            UpdateResource(texture, bytes, rowPitch);
+            UpdateResource(texture, bytes, rowPitch, subresource);
         }
     }
 
-    private void UpdateResource(nint resource, void* data, uint rowPitch) =>
+    private void UpdateResource(nint resource, void* data, uint rowPitch, uint subresource = 0) =>
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, void*, void*, uint, uint, void>)Slot(_context, 48))(
-            _context, resource, 0, null, data, rowPitch, 0);
+            _context, resource, subresource, null, data, rowPitch, 0);
 
     internal nint CreateTexture(TextureDesc desc, SubresourceData* initialData = null)
     {
@@ -258,7 +258,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     }
 
     internal void SetPass(nint surface, nint depth, nint blendState, nint depthState, byte stencilReference, nint rasterizerState,
-        int size, nint secondarySurface = 0)
+        int size, nint secondarySurface = 0, int x = 0, int y = 0)
     {
         nint* outputs = stackalloc nint[] { surface, secondarySurface };
         uint outputCount = secondarySurface != 0 ? 2u : surface != 0 ? 1u : 0u;
@@ -267,7 +267,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         ((delegate* unmanaged[Stdcall]<nint, nint, float*, uint, void>)Slot(_context, 35))(_context, blendState, null, uint.MaxValue);
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 36))(_context, depthState, stencilReference);
         ((delegate* unmanaged[Stdcall]<nint, nint, void>)Slot(_context, 43))(_context, rasterizerState);
-        var viewport = new Viewport { Width = size, Height = size, MaxDepth = 1 };
+        var viewport = new Viewport { X = x, Y = y, Width = size, Height = size, MaxDepth = 1 };
         ((delegate* unmanaged[Stdcall]<nint, uint, Viewport*, void>)Slot(_context, 44))(_context, 1, &viewport);
     }
 

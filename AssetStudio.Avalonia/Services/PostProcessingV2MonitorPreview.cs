@@ -36,9 +36,9 @@ internal static class PostProcessingV2MonitorPreview
         };
 
         var file = resources.assetsFile;
-        var (_, copyReference, computeReference) =
+        var (_, copyReference, computeReferences) =
             PostProcessingResourcesPreview.ReadComputeReferences(resources, shader, monitor.ShaderField, monitor.ComputeField);
-        var computeAsset = resolveCompute(file, computeReference);
+        var computeAsset = resolveCompute(file, computeReferences[0]);
         var compute = SerializedComputeShaderPreview.Read(computeAsset);
 
         var buffer = new ShaderPreviewComputeBuffer(monitor.BufferName, monitor.Width * monitor.Height, monitor.Stride);

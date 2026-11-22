@@ -8,7 +8,8 @@ namespace AssetStudio.Avalonia.Services;
 
 // Camera passes for serialized Built-in and Post Processing shaders.
 internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] PassIndices, bool UsesCameraColor,
-    ImageEffectPass? Effect = null, string? SceneKeyword = null, uint DepthBlitSamples = 0)
+    ImageEffectPass? Effect = null, string? SceneKeyword = null, uint DepthBlitSamples = 0,
+    ShaderPreviewStereoLayout? StereoLayout = null)
 {
     internal static string? ShadowFilter(string name) => name == "Hidden/Internal-ScreenSpaceShadows" ? "HardShadow" : null;
 
@@ -57,6 +58,10 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
             throw new NotSupportedException($"'{ShaderName}' has an unsupported depth blit pass.");
         }
 
+        if (StereoLayout is { } stereo)
+        {
+            return StereoCameraPreview.PrepareCopy(draws[0], stereo, size);
+        }
         if (ShaderName.StartsWith(PostProcessingV2Preview.Prefix, StringComparison.Ordinal))
         {
             return PostProcessingV2Preview.Prepare(ShaderName, draws, values, textures, size);
@@ -150,7 +155,8 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
                 }
             }
         }
-        return new ShaderPreviewTexture(size, size, 1, 28, 4, false, pixels, 1, 1, 1, 0, faces);
+        return new ShaderPreviewTexture(size, size, 1, 28, 4, false, pixels, 1, 1, 1, 0, faces,
+            Dimension: ShaderPreviewTextureDimension.Cube);
     }
 
     private static void SetColorGradingInputs(IDictionary<string, NumericsVector4> values,

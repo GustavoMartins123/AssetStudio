@@ -19,6 +19,9 @@ internal static class PostProcessingV2Preview
     internal static SerializedCameraShaderPreview? Find(string name) => name switch
     {
         Prefix + "Copy" or Prefix + "CopyStd" or Prefix + "DiscardAlpha" or Prefix + "Uber" => new(name, [0], true),
+        // PostProcessLayer enables NaN removal by default, which uses copy pass 1.
+        Prefix + "CopyStdFromTexArray" => new(name, [1], true, StereoLayout: ShaderPreviewStereoLayout.TextureArray),
+        Prefix + "CopyStdFromDoubleWide" => new(name, [1], true, StereoLayout: ShaderPreviewStereoLayout.DoubleWide),
         Prefix + "DeferredFog" => new(name, [1], true, SceneKeyword: "FOG_EXP2"),
         Prefix + "Bloom" => new(name, [0, 2, 4, 7], true, ImageEffectPass.PostProcessingBloom),
         Prefix + "MotionBlur" => new(name, [0, 1, 2, 3, 4, 5], true, ImageEffectPass.PostProcessingMotionBlur),
@@ -30,6 +33,7 @@ internal static class PostProcessingV2Preview
         PostProcessingV2MonitorPreview.Histogram or PostProcessingV2MonitorPreview.Waveform or
             PostProcessingV2MonitorPreview.Vectorscope => new(name, [0], true),
         PostProcessingV2ReflectionPreview.Name => new(name, [0, 1, 3], true, ImageEffectPass.ScreenSpaceReflection),
+        PostProcessingV2MultiScalePreview.Name => new(name, [0, 3], false),
         Prefix + "Lut2DBaker" => new(name, [0], false),
         FinalPass => new(name, [0], true),
         Smaa => new(name, [2, 5, 6], true),

@@ -10,7 +10,7 @@ namespace AssetStudio
 {
     public sealed record ShaderPreviewParameter(string Name, int Type, int Rows, int Columns, bool IsMatrix, int ArraySize, int Offset);
     public sealed record ShaderPreviewBuffer(string Name, int Slot, int Size, ShaderPreviewParameter[] Parameters);
-    public enum ShaderPreviewTextureDimension { Texture2D = 2, Texture3D = 3, Cube = 4 }
+    public enum ShaderPreviewTextureDimension { Texture2D = 2, Texture3D = 3, Cube = 4, Texture2DArray = 5 }
     public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot, ShaderPreviewTextureDimension Dimension);
     public sealed record ShaderPreviewStructuredBufferBinding(string Name, int Slot);
     public sealed record ShaderPreviewSamplerBinding(int Slot, int Filter, int Wrap);

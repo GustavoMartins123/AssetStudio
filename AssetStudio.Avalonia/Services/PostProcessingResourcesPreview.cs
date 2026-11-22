@@ -48,8 +48,8 @@ internal static class PostProcessingResourcesPreview
         return (noise64, noise256, new PPtr<Texture>(reader), new PPtr<Texture>(reader));
     }
 
-    internal static (PPtr<Texture>? Noise256, PPtr<Shader> Copy, PPtr<AssetStudio.Object> Compute) ReadComputeReferences(
-        MonoBehaviour resources, Shader shader, int shaderField, int computeField)
+    internal static (PPtr<Texture>? Noise256, PPtr<Shader> Copy, PPtr<AssetStudio.Object>[] Compute) ReadComputeReferences(
+        MonoBehaviour resources, Shader shader, int shaderField, params int[] computeFields)
     {
         var file = resources.assetsFile;
         using var stream = file.reader.Clone();
@@ -60,10 +60,10 @@ internal static class PostProcessingResourcesPreview
         }
         var (_, noise256, _, _) = ReadTextures(reader);
         // PostProcessResources serializes Shaders, followed by ComputeShaders, in package field order.
-        const int shaderFields = 24, computeFields = 12, copyField = 1;
+        const int shaderFields = 24, computeFieldCount = 12, copyField = 1;
         long start = reader.Position;
-        if (reader.byteStart + reader.byteSize - start != (shaderFields + computeFields) * PointerSize ||
-            (uint)shaderField >= shaderFields || (uint)computeField >= computeFields)
+        if (reader.byteStart + reader.byteSize - start != (shaderFields + computeFieldCount) * PointerSize ||
+            (uint)shaderField >= shaderFields || Array.Exists(computeFields, field => (uint)field >= computeFieldCount))
         {
             throw new InvalidDataException("The PostProcessResources shader references have an unexpected layout.");
         }
@@ -75,8 +75,13 @@ internal static class PostProcessingResourcesPreview
         }
         reader.Position = start + copyField * PointerSize;
         var copy = new PPtr<Shader>(reader);
-        reader.Position = start + (shaderFields + computeField) * PointerSize;
-        return (noise256, copy, new PPtr<AssetStudio.Object>(reader));
+        var compute = new PPtr<AssetStudio.Object>[computeFields.Length];
+        for (int i = 0; i < compute.Length; i++)
+        {
+            reader.Position = start + (shaderFields + computeFields[i]) * PointerSize;
+            compute[i] = new PPtr<AssetStudio.Object>(reader);
+        }
+        return (noise256, copy, compute);
     }
 
     private static PPtr<Texture>? ReadFirstTexture(ObjectReader reader)

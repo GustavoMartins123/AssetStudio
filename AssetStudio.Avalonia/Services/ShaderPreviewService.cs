@@ -19,8 +19,12 @@ public sealed record ShaderPreviewFrame(int Width, int Height, byte[] RgbaPixels
 internal abstract record ShaderPreviewOperation;
 internal sealed record ShaderPreviewRenderTarget(string Name, int Size, int Filter = 1)
 {
+    internal int Format { get; init; } = D3D11PreviewDevice.Rgba16Float;
+    internal int ArraySize { get; init; } = 1;
     internal int MipLevels { get; init; } = 1;
     internal bool UnorderedAccess { get; init; }
+    internal ShaderPreviewTextureDimension Dimension => ArraySize > 1
+        ? ShaderPreviewTextureDimension.Texture2DArray : ShaderPreviewTextureDimension.Texture2D;
 }
 internal sealed record ShaderPreviewComputeBuffer(string Name, int Count, int Stride);
 internal enum ShaderPreviewPointPass { None, Collect, Draw }
@@ -30,16 +34,28 @@ internal abstract record ShaderPreviewProgramOperation : ShaderPreviewOperation
     internal IReadOnlyDictionary<string, ShaderPreviewRenderTarget>? Inputs { get; init; }
     internal IReadOnlyDictionary<string, ShaderPreviewComputeBuffer>? ComputeBuffers { get; init; }
     internal IReadOnlyDictionary<string, NumericsVector4>? Values { get; init; }
+    internal IReadOnlyDictionary<string, NumericsVector4[]>? VectorArrays { get; init; }
     internal IReadOnlyDictionary<string, string>? TextureSources { get; init; }
     internal string TextureSource(string name) => TextureSources?.GetValueOrDefault(name) ?? name;
+
+    internal bool TryGetVector(string name, int arraySize, int element, out NumericsVector4 value)
+    {
+        if (VectorArrays?.TryGetValue(name, out var elements) == true && elements.Length == arraySize)
+        {
+            value = elements[element];
+            return true;
+        }
+        value = default;
+        return arraySize == 1 && Values?.TryGetValue(name, out value) == true;
+    }
 }
 internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPreviewLight Light, int SkyboxSide = -1) : ShaderPreviewProgramOperation
 {
     internal override IEnumerable<ShaderPreviewStage> Stages => Pass.Stages;
     internal ShaderPreviewRenderTarget? Output { get; init; }
-    internal IReadOnlyDictionary<string, NumericsVector4[]>? VectorArrays { get; init; }
     internal IReadOnlyDictionary<string, NumericsMatrix4x4>? Matrices { get; init; }
     internal ShaderPreviewGeometry? Geometry { get; init; }
+    internal ShaderPreviewViewport? Viewport { get; init; }
     internal NumericsVector4? VertexColor { get; init; }
     internal ShaderPreviewBillboard? Billboard { get; init; }
     internal ShaderPreviewPointPass PointPass { get; init; }
@@ -52,7 +68,8 @@ internal sealed record ShaderPreviewDispatch(ShaderPreviewComputeKernel Kernel, 
 internal sealed record ShaderPreviewCopyMip(ShaderPreviewRenderTarget Source, ShaderPreviewRenderTarget Destination, int Mip) : ShaderPreviewOperation;
 internal sealed record ShaderPreviewGrab(string TextureName, bool Once) : ShaderPreviewOperation;
 internal readonly record struct ShaderPreviewLight(NumericsVector3 Direction, NumericsVector3 Color);
-internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad, Text }
+internal readonly record struct ShaderPreviewViewport(int X, int Y, int Size);
+internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad, Text, UnitQuad }
 
 internal sealed record ShaderPreviewScene(
     string ShaderName, ShaderPreviewGeometry Geometry, bool IsAnimated, IReadOnlyList<ShaderPreviewOperation> Operations,
@@ -64,20 +81,19 @@ internal sealed record ShaderPreviewScene(
     internal NoisePreviewSettings? NoiseSettings { get; init; }
     internal bool SerializedShader { get; init; }
     internal uint DepthBlitSamples { get; init; }
+    internal ShaderPreviewStereoLayout? StereoLayout { get; init; }
 }
 
 internal sealed record ShaderPreviewTexture(
     int Width, int Height, int MipCount, int Format, int BytesPerBlock, bool BlockCompressed, byte[] Pixels,
-    int Filter, int Wrap, int Anisotropy, float MipBias, int Faces = 1, bool Comparison = false, int VolumeDepth = 0)
-{
-    internal ShaderPreviewTextureDimension Dimension => VolumeDepth > 0 ? ShaderPreviewTextureDimension.Texture3D :
-        Faces == 6 ? ShaderPreviewTextureDimension.Cube : ShaderPreviewTextureDimension.Texture2D;
-}
+    int Filter, int Wrap, int Anisotropy, float MipBias, int ArraySize = 1, bool Comparison = false, int VolumeDepth = 0,
+    ShaderPreviewTextureDimension Dimension = ShaderPreviewTextureDimension.Texture2D);
 
 internal readonly record struct ShaderPreviewCamera(float Yaw, float Pitch, float Distance, System.Numerics.Vector2 Pan = default)
 {
     public static ShaderPreviewCamera Default => new(0, 0, 4);
     public const float Near = 0.1f, Far = 100;
+    internal const float FieldOfView = 35 * MathF.PI / 180;
 }
 
 internal static class ShaderPreviewService
@@ -329,16 +345,19 @@ internal static class ShaderPreviewService
                 resolveAsset, Resolve<MonoScript>, Resolve<Texture>, cancellationToken);
             if (PostProcessingV2MonitorPreview.Handles(reader.Name))
             {
-                var resources = PostProcessingResourcesPreview.Find(shader, resolveAsset, Resolve<MonoScript>, cancellationToken);
                 operations = [.. PostProcessingV2MonitorPreview.Prepare(shader, reader.Name, operations.OfType<ShaderPreviewDraw>().Single(),
-                    resources, RenderSize, Resolve<AssetStudio.Object>, Resolve<Shader>,
+                    ResolvePostProcessingResources(), RenderSize, Resolve<AssetStudio.Object>, Resolve<Shader>,
                     copy => Prepare(copy, null, loadExternalSources, resolveAsset, cancellationToken, lights))];
             }
             else if (reader.Name == PostProcessingV2ReflectionPreview.Name)
             {
-                var resources = PostProcessingResourcesPreview.Find(shader, resolveAsset, Resolve<MonoScript>, cancellationToken);
                 operations = [.. PostProcessingV2ReflectionPreview.Prepare(shader, operations.OfType<ShaderPreviewDraw>().ToArray(),
-                    resources, values, textures, RenderSize, Resolve<AssetStudio.Object>, Resolve<Texture>)];
+                    ResolvePostProcessingResources(), values, textures, RenderSize, Resolve<AssetStudio.Object>, Resolve<Texture>)];
+            }
+            else if (reader.Name == PostProcessingV2MultiScalePreview.Name)
+            {
+                operations = [.. PostProcessingV2MultiScalePreview.Prepare(shader, operations.OfType<ShaderPreviewDraw>().ToArray(),
+                    ResolvePostProcessingResources(), RenderSize, Resolve<AssetStudio.Object>)];
             }
             geometry = ShaderPreviewGeometry.ScreenQuad;
             imageEffect = cameraPreview.Effect;
@@ -441,6 +460,7 @@ internal static class ShaderPreviewService
             if (operation is ShaderPreviewCopyMip copy)
             {
                 if (!renderedTargets.Contains(copy.Source) || copy.Source == copy.Destination ||
+                    copy.Source.ArraySize != 1 || copy.Destination.ArraySize != 1 || copy.Source.Format != copy.Destination.Format ||
                     copy.Destination.Size is <= 0 or > RenderSize ||
                     copy.Destination.MipLevels < 2 ||
                     copy.Destination.MipLevels > 1 + System.Numerics.BitOperations.Log2((uint)copy.Destination.Size) ||
@@ -467,10 +487,11 @@ internal static class ShaderPreviewService
                     PrepareInputs(dispatch, output: null);
                     foreach (var binding in dispatch.Kernel.Outputs)
                     {
-                        if (binding.Dimension == ShaderPreviewTextureDimension.Texture2D)
+                        if (binding.Dimension is ShaderPreviewTextureDimension.Texture2D or ShaderPreviewTextureDimension.Texture2DArray)
                         {
                             var target = dispatch.TextureOutputs?.GetValueOrDefault(binding.Name);
                             if (target is not { UnorderedAccess: true, MipLevels: 1 } || target.Size is <= 0 or > RenderSize ||
+                                target.Dimension != binding.Dimension || target.ArraySize is <= 0 or > 2048 ||
                                 dispatch.Inputs?.Values.Contains(target) == true)
                             {
                                 throw new InvalidDataException($"Invalid writable texture for '{binding.Name}'.");
@@ -519,7 +540,7 @@ internal static class ShaderPreviewService
                         pass.State.Stencil == null;
                     if ((!depthIndependent && ((draw.Geometry ?? geometry) != ShaderPreviewGeometry.ScreenQuad || pass.State.ZWrite)) ||
                         pass.State.AlphaToMask ||
-                        output.Size is <= 0 or > RenderSize || output.MipLevels != 1)
+                        output.Size is <= 0 or > RenderSize || output.MipLevels != 1 || output.ArraySize != 1)
                     {
                         throw new NotSupportedException($"Unsupported state for render target '{output.Name}'.");
                     }
@@ -541,11 +562,15 @@ internal static class ShaderPreviewService
         return new ShaderPreviewScene(reader.Name, geometry, animated, operations, PreviewAmbientLinear, lights, values, textures,
             unusedKeywords, lightingPass, imageEffect, cameraTextures)
         {
-            NoiseSettings = noiseSettings, SerializedShader = serialized, DepthBlitSamples = depthBlitSamples
+            NoiseSettings = noiseSettings, SerializedShader = serialized, DepthBlitSamples = depthBlitSamples,
+            StereoLayout = cameraTextures.Contains(ImageEffectPreview.MainTexture) ? cameraPreview?.StereoLayout : null
         };
 
         T Resolve<T>(SerializedFile source, PPtr<T> reference) where T : AssetStudio.Object =>
             ResolveReference(reference, source, loadExternalSources, resolveAsset, cancellationToken);
+
+        MonoBehaviour ResolvePostProcessingResources() =>
+            PostProcessingResourcesPreview.Find(shader, resolveAsset, Resolve<MonoScript>, cancellationToken);
 
         void PrepareInputs(ShaderPreviewProgramOperation operation, ShaderPreviewRenderTarget? output)
         {
@@ -557,7 +582,7 @@ internal static class ShaderPreviewService
                 }
                 if (operation.Inputs?.TryGetValue(binding.Name, out var target) == true)
                 {
-                    if (binding.Dimension != ShaderPreviewTextureDimension.Texture2D || target == output || !renderedTargets.Contains(target))
+                    if (binding.Dimension != target.Dimension || target == output || !renderedTargets.Contains(target))
                     {
                         throw new InvalidDataException($"Render target '{target.Name}' is incompatible or unavailable for '{binding.Name}'.");
                     }
@@ -589,9 +614,11 @@ internal static class ShaderPreviewService
             if (cameraTextures.Contains(name) || ImageEffectPreview.ProvidesTexture(imageEffect, name) ||
                 imageEffect == ImageEffectPass.TemporalAntialiasing && name == TemporalAntialiasingPreview.HistoryTexture)
             {
-                if (!image)
+                var required = name == ImageEffectPreview.MainTexture && cameraPreview?.StereoLayout == ShaderPreviewStereoLayout.TextureArray
+                    ? ShaderPreviewTextureDimension.Texture2DArray : ShaderPreviewTextureDimension.Texture2D;
+                if (dimension != required)
                 {
-                    throw new InvalidDataException($"The preview's camera texture '{name}' requires a 2D binding.");
+                    throw new InvalidDataException($"The preview's camera texture '{name}' requires a {required} binding.");
                 }
                 return;
             }
@@ -802,7 +829,8 @@ internal static class ShaderPreviewService
         {
             color.CopyTo(pixels, face * 4);
         }
-        return new ShaderPreviewTexture(1, 1, 1, 28 /* R8G8B8A8_UNORM */, 4, false, pixels, 0, 1, 1, 0, faces);
+        return new ShaderPreviewTexture(1, 1, 1, 28 /* R8G8B8A8_UNORM */, 4, false, pixels, 0, 1, 1, 0, faces,
+            Dimension: faces == 6 ? ShaderPreviewTextureDimension.Cube : ShaderPreviewTextureDimension.Texture2D);
     }
 
     private static ShaderPreviewTexture CreateReflectionProbe(NumericsVector3 ambient)
@@ -817,7 +845,8 @@ internal static class ShaderPreviewService
         // Built-in probe volumes pack the RGB spherical harmonics and the occlusion mask in four X slices.
         float[] coefficients = [0, 0, 0, ambient.X, 0, 0, 0, ambient.Y, 0, 0, 0, ambient.Z, 1, 1, 1, 1];
         return new ShaderPreviewTexture(4, 1, 1, 2 /* R32G32B32A32_FLOAT */, 16, false,
-            MemoryMarshal.AsBytes(coefficients.AsSpan()).ToArray(), 1, 1, 1, 0, VolumeDepth: 1);
+            MemoryMarshal.AsBytes(coefficients.AsSpan()).ToArray(), 1, 1, 1, 0, VolumeDepth: 1,
+            Dimension: ShaderPreviewTextureDimension.Texture3D);
     }
 
     internal static ShaderPreviewTexture ReadTexture(Texture asset, ShaderPreviewTextureDimension dimension)
@@ -897,7 +926,7 @@ internal static class ShaderPreviewService
             }
         }
         return new ShaderPreviewTexture(width, height, mips, format, bytesPerBlock, blockCompressed, data,
-            settings.m_FilterMode, settings.m_WrapMode, settings.m_Aniso, settings.m_MipBias, faces);
+            settings.m_FilterMode, settings.m_WrapMode, settings.m_Aniso, settings.m_MipBias, faces, Dimension: dimension);
     }
 
     private static byte[] UnpackCrunchedMips(string name, byte[] data, int width, int height, int mips, int bytesPerBlock)
@@ -995,11 +1024,7 @@ internal static class ShaderPreviewService
 
         NumericsVector4 ResolveVector(string name, int arraySize, int element)
         {
-            if (draw.VectorArrays?.TryGetValue(name, out var elements) == true && elements.Length == arraySize)
-            {
-                return elements[element];
-            }
-            if (arraySize == 1 && draw.Values?.TryGetValue(name, out var perDraw) == true)
+            if (draw.TryGetVector(name, arraySize, element, out var perDraw))
             {
                 return perDraw;
             }
@@ -1167,10 +1192,9 @@ internal static class ShaderPreviewService
         }
     }
 
-    internal static byte[] BindComputeConstants(ShaderPreviewBuffer buffer, IReadOnlyDictionary<string, NumericsVector4>? values) =>
+    internal static byte[] BindComputeConstants(ShaderPreviewBuffer buffer, ShaderPreviewProgramOperation operation) =>
         PackConstants(buffer, (name, _, _) => throw MissingValue(name),
-            (name, arraySize, _) => arraySize == 1 && values?.TryGetValue(name, out var value) == true
-                ? value : throw MissingValue(name));
+            (name, arraySize, element) => operation.TryGetVector(name, arraySize, element, out var value) ? value : throw MissingValue(name));
 
     private static byte[] PackConstants(ShaderPreviewBuffer buffer,
         Func<string, int, int, NumericsMatrix4x4> resolveMatrix, Func<string, int, int, NumericsVector4> resolveVector,

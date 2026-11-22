@@ -20,11 +20,12 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private const uint BokehPointStride = 28;
     private const uint BindVertexBuffer = 1, BindIndexBuffer = 2, BindConstantBuffer = 4,
         BindShaderResource = 8, BindRenderTarget = 32, BindDepthStencil = 64, BindUnorderedAccess = 128;
-    private static readonly NumericsMatrix4x4 Projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(35 * MathF.PI / 180, 1,
+    private static readonly NumericsMatrix4x4 Projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(ShaderPreviewCamera.FieldOfView, 1,
         ShaderPreviewCamera.Near, ShaderPreviewCamera.Far);
     private static readonly NumericsMatrix4x4 ReversedProjection = BuiltInLightingPreview.DepthProjection(Projection, reversedDepth: true);
 
     private static readonly (Vertex[] Vertices, uint[] Indices) Plane = BuildPlane();
+    private static readonly (Vertex[] Vertices, uint[] Indices) UnitQuad = BuildUnitQuad();
     private static readonly (Vertex[] Vertices, uint[] Indices) TextPlane = BuildTextPlane();
     private static readonly (Vertex[] Vertices, uint[] Indices) ScreenQuad = BuildScreenQuad();
     private static readonly (Vertex[] Vertices, uint[] Indices) FogQuad = BuildScreenQuad(includeCornerIndices: true);
@@ -36,6 +37,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private readonly ShaderPreviewScene _scene;
     private readonly D3D11PreviewDevice _device;
     private readonly BuiltInLightingPreview? _lighting;
+    private readonly StereoCameraPreview? _stereo;
     private readonly ImageEffectPreview? _animatedEffect;
     private readonly IReadOnlyDictionary<string, ShaderPreviewTexture>? _cameraTextures;
     private ShaderPreviewCamera? _lightingCamera;
@@ -146,7 +148,12 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 // The collection pass can append at most one point per pixel.
                 _bokehPoints = _device.CreateAppendBuffer(FrameSize * FrameSize, BokehPointStride);
             }
-            if (scene.CameraTextures.Count != 0)
+            if (scene.StereoLayout is { } stereoLayout)
+            {
+                _stereo = new StereoCameraPreview(stereoLayout, scene.Lights[0], FrameSize, scene.SerializedShader, scene.AmbientLinear);
+                _cameraTextures = _stereo.Textures;
+            }
+            else if (scene.CameraTextures.Count != 0)
             {
                 _lighting = new BuiltInLightingPreview(scene.CameraTextures, scene.Lights[0], FrameSize, scene.ImageEffect,
                     scene.SerializedShader, scene.AmbientLinear);
@@ -233,6 +240,12 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             _lightingMotion = motion;
             _lightingJitter = jitter;
         }
+        if (_stereo is { } stereo && _lightingCamera != renderCamera)
+        {
+            stereo.RenderInputs(view, Projection, eye, token);
+            UploadCameraTextures(stereo.Textures);
+            _lightingCamera = renderCamera;
+        }
         if (temporal && (!_historyReady || resetMotionHistory || time < _lastMotionTime))
         {
             _device.ClearBindings();
@@ -298,7 +311,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     DispatchKernel(dispatch);
                     foreach (var output in dispatch.Kernel.Outputs)
                     {
-                        if (output.Dimension == ShaderPreviewTextureDimension.Texture2D)
+                        if (output.Dimension.HasValue)
                         {
                             renderedTargets.Add(dispatch.TextureOutputs![output.Name]);
                         }
@@ -414,7 +427,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             }
             _device.ClearBindings();
             nint targetView = _targetView;
-            int size = FrameSize;
+            int size = draw.Viewport?.Size ?? FrameSize;
             if (draw.Output is { } output)
             {
                 targetView = GetRenderTarget(output).View;
@@ -424,7 +437,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             nint depthView = draw.Output == null ? _depth : 0;
             nint secondaryView = temporal ? GetRenderTarget(TemporalHistory[_historyReadIndex ^ 1]).View : 0;
             _device.SetPass(targetView, depthView, gpu.Blend, gpu.Depth,
-                pass.State.Stencil?.Reference ?? 0, gpu.Rasterizer, size, secondaryView);
+                pass.State.Stencil?.Reference ?? 0, gpu.Rasterizer, size, secondaryView,
+                draw.Viewport?.X ?? 0, draw.Viewport?.Y ?? 0);
             if (draw.PointPass == ShaderPreviewPointPass.Collect)
             {
                 _device.SetAppendTarget(targetView, depthView, _bokehPoints.AppendView);
@@ -473,7 +487,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 nint output = binding.Dimension switch
                 {
                     null when dispatch.ComputeBuffers?.GetValueOrDefault(binding.Name) is { } buffer => GetComputeBuffer(buffer).UnorderedView,
-                    ShaderPreviewTextureDimension.Texture2D when dispatch.TextureOutputs?.GetValueOrDefault(binding.Name) is { } texture =>
+                    { } dimension when dispatch.TextureOutputs?.GetValueOrDefault(binding.Name) is { } texture &&
+                        texture.Dimension == dimension =>
                         GetRenderTarget(texture).UnorderedView,
                     _ => 0
                 };
@@ -511,7 +526,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 var data = operation is ShaderPreviewDraw draw
                     ? ShaderPreviewService.BindConstants(_scene, draw, buffer, view, projection ?? Projection, eye, size, capturedNames,
                         time, deltaTime, _lighting, _cameraTextures, motion, billboardTransform, unusedVertexParameter)
-                    : ShaderPreviewService.BindComputeConstants(buffer, operation.Values);
+                    : ShaderPreviewService.BindComputeConstants(buffer, operation);
                 if (_constantBuffers.TryGetValue(buffer, out nint gpuBuffer))
                 {
                     _device.UpdateBuffer<byte>(gpuBuffer, data);
@@ -658,6 +673,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     {
         ShaderPreviewGeometry.Particles => (new Vertex[ParticleCount * 4], ParticleIndices),
         ShaderPreviewGeometry.Plane => Plane,
+        ShaderPreviewGeometry.UnitQuad => UnitQuad,
         ShaderPreviewGeometry.Text => TextPlane,
         ShaderPreviewGeometry.ScreenQuad => _scene.ImageEffect == ImageEffectPass.GlobalFog ? FogQuad : ScreenQuad,
         ShaderPreviewGeometry.Skybox or ShaderPreviewGeometry.Volume => Skybox,
@@ -861,12 +877,13 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         {
             nint image = _device.CreateTexture(new TextureDesc
             {
-                Width = (uint)target.Size, Height = (uint)target.Size, MipLevels = (uint)target.MipLevels, ArraySize = 1,
-                Format = 10, // R16G16B16A16_FLOAT, to retain signed focus values and HDR color.
+                Width = (uint)target.Size, Height = (uint)target.Size, MipLevels = (uint)target.MipLevels, ArraySize = (uint)target.ArraySize,
+                Format = target.Format,
                 SampleCount = 1, BindFlags = BindShaderResource | BindRenderTarget | (target.UnorderedAccess ? BindUnorderedAccess : 0u)
             });
             var texture = new GpuTexture(image, _device.CreateShaderView(image), CreateSampler(_device, target.Filter, 1, 1, 0));
-            resource = (texture, _device.CreateRenderView(image), target.UnorderedAccess ? _device.CreateUnorderedTextureView(image) : 0);
+            resource = (texture, target.ArraySize == 1 ? _device.CreateRenderView(image) : 0,
+                target.UnorderedAccess ? _device.CreateUnorderedTextureView(image) : 0);
             _renderTargets.Add(target, resource);
         }
         return resource;
@@ -883,7 +900,12 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             }
             else if (!texture.Comparison)
             {
-                _device.UpdateTexture2D(gpu.Image, texture.Pixels, checked((uint)(texture.Width * texture.BytesPerBlock)));
+                int pitch = checked(texture.Width * texture.BytesPerBlock);
+                int sliceBytes = checked(pitch * texture.Height);
+                for (int slice = 0; slice < texture.ArraySize; slice++)
+                {
+                    _device.UpdateTexture2D(gpu.Image, texture.Pixels.AsSpan(slice * sliceBytes, sliceBytes), (uint)pitch, (uint)slice);
+                }
             }
         }
     }
@@ -907,7 +929,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     private static GpuTexture UploadTexture(D3D11PreviewDevice device, ShaderPreviewTexture texture, string name, bool mutable = false)
     {
-        int subresources = texture.MipCount * texture.Faces;
+        int subresources = texture.MipCount * texture.ArraySize;
         var levels = stackalloc SubresourceData[subresources];
         fixed (byte* data = texture.Pixels)
         {
@@ -934,7 +956,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 throw new InvalidDataException($"Unexpected data after the mips for texture '{name}'.");
             }
             uint usage = mutable ? 0u : 1u;
-            nint image = texture.VolumeDepth > 0
+            bool cube = texture.Dimension == ShaderPreviewTextureDimension.Cube;
+            nint image = texture.Dimension == ShaderPreviewTextureDimension.Texture3D
                 ? device.CreateTexture3D(new Texture3DDesc
                 {
                     Width = (uint)texture.Width, Height = (uint)texture.Height, Depth = (uint)texture.VolumeDepth,
@@ -943,11 +966,11 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 : device.CreateTexture(new TextureDesc
                 {
                     Width = (uint)texture.Width, Height = (uint)texture.Height, MipLevels = (uint)texture.MipCount,
-                    ArraySize = (uint)texture.Faces, Format = texture.Format, SampleCount = 1, Usage = usage, BindFlags = BindShaderResource,
-                    MiscFlags = texture.Faces == 6 ? 4u : 0u // D3D11_RESOURCE_MISC_TEXTURECUBE
+                    ArraySize = (uint)texture.ArraySize, Format = texture.Format, SampleCount = 1, Usage = usage, BindFlags = BindShaderResource,
+                    MiscFlags = cube ? 4u : 0u // D3D11_RESOURCE_MISC_TEXTURECUBE
                 }, levels);
             nint sampler = CreateSampler(device, texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias, texture.Comparison);
-            var view = texture.Faces == 6 ? device.CreateCubeView(image, texture.Format, texture.MipCount) : device.CreateShaderView(image);
+            var view = cube ? device.CreateCubeView(image, texture.Format, texture.MipCount) : device.CreateShaderView(image);
             return new GpuTexture(image, view, sampler);
         }
     }
@@ -1106,10 +1129,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                         ShaderPreviewTextureDimension.Texture2D when IsDepthBlitInput(texture.Name) && _scene.DepthBlitSamples > 1 =>
                             kind == ShaderPreviewProgramKind.Pixel && texture.SamplerSlot < 0 &&
                             (samples == 0 || samples == _scene.DepthBlitSamples) ? 4u : 0u,
-                        ShaderPreviewTextureDimension.Texture2D => 3u,
-                        ShaderPreviewTextureDimension.Texture3D => 5u,
-                        ShaderPreviewTextureDimension.Cube => 6u,
-                        _ => throw new InvalidDataException($"Unsupported DXBC texture dimension '{texture.Dimension}'.")
+                        _ => ResourceDimension(texture.Dimension)
                     })),
                     declareSampler => Array.Exists(stage.Textures, texture => texture.SamplerSlot == slot && flags ==
                         (_lighting?.Textures.TryGetValue(texture.Name, out var lightingTexture) == true && lightingTexture.Comparison ? 1u : 0u))
@@ -1137,16 +1157,17 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             }
             else if (opcode == 156 && dispatch != null) // dcl_uav_typed
             {
-                const uint texture2D = 3, float4ReturnType = 0x5555;
-                if (words != 4 || ((token >> 11) & 0x1fff) != texture2D || (token & 0x80000000) != 0 ||
+                const uint float4ReturnType = 0x5555;
+                uint dimension = (token >> 11) & 0x1fff;
+                if (words != 4 || (token & 0x80000000) != 0 ||
                     ReadUInt(program, offset + 12) != float4ReturnType)
                 {
                     throw new NotSupportedException("Unsupported compute writable texture declaration.");
                 }
                 uint slot = ReadUInt(program, offset + 8);
                 if (!declaredOutputs!.Add(slot) || !Array.Exists(dispatch.Kernel.Outputs, item =>
-                    item.Slot == slot && item.Dimension == ShaderPreviewTextureDimension.Texture2D &&
-                    dispatch.TextureOutputs?.GetValueOrDefault(item.Name)?.UnorderedAccess == true))
+                    item.Slot == slot && item.Dimension is { } type && ResourceDimension(type) == dimension &&
+                    dispatch.TextureOutputs?.GetValueOrDefault(item.Name) is { UnorderedAccess: true } target && target.Dimension == type))
                 {
                     throw new NotSupportedException($"No writable texture is bound at compute slot u{slot}.");
                 }
@@ -1191,6 +1212,15 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         bool MatchesBuffer(string name, uint stride) =>
             operation.ComputeBuffers?.TryGetValue(name, out var buffer) == true && buffer.Stride == stride;
     }
+
+    private static uint ResourceDimension(ShaderPreviewTextureDimension dimension) => dimension switch
+    {
+        ShaderPreviewTextureDimension.Texture2D => 3,
+        ShaderPreviewTextureDimension.Texture3D => 5,
+        ShaderPreviewTextureDimension.Cube => 6,
+        ShaderPreviewTextureDimension.Texture2DArray => 8,
+        _ => throw new InvalidDataException($"Unsupported DXBC texture dimension '{dimension}'.")
+    };
 
     private static nint CreateInputLayout(D3D11PreviewDevice device, byte[] bytecode, bool usesSecondaryUv)
     {
@@ -1307,6 +1337,11 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private static (Vertex[], uint[]) BuildPlane() =>
         ([PlaneVertex(-1, -1, 0, 0), PlaneVertex(1, -1, 1, 0), PlaneVertex(1, 1, 1, 1), PlaneVertex(-1, 1, 0, 1)],
          [0, 1, 2, 0, 2, 3]);
+
+    private static (Vertex[], uint[]) BuildUnitQuad() => (Array.ConvertAll(Plane.Vertices, vertex => vertex with
+    {
+        Position = vertex.Position with { X = (vertex.Position.X + 1) * 0.5f, Y = (vertex.Position.Y + 1) * 0.5f }
+    }), Plane.Indices);
 
     private static (Vertex[], uint[]) BuildTextPlane() => (Array.ConvertAll(Plane.Vertices, vertex => vertex with
     {

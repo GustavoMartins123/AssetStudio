@@ -16,13 +16,13 @@ internal static class PostProcessingV2ReflectionPreview
         Func<SerializedFile, PPtr<AssetStudio.Object>, AssetStudio.Object> resolveCompute,
         Func<SerializedFile, PPtr<Texture>, Texture> resolveTexture)
     {
-        var (noise256, _, gaussianReference) =
-            PostProcessingResourcesPreview.ReadComputeReferences(resources, shader, shaderField: 23, computeField: 11);
+        var (noise256, _, computeReferences) =
+            PostProcessingResourcesPreview.ReadComputeReferences(resources, shader, shaderField: 23, computeFields: [11]);
         var file = resources.assetsFile;
         var noise = ShaderPreviewService.ReadTexture(resolveTexture(file,
             noise256 ?? throw new InvalidDataException("The blueNoise256 resource array is empty.")), ShaderPreviewTextureDimension.Texture2D);
         textures.Add(Noise, noise);
-        var gaussian = SerializedComputeShaderPreview.Read(resolveCompute(file, gaussianReference)).GetKernel("KMain");
+        var gaussian = SerializedComputeShaderPreview.Read(resolveCompute(file, computeReferences[0])).GetKernel("KMain");
 
         // The package's Medium preset uses a half-resolution power-of-two target. Keep an 8x8 final mip.
         int resolution = 1 << (BitOperations.Log2((uint)size) - 1);
