@@ -16,6 +16,7 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
     private ShaderPreviewCamera _camera;
     private float _time, _deltaTime;
     private bool _active, _isAnimated, _busy, _suspended, _pending;
+    private bool _resetMotionHistory;
     private ShaderPreviewFrame? _frame;
     private string? _status, _error, _passDetails;
 
@@ -70,6 +71,7 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
     {
         _time = frame / framesPerSecond;
         _deltaTime = 1 / framesPerSecond;
+        _resetMotionHistory |= frame == 0;
         QueueFrame();
     }
 
@@ -93,6 +95,8 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
         _renderer = null; // The request owns the renderer until its UI continuation completes.
         var camera = _camera;
         float time = _time, deltaTime = _deltaTime;
+        bool resetMotionHistory = _resetMotionHistory;
+        _resetMotionHistory = false;
         CancellationToken token = _requests.BeginNewRequest(out long request);
         _ = RenderAsync();
 
@@ -105,7 +109,7 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
                 {
                     scene ??= prepare(token);
                     renderer ??= new D3D11ShaderPreviewRenderer(scene);
-                    return renderer.Render(camera, token, time, deltaTime);
+                    return renderer.Render(camera, token, time, deltaTime, resetMotionHistory);
                 }, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -181,6 +185,7 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
         _renderer?.Dispose();
         _renderer = null;
         _time = _deltaTime = 0;
+        _resetMotionHistory = false;
         _isAnimated = _pending = _busy = false;
         Frame = null;
         Status = Error = _passDetails = null;

@@ -43,7 +43,7 @@ public partial class MainWindow
             if (preview.IsAnimated)
             {
                 const int frames = 120;
-                GLPreviewControl.StartMaterialShaderAnimation(frames, 30);
+                GLPreviewControl.StartMaterialShaderAnimation(frames, ShaderPreviewService.FramesPerSecond);
                 ShowAnimationPlayback(frames);
                 if (PreviewSession.IsDumpTabActive)
                 {
@@ -68,9 +68,8 @@ public partial class MainWindow
     private ShaderPreviewScene PrepareShaderScene(Shader shader, Material? material, CancellationToken token)
     {
         using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
-        return ShaderPreviewService.Prepare(shader, material,
-            (owner, reference) => ResolveShaderPreviewReference(reference, owner.assetsFile, token),
-            (owner, reference) => ResolveShaderPreviewReference(reference, owner.assetsFile, token), token);
+        return ShaderPreviewService.Prepare(shader, material, EnsureIndexedExternalSourcesLoaded,
+            ResolveSemanticRelationHandleForPreview, token);
     }
 
     private T ResolveShaderPreviewReference<T>(PPtr<T> reference, SerializedFile source, CancellationToken token)

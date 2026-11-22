@@ -37,13 +37,34 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     internal nint CreateBuffer<T>(ReadOnlySpan<T> data, uint flags, bool mutable = false) where T : unmanaged
     {
         var desc = new BufferDesc { ByteWidth = checked((uint)(data.Length * sizeof(T))), Usage = mutable ? 0u : 1u, BindFlags = flags };
-        nint buffer = 0;
         fixed (T* pixels = data)
         {
             var initialData = new SubresourceData { Data = pixels };
-            var create = (delegate* unmanaged[Stdcall]<nint, BufferDesc*, SubresourceData*, nint*, int>)Slot(_device, 3);
-            return Keep(create(_device, &desc, &initialData, &buffer), buffer, "create a buffer");
+            return CreateBuffer(desc, &initialData);
         }
+    }
+
+    private nint CreateBuffer(BufferDesc desc, SubresourceData* initialData = null)
+    {
+        nint buffer = 0;
+        var create = (delegate* unmanaged[Stdcall]<nint, BufferDesc*, SubresourceData*, nint*, int>)Slot(_device, 3);
+        return Keep(create(_device, &desc, initialData, &buffer), buffer, "create a buffer");
+    }
+
+    internal (nint ShaderView, nint AppendView, nint DrawArguments) CreateAppendBuffer(uint capacity, uint stride)
+    {
+        nint points = CreateBuffer(new BufferDesc
+        {
+            ByteWidth = checked(capacity * stride), StructureStride = stride,
+            BindFlags = 0x88, MiscFlags = 0x40 // Shader resource, unordered access and structured buffer.
+        });
+        var shader = new ShaderViewDesc { Dimension = 1, MipLevels = capacity }; // BUFFER union: first element, number of elements.
+        var append = new BufferUavDesc { Dimension = 1, Count = capacity, Flags = 2 }; // D3D11_BUFFER_UAV_FLAG_APPEND.
+        uint* args = stackalloc uint[] { 0, 1, 0, 0 };
+        var initial = new SubresourceData { Data = args };
+        nint indirect = CreateBuffer(new BufferDesc { ByteWidth = 16, MiscFlags = 0x10 }, &initial);
+        return (CreateView(7, points, "create the structured buffer view", &shader),
+            CreateView(8, points, "create the append buffer view", &append), indirect);
     }
 
     internal void UpdateBuffer<T>(nint buffer, ReadOnlySpan<T> data) where T : unmanaged
@@ -100,14 +121,19 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         }
     }
 
-    internal nint CreateShader(byte[] bytecode, bool vertex)
+    internal nint CreateShader(byte[] bytecode, ShaderPreviewProgramKind kind)
     {
         nint shader = 0;
-        var create = (delegate* unmanaged[Stdcall]<nint, void*, nuint, nint, nint*, int>)Slot(_device, vertex ? 12 : 15);
+        var create = (delegate* unmanaged[Stdcall]<nint, void*, nuint, nint, nint*, int>)Slot(_device, kind switch
+        {
+            ShaderPreviewProgramKind.Vertex => 12,
+            ShaderPreviewProgramKind.Geometry => 13,
+            _ => 15
+        });
         fixed (byte* code = bytecode)
         {
             return Keep(create(_device, code, (nuint)bytecode.Length, 0, &shader), shader,
-                vertex ? "create the vertex shader" : "create the pixel shader");
+                $"create the {kind.ToString().ToLowerInvariant()} shader");
         }
     }
 
@@ -126,15 +152,20 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     internal void ClearBindings() =>
         ((delegate* unmanaged[Stdcall]<nint, void>)Slot(_context, 110))(_context);
 
-    internal void ClearFrame(nint surface, nint depth, int size, bool showBackgroundPattern)
+    internal void ClearFrame(nint surface, nint depth, int size, bool showBackgroundPattern, float background = 0.18f)
     {
-        float* clear = stackalloc float[] { 0.18f, 0.18f, 0.18f, 1f };
-        ((delegate* unmanaged[Stdcall]<nint, nint, float*, void>)Slot(_context, 50))(_context, surface, clear);
+        ClearColor(surface, background, 1f);
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(_context, depth, 3, 1f, 0);
         if (showBackgroundPattern)
         {
             ClearBackgroundTiles(surface, size);
         }
+    }
+
+    internal void ClearColor(nint surface, float color = 0, float alpha = 0)
+    {
+        float* clear = stackalloc float[] { color, color, color, alpha };
+        ((delegate* unmanaged[Stdcall]<nint, nint, float*, void>)Slot(_context, 50))(_context, surface, clear);
     }
 
     private void ClearBackgroundTiles(nint surface, int size)
@@ -193,12 +224,34 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         ((delegate* unmanaged[Stdcall]<nint, uint, void>)Slot(_context, 24))(_context, 4 /* triangle list */);
     }
 
-    internal void SetShader(nint shader, bool vertex) =>
-        ((delegate* unmanaged[Stdcall]<nint, nint, nint*, uint, void>)Slot(_context, vertex ? 11 : 9))(_context, shader, null, 0);
+    internal void SetShader(nint shader, ShaderPreviewProgramKind kind) =>
+        ((delegate* unmanaged[Stdcall]<nint, nint, nint*, uint, void>)Slot(_context, kind switch
+        {
+            ShaderPreviewProgramKind.Vertex => 11,
+            ShaderPreviewProgramKind.Geometry => 23,
+            _ => 9
+        }))(_context, shader, null, 0);
 
-    internal void SetConstantBuffer(nint buffer, int slot, bool vertex) => Bind(buffer, slot, vertex ? 7 : 16);
-    internal void SetTexture(nint view, int slot, bool vertex) => Bind(view, slot, vertex ? 25 : 8);
-    internal void SetSampler(nint sampler, int slot, bool vertex) => Bind(sampler, slot, vertex ? 26 : 10);
+    internal void SetConstantBuffer(nint buffer, int slot, ShaderPreviewProgramKind kind) =>
+        Bind(buffer, slot, kind switch { ShaderPreviewProgramKind.Vertex => 7, ShaderPreviewProgramKind.Geometry => 22, _ => 16 });
+    internal void SetTexture(nint view, int slot, ShaderPreviewProgramKind kind) =>
+        Bind(view, slot, kind switch { ShaderPreviewProgramKind.Vertex => 25, ShaderPreviewProgramKind.Geometry => 31, _ => 8 });
+    internal void SetSampler(nint sampler, int slot, ShaderPreviewProgramKind kind) =>
+        Bind(sampler, slot, kind switch { ShaderPreviewProgramKind.Vertex => 26, ShaderPreviewProgramKind.Geometry => 32, _ => 10 });
+
+    internal void SetAppendTarget(nint surface, nint depth, nint appendView)
+    {
+        uint resetCount = 0;
+        ((delegate* unmanaged[Stdcall]<nint, uint, nint*, nint, uint, uint, nint*, uint*, void>)Slot(_context, 34))(
+            _context, 1, &surface, depth, 1, 1, &appendView, &resetCount);
+    }
+
+    internal void DrawPoints(nint arguments, nint appendView)
+    {
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, nint, void>)Slot(_context, 49))(_context, arguments, 0, appendView);
+        ((delegate* unmanaged[Stdcall]<nint, uint, void>)Slot(_context, 24))(_context, 1 /* point list */);
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 40))(_context, arguments, 0);
+    }
 
     private void Bind(nint resource, int slot, int method) =>
         ((delegate* unmanaged[Stdcall]<nint, uint, uint, nint*, void>)Slot(_context, method))(_context, (uint)slot, 1, &resource);
@@ -327,6 +380,13 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     {
         public int Format, Dimension;
         public uint MostDetailedMip, MipLevels, Reserved0, Reserved1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BufferUavDesc
+    {
+        public int Format, Dimension;
+        public uint First, Count, Flags;
     }
 
     [StructLayout(LayoutKind.Sequential)]

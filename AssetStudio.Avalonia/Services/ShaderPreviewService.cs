@@ -17,7 +17,21 @@ namespace AssetStudio.Avalonia.Services;
 public sealed record ShaderPreviewFrame(int Width, int Height, byte[] RgbaPixels);
 
 internal abstract record ShaderPreviewOperation;
-internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPreviewLight Light, int SkyboxSide = -1) : ShaderPreviewOperation;
+internal sealed record ShaderPreviewRenderTarget(string Name, int Size);
+internal enum ShaderPreviewPointPass { None, Collect, Draw }
+internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPreviewLight Light, int SkyboxSide = -1) : ShaderPreviewOperation
+{
+    internal ShaderPreviewRenderTarget? Output { get; init; }
+    internal IReadOnlyDictionary<string, ShaderPreviewRenderTarget>? Inputs { get; init; }
+    internal IReadOnlyDictionary<string, NumericsVector4>? Values { get; init; }
+    internal IReadOnlyDictionary<string, NumericsMatrix4x4>? Matrices { get; init; }
+    internal IReadOnlyDictionary<string, string>? TextureSources { get; init; }
+    internal ShaderPreviewGeometry? Geometry { get; init; }
+    internal NumericsVector4? VertexColor { get; init; }
+    internal ShaderPreviewBillboard? Billboard { get; init; }
+    internal ShaderPreviewPointPass PointPass { get; init; }
+    internal string TextureSource(string name) => TextureSources?.GetValueOrDefault(name) ?? name;
+}
 internal sealed record ShaderPreviewGrab(string TextureName, bool Once) : ShaderPreviewOperation;
 internal readonly record struct ShaderPreviewLight(NumericsVector3 Direction, NumericsVector3 Color);
 internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad }
@@ -27,7 +41,10 @@ internal sealed record ShaderPreviewScene(
     NumericsVector3 AmbientLinear, IReadOnlyList<ShaderPreviewLight> Lights,
     IReadOnlyDictionary<string, NumericsVector4> Values,
     IReadOnlyDictionary<string, ShaderPreviewTexture> Textures, IReadOnlyList<string> UnusedMaterialKeywords,
-    BuiltInLightingPass LightingPass);
+    BuiltInLightingPass LightingPass, ImageEffectPass? ImageEffect, IReadOnlySet<string> CameraTextures)
+{
+    internal NoisePreviewSettings? NoiseSettings { get; init; }
+}
 
 internal sealed record ShaderPreviewTexture(
     int Width, int Height, int MipCount, int Format, int BytesPerBlock, bool BlockCompressed, byte[] Pixels,
@@ -42,6 +59,7 @@ internal readonly record struct ShaderPreviewCamera(float Yaw, float Pitch, floa
 internal static class ShaderPreviewService
 {
     internal const int RenderSize = 384;
+    internal const int FramesPerSecond = 30;
     private static readonly ShaderPreviewLight[] PreviewLights =
     [
         new(NumericsVector3.Normalize(new NumericsVector3(-0.45f, 0.7f, 0.65f)), new NumericsVector3(0.82f))
@@ -86,7 +104,7 @@ internal static class ShaderPreviewService
     }
 
     internal static ShaderPreviewScene Prepare(Shader shader, Material? material,
-        Func<Shader, PPtr<Shader>, Shader> resolveShader, Func<Material, PPtr<Texture>, Texture> resolveTexture,
+        Action<SerializedFile, CancellationToken> loadExternalSources, Func<AssetHandle, AssetStudio.Object?> resolveAsset,
         CancellationToken cancellationToken, IReadOnlyList<ShaderPreviewLight>? lights = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -160,7 +178,7 @@ internal static class ShaderPreviewService
         };
         // Screen-space preview geometry is independent from the game's depth ordering.
         values.TryAdd("unity_GUIZTestMode", new NumericsVector4(8, 0, 0, 0));
-        var passes = ExpandPasses(shader, reader, subShader, resolveShader, cancellationToken)
+        var passes = ExpandPasses(shader, reader, subShader, (owner, reference) => Resolve(owner.assetsFile, reference), cancellationToken)
             .Select(item => (item.Reader, item.Sub, Pass: ResolvePassLightMode(item.Reader, item.Pass)))
             .ToArray();
         bool forward = passes.Any(item => IsMode(item.Pass, "ForwardBase"));
@@ -195,15 +213,12 @@ internal static class ShaderPreviewService
         }
 
         var operations = new List<ShaderPreviewOperation>();
-        var textures = new Dictionary<string, ShaderPreviewTexture>(StringComparer.Ordinal);
-        var captures = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (owner, ownerSub, definition) in passes)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (definition.Type == PassType.Grab)
             {
                 operations.Add(new ShaderPreviewGrab(definition.Name, definition.CaptureOnce));
-                captures.Add(definition.Name);
                 continue;
             }
             bool additive = IsMode(definition, "ForwardAdd");
@@ -216,20 +231,6 @@ internal static class ShaderPreviewService
             try
             {
                 var pass = owner.PreparePass(ownerSub, definition, enabled, values);
-                foreach (var binding in pass.Vertex.Textures.Concat(pass.Fragment.Textures))
-                {
-                    PrepareTexture(binding.Name, binding.Dimension);
-                }
-                foreach (string name in pass.Vertex.Buffers.Concat(pass.Fragment.Buffers).SelectMany(buffer => buffer.Parameters)
-                    .Select(parameter => parameter.Name).Where(name => name.EndsWith("_TexelSize", StringComparison.Ordinal)))
-                {
-                    string textureName = name[..^"_TexelSize".Length];
-                    if (!textures.ContainsKey(textureName) && !captures.Contains(textureName) &&
-                        (reader.TextureDefaults.ContainsKey(textureName) || textureSlots.ContainsKey(textureName)))
-                    {
-                        PrepareTexture(textureName, ShaderPreviewTextureDimension.Texture2D);
-                    }
-                }
                 if (additive)
                 {
                     for (int i = 1; i < lights.Count; i++)
@@ -251,21 +252,164 @@ internal static class ShaderPreviewService
         {
             throw new NotSupportedException($"'{reader.Name}' has no D3D11 pass for the Built-in preview scene.");
         }
-        bool animated = geometry == ShaderPreviewGeometry.Particles || operations.OfType<ShaderPreviewDraw>().Any(draw =>
-            draw.Pass.Vertex.Buffers.Concat(draw.Pass.Fragment.Buffers).SelectMany(buffer => buffer.Parameters)
+
+        var textures = new Dictionary<string, ShaderPreviewTexture>(StringComparer.Ordinal);
+        ImageEffectPass? imageEffect = null;
+        if (SplashShadowPreview.IsShadowEffect(reader.Name))
+        {
+            operations = [.. SplashShadowPreview.Prepare(shader, reader.Name, operations.Cast<ShaderPreviewDraw>().ToArray(), lights[0], RenderSize, cancellationToken)];
+        }
+        else if (LegacyLightEffectsPreview.IsLightEffect(reader.Name))
+        {
+            var effect = LegacyLightEffectsPreview.Prepare(shader, reader.Name, operations.Cast<ShaderPreviewDraw>().Single(),
+                resolveAsset, Resolve<AssetStudio.Object>, Resolve<Texture>, cancellationToken);
+            textures.Add(effect.TextureName, effect.Texture);
+            operations = [.. effect.Draws];
+            geometry = ShaderPreviewGeometry.ScreenQuad;
+        }
+        else if (material == null && reader.Name == TreeBillboardPreview.ShaderName)
+        {
+            TreeBillboardPreview.Prepare(shader, values, textures, Resolve<Shader>, Resolve<Texture>, cancellationToken);
+        }
+        else if (geometry is ShaderPreviewGeometry.Sphere or ShaderPreviewGeometry.Plane &&
+            operations.All(operation => operation is ShaderPreviewDraw draw && draw.Pass.LightMode.Equals("Always", StringComparison.OrdinalIgnoreCase)))
+        {
+            // An image effect chooses a pass for its blit. Its passes are not successive draws on the material sphere.
+            var draws = operations.Cast<ShaderPreviewDraw>();
+            var cameraPasses = draws.Where(draw => draw.Pass.Fragment.Textures.Any(texture =>
+                BuiltInLightingPreview.IsSurfaceTexture(texture.Name))).ToArray();
+            if (cameraPasses.Length > 0)
+            {
+                // The legacy light prepass has separate encoded and linear accumulation passes.
+                // The preview displays the linear light buffer.
+                var draw = cameraPasses.Length == 1 ? cameraPasses[0] : cameraPasses.FirstOrDefault(candidate =>
+                    candidate.Pass.Keywords.Contains("DIRECTIONAL") && candidate.Pass.State is
+                        { Blend: true, Source: ShaderPreviewBlend.One, Destination: ShaderPreviewBlend.One });
+                if (draw == null)
+                {
+                    throw new NotSupportedException($"'{reader.Name}' requires a camera driver to choose its fullscreen pass.");
+                }
+                geometry = ShaderPreviewGeometry.ScreenQuad;
+                operations = [draw];
+            }
+            else
+            {
+                var (effectDraws, effectPass) = ImageEffectPreview.SelectDraws(draws, RenderSize);
+                if (effectDraws != null && effectPass is { } selected)
+                {
+                    imageEffect = selected;
+                    geometry = selected == ImageEffectPass.ObjectMotion ? ShaderPreviewGeometry.Sphere : ShaderPreviewGeometry.ScreenQuad;
+                    operations = [.. effectDraws];
+                    ImageEffectPreview.SetParameters(selected, values, RenderSize);
+                }
+            }
+        }
+
+        var cameraTextures = new HashSet<string>(StringComparer.Ordinal);
+        if (geometry == ShaderPreviewGeometry.ScreenQuad && !ImageEffectPreview.HasAnimatedInput(imageEffect))
+        {
+            foreach (string name in operations.OfType<ShaderPreviewDraw>()
+                .SelectMany(draw => draw.Pass.Stages.SelectMany(stage => stage.Textures).Select(binding => draw.TextureSource(binding.Name))))
+            {
+                if (BuiltInLightingPreview.IsSurfaceTexture(name) || name == BuiltInLightingPreview.CameraDepth ||
+                    (imageEffect == ImageEffectPass.Bokeh && name == ImageEffectPreview.BokehBlurredColor) ||
+                    (imageEffect == ImageEffectPass.MotionBlur && name == MotionPreview.MotionTexture) ||
+                    (imageEffect == ImageEffectPass.SkinDeformation && MotionPreview.IsSkinTexture(name)) ||
+                    (lightingPass == BuiltInLightingPass.CollectShadows && name == BuiltInLightingPreview.ShadowMap))
+                {
+                    cameraTextures.Add(name);
+                }
+            }
+            if (imageEffect.HasValue && imageEffect != ImageEffectPass.SkinDeformation && (imageEffect == ImageEffectPass.Bokeh || material == null ||
+                !textureSlots.TryGetValue(ImageEffectPreview.MainTexture, out var source) || source.m_Texture.IsNull))
+            {
+                cameraTextures.Add(ImageEffectPreview.MainTexture);
+            }
+        }
+        NoisePreviewSettings? noiseSettings = null;
+        if (imageEffect == ImageEffectPass.Noise)
+        {
+            var noise = NoisePreview.Read(shader, Resolve<Texture>, cancellationToken);
+            noiseSettings = noise.Settings;
+            textures.Add(NoisePreview.GrainTexture, ReadTexture(noise.Grain, ShaderPreviewTextureDimension.Texture2D));
+            textures.Add(NoisePreview.ScratchTexture, ReadTexture(noise.Scratch, ShaderPreviewTextureDimension.Texture2D));
+        }
+        var captures = new HashSet<string>(StringComparer.Ordinal);
+        var renderedTargets = new HashSet<ShaderPreviewRenderTarget>();
+        foreach (var operation in operations)
+        {
+            if (operation is ShaderPreviewGrab grab)
+            {
+                captures.Add(grab.TextureName);
+                continue;
+            }
+
+            var draw = (ShaderPreviewDraw)operation;
+            var pass = draw.Pass;
+            try
+            {
+                foreach (var binding in pass.Stages.SelectMany(stage => stage.Textures))
+                {
+                    if (draw.Inputs?.TryGetValue(binding.Name, out var target) == true)
+                    {
+                        if (binding.Dimension != ShaderPreviewTextureDimension.Texture2D || target == draw.Output || !renderedTargets.Contains(target))
+                        {
+                            throw new InvalidDataException($"Render target '{target.Name}' is incompatible or unavailable for '{binding.Name}'.");
+                        }
+                        continue;
+                    }
+                    PrepareTexture(draw.TextureSource(binding.Name), binding.Dimension);
+                }
+                foreach (string name in pass.Stages.SelectMany(stage => stage.Buffers).SelectMany(buffer => buffer.Parameters)
+                    .Select(parameter => parameter.Name).Where(name => name.EndsWith("_TexelSize", StringComparison.Ordinal)))
+                {
+                    string slot = name[..^"_TexelSize".Length];
+                    string textureName = draw.TextureSource(slot);
+                    if (draw.Inputs?.ContainsKey(slot) != true && !textures.ContainsKey(textureName) && !captures.Contains(textureName) &&
+                        (reader.TextureDefaults.ContainsKey(textureName) || textureSlots.ContainsKey(textureName)))
+                    {
+                        PrepareTexture(textureName, ShaderPreviewTextureDimension.Texture2D);
+                    }
+                }
+                if (draw.Output is { } output)
+                {
+                    bool depthIndependent = pass.State.ZTest is ShaderPreviewDepth.Always or ShaderPreviewDepth.Off &&
+                        pass.State.Stencil == null;
+                    if ((!depthIndependent && ((draw.Geometry ?? geometry) != ShaderPreviewGeometry.ScreenQuad || pass.State.ZWrite)) ||
+                        pass.State.AlphaToMask ||
+                        output.Size is <= 0 or > RenderSize)
+                    {
+                        throw new NotSupportedException($"Unsupported state for render target '{output.Name}'.");
+                    }
+                    renderedTargets.Add(output);
+                }
+            }
+            catch (Exception error) when (error is NotSupportedException or InvalidDataException)
+            {
+                throw new NotSupportedException($"{pass.ShaderName} · {pass.LightMode} {pass.PassName}. {error.Message}", error);
+            }
+        }
+
+        bool animated = ImageEffectPreview.HasAnimatedInput(imageEffect) || imageEffect is ImageEffectPass.SunShafts or ImageEffectPass.Noise or ImageEffectPass.SkinDeformation ||
+            MotionPreview.UsesHistory(imageEffect) ||
+            geometry == ShaderPreviewGeometry.Particles || operations.OfType<ShaderPreviewDraw>().Any(draw =>
+            draw.Billboard.HasValue || draw.Pass.Stages.SelectMany(stage => stage.Buffers).SelectMany(buffer => buffer.Parameters)
                 .Any(parameter => parameter.Name is "_Time" or "_SinTime" or "_CosTime" or "unity_DeltaTime" or "_WaveOffset"));
         return new ShaderPreviewScene(reader.Name, geometry, animated, operations, PreviewAmbientLinear, lights, values, textures,
-            unusedKeywords, lightingPass);
+            unusedKeywords, lightingPass, imageEffect, cameraTextures) { NoiseSettings = noiseSettings };
+
+        T Resolve<T>(SerializedFile source, PPtr<T> reference) where T : AssetStudio.Object =>
+            ResolveReference(reference, source, loadExternalSources, resolveAsset, cancellationToken);
 
         void PrepareTexture(string name, ShaderPreviewTextureDimension dimension)
         {
             cancellationToken.ThrowIfCancellationRequested();
             bool cube = dimension == ShaderPreviewTextureDimension.Cube;
-            if (BuiltInLightingPreview.ProvidesTexture(lightingPass, name))
+            if (cameraTextures.Contains(name) || ImageEffectPreview.ProvidesTexture(imageEffect, name))
             {
                 if (cube)
                 {
-                    throw new InvalidDataException($"Lighting buffer '{name}' requires a 2D binding.");
+                    throw new InvalidDataException($"The preview's camera texture '{name}' requires a 2D binding.");
                 }
                 return;
             }
@@ -288,7 +432,7 @@ internal static class ShaderPreviewService
             ShaderPreviewTexture texture;
             if (material != null && textureSlots.TryGetValue(name, out var slot) && !slot.m_Texture.IsNull)
             {
-                texture = ReadTexture(resolveTexture(material, slot.m_Texture), dimension);
+                texture = ReadTexture(Resolve(material.assetsFile, slot.m_Texture), dimension);
             }
             else if (reader.TextureDefaults.TryGetValue(name, out string? declared))
             {
@@ -308,6 +452,17 @@ internal static class ShaderPreviewService
             else if (!cube && name is "_ClipTex" or "_GUIClipTexture")
             {
                 texture = CreateClipMask();
+                if (name == "_GUIClipTexture")
+                {
+                    // GUI.color starts white for the preview's GUI draw.
+                    values.TryAdd("_Color", NumericsVector4.One);
+                }
+            }
+            else if (!cube && imageEffect == ImageEffectPass.Bokeh && name == ImageEffectPreview.BokehAperture)
+            {
+                texture = material != null && textureSlots.TryGetValue(ImageEffectPreview.MainTexture, out var aperture) && !aperture.m_Texture.IsNull
+                    ? ReadTexture(Resolve(material.assetsFile, aperture.m_Texture), dimension)
+                    : ImageEffectPreview.CreateBokehAperture();
             }
             else
             {
@@ -382,7 +537,7 @@ internal static class ShaderPreviewService
             string passName = pass.Name[(separator + 1)..];
             if (!dependencies.TryGetValue(shaderName, out var referenced))
             {
-                referenced = ResolveReferencedShader(shaderName);
+                referenced = LegacyShaderPreview.Read(ResolveUsePassShader(shader, shaderName, resolve, token));
                 dependencies.Add(shaderName, referenced);
             }
             var sourceSub = referenced.SubShaders.FirstOrDefault(sub => IsBuiltIn(sub) &&
@@ -399,37 +554,45 @@ internal static class ShaderPreviewService
                 }
             }
         }
+    }
 
-        LegacyShaderPreview ResolveReferencedShader(string shaderName)
+    private static Shader ResolveUsePassShader(Shader shader, string shaderName,
+        Func<Shader, PPtr<Shader>, Shader> resolve, CancellationToken token)
+    {
+        // Unity 5.3 can serialize the Legacy Shaders namespace on a dependency while UsePass retains the source name.
+        string referencedName = UsePassShaderName(shaderName);
+        Shader? match = null;
+        foreach (var dependency in shader.m_Dependencies)
         {
-            Shader? match = null;
-            foreach (var dependency in shader.m_Dependencies)
+            token.ThrowIfCancellationRequested();
+            Shader linked;
+            string actual;
+            try
             {
-                token.ThrowIfCancellationRequested();
-                Shader linked;
-                string actual;
-                try
-                {
-                    linked = resolve(shader, dependency);
-                    actual = LegacyShaderPreview.ReadName(linked);
-                }
-                catch (Exception error) when (error is InvalidDataException or EndOfStreamException or DecoderFallbackException)
-                {
-                    continue;
-                }
-                if (!actual.Equals(shaderName, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-                if (match != null && AssetHandle.BuildUniqueID(match.assetsFile, match.m_PathID) !=
-                    AssetHandle.BuildUniqueID(linked.assetsFile, linked.m_PathID))
-                {
-                    throw new InvalidDataException($"UsePass shader '{shaderName}' resolves to multiple asset references.");
-                }
-                match = linked;
+                linked = resolve(shader, dependency);
+                actual = LegacyShaderPreview.ReadName(linked);
             }
-            return match != null ? LegacyShaderPreview.Read(match)
-                : throw new InvalidDataException($"UsePass shader '{shaderName}' could not be resolved from the shader dependencies.");
+            catch (Exception error) when (error is InvalidDataException or EndOfStreamException or DecoderFallbackException)
+            {
+                continue;
+            }
+            if (!UsePassShaderName(actual).Equals(referencedName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (match != null && AssetHandle.BuildUniqueID(match.assetsFile, match.m_PathID) !=
+                AssetHandle.BuildUniqueID(linked.assetsFile, linked.m_PathID))
+            {
+                throw new InvalidDataException($"UsePass shader '{shaderName}' resolves to multiple asset references.");
+            }
+            match = linked;
+        }
+        return match ?? throw new InvalidDataException($"UsePass shader '{shaderName}' could not be resolved from the shader dependencies.");
+
+        static string UsePassShaderName(string name)
+        {
+            const string prefix = "Legacy Shaders/";
+            return name.StartsWith(prefix, StringComparison.Ordinal) ? name[prefix.Length..] : name;
         }
     }
 
@@ -480,7 +643,7 @@ internal static class ShaderPreviewService
         return CreateSolidTexture([Encode(ambient.X), Encode(ambient.Y), Encode(ambient.Z), 255], 6);
     }
 
-    private static ShaderPreviewTexture ReadTexture(Texture asset, ShaderPreviewTextureDimension dimension)
+    internal static ShaderPreviewTexture ReadTexture(Texture asset, ShaderPreviewTextureDimension dimension)
     {
         Texture2D texture = (asset, dimension) switch
         {
@@ -589,13 +752,19 @@ internal static class ShaderPreviewService
         return result;
     }
 
-    internal static byte[] BindConstants(ShaderPreviewScene scene, ShaderPreviewBuffer buffer, ShaderPreviewLight light,
+    internal static byte[] BindConstants(ShaderPreviewScene scene, ShaderPreviewDraw draw, ShaderPreviewBuffer buffer,
         NumericsMatrix4x4 view, NumericsMatrix4x4 projection, NumericsVector3 eye, int size, IReadOnlySet<string> captures,
-        float time, float deltaTime, BuiltInLightingPreview? lighting)
+        float time, float deltaTime, BuiltInLightingPreview? lighting, IReadOnlyDictionary<string, ShaderPreviewTexture>? cameraTextures,
+        MotionPreviewFrame? motion, NumericsMatrix4x4? billboardTransform, ShaderPreviewParameter? unusedVertexParameter)
     {
         var data = new byte[(buffer.Size + 15) & ~15];
+        var light = draw.Light;
         foreach (var parameter in buffer.Parameters)
         {
+            if (ReferenceEquals(parameter, unusedVertexParameter))
+            {
+                continue;
+            }
             if (parameter.Type is not (0 or 1) || parameter.ArraySize < 1 || parameter.Offset < 0)
             {
                 throw new NotSupportedException($"Unsupported shader parameter format for '{parameter.Name}'.");
@@ -607,18 +776,26 @@ internal static class ShaderPreviewService
                 {
                     throw new NotSupportedException($"Unsupported shader matrix layout for '{parameter.Name}'.");
                 }
-                NumericsMatrix4x4 matrix = parameter.Name switch
+                NumericsMatrix4x4 matrix = draw.Matrices?.TryGetValue(parameter.Name, out var matrixValue) == true ? matrixValue : parameter.Name switch
                 {
-                    "glstate_matrix_mvp" when lighting != null => NumericsMatrix4x4.Identity,
+                    "glstate_matrix_mvp" when billboardTransform.HasValue => billboardTransform.Value,
+                    "glstate_matrix_mvp" when (draw.Geometry ?? scene.Geometry) == ShaderPreviewGeometry.ScreenQuad => NumericsMatrix4x4.Identity,
+                    "glstate_matrix_mvp" when motion is { } frame => frame.Model * view * projection,
                     "glstate_matrix_mvp" or "unity_MatrixMVP" or "unity_MatrixVP" => view * projection,
                     "glstate_matrix_modelview0" or "unity_MatrixV" or "unity_MatrixMV" => view,
                     "glstate_matrix_projection" or "unity_MatrixP" => projection,
                     "glstate_matrix_invtrans_modelview0" or "unity_MatrixITMV" => NumericsMatrix4x4.Transpose(Inverse(view)),
                     "_CameraToWorld" when lighting != null => NumericsMatrix4x4.CreateScale(1, 1, -1) * Inverse(view),
                     "unity_MatrixInvV" or "_CameraToWorld" => Inverse(view),
+                    "_WorldToCamera" when lighting != null => view * NumericsMatrix4x4.CreateScale(1, 1, -1),
+                    "_FrustumCornersWS" when scene.ImageEffect == ImageEffectPass.GlobalFog => FrustumCorners(view, projection),
+                    "_AM_MATRIX_CURR_REPROJ" when motion is { } frame => frame.Reprojection,
+                    "_AM_MATRIX_PREV_MVP" when motion is { } frame => frame.PreviousModelViewProjection,
+                    "_AM_WORLD_TO_LOCAL_MATRIX" when scene.ImageEffect == ImageEffectPass.SkinDeformation => NumericsMatrix4x4.Identity,
                     "unity_CameraInvProjection" when lighting != null => Inverse(projection),
-                    "unity_World2Shadow0" when lighting != null => lighting.WorldToShadow,
-                    "unity_World2Shadow1" or "unity_World2Shadow2" or "unity_World2Shadow3" when lighting != null => default,
+                    "unity_World2Shadow0" when scene.LightingPass == BuiltInLightingPass.CollectShadows => lighting!.WorldToShadow,
+                    "unity_World2Shadow1" or "unity_World2Shadow2" or "unity_World2Shadow3"
+                        when scene.LightingPass == BuiltInLightingPass.CollectShadows => default,
                     "_GUIClipTextureMatrix" => NumericsMatrix4x4.CreateScale(0.5f, 0.5f, 1) * NumericsMatrix4x4.CreateTranslation(0.5f, 0.5f, 0),
                     "_TerrainEngineBendTree" => NumericsMatrix4x4.CreateRotationZ(0.08f * MathF.Sin(time)),
                     "_Object2World" or "_World2Object" or "unity_ObjectToWorld" or "unity_WorldToObject" => NumericsMatrix4x4.Identity,
@@ -662,8 +839,12 @@ internal static class ShaderPreviewService
 
         NumericsVector4 ResolveVector(string name, int arraySize, int element)
         {
+            if (arraySize == 1 && draw.Values?.TryGetValue(name, out var perDraw) == true)
+            {
+                return perDraw;
+            }
             if (TryVertexLight(name, arraySize, element, scene.Lights, view, out var vertexLight) ||
-                TryTerrainImposterLight(buffer.Name, name, scene.Lights, out vertexLight))
+                (arraySize == 1 && TryTerrainImposterLight(name, scene.Lights, out vertexLight)))
             {
                 return vertexLight;
             }
@@ -671,22 +852,37 @@ internal static class ShaderPreviewService
             {
                 throw MissingValue(name);
             }
+            if (scene.NoiseSettings is { } noise && name is "_GrainOffsetScale" or "_ScratchOffsetScale" or "_Intensity")
+            {
+                return noise.GetValue(name, time, size, scene.Textures);
+            }
             if (scene.Values.TryGetValue(name, out var property))
             {
                 return property;
             }
             if (name.EndsWith("_TexelSize", StringComparison.Ordinal))
             {
-                string textureName = name[..^"_TexelSize".Length];
+                string slot = name[..^"_TexelSize".Length];
+                string textureName = draw.TextureSource(slot);
+                if (draw.Inputs?.TryGetValue(slot, out var target) == true)
+                {
+                    return new NumericsVector4(1f / target.Size, 1f / target.Size, target.Size, target.Size);
+                }
                 if (captures.Contains(textureName))
                 {
-                    return new NumericsVector4(1f / size, 1f / size, size, size);
+                    return new NumericsVector4(1f / RenderSize, 1f / RenderSize, RenderSize, RenderSize);
                 }
-                var resources = BuiltInLightingPreview.ProvidesTexture(scene.LightingPass, textureName) ? lighting!.Textures : scene.Textures;
+                var resources = scene.CameraTextures.Contains(textureName) || ImageEffectPreview.ProvidesTexture(scene.ImageEffect, textureName)
+                    ? cameraTextures! : scene.Textures;
                 if (resources.TryGetValue(textureName, out var texture))
                 {
                     return new NumericsVector4(1f / texture.Width, 1f / texture.Height, texture.Width, texture.Height);
                 }
+            }
+            if (name.EndsWith("_ST", StringComparison.Ordinal) && scene.CameraTextures.Contains(name[..^3]))
+            {
+                // Camera targets cover the whole viewport with an unscaled UV rectangle.
+                return new NumericsVector4(1, 1, 0, 0);
             }
             if (name.EndsWith("_HDR", StringComparison.Ordinal) && scene.Textures.ContainsKey(name[..^"_HDR".Length]))
             {
@@ -698,6 +894,21 @@ internal static class ShaderPreviewService
             return name switch
             {
                 "_WorldSpaceCameraPos" => new NumericsVector4(eye, 1),
+                "_CameraWS" when scene.ImageEffect == ImageEffectPass.GlobalFog => new NumericsVector4(eye, 1),
+                "_HeightParams" when scene.ImageEffect == ImageEffectPass.GlobalFog =>
+                    new NumericsVector4(1, eye.Y - 1, eye.Y <= 1 ? 1 : 0, 1),
+                "_SunPosition" when scene.ImageEffect == ImageEffectPass.SunShafts => ImageEffectPreview.SunPosition(view, projection, time),
+                "_SunColor" when scene.ImageEffect == ImageEffectPass.SunShafts => ImageEffectPreview.SunPosition(view, projection, time).Z >= 0
+                    ? new NumericsVector4(1.15f) : NumericsVector4.Zero,
+                "_CurveParams" when scene.ImageEffect == ImageEffectPass.DepthOfField => ImageEffectPreview.DepthOfFieldCurve(view),
+                "_Screen" when draw.PointPass == ShaderPreviewPointPass.Draw => new NumericsVector4(1f / size, 1f / size, 2, 0),
+                "_AM_OBJECT_ID" when motion.HasValue => new NumericsVector4(1f / 255, 0, 0, 0),
+                "_AM_MOTION_SCALE" when motion is { } frame => new NumericsVector4(frame.Scale, 0, 0, 0),
+                "_AM_MIN_VELOCITY" when motion.HasValue => new NumericsVector4(MotionPreview.MinVelocity, 0, 0, 0),
+                "_AM_MAX_VELOCITY" when motion.HasValue => new NumericsVector4(MotionPreview.MaxVelocity, 0, 0, 0),
+                "_AM_RCP_TOTAL_VELOCITY" when motion.HasValue => new NumericsVector4(1f / (MotionPreview.MaxVelocity - MotionPreview.MinVelocity), 0, 0, 0),
+                "_AM_BONE_TEXEL_SIZE" when scene.ImageEffect == ImageEffectPass.SkinDeformation => BoneTexelSize(),
+                "_AM_BONE_TEXEL_HALFSIZE" when scene.ImageEffect == ImageEffectPass.SkinDeformation => BoneTexelSize() * 0.5f,
                 "_ScreenParams" => new NumericsVector4(size, size, 1f + 1f / size, 1f + 1f / size),
                 "_ClipRange" or "_ClipRange0" or "_ClipRange1" or "_ClipRange2" or "_ClipRange3" => new NumericsVector4(0, 0, 1, 1),
                 "_ClipArgs0" or "_ClipArgs1" or "_ClipArgs2" or "_ClipArgs3" => new NumericsVector4(16, 16, 0, 1),
@@ -730,6 +941,7 @@ internal static class ShaderPreviewService
                 "_ProjectionParams" => new NumericsVector4(lighting != null ? -1 : 1, near, far, 1f / far),
                 "_ZBufferParams" => new NumericsVector4(1 - far / near, far / near, (1 - far / near) / far, 1f / near),
                 "unity_OrthoParams" when lighting != null => NumericsVector4.Zero,
+                "unity_LightmapFade" or "unity_ShadowFadeCenterAndType" when lighting != null => NumericsVector4.Zero,
                 "_LightShadowData" when lighting != null => new NumericsVector4(0.25f, 0, 0.25f, -3),
                 "_LightAsQuad" when lighting != null => new NumericsVector4(1, 0, 0, 0),
                 "_LightDir" when lighting != null => new NumericsVector4(-light.Direction, 0),
@@ -759,6 +971,12 @@ internal static class ShaderPreviewService
             };
         }
 
+        NumericsVector4 BoneTexelSize()
+        {
+            var texture = cameraTextures![MotionPreview.BoneTexture];
+            return new NumericsVector4(1f / texture.Width, 1f / texture.Height, texture.Width, texture.Height);
+        }
+
         NumericsVector4 WaveScale()
         {
             float scale = scene.Values["_WaveScale"].X;
@@ -772,13 +990,25 @@ internal static class ShaderPreviewService
         }
     }
 
-    private static bool TryTerrainImposterLight(string buffer, string name, IReadOnlyList<ShaderPreviewLight> lights, out NumericsVector4 value)
+    private static NumericsMatrix4x4 FrustumCorners(NumericsMatrix4x4 view, NumericsMatrix4x4 projection)
+    {
+        const float far = ShaderPreviewCamera.Far;
+        var right = new NumericsVector3(view.M11, view.M21, view.M31) * (far / projection.M11);
+        var up = new NumericsVector3(view.M12, view.M22, view.M32) * (far / projection.M22);
+        var forward = -new NumericsVector3(view.M13, view.M23, view.M33) * far;
+        var topLeft = forward - right + up;
+        var topRight = forward + right + up;
+        var bottomRight = forward + right - up;
+        var bottomLeft = forward - right - up;
+        // The DXBC loads the x, y and z components of all four corner rays in separate registers.
+        return new NumericsMatrix4x4(topLeft.X, topRight.X, bottomRight.X, bottomLeft.X,
+            topLeft.Y, topRight.Y, bottomRight.Y, bottomLeft.Y,
+            topLeft.Z, topRight.Z, bottomRight.Z, bottomLeft.Z, 0, 0, 0, 0);
+    }
+
+    private static bool TryTerrainImposterLight(string name, IReadOnlyList<ShaderPreviewLight> lights, out NumericsVector4 value)
     {
         value = default;
-        if (buffer != "UnityTerrainImposter")
-        {
-            return false;
-        }
         const string directions = "_TerrainTreeLightDirections";
         const string colors = "_TerrainTreeLightColors";
         bool direction = name.StartsWith(directions, StringComparison.Ordinal);

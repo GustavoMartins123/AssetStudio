@@ -17,9 +17,11 @@ namespace AssetStudio
         private readonly IReadOnlyDictionary<string, NumericsVector4>? _properties;
 
         internal string Name { get; private set; } = "";
+        internal string? DeclaredFallback { get; private set; }
         internal ShaderPreviewState State { get; private set; } = new();
         internal Dictionary<string, NumericsVector4> Values { get; } = new(StringComparer.Ordinal);
         internal Dictionary<string, string> TextureDefaults { get; } = new(StringComparer.Ordinal);
+        internal Dictionary<string, string> Dependencies { get; } = new(StringComparer.Ordinal);
         internal HashSet<string> PropertyKeywords { get; } = new(StringComparer.Ordinal);
         internal List<ShaderPreviewSubShader> SubShaders { get; } = new();
 
@@ -67,24 +69,21 @@ namespace AssetStudio
                         SubShaders.Add(ReadSubShader());
                         break;
                     case "Fallback":
-                        if (!Take("Off"))
-                        {
-                            ReadString();
-                        }
+                        DeclaredFallback = Take("Off") ? null : ReadString();
                         break;
                     case "CustomEditor":
                         ReadString();
                         break;
                     case "Dependency":
-                        ReadString();
+                        string role = ReadString();
                         Require("=");
-                        ReadString();
+                        Dependencies[role] = ReadString();
                         break;
                     default:
                         throw Unsupported(field);
                 }
             }
-            if (SubShaders.Count == 0 || Peek().Length != 0)
+            if ((SubShaders.Count == 0 && DeclaredFallback == null) || Peek().Length != 0)
             {
                 throw new InvalidDataException("Expected a complete ShaderLab object with a SubShader.");
             }
@@ -257,6 +256,7 @@ namespace AssetStudio
             var tags = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var vertex = new List<int>();
             var fragment = new List<int>();
+            var geometry = new List<int>();
             var state = new StringBuilder();
             string name = "";
             Require("{");
@@ -268,12 +268,12 @@ namespace AssetStudio
                     case "Tags": ReadTags(tags); break;
                     case "Name": name = ReadString(); break;
                     case "GpuProgramID": ReadInteger(); break;
-                    case "Program": ReadProgram(vertex, fragment, state); break;
+                    case "Program": ReadProgram(vertex, fragment, geometry, state); break;
                     default: CollectState(field, state); break;
                 }
             }
             return new ShaderPreviewPassDefinition(PassType.Normal, name, tags.GetValueOrDefault("LightMode", "Always"),
-                state.ToString(), vertex, fragment);
+                state.ToString(), vertex, fragment) { GeometryIndices = geometry };
         }
 
         private void CollectState(string field, StringBuilder state)
@@ -340,13 +340,14 @@ namespace AssetStudio
             }
         }
 
-        private void ReadProgram(List<int> vertex, List<int> fragment, StringBuilder state)
+        private void ReadProgram(List<int> vertex, List<int> fragment, List<int> geometry, StringBuilder state)
         {
             string stage = ReadString();
             List<int>? indices = stage switch
             {
                 "vp" => vertex,
                 "fp" => fragment,
+                "gp" => geometry,
                 _ => null
             };
             if (indices?.Count > 0)
