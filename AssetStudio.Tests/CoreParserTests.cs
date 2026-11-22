@@ -525,6 +525,191 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void StreamTransformPipeline_DetectsMultiByteAndPrefixXorUnityFs_AndEncryptedBundleBarriers()
+        {
+            DecryptionHelper.Clear();
+            try
+            {
+                byte[] nodePayload = CreateDeterministicPayload(4096);
+                // Stamp a valid SerializedFile v22 header at offset 0 (matching real UnityFS serialized nodes with flags=4)
+                BinaryPrimitives.WriteUInt32BigEndian(nodePayload.AsSpan(0, 4), 0u);
+                BinaryPrimitives.WriteUInt32BigEndian(nodePayload.AsSpan(4, 4), 0u);
+                BinaryPrimitives.WriteUInt32BigEndian(nodePayload.AsSpan(8, 4), 22u);
+                BinaryPrimitives.WriteUInt32BigEndian(nodePayload.AsSpan(12, 4), 0u);
+                nodePayload[16] = 0; // little endian
+                BinaryPrimitives.WriteUInt32BigEndian(nodePayload.AsSpan(20, 4), 128u); // metadataSize
+                BinaryPrimitives.WriteInt64BigEndian(nodePayload.AsSpan(24, 8), nodePayload.Length); // fileSize
+                BinaryPrimitives.WriteInt64BigEndian(nodePayload.AsSpan(32, 8), 256L); // dataOffset
+                byte[] plainBundle = BuildValidLz4UnityFsBundle("CAB-synthetic-xor-test", nodePayload);
+
+                // 1. 4-byte repeating XOR over first 128 bytes only
+                byte[] key4 = { 0x3A, 0x91, 0xC4, 0x0D };
+                byte[] xor4Prefix128 = (byte[])plainBundle.Clone();
+                UnityHeaderProbe.XorBytesRepeating(xor4Prefix128.AsSpan(0, 128), 0, key4);
+
+                using (var r1 = new FileReader("prefix128.bundle", new MemoryStream(xor4Prefix128)))
+                {
+                    Assert.Equal("KnownPlaintextXor", r1.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, r1.FileType);
+                    using var bundle1 = new BundleFile(r1);
+                    Assert.Single(bundle1.fileList);
+                    using var ms1 = new MemoryStream();
+                    bundle1.fileList[0].stream.CopyTo(ms1);
+                    Assert.Equal(nodePayload, ms1.ToArray());
+                }
+
+                // 2. 16-byte repeating XOR over first 256 bytes only
+                byte[] key16 = { 0x5B, 0xE2, 0x17, 0x89, 0x44, 0xAD, 0x31, 0xF0, 0x62, 0x9E, 0x05, 0xC7, 0x19, 0x74, 0xB8, 0x2F };
+                byte[] xor16Prefix256 = (byte[])plainBundle.Clone();
+                UnityHeaderProbe.XorBytesRepeating(xor16Prefix256.AsSpan(0, 256), 0, key16);
+
+                using (var r2 = new FileReader("prefix256.bundle", new MemoryStream(xor16Prefix256)))
+                {
+                    Assert.Equal("KnownPlaintextXor", r2.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, r2.FileType);
+                    using var bundle2 = new BundleFile(r2);
+                    Assert.Single(bundle2.fileList);
+                    using var ms2 = new MemoryStream();
+                    bundle2.fileList[0].stream.CopyTo(ms2);
+                    Assert.Equal(nodePayload, ms2.ToArray());
+                }
+
+                // 3. 8-byte repeating XOR across full stream
+                byte[] key8 = { 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF1 };
+                byte[] xor8Full = (byte[])plainBundle.Clone();
+                UnityHeaderProbe.XorBytesRepeating(xor8Full, 0, key8);
+
+                using (var r3 = new FileReader("full8.bundle", new MemoryStream(xor8Full)))
+                {
+                    Assert.Equal("KnownPlaintextXor", r3.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, r3.FileType);
+                    using var bundle3 = new BundleFile(r3);
+                    Assert.Single(bundle3.fileList);
+                    using var ms3 = new MemoryStream();
+                    bundle3.fileList[0].stream.CopyTo(ms3);
+                    Assert.Equal(nodePayload, ms3.ToArray());
+                }
+
+                // 4. Barrier detection: high-entropy .bundle.enc and cipher .bundle vs plain CRID .enc
+                var rng = new Random(1337);
+                byte[] highEntropyEnc = new byte[1024];
+                rng.NextBytes(highEntropyEnc);
+                for (int i = 0; i < 256; i++)
+                {
+                    if (highEntropyEnc[i] == 0) highEntropyEnc[i] = 1;
+                }
+
+                using (var rEnc = new FileReader("packed.bundle.enc", new MemoryStream(highEntropyEnc)))
+                {
+                    Assert.Null(rEnc.AppliedDecryptionProvider);
+                    Assert.True(rEnc.EncryptionBarrier.HasValue);
+                    Assert.Equal("EncryptedBundleContainer", rEnc.EncryptionBarrier!.Value.ProviderId);
+                }
+
+                using (var rBundle = new FileReader("cipher_header.bundle", new MemoryStream(highEntropyEnc)))
+                {
+                    Assert.Null(rBundle.AppliedDecryptionProvider);
+                    Assert.True(rBundle.EncryptionBarrier.HasValue);
+                    Assert.Equal("EncryptedUnityBundle", rBundle.EncryptionBarrier!.Value.ProviderId);
+                }
+
+                byte[] plainCrid = new byte[512];
+                rng.NextBytes(plainCrid);
+                plainCrid[0] = (byte)'C'; plainCrid[1] = (byte)'R'; plainCrid[2] = (byte)'I'; plainCrid[3] = (byte)'D';
+                using (var rCrid = new FileReader("movie.enc", new MemoryStream(plainCrid)))
+                {
+                    Assert.False(rCrid.EncryptionBarrier.HasValue);
+                }
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+            }
+        }
+
+        private static byte[] BuildValidLz4UnityFsBundle(string nodePath, byte[] nodePayload)
+        {
+            // Split payload into 2 LZ4 blocks so prefix-cutoff boundary validation exercises multiple blocks
+            int half = nodePayload.Length / 2;
+            byte[] part1 = nodePayload.AsSpan(0, half).ToArray();
+            byte[] part2 = nodePayload.AsSpan(half).ToArray();
+
+            byte[] comp1 = new byte[K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(part1.Length)];
+            int comp1Len = K4os.Compression.LZ4.LZ4Codec.Encode(part1, comp1);
+            Array.Resize(ref comp1, comp1Len);
+
+            byte[] comp2 = new byte[K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(part2.Length)];
+            int comp2Len = K4os.Compression.LZ4.LZ4Codec.Encode(part2, comp2);
+            Array.Resize(ref comp2, comp2Len);
+
+            // Build uncompressed blocksInfo (16B hash + 2 blocks + 1 directory node)
+            byte[] blocksInfoRaw;
+            using (var biMs = new MemoryStream())
+            using (var biBw = new BinaryWriter(biMs, Encoding.ASCII, leaveOpen: true))
+            {
+                biBw.Write(new byte[16]); // hash
+                Span<byte> be32 = stackalloc byte[4];
+                Span<byte> be16 = stackalloc byte[2];
+                Span<byte> be64 = stackalloc byte[8];
+
+                BinaryPrimitives.WriteInt32BigEndian(be32, 2); biBw.Write(be32); // blockCount
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)part1.Length); biBw.Write(be32);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)comp1.Length); biBw.Write(be32);
+                BinaryPrimitives.WriteUInt16BigEndian(be16, (ushort)CompressionType.Lz4); biBw.Write(be16);
+
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)part2.Length); biBw.Write(be32);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)comp2.Length); biBw.Write(be32);
+                BinaryPrimitives.WriteUInt16BigEndian(be16, (ushort)CompressionType.Lz4); biBw.Write(be16);
+
+                BinaryPrimitives.WriteInt32BigEndian(be32, 1); biBw.Write(be32); // nodeCount
+                BinaryPrimitives.WriteInt64BigEndian(be64, 0L); biBw.Write(be64); // offset
+                BinaryPrimitives.WriteInt64BigEndian(be64, nodePayload.Length); biBw.Write(be64); // size
+                BinaryPrimitives.WriteUInt32BigEndian(be32, 4u); biBw.Write(be32); // flags
+                biBw.Write(Encoding.ASCII.GetBytes(nodePath));
+                biBw.Write((byte)0);
+                blocksInfoRaw = biMs.ToArray();
+            }
+
+            byte[] compBlocksInfo = new byte[K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(blocksInfoRaw.Length)];
+            int compBlocksInfoLen = K4os.Compression.LZ4.LZ4Codec.Encode(blocksInfoRaw, compBlocksInfo);
+            Array.Resize(ref compBlocksInfo, compBlocksInfoLen);
+
+            // Header prefix before size/blocksInfo/flags
+            byte[] prefix;
+            using (var pMs = new MemoryStream())
+            using (var pBw = new BinaryWriter(pMs, Encoding.ASCII, leaveOpen: true))
+            {
+                pBw.Write(Encoding.ASCII.GetBytes("UnityFS\0"));
+                Span<byte> be32 = stackalloc byte[4];
+                BinaryPrimitives.WriteUInt32BigEndian(be32, 8u); pBw.Write(be32);
+                pBw.Write(Encoding.ASCII.GetBytes("5.x.x\0"));
+                pBw.Write(Encoding.ASCII.GetBytes("0.0.0\0"));
+                prefix = pMs.ToArray();
+            }
+
+            int rawHeaderEnd = prefix.Length + 8 + 4 + 4 + 4;
+            int alignedHeaderEnd = (rawHeaderEnd + 15) & ~15;
+            long totalSize = alignedHeaderEnd + compBlocksInfo.Length + comp1.Length + comp2.Length;
+
+            using var outMs = new MemoryStream((int)totalSize);
+            using (var bw = new BinaryWriter(outMs, Encoding.ASCII, leaveOpen: true))
+            {
+                Span<byte> be32 = stackalloc byte[4];
+                Span<byte> be64 = stackalloc byte[8];
+                bw.Write(prefix);
+                BinaryPrimitives.WriteInt64BigEndian(be64, totalSize); bw.Write(be64);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)compBlocksInfo.Length); bw.Write(be32);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)blocksInfoRaw.Length); bw.Write(be32);
+                BinaryPrimitives.WriteUInt32BigEndian(be32, (uint)(ArchiveFlags.BlocksAndDirectoryInfoCombined | (ArchiveFlags)CompressionType.Lz4)); bw.Write(be32);
+                while (outMs.Position < alignedHeaderEnd) bw.Write((byte)0);
+                bw.Write(compBlocksInfo);
+                bw.Write(comp1);
+                bw.Write(comp2);
+            }
+            return outMs.ToArray();
+        }
+
         private static byte[] BuildSyntheticUnityFsHeaderPayload(int totalSize)
         {
             using var ms = new MemoryStream();

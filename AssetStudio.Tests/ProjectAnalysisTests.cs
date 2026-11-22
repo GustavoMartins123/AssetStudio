@@ -601,6 +601,37 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void ProjectRuntimeDetector_DetectsPlainDataDirectory_FromRootAndDirectDataFolder()
+        {
+            var tempRoot = CreateTempDirectory("PlainDataDir");
+            try
+            {
+                var dataDir = Path.Combine(tempRoot, "Data");
+                var managedDir = Path.Combine(dataDir, "Managed");
+                Directory.CreateDirectory(managedDir);
+                WriteSerializedFileVersionHeader(Path.Combine(dataDir, "globalgamemanagers"), formatVersion: 22, unityVersion: "6000.0.61f1");
+                File.WriteAllBytes(Path.Combine(managedDir, "Assembly-CSharp.dll"), new byte[64]);
+
+                var detector = new ProjectRuntimeDetector();
+                var fromRoot = detector.Detect(tempRoot);
+                Assert.Equal(UnityScriptingBackend.Mono, fromRoot.ScriptingBackend);
+                Assert.Equal("6000.0.61f1", fromRoot.UnityVersion);
+                Assert.True(fromRoot.HasManagedAssemblies);
+                Assert.Equal(1, fromRoot.ManagedAssemblyCount);
+
+                var fromDataDir = detector.Detect(dataDir);
+                Assert.Equal(UnityScriptingBackend.Mono, fromDataDir.ScriptingBackend);
+                Assert.Equal("6000.0.61f1", fromDataDir.UnityVersion);
+                Assert.True(fromDataDir.HasManagedAssemblies);
+                Assert.Equal(1, fromDataDir.ManagedAssemblyCount);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
         private static void WriteIl2CppMetadataHeader(string path, uint magic, int version, int totalLength)
         {
             var data = new byte[Math.Max(8, totalLength)];

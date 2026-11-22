@@ -298,7 +298,10 @@ public sealed class ProjectRuntimeDetector
         }
 
         var rootDirName = Path.GetFileName(fullRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-        if (rootDirName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase))
+        if (rootDirName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(rootDirName, "Data", StringComparison.OrdinalIgnoreCase)
+            || File.Exists(Path.Combine(fullRoot, "globalgamemanagers"))
+            || File.Exists(Path.Combine(fullRoot, "data.unity3d")))
         {
             TryAdd(fullRoot);
         }

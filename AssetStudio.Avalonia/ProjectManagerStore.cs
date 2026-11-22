@@ -759,6 +759,8 @@ public sealed class ProjectManagerStore
             commonDirectories.Add(Path.Combine(normalizedRoot, rootName + "_Data", "Resources"));
         }
 
+        commonDirectories.Add(Path.Combine(normalizedRoot, "Data"));
+        commonDirectories.Add(Path.Combine(normalizedRoot, "Data", "Resources"));
         commonDirectories.Add(Path.Combine(normalizedRoot, "Assets"));
         commonDirectories.Add(Path.Combine(normalizedRoot, "ProjectSettings"));
 

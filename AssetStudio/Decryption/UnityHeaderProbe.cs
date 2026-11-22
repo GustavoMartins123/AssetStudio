@@ -304,6 +304,8 @@ namespace AssetStudio
             return false;
         }
 
+        private static readonly byte[] UnityFsPrefix5xx = Encoding.ASCII.GetBytes("5.x.");
+
         public static bool TryDetectRepeatingXorUnityFsKey(
             ReadOnlySpan<byte> header,
             long totalStreamLength,
@@ -320,53 +322,156 @@ namespace AssetStudio
                 return false;
             }
 
+            // 1. Fast path: 1-, 2-, or 4-byte repeating key (first 4 bytes of "UnityFS\0" match next 4 bytes)
             Span<byte> candidateKey4 = stackalloc byte[4];
-            bool anyNonZero = false;
+            bool matches4 = true;
+            bool anyNonZero4 = false;
             for (int i = 0; i < 4; i++)
             {
                 byte k = (byte)(header[i] ^ UnityFsMagicWithNull[i]);
                 byte kSecondWord = (byte)(header[i + 4] ^ UnityFsMagicWithNull[i + 4]);
                 if (k != kSecondWord)
                 {
-                    return false;
+                    matches4 = false;
+                    break;
                 }
 
                 candidateKey4[i] = k;
                 if (k != 0)
                 {
-                    anyNonZero = true;
+                    anyNonZero4 = true;
                 }
             }
 
-            if (!anyNonZero)
+            if (matches4 && anyNonZero4
+                && TryValidateXorUnityFsCandidate(header, totalStreamLength, candidateKey4, out version, out unityVersion))
             {
-                return false;
+                xorKey = ReduceRepeatingKey(candidateKey4);
+                return true;
             }
 
+            // 2. 8-byte repeating key derived directly from "UnityFS\0"
+            Span<byte> candidateKey8 = stackalloc byte[8];
+            bool anyNonZero8 = false;
+            for (int i = 0; i < 8; i++)
+            {
+                byte k = (byte)(header[i] ^ UnityFsMagicWithNull[i]);
+                candidateKey8[i] = k;
+                if (k != 0)
+                {
+                    anyNonZero8 = true;
+                }
+            }
+
+            if (anyNonZero8
+                && TryValidateXorUnityFsCandidate(header, totalStreamLength, candidateKey8, out version, out unityVersion))
+            {
+                xorKey = ReduceRepeatingKey(candidateKey8);
+                return true;
+            }
+
+            // 3. 16-byte repeating key derived from "UnityFS\0" + big-endian format version (6..8) + "5.x."
+            if (header.Length >= 36)
+            {
+                Span<byte> candidateKey16 = stackalloc byte[16];
+                ReadOnlySpan<byte> candidateVersions = stackalloc byte[] { 8, 7, 6 };
+                for (int vIdx = 0; vIdx < candidateVersions.Length; vIdx++)
+                {
+                    byte fmtVer = candidateVersions[vIdx];
+                    bool anyNonZero16 = false;
+                    for (int i = 0; i < 8; i++)
+                    {
+                        byte k = (byte)(header[i] ^ UnityFsMagicWithNull[i]);
+                        candidateKey16[i] = k;
+                        if (k != 0) anyNonZero16 = true;
+                    }
+
+                    candidateKey16[8] = header[8];
+                    candidateKey16[9] = header[9];
+                    candidateKey16[10] = header[10];
+                    candidateKey16[11] = (byte)(header[11] ^ fmtVer);
+                    for (int i = 0; i < 4; i++)
+                    {
+                        byte k = (byte)(header[12 + i] ^ UnityFsPrefix5xx[i]);
+                        candidateKey16[12 + i] = k;
+                    }
+                    for (int i = 8; i < 16; i++)
+                    {
+                        if (candidateKey16[i] != 0) anyNonZero16 = true;
+                    }
+
+                    if (!anyNonZero16)
+                    {
+                        continue;
+                    }
+
+                    // Verify trailing "x\0" of "5.x.x\0" at [16..17] before full header validation
+                    if ((byte)(header[16] ^ candidateKey16[0]) != (byte)'x'
+                        || (byte)(header[17] ^ candidateKey16[1]) != 0)
+                    {
+                        continue;
+                    }
+
+                    if (TryValidateXorUnityFsCandidate(header, totalStreamLength, candidateKey16, out version, out unityVersion))
+                    {
+                        xorKey = ReduceRepeatingKey(candidateKey16);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryValidateXorUnityFsCandidate(
+            ReadOnlySpan<byte> header,
+            long totalStreamLength,
+            ReadOnlySpan<byte> candidateKey,
+            out uint version,
+            out string unityVersion)
+        {
             int sampleLen = Math.Min(header.Length, 128);
             Span<byte> decoded = stackalloc byte[sampleLen];
             header.Slice(0, sampleLen).CopyTo(decoded);
-            XorBytesRepeating(decoded, 0, candidateKey4);
+            XorBytesRepeating(decoded, 0, candidateKey);
 
-            if (!TryParseUnityBundleHeader(decoded, 0, totalStreamLength, out _, out version, out unityVersion, out _, requireStrictValidation: true))
+            return TryParseUnityBundleHeader(
+                decoded,
+                0,
+                totalStreamLength,
+                out _,
+                out version,
+                out unityVersion,
+                out _,
+                requireStrictValidation: true);
+        }
+
+        private static byte[] ReduceRepeatingKey(ReadOnlySpan<byte> key)
+        {
+            for (int period = 1; period < key.Length; period++)
             {
-                return false;
+                if (key.Length % period != 0)
+                {
+                    continue;
+                }
+
+                bool repeats = true;
+                for (int i = period; i < key.Length; i++)
+                {
+                    if (key[i] != key[i % period])
+                    {
+                        repeats = false;
+                        break;
+                    }
+                }
+
+                if (repeats)
+                {
+                    return key.Slice(0, period).ToArray();
+                }
             }
 
-            if (candidateKey4[0] == candidateKey4[1] && candidateKey4[1] == candidateKey4[2] && candidateKey4[2] == candidateKey4[3])
-            {
-                xorKey = new[] { candidateKey4[0] };
-            }
-            else if (candidateKey4[0] == candidateKey4[2] && candidateKey4[1] == candidateKey4[3])
-            {
-                xorKey = new[] { candidateKey4[0], candidateKey4[1] };
-            }
-            else
-            {
-                xorKey = candidateKey4.ToArray();
-            }
-
-            return true;
+            return key.ToArray();
         }
 
         public static bool TryDetectEncryptionBarrier(
@@ -436,7 +541,96 @@ namespace AssetStudio
                 }
             }
 
+            // 3. Check for encrypted .enc / .bundle.enc containers (high-entropy non-Unity, non-media payloads)
+            if (string.Equals(ext, ".enc", StringComparison.OrdinalIgnoreCase)
+                && totalStreamLength >= 128
+                && !TryParseUnityBundleHeader(probeBuffer, 0, totalStreamLength, out _, out _, out _, out _)
+                && !IsSerializedFileHeader(probeBuffer, totalStreamLength)
+                && !HasKnownPlainMediaOrArchiveSignature(probeBuffer))
+            {
+                int headerCheckLen = Math.Min(probeBuffer.Length, 256);
+                int nonZero = CountNonZeroBytes(probeBuffer.Slice(0, headerCheckLen));
+                int distinct = CountDistinctBytes(probeBuffer.Slice(0, headerCheckLen));
+                if (nonZero >= (headerCheckLen * 7) / 8 && distinct >= Math.Min(96, headerCheckLen / 2))
+                {
+                    string prefixHex = FormatHexPrefix(probeBuffer, 16);
+                    barrier = new StreamEncryptionBarrier(
+                        providerId: "EncryptedBundleContainer",
+                        filePath: filePath,
+                        reason: $"Encrypted container ({fileName}) uses a non-standard cipher without a recognizable UnityFS header (prefix: {prefixHex}).",
+                        confidence: 0.92,
+                        headerPrefixHex: prefixHex);
+                    return true;
+                }
+            }
+
+            // 4. Check for partial-header-encrypted .bundle files (high-entropy encrypted header/blocksInfo prefix
+            //    followed by zero-padded or structured payload pages)
+            if (string.Equals(ext, ".bundle", StringComparison.OrdinalIgnoreCase)
+                && totalStreamLength >= 512
+                && probeBuffer.Length >= 512
+                && !TryParseUnityBundleHeader(probeBuffer, 0, totalStreamLength, out _, out _, out _, out _)
+                && !IsSerializedFileHeader(probeBuffer, totalStreamLength)
+                && !HasKnownPlainMediaOrArchiveSignature(probeBuffer)
+                && !TryFindOffsetUnityBundleHeader(probeBuffer, totalStreamLength, out _, out _, out _, out _)
+                && !TryDetectRepeatingXorUnityFsKey(probeBuffer, totalStreamLength, out _, out _, out _))
+            {
+                int nonZero128 = CountNonZeroBytes(probeBuffer.Slice(0, 128));
+                int distinct128 = CountDistinctBytes(probeBuffer.Slice(0, 128));
+                if (nonZero128 >= 112 && distinct128 >= 72)
+                {
+                    string prefixHex = FormatHexPrefix(probeBuffer, 16);
+                    barrier = new StreamEncryptionBarrier(
+                        providerId: "EncryptedUnityBundle",
+                        filePath: filePath,
+                        reason: $"Bundle header appears cipher-encrypted without a recognizable UnityFS signature or repeating XOR key (prefix: {prefixHex}).",
+                        confidence: 0.90,
+                        headerPrefixHex: prefixHex);
+                    return true;
+                }
+            }
+
             return false;
+        }
+
+        private static bool HasKnownPlainMediaOrArchiveSignature(ReadOnlySpan<byte> buf)
+        {
+            if (buf.Length < 4)
+            {
+                return false;
+            }
+
+            // Common unencrypted container/media headers (CRID, @UTF, AFS2, RIFF, OggS, ZIP, GZIP, JSON)
+            if ((buf[0] == 'C' && buf[1] == 'R' && buf[2] == 'I' && buf[3] == 'D')
+                || (buf[0] == '@' && buf[1] == 'U' && buf[2] == 'T' && buf[3] == 'F')
+                || (buf[0] == 'A' && buf[1] == 'F' && buf[2] == 'S' && buf[3] == '2')
+                || (buf[0] == 'R' && buf[1] == 'I' && buf[2] == 'F' && buf[3] == 'F')
+                || (buf[0] == 'O' && buf[1] == 'g' && buf[2] == 'g' && buf[3] == 'S')
+                || (buf[0] == 'P' && buf[1] == 'K' && (buf[2] == 3 || buf[2] == 5))
+                || (buf[0] == 0x1F && buf[1] == 0x8B))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static int CountDistinctBytes(ReadOnlySpan<byte> span)
+        {
+            Span<byte> seen = stackalloc byte[32];
+            int count = 0;
+            for (int i = 0; i < span.Length; i++)
+            {
+                byte b = span[i];
+                int idx = b >> 3;
+                byte bit = (byte)(1 << (b & 7));
+                if ((seen[idx] & bit) == 0)
+                {
+                    seen[idx] |= bit;
+                    count++;
+                }
+            }
+            return count;
         }
 
         private static bool IsStandardSerializedAssetFileName(string fileName, string ext)

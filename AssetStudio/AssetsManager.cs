@@ -1259,7 +1259,9 @@ namespace AssetStudio
             }
 
             var folderName = Path.GetFileName(directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            if (!string.IsNullOrEmpty(folderName) && folderName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase))
+            if (!string.IsNullOrEmpty(folderName)
+                && (folderName.EndsWith("_Data", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(folderName, "Data", StringComparison.OrdinalIgnoreCase)))
             {
                 var fallback = TryReadUnityVersionFromUnityPlayerFallback(directory);
                 if (!string.IsNullOrEmpty(fallback))
@@ -1271,6 +1273,16 @@ namespace AssetStudio
             foreach (var childDataDir in EnumerateDirectoriesSafe(directory, "*_Data"))
             {
                 var fallback = TryReadUnityVersionFromUnityPlayerFallback(childDataDir);
+                if (!string.IsNullOrEmpty(fallback))
+                {
+                    return fallback;
+                }
+            }
+
+            var plainDataDir = Path.Combine(directory, "Data");
+            if (Directory.Exists(plainDataDir))
+            {
+                var fallback = TryReadUnityVersionFromUnityPlayerFallback(plainDataDir);
                 if (!string.IsNullOrEmpty(fallback))
                 {
                     return fallback;
