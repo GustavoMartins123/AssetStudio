@@ -18,7 +18,17 @@ public partial class MainWindow
     private void UnloadAsset(AssetHandle handle) =>
         LazyAssetResolutionService.UnloadAsset(handle);
 
-    private void UpdatePreloadWindow(AssetItem currentItem) =>
+    private void UpdatePreloadWindow(AssetItem currentItem)
+    {
+        if (ShouldSkipPreloadWindowForVideo(currentItem))
+        {
+            lock (preloaderLock)
+            {
+                preloaderCts?.Cancel();
+            }
+            return;
+        }
+
         ProjectLoadingService.UpdatePreloadWindow(
             assetsManager,
             IsProgressiveIndexingActive(),
@@ -32,5 +42,7 @@ public partial class MainWindow
             shouldPausePreload: () => isBuildingLazyConnections
                 || Volatile.Read(ref foregroundLazyLoadCount) > 0
                 || _activeMeshMaterialsLoading
+                || IsVideoPreviewBusyForPreload()
                 || ShouldPauseBackgroundWork());
+    }
 }

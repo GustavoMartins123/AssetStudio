@@ -224,6 +224,7 @@ public partial class MainWindow : Window
     private void CancelPendingPreview()
     {
         previewDebounce?.Cancel();
+        CancelVideoPreviewLoad();
         PreviewSession.CancelPendingPreview();
         var nextVersion = Interlocked.Increment(ref texturePreviewIdCounter);
         PreviewSession.SyncPreviewVersion(nextVersion);
@@ -255,6 +256,7 @@ public partial class MainWindow : Window
         var token = previewDebounce.Token;
         _previewRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
+        OnPreviewAssetQueuedForVideo(assetItem);
         var previewId = Interlocked.Increment(ref texturePreviewIdCounter);
 
         if (PreviewLabel != null)

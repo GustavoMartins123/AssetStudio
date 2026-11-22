@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
@@ -9,22 +10,46 @@ using Avalonia.Threading;
 using FFmpegVideoPlayer.Core;
 using Avalonia.FFmpegVideoPlayer;
 using AssetStudio.Avalonia;
+using AssetStudio.Avalonia.Services;
 using Logger = AssetStudio.Logger;
 
 namespace AssetStudio.Avalonia.Controls
 {
     public class VideoPlayerControl : UserControl
     {
-        private FFmpegMediaPlayer? _mediaPlayer;
+        internal static readonly VideoPlayerTeardownQueue SharedTeardownQueue = new();
+
+        private sealed class PlayerHandle
+        {
+            public PlayerHandle(FFmpegMediaPlayer player, long generation)
+            {
+                Player = player;
+                Generation = generation;
+            }
+
+            public FFmpegMediaPlayer Player { get; }
+            public long Generation { get; }
+
+            // 0 = Opening, 1 = Open, 2 = ReleaseRequested
+            public int State;
+            public volatile bool IsPlayTransitionPending;
+            public volatile bool IsPauseTransitionPending;
+        }
+
+        private PlayerHandle? _activeHandle;
+        private long _playerGeneration;
         private IVideoRenderer? _videoRenderer;
         private Border? _videoBorder;
         private string? _currentMediaPath;
-        private bool _hasMediaLoaded;
+        private volatile bool _hasMediaLoaded;
         private bool _isInitialized;
         private int _previousVolume = 100;
+        private int _volumeCached = 100;
         private Func<int, int, IAudioPlayer?>? _audioPlayerFactoryFunc;
         private bool _autoPlayCached;
         private bool _frameRenderErrorLogged;
+        private float _pendingSeekPercent = float.NaN;
+        private int _seekWorkerRunning;
 
         public static readonly StyledProperty<int> VolumeProperty =
             AvaloniaProperty.Register<VideoPlayerControl, int>(nameof(Volume), defaultValue: 100);
@@ -68,15 +93,27 @@ namespace AssetStudio.Avalonia.Controls
         public static readonly StyledProperty<bool> IsFullscreenProperty =
             AvaloniaProperty.Register<VideoPlayerControl, bool>(nameof(IsFullscreen), defaultValue: false);
 
+        private FFmpegMediaPlayer? ActivePlayer
+        {
+            get
+            {
+                var handle = Volatile.Read(ref _activeHandle);
+                return handle != null && Volatile.Read(ref handle.State) == 1 ? handle.Player : null;
+            }
+        }
+
         public int Volume
         {
             get => GetValue(VolumeProperty);
             set
             {
-                SetValue(VolumeProperty, Math.Clamp(value, 0, 100));
-                if (_mediaPlayer != null)
+                var clamped = Math.Clamp(value, 0, 100);
+                _volumeCached = clamped;
+                SetValue(VolumeProperty, clamped);
+                var player = ActivePlayer;
+                if (player != null)
                 {
-                    _mediaPlayer.Volume = value;
+                    player.Volume = clamped;
                 }
             }
         }
@@ -162,19 +199,35 @@ namespace AssetStudio.Avalonia.Controls
         public string? CurrentMediaPath => _currentMediaPath;
         public bool HasMediaLoaded => _hasMediaLoaded;
 
-        public bool IsPlaying => _mediaPlayer?.IsPlaying ?? false;
+        public bool IsPlaying
+        {
+            get
+            {
+                var handle = Volatile.Read(ref _activeHandle);
+                if (handle == null || Volatile.Read(ref handle.State) != 1 || handle.IsPauseTransitionPending)
+                {
+                    return false;
+                }
+
+                return handle.IsPlayTransitionPending || handle.Player.IsPlaying;
+            }
+        }
 
         public long Position
         {
             get
             {
-                if (_mediaPlayer == null)
+                var player = ActivePlayer;
+                if (player == null)
+                {
                     return 0L;
-                return (long)(_mediaPlayer.Position * (float)_mediaPlayer.Length);
+                }
+
+                return (long)(player.Position * (float)player.Length);
             }
         }
 
-        public long Duration => _mediaPlayer?.Length ?? 0L;
+        public long Duration => ActivePlayer?.Length ?? 0L;
 
         public event EventHandler? PlaybackStarted;
         public event EventHandler<MediaOpenedEventArgs>? MediaOpened;
@@ -208,8 +261,9 @@ namespace AssetStudio.Avalonia.Controls
 
         private FFmpegMediaPlayer CreateMediaPlayerInstance()
         {
-            Func<int, int, IAudioPlayer?> func = _audioPlayerFactoryFunc ?? 
-                ((sr, ch) => {
+            Func<int, int, IAudioPlayer?> func = _audioPlayerFactoryFunc ??
+                ((sr, ch) =>
+                {
                     try
                     {
                         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -237,6 +291,10 @@ namespace AssetStudio.Avalonia.Controls
                 Dispatcher.UIThread.Post(action);
             }, func);
 
+            // Disable FFmpegMediaPlayer's built-in disk JSON logger so it never allocates JSON per audio packet
+            // or blocks player._lock writing multi-MB debug/player-log-*.json files.
+            VideoPreviewService.DisablePlayerDiskLogger(mediaPlayer);
+
             mediaPlayer.PositionChanged += OnPositionChanged;
             mediaPlayer.LengthChanged += OnLengthChanged;
             mediaPlayer.Playing += OnPlaying;
@@ -246,6 +304,46 @@ namespace AssetStudio.Avalonia.Controls
             mediaPlayer.FrameReady += OnFrameReady;
 
             return mediaPlayer;
+        }
+
+        private void UnsubscribeEvents(FFmpegMediaPlayer player)
+        {
+            player.PositionChanged -= OnPositionChanged;
+            player.LengthChanged -= OnLengthChanged;
+            player.Playing -= OnPlaying;
+            player.Paused -= OnPaused;
+            player.Stopped -= OnStopped;
+            player.EndReached -= OnEndReached;
+            player.FrameReady -= OnFrameReady;
+        }
+
+        private void ReleaseHandle(PlayerHandle? handle, Action? onTeardownCompleted = null)
+        {
+            if (handle == null)
+            {
+                if (onTeardownCompleted != null)
+                {
+                    _ = SharedTeardownQueue.EnqueueTeardownAsync(static () => { }, onTeardownCompleted);
+                }
+                return;
+            }
+
+            handle.IsPlayTransitionPending = false;
+            handle.IsPauseTransitionPending = false;
+
+            if (Interlocked.Exchange(ref handle.State, 2) == 2)
+            {
+                if (onTeardownCompleted != null)
+                {
+                    _ = SharedTeardownQueue.EnqueueTeardownAsync(static () => { }, onTeardownCompleted);
+                }
+                return;
+            }
+
+            UnsubscribeEvents(handle.Player);
+            _ = SharedTeardownQueue.EnqueueTeardownAsync(
+                () => VideoPreviewService.SafeDisposePlayer(handle.Player),
+                onTeardownCompleted);
         }
 
         private void InitializePlayer()
@@ -259,7 +357,7 @@ namespace AssetStudio.Avalonia.Controls
 
                 _audioPlayerFactoryFunc = AudioPlayerFactory;
                 _autoPlayCached = AutoPlay;
-                _mediaPlayer = CreateMediaPlayerInstance();
+                _volumeCached = Math.Clamp(Volume, 0, 100);
 
                 _isInitialized = true;
                 SetupVideoRenderer();
@@ -271,7 +369,7 @@ namespace AssetStudio.Avalonia.Controls
 
                 if (!string.IsNullOrEmpty(Source))
                 {
-                    Open(Source);
+                    _ = OpenAsync(Source);
                 }
             }
             catch (Exception ex)
@@ -348,11 +446,7 @@ namespace AssetStudio.Avalonia.Controls
                 string? text = e.NewValue as string;
                 if (!string.IsNullOrEmpty(text) && _isInitialized)
                 {
-                    Open(text);
-                    if (_autoPlayCached)
-                    {
-                        Play();
-                    }
+                    _ = OpenAsync(text);
                 }
             }
             else if (e.Property == VideoBackgroundProperty)
@@ -390,27 +484,98 @@ namespace AssetStudio.Avalonia.Controls
             }
         }
 
+        private bool IsSenderActivePlayer(object? sender)
+        {
+            var handle = Volatile.Read(ref _activeHandle);
+            return handle != null
+                && Volatile.Read(ref handle.State) == 1
+                && ReferenceEquals(sender, handle.Player);
+        }
+
         private void OnPlaying(object? sender, EventArgs e)
         {
-            PlaybackStarted?.Invoke(this, EventArgs.Empty);
+            if (!IsSenderActivePlayer(sender))
+            {
+                return;
+            }
+
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                PlaybackStarted?.Invoke(this, EventArgs.Empty);
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsSenderActivePlayer(sender))
+                    {
+                        PlaybackStarted?.Invoke(this, EventArgs.Empty);
+                    }
+                });
+            }
         }
 
         private void OnPaused(object? sender, EventArgs e)
         {
-            PlaybackPaused?.Invoke(this, EventArgs.Empty);
+            if (!IsSenderActivePlayer(sender))
+            {
+                return;
+            }
+
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                PlaybackPaused?.Invoke(this, EventArgs.Empty);
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsSenderActivePlayer(sender))
+                    {
+                        PlaybackPaused?.Invoke(this, EventArgs.Empty);
+                    }
+                });
+            }
         }
 
         private void OnStopped(object? sender, EventArgs e)
         {
-            PlaybackStopped?.Invoke(this, EventArgs.Empty);
-            _videoRenderer?.Clear();
+            if (!IsSenderActivePlayer(sender))
+            {
+                return;
+            }
+
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                PlaybackStopped?.Invoke(this, EventArgs.Empty);
+                _videoRenderer?.Clear();
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsSenderActivePlayer(sender))
+                    {
+                        PlaybackStopped?.Invoke(this, EventArgs.Empty);
+                        _videoRenderer?.Clear();
+                    }
+                });
+            }
         }
 
         private void OnEndReached(object? sender, EventArgs e)
         {
+            if (!IsSenderActivePlayer(sender))
+            {
+                return;
+            }
+
             Dispatcher.UIThread.Post(() =>
             {
-                MediaEnded?.Invoke(this, EventArgs.Empty);
+                if (IsSenderActivePlayer(sender))
+                {
+                    MediaEnded?.Invoke(this, EventArgs.Empty);
+                }
             });
         }
 
@@ -426,6 +591,14 @@ namespace AssetStudio.Avalonia.Controls
         {
             try
             {
+                var handle = Volatile.Read(ref _activeHandle);
+                if (handle == null
+                    || Volatile.Read(ref handle.State) == 2
+                    || !ReferenceEquals(sender, handle.Player))
+                {
+                    return;
+                }
+
                 _videoRenderer?.RenderFrame(e.Data, e.Width, e.Height, e.Stride);
             }
             catch (Exception ex)
@@ -442,49 +615,111 @@ namespace AssetStudio.Avalonia.Controls
             }
         }
 
+        public Task<bool> OpenAsync(string path, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(path) || cancellationToken.IsCancellationRequested)
+            {
+                return Task.FromResult(false);
+            }
+
+            return Task.Run(() => OpenCore(path, cancellationToken), cancellationToken);
+        }
+
         public void Open(string path)
         {
-            _hasMediaLoaded = false;
-            _frameRenderErrorLogged = false;
+            _ = OpenCore(path, CancellationToken.None);
+        }
 
-            var oldPlayer = _mediaPlayer;
-            if (oldPlayer != null)
+        private bool OpenCore(string path, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(path) || cancellationToken.IsCancellationRequested)
             {
-                oldPlayer.PositionChanged -= OnPositionChanged;
-                oldPlayer.LengthChanged -= OnLengthChanged;
-                oldPlayer.Playing -= OnPlaying;
-                oldPlayer.Paused -= OnPaused;
-                oldPlayer.Stopped -= OnStopped;
-                oldPlayer.EndReached -= OnEndReached;
-                oldPlayer.FrameReady -= OnFrameReady;
-
-                ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    try
-                    {
-                        oldPlayer.Close();
-                        oldPlayer.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Debug($"Error closing/disposing old video player: {ex.Message}");
-                    }
-                });
+                return false;
             }
 
-            _mediaPlayer = CreateMediaPlayerInstance();
+            _hasMediaLoaded = false;
+            _currentMediaPath = null;
+            _frameRenderErrorLogged = false;
+            Volatile.Write(ref _pendingSeekPercent, float.NaN);
 
-            if (_mediaPlayer.Open(path))
+            var oldHandle = Interlocked.Exchange(ref _activeHandle, null);
+            if (oldHandle != null)
             {
-                _currentMediaPath = path;
-                _hasMediaLoaded = true;
-                MediaOpened?.Invoke(this, new MediaOpenedEventArgs(path));
-                _mediaPlayer.DecodeFirstFrame();
-                if (_autoPlayCached)
+                ReleaseHandle(oldHandle);
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            var player = CreateMediaPlayerInstance();
+            var generation = Interlocked.Increment(ref _playerGeneration);
+            var handle = new PlayerHandle(player, generation);
+            Volatile.Write(ref _activeHandle, handle);
+
+            bool opened = false;
+            try
+            {
+                if (!cancellationToken.IsCancellationRequested && Volatile.Read(ref handle.State) == 0)
                 {
-                    _mediaPlayer.Play();
+                    opened = player.Open(path);
                 }
             }
+            catch (Exception ex)
+            {
+                Logger.Debug($"FFmpegMediaPlayer.Open failed for '{path}': {ex.Message}");
+                opened = false;
+            }
+
+            if (!opened || cancellationToken.IsCancellationRequested || Volatile.Read(ref handle.State) != 0)
+            {
+                Interlocked.CompareExchange(ref _activeHandle, null, handle);
+                ReleaseHandle(handle);
+                return false;
+            }
+
+            player.Volume = _volumeCached;
+
+            try
+            {
+                if (!cancellationToken.IsCancellationRequested && Volatile.Read(ref handle.State) == 0)
+                {
+                    player.DecodeFirstFrame();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug($"FFmpegMediaPlayer.DecodeFirstFrame failed for '{path}': {ex.Message}");
+            }
+
+            if (cancellationToken.IsCancellationRequested
+                || !ReferenceEquals(Volatile.Read(ref _activeHandle), handle)
+                || Interlocked.CompareExchange(ref handle.State, 1, 0) != 0)
+            {
+                Interlocked.CompareExchange(ref _activeHandle, null, handle);
+                ReleaseHandle(handle);
+                return false;
+            }
+
+            _currentMediaPath = path;
+            _hasMediaLoaded = true;
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                var current = Volatile.Read(ref _activeHandle);
+                if (ReferenceEquals(current, handle) && Volatile.Read(ref handle.State) == 1)
+                {
+                    MediaOpened?.Invoke(this, new MediaOpenedEventArgs(path));
+                }
+            });
+
+            if (_autoPlayCached)
+            {
+                Play();
+            }
+
+            return true;
         }
 
         public void OpenUri(Uri uri)
@@ -499,48 +734,188 @@ namespace AssetStudio.Avalonia.Controls
             }
         }
 
-        public void Play() => _mediaPlayer?.Play();
-        public void Pause() => _mediaPlayer?.Pause();
-        
+        public void Play()
+        {
+            var handle = Volatile.Read(ref _activeHandle);
+            if (handle == null || Volatile.Read(ref handle.State) != 1)
+            {
+                return;
+            }
+
+            handle.IsPauseTransitionPending = false;
+            handle.IsPlayTransitionPending = true;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    if (Volatile.Read(ref handle.State) == 1)
+                    {
+                        handle.Player.Play();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug($"Error starting video playback: {ex.Message}");
+                }
+                finally
+                {
+                    handle.IsPlayTransitionPending = false;
+                }
+            });
+        }
+
+        public void Pause()
+        {
+            var handle = Volatile.Read(ref _activeHandle);
+            if (handle == null || Volatile.Read(ref handle.State) != 1)
+            {
+                return;
+            }
+
+            handle.IsPlayTransitionPending = false;
+            handle.IsPauseTransitionPending = true;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    if (Volatile.Read(ref handle.State) == 1)
+                    {
+                        handle.Player.Pause();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug($"Error pausing video playback: {ex.Message}");
+                }
+                finally
+                {
+                    handle.IsPauseTransitionPending = false;
+                }
+            });
+        }
+
         public void Stop()
         {
-            var oldPlayer = _mediaPlayer;
-            if (oldPlayer != null)
+            Volatile.Write(ref _pendingSeekPercent, float.NaN);
+            var handle = Volatile.Read(ref _activeHandle);
+            if (handle != null && Volatile.Read(ref handle.State) == 1)
             {
-                ThreadPool.QueueUserWorkItem(_ =>
+                handle.IsPlayTransitionPending = false;
+                handle.IsPauseTransitionPending = false;
+                _ = SharedTeardownQueue.EnqueueTeardownAsync(() =>
                 {
-                    try
+                    if (Volatile.Read(ref handle.State) == 1)
                     {
-                        oldPlayer.Stop();
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Debug($"Error stopping video player: {ex.Message}");
+                        VideoPreviewService.SafeStopPlayer(handle.Player);
                     }
                 });
             }
-            Dispatcher.UIThread.Post(() => _videoRenderer?.Clear());
-        }
 
-        public bool StepForward() => _mediaPlayer?.StepForward() ?? false;
-        public bool StepBackward() => _mediaPlayer?.StepBackward() ?? false;
-
-        public void TogglePlayPause()
-        {
-            if (_mediaPlayer != null)
+            if (Dispatcher.UIThread.CheckAccess())
             {
-                if (_mediaPlayer.IsPlaying)
-                    _mediaPlayer.Pause();
-                else
-                    _mediaPlayer.Play();
+                _videoRenderer?.Clear();
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(() => _videoRenderer?.Clear());
             }
         }
 
-        public void Seek(float positionPercent) => _mediaPlayer?.Seek(positionPercent);
+        /// <summary>
+        /// Detaches the active media player immediately without blocking the UI thread, clears the rendered frame,
+        /// and disposes the native FFmpeg format/codec contexts on the background teardown queue so the underlying
+        /// temp file handle is closed before <paramref name="onTeardownCompleted"/> runs.
+        /// </summary>
+        public void ResetMedia(Action? onTeardownCompleted = null)
+        {
+            _hasMediaLoaded = false;
+            _currentMediaPath = null;
+            Volatile.Write(ref _pendingSeekPercent, float.NaN);
+            Interlocked.Increment(ref _playerGeneration);
+
+            var oldHandle = Interlocked.Exchange(ref _activeHandle, null);
+            ReleaseHandle(oldHandle, onTeardownCompleted);
+
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                _videoRenderer?.Clear();
+            }
+            else
+            {
+                Dispatcher.UIThread.Post(() => _videoRenderer?.Clear());
+            }
+        }
+
+        public bool StepForward() => ActivePlayer?.StepForward() ?? false;
+        public bool StepBackward() => ActivePlayer?.StepBackward() ?? false;
+
+        public void TogglePlayPause()
+        {
+            if (IsPlaying)
+            {
+                Pause();
+            }
+            else
+            {
+                Play();
+            }
+        }
+
+        public void Seek(float positionPercent)
+        {
+            var handle = Volatile.Read(ref _activeHandle);
+            if (handle == null || Volatile.Read(ref handle.State) != 1)
+            {
+                return;
+            }
+
+            var clamped = Math.Clamp(positionPercent, 0f, 1f);
+            Volatile.Write(ref _pendingSeekPercent, clamped);
+            if (Interlocked.CompareExchange(ref _seekWorkerRunning, 1, 0) != 0)
+            {
+                return;
+            }
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        var target = Interlocked.Exchange(ref _pendingSeekPercent, float.NaN);
+                        if (float.IsNaN(target))
+                        {
+                            break;
+                        }
+
+                        var currentHandle = Volatile.Read(ref _activeHandle);
+                        if (currentHandle == null || Volatile.Read(ref currentHandle.State) != 1)
+                        {
+                            break;
+                        }
+
+                        try
+                        {
+                            currentHandle.Player.Seek(target);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Debug($"Error seeking video player: {ex.Message}");
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _seekWorkerRunning, 0);
+                }
+            });
+        }
 
         public void ToggleMute()
         {
-            if (_mediaPlayer != null)
+            if (ActivePlayer != null)
             {
                 if (Volume > 0)
                 {
@@ -556,20 +931,7 @@ namespace AssetStudio.Avalonia.Controls
 
         private void Cleanup()
         {
-            if (_mediaPlayer != null)
-            {
-                _mediaPlayer.PositionChanged -= OnPositionChanged;
-                _mediaPlayer.LengthChanged -= OnLengthChanged;
-                _mediaPlayer.Playing -= OnPlaying;
-                _mediaPlayer.Paused -= OnPaused;
-                _mediaPlayer.Stopped -= OnStopped;
-                _mediaPlayer.EndReached -= OnEndReached;
-                _mediaPlayer.FrameReady -= OnFrameReady;
-
-                _mediaPlayer.Close();
-                _mediaPlayer.Dispose();
-                _mediaPlayer = null;
-            }
+            ResetMedia();
 
             if (_videoRenderer != null)
             {

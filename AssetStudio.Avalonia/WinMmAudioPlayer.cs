@@ -109,9 +109,17 @@ namespace AssetStudio.Avalonia
         #endregion
 
         #region State Fields
+        private sealed class StreamingWaveBuffer
+        {
+            public GCHandle BufferHandle;
+            public IntPtr HeaderPtr;
+            public bool IsPrepared;
+        }
+
+        private const int MaxQueuedStreamingBuffers = 256;
         private readonly object _lock = new();
         private readonly object _waveOutLock = new();
-        private int _activeBufferCount;
+        private readonly System.Collections.Generic.Queue<StreamingWaveBuffer> _streamingBuffers = new();
         private bool _isDisposed;
 
         // Streaming (FFmpeg) mode fields
@@ -228,8 +236,15 @@ namespace AssetStudio.Avalonia
         {
             lock (_waveOutLock)
             {
-                if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
-                waveOutReset(_hWaveOut);
+                if (_hWaveOut != IntPtr.Zero && !_isDisposed)
+                {
+                    try
+                    {
+                        waveOutReset(_hWaveOut);
+                    }
+                    catch { }
+                }
+                ReapCompletedStreamingBuffersLocked(forceAll: true);
             }
             _playbackClock.Reset();
             _playbackTimeBaseSec = 0;
@@ -259,11 +274,68 @@ namespace AssetStudio.Avalonia
 
         private void QueueBufferPlayback(byte[] buffer)
         {
-            _ = Task.Run(async () => await PlayBufferAsync(buffer));
+            if (buffer == null || buffer.Length == 0)
+            {
+                return;
+            }
+
+            lock (_waveOutLock)
+            {
+                if (_isDisposed || _hWaveOut == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                ReapCompletedStreamingBuffersLocked(forceAll: false);
+                if (_streamingBuffers.Count >= MaxQueuedStreamingBuffers)
+                {
+                    return;
+                }
+
+                var item = new StreamingWaveBuffer
+                {
+                    BufferHandle = GCHandle.Alloc(buffer, GCHandleType.Pinned)
+                };
+                var headerSize = Marshal.SizeOf<WaveHeader>();
+                try
+                {
+                    var header = new WaveHeader
+                    {
+                        lpData = item.BufferHandle.AddrOfPinnedObject(),
+                        dwBufferLength = (uint)buffer.Length
+                    };
+                    item.HeaderPtr = Marshal.AllocHGlobal(headerSize);
+                    Marshal.StructureToPtr(header, item.HeaderPtr, false);
+
+                    if (waveOutPrepareHeader(_hWaveOut, item.HeaderPtr, headerSize) != MMSYSERR_NOERROR)
+                    {
+                        ReleaseStreamingBufferLocked(item, headerSize);
+                        return;
+                    }
+                    item.IsPrepared = true;
+
+                    if (waveOutWrite(_hWaveOut, item.HeaderPtr, headerSize) != MMSYSERR_NOERROR)
+                    {
+                        ReleaseStreamingBufferLocked(item, headerSize);
+                        return;
+                    }
+
+                    _streamingBuffers.Enqueue(item);
+                }
+                catch
+                {
+                    ReleaseStreamingBufferLocked(item, headerSize);
+                }
+            }
         }
 
         public unsafe void QueueSamplesS16(short* samples, int count)
         {
+            if (samples == null || count <= 0)
+            {
+                return;
+            }
+
             lock (_waveOutLock)
             {
                 if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
@@ -278,6 +350,11 @@ namespace AssetStudio.Avalonia
 
         public void QueueSamples(float[] samples)
         {
+            if (samples == null || samples.Length == 0)
+            {
+                return;
+            }
+
             lock (_waveOutLock)
             {
                 if (_hWaveOut == IntPtr.Zero || _isDisposed) return;
@@ -296,88 +373,54 @@ namespace AssetStudio.Avalonia
             QueueBufferPlayback(managedBuffer);
         }
 
-        private async Task PlayBufferAsync(byte[] buffer)
+        private void ReapCompletedStreamingBuffersLocked(bool forceAll)
         {
-            lock (_waveOutLock)
+            var headerSize = Marshal.SizeOf<WaveHeader>();
+            while (_streamingBuffers.Count > 0)
             {
-                if (_isDisposed || _hWaveOut == IntPtr.Zero) return;
-                _activeBufferCount++;
-            }
-
-            var bufferHandle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-            var headerPtr = IntPtr.Zero;
-            var headerPrepared = false;
-            try
-            {
-                var header = new WaveHeader
+                var head = _streamingBuffers.Peek();
+                if (!forceAll && head.HeaderPtr != IntPtr.Zero)
                 {
-                    lpData = bufferHandle.AddrOfPinnedObject(),
-                    dwBufferLength = (uint)buffer.Length
-                };
-                var headerSize = Marshal.SizeOf<WaveHeader>();
-                headerPtr = Marshal.AllocHGlobal(headerSize);
-                Marshal.StructureToPtr(header, headerPtr, false);
-
-                lock (_waveOutLock)
-                {
-                    if (_isDisposed || _hWaveOut == IntPtr.Zero) return;
-                    if (waveOutPrepareHeader(_hWaveOut, headerPtr, headerSize) != MMSYSERR_NOERROR)
-                    {
-                        return;
-                    }
-                    headerPrepared = true;
-
-                    if (waveOutWrite(_hWaveOut, headerPtr, headerSize) != MMSYSERR_NOERROR)
-                    {
-                        return;
-                    }
-                }
-
-                while (!_isDisposed)
-                {
-                    var currentHeader = Marshal.PtrToStructure<WaveHeader>(headerPtr);
-                    if ((currentHeader.dwFlags & WHDR_DONE) == WHDR_DONE)
+                    var currentHeader = Marshal.PtrToStructure<WaveHeader>(head.HeaderPtr);
+                    if ((currentHeader.dwFlags & WHDR_DONE) == 0)
                     {
                         break;
                     }
-                    await Task.Delay(5);
                 }
+
+                _streamingBuffers.Dequeue();
+                ReleaseStreamingBufferLocked(head, headerSize);
             }
-            catch {}
-            finally
+        }
+
+        private void ReleaseStreamingBufferLocked(StreamingWaveBuffer item, int headerSize)
+        {
+            if (item.IsPrepared && _hWaveOut != IntPtr.Zero && item.HeaderPtr != IntPtr.Zero)
             {
-                lock (_waveOutLock)
+                try
                 {
-                    if (headerPrepared && _hWaveOut != IntPtr.Zero)
-                    {
-                        try
-                        {
-                            waveOutUnprepareHeader(_hWaveOut, headerPtr, Marshal.SizeOf<WaveHeader>());
-                        }
-                        catch {}
-                    }
-
-                    if (headerPtr != IntPtr.Zero)
-                    {
-                        try
-                        {
-                            Marshal.FreeHGlobal(headerPtr);
-                        }
-                        catch {}
-                    }
-
-                    if (bufferHandle.IsAllocated)
-                    {
-                        try
-                        {
-                            bufferHandle.Free();
-                        }
-                        catch {}
-                    }
-
-                    _activeBufferCount--;
-                    Monitor.PulseAll(_waveOutLock);
+                    waveOutUnprepareHeader(_hWaveOut, item.HeaderPtr, headerSize);
                 }
+                catch { }
+            }
+
+            if (item.HeaderPtr != IntPtr.Zero)
+            {
+                try
+                {
+                    Marshal.FreeHGlobal(item.HeaderPtr);
+                }
+                catch { }
+                item.HeaderPtr = IntPtr.Zero;
+            }
+
+            if (item.BufferHandle.IsAllocated)
+            {
+                try
+                {
+                    item.BufferHandle.Free();
+                }
+                catch { }
             }
         }
         #endregion
@@ -812,10 +855,7 @@ namespace AssetStudio.Avalonia
                     }
                     catch {}
 
-                    while (_activeBufferCount > 0)
-                    {
-                        Monitor.Wait(_waveOutLock, 100);
-                    }
+                    ReapCompletedStreamingBuffersLocked(forceAll: true);
 
                     try
                     {
@@ -823,6 +863,10 @@ namespace AssetStudio.Avalonia
                     }
                     catch {}
                     _hWaveOut = IntPtr.Zero;
+                }
+                else
+                {
+                    ReapCompletedStreamingBuffersLocked(forceAll: true);
                 }
             }
             _playbackClock.Stop();
