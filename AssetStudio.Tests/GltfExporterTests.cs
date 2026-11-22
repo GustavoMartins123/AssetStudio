@@ -79,8 +79,8 @@ namespace AssetStudio.Tests
                 Assert.Equal(0.1f, uv1[0].X, 4);
                 Assert.Equal(0.75f, uv1[0].Y, 4);
 
-                // Verify COLOR_0 and TANGENT present
-                Assert.True(prim0.GetProperty("attributes").TryGetProperty("COLOR_0", out _));
+                // Verify COLOR_0 is omitted by default (matching 3D Preview) and TANGENT is present
+                Assert.False(prim0.GetProperty("attributes").TryGetProperty("COLOR_0", out _));
                 Assert.True(prim0.GetProperty("attributes").TryGetProperty("TANGENT", out var tanProp));
                 var tangents = ReadVec4Accessor(doc, tanProp.GetInt32());
                 foreach (var t in tangents)
@@ -847,12 +847,12 @@ namespace AssetStudio.Tests
                     Assert.Equal(1, blendQuad.GetProperty("polygon_count").GetInt32());
                     Assert.True(blendQuad.GetProperty("avg_normal_winding_dot").GetSingle() > 0.99f);
 
-                    // Skinned + Morphed RichHero: 2 UV layers, COLOR_0, normalized weights, REST alignment, Shape Keys!
+                    // Skinned + Morphed RichHero: 2 UV layers, no COLOR_0 by default, normalized weights, REST alignment, Shape Keys!
                     var hero = meshes.EnumerateArray().First(m => m.GetProperty("object_name").GetString()!.StartsWith("RichHero", StringComparison.Ordinal));
                     Assert.Equal(4, hero.GetProperty("vertex_count").GetInt32());
                     Assert.Equal(2, hero.GetProperty("polygon_count").GetInt32());
                     Assert.Equal(2, hero.GetProperty("uv_layers").GetArrayLength());
-                    Assert.Equal(1, hero.GetProperty("color_attributes").GetArrayLength());
+                    Assert.Equal(0, hero.GetProperty("color_attributes").GetArrayLength());
                     Assert.Equal(2, hero.GetProperty("vertex_group_count").GetInt32());
                     Assert.InRange(hero.GetProperty("weight_sum_min").GetSingle(), 0.999f, 1.001f);
                     Assert.InRange(hero.GetProperty("weight_sum_max").GetSingle(), 0.999f, 1.001f);
@@ -1942,7 +1942,11 @@ namespace AssetStudio.Tests
                 SurfaceMode = 1f, // MASK
                 AlphaCutoff = 0.4f,
                 Metallic = 0.25f,
-                Smoothness = 0.7f
+                Smoothness = 0.7f,
+                Textures = new List<ImportedMaterialTexture>
+                {
+                    new ImportedMaterialTexture { Name = "albedo.png", Dest = 0, Scale = new Vector2(1, 1) }
+                }
             };
 
             // Morph targets (Smile + Blink)

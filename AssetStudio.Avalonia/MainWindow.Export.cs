@@ -527,6 +527,7 @@ public partial class MainWindow
         }
 
         using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
 
         reportStage?.Invoke(10, "Loading selected assets...");
         EnsureLazyAssetsLoadedForExport(selectedAssets.Where(x => x != null).ToList());
@@ -1038,7 +1039,8 @@ public partial class MainWindow
             combineMeshes: false,
             partTransforms: null,
             partMaterials: partMaterials,
-            partNames: partNames);
+            partNames: partNames,
+            textureResolver: ResolveTextureForModelConverter);
 
         if (convert.MeshList.Count == 0)
         {
@@ -1251,15 +1253,15 @@ public partial class MainWindow
     private ModelConverter CreateModelConverter(string rootName, List<GameObject> gameObjects, AnimationClip[]? clips)
     {
         return clips == null
-            ? new ModelConverter(rootName, gameObjects, exportOptions.ConvertTextureFormat)
-            : new ModelConverter(rootName, gameObjects, exportOptions.ConvertTextureFormat, clips);
+            ? new ModelConverter(rootName, gameObjects, exportOptions.ConvertTextureFormat, textureResolver: ResolveTextureForModelConverter)
+            : new ModelConverter(rootName, gameObjects, exportOptions.ConvertTextureFormat, clips, textureResolver: ResolveTextureForModelConverter);
     }
 
     private ModelConverter CreateModelConverter(GameObject gameObject, AnimationClip[]? clips)
     {
         return clips == null
-            ? new ModelConverter(gameObject, exportOptions.ConvertTextureFormat)
-            : new ModelConverter(gameObject, exportOptions.ConvertTextureFormat, clips);
+            ? new ModelConverter(gameObject, exportOptions.ConvertTextureFormat, textureResolver: ResolveTextureForModelConverter)
+            : new ModelConverter(gameObject, exportOptions.ConvertTextureFormat, clips, textureResolver: ResolveTextureForModelConverter);
     }
 
     private List<GameObjectNode> GetSelectedParentNodes()
@@ -1521,6 +1523,7 @@ public partial class MainWindow
             return false;
         }
 
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
         Directory.CreateDirectory(exportPath);
         var fileName = FixFileName(AssetExportService.GetExportFileName(item));
 
@@ -1611,6 +1614,13 @@ public partial class MainWindow
         string fileName,
         Services.ExportConversionContext conversionContext)
     {
+        mesh.EnsureProcessed();
+        if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
+        {
+            Logger.Info($"Skipping empty 0-vertex mesh '{mesh.m_Name}' (PathID: {mesh.m_PathID}).");
+            return false;
+        }
+
         if (TryExportMeshModelGroupFbx(item, mesh, exportPath, fileName, conversionContext, out var alreadyExportedGroup))
         {
             return true;
@@ -1624,8 +1634,8 @@ public partial class MainWindow
         {
             var animator = FindAnimatorForModelExport(item);
             var convert = animator != null
-                ? new ModelConverter(animator, exportOptions.ConvertTextureFormat)
-                : new ModelConverter(item.TreeNode.GameObject, exportOptions.ConvertTextureFormat);
+                ? new ModelConverter(animator, exportOptions.ConvertTextureFormat, textureResolver: ResolveTextureForModelConverter)
+                : new ModelConverter(item.TreeNode.GameObject, exportOptions.ConvertTextureFormat, textureResolver: ResolveTextureForModelConverter);
             var modelExt = AssetExportService.GetModelFileExtension(exportOptions);
             if (convert.MeshList.Count > 0
                 && conversionContext.TryGetAssetFilePath(exportPath, fileName, modelExt, item, out var fbxPath))
@@ -1633,12 +1643,6 @@ public partial class MainWindow
                 ExportFbx(convert, fbxPath);
                 return true;
             }
-        }
-
-        mesh.EnsureProcessed();
-        if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
-        {
-            return false;
         }
 
         if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".obj", item, out var objPath)) return false;
@@ -1736,6 +1740,7 @@ public partial class MainWindow
         await Task.Run(() =>
         {
             using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
             try
             {
                 if (target.SelectedAsset != null && target.SelectedAsset.Asset == null)
@@ -1803,8 +1808,17 @@ public partial class MainWindow
         ExportOptionsState? optionsOverride = null,
         List<string>? exportedFilePaths = null)
     {
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
         actualExportFile = exportFile;
         bool success = false;
+
+        if (!preferFullModelGroup
+            && (target.ExportFullModelGroup
+                || target.Kind is PreviewModelExportKind.ModelGroup or PreviewModelExportKind.AnimatedModelGroup
+                || SelectedPreviewCandidate?.IsModelGroup == true))
+        {
+            preferFullModelGroup = true;
+        }
 
         if (preferFullModelGroup)
         {
@@ -1931,6 +1945,7 @@ public partial class MainWindow
         await Task.Run(() =>
         {
             using var lruSuspension = assetsManager.LazyLoading ? assetsManager.LruCache.SuspendEviction() : null;
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
             try
             {
                 if (target.SelectedAsset != null && target.SelectedAsset.Asset == null)
@@ -2514,10 +2529,23 @@ public partial class MainWindow
                         var resolvedMat = !string.IsNullOrWhiteSpace(slot.MaterialAssetId)
                             ? ResolvePreviewCandidateAsset(slot.MaterialAssetId) as Material
                             : null;
-                        if (!string.IsNullOrWhiteSpace(slot.MainTextureAssetId)
-                            && visitedTextures.Add($"resolvedTex|{slot.MainTextureAssetId}"))
+                        if (!string.IsNullOrWhiteSpace(slot.MainTextureAssetId))
                         {
-                            _ = ResolvePreviewCandidateAsset(slot.MainTextureAssetId);
+                            Texture2D? resolvedTex = null;
+                            if (visitedTextures.Add($"resolvedTex|{slot.MainTextureAssetId}"))
+                            {
+                                resolvedTex = ResolvePreviewCandidateAsset(slot.MainTextureAssetId) as Texture2D;
+                            }
+                            else
+                            {
+                                resolvedTex = assetsManager.ProjectIndex?.GetHandle(slot.MainTextureAssetId)?.RealObject as Texture2D;
+                            }
+
+                            if (resolvedMat != null && resolvedTex != null)
+                            {
+                                materialMainTextureCache ??= new Dictionary<Material, Texture2D?>();
+                                materialMainTextureCache[resolvedMat] = resolvedTex;
+                            }
                         }
                         materials.Add(resolvedMat);
                     }
@@ -2650,7 +2678,8 @@ public partial class MainWindow
                 combineMeshes: false,
                 partTransforms: partTransforms!,
                 partMaterials: partMaterials,
-                partNames: partNames);
+                partNames: partNames,
+                textureResolver: ResolveTextureForModelConverter);
             if (convert.MeshList.Count > 0)
             {
                 reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
@@ -2731,7 +2760,7 @@ public partial class MainWindow
                 }
 
                 reportStage?.Invoke(65, $"Converting rig & textures ({subMeshes.Count} parts)...");
-                var directConvert = new ModelConverter(animator, effectiveOptions.ConvertTextureFormat, animationClips);
+                var directConvert = new ModelConverter(animator, effectiveOptions.ConvertTextureFormat, animationClips, ResolveTextureForModelConverter);
                 if (directConvert.MeshList.Count >= Math.Max(1, groupMeshes.Count))
                 {
                     reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
@@ -2782,6 +2811,20 @@ public partial class MainWindow
             var renderer = !string.IsNullOrWhiteSpace(part.RendererAssetId)
                 ? ResolvePreviewCandidateAsset(part.RendererAssetId) as Renderer
                 : null;
+            if (renderer == null)
+            {
+                if (assetsManager.LazyLoading && mesh.assetsFile != null)
+                {
+                    EnsureLocalHierarchyObjectsLoadedForFile(mesh.assetsFile);
+                }
+                renderer = FindSkinnedRendererForAvatarMesh(avatar, mesh)
+                    ?? TryFindRendererForMeshFromSemanticCache(mesh)
+                    ?? FindSingleRendererForMeshForExport(mesh);
+            }
+            if (assetsManager.LazyLoading)
+            {
+                EnsureLocalHierarchyObjectsLoadedForFile(renderer?.assetsFile ?? mesh.assetsFile);
+            }
 
             var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures, part.RendererAssetId);
 
@@ -2815,7 +2858,8 @@ public partial class MainWindow
             combineMeshes: false,
             partTransforms: partTransforms!,
             partMaterials: partMaterials,
-            partNames: partNames);
+            partNames: partNames,
+            textureResolver: ResolveTextureForModelConverter);
         if (convert.MeshList.Count == 0)
         {
             return false;
@@ -2837,23 +2881,71 @@ public partial class MainWindow
         List<string>? exportedFilePaths = null,
         Renderer? explicitRenderer = null)
     {
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
         var effectiveOptions = optionsOverride ?? exportOptions;
         actualExportFile = exportFile;
         reportStage?.Invoke(20, $"Preparing mesh {mesh.m_Name}...");
         mesh.EnsureProcessed();
+        if (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0)
+        {
+            Logger.Info($"Skipping empty 0-vertex mesh '{mesh.m_Name}' (PathID: {mesh.m_PathID}).");
+            return false;
+        }
 
         var visitedMaterials = new HashSet<Material>();
         var visitedTextures = new HashSet<string>(StringComparer.Ordinal);
 
-        // Prefer explicit or O(1) SQLite semantic renderer lookup before falling back to linear file scan.
-        Renderer? renderer = explicitRenderer ?? FindSkinnedRendererForAvatarMesh(avatar, mesh);
-        if (renderer == null && !assetsManager.LazyLoading)
+        // Prefer explicit or O(1) SQLite semantic renderer lookup, then model group metadata, then local file scan (even in Lazy Mode).
+        Renderer? renderer = explicitRenderer
+            ?? FindSkinnedRendererForAvatarMesh(avatar, mesh)
+            ?? TryFindRendererForMeshFromSemanticCache(mesh);
+
+        string? rendererAssetId = null;
+        if ((renderer == null || avatar == null)
+            && TryFindModelGroupForMesh(mesh, out var meshGroup, out var meshGroupParts)
+            && meshGroup != null)
         {
+            if (avatar == null && !string.IsNullOrWhiteSpace(meshGroup.AvatarAssetId))
+            {
+                avatar = ResolveAvatarPreviewCandidate(meshGroup.AvatarAssetId);
+            }
+
+            if (renderer == null && meshGroupParts.Count > 0)
+            {
+                var meshKey = GetPreviewObjectKey(mesh);
+                var matchingPart = meshGroupParts.FirstOrDefault(p =>
+                    !string.IsNullOrWhiteSpace(p.RendererAssetId)
+                    && (!string.IsNullOrWhiteSpace(meshKey) && string.Equals(p.MeshAssetId, meshKey, StringComparison.Ordinal)))
+                    ?? meshGroupParts.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p.RendererAssetId));
+                if (matchingPart != null && !string.IsNullOrWhiteSpace(matchingPart.RendererAssetId))
+                {
+                    rendererAssetId = matchingPart.RendererAssetId;
+                    renderer = ResolvePreviewCandidateAsset(matchingPart.RendererAssetId) as Renderer;
+                }
+            }
+        }
+
+        if (renderer == null)
+        {
+            if (assetsManager.LazyLoading && mesh.assetsFile != null)
+            {
+                EnsureLocalHierarchyObjectsLoadedForFile(mesh.assetsFile);
+            }
             renderer = FindSingleRendererForMeshForExport(mesh);
         }
 
+        if (assetsManager.LazyLoading)
+        {
+            EnsureLocalHierarchyObjectsLoadedForFile(renderer?.assetsFile ?? mesh.assetsFile);
+        }
+
+        if (avatar == null)
+        {
+            avatar = TryResolveAvatarFromRendererHierarchy(renderer) ?? FindBestAvatarForMesh(mesh);
+        }
+
         reportStage?.Invoke(40, $"Loading materials & textures for {mesh.m_Name}...");
-        var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures);
+        var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures, rendererAssetId);
         var nonNullMaterials = materials.Where(m => m != null).Cast<Material>().ToList();
         var meshName = !string.IsNullOrWhiteSpace(mesh.m_Name)
             ? mesh.m_Name
@@ -2873,7 +2965,8 @@ public partial class MainWindow
                 combineMeshes: false,
                 partTransforms: new float[]?[] { null }!,
                 partMaterials: new IReadOnlyList<Material>[] { nonNullMaterials },
-                partNames: new[] { meshName });
+                partNames: new[] { meshName },
+                textureResolver: ResolveTextureForModelConverter);
             if (convert.MeshList.Count > 0)
             {
                 reportStage?.Invoke(85, $"Writing {Path.GetFileName(exportFile)}...");
@@ -2973,37 +3066,197 @@ public partial class MainWindow
 
     private Renderer? FindSingleRendererForMeshForExport(Mesh mesh)
     {
+        if (mesh.assetsFile != null)
+        {
+            var localMatch = FindSingleRendererForMeshInFile(mesh, mesh.assetsFile);
+            if (localMatch != null)
+            {
+                return localMatch;
+            }
+        }
+
         var loadedFiles = GetLoadedFilesSnapshot();
         for (var f = 0; f < loadedFiles.Count; f++)
         {
             var file = loadedFiles[f];
-            if (file == null) continue;
-            AssetStudio.Object[] objs;
-            lock (file)
+            if (file == null || ReferenceEquals(file, mesh.assetsFile)) continue;
+            var match = FindSingleRendererForMeshInFile(mesh, file);
+            if (match != null)
             {
-                objs = file.Objects.ToArray();
+                return match;
+            }
+        }
+
+        return null;
+    }
+
+    private Renderer? FindSingleRendererForMeshInFile(Mesh mesh, SerializedFile file)
+    {
+        AssetStudio.Object[] objs;
+        lock (file)
+        {
+            objs = file.Objects.ToArray();
+        }
+
+        for (var i = 0; i < objs.Length; i++)
+        {
+            if (objs[i] is SkinnedMeshRenderer smr
+                && smr.m_Mesh != null
+                && ((smr.m_Mesh.m_FileID == 0 && smr.m_Mesh.m_PathID == mesh.m_PathID && ReferenceEquals(file, mesh.assetsFile))
+                    || (smr.m_Mesh.TryGet(out var smrMesh) && AreSamePreviewObject(smrMesh, mesh))))
+            {
+                return smr;
             }
 
-            for (var i = 0; i < objs.Length; i++)
+            if (objs[i] is MeshFilter mf
+                && mf.m_Mesh != null
+                && ((mf.m_Mesh.m_FileID == 0 && mf.m_Mesh.m_PathID == mesh.m_PathID && ReferenceEquals(file, mesh.assetsFile))
+                    || (mf.m_Mesh.TryGet(out var mfMesh) && AreSamePreviewObject(mfMesh, mesh)))
+                && mf.m_GameObject != null
+                && mf.m_GameObject.TryGet(out var mfGo)
+                && mfGo != null)
             {
-                if (objs[i] is SkinnedMeshRenderer smr
-                    && smr.m_Mesh != null
-                    && smr.m_Mesh.TryGet(out var smrMesh)
-                    && AreSamePreviewObject(smrMesh, mesh))
-                {
-                    return smr;
-                }
-
-                if (objs[i] is MeshFilter mf
-                    && mf.m_Mesh != null
-                    && mf.m_Mesh.TryGet(out var mfMesh)
-                    && AreSamePreviewObject(mfMesh, mesh)
-                    && mf.m_GameObject != null
-                    && mf.m_GameObject.TryGet(out var mfGo)
-                    && mfGo?.m_MeshRenderer != null)
+                if (mfGo.m_MeshRenderer != null)
                 {
                     return mfGo.m_MeshRenderer;
                 }
+
+                if (mfGo.m_Components != null)
+                {
+                    for (int c = 0; c < mfGo.m_Components.Length; c++)
+                    {
+                        var compPtr = mfGo.m_Components[c];
+                        if (compPtr != null && !compPtr.IsNull && compPtr.TryGet(out var comp) && comp is MeshRenderer mr)
+                        {
+                            mfGo.m_MeshRenderer = mr;
+                            return mr;
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private Renderer? TryFindRendererForMeshFromSemanticCache(Mesh mesh)
+    {
+        if (!assetsManager.LazyLoading || mesh.assetsFile == null || currentScanResult == null)
+        {
+            return null;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return null;
+        }
+
+        var meshAssetId = AssetHandle.BuildUniqueID(mesh.assetsFile, mesh.m_PathID);
+        if (string.IsNullOrWhiteSpace(meshAssetId))
+        {
+            return null;
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        var rendererIds = _sqliteCache.LoadMeshRendererAssetIds(folderPath, signature, meshAssetId);
+        foreach (var rendererId in rendererIds)
+        {
+            if (string.IsNullOrWhiteSpace(rendererId))
+            {
+                continue;
+            }
+
+            var handle = assetsManager.ProjectIndex?.GetHandle(rendererId);
+            if (handle != null && ResolveSemanticRelationHandleForPreview(handle) is Renderer resolvedRenderer)
+            {
+                return resolvedRenderer;
+            }
+        }
+
+        return null;
+    }
+
+    private static Avatar? TryResolveAvatarFromRendererHierarchy(Renderer? renderer)
+    {
+        if (renderer?.m_GameObject == null || renderer.m_GameObject.IsNull || !renderer.m_GameObject.TryGet(out var go) || go == null)
+        {
+            return null;
+        }
+
+        var visited = new HashSet<Transform>();
+        var current = go.m_Transform;
+        while (current != null && visited.Add(current))
+        {
+            if (current.m_GameObject != null && current.m_GameObject.TryGet(out var curGo) && curGo != null)
+            {
+                if (curGo.m_Animator?.m_Avatar != null && curGo.m_Animator.m_Avatar.TryGet(out var av) && av != null)
+                {
+                    return av;
+                }
+
+                if (curGo.m_Components != null)
+                {
+                    for (int i = 0; i < curGo.m_Components.Length; i++)
+                    {
+                        var compPtr = curGo.m_Components[i];
+                        if (compPtr != null && !compPtr.IsNull && compPtr.TryGet(out var comp) && comp is Animator anim)
+                        {
+                            curGo.m_Animator ??= anim;
+                            if (anim.m_Avatar != null && anim.m_Avatar.TryGet(out var animAv) && animAv != null)
+                            {
+                                return animAv;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (current.m_Father == null || current.m_Father.IsNull || !current.m_Father.TryGet(out var father))
+            {
+                break;
+            }
+            current = father;
+        }
+
+        return null;
+    }
+
+    private Texture2D? ResolveTextureForModelConverter(Material? material, string? propertyName, PPtr<Texture>? textureRef)
+    {
+        if (material == null)
+        {
+            return null;
+        }
+
+        if (textureRef != null && !textureRef.IsNull)
+        {
+            var resolved = ResolveTexturePPtrForPreview(material, textureRef);
+            if (resolved != null)
+            {
+                return resolved;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(propertyName))
+        {
+            var bySlot = TryLoadTextureForMaterialFromSemanticCache(material, propertyName);
+            if (bySlot != null)
+            {
+                return bySlot;
+            }
+        }
+        else
+        {
+            if (materialMainTextureCache != null && materialMainTextureCache.TryGetValue(material, out var cachedMain) && cachedMain != null)
+            {
+                return cachedMain;
+            }
+
+            var semanticMain = TryLoadTextureForMaterialFromSemanticCache(material);
+            if (semanticMain != null)
+            {
+                return semanticMain;
             }
         }
 
@@ -3156,6 +3409,10 @@ public partial class MainWindow
             return false;
         }
 
+        using var textureResolverScope = ModelConverter.PushTextureResolver(ResolveTextureForModelConverter);
+        var visitedMaterials = new HashSet<Material>();
+        var visitedTextures = new HashSet<string>(StringComparer.Ordinal);
+
         var rootGameObject = !string.IsNullOrWhiteSpace(group.RootGameObjectAssetId)
             ? ResolvePreviewCandidateAsset(group.RootGameObjectAssetId) as GameObject
             : null;
@@ -3198,22 +3455,23 @@ public partial class MainWindow
             var renderer = !string.IsNullOrWhiteSpace(part.RendererAssetId)
                 ? ResolvePreviewCandidateAsset(part.RendererAssetId) as Renderer
                 : null;
-
-            var materials = FindMaterialsForMesh(mesh);
+            if (renderer == null)
+            {
+                if (assetsManager.LazyLoading && mesh.assetsFile != null)
+                {
+                    EnsureLocalHierarchyObjectsLoadedForFile(mesh.assetsFile);
+                }
+                renderer = FindSkinnedRendererForAvatarMesh(avatar, mesh)
+                    ?? TryFindRendererForMeshFromSemanticCache(mesh)
+                    ?? FindSingleRendererForMeshForExport(mesh);
+            }
             if (assetsManager.LazyLoading)
             {
-                EnsureMaterialTexturesLoadedForExport(materials);
-                if (renderer != null)
-                {
-                    EnsureRendererMaterialsLoadedForExport(renderer);
-                }
+                EnsureLocalHierarchyObjectsLoadedForFile(renderer?.assetsFile ?? mesh.assetsFile);
             }
 
-            var nonNullMaterials = new List<Material>(materials.Count);
-            for (int m = 0; m < materials.Count; m++)
-            {
-                nonNullMaterials.Add(materials[m]!);
-            }
+            var materials = ResolveExportMaterialsForPart(mesh, renderer, visitedMaterials, visitedTextures, part.RendererAssetId);
+            var nonNullMaterials = materials.Where(m => m != null).Cast<Material>().ToList();
 
             resolvedMeshes.Add(mesh);
             resolvedRenderers.Add(renderer!);
@@ -3244,7 +3502,8 @@ public partial class MainWindow
             combineMeshes: false,
             partTransforms: partTransforms!,
             partMaterials: partMaterials,
-            partNames: partNames);
+            partNames: partNames,
+            textureResolver: ResolveTextureForModelConverter);
 
         if (convert.MeshList.Count == 0)
         {

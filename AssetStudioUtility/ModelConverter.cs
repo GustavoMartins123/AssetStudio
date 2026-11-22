@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AssetStudio
@@ -18,7 +20,37 @@ namespace AssetStudio
 
         public Avatar? SourceAvatar => avatar;
 
+        private static readonly AsyncLocal<Func<Material, string, PPtr<Texture>?, Texture2D?>?> AmbientTextureResolver = new();
+
+        public static IDisposable PushTextureResolver(Func<Material, string, PPtr<Texture>?, Texture2D?>? resolver)
+        {
+            var previous = AmbientTextureResolver.Value;
+            AmbientTextureResolver.Value = resolver;
+            return new TextureResolverScope(previous);
+        }
+
+        private sealed class TextureResolverScope : IDisposable
+        {
+            private readonly Func<Material, string, PPtr<Texture>?, Texture2D?>? _previous;
+            private bool _disposed;
+
+            public TextureResolverScope(Func<Material, string, PPtr<Texture>?, Texture2D?>? previous)
+            {
+                _previous = previous;
+            }
+
+            public void Dispose()
+            {
+                if (!_disposed)
+                {
+                    _disposed = true;
+                    AmbientTextureResolver.Value = _previous;
+                }
+            }
+        }
+
         private ImageFormat imageFormat;
+        private Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver;
         private Avatar? avatar;
         private bool hasRootFrame;
         private string? animatorRootPath;
@@ -37,14 +69,16 @@ namespace AssetStudio
             hasRootFrame = true;
         }
 
-        protected ModelConverter(ImageFormat imageFormat)
+        protected ModelConverter(ImageFormat imageFormat, Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
         {
             this.imageFormat = imageFormat;
+            this.textureResolver = textureResolver ?? AmbientTextureResolver.Value;
         }
 
-        public ModelConverter(GameObject m_GameObject, ImageFormat imageFormat, AnimationClip[]? animationList = null)
+        public ModelConverter(GameObject m_GameObject, ImageFormat imageFormat, AnimationClip[]? animationList = null, Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
         {
             this.imageFormat = imageFormat;
+            this.textureResolver = textureResolver ?? AmbientTextureResolver.Value;
             if (m_GameObject.m_Animator != null)
             {
                 InitWithAnimator(m_GameObject.m_Animator);
@@ -72,9 +106,10 @@ namespace AssetStudio
             FlushPendingTextures();
         }
 
-        public ModelConverter(string rootName, List<GameObject> m_GameObjects, ImageFormat imageFormat, AnimationClip[]? animationList = null)
+        public ModelConverter(string rootName, List<GameObject> m_GameObjects, ImageFormat imageFormat, AnimationClip[]? animationList = null, Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
         {
             this.imageFormat = imageFormat;
+            this.textureResolver = textureResolver ?? AmbientTextureResolver.Value;
             SetRootFrame(CreateFrame(rootName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One));
             foreach (var m_GameObject in m_GameObjects)
             {
@@ -111,9 +146,10 @@ namespace AssetStudio
             FlushPendingTextures();
         }
 
-        public ModelConverter(Animator m_Animator, ImageFormat imageFormat, AnimationClip[]? animationList = null)
+        public ModelConverter(Animator m_Animator, ImageFormat imageFormat, AnimationClip[]? animationList = null, Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
         {
             this.imageFormat = imageFormat;
+            this.textureResolver = textureResolver ?? AmbientTextureResolver.Value;
             InitWithAnimator(m_Animator);
             if (avatar == null && m_Animator.m_GameObject.TryGet(out var go))
             {
@@ -811,7 +847,7 @@ namespace AssetStudio
                             if (mesh.m_BindPose.Length > 0 && (mesh.m_BindPose.Length == mesh.m_BoneNameHashes?.Length))
                             {
                                 //有效bone数量是否大于SkinnedMeshRenderer
-                                var verifiedBoneCount2 = mesh.m_BoneNameHashes.Count(x => FixBonePath(GetPathFromHash(x)) != null);
+                                var verifiedBoneCount2 = mesh.m_BoneNameHashes.Count(x => TryResolveBonePathFromHash(x, out _));
                                 if (verifiedBoneCount2 > verifiedBoneCount)
                                 {
                                     boneType = 2;
@@ -825,7 +861,7 @@ namespace AssetStudio
                     //尝试使用m_BoneNameHashes 4.3 and up
                     if (mesh.m_BindPose.Length > 0 && (mesh.m_BindPose.Length == mesh.m_BoneNameHashes?.Length))
                     {
-                        var verifiedBoneCount = mesh.m_BoneNameHashes.Count(x => FixBonePath(GetPathFromHash(x)) != null);
+                        var verifiedBoneCount = mesh.m_BoneNameHashes.Count(x => TryResolveBonePathFromHash(x, out _));
                         if (verifiedBoneCount > 0)
                         {
                             boneType = 2;
@@ -857,8 +893,10 @@ namespace AssetStudio
                     {
                         var bone = new ImportedBone();
                         var boneHash = mesh.m_BoneNameHashes[i];
-                        var path = GetPathFromHash(boneHash);
-                        bone.Path = FixBonePath(path);
+                        if (TryResolveBonePathFromHash(boneHash, out var resolvedBonePath))
+                        {
+                            bone.Path = resolvedBonePath;
+                        }
                         var convert = Matrix4x4.Scale(new Vector3(-1, 1, 1));
                         bone.Matrix = convert * mesh.m_BindPose[i] * convert;
                         iMesh.BoneList.Add(bone);
@@ -1278,8 +1316,10 @@ namespace AssetStudio
 
                 //textures (inherit from m_Parent Material Variant chain when child slots are empty/unset)
                 iMat.Textures = new List<ImportedMaterialTexture>();
+                var activeResolver = textureResolver ?? AmbientTextureResolver.Value;
                 var effectiveTexEnvs = CollectEffectiveMaterialTexEnvs(mat);
                 ImportedMaterialTexture? fallbackDiffuseCandidate = null;
+                var diffusePriorities = new Dictionary<ImportedMaterialTexture, int>();
                 foreach (var texEnv in effectiveTexEnvs)
                 {
                     if (texEnv.Value == null)
@@ -1288,21 +1328,13 @@ namespace AssetStudio
                     }
                     var textureRef = texEnv.Value.m_Texture;
                     Texture2D? m_Texture2D = null;
-                    if (textureRef != null && !textureRef.IsNull && !textureRef.TryGet<Texture2D>(out m_Texture2D)) //TODO other Texture
+                    if (activeResolver != null)
                     {
-                        var files = mat.assetsFile?.assetsManager?.assetsFileList;
-                        if (files != null)
-                        {
-                            foreach (var sf in files)
-                            {
-                                if (sf.TryGetObject(textureRef.m_PathID, out var obj) && obj is Texture2D foundTex)
-                                {
-                                    m_Texture2D = foundTex;
-                                    Logger.Info($"Found texture '{foundTex.m_Name}' by PathID fallback in file '{sf.fileName}'.");
-                                    break;
-                                }
-                            }
-                        }
+                        m_Texture2D = activeResolver(mat, texEnv.Key, textureRef);
+                    }
+                    if (m_Texture2D == null && textureRef != null && !textureRef.IsNull) //TODO other Texture
+                    {
+                        TryFindTextureInMaterialScope(mat, textureRef, out m_Texture2D);
                     }
 
                     if (m_Texture2D == null)
@@ -1318,38 +1350,42 @@ namespace AssetStudio
                     iMat.Textures.Add(texture);
 
                     texture.Dest = GetTextureDestination(texEnv.Key);
-                    if (texture.Dest < 0 && fallbackDiffuseCandidate == null && !IsLikelyAuxiliaryTextureProperty(texEnv.Key))
+                    if (texture.Dest == 0)
+                    {
+                        diffusePriorities[texture] = GetDiffuseSlotPriority(texEnv.Key);
+                    }
+                    else if (texture.Dest < 0 && fallbackDiffuseCandidate == null && !IsLikelyAuxiliaryTextureProperty(texEnv.Key))
                     {
                         fallbackDiffuseCandidate = texture;
                     }
 
-                    var ext = $".{imageFormat.ToString().ToLower()}";
-                    if (textureNameDictionary.TryGetValue(m_Texture2D, out var textureName))
-                    {
-                        texture.Name = textureName;
-                    }
-                    else if (IsTextureNameAllocated(m_Texture2D.m_Name + ext)) //已有相同名字的图片
-                    {
-                        for (int i = 1; ; i++)
-                        {
-                            var name = m_Texture2D.m_Name + $" ({i}){ext}";
-                            if (!IsTextureNameAllocated(name))
-                            {
-                                texture.Name = name;
-                                textureNameDictionary.Add(m_Texture2D, name);
-                                break;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        texture.Name = m_Texture2D.m_Name + ext;
-                        textureNameDictionary.Add(m_Texture2D, texture.Name);
-                    }
-
+                    texture.Name = AllocateOrGetConvertedTextureName(m_Texture2D);
                     texture.Offset = texEnv.Value.m_Offset;
                     texture.Scale = texEnv.Value.m_Scale;
                     ConvertTexture2D(m_Texture2D, texture.Name, mat.m_Name, texEnv.Key, forceNormalMapUnpack: texture.Dest == 1);
+                }
+
+                // When multiple slots map to diffuse (Dest = 0), e.g. _BaseEyeIrisMap + _BaseEyeWhiteMap or _MainTexture + _Texture,
+                // ensure the highest-priority diffuse slot comes first so exporters select it as primary baseColorTexture.
+                if (diffusePriorities.Count > 1)
+                {
+                    ImportedMaterialTexture? bestDiffuse = null;
+                    int bestPriority = int.MaxValue;
+                    for (int i = 0; i < iMat.Textures.Count; i++)
+                    {
+                        var t = iMat.Textures[i];
+                        if (t.Dest == 0 && diffusePriorities.TryGetValue(t, out int prio) && prio < bestPriority)
+                        {
+                            bestPriority = prio;
+                            bestDiffuse = t;
+                        }
+                    }
+
+                    if (bestDiffuse != null && iMat.Textures[0] != bestDiffuse)
+                    {
+                        iMat.Textures.Remove(bestDiffuse);
+                        iMat.Textures.Insert(0, bestDiffuse);
+                    }
                 }
 
                 // Custom/ShaderGraph shaders often name their primary color map generically (e.g. _Texture, Texture2D_XXXX).
@@ -1357,6 +1393,25 @@ namespace AssetStudio
                 if (fallbackDiffuseCandidate != null && !iMat.Textures.Any(t => t.Dest == 0))
                 {
                     fallbackDiffuseCandidate.Dest = 0;
+                }
+
+                // Final fallback: consult injected resolver for SQLite MaterialCache / MeshMaterialResolvedCache main texture
+                // when cross-bundle m_Externals filenames did not resolve via PPtr.
+                if (!iMat.Textures.Any(t => t.Dest == 0) && activeResolver != null)
+                {
+                    var fallbackMainTex = activeResolver(mat, string.Empty, null);
+                    if (fallbackMainTex != null)
+                    {
+                        var fallbackTexEntry = new ImportedMaterialTexture
+                        {
+                            Name = AllocateOrGetConvertedTextureName(fallbackMainTex),
+                            Dest = 0,
+                            Offset = Vector2.Zero,
+                            Scale = new Vector2(1f, 1f)
+                        };
+                        iMat.Textures.Insert(0, fallbackTexEntry);
+                        ConvertTexture2D(fallbackMainTex, fallbackTexEntry.Name, mat.m_Name, "_MainTex", forceNormalMapUnpack: false);
+                    }
                 }
 
                 MaterialList.Add(iMat);
@@ -1523,8 +1578,172 @@ namespace AssetStudio
             }
         }
 
+        private string AllocateOrGetConvertedTextureName(Texture2D m_Texture2D)
+        {
+            var ext = $".{imageFormat.ToString().ToLower()}";
+            if (textureNameDictionary.TryGetValue(m_Texture2D, out var textureName))
+            {
+                return textureName;
+            }
+
+            if (IsTextureNameAllocated(m_Texture2D.m_Name + ext))
+            {
+                for (int i = 1; ; i++)
+                {
+                    var name = m_Texture2D.m_Name + $" ({i}){ext}";
+                    if (!IsTextureNameAllocated(name))
+                    {
+                        textureNameDictionary.Add(m_Texture2D, name);
+                        return name;
+                    }
+                }
+            }
+
+            var defaultName = m_Texture2D.m_Name + ext;
+            textureNameDictionary.Add(m_Texture2D, defaultName);
+            return defaultName;
+        }
+
+        private static bool TryFindTextureInMaterialScope(Material mat, PPtr<Texture> textureRef, [NotNullWhen(true)] out Texture2D? foundTex)
+        {
+            foundTex = null;
+            var ownerFile = mat.assetsFile;
+            if (ownerFile == null || textureRef == null || textureRef.IsNull)
+            {
+                return false;
+            }
+
+            if (textureRef.TryGetAssetsFile(out var targetFile)
+                && TryResolveTextureFromFile(targetFile, textureRef.m_PathID, out foundTex))
+            {
+                return true;
+            }
+
+            if (textureRef.m_FileID == 0)
+            {
+                return TryResolveTextureFromFile(ownerFile, textureRef.m_PathID, out foundTex);
+            }
+
+            if (textureRef.m_FileID > 0
+                && ownerFile.m_Externals != null
+                && textureRef.m_FileID - 1 < ownerFile.m_Externals.Count)
+            {
+                var external = ownerFile.m_Externals[textureRef.m_FileID - 1];
+                var files = ownerFile.assetsManager?.assetsFileList;
+                if (files != null)
+                {
+                    for (int i = 0; i < files.Count; i++)
+                    {
+                        var sf = files[i];
+                        if (sf == null || !IsMatchingExternalFile(sf, external))
+                        {
+                            continue;
+                        }
+
+                        if (TryResolveTextureFromFile(sf, textureRef.m_PathID, out var extTex))
+                        {
+                            foundTex = extTex;
+                            Logger.Info($"Found texture '{extTex.m_Name}' in external file '{sf.fileName}'.");
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveTextureFromFile(SerializedFile sourceFile, long pathId, [NotNullWhen(true)] out Texture2D? foundTex)
+        {
+            foundTex = null;
+            if (sourceFile == null)
+            {
+                return false;
+            }
+
+            if (sourceFile.TryGetObject(pathId, out var existing) && existing is Texture2D existingTex)
+            {
+                foundTex = existingTex;
+                return true;
+            }
+
+            var handle = sourceFile.assetsManager?.ProjectIndex?.GetHandle(AssetHandle.BuildUniqueID(sourceFile, pathId));
+            if (handle != null && sourceFile.assetsManager != null && sourceFile.assetsManager.ResolveHandle(handle) is Texture2D resolvedTex)
+            {
+                foundTex = resolvedTex;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsMatchingExternalFile(SerializedFile candidate, FileIdentifier external)
+        {
+            if (candidate == null || external == null)
+            {
+                return false;
+            }
+
+            var extFile = Path.GetFileName(external.fileName);
+            var extPathFile = Path.GetFileName(external.pathName);
+            var candFile = Path.GetFileName(candidate.fileName);
+            var candOrig = Path.GetFileName(candidate.originalPath);
+
+            if (!string.IsNullOrEmpty(extFile))
+            {
+                if (string.Equals(candFile, extFile, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(candOrig, extFile, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(extPathFile))
+            {
+                if (string.Equals(candFile, extPathFile, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(candOrig, extPathFile, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private static int GetTextureDestination(string propertyName)
         {
+            if (string.IsNullOrWhiteSpace(propertyName))
+            {
+                return -1;
+            }
+
+            // 1. Explicit non-diffuse / mask / highlight / scroll / matcap exclusions MUST be checked first
+            // so e.g. _MaskTexture, _EmissionMask, or _BaseEyeHighlightMap never masquerade as diffuse or emissive maps.
+            switch (propertyName)
+            {
+                case "_MaskTexture":
+                case "_MaskMap":
+                case "_Mask":
+                case "_WeatheringMask":
+                case "_EmissionMask":
+                case "_DetailAlbedoMap":
+                case "_DetailMap":
+                case "_DetailMask":
+                    return 7;
+                case "_MatcapMap":
+                case "_Matcap":
+                case "_MatcapTex":
+                case "_MatcapMaskMap":
+                case "_WetTexture":
+                case "_BaseEyeHighlightMap":
+                case "_BaseEyeHighlightMapBackup":
+                case "_BaseEyePupilMap":
+                case "_BaseEyePupilMapBackup":
+                case "_UVScrollTexture1":
+                case "_UVScrollTexture2":
+                    return -1;
+            }
+
             switch (propertyName)
             {
                 case "_BaseMap":
@@ -1533,6 +1752,7 @@ namespace AssetStudio
                 case "_Main_Tex":
                 case "_BaseColorMap":
                 case "_BaseColorTexture":
+                case "_BaseColorTex":
                 case "_BaseTex":
                 case "_BaseTexture":
                 case "_Base_Texture":
@@ -1548,6 +1768,14 @@ namespace AssetStudio
                 case "_ColorTex":
                 case "_ColorTexture":
                 case "_Color_Texture":
+                case "_FaceTex":
+                case "_BaseEyeIrisMap":
+                case "_EyeIrisMap":
+                case "_IrisMap":
+                case "_IrisTex":
+                case "_EyeTex":
+                case "_EyeMap":
+                case "_BaseEyeWhiteMap":
                 case "_Texture":
                 case "_Tex":
                     return 0;
@@ -1570,11 +1798,6 @@ namespace AssetStudio
                 case "_ParallaxMap":
                 case "_HeightMap":
                     return 6;
-                case "_DetailAlbedoMap":
-                case "_DetailMap":
-                case "_DetailMask":
-                case "_MaskMap":
-                    return 7;
                 case "_RoughnessMap":
                 case "_SmoothnessMap":
                 case "_GlossMap":
@@ -1585,6 +1808,21 @@ namespace AssetStudio
                     return 9;
             }
 
+            if (propertyName.IndexOf("Highlight", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Pupil", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Backup", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Matcap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("UVScroll", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("WetTexture", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return -1;
+            }
+
+            if (propertyName.IndexOf("Mask", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Detail", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 7;
+            }
             if (propertyName.IndexOf("Normal", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Bump", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -1612,11 +1850,6 @@ namespace AssetStudio
             {
                 return 6;
             }
-            if (propertyName.IndexOf("Mask", StringComparison.OrdinalIgnoreCase) >= 0
-                || propertyName.IndexOf("Detail", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                return 7;
-            }
             if (propertyName.IndexOf("Rough", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Smooth", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Gloss", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -1629,9 +1862,17 @@ namespace AssetStudio
                 || propertyName.IndexOf("BaseTex", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("MainTex", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Main_Tex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("MainTexture", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("ColorTex", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Color_Tex", StringComparison.OrdinalIgnoreCase) >= 0
-                || propertyName.IndexOf("Diffuse", StringComparison.OrdinalIgnoreCase) >= 0)
+                || propertyName.IndexOf("Diffuse", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("FaceTex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("EyeIris", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("IrisMap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("IrisTex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("EyeTex", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("EyeMap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("EyeWhite", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return 0;
             }
@@ -1645,6 +1886,46 @@ namespace AssetStudio
             return -1;
         }
 
+        private static int GetDiffuseSlotPriority(string propertyName)
+        {
+            return propertyName switch
+            {
+                "_BaseMap" => 1,
+                "_MainTex" => 2,
+                "_MainTexture" => 3,
+                "_Main_Tex" => 4,
+                "_BaseColorMap" => 5,
+                "_BaseColorTexture" => 6,
+                "_BaseColorTex" => 7,
+                "_BaseTex" => 8,
+                "_BaseTexture" => 9,
+                "_Base_Texture" => 10,
+                "_Albedo" => 11,
+                "_AlbedoMap" => 12,
+                "_AlbedoTex" => 13,
+                "_AlbedoTexture" => 14,
+                "_Diffuse" => 15,
+                "_DiffuseMap" => 16,
+                "_DiffuseTex" => 17,
+                "_DiffuseTexture" => 18,
+                "_ColorMap" => 19,
+                "_ColorTex" => 20,
+                "_ColorTexture" => 21,
+                "_Color_Texture" => 22,
+                "_FaceTex" => 23,
+                "_BaseEyeIrisMap" => 24,
+                "_EyeIrisMap" => 25,
+                "_IrisMap" => 26,
+                "_IrisTex" => 27,
+                "_EyeTex" => 28,
+                "_EyeMap" => 29,
+                "_BaseEyeWhiteMap" => 30,
+                "_Texture" => 31,
+                "_Tex" => 32,
+                _ => 50
+            };
+        }
+
         private static bool IsLikelyAuxiliaryTextureProperty(string propertyName)
         {
             if (string.IsNullOrWhiteSpace(propertyName))
@@ -1655,6 +1936,13 @@ namespace AssetStudio
             return propertyName.IndexOf("Ramp", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Lut", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Matcap", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Mask", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Weathering", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("WetTexture", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Highlight", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Pupil", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("Backup", StringComparison.OrdinalIgnoreCase) >= 0
+                || propertyName.IndexOf("UVScroll", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Shadow", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Shade", StringComparison.OrdinalIgnoreCase) >= 0
                 || propertyName.IndexOf("Cube", StringComparison.OrdinalIgnoreCase) >= 0
@@ -2327,6 +2615,35 @@ namespace AssetStudio
             }
         }
 
+        private bool TryResolveBonePathFromHash(uint hash, [NotNullWhen(true)] out string? resolvedPath)
+        {
+            resolvedPath = null;
+            if (hash == 0)
+            {
+                return false;
+            }
+
+            if (bonePathHash.TryGetValue(hash, out var boneName) && !string.IsNullOrEmpty(boneName))
+            {
+                var frame = RootFrame?.FindFrameByPath(boneName);
+                resolvedPath = frame?.Path ?? boneName;
+                return !string.IsNullOrEmpty(resolvedPath);
+            }
+
+            if (avatar != null)
+            {
+                boneName = avatar.FindBonePath(hash);
+                if (!string.IsNullOrEmpty(boneName))
+                {
+                    var frame = RootFrame?.FindFrameByPath(boneName);
+                    resolvedPath = frame?.Path ?? boneName;
+                    return !string.IsNullOrEmpty(resolvedPath);
+                }
+            }
+
+            return false;
+        }
+
         private string GetPathFromHash(uint hash)
         {
             if (hash == 0)
@@ -2883,7 +3200,8 @@ namespace AssetStudio
             Avatar? avatar,
             AnimationClip[]? animationClips,
             ImageFormat imageFormat,
-            bool combineMeshes = false)
+            bool combineMeshes = false,
+            Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
         {
             return CreateFromModelGroup(
                 groupName,
@@ -2896,7 +3214,8 @@ namespace AssetStudio
                 combineMeshes,
                 partTransforms: null,
                 partMaterials: null,
-                partNames: null);
+                partNames: null,
+                textureResolver: textureResolver);
         }
 
         public static ModelConverter CreateFromModelGroup(
@@ -2910,9 +3229,10 @@ namespace AssetStudio
             bool combineMeshes,
             IReadOnlyList<float[]>? partTransforms,
             IReadOnlyList<IReadOnlyList<Material>>? partMaterials = null,
-            IReadOnlyList<string>? partNames = null)
+            IReadOnlyList<string>? partNames = null,
+            Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
         {
-            var converter = new ModelConverter(imageFormat);
+            var converter = new ModelConverter(imageFormat, textureResolver);
             converter.InitFromModelGroup(
                 groupName,
                 rootGameObject,
@@ -3715,7 +4035,7 @@ namespace AssetStudio
                         int verifiedByHash = 0;
                         for (int b = 0; b < mesh.m_BoneNameHashes.Length; b++)
                         {
-                            if (FixBonePath(GetPathFromHash(mesh.m_BoneNameHashes[b])) != null) verifiedByHash++;
+                            if (TryResolveBonePathFromHash(mesh.m_BoneNameHashes[b], out _)) verifiedByHash++;
                         }
                         if (verifiedByHash > verified)
                         {
@@ -3729,7 +4049,7 @@ namespace AssetStudio
                     int verifiedByHash = 0;
                     for (int b = 0; b < mesh.m_BoneNameHashes.Length; b++)
                     {
-                        if (FixBonePath(GetPathFromHash(mesh.m_BoneNameHashes[b])) != null) verifiedByHash++;
+                        if (TryResolveBonePathFromHash(mesh.m_BoneNameHashes[b], out _)) verifiedByHash++;
                     }
                     if (verifiedByHash > 0)
                     {
@@ -3761,7 +4081,7 @@ namespace AssetStudio
                     {
                         var bone = new ImportedBone
                         {
-                            Path = FixBonePath(GetPathFromHash(mesh.m_BoneNameHashes[b])),
+                            Path = TryResolveBonePathFromHash(mesh.m_BoneNameHashes[b], out var resolvedBonePath) ? resolvedBonePath : null,
                             Matrix = convert * mesh.m_BindPose[b] * convert
                         };
                         iMesh.BoneList.Add(bone);

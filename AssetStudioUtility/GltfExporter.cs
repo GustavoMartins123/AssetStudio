@@ -39,6 +39,9 @@ namespace AssetStudio
         private readonly bool _exportSkins;
         private readonly bool _exportAnimations;
         private readonly bool _exportBlendShape;
+        private readonly bool _exportVertexColors;
+
+        public bool ExportVertexColors { get; set; }
 
         private readonly BufferBuilder _buffer = new BufferBuilder();
         private readonly List<GltfNode> _nodes = new List<GltfNode>();
@@ -79,13 +82,16 @@ namespace AssetStudio
             float scaleFactor = 1f,
             bool exportSkins = true,
             bool exportAnimations = true,
-            bool exportBlendShape = true)
+            bool exportBlendShape = true,
+            bool exportVertexColors = false)
         {
             _binary = binary;
             _scaleFactor = float.IsFinite(scaleFactor) && scaleFactor > 0f ? scaleFactor : 1f;
             _exportSkins = exportSkins;
             _exportAnimations = exportAnimations;
             _exportBlendShape = exportBlendShape;
+            _exportVertexColors = exportVertexColors;
+            ExportVertexColors = exportVertexColors;
         }
 
         public void Export(IImported imported, string exportPath)
@@ -300,14 +306,6 @@ namespace AssetStudio
             var normalized = NormalizeFramePath(rawPath);
             if (string.IsNullOrEmpty(normalized))
             {
-                if (_rootFrame != null)
-                {
-                    var rootPath = NormalizeFramePath(_rootFrame.Path);
-                    if (!string.IsNullOrEmpty(rootPath) && _nodeByPath.TryGetValue(rootPath, out nodeIndex))
-                    {
-                        return true;
-                    }
-                }
                 return false;
             }
 
@@ -653,8 +651,17 @@ namespace AssetStudio
                 int modeInt = (int)MathF.Round(mat.SurfaceMode.Value);
                 if (modeInt == 1)
                 {
-                    gltfMat.AlphaMode = "MASK";
-                    gltfMat.AlphaCutoff = mat.AlphaCutoff.HasValue ? Clamp01(mat.AlphaCutoff.Value) : 0.5f;
+                    if (gltfMat.BaseColorTexture != null)
+                    {
+                        gltfMat.AlphaMode = "MASK";
+                        gltfMat.AlphaCutoff = mat.AlphaCutoff.HasValue ? Clamp01(mat.AlphaCutoff.Value) : 0.5f;
+                    }
+                    else
+                    {
+                        // Downgrade MASK without a baseColorTexture to OPAQUE so untextured materials never clip geometry to invisible.
+                        gltfMat.AlphaMode = "OPAQUE";
+                        gltfMat.AlphaCutoff = null;
+                    }
                 }
                 else if (modeInt >= 2)
                 {
@@ -1225,13 +1232,14 @@ namespace AssetStudio
                 var joints = new HashSet<int>();
                 for (int b = 0; b < mesh.BoneList.Count; b++)
                 {
-                    if (TryResolveNodeIndex(mesh.BoneList[b].Path, out int jointIdx))
+                    if (TryResolveNodeIndex(mesh.BoneList[b]?.Path, out int jointIdx))
                     {
                         joints.Add(jointIdx);
                     }
                 }
 
-                if (joints.Count == 0)
+                if (joints.Count == 0
+                    || (mesh.BoneList.Count > 1 && joints.Count == 1 && _sceneRootNodes.Count > 0 && joints.Contains(_sceneRootNodes[0])))
                 {
                     continue;
                 }
@@ -1429,6 +1437,31 @@ namespace AssetStudio
             bool isSkinned = _exportSkins && mesh.BoneList != null && mesh.BoneList.Count > 0;
             List<int>? skinJointNodes = null;
             int resolvedTargetNode = TryResolveNodeIndex(mesh.Path, out int foundTargetNode) ? foundTargetNode : -1;
+
+            if (isSkinned)
+            {
+                int boneCount = mesh.BoneList!.Count;
+                var distinctResolvedJoints = new HashSet<int>();
+                for (int b = 0; b < boneCount; b++)
+                {
+                    if (TryResolveNodeIndex(mesh.BoneList[b]?.Path, out int rj))
+                    {
+                        distinctResolvedJoints.Add(rj);
+                    }
+                }
+
+                bool collapsedToSceneRootOnly = boneCount > 1
+                    && distinctResolvedJoints.Count == 1
+                    && _sceneRootNodes.Count > 0
+                    && distinctResolvedJoints.Contains(_sceneRootNodes[0]);
+
+                if (distinctResolvedJoints.Count == 0 || collapsedToSceneRootOnly)
+                {
+                    // When no real Transform skeleton nodes exist for the mesh's bones, export as a clean static mesh
+                    // in bind-pose rest space rather than spawning identity *_Dup_N or unparented placeholder nodes.
+                    isSkinned = false;
+                }
+            }
 
             if (isSkinned)
             {
@@ -1760,19 +1793,58 @@ namespace AssetStudio
                 }
             }
 
-            if (mesh.hasColor)
+            int? opaqueVertexColorAccessor = null;
+            int? blendVertexColorAccessor = null;
+            if ((_exportVertexColors || ExportVertexColors) && mesh.hasColor)
             {
-                var colors = new System.Numerics.Vector4[vertexCount];
-                for (int i = 0; i < vertexCount; i++)
+                bool needsOpaqueColors = false;
+                bool needsBlendColors = false;
+                for (int p = 0; p < primitivePayloads.Count; p++)
                 {
-                    var c = mesh.VertexList[i].Color;
-                    colors[i] = new System.Numerics.Vector4(
-                        Clamp01(SanitizeFloat(c.R, 1f)),
-                        Clamp01(SanitizeFloat(c.G, 1f)),
-                        Clamp01(SanitizeFloat(c.B, 1f)),
-                        Clamp01(SanitizeFloat(c.A, 1f)));
+                    var matIdx = primitivePayloads[p].MaterialIndex;
+                    bool isBlend = matIdx.HasValue
+                        && matIdx.Value >= 0
+                        && matIdx.Value < _materials.Count
+                        && string.Equals(_materials[matIdx.Value].AlphaMode, "BLEND", StringComparison.Ordinal);
+                    if (isBlend)
+                    {
+                        needsBlendColors = true;
+                    }
+                    else
+                    {
+                        needsOpaqueColors = true;
+                    }
                 }
-                sharedAttributes["COLOR_0"] = _buffer.AddVec4Accessor(colors, target: TargetArrayBuffer);
+
+                if (needsOpaqueColors)
+                {
+                    var opaqueColors = new System.Numerics.Vector4[vertexCount];
+                    for (int i = 0; i < vertexCount; i++)
+                    {
+                        var c = mesh.VertexList[i].Color;
+                        opaqueColors[i] = new System.Numerics.Vector4(
+                            Clamp01(SanitizeFloat(c.R, 1f)),
+                            Clamp01(SanitizeFloat(c.G, 1f)),
+                            Clamp01(SanitizeFloat(c.B, 1f)),
+                            1f);
+                    }
+                    opaqueVertexColorAccessor = _buffer.AddVec4Accessor(opaqueColors, target: TargetArrayBuffer);
+                }
+
+                if (needsBlendColors)
+                {
+                    var blendColors = new System.Numerics.Vector4[vertexCount];
+                    for (int i = 0; i < vertexCount; i++)
+                    {
+                        var c = mesh.VertexList[i].Color;
+                        blendColors[i] = new System.Numerics.Vector4(
+                            Clamp01(SanitizeFloat(c.R, 1f)),
+                            Clamp01(SanitizeFloat(c.G, 1f)),
+                            Clamp01(SanitizeFloat(c.B, 1f)),
+                            Clamp01(SanitizeFloat(c.A, 1f)));
+                    }
+                    blendVertexColorAccessor = _buffer.AddVec4Accessor(blendColors, target: TargetArrayBuffer);
+                }
             }
 
             if (isSkinned && mesh.BoneList != null)
@@ -1946,10 +2018,25 @@ namespace AssetStudio
             {
                 var (indices, maxIdx, matIdx) = primitivePayloads[p];
                 int indicesAccessor = _buffer.AddIndicesAccessor(indices, maxIdx);
+                var primAttributes = new Dictionary<string, int>(sharedAttributes, StringComparer.Ordinal);
+                if (opaqueVertexColorAccessor.HasValue || blendVertexColorAccessor.HasValue)
+                {
+                    bool isBlend = matIdx.HasValue
+                        && matIdx.Value >= 0
+                        && matIdx.Value < _materials.Count
+                        && string.Equals(_materials[matIdx.Value].AlphaMode, "BLEND", StringComparison.Ordinal);
+                    int? colorAccessor = isBlend
+                        ? (blendVertexColorAccessor ?? opaqueVertexColorAccessor)
+                        : (opaqueVertexColorAccessor ?? blendVertexColorAccessor);
+                    if (colorAccessor.HasValue)
+                    {
+                        primAttributes["COLOR_0"] = colorAccessor.Value;
+                    }
+                }
 
                 gltfMesh.Primitives.Add(new GltfPrimitive
                 {
-                    Attributes = new Dictionary<string, int>(sharedAttributes, StringComparer.Ordinal),
+                    Attributes = primAttributes,
                     Indices = indicesAccessor,
                     Material = matIdx,
                     Targets = morphTargets
@@ -2218,7 +2305,10 @@ namespace AssetStudio
                     continue;
                 }
 
-                if (TryResolveNodeIndex(track.Path, out int nodeIdx))
+                int nodeIdx;
+                bool hasResolvedTrackNode = TryResolveNodeIndex(track.Path, out nodeIdx)
+                    || (string.IsNullOrEmpty(NormalizeFramePath(track.Path)) && _sceneRootNodes.Count > 0 && (nodeIdx = _sceneRootNodes[0]) >= 0);
+                if (hasResolvedTrackNode)
                 {
                     if (track.Translations != null && track.Translations.Count > 0 && usedTrsTargets.Add((nodeIdx, "translation")))
                     {

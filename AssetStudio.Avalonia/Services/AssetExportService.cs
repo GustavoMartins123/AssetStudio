@@ -1853,6 +1853,7 @@ namespace AssetStudio.Avalonia.Services
                     m_Mesh.EnsureProcessed();
                     if (m_Mesh.m_VertexCount <= 0 || m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
                     {
+                        Logger.Info($"Skipping empty 0-vertex mesh '{m_Mesh.m_Name}' (PathID: {m_Mesh.m_PathID}).");
                         return false;
                     }
                     if (!conversionContext.TryGetAssetFilePath(exportPath, fileName, ".obj", item, out var objPath))
