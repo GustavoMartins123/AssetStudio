@@ -102,23 +102,25 @@ public partial class MainWindow
                 continue;
             }
 
-            var groupMeshes = composite.Parts
-                .Select(p => new ModelGroupMeshInfo(
-                    composite.CompositeAssetId,
-                    p.MeshAssetId,
-                    p.RendererAssetId,
-                    p.RendererType,
-                    p.GameObjectAssetId,
-                    p.GameObjectName,
-                    p.PartIndex,
-                    p.Confidence,
-                    string.Empty,
-                    p.TransformMatrix,
-                    p.MeshName,
-                    p.MeshPathId,
-                    p.MeshByteSize,
-                    (int)ClassIDType.Mesh))
-                .ToList();
+            var groupMeshes = FilterActivePreviewModelGroupParts(
+                composite.Parts
+                    .Select(p => new ModelGroupMeshInfo(
+                        composite.CompositeAssetId,
+                        p.MeshAssetId,
+                        p.RendererAssetId,
+                        p.RendererType,
+                        p.GameObjectAssetId,
+                        p.GameObjectName,
+                        p.PartIndex,
+                        p.Confidence,
+                        string.Empty,
+                        p.TransformMatrix,
+                        p.MeshName,
+                        p.MeshPathId,
+                        p.MeshByteSize,
+                        (int)ClassIDType.Mesh))
+                    .ToList(),
+                meshId);
             var meshIds = groupMeshes
                 .Select(item => item.MeshAssetId)
                 .Where(id => !string.IsNullOrWhiteSpace(id))
@@ -169,7 +171,7 @@ public partial class MainWindow
                     continue;
                 }
 
-                var groupMeshes = groupCandidate.Meshes;
+                var groupMeshes = FilterActivePreviewModelGroupParts(groupCandidate.Meshes, meshId);
                 var meshIds = groupMeshes
                     .Select(item => item.MeshAssetId)
                     .Where(id => !string.IsNullOrWhiteSpace(id))
@@ -213,7 +215,228 @@ public partial class MainWindow
             }
         }
 
+        // Local SerializedFile fallback when SQLite semantic relations are unavailable or still building
+        // (e.g. single-file loads or clicking a multi-SMR character mesh before connections finish).
+        if (candidates.Count <= 1 && mesh.assetsFile != null)
+        {
+            TryAddLocalSerializedFileModelGroupCandidates(
+                mesh,
+                meshId,
+                candidates,
+                seenGroups,
+                seenGroupPartSignatures);
+        }
+
         return candidates;
+    }
+
+    internal static List<ModelGroupMeshInfo> FilterActivePreviewModelGroupParts(
+        IReadOnlyList<ModelGroupMeshInfo> infos,
+        string? selectedMeshId = null)
+    {
+        if (infos == null || infos.Count == 0)
+        {
+            return new List<ModelGroupMeshInfo>();
+        }
+
+        var hasHighConfidenceActive = false;
+        var hasExplicitInactiveMarker = false;
+        for (var i = 0; i < infos.Count; i++)
+        {
+            var info = infos[i];
+            if (!string.IsNullOrEmpty(info.ConfidenceReason)
+                && info.ConfidenceReason.Contains("(inactive)", StringComparison.OrdinalIgnoreCase))
+            {
+                hasExplicitInactiveMarker = true;
+            }
+            else if (info.Confidence >= 80)
+            {
+                hasHighConfidenceActive = true;
+            }
+        }
+
+        if (!hasExplicitInactiveMarker && !hasHighConfidenceActive)
+        {
+            return infos.ToList();
+        }
+
+        bool IsInactivePart(ModelGroupMeshInfo info)
+        {
+            if (!string.IsNullOrEmpty(info.ConfidenceReason)
+                && info.ConfidenceReason.Contains("(inactive)", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return string.IsNullOrEmpty(info.ConfidenceReason)
+                && hasHighConfidenceActive
+                && info.Confidence > 0
+                && info.Confidence <= 40;
+        }
+
+        var filtered = new List<ModelGroupMeshInfo>(infos.Count);
+        for (var i = 0; i < infos.Count; i++)
+        {
+            var info = infos[i];
+            var isSelected = !string.IsNullOrWhiteSpace(selectedMeshId)
+                && string.Equals(info.MeshAssetId, selectedMeshId, StringComparison.Ordinal);
+            if (isSelected || !IsInactivePart(info))
+            {
+                filtered.Add(info);
+            }
+        }
+
+        return filtered.Count > 0 ? filtered : infos.ToList();
+    }
+
+    private void EnsureLocalHierarchyObjectsLoadedForFile(SerializedFile? sourceFile)
+    {
+        if (sourceFile == null || !assetsManager.LazyLoading || assetsManager.ProjectIndex == null)
+        {
+            return;
+        }
+
+        var handles = assetsManager.ProjectIndex.GetHandlesForFile(sourceFile.fileName);
+        if (handles == null)
+        {
+            return;
+        }
+
+        foreach (var handle in handles)
+        {
+            if (handle == null || handle.RealObject != null)
+            {
+                continue;
+            }
+
+            if (handle.Type != ClassIDType.GameObject
+                && handle.Type != ClassIDType.Transform
+                && handle.Type != ClassIDType.Animator
+                && handle.Type != ClassIDType.SkinnedMeshRenderer
+                && handle.Type != ClassIDType.MeshRenderer
+                && handle.Type != ClassIDType.MeshFilter)
+            {
+                continue;
+            }
+
+            if (handle.SourceFile?.reader == null)
+            {
+                handle.SourceFile = sourceFile;
+            }
+
+            try
+            {
+                assetsManager.ResolveHandle(handle);
+            }
+            catch
+            {
+                // Best-effort local hierarchy resolution
+            }
+        }
+    }
+
+    private void TryAddLocalSerializedFileModelGroupCandidates(
+        Mesh mesh,
+        string meshId,
+        List<PreviewCandidateItem> candidates,
+        HashSet<string> seenGroups,
+        HashSet<string> seenGroupPartSignatures)
+    {
+        var sourceFile = mesh.assetsFile;
+        if (sourceFile == null)
+        {
+            return;
+        }
+
+        EnsureLocalHierarchyObjectsLoadedForFile(sourceFile);
+        var localRelations = Services.SemanticGraphService.BuildAssetReferenceIndexForFile(sourceFile).SemanticRelations;
+        if (localRelations.ModelGroups.Count == 0 || localRelations.ModelGroupMeshes.Count == 0)
+        {
+            return;
+        }
+
+        var meshesByGroupId = localRelations.ModelGroupMeshes
+            .GroupBy(m => m.GroupId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
+        foreach (var group in localRelations.ModelGroups
+            .OrderByDescending(g => string.Equals(g.GroupKind, "Animator", StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(g => g.Confidence))
+        {
+            if (string.IsNullOrWhiteSpace(group.GroupId)
+                || !seenGroups.Add(group.GroupId)
+                || !meshesByGroupId.TryGetValue(group.GroupId, out var rawParts))
+            {
+                continue;
+            }
+
+            if (!rawParts.Any(p => string.Equals(p.MeshAssetId, meshId, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            var mappedParts = rawParts.Select(p =>
+            {
+                var handle = assetsManager.ProjectIndex?.GetHandle(p.MeshAssetId);
+                return new ModelGroupMeshInfo(
+                    p.GroupId,
+                    p.MeshAssetId,
+                    p.RendererAssetId,
+                    p.RendererType,
+                    p.GameObjectAssetId,
+                    p.GameObjectName,
+                    p.SlotIndex,
+                    p.Confidence,
+                    p.ConfidenceReason,
+                    p.LocalToWorldMatrix,
+                    handle?.Name ?? (string.Equals(p.MeshAssetId, meshId, StringComparison.Ordinal) ? mesh.m_Name ?? string.Empty : string.Empty),
+                    handle?.PathID ?? (string.Equals(p.MeshAssetId, meshId, StringComparison.Ordinal) ? mesh.m_PathID : 0L),
+                    handle?.ByteSize ?? 0L,
+                    (int)ClassIDType.Mesh);
+            }).ToList();
+
+            var groupMeshes = FilterActivePreviewModelGroupParts(mappedParts, meshId);
+            var meshIds = groupMeshes
+                .Select(item => item.MeshAssetId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToArray();
+            if (meshIds.Length < 2)
+            {
+                continue;
+            }
+
+            var partSignature = string.Join("\u001f", groupMeshes.Select(part => $"{part.MeshAssetId}:{part.RendererAssetId}:{part.SlotIndex}"));
+            if (!seenGroupPartSignatures.Add(partSignature))
+            {
+                continue;
+            }
+
+            var representative = SelectRepresentativeModelGroupMesh(groupMeshes);
+            var representativeMeshId = representative?.MeshAssetId ?? meshId;
+            var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+                ? group.GroupName
+                : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                    ? group.RootGameObjectName
+                    : GetPreviewHandleName(representativeMeshId, "Model");
+            var representativeName = !string.IsNullOrWhiteSpace(representative?.MeshName)
+                ? representative!.MeshName
+                : GetPreviewHandleName(representativeMeshId, "Mesh");
+
+            candidates.Add(new PreviewCandidateItem
+            {
+                Mesh = string.Equals(representativeMeshId, meshId, StringComparison.Ordinal) ? mesh : null,
+                MeshId = representativeMeshId,
+                ModelGroupId = group.GroupId,
+                ModelGroupName = groupName,
+                ModelGroupKind = group.GroupKind,
+                ModelGroupMeshIds = meshIds,
+                ModelGroupMeshInfos = groupMeshes.ToArray(),
+                ModelGroupTransforms = groupMeshes.Select(part => part.TransformMatrix).ToArray(),
+                ModelGroupMeshCount = meshIds.Length,
+                ModelGroupConfidence = group.Confidence,
+                Label = $"Model group: {groupName} ({meshIds.Length:N0} parts) -> {representativeName}"
+            });
+        }
     }
 
     private PreviewCandidateItem? SelectMeshPreviewCandidate(
@@ -992,14 +1215,15 @@ public partial class MainWindow
     }
 
     private List<MeshPreviewControl.AvatarPreviewPartSpec> BuildCompositeAvatarPartSpecsForCandidate(
-        Avatar avatar,
+        Avatar? avatar,
         Services.AvatarDefaultSkeletonData defaultSkeleton,
         PreviewCandidateItem? candidate,
         Mesh? fallbackMesh,
         bool includeAllGroupParts,
         CancellationToken token,
         out Mesh? primaryMesh,
-        out int availableGroupPartCount)
+        out int availableGroupPartCount,
+        IReadOnlyDictionary<long, int>? transformPathIdToNodeIdx = null)
     {
         primaryMesh = fallbackMesh;
         availableGroupPartCount = 0;
@@ -1011,7 +1235,8 @@ public partial class MainWindow
                 ? LoadModelGroupMeshesForPreview(candidate!.ModelGroupId)
                 : (IReadOnlyList<ModelGroupMeshInfo>)Array.Empty<ModelGroupMeshInfo>());
 
-        var dedupInfos = DeduplicateModelGroupMeshInfos(rawInfos);
+        var fallbackMeshKey = fallbackMesh != null ? GetPreviewObjectKey(fallbackMesh) : candidate?.MeshId;
+        var dedupInfos = FilterActivePreviewModelGroupParts(DeduplicateModelGroupMeshInfos(rawInfos), fallbackMeshKey);
         var preResolvedMeshes = candidate?.ModelGroupMeshes ?? Array.Empty<Mesh>();
         availableGroupPartCount = Math.Max(
             dedupInfos.Count,
@@ -1168,17 +1393,30 @@ public partial class MainWindow
 
             if (isSkinned)
             {
-                var boneMap = Services.MeshPreviewSkeletonBuilder.MapSkinnedMeshBonesToAvatarNodes(mesh, avatar, defaultSkeleton);
-                if (boneMap.Length > 0 && boneMap.All(idx => idx < 0))
+                int[] boneMap;
+                if (transformPathIdToNodeIdx != null && transformPathIdToNodeIdx.Count > 0)
                 {
-                    var rendererBonePaths = TryExtractLoadedSkinnedRendererBonePaths(avatar, mesh, info?.RendererAssetId);
-                    if (rendererBonePaths != null && rendererBonePaths.Length > 0)
+                    boneMap = TryMapSkinnedMeshBonesViaTransformIds(avatar, mesh, info?.RendererAssetId, transformPathIdToNodeIdx);
+                }
+                else
+                {
+                    boneMap = Array.Empty<int>();
+                }
+
+                if (boneMap.Length == 0 || boneMap.All(idx => idx < 0))
+                {
+                    boneMap = Services.MeshPreviewSkeletonBuilder.MapSkinnedMeshBonesToAvatarNodes(mesh, avatar, defaultSkeleton);
+                    if (boneMap.Length > 0 && boneMap.All(idx => idx < 0))
                     {
-                        boneMap = Services.MeshPreviewSkeletonBuilder.MapSkinnedMeshBonesToAvatarNodes(
-                            mesh,
-                            avatar,
-                            defaultSkeleton,
-                            rendererBonePaths);
+                        var rendererBonePaths = TryExtractLoadedSkinnedRendererBonePaths(avatar, mesh, info?.RendererAssetId);
+                        if (rendererBonePaths != null && rendererBonePaths.Length > 0)
+                        {
+                            boneMap = Services.MeshPreviewSkeletonBuilder.MapSkinnedMeshBonesToAvatarNodes(
+                                mesh,
+                                avatar,
+                                defaultSkeleton,
+                                rendererBonePaths);
+                        }
                     }
                 }
 
@@ -1260,7 +1498,62 @@ public partial class MainWindow
         return specs;
     }
 
-    private string?[]? TryExtractLoadedSkinnedRendererBonePaths(Avatar avatar, Mesh mesh, string? rendererAssetId)
+    private int[] TryMapSkinnedMeshBonesViaTransformIds(
+        Avatar? avatar,
+        Mesh mesh,
+        string? rendererAssetId,
+        IReadOnlyDictionary<long, int> transformPathIdToNodeIdx)
+    {
+        if (mesh?.m_BindPose == null || mesh.m_BindPose.Length == 0)
+        {
+            return Array.Empty<int>();
+        }
+
+        SkinnedMeshRenderer? smr = null;
+        if (!string.IsNullOrWhiteSpace(rendererAssetId))
+        {
+            var handle = assetsManager.ProjectIndex.GetHandle(rendererAssetId);
+            if (handle?.RealObject is SkinnedMeshRenderer loadedSmr)
+            {
+                smr = loadedSmr;
+            }
+        }
+
+        smr ??= FindSkinnedRendererForAvatarMesh(avatar, mesh);
+        if (smr?.m_Bones == null || smr.m_Bones.Length == 0 || smr.assetsFile == null)
+        {
+            return Array.Empty<int>();
+        }
+
+        var boneCount = mesh.m_BindPose.Length;
+        var map = new int[boneCount];
+        Array.Fill(map, -1);
+        var limit = Math.Min(boneCount, smr.m_Bones.Length);
+        for (var b = 0; b < limit; b++)
+        {
+            var bonePtr = smr.m_Bones[b];
+            if (bonePtr == null || bonePtr.IsNull)
+            {
+                continue;
+            }
+
+            if (transformPathIdToNodeIdx.TryGetValue(bonePtr.m_PathID, out var directIdx))
+            {
+                map[b] = directIdx;
+                continue;
+            }
+
+            var boneTr = ResolveTransformBackground(smr.assetsFile, bonePtr);
+            if (boneTr != null && transformPathIdToNodeIdx.TryGetValue(boneTr.m_PathID, out var resolvedIdx))
+            {
+                map[b] = resolvedIdx;
+            }
+        }
+
+        return map;
+    }
+
+    private string?[]? TryExtractLoadedSkinnedRendererBonePaths(Avatar? avatar, Mesh mesh, string? rendererAssetId)
     {
         SkinnedMeshRenderer? smr = null;
         if (!string.IsNullOrWhiteSpace(rendererAssetId))

@@ -356,6 +356,7 @@ namespace AssetStudio.Avalonia
 
                 CREATE INDEX IF NOT EXISTS idx_asset_edges_kind_source ON AssetEdges(ProjectId, EdgeKind, SourceAssetUniqueID, SlotName, TargetAssetUniqueID, SlotIndex);
                 CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_controller ON ModelGroups(ProjectId, ControllerAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_material_cache_main_tex ON MaterialCache(ProjectId, MainTextureAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_mesh_mat_resolved_material ON MeshMaterialResolvedCache(ProjectId, MaterialAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_composite_assets_root_go ON CompositeAssets(ProjectId, RootGameObjectAssetUniqueID);
@@ -1032,6 +1033,7 @@ namespace AssetStudio.Avalonia
                             CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_asset_edges_kind_source ON AssetEdges(ProjectId, EdgeKind, SourceAssetUniqueID, SlotName, TargetAssetUniqueID, SlotIndex);
                 CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_controller ON ModelGroups(ProjectId, ControllerAssetUniqueID);
                             CREATE UNIQUE INDEX IF NOT EXISTS idx_model_group_meshes_unique ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, MeshAssetUniqueID, RendererAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                             CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
@@ -1071,6 +1073,7 @@ namespace AssetStudio.Avalonia
                 DROP INDEX IF EXISTS idx_asset_edges_kind_source;
                 DROP INDEX IF EXISTS idx_model_groups_avatar;
                 DROP INDEX IF EXISTS idx_model_groups_animator;
+                DROP INDEX IF EXISTS idx_model_groups_controller;
                 DROP INDEX IF EXISTS idx_model_group_meshes_group;
                 DROP INDEX IF EXISTS idx_model_group_meshes_candidate;
                 DROP INDEX IF EXISTS idx_material_textures_preview_lookup;
@@ -1095,6 +1098,7 @@ namespace AssetStudio.Avalonia
                 CREATE INDEX IF NOT EXISTS idx_model_groups_avatar ON ModelGroups(ProjectId, AvatarAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_asset_edges_kind_source ON AssetEdges(ProjectId, EdgeKind, SourceAssetUniqueID, SlotName, TargetAssetUniqueID, SlotIndex);
                 CREATE INDEX IF NOT EXISTS idx_model_groups_animator ON ModelGroups(ProjectId, AnimatorAssetUniqueID);
+                CREATE INDEX IF NOT EXISTS idx_model_groups_controller ON ModelGroups(ProjectId, ControllerAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_model_group_meshes_group ON ModelGroupMeshes(ProjectId, GroupAssetUniqueID, SlotIndex, MeshAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_model_group_meshes_candidate ON ModelGroupMeshes(ProjectId, MeshAssetUniqueID, GroupAssetUniqueID);
                 CREATE INDEX IF NOT EXISTS idx_material_textures_preview_lookup ON MaterialTextures(ProjectId, PreviewMaterialAssetUniqueID, SlotName, IsMainTexture DESC, SlotIndex, TextureAssetUniqueID);

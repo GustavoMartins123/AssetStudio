@@ -825,6 +825,80 @@ public partial class MainWindow
                         match.Overlap,
                         clipBindings.Count));
                 }
+
+                // 4. Avatar-less Generic rig fallback: match Transform-hierarchy bone hashes of loaded
+                //    SkinnedMeshRenderers (e.g. characters whose Animator has m_Avatar = null and zeroed m_BoneNameHashes).
+                if (scoredAvatars.Count == 0)
+                {
+                    var scoredRenderers = new List<(Mesh Mesh, string MeshId, int Overlap, bool SameFile)>();
+                    var seenMeshKeys = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var file in filesToInspect)
+                    {
+                        EnsureLocalHierarchyObjectsLoadedForFile(file);
+                        AssetStudio.Object[] objs;
+                        lock (file)
+                        {
+                            objs = file.Objects.ToArray();
+                        }
+
+                        var animatorRoots = objs.OfType<Animator>()
+                            .Select(a =>
+                            {
+                                var go = ResolveGameObjectBackground(file, a.m_GameObject);
+                                return go != null ? Services.SemanticGraphService.ResolveTransformForGameObjectBackground(file, go) : null;
+                            })
+                            .Where(t => t != null)
+                            .Select(t => t!)
+                            .ToList();
+
+                        foreach (var smr in objs.OfType<SkinnedMeshRenderer>())
+                        {
+                            if (smr.m_Bones == null || smr.m_Bones.Length == 0)
+                            {
+                                continue;
+                            }
+
+                            var smrMeshId = Services.SemanticGraphService.GetSemanticAssetIdFromPPtr(file, smr.m_Mesh, ClassIDType.Mesh);
+                            if (string.IsNullOrWhiteSpace(smrMeshId) || !seenMeshKeys.Add(smrMeshId))
+                            {
+                                continue;
+                            }
+
+                            var rigHashes = Services.MeshPreviewSkeletonBuilder.ComputeRendererTransformBoneHashes(file, smr, animatorRoots);
+                            if (rigHashes.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            var overlap = clipBindings.Count(rigHashes.Contains);
+                            if (IsStrongAnimationAvatarMatch(clipBindings.Count, overlap))
+                            {
+                                var loadedMesh = smr.m_Mesh.TryGet(out var m) ? m : null;
+                                scoredRenderers.Add((loadedMesh!, smrMeshId, overlap, ReferenceEquals(file, clip.assetsFile)));
+                            }
+                        }
+                    }
+
+                    var bestRendererOverlap = scoredRenderers.Count > 0 ? scoredRenderers.Max(m => m.Overlap) : 0;
+                    foreach (var match in scoredRenderers
+                        .Where(m => m.Overlap >= Math.Max(3, bestRendererOverlap / 2))
+                        .OrderByDescending(m => m.Overlap)
+                        .ThenByDescending(m => m.SameFile)
+                        .Take(4))
+                    {
+                        addCandidate(null, match.Mesh, string.Empty, match.MeshId, "Local transform rig");
+                        backfill.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
+                            clipId,
+                            string.Empty,
+                            string.Empty,
+                            match.MeshId,
+                            string.Empty,
+                            "BoneHashMatch",
+                            match.Overlap * 100,
+                            match.Overlap,
+                            clipBindings.Count));
+                    }
+                }
             }
 
             if (backfill.HasRelations)
@@ -1211,19 +1285,46 @@ public partial class MainWindow
         }
 
         var bindingPaths = GetCachedOrExtractTransformBindingPaths(clip);
-        if (bindingPaths.Count == 0 || mesh.m_BoneNameHashes == null || mesh.m_BoneNameHashes.Length == 0)
+        if (bindingPaths.Count == 0)
         {
             return false;
         }
 
-        var meshBoneHashes = new HashSet<uint>(mesh.m_BoneNameHashes.Where(h => h != 0));
-        if (meshBoneHashes.Count == 0)
+        if (mesh.m_BoneNameHashes != null && mesh.m_BoneNameHashes.Length > 0)
         {
-            return false;
+            var meshBoneHashes = new HashSet<uint>(mesh.m_BoneNameHashes.Where(h => h != 0));
+            if (meshBoneHashes.Count > 0)
+            {
+                var overlap = bindingPaths.Count(meshBoneHashes.Contains);
+                if (IsStrongAnimationAvatarMatch(bindingPaths.Count, overlap))
+                {
+                    return true;
+                }
+            }
         }
 
-        var overlap = bindingPaths.Count(meshBoneHashes.Contains);
-        return IsStrongAnimationAvatarMatch(bindingPaths.Count, overlap);
+        // Fallback for Generic rigs where Mesh.m_BoneNameHashes is empty or all zeros:
+        // compute CRC32 hashes of Animator-relative Transform paths from the owning SkinnedMeshRenderer.
+        if (mesh.assetsFile != null)
+        {
+            EnsureLocalHierarchyObjectsLoadedForFile(mesh.assetsFile);
+            var renderer = FindSkinnedRendererForAvatarMesh(null, mesh);
+            if (renderer != null && renderer.assetsFile != null)
+            {
+                var animatorRoots = CollectAncestorAndFileAnimatorRoots(renderer.assetsFile, renderer);
+                var transformHashes = Services.MeshPreviewSkeletonBuilder.ComputeRendererTransformBoneHashes(
+                    renderer.assetsFile,
+                    renderer,
+                    animatorRoots);
+                if (transformHashes.Count > 0)
+                {
+                    var overlap = bindingPaths.Count(transformHashes.Contains);
+                    return IsStrongAnimationAvatarMatch(bindingPaths.Count, overlap);
+                }
+            }
+        }
+
+        return false;
     }
 
     private bool IsAnimationClipCompatibleWithAvatar(AnimationClip clip, Avatar avatar)

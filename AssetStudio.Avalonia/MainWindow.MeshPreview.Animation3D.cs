@@ -1036,6 +1036,7 @@ public partial class MainWindow
                     currentMeshSnapshot,
                     densityPercent,
                     boneScale,
+                    showFullModelGroup,
                     allowStaticBindPoseFallback,
                     token,
                     out var fallbackOutcome,
@@ -1063,6 +1064,7 @@ public partial class MainWindow
                     currentMeshSnapshot,
                     densityPercent,
                     boneScale,
+                    showFullModelGroup,
                     allowStaticBindPoseFallback,
                     token,
                     out var fallbackOutcome,
@@ -1388,7 +1390,7 @@ public partial class MainWindow
 
     private PreparedAnimationClipPreviewOutcome? PrepareCompositeAvatarAnimationOutcome(
         AnimationClip clip,
-        Avatar avatar,
+        Avatar? avatar,
         Mesh? primaryMesh,
         AvatarDefaultSkeletonData defaultSkeleton,
         IReadOnlyList<MeshPreviewControl.AvatarPreviewPartSpec> partSpecs,
@@ -1400,6 +1402,11 @@ public partial class MainWindow
         bool allowStaticBindPoseFallback,
         CancellationToken token)
     {
+        var rigDisplayName = !string.IsNullOrWhiteSpace(avatar?.m_Name)
+            ? avatar!.m_Name
+            : !string.IsNullOrWhiteSpace(activeCandidate.ModelGroupName)
+                ? activeCandidate.ModelGroupName
+                : primaryMesh?.m_Name ?? "Rig";
         var skinnedPartPairs = new List<(Mesh Mesh, int[] BoneToNodeMap)>();
         var rigidAttachNodes = new List<int>();
         for (var i = 0; i < partSpecs.Count; i++)
@@ -1446,7 +1453,7 @@ public partial class MainWindow
                     updateMaxTimeBeforeBoundsCheck: true);
             }
 
-            if (AssetExportHelper.IsHumanoidAvatar(avatar) && muscleClip.m_IndexArray?.Length > HumanoidMuscleDecoder.RootSlotOffset)
+            if (avatar != null && AssetExportHelper.IsHumanoidAvatar(avatar) && muscleClip.m_IndexArray?.Length > HumanoidMuscleDecoder.RootSlotOffset)
             {
                 MeshPreviewAnimationEvaluator.ExtractHumanoidMuscleTracksForAvatarSkeleton(
                     clip,
@@ -1489,7 +1496,7 @@ public partial class MainWindow
                     Candidates = candidates,
                     SelectedCandidate = activeCandidate,
                     AvailableGroupPartCount = availableGroupPartCount,
-                    StatusMessage = $"AnimationClip: {clip.m_Name} | No animation tracks matched skeletal rig {avatar.m_Name}."
+                    StatusMessage = $"AnimationClip: {clip.m_Name} | No animation tracks matched skeletal rig {rigDisplayName}."
                 };
             }
 
@@ -1568,12 +1575,12 @@ public partial class MainWindow
         var renderedParts = animatedGlData.PartCount;
         var groupLabel = !string.IsNullOrWhiteSpace(activeCandidate.ModelGroupName)
             ? activeCandidate.ModelGroupName
-            : avatar.m_Name;
+            : rigDisplayName;
         var targetStatus = renderedParts > 1
             ? $" | Full Object: {groupLabel} ({renderedParts:N0} parts)"
             : animatedGlData.IsSkeletonOnly
-                ? $" | Skeleton only: {avatar.m_Name}"
-                : $" | Mesh: {primaryMesh?.m_Name ?? avatar.m_Name}";
+                ? $" | Skeleton only: {rigDisplayName}"
+                : $" | Mesh: {primaryMesh?.m_Name ?? rigDisplayName}";
 
         return new PreparedAnimationClipPreviewOutcome
         {
@@ -1598,6 +1605,7 @@ public partial class MainWindow
         Mesh? currentMeshSnapshot,
         float densityPercent,
         float boneScale,
+        bool showFullModelGroup,
         bool allowStaticBindPoseFallback,
         CancellationToken token,
         out PreparedAnimationClipPreviewOutcome? outcome,
@@ -1639,21 +1647,105 @@ public partial class MainWindow
         int[]? staticParentIndices = null;
         string[]? staticBoneNames = null;
         string? lastReason = null;
+        var clipBindingPaths = GetCachedOrExtractTransformBindingPaths(clip);
 
         foreach (var mesh in meshes)
         {
             token.ThrowIfCancellationRequested();
             mesh.EnsureProcessed();
+            EnsureLocalHierarchyObjectsLoadedForFile(mesh.assetsFile);
             var renderer = FindSkinnedRendererForAvatarMesh(null, mesh);
             if (renderer == null && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
             {
                 EnsureMeshPreviewDependenciesLoaded(mesh);
+                EnsureLocalHierarchyObjectsLoadedForFile(mesh.assetsFile);
                 renderer = FindSkinnedRendererForAvatarMesh(null, mesh);
             }
 
             if (renderer == null)
             {
                 continue;
+            }
+
+            // Primary path for Avatar-less Generic Transform rigs (including rigs with zeroed Mesh.m_BoneNameHashes,
+            // nested Animators, intermediate non-SMR bones, and multi-SMR character ModelGroups):
+            if (TryBuildTransformHierarchySkeletonForMesh(
+                    mesh,
+                    renderer,
+                    clipBindingPaths,
+                    out var transformSkeleton,
+                    out var transformPathIdToNodeIdx))
+            {
+                token.ThrowIfCancellationRequested();
+                var effectiveCandidate = selectedCandidate ?? new PreviewCandidateItem
+                {
+                    AnimationClip = clip,
+                    Mesh = mesh,
+                    MeshId = GetPreviewObjectKey(mesh)
+                };
+
+                // If the candidate doesn't carry ModelGroup parts yet, assemble local active ModelGroup parts
+                // from mesh.assetsFile so full multi-SMR characters animate together seamlessly.
+                if (showFullModelGroup && !effectiveCandidate.IsModelGroup && mesh.assetsFile != null)
+                {
+                    var localMeshCandidates = BuildMeshPreviewCandidates(mesh);
+                    var localGroup = localMeshCandidates.FirstOrDefault(c => c.IsModelGroup && c.ModelGroupMeshInfos.Count > 1);
+                    if (localGroup != null)
+                    {
+                        effectiveCandidate = new PreviewCandidateItem
+                        {
+                            AnimationClip = clip,
+                            Mesh = mesh,
+                            MeshId = effectiveCandidate.MeshId,
+                            ModelGroupId = localGroup.ModelGroupId,
+                            ModelGroupName = localGroup.ModelGroupName,
+                            ModelGroupKind = localGroup.ModelGroupKind,
+                            ModelGroupMeshIds = localGroup.ModelGroupMeshIds,
+                            ModelGroupMeshInfos = localGroup.ModelGroupMeshInfos,
+                            ModelGroupTransforms = localGroup.ModelGroupTransforms,
+                            ModelGroupMeshCount = localGroup.ModelGroupMeshCount,
+                            ModelGroupConfidence = localGroup.ModelGroupConfidence,
+                            Label = effectiveCandidate.Label
+                        };
+                    }
+                }
+
+                var availableParts = effectiveCandidate.IsModelGroup
+                    ? Math.Max(effectiveCandidate.ModelGroupMeshCount, effectiveCandidate.ModelGroupMeshInfos.Count)
+                    : 1;
+                var partSpecs = BuildCompositeAvatarPartSpecsForCandidate(
+                    avatar: null,
+                    transformSkeleton,
+                    effectiveCandidate,
+                    mesh,
+                    includeAllGroupParts: showFullModelGroup && availableParts > 1,
+                    token,
+                    out var primaryCompositeMesh,
+                    out var resolvedGroupPartCount,
+                    transformPathIdToNodeIdx);
+                availableParts = Math.Max(availableParts, resolvedGroupPartCount);
+
+                if (partSpecs.Count > 0)
+                {
+                    var compositeOutcome = PrepareCompositeAvatarAnimationOutcome(
+                        clip,
+                        avatar: null,
+                        primaryCompositeMesh ?? mesh,
+                        transformSkeleton,
+                        partSpecs,
+                        candidates,
+                        effectiveCandidate,
+                        availableParts,
+                        densityPercent,
+                        boneScale,
+                        allowStaticBindPoseFallback: false,
+                        token);
+                    if (compositeOutcome != null && compositeOutcome.FrameCount > 0 && compositeOutcome.GlData != null)
+                    {
+                        outcome = compositeOutcome;
+                        return true;
+                    }
+                }
             }
 
             if (!TryBuildSkeletonFromSkinnedRenderer(
@@ -1678,6 +1770,7 @@ public partial class MainWindow
             if (TryBuildAnimationFramesFromRendererSkeleton(
                     clip,
                     mesh,
+                    renderer,
                     bonePositions,
                     parentIndices,
                     boneNames,
@@ -1915,6 +2008,7 @@ public partial class MainWindow
     private bool TryBuildAnimationFramesFromRendererSkeleton(
         AnimationClip clip,
         Mesh mesh,
+        SkinnedMeshRenderer? renderer,
         global::OpenTK.Mathematics.Vector3[] restBonePositions,
         int[] meshParentIndices,
         string[] meshBoneNames,
@@ -1952,7 +2046,59 @@ public partial class MainWindow
         {
             for (var i = 0; i < Math.Min(mesh.m_BoneNameHashes.Length, meshBoneCount); i++)
             {
-                meshBoneHashToIdx[mesh.m_BoneNameHashes[i]] = i;
+                if (mesh.m_BoneNameHashes[i] != 0)
+                {
+                    meshBoneHashToIdx[mesh.m_BoneNameHashes[i]] = i;
+                }
+            }
+        }
+
+        if (meshBoneHashToIdx.Count == 0 && renderer?.m_Bones != null && renderer.assetsFile != null)
+        {
+            var animatorRoots = CollectAncestorAndFileAnimatorRoots(renderer.assetsFile, renderer);
+            var animatorRootIds = new HashSet<long>(animatorRoots.Select(t => t.m_PathID));
+            var pathSegments = new List<string>(24);
+            var pathIds = new List<long>(24);
+            var visited = new HashSet<long>();
+            var limit = Math.Min(meshBoneCount, renderer.m_Bones.Length);
+            for (var i = 0; i < limit; i++)
+            {
+                var boneTr = ResolveTransformBackground(renderer.assetsFile, renderer.m_Bones[i]);
+                if (boneTr == null)
+                {
+                    continue;
+                }
+
+                pathSegments.Clear();
+                pathIds.Clear();
+                visited.Clear();
+                for (var cur = boneTr; cur != null && visited.Add(cur.m_PathID) && pathSegments.Count < 64; )
+                {
+                    var curFile = cur.assetsFile ?? renderer.assetsFile;
+                    var go = ResolveGameObjectBackground(curFile, cur.m_GameObject);
+                    pathSegments.Add(go?.m_Name ?? string.Empty);
+                    pathIds.Add(cur.m_PathID);
+                    if (cur.m_Father == null || cur.m_Father.IsNull)
+                    {
+                        break;
+                    }
+                    cur = ResolveTransformBackground(curFile, cur.m_Father);
+                }
+
+                for (var a = 1; a < pathIds.Count; a++)
+                {
+                    if (!animatorRootIds.Contains(pathIds[a]))
+                    {
+                        continue;
+                    }
+
+                    var rel = string.Join("/", Enumerable.Range(0, a).Reverse().Select(k => pathSegments[k]));
+                    var h = Services.SemanticGraphService.ComputeUnityBonePathHash(rel);
+                    if (h != 0)
+                    {
+                        meshBoneHashToIdx.TryAdd(h, i);
+                    }
+                }
             }
         }
 

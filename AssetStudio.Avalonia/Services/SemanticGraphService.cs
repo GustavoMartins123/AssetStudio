@@ -10,9 +10,9 @@ namespace AssetStudio.Avalonia.Services
 {
     public sealed class SemanticGraphService
     {
-        public const int LazyConnectionStagingFlushRowThreshold = 10_000;
+        public const int LazyConnectionStagingFlushRowThreshold = 100_000;
         public const int MaxClipBoneHashProbes = 24;
-        public const int MaxRigBoneHashProbes = 192;
+        public const int MaxRigBoneHashProbes = 512;
 
         public static readonly string[] PreferredMaterialTextureSlots = MaterialPreviewBuilder.PreferredTextureSlots;
 
@@ -477,7 +477,7 @@ namespace AssetStudio.Avalonia.Services
             AssetReferenceIndexBuildResult result,
             SkinnedMeshRenderer smr)
         {
-            var smrMesh = ResolveMeshBackground(file, smr.m_Mesh);
+            var smrMesh = TryGetLoadedMeshBackground(file, smr.m_Mesh);
             var smrMeshId = GetSemanticAssetId(smrMesh);
             if (string.IsNullOrEmpty(smrMeshId))
             {
@@ -538,7 +538,7 @@ namespace AssetStudio.Avalonia.Services
 
                     if (comp is MeshFilter mf)
                     {
-                        var mfMesh = ResolveMeshBackground(file, mf.m_Mesh);
+                        var mfMesh = TryGetLoadedMeshBackground(file, mf.m_Mesh);
                         var mfMeshId = GetSemanticAssetId(mfMesh);
                         if (string.IsNullOrEmpty(mfMeshId))
                         {
@@ -893,6 +893,32 @@ namespace AssetStudio.Avalonia.Services
             }
 
             return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Mesh : null;
+        }
+
+        private static Mesh? TryGetLoadedMeshBackground(SerializedFile sourceFile, PPtr<Mesh> pptr)
+        {
+            if (pptr == null || pptr.IsNull)
+            {
+                return null;
+            }
+
+            if (pptr.TryGet(out var mesh))
+            {
+                return mesh;
+            }
+
+            if (pptr.m_FileID == 0)
+            {
+                lock (sourceFile)
+                {
+                    if (sourceFile.ObjectsDic.TryGetValue(pptr.m_PathID, out var existing))
+                    {
+                        return existing as Mesh;
+                    }
+                }
+            }
+
+            return null;
         }
 
         public static Material? ResolveRendererMaterialBackground(PPtr<Material> pptr)
@@ -1759,7 +1785,7 @@ namespace AssetStudio.Avalonia.Services
                     continue;
                 }
 
-                var mesh = ResolveMeshBackground(sourceFile, meshFilter.m_Mesh);
+                var mesh = TryGetLoadedMeshBackground(sourceFile, meshFilter.m_Mesh);
                 var meshId = GetSemanticAssetId(mesh);
                 if (string.IsNullOrEmpty(meshId))
                 {
@@ -1790,7 +1816,7 @@ namespace AssetStudio.Avalonia.Services
             var result = new List<SkinnedMeshSemanticBinding>();
             foreach (var renderer in objects.OfType<SkinnedMeshRenderer>())
             {
-                var mesh = ResolveMeshBackground(sourceFile, renderer.m_Mesh);
+                var mesh = TryGetLoadedMeshBackground(sourceFile, renderer.m_Mesh);
                 var meshId = GetSemanticAssetId(mesh);
                 if (string.IsNullOrEmpty(meshId))
                 {
@@ -2335,6 +2361,21 @@ namespace AssetStudio.Avalonia.Services
                     groupId,
                     depth: 0);
             }
+
+            // Emit exact Animator-relative Transform path hashes for Avatar-less (Generic) rigs,
+            // including nested Animators (e.g. facial rigs) whose bones belong to a sibling SkinnedMeshRenderer.
+            if (string.IsNullOrEmpty(avatarId) && animatorGameObject != null && skinnedMeshBindings.Count > 0)
+            {
+                AddAnimatorTransformRigBoneHashes(
+                    sourceFile,
+                    animator,
+                    animatorId,
+                    animatorGameObject,
+                    groupId,
+                    primaryMeshId,
+                    skinnedMeshBindings,
+                    relations);
+            }
         }
 
         private static string AddAnimatorModelGroupRelations(
@@ -2362,9 +2403,14 @@ namespace AssetStudio.Avalonia.Services
             var groupName = !string.IsNullOrWhiteSpace(animatorGameObject?.m_Name)
                 ? animatorGameObject!.m_Name
                 : "Animator Model";
-            var confidence = meshMatches.Min(match => match.Confidence);
-            var confidenceReason = meshMatches.All(match => match.ConfidenceReason == meshMatches[0].ConfidenceReason)
-                ? meshMatches[0].ConfidenceReason
+            var activeMatches = meshMatches
+                .Where(match => string.IsNullOrEmpty(match.ConfidenceReason)
+                    || !match.ConfidenceReason.Contains("(inactive)", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var confidenceSource = activeMatches.Count > 0 ? activeMatches : meshMatches;
+            var confidence = confidenceSource.Min(match => match.Confidence);
+            var confidenceReason = confidenceSource.All(match => match.ConfidenceReason == confidenceSource[0].ConfidenceReason)
+                ? confidenceSource[0].ConfidenceReason
                 : "Mixed animator mesh evidence";
 
             relations.ModelGroups.Add(new SemanticModelGroupRelation(
@@ -2467,6 +2513,7 @@ namespace AssetStudio.Avalonia.Services
                         && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
                     {
                         matchedAnySkinned = true;
+                        var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
                         yield return new RendererMeshSemanticBinding(
                             binding.Renderer,
                             GetSemanticAssetId(binding.Renderer),
@@ -2476,8 +2523,8 @@ namespace AssetStudio.Avalonia.Services
                             binding.GameObject,
                             binding.MeshFileId,
                             binding.MeshPathId,
-                            100,
-                            "Animator hierarchy descendant");
+                            isActive ? 100 : 40,
+                            isActive ? "Animator hierarchy descendant" : "Animator hierarchy descendant (inactive)");
                     }
                 }
 
@@ -2493,6 +2540,7 @@ namespace AssetStudio.Avalonia.Services
                         && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
                     {
                         matchedAnyStatic = true;
+                        var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
                         yield return new RendererMeshSemanticBinding(
                             binding.Renderer,
                             binding.RendererId,
@@ -2502,8 +2550,8 @@ namespace AssetStudio.Avalonia.Services
                             binding.GameObject,
                             binding.MeshFileId,
                             binding.MeshPathId,
-                            80,
-                            "Animator MeshRenderer descendant");
+                            isActive ? 80 : 35,
+                            isActive ? "Animator MeshRenderer descendant" : "Animator MeshRenderer descendant (inactive)");
                     }
                 }
 
@@ -2519,6 +2567,7 @@ namespace AssetStudio.Avalonia.Services
                 {
                     foreach (var binding in skinnedMeshBindings)
                     {
+                        var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
                         yield return new RendererMeshSemanticBinding(
                             binding.Renderer,
                             GetSemanticAssetId(binding.Renderer),
@@ -2528,8 +2577,8 @@ namespace AssetStudio.Avalonia.Services
                             binding.GameObject,
                             binding.MeshFileId,
                             binding.MeshPathId,
-                            20,
-                            "Single animator file fallback");
+                            isActive ? 20 : 10,
+                            isActive ? "Single animator file fallback" : "Single animator file fallback (inactive)");
                     }
 
                     yield break;
@@ -2537,6 +2586,7 @@ namespace AssetStudio.Avalonia.Services
 
                 foreach (var binding in meshRendererBindings)
                 {
+                    var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
                     yield return new RendererMeshSemanticBinding(
                         binding.Renderer,
                         binding.RendererId,
@@ -2546,10 +2596,235 @@ namespace AssetStudio.Avalonia.Services
                         binding.GameObject,
                         binding.MeshFileId,
                         binding.MeshPathId,
-                        15,
-                        "Single animator MeshRenderer file fallback");
+                        isActive ? 15 : 8,
+                        isActive ? "Single animator MeshRenderer file fallback" : "Single animator MeshRenderer file fallback (inactive)");
                 }
             }
+        }
+
+        public static bool IsGameObjectActiveInHierarchy(
+            SerializedFile sourceFile,
+            GameObject? gameObject,
+            GameObject? stopAtAncestor = null)
+        {
+            if (gameObject == null)
+            {
+                return true;
+            }
+
+            var visited = new HashSet<long>();
+            GameObject? current = gameObject;
+            var stopPathId = stopAtAncestor?.m_PathID;
+            for (var depth = 0; current != null && depth < 256; depth++)
+            {
+                if (!visited.Add(current.m_PathID))
+                {
+                    break;
+                }
+
+                if (!current.m_IsActive)
+                {
+                    return false;
+                }
+
+                if (stopPathId.HasValue && current.m_PathID == stopPathId.Value)
+                {
+                    break;
+                }
+
+                var currentFile = current.assetsFile ?? sourceFile;
+                var transform = ResolveTransformForGameObjectBackground(currentFile, current);
+                if (transform?.m_Father == null || transform.m_Father.IsNull)
+                {
+                    break;
+                }
+
+                var parentTransform = ResolveTransformBackground(currentFile, transform.m_Father);
+                if (parentTransform == null)
+                {
+                    break;
+                }
+
+                current = ResolveGameObjectBackground(parentTransform.assetsFile ?? currentFile, parentTransform.m_GameObject);
+            }
+
+            return true;
+        }
+
+        private static void AddAnimatorTransformRigBoneHashes(
+            SerializedFile sourceFile,
+            Animator animator,
+            string animatorId,
+            GameObject animatorGameObject,
+            string animatorGroupId,
+            string primaryMeshId,
+            List<SkinnedMeshSemanticBinding> skinnedMeshBindings,
+            SemanticAssetRelations relations)
+        {
+            var animatorTransform = ResolveTransformForGameObjectBackground(sourceFile, animatorGameObject);
+            if (animatorTransform == null)
+            {
+                return;
+            }
+
+            var animatorTransformPathId = animatorTransform.m_PathID;
+            var relativeHashes = new HashSet<uint>();
+            var resolvedMeshId = primaryMeshId;
+            var resolvedGroupId = animatorGroupId;
+            var pathSegments = new List<string>(16);
+            var visited = new HashSet<long>();
+
+            // Collect exact Animator-relative Transform path hashes for every bone (and ancestor transform
+            // beneath the Animator) across all SkinnedMeshRenderers whose bones descend from this Animator.
+            for (var bIdx = 0; bIdx < skinnedMeshBindings.Count; bIdx++)
+            {
+                var binding = skinnedMeshBindings[bIdx];
+                var bones = binding.Renderer?.m_Bones;
+                if (bones == null || bones.Length == 0)
+                {
+                    continue;
+                }
+
+                var matchedAnyBoneUnderAnimator = false;
+                for (var i = 0; i < bones.Length; i++)
+                {
+                    var boneTransform = ResolveTransformBackground(sourceFile, bones[i]);
+                    if (boneTransform == null)
+                    {
+                        continue;
+                    }
+
+                    if (!TryCollectRelativePathsToAnimator(
+                        sourceFile,
+                        boneTransform,
+                        animatorTransformPathId,
+                        pathSegments,
+                        visited,
+                        relativeHashes))
+                    {
+                        continue;
+                    }
+
+                    matchedAnyBoneUnderAnimator = true;
+                }
+
+                if (binding.Renderer?.m_RootBone != null && !binding.Renderer.m_RootBone.IsNull)
+                {
+                    var rootBoneTransform = ResolveTransformBackground(sourceFile, binding.Renderer.m_RootBone);
+                    if (rootBoneTransform != null)
+                    {
+                        TryCollectRelativePathsToAnimator(
+                            sourceFile,
+                            rootBoneTransform,
+                            animatorTransformPathId,
+                            pathSegments,
+                            visited,
+                            relativeHashes);
+                    }
+                }
+
+                if (matchedAnyBoneUnderAnimator && string.IsNullOrEmpty(resolvedMeshId) && !string.IsNullOrEmpty(binding.MeshId))
+                {
+                    resolvedMeshId = binding.MeshId;
+                }
+            }
+
+            if (relativeHashes.Count == 0 || string.IsNullOrEmpty(resolvedMeshId))
+            {
+                return;
+            }
+
+            // If this is a nested Animator (e.g. a facial rig under a character body) that had no direct
+            // descendant renderers of its own, associate it with the enclosing ModelGroup containing resolvedMeshId.
+            if (string.IsNullOrEmpty(resolvedGroupId))
+            {
+                resolvedGroupId = relations.ModelGroupMeshes
+                    .FirstOrDefault(m => string.Equals(m.MeshAssetId, resolvedMeshId, StringComparison.Ordinal)
+                        && !string.IsNullOrEmpty(m.GroupId))
+                    ?.GroupId ?? string.Empty;
+            }
+
+            var selectedHashes = SelectDeterministicBoneHashProbes(relativeHashes, MaxRigBoneHashProbes);
+            for (var i = 0; i < selectedHashes.Length; i++)
+            {
+                relations.RigBoneHashes.Add(new SemanticRigBoneHashEntry(
+                    string.Empty,
+                    animatorId,
+                    resolvedMeshId,
+                    resolvedGroupId,
+                    selectedHashes[i]));
+            }
+        }
+
+        private static bool TryCollectRelativePathsToAnimator(
+            SerializedFile sourceFile,
+            Transform leafTransform,
+            long animatorTransformPathId,
+            List<string> pathSegments,
+            HashSet<long> visited,
+            HashSet<uint> outputHashes)
+        {
+            pathSegments.Clear();
+            visited.Clear();
+            Transform? current = leafTransform;
+            var reachedAnimator = false;
+
+            for (var depth = 0; current != null && depth < 64; depth++)
+            {
+                if (!visited.Add(current.m_PathID))
+                {
+                    break;
+                }
+
+                if (current.m_PathID == animatorTransformPathId)
+                {
+                    reachedAnimator = true;
+                    break;
+                }
+
+                var currentFile = current.assetsFile ?? sourceFile;
+                var go = ResolveGameObjectBackground(currentFile, current.m_GameObject);
+                pathSegments.Add(go?.m_Name ?? string.Empty);
+
+                if (current.m_Father == null || current.m_Father.IsNull)
+                {
+                    break;
+                }
+
+                current = ResolveTransformBackground(currentFile, current.m_Father);
+            }
+
+            if (!reachedAnimator || pathSegments.Count == 0)
+            {
+                return false;
+            }
+
+            // Emit the Animator-relative path for this bone AND every intermediate ancestor transform
+            // beneath the Animator (e.g. SklRootNode, SklRootNode/SK_Skeleton, ..., bone).
+            pathSegments.Reverse();
+            var builder = new System.Text.StringBuilder(128);
+            for (var i = 0; i < pathSegments.Count; i++)
+            {
+                var segment = pathSegments[i];
+                if (string.IsNullOrEmpty(segment))
+                {
+                    return true;
+                }
+
+                if (builder.Length > 0)
+                {
+                    builder.Append('/');
+                }
+                builder.Append(segment);
+
+                var hash = ComputeUnityBonePathHash(builder.ToString());
+                if (hash != 0)
+                {
+                    outputHashes.Add(hash);
+                }
+            }
+
+            return true;
         }
 
         private static void AddAnimatorControllerClipRelations(
@@ -3411,9 +3686,17 @@ namespace AssetStudio.Avalonia.Services
                 }
 
                 var boneHashes = new HashSet<uint>();
-                if (binding.Mesh?.m_BoneNameHashes != null)
+                var hasTransformBones = binding.Renderer?.m_Bones != null && binding.Renderer.m_Bones.Length > 0;
+                var meshForHashes = binding.Mesh;
+                if (meshForHashes == null && !hasTransformBones && binding.Renderer?.m_Mesh != null)
                 {
-                    foreach (var hash in binding.Mesh.m_BoneNameHashes)
+                    // Rare fallback: only resolve Mesh when SkinnedMeshRenderer has no Transform m_Bones.
+                    meshForHashes = ResolveMeshBackground(sourceFile, binding.Renderer.m_Mesh);
+                }
+
+                if (meshForHashes?.m_BoneNameHashes != null)
+                {
+                    foreach (var hash in meshForHashes.m_BoneNameHashes)
                     {
                         if (hash != 0)
                         {
@@ -3422,14 +3705,16 @@ namespace AssetStudio.Avalonia.Services
                     }
                 }
 
-                if (binding.Renderer?.m_Bones != null && binding.Renderer.m_Bones.Length > 0)
+                if (hasTransformBones)
                 {
-                    var maxBonesToInspect = Math.Min(binding.Renderer.m_Bones.Length, MaxRigBoneHashProbes);
+                    var bones = binding.Renderer!.m_Bones!;
                     var pathSegments = new List<string>(16);
                     var visitedTransforms = new HashSet<long>();
-                    for (var i = 0; i < maxBonesToInspect && boneHashes.Count < MaxRigBoneHashProbes; i++)
+                    var primaryHashes = new HashSet<uint>();
+                    var secondaryHashes = new HashSet<uint>();
+                    for (var i = 0; i < bones.Length; i++)
                     {
-                        var transform = ResolveTransformBackground(sourceFile, binding.Renderer.m_Bones[i]);
+                        var transform = ResolveTransformBackground(sourceFile, bones[i]);
                         if (transform == null)
                         {
                             continue;
@@ -3465,49 +3750,65 @@ namespace AssetStudio.Avalonia.Services
                             continue;
                         }
 
-                        // Emit leaf name hash, full path hash, and relative path hashes beneath root ancestors
-                        // so Unity GenericBinding.path CRC32 hashes match Animator-root-relative paths.
                         var leafHash = ComputeUnityBonePathHash(pathSegments[0]);
-                        if (leafHash != 0)
-                        {
-                            boneHashes.Add(leafHash);
-                        }
-
                         pathSegments.Reverse();
                         var fullPath = string.Join("/", pathSegments);
                         var fullHash = ComputeUnityBonePathHash(fullPath);
-                        if (fullHash != 0)
-                        {
-                            boneHashes.Add(fullHash);
-                        }
 
-                        // Emit relative path without the outermost root (and second root if nested in scene)
+                        // Prioritize root-relative paths (strip=1, strip=2) and full path across ALL bones first,
+                        // keeping leaf names as secondary so large rigs are not truncated before reaching all bones.
                         for (var strip = 1; strip < pathSegments.Count - 1 && strip <= 2; strip++)
                         {
                             var relPath = string.Join("/", pathSegments.Skip(strip));
                             var relHash = ComputeUnityBonePathHash(relPath);
                             if (relHash != 0)
                             {
-                                boneHashes.Add(relHash);
+                                primaryHashes.Add(relHash);
+                            }
+                        }
+
+                        if (fullHash != 0)
+                        {
+                            secondaryHashes.Add(fullHash);
+                        }
+
+                        if (leafHash != 0)
+                        {
+                            secondaryHashes.Add(leafHash);
+                        }
+                    }
+
+                    foreach (var h in primaryHashes)
+                    {
+                        boneHashes.Add(h);
+                    }
+
+                    if (boneHashes.Count < MaxRigBoneHashProbes)
+                    {
+                        foreach (var h in secondaryHashes)
+                        {
+                            boneHashes.Add(h);
+                            if (boneHashes.Count >= MaxRigBoneHashProbes)
+                            {
+                                break;
                             }
                         }
                     }
                 }
 
-                var count = 0;
-                foreach (var hash in boneHashes)
+                var selectedHashes = SelectDeterministicBoneHashProbes(boneHashes, MaxRigBoneHashProbes);
+                var groupId = relations.ModelGroupMeshes
+                    .FirstOrDefault(m => string.Equals(m.MeshAssetId, binding.MeshId, StringComparison.Ordinal)
+                        && !string.IsNullOrEmpty(m.GroupId))
+                    ?.GroupId ?? string.Empty;
+                for (var i = 0; i < selectedHashes.Length; i++)
                 {
                     relations.RigBoneHashes.Add(new SemanticRigBoneHashEntry(
                         string.Empty,
                         string.Empty,
                         binding.MeshId,
-                        string.Empty,
-                        hash));
-                    count++;
-                    if (count >= MaxRigBoneHashProbes)
-                    {
-                        break;
-                    }
+                        groupId,
+                        selectedHashes[i]));
                 }
             }
         }
@@ -4041,6 +4342,13 @@ namespace AssetStudio.Avalonia.Services
 
         // --- Lazy Connections Pass & SQLite Staging ---
 
+        private static bool IsMeaningfulLazyConnectionHandleType(ClassIDType type)
+        {
+            return (LazyConnectionReferenceTypes.Contains(type) && type != ClassIDType.AssetBundle)
+                || type == ClassIDType.Mesh
+                || type == ClassIDType.MonoBehaviour;
+        }
+
         public static List<string> GetLazyConnectionSourcePaths(
             ProjectIndex projectIndex,
             Action<AssetHandle>? rememberHandleSourcePath,
@@ -4064,7 +4372,9 @@ namespace AssetStudio.Avalonia.Services
 
                 rememberHandleSourcePath?.Invoke(handle);
 
-                if (!LazyConnectionReferenceTypes.Contains(handle.Type))
+                // Skip pure media/leaf bundles containing only AssetBundle + Texture/Audio/Text/Shader/Sprite
+                // with zero reference types, zero Mesh, and zero MonoBehaviour (guaranteed zero semantic rows).
+                if (!IsMeaningfulLazyConnectionHandleType(handle.Type))
                 {
                     continue;
                 }
@@ -4134,7 +4444,7 @@ namespace AssetStudio.Avalonia.Services
             };
             var failedSources = new List<string>();
             var effectiveFlushThreshold = Math.Max(1, stagingFlushRowThreshold);
-            const int batchSize = 32;
+            const int batchSize = 64;
             var parallelOptions = CreateSemanticGraphParallelOptions();
 
             for (var i = 0; i < sourcePaths.Count; i += batchSize)
@@ -4148,7 +4458,7 @@ namespace AssetStudio.Avalonia.Services
                         await waitForInteractionPriorityAsync(CancellationToken.None);
                     }
                     AssetsManager.ThrowIfMemoryPressureTooHigh("building lazy connections");
-                    await assetsManager.LoadFilesAsync(batch.ToArray());
+                    await assetsManager.LoadFilesForConnectionsAsync(batch.ToArray());
 
                     var filesBySource = ResolveLoadedFilesForConnectionBatch(assetsManager, batch);
                     var materializationResults = new SourceConnectionMaterializationResult?[batch.Count];
@@ -4456,7 +4766,7 @@ namespace AssetStudio.Avalonia.Services
                 {
                     if (handle == null
                         || !ReferenceEquals(handle.SourceFile, file)
-                        || !LazyConnectionReferenceTypes.Contains(handle.Type)
+                        || (!LazyConnectionReferenceTypes.Contains(handle.Type) && handle.Type != ClassIDType.Mesh)
                         || (isHandlePinnedForPreview != null && isHandlePinnedForPreview(handle)))
                     {
                         continue;

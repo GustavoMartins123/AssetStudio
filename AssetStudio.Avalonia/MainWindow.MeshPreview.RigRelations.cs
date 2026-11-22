@@ -268,21 +268,150 @@ public partial class MainWindow
                 continue;
             }
 
-            var sourceFile = current.assetsFile ?? renderer.assetsFile;
-            var parentTransform = ResolveTransformBackground(sourceFile, current.m_Father);
-            if (parentTransform == null)
+            // Walk up m_Father past intermediate non-SMR transforms until finding the nearest
+            // ancestor bone that belongs to this SkinnedMeshRenderer (prevents detached sub-chains).
+            var visitedParents = new HashSet<long> { current.m_PathID };
+            var walk = current;
+            for (var depth = 0; walk?.m_Father != null && !walk.m_Father.IsNull && depth < 64; depth++)
             {
-                continue;
-            }
+                var sourceFile = walk.assetsFile ?? renderer.assetsFile;
+                var parentTransform = ResolveTransformBackground(sourceFile, walk.m_Father);
+                if (parentTransform == null || !visitedParents.Add(parentTransform.m_PathID))
+                {
+                    break;
+                }
 
-            var parentId = GetSemanticAssetId(parentTransform);
-            if (!string.IsNullOrEmpty(parentId) && transformIndexById.TryGetValue(parentId, out var parentIndex))
-            {
-                parentIndices[i] = parentIndex;
+                var parentId = GetSemanticAssetId(parentTransform);
+                if (!string.IsNullOrEmpty(parentId) && transformIndexById.TryGetValue(parentId, out var parentIndex))
+                {
+                    parentIndices[i] = parentIndex;
+                    break;
+                }
+
+                walk = parentTransform;
             }
         }
 
         return parentIndices.Any(index => index >= 0);
+    }
+
+    private static List<Transform> CollectAncestorAndFileAnimatorRoots(
+        SerializedFile sourceFile,
+        SkinnedMeshRenderer renderer)
+    {
+        var roots = new List<Transform>();
+        var seenIds = new HashSet<long>();
+
+        void TryAddAnimatorTransform(Animator? anim)
+        {
+            if (anim == null)
+            {
+                return;
+            }
+
+            var animFile = anim.assetsFile ?? sourceFile;
+            var animGo = ResolveGameObjectBackground(animFile, anim.m_GameObject);
+            var animTr = animGo != null ? Services.SemanticGraphService.ResolveTransformForGameObjectBackground(animFile, animGo) : null;
+            if (animTr != null && seenIds.Add(animTr.m_PathID))
+            {
+                roots.Add(animTr);
+            }
+        }
+
+        AssetStudio.Object[] objs;
+        lock (sourceFile)
+        {
+            objs = sourceFile.Objects.ToArray();
+        }
+
+        foreach (var anim in objs.OfType<Animator>())
+        {
+            TryAddAnimatorTransform(anim);
+        }
+
+        return roots;
+    }
+
+    private static bool TryBuildTransformHierarchySkeletonForMesh(
+        Mesh mesh,
+        SkinnedMeshRenderer renderer,
+        HashSet<uint>? preferredClipBindingPaths,
+        out Services.AvatarDefaultSkeletonData skeleton,
+        out Dictionary<long, int> transformPathIdToNodeIdx)
+    {
+        skeleton = null!;
+        transformPathIdToNodeIdx = new Dictionary<long, int>();
+
+        var sourceFile = renderer?.assetsFile ?? mesh?.assetsFile;
+        if (sourceFile == null || renderer?.m_Bones == null || renderer.m_Bones.Length == 0)
+        {
+            return false;
+        }
+
+        var requiredTransforms = new List<Transform>(renderer.m_Bones.Length + 1);
+        for (var i = 0; i < renderer.m_Bones.Length; i++)
+        {
+            var tr = ResolveTransformBackground(sourceFile, renderer.m_Bones[i]);
+            if (tr != null)
+            {
+                requiredTransforms.Add(tr);
+            }
+        }
+
+        if (renderer.m_RootBone != null && !renderer.m_RootBone.IsNull)
+        {
+            var rootBoneTr = ResolveTransformBackground(sourceFile, renderer.m_RootBone);
+            if (rootBoneTr != null)
+            {
+                requiredTransforms.Add(rootBoneTr);
+            }
+        }
+
+        if (requiredTransforms.Count == 0)
+        {
+            return false;
+        }
+
+        var animatorRoots = CollectAncestorAndFileAnimatorRoots(sourceFile, renderer);
+        var animatorRootIds = new HashSet<long>(animatorRoots.Select(t => t.m_PathID));
+
+        // Pick the outermost Animator (or top-most Transform root) enclosing this renderer's bones
+        // so RestWorldMatrices live in character root space (matching mesh.m_BindPose).
+        Transform? skeletonRoot = null;
+        var seed = requiredTransforms[0];
+        var visited = new HashSet<long>();
+        Transform? topTransform = seed;
+        Transform? outermostAnimator = null;
+        for (var cur = seed; cur != null && visited.Add(cur.m_PathID); )
+        {
+            topTransform = cur;
+            if (animatorRootIds.Contains(cur.m_PathID))
+            {
+                outermostAnimator = cur;
+            }
+
+            if (cur.m_Father == null || cur.m_Father.IsNull)
+            {
+                break;
+            }
+
+            cur = ResolveTransformBackground(cur.assetsFile ?? sourceFile, cur.m_Father);
+        }
+
+        skeletonRoot = outermostAnimator ?? topTransform;
+        if (skeletonRoot == null)
+        {
+            return false;
+        }
+
+        return Services.MeshPreviewSkeletonBuilder.TryBuildSkeletonFromTransformHierarchy(
+            sourceFile,
+            skeletonRoot,
+            requiredTransforms,
+            animatorRoots,
+            preferredClipBindingPaths,
+            out skeleton,
+            out transformPathIdToNodeIdx);
     }
 
     private static string GetTransformRelationId(SerializedFile sourceFile, PPtr<Transform> transformPtr, Transform? transform)

@@ -120,16 +120,25 @@ namespace AssetStudio
             public readonly ConcurrentDictionary<string, byte> SkippedExternalFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
             public readonly bool IsolateStreams;
             public readonly bool AllowExternalCascadeGuard;
+            public readonly bool SerializedFilesOnly;
+            public readonly bool SkipDecompressionCache;
             public readonly object CascadePromptLock = new object();
             public int TotalCount;
             public int EnqueuedExternalCount;
             public int CascadeDecision; // 0 = undecided, 1 = allow, -1 = stop
 
-            public LoadContext(int totalCount, bool isolateStreams = false, bool allowExternalCascadeGuard = false)
+            public LoadContext(
+                int totalCount,
+                bool isolateStreams = false,
+                bool allowExternalCascadeGuard = false,
+                bool serializedFilesOnly = false,
+                bool skipDecompressionCache = false)
             {
                 TotalCount = totalCount;
                 IsolateStreams = isolateStreams;
                 AllowExternalCascadeGuard = allowExternalCascadeGuard;
+                SerializedFilesOnly = serializedFilesOnly;
+                SkipDecompressionCache = skipDecompressionCache;
             }
         }
 
@@ -308,6 +317,48 @@ namespace AssetStudio
             await LoadFilesAsync(false, files);
         }
 
+        public async System.Threading.Tasks.Task LoadFilesForConnectionsAsync(params string?[] files)
+        {
+            DisableMemoryPressureCheck = false;
+            ShouldStopLoading = false;
+            if (files == null || files.Length == 0)
+            {
+                return;
+            }
+
+            var nonEmptyFiles = files.Where(f => !string.IsNullOrWhiteSpace(f)).Select(f => f!).ToArray();
+            if (nonEmptyFiles.Length == 0)
+            {
+                return;
+            }
+
+            var path = Path.GetDirectoryName(Path.GetFullPath(nonEmptyFiles[0]));
+            if (string.IsNullOrEmpty(ProjectRoot))
+            {
+                ProjectRoot = path;
+            }
+
+            var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            foreach (var dir in nonEmptyFiles
+                .Where(f => f.EndsWith(".split0", StringComparison.OrdinalIgnoreCase))
+                .Select(f => Path.GetDirectoryName(Path.GetFullPath(f)))
+                .Where(d => !string.IsNullOrEmpty(d))
+                .Select(d => d!)
+                .Distinct(dirComparer))
+            {
+                MergeSplitAssets(dir);
+            }
+
+            var toReadFile = ProcessingSplitFiles(nonEmptyFiles);
+            await LoadAsync(
+                toReadFile,
+                highPriority: false,
+                allowAutoDependencies: false,
+                allowExternalCascadeGuard: false,
+                serializedFilesOnly: true,
+                skipDecompressionCache: true);
+        }
+
         public void LoadFilesForPreview(params string?[] files)
         {
             LoadFilesAsync(true, files).GetAwaiter().GetResult();
@@ -390,10 +441,17 @@ namespace AssetStudio
             string[] files,
             bool highPriority,
             bool allowAutoDependencies = false,
-            bool allowExternalCascadeGuard = false)
+            bool allowExternalCascadeGuard = false,
+            bool serializedFilesOnly = false,
+            bool skipDecompressionCache = false)
         {
             LastSkippedExternalDependencyCount = 0;
-            var context = new LoadContext(files.Length, isolateStreams: false, allowExternalCascadeGuard: allowExternalCascadeGuard);
+            var context = new LoadContext(
+                files.Length,
+                isolateStreams: false,
+                allowExternalCascadeGuard: allowExternalCascadeGuard,
+                serializedFilesOnly: serializedFilesOnly,
+                skipDecompressionCache: skipDecompressionCache);
 
             foreach (var file in files)
             {
@@ -867,13 +925,14 @@ namespace AssetStudio
             int handedOffCount = 0;
             try
             {
-                bool isLazyIndexingPass = LazyLoading && context.IsolateStreams;
+                bool skipDecompressionCache = context.SkipDecompressionCache || (LazyLoading && context.IsolateStreams);
+                bool serializedFilesOnly = context.SerializedFilesOnly || (LazyLoading && context.IsolateStreams);
                 bundleFile = new BundleFile(
                     reader,
-                    decompressionCache: isLazyIndexingPass ? null : DecompressionCache,
+                    decompressionCache: skipDecompressionCache ? null : DecompressionCache,
                     allowParallelDecompression: true,
                     lowMemoryThresholdOverride: null,
-                    serializedFilesOnly: isLazyIndexingPass);
+                    serializedFilesOnly: serializedFilesOnly);
                 if (bundleFile.BlocksStream != null)
                 {
                     if (context.IsolateStreams)
