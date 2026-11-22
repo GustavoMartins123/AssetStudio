@@ -122,6 +122,7 @@ public partial class MainWindow
     private void ApplyUnityVersionOption()
     {
         assetsManager.SpecifyUnityVersion = ViewModel.Options.SpecifyUnityVersion?.Trim() ?? string.Empty;
+        assetsManager.AutoLoadCatalogDependencies = ViewModel.Options.AutoLoadCatalogDependencies;
         if (appSettings.SpecifyUnityVersion != assetsManager.SpecifyUnityVersion)
         {
             appSettings.SpecifyUnityVersion = assetsManager.SpecifyUnityVersion;
@@ -307,6 +308,16 @@ public partial class MainWindow
         StatusStripUpdate(enabled
             ? "Disk decompression cache (Lazy Mode) enabled."
             : "Disk decompression cache (Lazy Mode) disabled.");
+    }
+
+    private void OnAutoLoadCatalogDependenciesOptionChanged(bool enabled)
+    {
+        appSettings.AutoLoadCatalogDependencies = enabled;
+        assetsManager.AutoLoadCatalogDependencies = enabled;
+        SaveAppSettings();
+        StatusStripUpdate(enabled
+            ? "Auto-load Addressables catalog dependencies enabled."
+            : "Auto-load Addressables catalog dependencies disabled.");
     }
 
     private void OnShowErrorMessageOptionChanged(bool showErrorMessage)

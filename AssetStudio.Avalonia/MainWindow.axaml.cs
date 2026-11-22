@@ -486,6 +486,7 @@ public partial class MainWindow : Window
         ViewModel.Options.EnablePreviewChanged += OnEnablePreviewOptionChanged;
         ViewModel.Options.DisplayInfoChanged += OnDisplayInfoOptionChanged;
         ViewModel.Options.UseDiskDecompressionCacheChanged += OnUseDiskDecompressionCacheOptionChanged;
+        ViewModel.Options.AutoLoadCatalogDependenciesChanged += OnAutoLoadCatalogDependenciesOptionChanged;
         ViewModel.Options.ShowErrorMessageChanged += OnShowErrorMessageOptionChanged;
         ViewModel.Options.ThemeChanged += OnThemeOptionChanged;
     }
@@ -496,6 +497,7 @@ public partial class MainWindow : Window
         ViewModel.Options.EnablePreviewChanged -= OnEnablePreviewOptionChanged;
         ViewModel.Options.DisplayInfoChanged -= OnDisplayInfoOptionChanged;
         ViewModel.Options.UseDiskDecompressionCacheChanged -= OnUseDiskDecompressionCacheOptionChanged;
+        ViewModel.Options.AutoLoadCatalogDependenciesChanged -= OnAutoLoadCatalogDependenciesOptionChanged;
         ViewModel.Options.ShowErrorMessageChanged -= OnShowErrorMessageOptionChanged;
         ViewModel.Options.ThemeChanged -= OnThemeOptionChanged;
     }

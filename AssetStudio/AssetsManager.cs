@@ -81,6 +81,8 @@ namespace AssetStudio
         public ConcurrentBag<Stream> bundleStreams = new ConcurrentBag<Stream>();
         public ProjectIndex ProjectIndex = new ProjectIndex();
         public bool LazyLoading = false;
+        public bool AutoLoadCatalogDependencies { get; set; } = true;
+        public int MaxAutoLoadCatalogDependencies { get; set; } = AddressablesCatalogDependencyResolver.DefaultMaxDependencyBundles;
         public DecompressedBundleCache? DecompressionCache { get; set; }
 
         private readonly object unityVersionInferenceLock = new object();
@@ -328,7 +330,7 @@ namespace AssetStudio
                 MergeSplitAssets(dir);
             }
             var toReadFile = ProcessingSplitFiles(nonEmptyFiles);
-            await LoadAsync(toReadFile, highPriority);
+            await LoadAsync(toReadFile, highPriority, allowAutoDependencies: AutoLoadCatalogDependencies && !LazyLoading);
         }
 
         public void LoadFolder(string path)
@@ -347,7 +349,7 @@ namespace AssetStudio
             MergeSplitAssets(path, true);
             var files = ImportHelper.GetFilesSafe(path, "*.*", true);
             var toReadFile = ProcessingSplitFiles(files);
-            await LoadAsync(toReadFile, highPriority: false);
+            await LoadAsync(toReadFile, highPriority: false, allowAutoDependencies: false);
         }
 
         private async System.Threading.Tasks.Task YieldForUserInteractionIfNeededAsync(bool highPriority = false)
@@ -369,7 +371,7 @@ namespace AssetStudio
             }
         }
 
-        private async System.Threading.Tasks.Task LoadAsync(string[] files, bool highPriority)
+        private async System.Threading.Tasks.Task LoadAsync(string[] files, bool highPriority, bool allowAutoDependencies = false)
         {
             var context = new LoadContext(files.Length);
 
@@ -386,7 +388,33 @@ namespace AssetStudio
             int configuredThreadCount = LazyLoading
                 ? GetConfiguredThreadCountOrDefault("ASSETSTUDIO_LAZY_LOAD_THREADS", DefaultLazyLoadThreadCount)
                 : GetConfiguredThreadCount("ASSETSTUDIO_LOAD_THREADS", DefaultLoadThreadRatio);
-            int threadCount = Math.Min(highPriority && LazyLoading ? 1 : configuredThreadCount, context.TotalCount);
+
+            await DrainLoadQueueAsync(context, highPriority, configuredThreadCount, () => System.Threading.Interlocked.Increment(ref completedCount));
+
+            if (allowAutoDependencies && AutoLoadCatalogDependencies && !LazyLoading && !ShouldStopLoading)
+            {
+                await ResolveAndLoadAutoDependenciesAsync(files, context, highPriority, configuredThreadCount, () => System.Threading.Interlocked.Increment(ref completedCount));
+            }
+
+            await ReadAssetsAsync(highPriority, context);
+            if (!LazyLoading)
+            {
+                ProcessAssets();
+            }
+        }
+
+        private async System.Threading.Tasks.Task DrainLoadQueueAsync(
+            LoadContext context,
+            bool highPriority,
+            int configuredThreadCount,
+            Func<int> incrementCompletedCount)
+        {
+            if (context.Queue.IsEmpty)
+            {
+                return;
+            }
+
+            int threadCount = Math.Min(highPriority && LazyLoading ? 1 : configuredThreadCount, Math.Max(1, context.Queue.Count));
             if (threadCount < 1) threadCount = 1;
             var lazyLoadGateForOperation = LazyLoading && !highPriority ? GetLazyLoadGate(configuredThreadCount) : null;
 
@@ -451,7 +479,7 @@ namespace AssetStudio
                             {
                                 Logger.Error($"Error loading file {file}: {ex.Message}", ex);
                             }
-                            var completed = System.Threading.Interlocked.Increment(ref completedCount);
+                            var completed = incrementCompletedCount();
                             Progress.Report(completed, System.Threading.Volatile.Read(ref context.TotalCount));
                         }
                         else
@@ -473,11 +501,95 @@ namespace AssetStudio
                 });
             }
             await System.Threading.Tasks.Task.WhenAll(tasks);
+        }
 
-            await ReadAssetsAsync(highPriority, context);
-            if (!LazyLoading)
+        private async System.Threading.Tasks.Task ResolveAndLoadAutoDependenciesAsync(
+            string[] initialFiles,
+            LoadContext context,
+            bool highPriority,
+            int configuredThreadCount,
+            Func<int> incrementCompletedCount)
+        {
+            int maxDeps = Math.Max(0, MaxAutoLoadCatalogDependencies);
+            if (maxDeps == 0 || initialFiles == null || initialFiles.Length == 0)
             {
-                ProcessAssets();
+                return;
+            }
+
+            var existingImports = new HashSet<string>(
+                context.ImportFiles.Select(static f =>
+                {
+                    try { return Path.GetFullPath(f); }
+                    catch { return f; }
+                }),
+                StringComparer.OrdinalIgnoreCase);
+
+            var currentSeedFiles = initialFiles;
+            int totalAutoLoaded = 0;
+            const int maxWaves = 4;
+
+            for (int wave = 0; wave < maxWaves && totalAutoLoaded < maxDeps && !ShouldStopLoading; wave++)
+            {
+                int remainingBudget = maxDeps - totalAutoLoaded;
+                var loadedFileNames = new HashSet<string>(assetsFileListHash.Keys, StringComparer.OrdinalIgnoreCase);
+                var resolvedDeps = AddressablesCatalogDependencyResolver.ResolveDependenciesForLoadedFiles(
+                    currentSeedFiles,
+                    context.LoadedAssetsFiles.ToArray(),
+                    loadedFileNames,
+                    remainingBudget,
+                    ProjectRoot);
+
+                if (resolvedDeps.Count == 0)
+                {
+                    break;
+                }
+
+                var enqueuedWave = new List<string>(resolvedDeps.Count);
+                foreach (var depPath in resolvedDeps)
+                {
+                    if (totalAutoLoaded + enqueuedWave.Count >= maxDeps)
+                    {
+                        break;
+                    }
+
+                    string fullDepPath;
+                    try
+                    {
+                        fullDepPath = Path.GetFullPath(depPath);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    var depFileName = Path.GetFileName(fullDepPath);
+                    if (string.IsNullOrEmpty(depFileName)
+                        || existingImports.Contains(fullDepPath)
+                        || !context.ImportFilesHash.TryAdd(depFileName, 0))
+                    {
+                        continue;
+                    }
+
+                    existingImports.Add(fullDepPath);
+                    context.ImportFiles.Add(fullDepPath);
+                    context.Queue.Enqueue(fullDepPath);
+                    System.Threading.Interlocked.Increment(ref context.TotalCount);
+                    enqueuedWave.Add(fullDepPath);
+                }
+
+                if (enqueuedWave.Count == 0)
+                {
+                    break;
+                }
+
+                totalAutoLoaded += enqueuedWave.Count;
+                await DrainLoadQueueAsync(context, highPriority, configuredThreadCount, incrementCompletedCount);
+                currentSeedFiles = enqueuedWave.ToArray();
+            }
+
+            if (totalAutoLoaded > 0)
+            {
+                Logger.Info($"Auto-resolved {totalAutoLoaded} dependency bundle(s) via Addressables catalog/externals.");
             }
         }
 

@@ -15,6 +15,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private bool _enablePreview = true;
         private bool _displayInfo = true;
         private bool _useDiskDecompressionCache = true;
+        private bool _autoLoadCatalogDependencies = true;
         private bool _showErrorMessage;
         private string _specifyUnityVersion = string.Empty;
         private AppThemePreference _selectedTheme = AppThemePreference.Default;
@@ -37,6 +38,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public event Action<bool>? DisplayInfoChanged;
 
         public event Action<bool>? UseDiskDecompressionCacheChanged;
+
+        public event Action<bool>? AutoLoadCatalogDependenciesChanged;
 
         public event Action<bool>? ShowErrorMessageChanged;
 
@@ -95,6 +98,19 @@ namespace AssetStudio.Avalonia.ViewModels
                 if (SetProperty(ref _useDiskDecompressionCache, value))
                 {
                     UseDiskDecompressionCacheChanged?.Invoke(value);
+                    SettingsChanged?.Invoke();
+                }
+            }
+        }
+
+        public bool AutoLoadCatalogDependencies
+        {
+            get => _autoLoadCatalogDependencies;
+            set
+            {
+                if (SetProperty(ref _autoLoadCatalogDependencies, value))
+                {
+                    AutoLoadCatalogDependenciesChanged?.Invoke(value);
                     SettingsChanged?.Invoke();
                 }
             }
@@ -199,6 +215,7 @@ namespace AssetStudio.Avalonia.ViewModels
             EnablePreview = settings.EnablePreview;
             DisplayInfo = settings.DisplayInfo;
             UseDiskDecompressionCache = settings.UseDiskDecompressionCache;
+            AutoLoadCatalogDependencies = settings.AutoLoadCatalogDependencies;
             ShowErrorMessage = settings.ShowErrorMessage;
             SpecifyUnityVersion = settings.SpecifyUnityVersion ?? string.Empty;
             SelectedTheme = ParseThemePreference(settings.SelectedTheme);
@@ -212,6 +229,7 @@ namespace AssetStudio.Avalonia.ViewModels
             settings.EnablePreview = EnablePreview;
             settings.DisplayInfo = DisplayInfo;
             settings.UseDiskDecompressionCache = UseDiskDecompressionCache;
+            settings.AutoLoadCatalogDependencies = AutoLoadCatalogDependencies;
             settings.ShowErrorMessage = ShowErrorMessage;
             settings.SpecifyUnityVersion = SpecifyUnityVersion;
             settings.SelectedTheme = FormatThemePreference(SelectedTheme);

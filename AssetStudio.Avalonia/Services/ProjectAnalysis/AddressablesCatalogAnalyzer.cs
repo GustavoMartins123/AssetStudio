@@ -343,9 +343,53 @@ public sealed class AddressablesCatalogAnalyzer
                 totalRead += read;
             }
 
-            var asciiTokens = ExtractBinaryCatalogStrings(buffer.AsSpan(0, totalRead), minLength: 6);
             var catalogProviders = new HashSet<string>(StringComparer.Ordinal);
             var seenBundles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (AddressablesCatalogDependencyResolver.TryParseBinaryCatalogBytes(
+                buffer.AsSpan(0, totalRead),
+                catalogPath,
+                Path.GetDirectoryName(catalogPath) ?? string.Empty,
+                out var parsedBinary) && parsedBinary != null)
+            {
+                summary.LocatorId = parsedBinary.LocatorId;
+                foreach (var provider in parsedBinary.Providers)
+                {
+                    if (!string.IsNullOrWhiteSpace(provider))
+                    {
+                        catalogProviders.Add(provider);
+                        allProviders.Add(provider);
+                        EvaluateProviderHint(provider, catalogPath, hints, seenHints);
+                    }
+                }
+
+                foreach (var node in parsedBinary.Bundles)
+                {
+                    if (string.IsNullOrWhiteSpace(node.InternalId) || !seenBundles.Add(node.InternalId))
+                    {
+                        continue;
+                    }
+
+                    summary.BundleCount++;
+                    if (index.Bundles.Count < MaxIndexedBundles)
+                    {
+                        index.Bundles.Add(new AddressablesBundleEntry
+                        {
+                            CatalogPath = catalogPath,
+                            InternalId = node.InternalId,
+                            BundleFileName = node.BundleFileName,
+                            BundleName = node.BundleName,
+                            Hash = node.Hash,
+                            Crc = node.Crc,
+                            ProviderId = node.ProviderId,
+                            IsRemote = IsRemoteUrl(node.InternalId),
+                            UsesNonStandardProvider = !string.IsNullOrWhiteSpace(node.ProviderId) && IsNonStandardProvider(node.ProviderId)
+                        });
+                    }
+                }
+            }
+
+            var asciiTokens = ExtractBinaryCatalogStrings(buffer.AsSpan(0, totalRead), minLength: 6);
 
             foreach (var token in asciiTokens)
             {

@@ -80,6 +80,11 @@
                         <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem x:Name="autoLoadCatalogDependenciesMenu" Header="Auto-load Addressables catalog dependencies" ToggleType="CheckBox" IsChecked="{Binding Options.AutoLoadCatalogDependencies, Mode=TwoWay}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_settings}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
                 <MenuItem Header="Set project root..." Command="{Binding SetProjectRootCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_folder}" Width="16" Height="16" />

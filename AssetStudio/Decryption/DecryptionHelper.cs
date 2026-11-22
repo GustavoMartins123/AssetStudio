@@ -144,6 +144,8 @@ namespace AssetStudio
                 customProviders.Clear();
                 activePipeline = BuildDefaultPipeline();
             }
+
+            AddressablesCatalogDependencyResolver.ClearCache();
         }
 
         public static Stream? CheckAndDecryptStream(Stream? stream, string? filePath)
