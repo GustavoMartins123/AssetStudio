@@ -8,44 +8,39 @@ This update is an independent community maintenance effort. Its purpose is to ke
 
 **None of the repo, the tool, nor the repo owner is affiliated with, or sponsored or authorized by, Unity Technologies or its affiliates.**
 
-AssetStudio is a cross-platform tool for exploring, previewing, extracting, and exporting Unity assets and AssetBundles.
+AssetStudio is a tool for exploring, extracting and exporting assets and AssetBundles.
 
 ## Features
 
-* **Unity Version Support**:
-  * **Unity `3.4` – `6000.4`** (Mono & IL2CPP, including `Renderer`/`SkinnedMeshRenderer` `6000.2+`, `Mesh` LOD info, `Shader` `2021.3.10+` `m_PlayerSubPrograms` / `6000.x`, `Texture2D` `m_ColorSpace`, `AnimatorController` `6000.3–6000.4`, `>512 MiB` serialized objects, and cross-platform `UnityPlayer.dll` / `.exe` PE version fallback for stripped `UnityFS` bundles).
-* **Supported Asset Types, Previews & Exporters**:
-  * **3D Models (`Mesh`, `Avatar`, `Animator`, `AnimationClip`)**:
-    * **Export to `.glb` / `.gltf 2.0`** (native pure-C#, zero extra dependencies) — PBR (`pbrMetallicRoughness` with automatic Metallic/Roughness channel packing), skinning (`skins` + `inverseBindMatrices`), morph targets / BlendShapes (`targets` + `extras.targetNames`), TRS + morph animations, `KHR_texture_transform`, and split animation export. Validated via headless **Blender 5.3.0** roundtrip tests.
-    * **Export to `.fbx`** (Binary/ASCII, Blender-reimportable with exact `UnitScaleFactor`, multi-UV layers, binormals, Humanoid `MuscleClip` decoding, BlendShape animation curves, Euler unwrapping, `CombineMeshes`, and FBX 7500 64-bit offsets), **`.obj`**, and Unity native **`.anim` / `.meta`**.
-    * **Unified Multi-Mesh 3D OpenGL Preview**: shared textured/lit/wireframe pipeline across `Mesh`, `Avatar`, and `AnimationClip` with optional X-Ray skeleton overlay, multi-part skinned + rigid bone-attached object assembly (including rigid-only chains and skeleton-only 3D Avatar fallback), a **Full Object (N parts)** toggle, and a **1-click `Export Model...`** button with async progress bar directly inside *Model Controls*.
-  * **Texture2D**: convert to `png`, `tga`, `jpeg`, `bmp` (with `DXT5nm`/`BC5` normal map unpacking, HDR float clamp, Crunch, BC6H/BC7, ETC2, ASTC, PVRTC) and GPU/CPU preview with channel toggles.
-  * **Sprite**: crop `Texture2D` / `SpriteAtlas` (with alpha texture & 32-bit support) to `png`, `tga`, `jpeg`, `bmp`.
-  * **AudioClip**: native pure-C# **FSB5 Vorbis → Ogg Vorbis** reconstruction + PCM/ADPCM decoding (`wav`, `ogg`, `mp3`, `m4a`, `fsb`) with real-time audio playback preview.
-  * **VideoClip, VideoPlayer & MovieTexture**: unified FFmpeg playback preview (thumbnail, Play/Pause/Stop, seek, volume, loop) and direct export.
-  * **TextAsset**: dialogue/text viewer plus O(1) header sniffing and interactive preview/export routing for **40+ embedded binary & multimedia formats** (AVI/MP4/WebM/MKV/Ogg/Bink/USM, WAV/OGG/MP3/FLAC/FSB5/Wwise, PNG/JPEG/WebP/DDS/KTX/PSD, TTF/OTF/WOFF, ZIP/7z/SQLite/PDF/UnityFS/Lua/WASM, etc.).
-  * **Shader & Material**: Unity `5.3` – `6000.4` ShaderLab conversion (supporting `m_PlayerSubPrograms` and excluding reflection parameter blobs), plus hardware **Direct3D 11 Shader & Material Preview** on Windows (executing Unity 5.3 DXBC passes, `UsePass`, `GrabPass`, `ForwardAdd`, particles/time, deferred lighting, and shadow mapping).
-  * **Font & TextMeshPro (`TMP_FontAsset`)**: renders embedded TrueType/OpenType/TTC/symbol fonts, legacy bitmap `Font` atlases (when `m_FontData` is empty), and `TMP_FontAsset` SDF atlases with alpha enhancement and glyph metrics.
-  * **MonoBehaviour**: JSON export and TypeTree/assembly-backed inspection (Mono & IL2CPP dummy DLLs, including `[SerializeReference]`, `Gradient` `2022.2+`, generics, and `InvariantCulture` formatting).
-* **Cross-Platform Pure MVVM UI (`AssetStudio.Avalonia`, Windows & Linux)**:
-  * Built on **.NET 10** and **Avalonia UI** (`x:CompileBindings="True"`, pure MVVM across all 5 windows).
-  * **Project Manager & Back to Projects**: per-project profiles, icons, settings, safe teardown, and instant navigation back to the Project Manager.
-  * **SQLite Schema v15 Graph Cache & Zero-Blocking Preview**: persistent asset index, mesh/material/texture cache, `ModelGroup` & `AnimationClipTargets` graph, and a non-detaching **`References` (*Used By* / *Uses*)** tab alongside `Preview` and `Dump` with click-to-jump navigation (preserving OpenGL surfaces across tab switches).
-  * **Scene Hierarchy, Asset List & Asset Classes**: virtualized list (`IDataGridCollectionView`), search & check propagation, column sorting, type filters, TypeTree class explorer, and Log Viewer.
+* Supported Unity versions:
+  * 3.4 – 6000.4 (Mono and IL2CPP)
+* Supported asset types:
+  * **Texture2D**: convert to `png`, `tga`, `jpeg`, `bmp`, with preview and color channel toggles.
+  * **Sprite**: crop `Texture2D` / `SpriteAtlas` to `png`, `tga`, `jpeg`, `bmp`.
+  * **AudioClip**: export to `wav`, `ogg`, `mp3`, `m4a`, `fsb` (including FSB5 Vorbis decoding), with audio playback preview.
+  * **Font**: export `ttf`, `otf`; preview embedded fonts, bitmap font atlases, and TextMeshPro font atlases.
+  * **Mesh, Avatar, Animator & AnimationClip**: export to `glb`, `gltf`, `fbx`, `obj`, and Unity `.anim` / `.meta`; 3D OpenGL preview with textures, skeleton overlay, multi-part model groups, animation playback, and direct export from the preview panel.
+  * **TextAsset**: text viewer plus detection, preview, and export for common embedded video, audio, image, font, and binary formats.
+  * **Shader & Material**: ShaderLab export, plus Direct3D 11 shader and material preview on Windows.
+  * **MovieTexture & VideoClip**: video playback preview and export.
+  * **MonoBehaviour**: export to `json`.
+* Cross-Platform Support (Windows & Linux):
+  * **AssetStudio.Avalonia**
+  * Avalonia UI frontend on .NET 10 with Project Manager, Scene Hierarchy search & check propagation, Asset List sorting & filters, Asset Classes explorer, Preview / Dump / References tabs, Log Viewer, and saved settings.
 
 ## Requirements
 
 * **AssetStudio.Avalonia** (Windows / Linux)
-  * [.NET 10 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (only required for framework-dependent builds; default publish scripts and GitHub Releases produce self-contained builds)
-  * Tested on **Windows (x64)** and **Ubuntu 24.04 LTS (x64)**
+  * [.NET 10 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (only required for framework-dependent builds; default publish scripts and releases produce self-contained builds)
+  * Tested on Windows (x64) and Ubuntu 24.04 LTS (x64)
 
 ## Usage
 
-### Load Assets / AssetBundles
+### Load Assets/AssetBundles
 
-Use **File → Load file** or **File → Load folder**, or open a game folder from the **Project Manager**.
+Use **File → Load file** or **File → Load folder**.
 
-When AssetStudio loads AssetBundles in eager mode, it decompresses and reads them in memory. For very large projects, use **Safe/Lazy Mode** (offered automatically by the Project Manager) or extract bundles first via **File → Extract file** / **File → Extract folder**.
+When AssetStudio loads AssetBundles directly in memory, large projects can use a significant amount of RAM. For large folders, use **Safe/Lazy Mode** from the Project Manager, or use **File → Extract file** / **File → Extract folder** to decompress AssetBundles to disk first.
 
 ### Project Root
 
@@ -58,104 +53,152 @@ The project root is different from the loaded file or folder:
 
 For example, you can load only `F:\Unity_Projects\TEST_PROJECT\Assets\Assets_Ripp\scene_objects`, while setting the project root to `F:\Unity_Projects\TEST_PROJECT`. AssetStudio will load only the selected folder, but can still search the project root when exported models need external texture or mesh resources.
 
-### Project Manager & Caches
+### Project Manager
 
-AssetStudio.Avalonia starts in the **Project Manager** window (and you can return anytime via the **← Projects** button in the top bar). A project profile stores the name/icon, project root, last load/export paths, per-project settings, and scan statistics without copying or modifying the original game files.
+AssetStudio.Avalonia starts in the **Project Manager** window, and you can return to it at any time using the **← Projects** button. A project is a profile for a game or Unity folder that stores the project name/icon, project root, last load/export paths, per-project settings, and scan statistics. It does not copy or modify the original game files.
 
 Project Manager data is stored in the user local application data folder:
 
 ```text
-Windows: %LOCALAPPDATA%\AssetStudio\ProjectManager\projects.db
-         %LOCALAPPDATA%\AssetStudio\ProjectManager\Icons\
-
-Linux:   ~/.local/share/AssetStudio/ProjectManager/projects.db
-         ~/.local/share/AssetStudio/ProjectManager/Icons/
+%LOCALAPPDATA%\AssetStudio\ProjectManager\projects.db
+%LOCALAPPDATA%\AssetStudio\ProjectManager\Icons\
 ```
 
-Opening a project sets its project root and runs background indexing. When a project has at least 1,000 Unity bundles or its estimated decompressed size exceeds available RAM, AssetStudio offers **Safe/Lazy Mode**, which keeps lightweight `AssetHandle` entries in memory and materializes assets on demand.
-
-Two project-related caches accelerate repeat loads and previews:
-
-* **SQLite Index & Semantic Graph Cache (Schema v15)**:
+On Linux this maps to:
 
 ```text
-Windows: %LOCALAPPDATA%\AssetStudio\IndexCache\project_index.db
-Linux:   ~/.local/share/AssetStudio/IndexCache/project_index.db
+~/.local/share/AssetStudio/ProjectManager/projects.db
+~/.local/share/AssetStudio/ProjectManager/Icons/
 ```
 
-  Stores asset handles, resolved mesh/material/texture links, multi-part `ModelGroup`s, `AnimationClipTargets`, reference edges, and inline LZ4 preview caches keyed by folder path and signature.
+Opening a project sets its project root and starts background indexing. If the selected root is large, AssetStudio scans the folder first and may offer **Safe/Lazy Mode**. A project is considered risky when it has at least 1,000 Unity bundles, or when the estimated decompressed load size exceeds available RAM.
 
-* **Decompressed Bundle Cache**:
+Safe/Lazy Mode indexes files in batches and keeps lightweight entries in the project index instead of holding every bundle in memory. When an asset is previewed or exported later, AssetStudio reloads only the files needed for that asset.
+
+There are two project-related caches:
+
+* **Index cache**: stored in SQLite at:
 
 ```text
-Windows: %LOCALAPPDATA%\AssetStudio\DecompressedCache\<folder-hash>\
-Linux:   ~/.local/share/AssetStudio/DecompressedCache/<folder-hash>/
+%LOCALAPPDATA%\AssetStudio\IndexCache\project_index.db
+~/.local/share/AssetStudio/IndexCache/project_index.db
 ```
 
-  Stores decompressed bundle `.blocks` files on disk for lazy/low-memory loading so unchanged bundles are reused without decompressing again.
+  Stores the indexed asset list and asset relationships (materials, textures, model groups, animation targets, and references) keyed by folder path and folder signature so repeat opens skip full re-indexing.
 
-Deleting a project from Project Manager removes only AssetStudio's profile, settings, icon, SQLite cache entries, and decompressed cache folder — never the original game files.
+* **Decompressed cache**: stored per project folder under:
 
-### Preview, References & 1-Click Model Export
+```text
+%LOCALAPPDATA%\AssetStudio\DecompressedCache\<folder-hash>\
+~/.local/share/AssetStudio/DecompressedCache/<folder-hash>/
+```
 
-* **3D Preview (`Mesh`, `Avatar`, `AnimationClip`)**: open *Model Controls* to toggle **Mesh**, **Textures**, **Bones**, **X-Ray**, **Full Object (N parts)** vs single mesh, vertex density, material tint overrides, and **Export Model...** (exports the active preview target directly in the format chosen in *Export options* with an async progress bar).
-* **Right Panel Tabs (`Preview` / `Dump` / `References`)**: switch freely between visual preview, full TypeTree/serialized dump, and bidirectional **Referenced By / References** navigation without losing OpenGL preview state.
+  Stores decompressed bundle block data on disk as `.blocks` files when lazy or low-memory loading is active, so unchanged bundles do not need to be decompressed again.
 
-### Export Models & Assets
+Deleting a project from Project Manager removes only AssetStudio's project entry, saved settings, copied icons, index cache, and decompressed cache folder for that project root. The original game or Unity project folder is not deleted.
 
-* Open **Options → Export options...** to choose **Model format** (`FBX`, `glTF Binary (.glb)`, or `glTF Separate (.gltf)`), skinning, animations (combined or split files), blend shapes, `Combine meshes`, scale factor, texture format, audio WAV conversion, and Unity `.anim` / `.meta` generation.
-* Export individual or bulk assets via the **Export** menu, whole hierarchies via the **Model** menu in *Scene Hierarchy*, or the active 3D preview target directly via **Export Model...** in *Model Controls*.
-* **With AnimationClip**: select a model in *Scene Hierarchy* and an `AnimationClip` in *Asset List* (**Model → Export selected objects with AnimationClip**), select `Animator` + `AnimationClip` in *Asset List* (**Export → Export Animator with selected AnimationClip**), or preview an `AnimationClip` and click **Export Model...**.
+### Preview, Dump & References
 
-### Export MonoBehaviour (Mono & IL2CPP)
+* The right panel provides **Preview**, **Dump**, and **References** tabs.
+* In **3D Preview** (`Mesh`, `Avatar`, `AnimationClip`), *Model Controls* lets you toggle mesh visibility, textures, bones, X-ray bones, full multi-part object vs single mesh, vertex density, material tint, and **Export Model...** directly from the preview.
+* The **References** tab lists assets that use the selected asset and assets it depends on, with click-to-jump navigation.
 
-When inspecting or exporting `MonoBehaviour` assets for the first time, AssetStudio prompts for the assembly directory (such as the `Managed` folder). For IL2CPP games, generate dummy DLLs with [Il2CppDumper by Perfare](https://github.com/Perfare/Il2CppDumper) and select the generated dummy DLL folder.
+### Extract/Decompress AssetBundles
 
-### Known Limitations on Protected / Custom-Engine Titles
+Use **File → Extract file** or **File → Extract folder**.
 
-* Games with **encrypted `.assets` headers** (e.g., partial header encryption), **proprietary encrypted VFS containers** (e.g., `.blc`/`.chk`), or **modified engine forks without TypeTrees** cannot be decoded without game-specific decryption or custom binary schemas.
-* Audio/video stored in external third-party middleware banks (such as FMOD `.bank`, Wwise `.bnk`/`.wem`, or CRIWARE `.acb`/`.awb`/`.usm`) outside Unity's `AudioClip`/`VideoClip` assets is not extracted by Unity asset decoders.
+### Export Assets
+
+Use the **Export** menu.
+
+### Export Model
+
+Choose the model format (**FBX**, **glTF Binary (`.glb`)**, or **glTF Separate (`.gltf`)**) and options under **Options → Export options...**.
+
+* Export from **Scene Hierarchy** using the **Model** menu.
+* Export an `Animator` or model group from **Asset List** using the **Export** menu.
+* Export the active 3D preview target directly using **Export Model...** in *Model Controls*.
+
+#### With AnimationClip
+
+* Select a model in **Scene Hierarchy**, then select an `AnimationClip` in **Asset List** and use **Model → Export selected objects with AnimationClip**.
+* Or select an `Animator` and an `AnimationClip` in **Asset List** and use **Export → Export Animator with selected AnimationClip**.
+* Or preview an `AnimationClip` and use **Export Model...** in *Model Controls*.
+
+### Export MonoBehaviour
+
+When you select an asset of the `MonoBehaviour` type for the first time, AssetStudio asks for the assembly directory, such as the `Managed` folder.
+
+#### For IL2CPP
+
+Generate dummy DLLs with [Il2CppDumper by Perfare](https://github.com/Perfare/Il2CppDumper), then select the generated dummy DLL folder when prompted for the assembly directory.
+
+### Limitations
+
+* Games using encrypted `.assets` headers, proprietary encrypted container formats, or modified engine formats without TypeTrees are not supported out of the box.
+* Audio and video stored in third-party middleware banks (such as FMOD `.bank`, Wwise `.bnk`/`.wem`, or CRIWARE `.acb`/`.awb`/`.usm`) outside Unity assets are not extracted.
 
 ## Build
 
-* **Windows**: .NET 10.0 SDK and Visual Studio 2022 or newer (with C++ desktop workload for `Texture2DDecoderNative`)
-* **Linux**: .NET 10.0 SDK, CMake, and GCC/G++
+* Windows: .NET 10.0 SDK and Visual Studio 2022 or newer (with C++ desktop workload for the native texture decoder)
+* Linux: .NET 10.0 SDK, CMake, and GCC/G++
 
 ### One-command Windows publish
+
+Use the publish script to build the managed GUI, build the native DLLs, and copy the native dependencies into the runtime folder expected by AssetStudio. The default publish is self-contained, so the target machine does not need the .NET SDK or runtime installed.
 
 ```powershell
 .\scripts\publish-windows.ps1 -Configuration Release -Platform x64
 ```
 
-Output folder: `AssetStudio.Avalonia\bin\Release\net10.0\win-x64\publish\AssetStudio.Avalonia.exe` (run from `publish`, which contains `x64\Texture2DDecoderNative.dll`).
+Output folder:
+
+```text
+AssetStudio.Avalonia\bin\Release\net10.0\win-x64\publish\AssetStudio.Avalonia.exe
+```
+
+Run the executable from inside `publish` (not from `AssetStudio.Avalonia\bin\Release\net10.0\win-x64`, which does not receive native dependencies).
+
+Use `-SelfContained $false` for a framework-dependent build, `-SkipNative` to skip building the native texture decoder, and `-OutputDir <path>` for a custom output folder.
 
 ### One-command Linux publish
+
+Use the publish script to build the native C++ decoder library, publish the Avalonia GUI application, and bundle `libTexture2DDecoderNative.so` into the target publish folder. The default publish is self-contained.
 
 ```bash
 ./scripts/publish-linux.sh -c Release
 ```
 
-Output folder: `AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish/AssetStudio.Avalonia` (bundles `x64/libTexture2DDecoderNative.so` and FFmpeg shared libraries; use `./scripts/package-linux.sh` to build `.AppImage` and `.deb`).
+Output folder:
 
-### Running Tests
-
-```powershell
-dotnet restore AssetStudio.Tests/AssetStudio.Tests.csproj --locked-mode
-dotnet test AssetStudio.Tests/AssetStudio.Tests.csproj -c Release --no-restore
+```text
+AssetStudio.Avalonia/bin/Release/net10.0/linux-x64/publish/AssetStudio.Avalonia
 ```
+
+Use `--self-contained false` for a framework-dependent Linux build, or `./scripts/package-linux.sh` to create `.AppImage` and `.deb` packages.
 
 ## Native Dependencies
 
-Compressed texture decoding depends on `Texture2DDecoderNative`. Audio and video previewing in the Avalonia UI use FFmpeg.
+Compressed texture conversion depends on the native texture decoder library. Audio and video previewing in the Avalonia UI use FFmpeg.
+
+### Windows Layout
 
 ```text
-Windows: AssetStudio.Avalonia.exe + x64\Texture2DDecoderNative.dll
-Linux:   AssetStudio.Avalonia     + x64/libTexture2DDecoderNative.so + x64/ffmpeg/
+AssetStudio.Avalonia.exe
+x64\Texture2DDecoderNative.dll
+```
+
+### Linux Layout
+
+```text
+AssetStudio.Avalonia
+x64/libTexture2DDecoderNative.so
+x64/ffmpeg/
 ```
 
 ## Open source libraries used
 
-See [`NOTICE.md`](NOTICE.md) for third-party license notices (including FSB5 Vorbis codebook reconstruction attribution).
+See [`NOTICE.md`](NOTICE.md) for third-party license notices.
 
 ### Texture2DDecoder
 * [Ishotihadus/mikunyan](https://github.com/Ishotihadus/mikunyan)
