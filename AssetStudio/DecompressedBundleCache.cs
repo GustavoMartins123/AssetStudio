@@ -120,6 +120,10 @@ namespace AssetStudio
         private readonly object _keyedLocksGate = new();
         private readonly object _evictionLock = new();
         private readonly ConcurrentDictionary<string, long> _lastAccessTicks = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CachedEntryState> _entries = new(StringComparer.OrdinalIgnoreCase);
+        private bool _indexInitialized;
+        private long _trackedTotalBytes;
+        private long _diskEnumerations;
 
         private long _maxTotalBytes;
         private long _cacheHits;
@@ -167,6 +171,7 @@ namespace AssetStudio
         public long CacheMisses => Interlocked.Read(ref _cacheMisses);
         public long EvictionCount => Interlocked.Read(ref _evictionCount);
         public long EvictedBytes => Interlocked.Read(ref _evictedBytes);
+        public long DiskEnumerationCount => Interlocked.Read(ref _diskEnumerations);
 
         public static string GetDefaultCacheBaseDirectory()
         {
@@ -236,6 +241,8 @@ namespace AssetStudio
 
             DecompressedBundleEntry result;
             var wroteNewEntry = false;
+            long writtenEntryTotalBytes = 0;
+            long writtenEntryTicks = 0;
 
             using (AcquireBundleLock(bundleDir, cancellationToken))
             {
@@ -310,9 +317,10 @@ namespace AssetStudio
                         Nodes = nodeList
                     };
 
-                    var manifestJson = JsonSerializer.Serialize(manifest, ManifestJsonOptions);
-                    File.WriteAllText(tempManifestPath, manifestJson, Encoding.UTF8);
-                    File.WriteAllText(tempReadyPath, nowTicks.ToString(CultureInfo.InvariantCulture), Encoding.ASCII);
+                    var manifestBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(manifest, ManifestJsonOptions));
+                    var readyBytes = Encoding.ASCII.GetBytes(nowTicks.ToString(CultureInfo.InvariantCulture));
+                    File.WriteAllBytes(tempManifestPath, manifestBytes);
+                    File.WriteAllBytes(tempReadyPath, readyBytes);
 
                     cancellationToken.ThrowIfCancellationRequested();
 
@@ -322,6 +330,8 @@ namespace AssetStudio
 
                     TouchAccessTimestamp(bundleDir, readyPath, nowTicks);
                     wroteNewEntry = true;
+                    writtenEntryTotalBytes = writtenLength + manifestBytes.Length + readyBytes.Length;
+                    writtenEntryTicks = nowTicks;
 
                     result = new DecompressedBundleEntry(
                         bundleDir,
@@ -350,7 +360,7 @@ namespace AssetStudio
 
             if (wroteNewEntry)
             {
-                EvictInternal(MaxTotalBytes, protectedBundleDirectory: bundleDir);
+                RecordWrittenEntryAndEvictIfNeeded(bundleDir, writtenEntryTotalBytes, writtenEntryTicks);
             }
 
             return result;
@@ -505,107 +515,169 @@ namespace AssetStudio
                 throw new ArgumentOutOfRangeException(nameof(maxTotalBytesOverride), "Max total bytes must be non-negative.");
             }
 
-            return EvictInternal(budget, protectedBundleDirectory: null);
+            return EvictInternal(budget, protectedBundleDirectory: null, refreshFromDisk: true);
         }
 
         public void Clear()
         {
-            EvictInternal(0, protectedBundleDirectory: null);
+            EvictInternal(0, protectedBundleDirectory: null, refreshFromDisk: true);
         }
 
-        private DecompressedBundleEvictionResult EvictInternal(long maxBytes, string? protectedBundleDirectory)
+        private void RecordWrittenEntryAndEvictIfNeeded(string bundleDir, long entryBytes, long accessTicks)
+        {
+            var maxBytes = MaxTotalBytes;
+            lock (_evictionLock)
+            {
+                EnsureIndexLoadedLocked();
+                if (_entries.TryGetValue(bundleDir, out var existing))
+                {
+                    _trackedTotalBytes -= existing.TotalBytes;
+                }
+
+                _entries[bundleDir] = new CachedEntryState(entryBytes, accessTicks);
+                _trackedTotalBytes += entryBytes;
+
+                if (_trackedTotalBytes <= maxBytes)
+                {
+                    return;
+                }
+
+                EvictLocked(maxBytes, protectedBundleDirectory: bundleDir);
+            }
+        }
+
+        private DecompressedBundleEvictionResult EvictInternal(long maxBytes, string? protectedBundleDirectory, bool refreshFromDisk)
         {
             lock (_evictionLock)
             {
-                var entries = EnumerateCachedBundles();
-                long totalBytes = 0;
-                for (int i = 0; i < entries.Count; i++)
+                if (refreshFromDisk || !_indexInitialized)
                 {
-                    totalBytes += entries[i].TotalBytes;
+                    ReloadIndexFromDiskLocked();
                 }
 
-                if (totalBytes <= maxBytes)
-                {
-                    return new DecompressedBundleEvictionResult(
-                        evictedBundleCount: 0,
-                        evictedBytes: 0,
-                        failedDeleteCount: 0,
-                        remainingBundleCount: entries.Count,
-                        remainingBytes: totalBytes);
-                }
-
-                entries.Sort(static (a, b) =>
-                {
-                    var cmp = a.LastAccessTicks.CompareTo(b.LastAccessTicks);
-                    return cmp != 0 ? cmp : string.Compare(a.DirectoryPath, b.DirectoryPath, StringComparison.OrdinalIgnoreCase);
-                });
-
-                var evictedCount = 0;
-                long evictedBytes = 0;
-                var failedDeletes = 0;
-                var remainingCount = entries.Count;
-                var remainingBytes = totalBytes;
-
-                for (int i = 0; i < entries.Count && remainingBytes > maxBytes; i++)
-                {
-                    var candidate = entries[i];
-                    if (maxBytes > 0
-                        && !string.IsNullOrEmpty(protectedBundleDirectory)
-                        && string.Equals(candidate.DirectoryPath, protectedBundleDirectory, StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    using var lease = TryAcquireBundleLockImmediate(candidate.DirectoryPath);
-                    if (lease == null)
-                    {
-                        continue;
-                    }
-
-                    try
-                    {
-                        if (Directory.Exists(candidate.DirectoryPath))
-                        {
-                            Directory.Delete(candidate.DirectoryPath, recursive: true);
-                        }
-
-                        _lastAccessTicks.TryRemove(candidate.DirectoryPath, out _);
-                        evictedCount++;
-                        evictedBytes += candidate.TotalBytes;
-                        remainingCount--;
-                        remainingBytes -= candidate.TotalBytes;
-
-                        var parentDir = Path.GetDirectoryName(candidate.DirectoryPath);
-                        if (!string.IsNullOrEmpty(parentDir)
-                            && !string.Equals(parentDir, CacheBaseDirectory, StringComparison.OrdinalIgnoreCase))
-                        {
-                            TryDeleteEmptyDirectory(parentDir);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        failedDeletes++;
-                        Logger.Warning($"Failed to evict cached bundle directory '{candidate.DirectoryPath}': {ex.Message}");
-                    }
-                }
-
-                if (evictedCount > 0)
-                {
-                    Interlocked.Add(ref _evictionCount, evictedCount);
-                    Interlocked.Add(ref _evictedBytes, evictedBytes);
-                }
-
-                return new DecompressedBundleEvictionResult(
-                    evictedCount,
-                    evictedBytes,
-                    failedDeletes,
-                    Math.Max(0, remainingCount),
-                    Math.Max(0L, remainingBytes));
+                return EvictLocked(maxBytes, protectedBundleDirectory);
             }
+        }
+
+        private void EnsureIndexLoadedLocked()
+        {
+            if (!_indexInitialized)
+            {
+                ReloadIndexFromDiskLocked();
+            }
+        }
+
+        private void ReloadIndexFromDiskLocked()
+        {
+            var diskEntries = EnumerateCachedBundles();
+            _entries.Clear();
+            long total = 0;
+            for (int i = 0; i < diskEntries.Count; i++)
+            {
+                var entry = diskEntries[i];
+                _entries[entry.DirectoryPath] = new CachedEntryState(entry.TotalBytes, entry.LastAccessTicks);
+                total += entry.TotalBytes;
+            }
+
+            _trackedTotalBytes = total;
+            _indexInitialized = true;
+        }
+
+        private DecompressedBundleEvictionResult EvictLocked(long maxBytes, string? protectedBundleDirectory)
+        {
+            if (_trackedTotalBytes <= maxBytes)
+            {
+                return new DecompressedBundleEvictionResult(
+                    evictedBundleCount: 0,
+                    evictedBytes: 0,
+                    failedDeleteCount: 0,
+                    remainingBundleCount: _entries.Count,
+                    remainingBytes: Math.Max(0L, _trackedTotalBytes));
+            }
+
+            var entries = new List<CachedBundleDiskEntry>(_entries.Count);
+            foreach (var kv in _entries)
+            {
+                var accessTicks = _lastAccessTicks.TryGetValue(kv.Key, out var memTicks)
+                    ? Math.Max(kv.Value.LastAccessTicks, memTicks)
+                    : kv.Value.LastAccessTicks;
+                entries.Add(new CachedBundleDiskEntry(kv.Key, kv.Value.TotalBytes, accessTicks));
+            }
+
+            entries.Sort(static (a, b) =>
+            {
+                var cmp = a.LastAccessTicks.CompareTo(b.LastAccessTicks);
+                return cmp != 0 ? cmp : string.Compare(a.DirectoryPath, b.DirectoryPath, StringComparison.OrdinalIgnoreCase);
+            });
+
+            var evictedCount = 0;
+            long evictedBytes = 0;
+            var failedDeletes = 0;
+            var remainingCount = entries.Count;
+            var remainingBytes = _trackedTotalBytes;
+
+            for (int i = 0; i < entries.Count && remainingBytes > maxBytes; i++)
+            {
+                var candidate = entries[i];
+                if (maxBytes > 0
+                    && !string.IsNullOrEmpty(protectedBundleDirectory)
+                    && string.Equals(candidate.DirectoryPath, protectedBundleDirectory, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                using var lease = TryAcquireBundleLockImmediate(candidate.DirectoryPath);
+                if (lease == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (Directory.Exists(candidate.DirectoryPath))
+                    {
+                        Directory.Delete(candidate.DirectoryPath, recursive: true);
+                    }
+
+                    _entries.Remove(candidate.DirectoryPath);
+                    _lastAccessTicks.TryRemove(candidate.DirectoryPath, out _);
+                    evictedCount++;
+                    evictedBytes += candidate.TotalBytes;
+                    remainingCount--;
+                    remainingBytes -= candidate.TotalBytes;
+                    _trackedTotalBytes = Math.Max(0L, _trackedTotalBytes - candidate.TotalBytes);
+
+                    var parentDir = Path.GetDirectoryName(candidate.DirectoryPath);
+                    if (!string.IsNullOrEmpty(parentDir)
+                        && !string.Equals(parentDir, CacheBaseDirectory, StringComparison.OrdinalIgnoreCase))
+                    {
+                        TryDeleteEmptyDirectory(parentDir);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failedDeletes++;
+                    Logger.Warning($"Failed to evict cached bundle directory '{candidate.DirectoryPath}': {ex.Message}");
+                }
+            }
+
+            if (evictedCount > 0)
+            {
+                Interlocked.Add(ref _evictionCount, evictedCount);
+                Interlocked.Add(ref _evictedBytes, evictedBytes);
+            }
+
+            return new DecompressedBundleEvictionResult(
+                evictedCount,
+                evictedBytes,
+                failedDeletes,
+                Math.Max(0, remainingCount),
+                Math.Max(0L, remainingBytes));
         }
 
         private List<CachedBundleDiskEntry> EnumerateCachedBundles()
         {
+            Interlocked.Increment(ref _diskEnumerations);
             var result = new List<CachedBundleDiskEntry>();
             if (!Directory.Exists(CacheBaseDirectory))
             {
@@ -980,6 +1052,18 @@ namespace AssetStudio
             public long CreatedUtcTicks { get; set; }
             public long LastAccessedUtcTicks { get; set; }
             public List<CachedBundleNode> Nodes { get; set; } = new();
+        }
+
+        private readonly struct CachedEntryState
+        {
+            public CachedEntryState(long totalBytes, long lastAccessTicks)
+            {
+                TotalBytes = totalBytes;
+                LastAccessTicks = lastAccessTicks;
+            }
+
+            public long TotalBytes { get; }
+            public long LastAccessTicks { get; }
         }
 
         private readonly struct CachedBundleDiskEntry

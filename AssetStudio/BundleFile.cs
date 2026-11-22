@@ -86,14 +86,16 @@ namespace AssetStudio
         public bool LoadedFromDecompressionCache { get; private set; }
         public string? CachedBlocksPath { get; private set; }
         public bool UsedParallelDecompression { get; private set; }
+        public bool UsedPartialDecompression { get; private set; }
+        public int DecompressedBlockCount { get; private set; }
 
         public BundleFile(FileReader reader)
-            : this(reader, null, allowParallelDecompression: true, lowMemoryThresholdOverride: null)
+            : this(reader, null, allowParallelDecompression: true, lowMemoryThresholdOverride: null, serializedFilesOnly: false)
         {
         }
 
         public BundleFile(FileReader reader, DecompressedBundleCache? decompressionCache)
-            : this(reader, decompressionCache, allowParallelDecompression: true, lowMemoryThresholdOverride: null)
+            : this(reader, decompressionCache, allowParallelDecompression: true, lowMemoryThresholdOverride: null, serializedFilesOnly: false)
         {
         }
 
@@ -101,7 +103,8 @@ namespace AssetStudio
             FileReader reader,
             DecompressedBundleCache? decompressionCache,
             bool allowParallelDecompression,
-            long? lowMemoryThresholdOverride = null)
+            long? lowMemoryThresholdOverride = null,
+            bool serializedFilesOnly = false)
         {
             this.allowParallelDecompression = allowParallelDecompression;
             this.lowMemoryThresholdOverride = lowMemoryThresholdOverride;
@@ -235,6 +238,10 @@ namespace AssetStudio
                     {
                         ReadHeader(reader);
                         ReadBlocksInfoAndDirectory(reader);
+                        if (serializedFilesOnly && TryReadSerializedNodesPartial(reader))
+                        {
+                            break;
+                        }
                         if (decompressionCache != null
                             && HasCompressedBlocks()
                             && !string.IsNullOrEmpty(reader.FullPath)
@@ -921,6 +928,7 @@ namespace AssetStudio
 
         private void ReadBlocks(EndianBinaryReader reader, Stream blocksStream)
         {
+            DecompressedBlockCount = m_BlocksInfo.Length;
             if (allowParallelDecompression && TryReadBlocksParallel(reader, blocksStream))
             {
                 UsedParallelDecompression = true;
@@ -929,6 +937,298 @@ namespace AssetStudio
 
             UsedParallelDecompression = false;
             ReadBlocksSequential(reader, blocksStream);
+        }
+
+        private bool TryReadSerializedNodesPartial(EndianBinaryReader reader)
+        {
+            if (m_DirectoryInfo == null || m_DirectoryInfo.Length == 0 || m_BlocksInfo == null || m_BlocksInfo.Length == 0)
+            {
+                return false;
+            }
+
+            if (!reader.BaseStream.CanSeek)
+            {
+                return false;
+            }
+
+            if (!TryBuildBlockOffsets(
+                m_BlocksInfo,
+                out var compressedOffsets,
+                out var uncompressedOffsets,
+                out _,
+                out var totalUncompressedSize))
+            {
+                return false;
+            }
+
+            if (totalUncompressedSize <= 0)
+            {
+                return false;
+            }
+
+            // Select SerializedFile nodes (flag 0x4). If no node carries flag 0x4, fall back to
+            // excluding known streaming resource extensions (.resS / .resource).
+            bool anyFlag4 = false;
+            for (int i = 0; i < m_DirectoryInfo.Length; i++)
+            {
+                if ((m_DirectoryInfo[i].flags & 4u) != 0)
+                {
+                    anyFlag4 = true;
+                    break;
+                }
+            }
+
+            var selectedNodes = new System.Collections.Generic.List<Node>(m_DirectoryInfo.Length);
+            long totalSelectedBytes = 0;
+            for (int i = 0; i < m_DirectoryInfo.Length; i++)
+            {
+                var node = m_DirectoryInfo[i];
+                bool include = anyFlag4
+                    ? (node.flags & 4u) != 0
+                    : !IsStreamingResourceNodePath(node.path);
+
+                if (!include)
+                {
+                    continue;
+                }
+
+                if (node.offset < 0 || node.size < 0 || node.offset > totalUncompressedSize - node.size || node.size > int.MaxValue)
+                {
+                    return false;
+                }
+
+                totalSelectedBytes = checked(totalSelectedBytes + node.size);
+                selectedNodes.Add(node);
+            }
+
+            if (selectedNodes.Count == 0 || selectedNodes.Count == m_DirectoryInfo.Length)
+            {
+                return false;
+            }
+
+            // Avoid exceeding the low-memory threshold in-memory when the SerializedFile payload itself is huge.
+            if (ShouldUseTemporaryStream(totalSelectedBytes, lowMemoryThresholdOverride))
+            {
+                return false;
+            }
+
+            int blockCount = m_BlocksInfo.Length;
+            var neededBlocks = new bool[blockCount];
+            int neededBlockCount = 0;
+
+            for (int n = 0; n < selectedNodes.Count; n++)
+            {
+                var node = selectedNodes[n];
+                if (node.size == 0)
+                {
+                    continue;
+                }
+
+                long nodeStart = node.offset;
+                long nodeEnd = node.offset + node.size;
+                int startBlock = FindBlockIndexForOffset(uncompressedOffsets, m_BlocksInfo, nodeStart);
+                for (int b = startBlock; b < blockCount; b++)
+                {
+                    long blockStart = uncompressedOffsets[b];
+                    if (blockStart >= nodeEnd)
+                    {
+                        break;
+                    }
+
+                    long blockEnd = blockStart + m_BlocksInfo[b].uncompressedSize;
+                    if (blockEnd <= nodeStart)
+                    {
+                        continue;
+                    }
+
+                    if (!neededBlocks[b])
+                    {
+                        neededBlocks[b] = true;
+                        neededBlockCount++;
+                    }
+                }
+            }
+
+            if (neededBlockCount >= blockCount)
+            {
+                return false;
+            }
+
+            long baseCompressedOffset = reader.Position;
+            var nodeBuffers = new byte[selectedNodes.Count][];
+            for (int n = 0; n < selectedNodes.Count; n++)
+            {
+                var size = (int)selectedNodes[n].size;
+                nodeBuffers[n] = size == 0 ? Array.Empty<byte>() : new byte[size];
+            }
+
+            byte[]? compressedBuffer = null;
+            byte[]? uncompressedBuffer = null;
+            try
+            {
+                for (int b = 0; b < blockCount; b++)
+                {
+                    if (!neededBlocks[b])
+                    {
+                        continue;
+                    }
+
+                    var blockInfo = m_BlocksInfo[b];
+                    int compressedSize = (int)blockInfo.compressedSize;
+                    int uncompressedSize = (int)blockInfo.uncompressedSize;
+                    if (uncompressedSize == 0)
+                    {
+                        continue;
+                    }
+
+                    long targetPos = baseCompressedOffset + compressedOffsets[b];
+                    if (reader.Position != targetPos)
+                    {
+                        reader.Position = targetPos;
+                    }
+
+                    if (uncompressedBuffer == null || uncompressedBuffer.Length < uncompressedSize)
+                    {
+                        if (uncompressedBuffer != null)
+                        {
+                            var oldBuf = uncompressedBuffer;
+                            uncompressedBuffer = null;
+                            BigArrayPool<byte>.Shared.Return(oldBuf);
+                        }
+                        uncompressedBuffer = BigArrayPool<byte>.Shared.Rent(uncompressedSize);
+                    }
+
+                    var compressionType = (CompressionType)(blockInfo.flags & StorageBlockFlags.CompressionTypeMask);
+                    switch (compressionType)
+                    {
+                        case CompressionType.None:
+                            ReadExact(reader, uncompressedBuffer, uncompressedSize);
+                            break;
+                        case CompressionType.Lz4:
+                        case CompressionType.Lz4HC:
+                            if (compressedBuffer == null || compressedBuffer.Length < compressedSize)
+                            {
+                                if (compressedBuffer != null)
+                                {
+                                    var oldComp = compressedBuffer;
+                                    compressedBuffer = null;
+                                    BigArrayPool<byte>.Shared.Return(oldComp);
+                                }
+                                compressedBuffer = BigArrayPool<byte>.Shared.Rent(compressedSize);
+                            }
+
+                            ReadExact(reader, compressedBuffer, compressedSize);
+                            var numWrite = LZ4Codec.Decode(compressedBuffer, 0, compressedSize, uncompressedBuffer, 0, uncompressedSize);
+                            if (numWrite != uncompressedSize)
+                            {
+                                throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                            }
+                            break;
+                        default:
+                            return false;
+                    }
+
+                    long blockStart = uncompressedOffsets[b];
+                    long blockEnd = blockStart + uncompressedSize;
+                    for (int n = 0; n < selectedNodes.Count; n++)
+                    {
+                        var node = selectedNodes[n];
+                        if (node.size == 0)
+                        {
+                            continue;
+                        }
+
+                        long nodeStart = node.offset;
+                        long nodeEnd = nodeStart + node.size;
+                        if (nodeEnd <= blockStart || nodeStart >= blockEnd)
+                        {
+                            continue;
+                        }
+
+                        long overlapStart = Math.Max(blockStart, nodeStart);
+                        long overlapEnd = Math.Min(blockEnd, nodeEnd);
+                        int copyLen = (int)(overlapEnd - overlapStart);
+                        if (copyLen > 0)
+                        {
+                            Buffer.BlockCopy(
+                                uncompressedBuffer,
+                                (int)(overlapStart - blockStart),
+                                nodeBuffers[n],
+                                (int)(overlapStart - nodeStart),
+                                copyLen);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (compressedBuffer != null)
+                {
+                    BigArrayPool<byte>.Shared.Return(compressedBuffer);
+                }
+                if (uncompressedBuffer != null)
+                {
+                    BigArrayPool<byte>.Shared.Return(uncompressedBuffer);
+                }
+            }
+
+            var partialFiles = new StreamFile[selectedNodes.Count];
+            for (int n = 0; n < selectedNodes.Count; n++)
+            {
+                var node = selectedNodes[n];
+                partialFiles[n] = new StreamFile
+                {
+                    path = node.path,
+                    fileName = Path.GetFileName(node.path.Replace('\\', '/')),
+                    stream = new MemoryStream(nodeBuffers[n], 0, nodeBuffers[n].Length, writable: false)
+                };
+            }
+
+            fileList = partialFiles;
+            UsedPartialDecompression = true;
+            UsedParallelDecompression = false;
+            DecompressedBlockCount = neededBlockCount;
+            return true;
+        }
+
+        private static int FindBlockIndexForOffset(long[] uncompressedOffsets, StorageBlock[] blocksInfo, long targetOffset)
+        {
+            int lo = 0;
+            int hi = uncompressedOffsets.Length - 1;
+            int best = 0;
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                long start = uncompressedOffsets[mid];
+                if (start <= targetOffset)
+                {
+                    best = mid;
+                    lo = mid + 1;
+                }
+                else
+                {
+                    hi = mid - 1;
+                }
+            }
+
+            // Back up past any zero-length trailing blocks sharing the same start offset.
+            while (best > 0 && uncompressedOffsets[best] == targetOffset && blocksInfo[best].uncompressedSize == 0)
+            {
+                best--;
+            }
+
+            return best;
+        }
+
+        private static bool IsStreamingResourceNodePath(string? nodePath)
+        {
+            if (string.IsNullOrEmpty(nodePath))
+            {
+                return false;
+            }
+
+            return nodePath.EndsWith(".resS", StringComparison.OrdinalIgnoreCase)
+                || nodePath.EndsWith(".resource", StringComparison.OrdinalIgnoreCase);
         }
 
         public static bool TryBuildBlockOffsets(

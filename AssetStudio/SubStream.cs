@@ -1,5 +1,6 @@
 #nullable enable
 using System;
+using System.Buffers;
 using System.IO;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
@@ -8,6 +9,8 @@ namespace AssetStudio
 {
     public class SubStream : Stream
     {
+        private const int DefaultReadBufferSize = 32 * 1024;
+
         public string FilePath { get; }
         public long Offset { get; }
         private readonly long length;
@@ -17,6 +20,12 @@ namespace AssetStudio
         private readonly bool leaveStreamOpen;
         private long position;
         private int disposed;
+        private byte[]? readBuffer;
+        private long readBufferFilePos;
+        private int readBufferCount;
+        private long underlyingReadCount;
+
+        public long UnderlyingReadCount => Volatile.Read(ref underlyingReadCount);
 
         public SharedFileHandle? SharedHandle => sharedHandle;
 
@@ -149,14 +158,99 @@ namespace AssetStudio
 
             long remaining = length - position;
             int toRead = (int)Math.Min(buffer.Length, remaining);
-            var slice = buffer.Slice(0, toRead);
+            int totalCopied = 0;
 
+            while (totalCopied < toRead)
+            {
+                int need = toRead - totalCopied;
+
+                // 1) Serve directly from read-ahead buffer when current position falls within buffered window.
+                var buf = readBuffer;
+                if (buf != null)
+                {
+                    long bufOffset = position - readBufferFilePos;
+                    if ((ulong)bufOffset < (ulong)readBufferCount)
+                    {
+                        int available = readBufferCount - (int)bufOffset;
+                        int copyCount = Math.Min(need, available);
+                        buf.AsSpan((int)bufOffset, copyCount).CopyTo(buffer.Slice(totalCopied, copyCount));
+                        position += copyCount;
+                        totalCopied += copyCount;
+                        continue;
+                    }
+                }
+
+                // 2) Bypass read-ahead buffer for large reads to avoid an extra copy.
+                if (need >= DefaultReadBufferSize)
+                {
+                    int directRead = ReadUncached(buffer.Slice(totalCopied, need), position);
+                    if (directRead <= 0)
+                    {
+                        break;
+                    }
+                    position += directRead;
+                    totalCopied += directRead;
+                    continue;
+                }
+
+                // 3) Refill bounded read-ahead buffer for small sequential/nearby reads.
+                if (buf == null)
+                {
+                    int targetSize = (int)Math.Min(DefaultReadBufferSize, length);
+                    buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, targetSize));
+                    readBuffer = buf;
+                }
+
+                int maxChunk = Math.Min(DefaultReadBufferSize, buf.Length);
+                int refillSize = (int)Math.Min(maxChunk, length - position);
+                int filled = ReadUncached(buf.AsSpan(0, refillSize), position);
+                readBufferFilePos = position;
+                readBufferCount = filled;
+
+                if (filled <= 0)
+                {
+                    break;
+                }
+
+                int take = Math.Min(need, filled);
+                buf.AsSpan(0, take).CopyTo(buffer.Slice(totalCopied, take));
+                position += take;
+                totalCopied += take;
+            }
+
+            return totalCopied;
+        }
+
+        public override int ReadByte()
+        {
+            ThrowIfDisposed();
+            if (position >= length)
+            {
+                return -1;
+            }
+
+            var buf = readBuffer;
+            if (buf != null)
+            {
+                long bufOffset = position - readBufferFilePos;
+                if ((ulong)bufOffset < (ulong)readBufferCount)
+                {
+                    position++;
+                    return buf[(int)bufOffset];
+                }
+            }
+
+            Span<byte> oneByte = stackalloc byte[1];
+            return Read(oneByte) == 1 ? oneByte[0] : -1;
+        }
+
+        private int ReadUncached(Span<byte> slice, long subStreamOffset)
+        {
             var handle = sharedHandle;
             if (handle != null)
             {
-                int read = RandomAccess.Read(handle.SafeFileHandle, slice, Offset + position);
-                position += read;
-                return read;
+                Interlocked.Increment(ref underlyingReadCount);
+                return RandomAccess.Read(handle.SafeFileHandle, slice, Offset + subStreamOffset);
             }
 
             var stream = baseStream;
@@ -164,20 +258,13 @@ namespace AssetStudio
             {
                 lock (streamLock!)
                 {
-                    stream.Position = Offset + position;
-                    int read = stream.Read(slice);
-                    position += read;
-                    return read;
+                    Interlocked.Increment(ref underlyingReadCount);
+                    stream.Position = Offset + subStreamOffset;
+                    return stream.Read(slice);
                 }
             }
 
             throw new ObjectDisposedException(nameof(SubStream));
-        }
-
-        public override int ReadByte()
-        {
-            Span<byte> oneByte = stackalloc byte[1];
-            return Read(oneByte) == 1 ? oneByte[0] : -1;
         }
 
         public int ReadAt(long subStreamOffset, byte[] buffer, int offset, int count)
@@ -279,6 +366,13 @@ namespace AssetStudio
         {
             if (Interlocked.Exchange(ref disposed, 1) == 0 && disposing)
             {
+                var buf = Interlocked.Exchange(ref readBuffer, null);
+                readBufferCount = 0;
+                if (buf != null)
+                {
+                    ArrayPool<byte>.Shared.Return(buf);
+                }
+
                 var handle = Interlocked.Exchange(ref sharedHandle, null);
                 handle?.Release();
 

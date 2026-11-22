@@ -867,7 +867,13 @@ namespace AssetStudio
             int handedOffCount = 0;
             try
             {
-                bundleFile = new BundleFile(reader, DecompressionCache);
+                bool isLazyIndexingPass = LazyLoading && context.IsolateStreams;
+                bundleFile = new BundleFile(
+                    reader,
+                    decompressionCache: isLazyIndexingPass ? null : DecompressionCache,
+                    allowParallelDecompression: true,
+                    lowMemoryThresholdOverride: null,
+                    serializedFilesOnly: isLazyIndexingPass);
                 if (bundleFile.BlocksStream != null)
                 {
                     if (context.IsolateStreams)
@@ -2080,16 +2086,18 @@ namespace AssetStudio
                         return "";
                     }
 
-                    using (var bundleFile = new BundleFile(reader, DecompressionCache))
+                    reader.Position = 0;
+                    _ = reader.ReadStringToNull(); // signature
+                    _ = reader.ReadUInt32();       // version
+                    var unityVersion = reader.ReadStringToNull();
+                    var unityRevision = reader.ReadStringToNull();
+                    if (IsConcreteUnityVersion(unityRevision))
                     {
-                        if (IsConcreteUnityVersion(bundleFile.m_Header.unityRevision))
-                        {
-                            return bundleFile.m_Header.unityRevision.Trim();
-                        }
-                        if (IsConcreteUnityVersion(bundleFile.m_Header.unityVersion))
-                        {
-                            return bundleFile.m_Header.unityVersion.Trim();
-                        }
+                        return unityRevision.Trim();
+                    }
+                    if (IsConcreteUnityVersion(unityVersion))
+                    {
+                        return unityVersion.Trim();
                     }
                 }
             }
