@@ -593,7 +593,14 @@
                                     <StackPanel x:Name="MeshViewerControlsContent" Spacing="8" ClipToBounds="False">
                                         <!-- Reset View & 1-Click Model Export -->
                                         <Button x:Name="ResetViewBtn" Content="Reset View" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ResetMeshViewCommand}" Height="28" FontSize="11" />
-                                        <Button x:Name="ExportPreviewModelBtn" Content="Export Model..." HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ExportPreviewModelCommand}" IsVisible="{Binding CanExportPreviewModel}" Height="28" FontSize="11" ToolTip.Tip="Export the currently previewed 3D model (.glb / .gltf / .fbx)" />
+                                        <Button x:Name="ExportPreviewModelBtn" Content="Export Model..." HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Command="{Binding ExportPreviewModelCommand}" IsVisible="{Binding CanExportPreviewModel}" IsEnabled="{Binding CanStartPreviewModelExport}" Height="28" FontSize="11" ToolTip.Tip="Export the currently previewed 3D model (.glb / .gltf / .fbx)" />
+                                        <StackPanel x:Name="PreviewExportProgressPanel" Spacing="3" IsVisible="{Binding Export.IsExporting}">
+                                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                                <TextBlock x:Name="PreviewExportStatusText" Text="{Binding Export.StatusText}" Foreground="#DDD" FontSize="10" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock x:Name="PreviewExportPercentText" Grid.Column="1" Text="{Binding Export.FormattedPercentText}" Foreground="#AAA" FontSize="10" FontFamily="Monospace" />
+                                            </Grid>
+                                            <ProgressBar x:Name="PreviewExportProgressBar" Minimum="0" Maximum="100" Value="{Binding Export.ProgressPercent}" Height="5" />
+                                        </StackPanel>
 
                                         <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
                                             <TextBlock Text="View" Foreground="White" FontSize="10" VerticalAlignment="Center" />

@@ -789,6 +789,40 @@ namespace AssetStudio.Tests
             Assert.Null(noInfo);
         }
 
+        [Fact]
+        public void ExportViewModel_ReportStageProgress_UpdatesFormattedPercent_AndMainWindowViewModel_DisablesPreviewExportWhileRunning()
+        {
+            using var vm = new MainWindowViewModel();
+            vm.PreviewSession.ActivateSurface(PreviewSurfaceKind.Mesh3D, asset: null);
+            vm.MeshPreview.IsGeometryControlsVisible = true;
+
+            Assert.True(vm.CanExportPreviewModel);
+            Assert.True(vm.CanStartPreviewModelExport);
+            Assert.True(vm.ExportPreviewModelCommand.CanExecute(null));
+
+            vm.Export.BeginExport(ExportOperationMode.Animator, 100, targetFolder: "C:\\out", initialStatusText: "Preparing...");
+            Assert.True(vm.Export.IsExporting);
+            Assert.False(vm.CanStartPreviewModelExport);
+            Assert.False(vm.ExportPreviewModelCommand.CanExecute(null));
+            Assert.Equal("0%", vm.Export.FormattedPercentText);
+
+            vm.Export.ReportStageProgress(45, "Preparing part 2/4...");
+            Assert.Equal(45, vm.Export.ProgressPercent);
+            Assert.Equal("45%", vm.Export.FormattedPercentText);
+            Assert.Equal("Preparing part 2/4...", vm.Export.StatusText);
+            Assert.Equal(45, vm.LoadingProgress);
+
+            vm.Export.ReportStageProgress(120, "Writing hero.glb...");
+            Assert.Equal(100, vm.Export.ProgressPercent);
+            Assert.Equal("100%", vm.Export.FormattedPercentText);
+            Assert.Equal(100, vm.LoadingProgress);
+
+            vm.Export.Complete(1, statusText: "Finished exporting hero.glb");
+            Assert.False(vm.Export.IsExporting);
+            Assert.True(vm.CanStartPreviewModelExport);
+            Assert.True(vm.ExportPreviewModelCommand.CanExecute(null));
+        }
+
         #endregion
 
         #region Helpers

@@ -106,8 +106,16 @@ namespace AssetStudio.Avalonia.ViewModels
         public int ProgressPercent
         {
             get => _progressPercent;
-            private set => SetProperty(ref _progressPercent, value);
+            private set
+            {
+                if (SetProperty(ref _progressPercent, value))
+                {
+                    OnPropertyChanged(nameof(FormattedPercentText));
+                }
+            }
         }
+
+        public string FormattedPercentText => $"{_progressPercent}%";
 
         public int CompletedCount
         {
@@ -434,6 +442,30 @@ namespace AssetStudio.Avalonia.ViewModels
                 }
 
                 StatusText = cleanText;
+            });
+        }
+
+        public void ReportStageProgress(int percent, string? statusText = null)
+        {
+            var generation = Volatile.Read(ref _operationGeneration);
+            var clampedPercent = Math.Clamp(percent, 0, 100);
+            Volatile.Write(ref _lastReportedPercent, clampedPercent);
+            Interlocked.Increment(ref _progressDispatchCount);
+
+            var hasStatus = statusText != null;
+            var cleanText = statusText ?? string.Empty;
+            _dispatchToUi(() =>
+            {
+                if (Volatile.Read(ref _operationGeneration) != generation)
+                {
+                    return;
+                }
+
+                ProgressPercent = clampedPercent;
+                if (hasStatus)
+                {
+                    StatusText = cleanText;
+                }
             });
         }
 

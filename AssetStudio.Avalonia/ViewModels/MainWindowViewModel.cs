@@ -210,6 +210,7 @@ namespace AssetStudio.Avalonia.ViewModels
             IndexingProgress.PropertyChanged += OnIndexingProgressPropertyChanged;
             PreviewSession.PropertyChanged += OnPreviewSessionPropertyChanged;
             MeshPreview.PropertyChanged += OnMeshPreviewPropertyChanged;
+            Export.PropertyChanged += OnExportPropertyChanged;
             Options.EnablePreviewChanged += OnOptionsEnablePreviewChanged;
             Options.DisplayInfoChanged += OnOptionsDisplayInfoChanged;
             Options.SpecifyUnityVersionChanged += OnOptionsSpecifyUnityVersionChanged;
@@ -279,7 +280,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ResetMeshMaterialColorCommand = new RelayCommand(ExecuteResetMeshMaterialColor);
             ExportPreviewModelCommand = new AsyncRelayCommand(
                 ExecuteExportPreviewModelAsync,
-                canExecute: () => CanExportPreviewModel,
+                canExecute: () => CanStartPreviewModelExport,
                 onException: HandleCommandException);
             NavigateToReferencedAssetCommand = new AsyncRelayCommand<AssetReferenceItem>(
                 ExecuteNavigateToReferencedAssetAsync,
@@ -487,6 +488,9 @@ namespace AssetStudio.Avalonia.ViewModels
                 PreviewSession.ActiveKind,
                 MeshPreview.IsGeometryControlsVisible);
 
+        public bool CanStartPreviewModelExport =>
+            CanExportPreviewModel && !Export.IsExporting;
+
         public bool CanNavigateToSelectedReference =>
             !_disposed && PreviewSession.SelectedReferenceItem?.IsNavigable == true;
 
@@ -496,6 +500,7 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 case nameof(PreviewSessionViewModel.ActiveKind):
                     OnPropertyChanged(nameof(CanExportPreviewModel));
+                    OnPropertyChanged(nameof(CanStartPreviewModelExport));
                     ExportPreviewModelCommand.NotifyCanExecuteChanged();
                     break;
                 case nameof(PreviewSessionViewModel.SelectedReferenceItem):
@@ -510,7 +515,29 @@ namespace AssetStudio.Avalonia.ViewModels
             if (e.PropertyName == nameof(MeshPreviewViewModel.IsGeometryControlsVisible))
             {
                 OnPropertyChanged(nameof(CanExportPreviewModel));
+                OnPropertyChanged(nameof(CanStartPreviewModelExport));
                 ExportPreviewModelCommand.NotifyCanExecuteChanged();
+            }
+        }
+
+        private void OnExportPropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            switch (e.PropertyName)
+            {
+                case nameof(ExportViewModel.IsExporting):
+                    OnPropertyChanged(nameof(CanStartPreviewModelExport));
+                    ExportPreviewModelCommand.NotifyCanExecuteChanged();
+                    if (Export.IsExporting)
+                    {
+                        LoadingProgress = Export.ProgressPercent;
+                    }
+                    break;
+                case nameof(ExportViewModel.ProgressPercent):
+                    if (Export.IsExporting || Export.Status == ExportOperationStatus.Completed)
+                    {
+                        LoadingProgress = Export.ProgressPercent;
+                    }
+                    break;
             }
         }
 
@@ -1257,6 +1284,7 @@ namespace AssetStudio.Avalonia.ViewModels
             IndexingProgress.PropertyChanged -= OnIndexingProgressPropertyChanged;
             PreviewSession.PropertyChanged -= OnPreviewSessionPropertyChanged;
             MeshPreview.PropertyChanged -= OnMeshPreviewPropertyChanged;
+            Export.PropertyChanged -= OnExportPropertyChanged;
             Options.EnablePreviewChanged -= OnOptionsEnablePreviewChanged;
             Options.DisplayInfoChanged -= OnOptionsDisplayInfoChanged;
             Options.SpecifyUnityVersionChanged -= OnOptionsSpecifyUnityVersionChanged;
@@ -1280,6 +1308,7 @@ namespace AssetStudio.Avalonia.ViewModels
             OnPropertyChanged(nameof(IsReturningToProjectManager));
             OnPropertyChanged(nameof(CanOpenProjectManager));
             OnPropertyChanged(nameof(CanExportPreviewModel));
+            OnPropertyChanged(nameof(CanStartPreviewModelExport));
             OnPropertyChanged(nameof(CanNavigateToSelectedReference));
             OpenProjectManagerCommand.NotifyCanExecuteChanged();
             ExportPreviewModelCommand.NotifyCanExecuteChanged();
