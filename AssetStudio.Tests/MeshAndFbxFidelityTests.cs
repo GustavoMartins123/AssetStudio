@@ -448,6 +448,7 @@ namespace AssetStudio.Tests
             Assert.Equal(6, v0.BoneIndices.Length);
             Assert.Equal(6, v0.Weights.Length);
 
+            iMesh.BoneList = new List<ImportedBone>(5);
             for (int b = 0; b < 5; b++)
             {
                 var boneFrame = new ImportedFrame
@@ -458,7 +459,11 @@ namespace AssetStudio.Tests
                     LocalScale = Vector3.One
                 };
                 converter.RootFrame.AddChild(boneFrame);
-                iMesh.BoneList![b].Path = boneFrame.Path;
+                iMesh.BoneList.Add(new ImportedBone
+                {
+                    Path = boneFrame.Path,
+                    Matrix = MakeIdentityMatrix()
+                });
             }
 
             var tempFbx = Path.Combine(Path.GetTempPath(), $"as_f2_skin6_{Guid.NewGuid():N}.fbx");
