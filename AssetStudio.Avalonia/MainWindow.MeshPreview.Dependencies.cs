@@ -85,10 +85,18 @@ public partial class MainWindow
             return;
         }
 
-        // Bounded local-file fallback: inspect ONLY mesh.assetsFile (never crawl/materialize all 50 preloaded files).
+        // Bounded local-file fallback: inspect ONLY mesh.assetsFile (never crawl/materialize all 50 preloaded files),
+        // and resolve referenced cross-bundle materials & chosen diffuse textures on demand via ProjectIndex.
         using var evictionSuspension = assetsManager.LruCache.SuspendEviction();
         MaterializeReferenceObjects(mesh.assetsFile, MeshPreviewReferenceTypes);
         BuildLazyPreviewReferenceIndexes(new List<SerializedFile> { mesh.assetsFile });
+        if (meshToMaterialsCache == null
+            || !meshToMaterialsCache.TryGetValue(mesh, out var cachedMats)
+            || cachedMats == null
+            || !cachedMats.Any(m => m != null))
+        {
+            TryResolveMaterialsFromLocalRenderersForPreview(mesh);
+        }
     }
 
     private void EnsureMaterialPreviewDependenciesLoaded(Material material)
@@ -496,12 +504,16 @@ public partial class MainWindow
             out var localSemanticRelations);
 
         // Merge into existing RAM caches rather than wiping previously resolved entries.
+        // Never cache all-null material lists so unresolved external PPtrs do not block on-demand cross-bundle lookup.
         lock (previewCacheLock)
         {
             meshToMaterialsCache ??= new Dictionary<Mesh, List<Material?>>();
             foreach (var entry in localMeshToMaterialsCache)
             {
-                meshToMaterialsCache[entry.Key] = entry.Value;
+                if (entry.Value != null && entry.Value.Any(m => m != null))
+                {
+                    meshToMaterialsCache[entry.Key] = entry.Value;
+                }
             }
 
             meshAssociatedRenderersCache ??= new Dictionary<Mesh, List<string>>();

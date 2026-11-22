@@ -23,6 +23,77 @@ namespace AssetStudio.Avalonia
 
         private ShaderPreviewFrame? uploadedMaterialShaderFrame;
         private int materialShaderTexture, materialShaderFramebuffer;
+        private bool[]? previewTextureHasAlpha;
+
+        internal static bool HasTransparentPixels(byte[]? rgbaBytes)
+        {
+            if (rgbaBytes == null || rgbaBytes.Length < 4)
+            {
+                return false;
+            }
+
+            for (int p = 3; p < rgbaBytes.Length; p += 4)
+            {
+                if (rgbaBytes[p] < 250)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal static bool IsSubMeshTransparent(
+            int subMeshIndex,
+            int[]? subMeshTextureMap,
+            bool[]? textureHasAlpha,
+            Vector4 tint)
+        {
+            if (tint.W < 0.99f)
+            {
+                return true;
+            }
+
+            if (textureHasAlpha == null || textureHasAlpha.Length == 0 || subMeshIndex < 0)
+            {
+                return false;
+            }
+
+            if (subMeshTextureMap != null)
+            {
+                if (subMeshIndex >= subMeshTextureMap.Length)
+                {
+                    return false;
+                }
+
+                int mappedIndex = subMeshTextureMap[subMeshIndex];
+                return mappedIndex >= 0 && mappedIndex < textureHasAlpha.Length && textureHasAlpha[mappedIndex];
+            }
+
+            int directIndex = subMeshIndex < textureHasAlpha.Length ? subMeshIndex : 0;
+            return textureHasAlpha[directIndex];
+        }
+
+        internal static void PartitionSubMeshDrawOrder(
+            int subMeshCount,
+            Func<int, bool> isTransparentSubMesh,
+            out List<int> opaqueSubMeshes,
+            out List<int> transparentSubMeshes)
+        {
+            opaqueSubMeshes = new List<int>(Math.Max(0, subMeshCount));
+            transparentSubMeshes = new List<int>();
+            for (int i = 0; i < subMeshCount; i++)
+            {
+                if (isTransparentSubMesh(i))
+                {
+                    transparentSubMeshes.Add(i);
+                }
+                else
+                {
+                    opaqueSubMeshes.Add(i);
+                }
+            }
+        }
 
         public bool IsMaterialShaderPreview
         {
@@ -329,6 +400,7 @@ namespace AssetStudio.Avalonia
             DeletePreviewTextures();
 
             previewTextureIds = new int[subTexBytes.Count];
+            previewTextureHasAlpha = new bool[subTexBytes.Count];
             previewSubMeshTextureMap = subTexMap;
             for (int i = 0; i < subTexBytes.Count; i++)
             {
@@ -337,6 +409,8 @@ namespace AssetStudio.Avalonia
                 {
                     continue;
                 }
+
+                previewTextureHasAlpha[i] = HasTransparentPixels(tBytes);
 
                 int tw = subTexW![i];
                 int th = subTexH![i];
@@ -453,6 +527,7 @@ namespace AssetStudio.Avalonia
             }
 
             var localTextureIds = previewTextureIds;
+            var localTextureHasAlpha = previewTextureHasAlpha;
             var localMaterialTints = materialTintOverrides;
             var localSubMeshIndexCounts = previewSubMeshIndexCounts;
             bool effectiveTextures = useTextures && previewMaterialMode;
@@ -462,7 +537,11 @@ namespace AssetStudio.Avalonia
 
             if (drawBySubMesh && localSubMeshIndexCounts != null)
             {
+                var drawRanges = new List<(int SubMeshIndex, int OffsetElements, int IndexCount, int TexId, Vector4 Tint, bool IsTransparent)>(localSubMeshIndexCounts.Length);
                 int flatOffsetElements = 0;
+                bool hasOpaque = false;
+                bool hasTransparent = false;
+
                 for (int i = 0; i < localSubMeshIndexCounts.Length; i++)
                 {
                     int indexCount = localSubMeshIndexCounts[i];
@@ -479,15 +558,66 @@ namespace AssetStudio.Avalonia
                     indexCount = Math.Min(indexCount, indices.Length - flatOffsetElements);
                     int texId = ResolveSubMeshTextureId(localTextureIds, previewSubMeshTextureMap, i);
                     var tint = GetMaterialTint(i);
+                    bool isTransparent = IsSubMeshTransparent(
+                        i,
+                        previewSubMeshTextureMap,
+                        effectiveTextures ? localTextureHasAlpha : null,
+                        tint);
 
-                    BindMeshShaderProgram(texId, tint);
-                    GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, (IntPtr)(flatOffsetElements * 4));
+                    if (isTransparent)
+                    {
+                        hasTransparent = true;
+                    }
+                    else
+                    {
+                        hasOpaque = true;
+                    }
+
+                    drawRanges.Add((i, flatOffsetElements, indexCount, texId, tint, isTransparent));
                     flatOffsetElements += indexCount;
+                }
+
+                // Pass 1: Opaque submeshes with depth writes enabled.
+                GL.DepthMask(true);
+                for (int i = 0; i < drawRanges.Count; i++)
+                {
+                    var range = drawRanges[i];
+                    if (range.IsTransparent)
+                    {
+                        continue;
+                    }
+
+                    BindMeshShaderProgram(range.TexId, range.Tint);
+                    GL.DrawElements(PrimitiveType.Triangles, range.IndexCount, DrawElementsType.UnsignedInt, (IntPtr)(range.OffsetElements * 4));
+                }
+
+                // Pass 2: Transparent & decal overlay submeshes drawn last with polygon offset and depth writes disabled over opaque geometry.
+                if (hasTransparent)
+                {
+                    GL.DepthMask(!hasOpaque);
+                    GL.Enable(EnableCap.PolygonOffsetFill);
+                    GL.PolygonOffset(-1.0f, -1.0f);
+
+                    for (int i = 0; i < drawRanges.Count; i++)
+                    {
+                        var range = drawRanges[i];
+                        if (!range.IsTransparent)
+                        {
+                            continue;
+                        }
+
+                        BindMeshShaderProgram(range.TexId, range.Tint);
+                        GL.DrawElements(PrimitiveType.Triangles, range.IndexCount, DrawElementsType.UnsignedInt, (IntPtr)(range.OffsetElements * 4));
+                    }
+
+                    GL.Disable(EnableCap.PolygonOffsetFill);
+                    GL.DepthMask(true);
                 }
 
                 return;
             }
 
+            GL.DepthMask(true);
             var defaultTint = GetMaterialTint(0);
             int defaultTexId = localTextureIds != null && localTextureIds.Length > 0 ? localTextureIds[0] : 0;
             BindMeshShaderProgram(defaultTexId, defaultTint);
@@ -634,6 +764,7 @@ namespace AssetStudio.Avalonia
             }
 
             previewSubMeshTextureMap = null;
+            previewTextureHasAlpha = null;
         }
 
         private Vector4 GetMaterialTint(int materialIndex)

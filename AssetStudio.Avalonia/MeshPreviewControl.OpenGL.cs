@@ -125,7 +125,7 @@ void main()
 	lightColor += vec3(0.779, 0.716, 0.453) * ContributionWeights.y;
 	lightColor += vec3(0.368, 0.477, 0.735) * ContributionWeights.x;
 	vec4 texColor = texture(mainTex, texCoord);
-	if (texColor.a < 0.25)
+	if (texColor.a < 0.02)
 		discard;
 	outputColor = vec4(texColor.rgb * materialTint.rgb * sqrt(lightColor), texColor.a * materialTint.a);
 }";

@@ -483,13 +483,20 @@ namespace AssetStudio
         public float[]? m_UV6;
         public float[]? m_UV7;
         public float[]? m_Tangents;
-        private VertexData? m_VertexData;
-        private CompressedMesh? m_CompressedMesh;
-        private StreamingInfo? m_StreamData;
+        public VertexData? m_VertexData;
+        public CompressedMesh? m_CompressedMesh;
+        public StreamingInfo? m_StreamData;
         private bool m_DataProcessed;
         private readonly object m_ProcessLock = new object();
 
         public List<uint> m_Indices = new List<uint>();
+
+        public bool HasDeclaredVertexData =>
+            m_VertexCount > 0
+            || (m_Vertices != null && m_Vertices.Length > 0)
+            || (m_VertexData != null && m_VertexData.m_VertexCount > 0)
+            || (m_StreamData != null && m_StreamData.size > 0 && !string.IsNullOrEmpty(m_StreamData.path))
+            || (m_CompressedMesh?.m_Vertices != null && m_CompressedMesh.m_Vertices.m_NumItems > 0);
 
         public Mesh(ObjectReader reader) : base(reader)
         {

@@ -98,6 +98,30 @@ public partial class MainWindow
         public int ExpectedSubMeshCount { get; init; }
     }
 
+    internal const string EmptyMeshPlaceholderMessage = "Empty mesh asset (0 vertices, 0 indices; no external stream referenced)";
+    internal const string MissingMeshStreamErrorMessage = "Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.";
+
+    internal static bool TryGetEmptyMeshPreviewDiagnostic(Mesh mesh, out bool isMissingStreamError, out string message)
+    {
+        if (mesh.m_Vertices != null && mesh.m_Vertices.Length > 0)
+        {
+            isMissingStreamError = false;
+            message = string.Empty;
+            return false;
+        }
+
+        if (mesh.HasDeclaredVertexData)
+        {
+            isMissingStreamError = true;
+            message = MissingMeshStreamErrorMessage;
+            return true;
+        }
+
+        isMissingStreamError = false;
+        message = EmptyMeshPlaceholderMessage;
+        return true;
+    }
+
     private void PreviewMesh(
         AssetItem assetItem,
         Mesh m_Mesh,
@@ -133,9 +157,35 @@ public partial class MainWindow
             try
             {
                 m_Mesh.EnsureProcessed();
-                if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
+                if (TryGetEmptyMeshPreviewDiagnostic(m_Mesh, out var isMissingStreamError, out var emptyDiagnosticMessage))
                 {
-                    throw new Exception("Mesh contains no vertex data. Companion resource file might be missing or failed to decompress.");
+                    if (isMissingStreamError)
+                    {
+                        throw new Exception(emptyDiagnosticMessage);
+                    }
+
+                    var emptySummary = FormatMeshPreviewSummary(m_Mesh, localAssetItem)
+                        + Environment.NewLine
+                        + emptyDiagnosticMessage;
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (meshPreviewId != texturePreviewIdCounter || !ReferenceEquals(AssetListDataGrid.SelectedItem, localAssetItem))
+                        {
+                            return;
+                        }
+
+                        _activeMeshMaterialsLoading = false;
+                        PreviewSession.IsLoading = false;
+                        ClearPreviewCacheBadge();
+                        MeshPreview.SetMeshAndRigSummary(
+                            meshSummary: emptySummary,
+                            associatedMaterialsSummary: emptyDiagnosticMessage,
+                            meshName: m_Mesh.m_Name);
+                        PreviewSession.PreviewMetadataSummary = includeMeshInfo ? emptySummary : emptyDiagnosticMessage;
+                        StatusStripUpdate($"Mesh preview: {emptyDiagnosticMessage}");
+                        SetPreviewInfoOverlay(includeMeshInfo ? emptySummary : emptyDiagnosticMessage);
+                    });
+                    return;
                 }
 
                 var uvs = BuildMeshPreviewUvs(m_Mesh);
@@ -215,7 +265,8 @@ public partial class MainWindow
                         out uniqueWidths,
                         out uniqueHeights,
                         out subMeshToTextureIndex,
-                        out loadedTextureFiles);
+                        out loadedTextureFiles,
+                        m_Mesh.m_Name);
 
                     if (meshPreviewId != texturePreviewIdCounter)
                     {
@@ -245,7 +296,7 @@ public partial class MainWindow
                 else
                 {
                     var allMaterials = FindMaterialsForMeshPreview(m_Mesh);
-                    if (allMaterials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                    if (!allMaterials.Any(m => m != null))
                     {
                         EnsureMeshPreviewDependenciesLoaded(m_Mesh);
                         allMaterials = FindMaterialsForMeshPreview(m_Mesh);
@@ -270,7 +321,8 @@ public partial class MainWindow
                         out uniqueWidths,
                         out uniqueHeights,
                         out subMeshToTextureIndex,
-                        out loadedTextureFiles);
+                        out loadedTextureFiles,
+                        m_Mesh.m_Name);
 
                     if (meshPreviewId != texturePreviewIdCounter)
                     {
@@ -411,6 +463,7 @@ public partial class MainWindow
 
                 var allSlotSpecs = new List<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)>();
                 var allSubMeshTextureIds = new List<string?>();
+                var allSubMeshPreserveAlpha = new List<bool>();
                 var fallbackTexturesBySlot = new Dictionary<int, Texture2D>();
 
                 for (var partIdx = 0; partIdx < partsSnapshot.Length; partIdx++)
@@ -464,21 +517,23 @@ public partial class MainWindow
                                 allSubMeshTextureIds.Add(string.IsNullOrWhiteSpace(resolved.MainTextureAssetId)
                                     ? null
                                     : resolved.MainTextureAssetId);
+                                allSubMeshPreserveAlpha.Add(ShouldPreserveResolvedSlotTextureAlphaForPreview(resolved, mesh.m_Name));
                             }
                             else
                             {
                                 allSlotSpecs.Add(("No Material", global::OpenTK.Mathematics.Vector4.One));
                                 allSubMeshTextureIds.Add(null);
+                                allSubMeshPreserveAlpha.Add(IsDecalMeshOrObjectName(mesh.m_Name));
                             }
                         }
                     }
                     else
                     {
-                        var materials = FindMaterialsForMeshPreview(mesh);
-                        if (materials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                        var materials = FindMaterialsForMeshPreview(mesh, part.RendererAssetId);
+                        if (!materials.Any(m => m != null))
                         {
                             EnsureMeshPreviewDependenciesLoaded(mesh);
-                            materials = FindMaterialsForMeshPreview(mesh);
+                            materials = FindMaterialsForMeshPreview(mesh, part.RendererAssetId);
                         }
 
                         if (expectedPreviewId != texturePreviewIdCounter)
@@ -501,6 +556,7 @@ public partial class MainWindow
                             allSlotSpecs.Add((matName, GetMeshMaterialBaseColor(mat)));
                             var tex = mat != null ? FindTextureForMaterial(mat) : null;
                             var texKey = tex != null ? GetPreviewObjectKey(tex) : null;
+                            var preserveAlpha = IsDecalMeshOrObjectName(mesh.m_Name) || ShouldPreserveMaterialTextureAlpha(mat);
                             if (tex != null && !string.IsNullOrWhiteSpace(texKey))
                             {
                                 fallbackTexturesBySlot[allSubMeshTextureIds.Count] = tex;
@@ -510,6 +566,7 @@ public partial class MainWindow
                             {
                                 allSubMeshTextureIds.Add(null);
                             }
+                            allSubMeshPreserveAlpha.Add(preserveAlpha);
                         }
                     }
                 }
@@ -526,7 +583,8 @@ public partial class MainWindow
                     out var uniqueWidths,
                     out var uniqueHeights,
                     out var subMeshToTextureIndex,
-                    out var loadedTextureFiles);
+                    out var loadedTextureFiles,
+                    allSubMeshPreserveAlpha);
 
                 if (fallbackTexturesBySlot.Count > 0)
                 {
@@ -542,8 +600,9 @@ public partial class MainWindow
                         {
                             try
                             {
+                                var preserveAlpha = kvp.Key < allSubMeshPreserveAlpha.Count && allSubMeshPreserveAlpha[kvp.Key];
                                 using var previewImg = LoadTexturePreviewThumbnail(kvp.Value, MaxCachedPreviewTextureDimension);
-                                var rgba = ConvertPreviewImageToRgbaBytes(previewImg, out var tw, out var th);
+                                var rgba = ConvertPreviewImageToRgbaBytes(previewImg, out var tw, out var th, preserveAlpha);
                                 if (rgba != null)
                                 {
                                     uniqueTextures[mappedIdx] = rgba;

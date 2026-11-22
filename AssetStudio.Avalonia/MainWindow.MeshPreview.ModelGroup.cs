@@ -646,11 +646,41 @@ public partial class MainWindow
         return _sqliteCache.LoadModelGroupById(folderPath, signature, groupId);
     }
 
-    private static ModelGroupMeshInfo? SelectRepresentativeModelGroupMesh(IReadOnlyList<ModelGroupMeshInfo> meshes)
+    internal static bool IsOverlayOrAuxiliaryModelGroupMesh(ModelGroupMeshInfo? mesh)
     {
+        if (mesh == null)
+        {
+            return false;
+        }
+
+        return IsOverlayOrAuxiliaryMeshName(mesh.MeshName)
+            || IsOverlayOrAuxiliaryMeshName(mesh.GameObjectName);
+    }
+
+    internal static bool IsOverlayOrAuxiliaryMeshName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("Decal", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Shadow", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Outline", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Effect", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static ModelGroupMeshInfo? SelectRepresentativeModelGroupMesh(IReadOnlyList<ModelGroupMeshInfo> meshes)
+    {
+        if (meshes == null || meshes.Count == 0)
+        {
+            return null;
+        }
+
         return meshes
             .Where(mesh => !string.IsNullOrWhiteSpace(mesh.MeshAssetId))
             .OrderByDescending(mesh => mesh.Confidence)
+            .ThenBy(mesh => IsOverlayOrAuxiliaryModelGroupMesh(mesh) ? 1 : 0)
             .ThenByDescending(mesh => mesh.MeshByteSize)
             .ThenBy(mesh => mesh.SlotIndex)
             .FirstOrDefault();
@@ -830,6 +860,7 @@ public partial class MainWindow
                 // Resolve materials per part using v15 cache (with per-renderer disambiguation) and deduplicate textures across ALL parts.
                 var allSlotSpecs = new List<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)>();
                 var allSubMeshTextureIds = new List<string?>();
+                var allSubMeshPreserveAlpha = new List<bool>();
                 var fallbackTexturesBySlot = new Dictionary<int, Texture2D>();
                 var allMaterialNames = new List<string>();
                 for (var partIdx = 0; partIdx < meshes.Count; partIdx++)
@@ -840,9 +871,11 @@ public partial class MainWindow
                     }
 
                     var mesh = meshes[partIdx];
-                    var partRendererId = partIdx < candidate.ModelGroupMeshInfos.Count
-                        ? candidate.ModelGroupMeshInfos[partIdx].RendererAssetId
+                    var partInfo = partIdx < candidate.ModelGroupMeshInfos.Count
+                        ? candidate.ModelGroupMeshInfos[partIdx]
                         : null;
+                    var partRendererId = partInfo?.RendererAssetId;
+                    var partGameObjectName = partInfo?.GameObjectName;
                     var resolvedPartSlots = TryLoadResolvedMeshMaterialsForPreview(mesh, partRendererId);
 
                     if (resolvedPartSlots.Count > 0)
@@ -877,6 +910,7 @@ public partial class MainWindow
                                     ClampPreviewColor(resolved.BaseColorB),
                                     ClampPreviewColor(resolved.BaseColorA))));
                                 allSubMeshTextureIds.Add(string.IsNullOrWhiteSpace(resolved.MainTextureAssetId) ? null : resolved.MainTextureAssetId);
+                                allSubMeshPreserveAlpha.Add(ShouldPreserveResolvedSlotTextureAlphaForPreview(resolved, mesh.m_Name, partGameObjectName));
                                 if (!string.IsNullOrWhiteSpace(resolved.MaterialAssetId))
                                 {
                                     allMaterialNames.Add(matName);
@@ -886,16 +920,17 @@ public partial class MainWindow
                             {
                                 allSlotSpecs.Add(("No Material", global::OpenTK.Mathematics.Vector4.One));
                                 allSubMeshTextureIds.Add(null);
+                                allSubMeshPreserveAlpha.Add(IsDecalMeshOrObjectName(mesh.m_Name) || IsDecalMeshOrObjectName(partGameObjectName));
                             }
                         }
                     }
                     else
                     {
-                        var materials = FindMaterialsForMeshPreview(mesh);
-                        if (materials.Count == 0 && !CanUseLazySemanticRelationCache(GetCurrentCacheFolderPath()))
+                        var materials = FindMaterialsForMeshPreview(mesh, partRendererId);
+                        if (!materials.Any(m => m != null))
                         {
                             EnsureMeshPreviewDependenciesLoaded(mesh);
-                            materials = FindMaterialsForMeshPreview(mesh);
+                            materials = FindMaterialsForMeshPreview(mesh, partRendererId);
                         }
 
                         var slotCount = Math.Max(mesh.m_SubMeshes?.Length ?? 0, materials.Count);
@@ -911,6 +946,9 @@ public partial class MainWindow
                             allSlotSpecs.Add((matName, GetMeshMaterialBaseColor(mat)));
                             var tex = mat != null ? FindTextureForMaterial(mat) : null;
                             var texKey = tex != null ? GetPreviewObjectKey(tex) : null;
+                            var preserveAlpha = IsDecalMeshOrObjectName(mesh.m_Name)
+                                || IsDecalMeshOrObjectName(partGameObjectName)
+                                || ShouldPreserveMaterialTextureAlpha(mat);
                             if (tex != null && !string.IsNullOrWhiteSpace(texKey))
                             {
                                 fallbackTexturesBySlot[allSubMeshTextureIds.Count] = tex;
@@ -920,6 +958,7 @@ public partial class MainWindow
                             {
                                 allSubMeshTextureIds.Add(null);
                             }
+                            allSubMeshPreserveAlpha.Add(preserveAlpha);
                             if (mat != null)
                             {
                                 allMaterialNames.Add(matName);
@@ -940,7 +979,8 @@ public partial class MainWindow
                     out var uniqueWidths,
                     out var uniqueHeights,
                     out var subMeshToTextureIndex,
-                    out var loadedTextureFiles);
+                    out var loadedTextureFiles,
+                    allSubMeshPreserveAlpha);
 
                 // Decode any non-indexed eager fallback textures that weren't in ProjectIndex.
                 if (fallbackTexturesBySlot.Count > 0)
@@ -957,8 +997,9 @@ public partial class MainWindow
                         {
                             try
                             {
+                                var preserveAlpha = kvp.Key < allSubMeshPreserveAlpha.Count && allSubMeshPreserveAlpha[kvp.Key];
                                 using var previewImg = LoadTexturePreviewThumbnail(kvp.Value, MaxCachedPreviewTextureDimension);
-                                var rgba = ConvertPreviewImageToRgbaBytes(previewImg, out var tw, out var th);
+                                var rgba = ConvertPreviewImageToRgbaBytes(previewImg, out var tw, out var th, preserveAlpha);
                                 if (rgba != null)
                                 {
                                     uniqueTextures[mappedIdx] = rgba;
@@ -1431,7 +1472,11 @@ public partial class MainWindow
                     BoneToSkeletonNodeMap = boneMap
                 });
 
-                if (bestPrimarySkinned == null || mesh.m_VertexCount > bestPrimarySkinned.m_VertexCount)
+                bool isOverlayPart = IsOverlayOrAuxiliaryMeshName(mesh.m_Name) || IsOverlayOrAuxiliaryMeshName(info?.GameObjectName);
+                bool bestSkinnedIsOverlay = bestPrimarySkinned != null && IsOverlayOrAuxiliaryMeshName(bestPrimarySkinned.m_Name);
+                if (bestPrimarySkinned == null
+                    || (bestSkinnedIsOverlay && !isOverlayPart)
+                    || (bestSkinnedIsOverlay == isOverlayPart && mesh.m_VertexCount > bestPrimarySkinned.m_VertexCount))
                 {
                     bestPrimarySkinned = mesh;
                 }
@@ -1488,7 +1533,11 @@ public partial class MainWindow
                 });
             }
 
-            if (bestPrimaryAny == null || mesh.m_VertexCount > bestPrimaryAny.m_VertexCount)
+            bool isOverlayAny = IsOverlayOrAuxiliaryMeshName(mesh.m_Name) || IsOverlayOrAuxiliaryMeshName(info?.GameObjectName);
+            bool bestAnyIsOverlay = bestPrimaryAny != null && IsOverlayOrAuxiliaryMeshName(bestPrimaryAny.m_Name);
+            if (bestPrimaryAny == null
+                || (bestAnyIsOverlay && !isOverlayAny)
+                || (bestAnyIsOverlay == isOverlayAny && mesh.m_VertexCount > bestPrimaryAny.m_VertexCount))
             {
                 bestPrimaryAny = mesh;
             }

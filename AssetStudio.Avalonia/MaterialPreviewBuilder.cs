@@ -21,7 +21,7 @@ internal sealed class MaterialPreviewData
 
 internal sealed class MaterialPreviewBuilder
 {
-    internal static readonly string[] PreferredTextureSlots =
+    public static readonly string[] PreferredTextureSlots =
     {
         "_BaseMap",
         "_MainTex",
@@ -32,7 +32,70 @@ internal sealed class MaterialPreviewBuilder
         "_BaseColorTexture",
         "_Diffuse",
         "_AlbedoMap",
-        "_Albedo"
+        "_Albedo",
+        "_MainTexture",
+        "_BaseColorTex",
+        "_AlbedoTex",
+        "_DiffuseTex",
+        "_DiffuseMap",
+        "_FaceTex",
+        "_BaseEyeIrisMap",
+        "_EyeIrisMap",
+        "_IrisMap",
+        "_IrisTex",
+        "_EyeTex",
+        "_EyeMap",
+        "_BaseEyeWhiteMap"
+    };
+
+    public static readonly HashSet<string> NonDiffuseTextureSlots = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "_BumpMap",
+        "_NormalMap",
+        "_DetailNormalMap",
+        "_DetailNormalMapScale",
+        "_Normal",
+        "Normal",
+        "normal",
+        "_MetallicGlossMap",
+        "_SpecGlossMap",
+        "_OcclusionMap",
+        "_EmissionMap",
+        "_ParallaxMap",
+        "_DetailMask",
+        "_Cubemap",
+        "_ReflectionTex",
+        "_ShadowMap",
+        "_MaskTexture",
+        "_MaskMap",
+        "_Mask",
+        "_WeatheringMask",
+        "_EmissionMask",
+        "_MatcapMap",
+        "_Matcap",
+        "_MatcapTex",
+        "_MatcapMaskMap",
+        "_WetTexture",
+        "_BaseEyeHighlightMap",
+        "_BaseEyeHighlightMapBackup",
+        "_BaseEyePupilMap",
+        "_BaseEyePupilMapBackup",
+        "_UVScrollTexture1",
+        "_UVScrollTexture2",
+        "_RoughnessMap",
+        "_MetallicMap",
+        "_AOMap",
+        "_AmbientOcclusionMap",
+        "_SpecularMap",
+        "_SpecMap",
+        "_RampMap",
+        "_RampTex",
+        "_Ramp",
+        "_ToonRamp",
+        "_LUT",
+        "_LutTex",
+        "_OutlineTex",
+        "_OutlineMap"
     };
 
     private readonly AssetsManager assetsManager;
@@ -66,19 +129,23 @@ internal sealed class MaterialPreviewBuilder
         sb.AppendLine();
         sb.AppendLine("Texture slots:");
 
-        Texture2D? previewTexture = null;
         var texEnvs = displayMaterial.m_SavedProperties?.m_TexEnvs ?? Array.Empty<KeyValuePair<string, UnityTexEnv>>();
         if (texEnvs.Length == 0)
         {
             sb.AppendLine("  <none>");
         }
 
+        var resolvedSlots = new Dictionary<string, Texture2D?>(StringComparer.OrdinalIgnoreCase);
         foreach (var texEnv in texEnvs)
         {
             sb.Append($"  {texEnv.Key}: ");
             var texEnvValue = texEnv.Value;
             var textureRef = texEnvValue?.m_Texture;
             var texture = texEnvValue != null ? getMaterialTextureSlot(displayMaterial, texEnv.Key) : null;
+            if (!string.IsNullOrWhiteSpace(texEnv.Key))
+            {
+                resolvedSlots[texEnv.Key] = texture;
+            }
 
             if (texture != null && textureRef != null)
             {
@@ -86,10 +153,6 @@ internal sealed class MaterialPreviewBuilder
                 sb.AppendLine($"    FileID: {textureRef.m_FileID}, PathID: {textureRef.m_PathID}");
                 sb.AppendLine($"    Scale: {texEnvValue?.m_Scale.X}, {texEnvValue?.m_Scale.Y}");
                 sb.AppendLine($"    Offset: {texEnvValue?.m_Offset.X}, {texEnvValue?.m_Offset.Y}");
-                if (previewTexture == null && IsPreferredTextureSlot(texEnv.Key))
-                {
-                    previewTexture = texture;
-                }
             }
             else
             {
@@ -101,12 +164,128 @@ internal sealed class MaterialPreviewBuilder
 
         AppendScalarProperties(sb, displayMaterial);
 
+        var previewTexture = SelectMainTexture(displayMaterial, resolvedSlots);
         if (previewTexture == null)
         {
             previewTexture = findTextureForMaterial(displayMaterial);
         }
 
         return new MaterialPreviewData(sb.ToString(), previewTexture);
+    }
+
+    public static bool IsPreferredTextureSlot(string? propertyName)
+    {
+        return !string.IsNullOrWhiteSpace(propertyName)
+            && PreferredTextureSlots.Contains(propertyName, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static bool IsNonDiffuseTextureSlot(string? propertyName)
+    {
+        return !string.IsNullOrWhiteSpace(propertyName)
+            && NonDiffuseTextureSlots.Contains(propertyName);
+    }
+
+    public static string? SelectMainTextureSlotName(Material? displayMaterial)
+    {
+        var texEnvs = displayMaterial?.m_SavedProperties?.m_TexEnvs;
+        if (texEnvs == null || texEnvs.Length == 0)
+        {
+            return null;
+        }
+
+        foreach (var preferredSlot in PreferredTextureSlots)
+        {
+            foreach (var texEnv in texEnvs)
+            {
+                if (string.Equals(texEnv.Key, preferredSlot, StringComparison.OrdinalIgnoreCase)
+                    && texEnv.Value?.m_Texture != null
+                    && !texEnv.Value.m_Texture.IsNull)
+                {
+                    return texEnv.Key;
+                }
+            }
+        }
+
+        foreach (var texEnv in texEnvs)
+        {
+            if (!string.IsNullOrWhiteSpace(texEnv.Key)
+                && !IsNonDiffuseTextureSlot(texEnv.Key)
+                && texEnv.Value?.m_Texture != null
+                && !texEnv.Value.m_Texture.IsNull)
+            {
+                return texEnv.Key;
+            }
+        }
+
+        return null;
+    }
+
+    public static Texture2D? SelectMainTexture(Material? displayMaterial, IReadOnlyDictionary<string, Texture2D?>? textureSlots)
+    {
+        if (textureSlots == null || textureSlots.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var preferredSlot in PreferredTextureSlots)
+        {
+            if (TryGetSlotTexture(textureSlots, preferredSlot, out var preferredTex) && preferredTex != null)
+            {
+                return preferredTex;
+            }
+        }
+
+        var texEnvs = displayMaterial?.m_SavedProperties?.m_TexEnvs;
+        if (texEnvs != null)
+        {
+            foreach (var env in texEnvs)
+            {
+                if (string.IsNullOrWhiteSpace(env.Key) || IsNonDiffuseTextureSlot(env.Key))
+                {
+                    continue;
+                }
+
+                if (TryGetSlotTexture(textureSlots, env.Key, out var tex) && tex != null)
+                {
+                    return tex;
+                }
+            }
+        }
+        else
+        {
+            foreach (var kvp in textureSlots)
+            {
+                if (!string.IsNullOrWhiteSpace(kvp.Key) && !IsNonDiffuseTextureSlot(kvp.Key) && kvp.Value != null)
+                {
+                    return kvp.Value;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryGetSlotTexture(
+        IReadOnlyDictionary<string, Texture2D?> textureSlots,
+        string slotName,
+        out Texture2D? texture)
+    {
+        if (textureSlots.TryGetValue(slotName, out texture))
+        {
+            return true;
+        }
+
+        foreach (var kvp in textureSlots)
+        {
+            if (string.Equals(kvp.Key, slotName, StringComparison.OrdinalIgnoreCase))
+            {
+                texture = kvp.Value;
+                return true;
+            }
+        }
+
+        texture = null;
+        return false;
     }
 
     private void AppendShaderReference(StringBuilder sb, Material material)
@@ -158,11 +337,6 @@ internal sealed class MaterialPreviewBuilder
         }
 
         return null;
-    }
-
-    private static bool IsPreferredTextureSlot(string propertyName)
-    {
-        return PreferredTextureSlots.Contains(propertyName, StringComparer.OrdinalIgnoreCase);
     }
 
     private static void AppendScalarProperties(StringBuilder sb, Material material)
