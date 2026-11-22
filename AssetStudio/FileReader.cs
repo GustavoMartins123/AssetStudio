@@ -40,7 +40,7 @@ namespace AssetStudio
 
         private FileReader(string path, Stream stream, EndianType endian, FileType fileType, byte[]? cachedMemoryBuffer, string? appliedDecryptionProvider = null, StreamEncryptionBarrier? encryptionBarrier = null) : base(stream, endian)
         {
-            FullPath = Path.GetFullPath(path);
+            FullPath = path;
             FileName = Path.GetFileName(path);
             FileType = fileType;
             AppliedDecryptionProvider = appliedDecryptionProvider;

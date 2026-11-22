@@ -13,8 +13,30 @@ namespace AssetStudio.Avalonia.Services
         public const int LazyConnectionStagingFlushRowThreshold = 25_000;
         public const int MaxClipBoneHashProbes = 24;
         public const int MaxRigBoneHashProbes = 512;
+        public const int MaxContainerMaterialMeshes = 4;
+        public const int MaxContainerMaterialCount = 16;
+
+        [ThreadStatic]
+        private static FileSemanticLookupContext? t_activeFileLookupContext;
 
         public static readonly string[] PreferredMaterialTextureSlots = MaterialPreviewBuilder.PreferredTextureSlots;
+
+        private static readonly string[] AdditionalPreferredMaterialTextureSlots =
+        {
+            "_MainTexture",
+            "_BaseColorTex",
+            "_AlbedoTex",
+            "_DiffuseTex",
+            "_DiffuseMap",
+            "_FaceTex",
+            "_BaseEyeIrisMap",
+            "_EyeIrisMap",
+            "_IrisMap",
+            "_IrisTex",
+            "_EyeTex",
+            "_EyeMap",
+            "_BaseEyeWhiteMap"
+        };
 
         public static readonly HashSet<string> NonDiffuseSlots = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -22,7 +44,13 @@ namespace AssetStudio.Avalonia.Services
             "_Normal", "Normal", "normal",
             "_MetallicGlossMap", "_SpecGlossMap", "_OcclusionMap",
             "_EmissionMap", "_ParallaxMap", "_DetailMask",
-            "_Cubemap", "_ReflectionTex", "_ShadowMap"
+            "_Cubemap", "_ReflectionTex", "_ShadowMap",
+            "_MaskTexture", "_MaskMap", "_Mask", "_WeatheringMask", "_EmissionMask",
+            "_MatcapMap", "_Matcap", "_MatcapTex", "_MatcapMaskMap",
+            "_WetTexture",
+            "_BaseEyeHighlightMap", "_BaseEyeHighlightMapBackup",
+            "_BaseEyePupilMap", "_BaseEyePupilMapBackup",
+            "_UVScrollTexture1", "_UVScrollTexture2"
         };
 
         public static readonly HashSet<ClassIDType> LazyConnectionReferenceTypes = new()
@@ -250,117 +278,125 @@ namespace AssetStudio.Avalonia.Services
         internal static AssetReferenceIndexBuildResult BuildAssetReferenceIndexForFile(SerializedFile file)
         {
             var result = new AssetReferenceIndexBuildResult();
-
-            AssetStudio.Object[] objectsSnapshot;
-            lock (file)
+            var previousLookupContext = t_activeFileLookupContext;
+            var lookupContext = new FileSemanticLookupContext(file);
+            t_activeFileLookupContext = lookupContext;
+            try
             {
-                objectsSnapshot = file.Objects.ToArray();
+                AssetStudio.Object[] objectsSnapshot;
+                lock (file)
+                {
+                    objectsSnapshot = file.Objects.ToArray();
+                }
+
+                var containerReferences = new List<(string Container, List<PPtr<AssetStudio.Object>> References)>();
+                var meshFiltersByGameObjectId = BuildMeshFilterBindingsByGameObject(file, objectsSnapshot);
+                var skinnedMeshBindings = BuildSkinnedMeshBindings(file, objectsSnapshot);
+                var meshRendererBindings = BuildMeshRendererBindings(file, objectsSnapshot, meshFiltersByGameObjectId);
+                var animatorCount = objectsSnapshot.OfType<Animator>().Count();
+                var seenRendererMeshRelations = new HashSet<string>(StringComparer.Ordinal);
+
+                result.SemanticRelations.SourceFiles.Add(new SemanticSourceFileEntry(
+                    file.fileName ?? string.Empty,
+                    file.originalPath ?? string.Empty,
+                    file.unityVersion ?? string.Empty,
+                    file.m_Objects?.Count ?? objectsSnapshot.Length));
+
+                foreach (var obj in objectsSnapshot)
+                {
+                    if (obj is AssetBundle assetBundle)
+                    {
+                        AddAssetBundleContainerReferences(containerReferences, assetBundle);
+                    }
+                    else if (obj is ResourceManager resourceManager)
+                    {
+                        AddResourceManagerContainerReferences(containerReferences, resourceManager);
+                    }
+                    else if (obj is Material material)
+                    {
+                        IndexMaterialTexturesBackground(
+                            material,
+                            result.MaterialPreviewMaterialCache,
+                            result.MaterialTextureSlotsCache,
+                            result.MaterialMainTextureCache);
+                        AddMaterialTextureRelations(
+                            result.SemanticRelations,
+                            material,
+                            result.MaterialPreviewMaterialCache,
+                            result.MaterialTextureSlotsCache,
+                            result.MaterialMainTextureCache);
+                    }
+                    else if (obj is SkinnedMeshRenderer smr)
+                    {
+                        IndexSkinnedMeshRendererRelations(file, result, smr);
+                    }
+                    else if (obj is Animator animator)
+                    {
+                        AddAnimatorAvatarMeshRelations(
+                            file,
+                            animator,
+                            skinnedMeshBindings,
+                            meshRendererBindings,
+                            animatorCount,
+                            result.SemanticRelations);
+                    }
+                    else if (obj is RuntimeAnimatorController controller)
+                    {
+                        IndexRuntimeAnimatorControllerRelations(
+                            file,
+                            controller,
+                            result.SemanticRelations);
+                    }
+                    else if (obj is Animation legacyAnimation)
+                    {
+                        AddLegacyAnimationRelations(
+                            file,
+                            legacyAnimation,
+                            skinnedMeshBindings,
+                            meshRendererBindings,
+                            animatorCount,
+                            result.SemanticRelations);
+                    }
+                    else if (obj is Avatar avatar)
+                    {
+                        AddAvatarRigRelations(
+                            file,
+                            avatar,
+                            skinnedMeshBindings,
+                            objectsSnapshot,
+                            result.SemanticRelations);
+                    }
+                    else if (obj is AnimationClip animationClip)
+                    {
+                        AddAnimationClipFingerprintRelations(
+                            file,
+                            animationClip,
+                            result.SemanticRelations);
+                    }
+                    else if (obj is MeshRenderer mr)
+                    {
+                        IndexMeshRendererComponentRelations(
+                            file,
+                            result,
+                            mr,
+                            meshFiltersByGameObjectId,
+                            seenRendererMeshRelations);
+                    }
+                }
+
+                AddSceneObjectModelGroupRelations(
+                    file,
+                    result.SemanticRelations,
+                    skinnedMeshBindings.Select(binding => RendererMeshSemanticBinding.FromSkinned(file, binding))
+                        .Concat(meshRendererBindings));
+                AddSkinnedMeshFallbackBoneHashes(file, skinnedMeshBindings, result.SemanticRelations);
+                AddContainerSemanticRelations(result.SemanticRelations, file, containerReferences);
+                return result;
             }
-
-            var containerReferences = new List<(string Container, List<PPtr<AssetStudio.Object>> References)>();
-            var meshFiltersByGameObjectId = BuildMeshFilterBindingsByGameObject(file, objectsSnapshot);
-            var skinnedMeshBindings = BuildSkinnedMeshBindings(file, objectsSnapshot);
-            var meshRendererBindings = BuildMeshRendererBindings(file, objectsSnapshot, meshFiltersByGameObjectId);
-            var animatorCount = objectsSnapshot.OfType<Animator>().Count();
-            var seenRendererMeshRelations = new HashSet<string>(StringComparer.Ordinal);
-
-            result.SemanticRelations.SourceFiles.Add(new SemanticSourceFileEntry(
-                file.fileName ?? string.Empty,
-                file.originalPath ?? string.Empty,
-                file.unityVersion ?? string.Empty,
-                file.m_Objects?.Count ?? objectsSnapshot.Length));
-
-            foreach (var obj in objectsSnapshot)
+            finally
             {
-                if (obj is AssetBundle assetBundle)
-                {
-                    AddAssetBundleContainerReferences(containerReferences, assetBundle);
-                }
-                else if (obj is ResourceManager resourceManager)
-                {
-                    AddResourceManagerContainerReferences(containerReferences, resourceManager);
-                }
-                else if (obj is Material material)
-                {
-                    IndexMaterialTexturesBackground(
-                        material,
-                        result.MaterialPreviewMaterialCache,
-                        result.MaterialTextureSlotsCache,
-                        result.MaterialMainTextureCache);
-                    AddMaterialTextureRelations(
-                        result.SemanticRelations,
-                        material,
-                        result.MaterialPreviewMaterialCache,
-                        result.MaterialTextureSlotsCache,
-                        result.MaterialMainTextureCache);
-                }
-                else if (obj is SkinnedMeshRenderer smr)
-                {
-                    IndexSkinnedMeshRendererRelations(file, result, smr);
-                }
-                else if (obj is Animator animator)
-                {
-                    AddAnimatorAvatarMeshRelations(
-                        file,
-                        animator,
-                        skinnedMeshBindings,
-                        meshRendererBindings,
-                        animatorCount,
-                        result.SemanticRelations);
-                }
-                else if (obj is RuntimeAnimatorController controller)
-                {
-                    IndexRuntimeAnimatorControllerRelations(
-                        file,
-                        controller,
-                        result.SemanticRelations);
-                }
-                else if (obj is Animation legacyAnimation)
-                {
-                    AddLegacyAnimationRelations(
-                        file,
-                        legacyAnimation,
-                        skinnedMeshBindings,
-                        meshRendererBindings,
-                        animatorCount,
-                        result.SemanticRelations);
-                }
-                else if (obj is Avatar avatar)
-                {
-                    AddAvatarRigRelations(
-                        file,
-                        avatar,
-                        skinnedMeshBindings,
-                        objectsSnapshot,
-                        result.SemanticRelations);
-                }
-                else if (obj is AnimationClip animationClip)
-                {
-                    AddAnimationClipFingerprintRelations(
-                        file,
-                        animationClip,
-                        result.SemanticRelations);
-                }
-                else if (obj is MeshRenderer mr)
-                {
-                    IndexMeshRendererComponentRelations(
-                        file,
-                        result,
-                        mr,
-                        meshFiltersByGameObjectId,
-                        seenRendererMeshRelations);
-                }
+                t_activeFileLookupContext = previousLookupContext;
             }
-
-            AddSceneObjectModelGroupRelations(
-                file,
-                result.SemanticRelations,
-                skinnedMeshBindings.Select(binding => RendererMeshSemanticBinding.FromSkinned(binding))
-                    .Concat(meshRendererBindings));
-            AddSkinnedMeshFallbackBoneHashes(file, skinnedMeshBindings, result.SemanticRelations);
-            AddContainerMaterialRelations(result.SemanticRelations, file, containerReferences);
-            AddContainerAnimationRelations(result.SemanticRelations, file, containerReferences);
-            return result;
         }
 
         private static void AddMeshMaterialsToCache(
@@ -526,17 +562,36 @@ namespace AssetStudio.Avalonia.Services
             {
                 foreach (var compPtr in go.m_Components)
                 {
-                    Component? comp = null;
-                    if (compPtr.TryGet(out var cp))
+                    if (compPtr == null || compPtr.IsNull)
                     {
-                        comp = cp;
-                    }
-                    else if (compPtr.m_FileID == 0)
-                    {
-                        comp = ResolveObjectBackground(file, compPtr.m_PathID) as Component;
+                        continue;
                     }
 
-                    if (comp is MeshFilter mf)
+                    MeshFilter? mf = null;
+                    if (compPtr.m_FileID == 0)
+                    {
+                        if (file.ObjectInfoDic != null
+                            && file.ObjectInfoDic.TryGetValue(compPtr.m_PathID, out var compInfo)
+                            && ClassIDTypeHelper.FromClassId(compInfo.classID) != ClassIDType.MeshFilter)
+                        {
+                            continue;
+                        }
+
+                        if (TryGetLoadedObjectNoDeserialize<Component, MeshFilter>(file, compPtr) is MeshFilter loadedMf)
+                        {
+                            mf = loadedMf;
+                        }
+                        else if (file.ObjectInfoDic == null || file.ObjectInfoDic.ContainsKey(compPtr.m_PathID))
+                        {
+                            mf = ResolveObjectBackground(file, compPtr.m_PathID) as MeshFilter;
+                        }
+                    }
+                    else
+                    {
+                        mf = TryGetLoadedObjectNoDeserialize<Component, MeshFilter>(file, compPtr);
+                    }
+
+                    if (mf != null)
                     {
                         var mfMesh = TryGetLoadedMeshBackground(file, mf.m_Mesh);
                         var mfMeshId = GetSemanticAssetId(mfMesh);
@@ -684,79 +739,196 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
-        private static void AddContainerMaterialRelations(
+        internal static void AddContainerMaterialRelations(
             SemanticAssetRelations relations,
             SerializedFile sourceFile,
             List<(string Container, List<PPtr<AssetStudio.Object>> References)> containerReferences)
+        {
+            AddContainerSemanticRelations(relations, sourceFile, containerReferences, includeMaterialRelations: true, includeAnimationRelations: false);
+        }
+
+        private static void AddContainerSemanticRelations(
+            SemanticAssetRelations relations,
+            SerializedFile sourceFile,
+            List<(string Container, List<PPtr<AssetStudio.Object>> References)> containerReferences,
+            bool includeMaterialRelations = true,
+            bool includeAnimationRelations = true)
         {
             if (containerReferences.Count == 0)
             {
                 return;
             }
 
-            var meshesWithRendererRelations = relations.MeshMaterials
-                .Where(relation => !string.Equals(relation.RendererType, "Container", StringComparison.OrdinalIgnoreCase))
-                .Select(relation => relation.MeshAssetId)
-                .ToHashSet(StringComparer.Ordinal);
+            HashSet<string>? meshesWithRendererRelations = null;
+            if (includeMaterialRelations)
+            {
+                meshesWithRendererRelations = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var relation in relations.MeshMaterials)
+                {
+                    if (!string.Equals(relation.RendererType, "Container", StringComparison.OrdinalIgnoreCase))
+                    {
+                        meshesWithRendererRelations.Add(relation.MeshAssetId);
+                    }
+                }
+            }
+
+            var resolvedCache = new Dictionary<(int FileId, long PathId), ResolvedSemanticPPtr>();
+            var meshIds = new List<string>();
+            var meshIdSet = new HashSet<string>(StringComparer.Ordinal);
+            var materialIds = new List<string>();
+            var materialIdSet = new HashSet<string>(StringComparer.Ordinal);
+            var clipIds = new List<string>();
+            var clipIdSet = new HashSet<string>(StringComparer.Ordinal);
+            var avatarIds = new List<string>();
+            var avatarIdSet = new HashSet<string>(StringComparer.Ordinal);
+            var animatorIds = new List<string>();
+            var animatorIdSet = new HashSet<string>(StringComparer.Ordinal);
+            var localObjectInfoDic = sourceFile.ObjectInfoDic;
 
             foreach (var container in containerReferences)
             {
-                var meshIds = new List<string>();
-                var materialIds = new List<string>();
+                meshIds.Clear();
+                meshIdSet.Clear();
+                materialIds.Clear();
+                materialIdSet.Clear();
+                clipIds.Clear();
+                clipIdSet.Clear();
+                avatarIds.Clear();
+                avatarIdSet.Clear();
+                animatorIds.Clear();
+                animatorIdSet.Clear();
+
+                var hasContainerName = !string.IsNullOrWhiteSpace(container.Container);
+                var needAnimationTypes = includeAnimationRelations && hasContainerName;
 
                 foreach (var reference in container.References)
                 {
-                    var handle = GetSemanticHandleFromPPtr(sourceFile, reference);
-                    if (handle == null || string.IsNullOrWhiteSpace(handle.UniqueID))
+                    if (reference == null || reference.IsNull)
                     {
                         continue;
                     }
 
-                    if (handle.Type == ClassIDType.Mesh && !meshIds.Contains(handle.UniqueID, StringComparer.Ordinal))
+                    // Fast-skip local objects whose ClassID cannot participate in container material or animation relations.
+                    if (reference.m_FileID == 0
+                        && localObjectInfoDic != null
+                        && localObjectInfoDic.TryGetValue(reference.m_PathID, out var localInfo))
                     {
-                        meshIds.Add(handle.UniqueID);
+                        var localType = ClassIDTypeHelper.FromClassId(localInfo.classID);
+                        if (localType != ClassIDType.Mesh
+                            && localType != ClassIDType.Material
+                            && (!needAnimationTypes
+                                || (localType != ClassIDType.AnimationClip
+                                    && localType != ClassIDType.Avatar
+                                    && localType != ClassIDType.Animator)))
+                        {
+                            continue;
+                        }
                     }
-                    else if (handle.Type == ClassIDType.Material && !materialIds.Contains(handle.UniqueID, StringComparer.Ordinal))
+
+                    var key = (reference.m_FileID, reference.m_PathID);
+                    if (!resolvedCache.TryGetValue(key, out var resolved))
                     {
-                        materialIds.Add(handle.UniqueID);
+                        TryResolveSemanticPPtrInfo(sourceFile, reference.m_FileID, reference.m_PathID, expectedType: null, out resolved);
+                        resolvedCache[key] = resolved;
                     }
-                }
 
-                if (meshIds.Count == 0 || materialIds.Count == 0)
-                {
-                    continue;
-                }
-
-                var rendererId = BuildContainerRelationId(sourceFile, container.Container);
-                foreach (var meshId in meshIds)
-                {
-                    if (meshesWithRendererRelations.Contains(meshId))
+                    if (!resolved.IsValid)
                     {
                         continue;
                     }
 
-                    relations.MeshRenderers.Add(new SemanticMeshRendererRelation(
-                        meshId,
-                        rendererId,
-                        "Container",
-                        string.Empty,
-                        string.Empty,
-                        string.IsNullOrWhiteSpace(container.Container)
-                            ? "AssetBundle container"
-                            : $"AssetBundle container \"{container.Container}\""));
-
-                    var currentMaterialIds = new List<string>();
-                    for (var index = 0; index < materialIds.Count; index++)
+                    switch (resolved.Type)
                     {
-                        currentMaterialIds.Add(materialIds[index]);
-                        relations.MeshMaterials.Add(new SemanticMeshMaterialRelation(
+                        case ClassIDType.Mesh:
+                            if (meshIdSet.Add(resolved.UniqueId))
+                            {
+                                meshIds.Add(resolved.UniqueId);
+                            }
+                            break;
+                        case ClassIDType.Material:
+                            if (includeMaterialRelations && materialIdSet.Add(resolved.UniqueId))
+                            {
+                                materialIds.Add(resolved.UniqueId);
+                            }
+                            break;
+                        case ClassIDType.AnimationClip:
+                            if (needAnimationTypes && clipIdSet.Add(resolved.UniqueId))
+                            {
+                                clipIds.Add(resolved.UniqueId);
+                            }
+                            break;
+                        case ClassIDType.Avatar:
+                            if (needAnimationTypes && avatarIdSet.Add(resolved.UniqueId))
+                            {
+                                avatarIds.Add(resolved.UniqueId);
+                            }
+                            break;
+                        case ClassIDType.Animator:
+                            if (needAnimationTypes && animatorIdSet.Add(resolved.UniqueId))
+                            {
+                                animatorIds.Add(resolved.UniqueId);
+                            }
+                            break;
+                    }
+                }
+
+                // Emit synthetic Container material bindings only for narrow asset containers to prevent
+                // scene-bundle Cartesian-product explosions (e.g. hundreds of meshes x hundreds of materials).
+                if (includeMaterialRelations
+                    && meshIds.Count > 0
+                    && materialIds.Count > 0
+                    && meshIds.Count <= MaxContainerMaterialMeshes
+                    && materialIds.Count <= MaxContainerMaterialCount)
+                {
+                    var rendererId = BuildContainerRelationId(sourceFile, container.Container);
+                    var description = string.IsNullOrWhiteSpace(container.Container)
+                        ? "AssetBundle container"
+                        : $"AssetBundle container \"{container.Container}\"";
+
+                    foreach (var meshId in meshIds)
+                    {
+                        if (meshesWithRendererRelations != null && meshesWithRendererRelations.Contains(meshId))
+                        {
+                            continue;
+                        }
+
+                        relations.MeshRenderers.Add(new SemanticMeshRendererRelation(
                             meshId,
-                            materialIds[index],
                             rendererId,
                             "Container",
-                            index,
-                            index,
-                            ScoreMaterialIds(currentMaterialIds)));
+                            string.Empty,
+                            string.Empty,
+                            description));
+
+                        for (var index = 0; index < materialIds.Count; index++)
+                        {
+                            relations.MeshMaterials.Add(new SemanticMeshMaterialRelation(
+                                meshId,
+                                materialIds[index],
+                                rendererId,
+                                "Container",
+                                index,
+                                index,
+                                index + 1));
+                        }
+                    }
+                }
+
+                if (needAnimationTypes && clipIds.Count > 0 && (avatarIds.Count > 0 || meshIds.Count > 0))
+                {
+                    var primaryAvatarId = avatarIds.Count > 0 ? avatarIds[0] : string.Empty;
+                    var primaryAnimatorId = animatorIds.Count > 0 ? animatorIds[0] : string.Empty;
+                    var primaryMeshId = meshIds.Count > 0 ? meshIds[0] : string.Empty;
+                    foreach (var clipId in clipIds)
+                    {
+                        relations.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
+                            clipId,
+                            primaryAnimatorId,
+                            primaryAvatarId,
+                            primaryMeshId,
+                            string.Empty,
+                            "Container",
+                            6000));
                     }
                 }
             }
@@ -770,6 +942,479 @@ namespace AssetStudio.Avalonia.Services
 
         // --- Semantic Resolution ---
 
+        private static SerializedFile? TryGetLoadedTargetFileForPPtr(SerializedFile? sourceFile, int fileId)
+        {
+            if (sourceFile == null)
+            {
+                return null;
+            }
+
+            if (fileId == 0)
+            {
+                return sourceFile;
+            }
+
+            if (fileId < 0 || sourceFile.m_Externals == null || fileId - 1 >= sourceFile.m_Externals.Count)
+            {
+                return null;
+            }
+
+            var activeContext = t_activeFileLookupContext;
+            if (activeContext != null && ReferenceEquals(activeContext.SourceFile, sourceFile))
+            {
+                return activeContext.GetLoadedExternalFile(fileId);
+            }
+
+            var assetsManager = sourceFile.assetsManager;
+            if (assetsManager == null)
+            {
+                return null;
+            }
+
+            var external = sourceFile.m_Externals[fileId - 1];
+            if (external == null)
+            {
+                return null;
+            }
+
+            lock (assetsManager.loadLock)
+            {
+                var assetsFileList = assetsManager.assetsFileList;
+                for (var i = 0; i < assetsFileList.Count; i++)
+                {
+                    var candidate = assetsFileList[i];
+                    if (candidate != null && IsExternalSerializedFileMatch(candidate, external))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static bool IsExternalSerializedFileMatch(SerializedFile candidate, FileIdentifier external)
+        {
+            var extFile = GetSemanticFileName(external.fileName);
+            if (!string.IsNullOrEmpty(extFile)
+                && (string.Equals(GetSemanticFileName(candidate.fileName), extFile, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(GetSemanticFileName(candidate.originalPath), extFile, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(GetSemanticFileName(candidate.fullName), extFile, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            var extPathFile = GetSemanticFileName(external.pathName);
+            return !string.IsNullOrEmpty(extPathFile)
+                && (string.Equals(GetSemanticFileName(candidate.fileName), extPathFile, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(GetSemanticFileName(candidate.originalPath), extPathFile, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(GetSemanticFileName(candidate.fullName), extPathFile, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static T? TryGetLoadedObjectNoDeserialize<T>(SerializedFile? sourceFile, PPtr<T>? pptr)
+            where T : AssetStudio.Object
+        {
+            return TryGetLoadedObjectNoDeserialize<T, T>(sourceFile, pptr);
+        }
+
+        private static TResult? TryGetLoadedObjectNoDeserialize<TPtr, TResult>(SerializedFile? sourceFile, PPtr<TPtr>? pptr)
+            where TPtr : AssetStudio.Object
+            where TResult : AssetStudio.Object
+        {
+            if (pptr == null || pptr.IsNull)
+            {
+                return null;
+            }
+
+            SerializedFile? targetFile;
+            if (pptr.m_FileID == 0)
+            {
+                targetFile = sourceFile;
+            }
+            else if (sourceFile != null)
+            {
+                targetFile = TryGetLoadedTargetFileForPPtr(sourceFile, pptr.m_FileID);
+            }
+            else
+            {
+                pptr.TryGetAssetsFile(out targetFile);
+            }
+
+            if (targetFile == null)
+            {
+                return null;
+            }
+
+            if (targetFile.TryGetObject(pptr.m_PathID, out var existing))
+            {
+                return existing as TResult;
+            }
+
+            return null;
+        }
+
+        private static bool TryResolveSemanticPPtrInfo(
+            SerializedFile sourceFile,
+            int fileId,
+            long pathId,
+            ClassIDType? expectedType,
+            out ResolvedSemanticPPtr resolved)
+        {
+            return TryResolveSemanticPPtrInfo(sourceFile, fileId, pathId, expectedType, out resolved, out _);
+        }
+
+        private static bool TryResolveSemanticPPtrInfo(
+            SerializedFile sourceFile,
+            int fileId,
+            long pathId,
+            ClassIDType? expectedType,
+            out ResolvedSemanticPPtr resolved,
+            out int arenaIndex)
+        {
+            resolved = default;
+            arenaIndex = -1;
+            if (sourceFile == null || pathId == 0)
+            {
+                return false;
+            }
+
+            var activeContext = t_activeFileLookupContext;
+            var hasActiveContext = activeContext != null && ReferenceEquals(activeContext.SourceFile, sourceFile);
+
+            if (fileId == 0)
+            {
+                if (sourceFile.ObjectInfoDic != null && sourceFile.ObjectInfoDic.TryGetValue(pathId, out var objInfo))
+                {
+                    var actualType = ClassIDTypeHelper.FromClassId(objInfo.classID);
+                    if (expectedType != null && !IsCompatibleSemanticClassId(actualType, expectedType.Value))
+                    {
+                        return false;
+                    }
+
+                    var localUniqueId = hasActiveContext
+                        ? activeContext!.BuildLocalUniqueId(pathId)
+                        : AssetHandle.BuildUniqueID(sourceFile, pathId);
+                    resolved = new ResolvedSemanticPPtr(actualType, localUniqueId);
+                    return true;
+                }
+
+                var localProjectIndex = sourceFile.assetsManager?.ProjectIndex;
+                if (localProjectIndex != null)
+                {
+                    var localOrigin = hasActiveContext
+                        ? activeContext!.LocalOrigin
+                        : AssetHandleOrigin.Intern(sourceFile);
+                    if (localProjectIndex.TryGetIndex(new AssetHandleKey(localOrigin.KeyOriginId, pathId), out var idx))
+                    {
+                        var actualType = localProjectIndex.Arena.GetType(idx);
+                        if (expectedType != null && !IsCompatibleSemanticClassId(actualType, expectedType.Value))
+                        {
+                            return false;
+                        }
+
+                        arenaIndex = idx;
+                        resolved = new ResolvedSemanticPPtr(actualType, localProjectIndex.Arena.GetUniqueId(idx));
+                        return true;
+                    }
+                }
+
+                if (expectedType != null)
+                {
+                    var fallbackUniqueId = hasActiveContext
+                        ? activeContext!.BuildLocalUniqueId(pathId)
+                        : AssetHandle.BuildUniqueID(sourceFile, pathId);
+                    resolved = new ResolvedSemanticPPtr(expectedType.Value, fallbackUniqueId);
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (hasActiveContext && activeContext!.TryGetCachedExternalPPtr(fileId, pathId, out var cachedEntry))
+            {
+                if (cachedEntry.Resolved.IsValid
+                    && (expectedType == null || IsCompatibleSemanticClassId(cachedEntry.Resolved.Type, expectedType.Value)))
+                {
+                    resolved = cachedEntry.Resolved;
+                    arenaIndex = cachedEntry.ArenaIndex;
+                    return true;
+                }
+
+                if (!cachedEntry.Resolved.IsValid)
+                {
+                    return false;
+                }
+            }
+
+            var loadedTarget = TryGetLoadedTargetFileForPPtr(sourceFile, fileId);
+            if (loadedTarget != null)
+            {
+                if (loadedTarget.ObjectInfoDic != null && loadedTarget.ObjectInfoDic.TryGetValue(pathId, out var targetInfo))
+                {
+                    var actualType = ClassIDTypeHelper.FromClassId(targetInfo.classID);
+                    var uid = AssetHandle.BuildUniqueID(loadedTarget, pathId);
+                    var candidateResolved = new ResolvedSemanticPPtr(actualType, uid);
+                    if (hasActiveContext)
+                    {
+                        activeContext!.CacheExternalPPtr(fileId, pathId, candidateResolved, -1);
+                    }
+
+                    if (expectedType == null || IsCompatibleSemanticClassId(actualType, expectedType.Value))
+                    {
+                        resolved = candidateResolved;
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                var loadedProjectIndex = sourceFile.assetsManager?.ProjectIndex;
+                if (loadedProjectIndex != null)
+                {
+                    var targetOrigin = AssetHandleOrigin.Intern(loadedTarget);
+                    if (loadedProjectIndex.TryGetIndex(new AssetHandleKey(targetOrigin.KeyOriginId, pathId), out var idx))
+                    {
+                        var actualType = loadedProjectIndex.Arena.GetType(idx);
+                        var candidateResolved = new ResolvedSemanticPPtr(actualType, loadedProjectIndex.Arena.GetUniqueId(idx));
+                        if (hasActiveContext)
+                        {
+                            activeContext!.CacheExternalPPtr(fileId, pathId, candidateResolved, idx);
+                        }
+
+                        if (expectedType == null || IsCompatibleSemanticClassId(actualType, expectedType.Value))
+                        {
+                            resolved = candidateResolved;
+                            arenaIndex = idx;
+                            return true;
+                        }
+
+                        return false;
+                    }
+                }
+
+                if (expectedType != null)
+                {
+                    resolved = new ResolvedSemanticPPtr(expectedType.Value, AssetHandle.BuildUniqueID(loadedTarget, pathId));
+                    return true;
+                }
+            }
+
+            if (TryFindSemanticArenaMatchForPPtr(sourceFile, fileId, pathId, expectedType, out var matchedIndex, out var matchedType, out var matchedUniqueId))
+            {
+                var matchedResolved = new ResolvedSemanticPPtr(matchedType, matchedUniqueId);
+                if (hasActiveContext && expectedType == null)
+                {
+                    activeContext!.CacheExternalPPtr(fileId, pathId, matchedResolved, matchedIndex);
+                }
+
+                resolved = matchedResolved;
+                arenaIndex = matchedIndex;
+                return true;
+            }
+
+            if (hasActiveContext && expectedType == null)
+            {
+                activeContext!.CacheExternalPPtr(fileId, pathId, default, -1);
+            }
+
+            return false;
+        }
+
+        private static bool TryFindSemanticArenaMatchForPPtr(
+            SerializedFile sourceFile,
+            int fileId,
+            long pathId,
+            ClassIDType? expectedType,
+            out int arenaIndex,
+            out ClassIDType actualType,
+            out string uniqueId)
+        {
+            arenaIndex = -1;
+            actualType = ClassIDType.UnknownType;
+            uniqueId = string.Empty;
+
+            var assetsManager = sourceFile?.assetsManager;
+            var projectIndex = assetsManager?.ProjectIndex;
+            if (assetsManager == null
+                || projectIndex == null
+                || sourceFile?.m_Externals == null
+                || fileId <= 0
+                || fileId - 1 >= sourceFile.m_Externals.Count)
+            {
+                return false;
+            }
+
+            var external = sourceFile.m_Externals[fileId - 1];
+            if (external == null)
+            {
+                return false;
+            }
+
+            var activeContext = t_activeFileLookupContext;
+            string? cand1;
+            string? cand2;
+            string? cand3;
+            if (activeContext != null && ReferenceEquals(activeContext.SourceFile, sourceFile))
+            {
+                (cand1, cand2, cand3) = activeContext.GetExternalNameCandidates(fileId);
+            }
+            else
+            {
+                GetExternalFileNameCandidates(external, out cand1, out cand2, out cand3);
+            }
+
+            // Fast O(1) path via AssetIndexArena._originIdsByFileName + _indexByKey (zero handle allocations).
+            var typeMismatchCandidate = false;
+            if (TryProbeExternalCandidate(assetsManager, cand1, pathId, expectedType, out arenaIndex, out actualType, out uniqueId, ref typeMismatchCandidate)
+                || TryProbeExternalCandidate(assetsManager, cand2, pathId, expectedType, out arenaIndex, out actualType, out uniqueId, ref typeMismatchCandidate)
+                || TryProbeExternalCandidate(assetsManager, cand3, pathId, expectedType, out arenaIndex, out actualType, out uniqueId, ref typeMismatchCandidate))
+            {
+                return true;
+            }
+
+            if (!typeMismatchCandidate)
+            {
+                return false;
+            }
+
+            // Rare fallback: multiple origins share the same fileName and PathID with different ClassIDTypes.
+            var arena = projectIndex.Arena;
+            var bestIndex = -1;
+            var bestScore = int.MinValue;
+            var bestType = ClassIDType.UnknownType;
+            var bestUniqueId = string.Empty;
+            ProbeFallbackIndicesForCandidate(arena, cand1, pathId, expectedType, external, sourceFile, ref bestIndex, ref bestScore, ref bestType, ref bestUniqueId);
+            ProbeFallbackIndicesForCandidate(arena, cand2, pathId, expectedType, external, sourceFile, ref bestIndex, ref bestScore, ref bestType, ref bestUniqueId);
+            ProbeFallbackIndicesForCandidate(arena, cand3, pathId, expectedType, external, sourceFile, ref bestIndex, ref bestScore, ref bestType, ref bestUniqueId);
+
+            if (bestIndex >= 0)
+            {
+                arenaIndex = bestIndex;
+                actualType = bestType;
+                uniqueId = bestUniqueId;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryProbeExternalCandidate(
+            AssetsManager assetsManager,
+            string? candidateFileName,
+            long pathId,
+            ClassIDType? expectedType,
+            out int arenaIndex,
+            out ClassIDType actualType,
+            out string uniqueId,
+            ref bool typeMismatchCandidate)
+        {
+            arenaIndex = -1;
+            actualType = ClassIDType.UnknownType;
+            uniqueId = string.Empty;
+            if (string.IsNullOrEmpty(candidateFileName))
+            {
+                return false;
+            }
+
+            if (!assetsManager.TryFindIndexedAssetByFileNameAndPathId(candidateFileName, pathId, out var idx, out var foundType, out var foundUniqueId, out _))
+            {
+                return false;
+            }
+
+            if (expectedType == null || IsCompatibleSemanticClassId(foundType, expectedType.Value))
+            {
+                arenaIndex = idx;
+                actualType = foundType;
+                uniqueId = foundUniqueId;
+                return true;
+            }
+
+            typeMismatchCandidate = true;
+            return false;
+        }
+
+        private static void ProbeFallbackIndicesForCandidate(
+            AssetIndexArena arena,
+            string? candidateFileName,
+            long pathId,
+            ClassIDType? expectedType,
+            FileIdentifier external,
+            SerializedFile sourceFile,
+            ref int bestIndex,
+            ref int bestScore,
+            ref ClassIDType bestType,
+            ref string bestUniqueId)
+        {
+            if (string.IsNullOrEmpty(candidateFileName))
+            {
+                return;
+            }
+
+            var indices = arena.GetIndicesForFile(candidateFileName);
+            for (var i = 0; i < indices.Length; i++)
+            {
+                var idx = indices[i];
+                if (arena.GetPathId(idx) != pathId)
+                {
+                    continue;
+                }
+
+                var foundType = arena.GetType(idx);
+                if (expectedType != null && !IsCompatibleSemanticClassId(foundType, expectedType.Value))
+                {
+                    continue;
+                }
+
+                var origin = arena.GetOrigin(idx);
+                var score = ScoreSemanticOriginMatch(origin, arena.GetSourceFile(idx), external, sourceFile);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIndex = idx;
+                    bestType = foundType;
+                    bestUniqueId = arena.GetUniqueId(idx);
+                }
+            }
+        }
+
+        private static void GetExternalFileNameCandidates(FileIdentifier external, out string? cand1, out string? cand2, out string? cand3)
+        {
+            cand1 = !string.IsNullOrWhiteSpace(external.fileName) ? external.fileName : null;
+            cand2 = null;
+            cand3 = null;
+
+            if (!string.IsNullOrWhiteSpace(external.fileName))
+            {
+                var fileLeaf = GetSemanticFileName(external.fileName);
+                if (!string.IsNullOrEmpty(fileLeaf) && !string.Equals(fileLeaf, cand1, StringComparison.OrdinalIgnoreCase))
+                {
+                    cand2 = fileLeaf;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(external.pathName))
+            {
+                var pathLeaf = GetSemanticFileName(external.pathName);
+                if (!string.IsNullOrEmpty(pathLeaf)
+                    && !string.Equals(pathLeaf, cand1, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(pathLeaf, cand2, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (cand1 == null) cand1 = pathLeaf;
+                    else if (cand2 == null) cand2 = pathLeaf;
+                    else cand3 = pathLeaf;
+                }
+
+                if (!string.Equals(external.pathName, cand1, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(external.pathName, cand2, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(external.pathName, cand3, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (cand1 == null) cand1 = external.pathName;
+                    else if (cand2 == null) cand2 = external.pathName;
+                    else if (cand3 == null) cand3 = external.pathName;
+                }
+            }
+        }
+
         public static AssetHandle? GetSemanticHandleFromPPtr(SerializedFile sourceFile, PPtr<AssetStudio.Object> pptr)
         {
             if (sourceFile?.assetsManager?.ProjectIndex == null || pptr == null || pptr.IsNull)
@@ -777,18 +1422,19 @@ namespace AssetStudio.Avalonia.Services
                 return null;
             }
 
-            if (pptr.TryGetAssetsFile(out var targetFile))
+            if (pptr.m_FileID == 0)
+            {
+                return sourceFile.assetsManager.ProjectIndex.GetHandle(sourceFile, pptr.m_PathID);
+            }
+
+            var targetFile = TryGetLoadedTargetFileForPPtr(sourceFile, pptr.m_FileID);
+            if (targetFile != null)
             {
                 var handle = sourceFile.assetsManager.ProjectIndex.GetHandle(targetFile, pptr.m_PathID);
                 if (handle != null)
                 {
                     return handle;
                 }
-            }
-
-            if (pptr.m_FileID == 0)
-            {
-                return sourceFile.assetsManager.ProjectIndex.GetHandle(sourceFile, pptr.m_PathID);
             }
 
             return FindSemanticHandleForPPtr(sourceFile, pptr.m_FileID, pptr.m_PathID, expectedType: null);
@@ -806,21 +1452,44 @@ namespace AssetStudio.Avalonia.Services
                 return null;
             }
 
+            var objectInfoDic = sourceFile?.ObjectInfoDic;
             foreach (var componentPtr in gameObject.m_Components)
             {
-                Component? component = null;
-                if (componentPtr.TryGet(out var resolvedComponent))
+                if (componentPtr == null || componentPtr.IsNull)
                 {
-                    component = resolvedComponent;
-                }
-                else if (componentPtr.m_FileID == 0)
-                {
-                    component = ResolveObjectBackground(sourceFile, componentPtr.m_PathID) as Component;
+                    continue;
                 }
 
-                if (component is Transform transform)
+                if (componentPtr.m_FileID == 0)
                 {
-                    return transform;
+                    if (objectInfoDic != null && objectInfoDic.TryGetValue(componentPtr.m_PathID, out var compInfo))
+                    {
+                        var compClass = ClassIDTypeHelper.FromClassId(compInfo.classID);
+                        if (compClass != ClassIDType.Transform && compClass != ClassIDType.RectTransform)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if (TryGetLoadedObjectNoDeserialize<Component, Transform>(sourceFile, componentPtr) is Transform loadedTransform)
+                    {
+                        return loadedTransform;
+                    }
+
+                    if (sourceFile != null && (objectInfoDic == null || objectInfoDic.ContainsKey(componentPtr.m_PathID)))
+                    {
+                        if (ResolveObjectBackground(sourceFile, componentPtr.m_PathID) is Transform resolvedTransform)
+                        {
+                            return resolvedTransform;
+                        }
+                    }
+                }
+                else
+                {
+                    if (TryGetLoadedObjectNoDeserialize<Component, Transform>(sourceFile, componentPtr) is Transform externalTransform)
+                    {
+                        return externalTransform;
+                    }
                 }
             }
 
@@ -829,36 +1498,19 @@ namespace AssetStudio.Avalonia.Services
 
         public static Transform? ResolveTransformBackground(SerializedFile sourceFile, PPtr<Transform> pptr)
         {
-            if (pptr.TryGet(out var transform))
-            {
-                return transform;
-            }
-
-            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Transform : null;
+            return ResolveReferenceObjectBackground(sourceFile, pptr);
         }
 
         public static Avatar? ResolveAvatarBackground(SerializedFile sourceFile, PPtr<Avatar> pptr)
         {
-            if (pptr.TryGet(out var avatar))
-            {
-                return avatar;
-            }
-
-            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Avatar : null;
+            return ResolveReferenceObjectBackground(sourceFile, pptr);
         }
 
         public static RuntimeAnimatorController? ResolveRuntimeAnimatorControllerBackground(
             SerializedFile sourceFile,
             PPtr<RuntimeAnimatorController> pptr)
         {
-            if (pptr.TryGet(out var controller))
-            {
-                return controller;
-            }
-
-            return pptr.m_FileID == 0
-                ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as RuntimeAnimatorController
-                : null;
+            return ResolveReferenceObjectBackground(sourceFile, pptr);
         }
 
         public static string GetSemanticGameObjectId(
@@ -877,68 +1529,59 @@ namespace AssetStudio.Avalonia.Services
 
         public static GameObject? ResolveGameObjectBackground(SerializedFile sourceFile, PPtr<GameObject> pptr)
         {
-            if (pptr.TryGet(out var go))
-            {
-                return go;
-            }
-
-            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as GameObject : null;
+            return ResolveReferenceObjectBackground(sourceFile, pptr);
         }
 
         public static Mesh? ResolveMeshBackground(SerializedFile sourceFile, PPtr<Mesh> pptr)
         {
-            if (pptr.TryGet(out var mesh))
-            {
-                return mesh;
-            }
-
-            return pptr.m_FileID == 0 ? ResolveObjectBackground(sourceFile, pptr.m_PathID) as Mesh : null;
+            return ResolveReferenceObjectBackground(sourceFile, pptr);
         }
 
-        private static Mesh? TryGetLoadedMeshBackground(SerializedFile sourceFile, PPtr<Mesh> pptr)
+        private static T? ResolveReferenceObjectBackground<T>(SerializedFile sourceFile, PPtr<T>? pptr)
+            where T : AssetStudio.Object
         {
             if (pptr == null || pptr.IsNull)
             {
                 return null;
             }
 
-            if (pptr.TryGet(out var mesh))
+            var loaded = TryGetLoadedObjectNoDeserialize(sourceFile, pptr);
+            if (loaded != null)
             {
-                return mesh;
+                return loaded;
             }
 
-            if (pptr.m_FileID == 0)
+            var targetFile = pptr.m_FileID == 0
+                ? sourceFile
+                : TryGetLoadedTargetFileForPPtr(sourceFile, pptr.m_FileID);
+            if (targetFile == null)
             {
-                lock (sourceFile)
-                {
-                    if (sourceFile.ObjectsDic.TryGetValue(pptr.m_PathID, out var existing))
-                    {
-                        return existing as Mesh;
-                    }
-                }
+                return null;
             }
 
-            return null;
+            if (targetFile.ObjectInfoDic != null && !targetFile.ObjectInfoDic.ContainsKey(pptr.m_PathID))
+            {
+                return null;
+            }
+
+            return ResolveObjectBackground(targetFile, pptr.m_PathID) as T;
+        }
+
+        private static Mesh? TryGetLoadedMeshBackground(SerializedFile sourceFile, PPtr<Mesh> pptr)
+        {
+            return TryGetLoadedObjectNoDeserialize(sourceFile, pptr);
         }
 
         public static Material? ResolveRendererMaterialBackground(PPtr<Material> pptr)
         {
-            if (pptr.TryGet(out var material))
-            {
-                return material;
-            }
-
-            return null;
+            return TryGetLoadedObjectNoDeserialize<Material, Material>(sourceFile: null, pptr);
         }
 
         public static AssetStudio.Object? ResolveObjectBackground(SerializedFile sourceFile, long pathID)
         {
-            lock (sourceFile)
+            if (sourceFile.TryGetObject(pathID, out var obj))
             {
-                if (sourceFile.ObjectsDic.TryGetValue(pathID, out var obj))
-                {
-                    return obj;
-                }
+                return obj;
             }
 
             if (sourceFile.assetsManager?.LazyLoading == true && sourceFile.assetsManager.ProjectIndex != null)
@@ -955,9 +1598,18 @@ namespace AssetStudio.Avalonia.Services
 
         public static string GetSemanticAssetId(AssetStudio.Object? asset)
         {
-            return asset?.assetsFile != null
-                ? AssetHandle.BuildUniqueID(asset.assetsFile, asset.m_PathID)
-                : string.Empty;
+            if (asset?.assetsFile == null)
+            {
+                return string.Empty;
+            }
+
+            var activeContext = t_activeFileLookupContext;
+            if (activeContext != null && ReferenceEquals(activeContext.SourceFile, asset.assetsFile))
+            {
+                return activeContext.BuildLocalUniqueId(asset.m_PathID);
+            }
+
+            return AssetHandle.BuildUniqueID(asset.assetsFile, asset.m_PathID);
         }
 
         public static string GetSemanticAssetIdFromPPtr<T>(SerializedFile sourceFile, PPtr<T> pptr, ClassIDType expectedType)
@@ -968,18 +1620,9 @@ namespace AssetStudio.Avalonia.Services
                 return string.Empty;
             }
 
-            if (pptr.TryGetAssetsFile(out var targetFile))
-            {
-                return AssetHandle.BuildUniqueID(targetFile, pptr.m_PathID);
-            }
-
-            if (pptr.m_FileID == 0)
-            {
-                return AssetHandle.BuildUniqueID(sourceFile, pptr.m_PathID);
-            }
-
-            var handle = FindSemanticHandleForPPtr(sourceFile, pptr.m_FileID, pptr.m_PathID, expectedType);
-            return handle?.UniqueID ?? string.Empty;
+            return TryResolveSemanticPPtrInfo(sourceFile, pptr.m_FileID, pptr.m_PathID, expectedType, out var resolved)
+                ? resolved.UniqueId
+                : string.Empty;
         }
 
         public static bool IsCompatibleSemanticClassId(ClassIDType actual, ClassIDType expected)
@@ -1015,61 +1658,47 @@ namespace AssetStudio.Avalonia.Services
 
         public static AssetHandle? FindSemanticHandleForPPtr(SerializedFile sourceFile, int fileId, long pathId, ClassIDType? expectedType)
         {
-            if (sourceFile?.assetsManager?.ProjectIndex == null
-                || sourceFile.m_Externals == null
-                || fileId <= 0
-                || fileId - 1 >= sourceFile.m_Externals.Count)
+            if (sourceFile?.assetsManager?.ProjectIndex == null)
             {
                 return null;
             }
 
-            var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var external = sourceFile.m_Externals[fileId - 1];
-            if (external == null)
+            if (TryFindSemanticArenaMatchForPPtr(sourceFile, fileId, pathId, expectedType, out var arenaIndex, out _, out _)
+                && arenaIndex >= 0)
             {
-                return null;
+                return sourceFile.assetsManager.ProjectIndex.Arena.MaterializeHandle(arenaIndex);
             }
 
-            AddSemanticFileNameCandidate(candidates, external.fileName);
-            AddSemanticFileNameCandidate(candidates, external.pathName);
-
-            return candidates
-                .SelectMany(fileName => sourceFile.assetsManager.ProjectIndex.GetHandlesForFile(fileName))
-                .Where(candidate => candidate.PathID == pathId
-                    && (expectedType == null || IsCompatibleSemanticClassId(candidate.Type, expectedType.Value)))
-                .GroupBy(candidate => candidate.UniqueID, StringComparer.Ordinal)
-                .Select(group => group.First())
-                .OrderByDescending(candidate => ScoreSemanticHandleMatch(candidate, external, sourceFile))
-                .FirstOrDefault();
+            return null;
         }
 
-        private static int ScoreSemanticHandleMatch(AssetHandle handle, FileIdentifier external, SerializedFile sourceFile)
+        private static int ScoreSemanticOriginMatch(SourceOriginRecord origin, SerializedFile? originSourceFile, FileIdentifier external, SerializedFile sourceFile)
         {
             var score = 0;
-            if (IsSameSemanticSource(handle.OriginalPath, external.pathName)
-                || IsSameSemanticSource(handle.SourceFile?.originalPath, external.pathName)
-                || IsSameSemanticSource(handle.SourceFile?.fullName, external.pathName))
+            if (IsSameSemanticSource(origin.OriginalPath, external.pathName)
+                || IsSameSemanticSource(originSourceFile?.originalPath, external.pathName)
+                || IsSameSemanticSource(originSourceFile?.fullName, external.pathName))
             {
                 score += 100;
             }
 
-            if (IsSameSemanticSource(handle.SerializedFileName, external.fileName)
-                || IsSameSemanticSource(handle.SourceFile?.fileName, external.fileName))
+            if (IsSameSemanticSource(origin.SerializedFileName, external.fileName)
+                || IsSameSemanticSource(originSourceFile?.fileName, external.fileName))
             {
                 score += 50;
             }
 
             var externalPathFileName = GetSemanticFileName(external.pathName);
             if (!string.IsNullOrEmpty(externalPathFileName)
-                && (IsSameSemanticSource(GetSemanticFileName(handle.OriginalPath), externalPathFileName)
-                    || IsSameSemanticSource(handle.SerializedFileName, externalPathFileName)
-                    || IsSameSemanticSource(handle.SourceFile?.fileName, externalPathFileName)))
+                && (IsSameSemanticSource(GetSemanticFileName(origin.OriginalPath), externalPathFileName)
+                    || IsSameSemanticSource(origin.SerializedFileName, externalPathFileName)
+                    || IsSameSemanticSource(originSourceFile?.fileName, externalPathFileName)))
             {
                 score += 25;
             }
 
             var sourceDirectory = Path.GetDirectoryName(sourceFile.originalPath ?? sourceFile.fullName ?? string.Empty);
-            var handleDirectory = Path.GetDirectoryName(handle.OriginalPath ?? handle.SourceFile?.originalPath ?? string.Empty);
+            var handleDirectory = Path.GetDirectoryName(origin.OriginalPath ?? originSourceFile?.originalPath ?? string.Empty);
             if (!string.IsNullOrEmpty(sourceDirectory)
                 && !string.IsNullOrEmpty(handleDirectory)
                 && string.Equals(sourceDirectory, handleDirectory, StringComparison.OrdinalIgnoreCase))
@@ -1105,22 +1734,6 @@ namespace AssetStudio.Avalonia.Services
             catch
             {
                 return string.Equals(left.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
-            }
-        }
-
-        private static void AddSemanticFileNameCandidate(HashSet<string> candidates, string? fileNameOrPath)
-        {
-            if (string.IsNullOrWhiteSpace(fileNameOrPath))
-            {
-                return;
-            }
-
-            candidates.Add(fileNameOrPath);
-            var normalized = fileNameOrPath.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
-            var fileName = Path.GetFileName(normalized);
-            if (!string.IsNullOrWhiteSpace(fileName))
-            {
-                candidates.Add(fileName);
             }
         }
 
@@ -1244,7 +1857,7 @@ namespace AssetStudio.Avalonia.Services
             foreach (var binding in bindings)
             {
                 var matPtr = binding.MaterialPointer;
-                var rendererMaterial = matPtr != null ? ResolveRendererMaterialBackground(matPtr) : null;
+                var rendererMaterial = matPtr != null ? TryGetLoadedObjectNoDeserialize(sourceFile, matPtr) : null;
                 var materialId = GetSemanticAssetId(rendererMaterial);
                 if (string.IsNullOrEmpty(materialId) && matPtr != null)
                 {
@@ -1406,9 +2019,32 @@ namespace AssetStudio.Avalonia.Services
                 return string.Empty;
             }
 
-            if (material.m_Shader.TryGet(out var shader) && shader != null)
+            var loadedShader = TryGetLoadedObjectNoDeserialize(material.assetsFile, material.m_Shader);
+            if (loadedShader != null)
             {
-                return shader.m_ParsedForm?.m_Name ?? shader.m_Name ?? string.Empty;
+                return loadedShader.m_ParsedForm?.m_Name ?? loadedShader.m_Name ?? string.Empty;
+            }
+
+            var sourceFile = material.assetsFile;
+            var arena = sourceFile?.assetsManager?.ProjectIndex?.Arena;
+            if (sourceFile != null && arena != null)
+            {
+                if (material.m_Shader.m_FileID == 0)
+                {
+                    var activeContext = t_activeFileLookupContext;
+                    var origin = activeContext != null && ReferenceEquals(activeContext.SourceFile, sourceFile)
+                        ? activeContext.LocalOrigin
+                        : AssetHandleOrigin.Intern(sourceFile);
+                    if (arena.TryGetIndex(new AssetHandleKey(origin.KeyOriginId, material.m_Shader.m_PathID), out var localIdx))
+                    {
+                        return arena.GetName(localIdx) ?? string.Empty;
+                    }
+                }
+                else if (TryResolveSemanticPPtrInfo(sourceFile, material.m_Shader.m_FileID, material.m_Shader.m_PathID, ClassIDType.Shader, out _, out var shaderArenaIndex)
+                    && shaderArenaIndex >= 0)
+                {
+                    return arena.GetName(shaderArenaIndex) ?? string.Empty;
+                }
             }
 
             return string.Empty;
@@ -1556,6 +2192,19 @@ namespace AssetStudio.Avalonia.Services
                 }
             }
 
+            foreach (var preferredSlot in AdditionalPreferredMaterialTextureSlots)
+            {
+                foreach (var texEnv in texEnvs)
+                {
+                    if (string.Equals(texEnv.Key, preferredSlot, StringComparison.OrdinalIgnoreCase)
+                        && texEnv.Value?.m_Texture != null
+                        && !texEnv.Value.m_Texture.IsNull)
+                    {
+                        return texEnv.Key;
+                    }
+                }
+            }
+
             foreach (var texEnv in texEnvs)
             {
                 if (!NonDiffuseSlots.Contains(texEnv.Key)
@@ -1641,7 +2290,10 @@ namespace AssetStudio.Avalonia.Services
                     return material;
                 }
 
-                if (material.m_Parent != null && material.m_Parent.TryGet(out var parent))
+                var parent = material.m_Parent != null
+                    ? TryGetLoadedObjectNoDeserialize(material.assetsFile, material.m_Parent)
+                    : null;
+                if (parent != null)
                 {
                     material = parent;
                     continue;
@@ -1655,20 +2307,7 @@ namespace AssetStudio.Avalonia.Services
 
         public static Texture2D? ResolveTexturePPtrBackground(Material material, PPtr<Texture> textureRef)
         {
-            if (textureRef.TryGet<Texture2D>(out var directTex))
-            {
-                return directTex;
-            }
-
-            if (material.assetsFile?.ObjectsDic != null
-                && textureRef.m_FileID == 0
-                && material.assetsFile.ObjectsDic.TryGetValue(textureRef.m_PathID, out var localObj)
-                && localObj is Texture2D localTex)
-            {
-                return localTex;
-            }
-
-            return null;
+            return TryGetLoadedObjectNoDeserialize<Texture, Texture2D>(material?.assetsFile, textureRef);
         }
 
         public static Texture2D? SelectMainTextureForMaterialBackground(Material displayMaterial, IReadOnlyDictionary<string, Texture2D?> textureSlots)
@@ -1679,6 +2318,14 @@ namespace AssetStudio.Avalonia.Services
             }
 
             foreach (var slot in PreferredMaterialTextureSlots)
+            {
+                if (textureSlots.TryGetValue(slot, out var tex) && tex != null)
+                {
+                    return tex;
+                }
+            }
+
+            foreach (var slot in AdditionalPreferredMaterialTextureSlots)
             {
                 if (textureSlots.TryGetValue(slot, out var tex) && tex != null)
                 {
@@ -1876,17 +2523,19 @@ namespace AssetStudio.Avalonia.Services
                         continue;
                     }
 
+                    var boundGameObject = binding.GameObject ?? gameObject;
+                    var isActive = IsRendererActiveInHierarchy(sourceFile, renderer, boundGameObject);
                     result.Add(new RendererMeshSemanticBinding(
                         renderer,
                         rendererId,
                         "MeshRenderer",
                         binding.Mesh,
                         binding.MeshId,
-                        binding.GameObject ?? gameObject,
+                        boundGameObject,
                         binding.MeshFilter.m_Mesh.m_FileID,
                         binding.MeshFilter.m_Mesh.m_PathID,
-                        100,
-                        "MeshRenderer GameObject MeshFilter"));
+                        isActive ? 100 : 40,
+                        isActive ? "MeshRenderer GameObject MeshFilter" : "MeshRenderer GameObject MeshFilter (inactive)"));
                 }
             }
 
@@ -2513,7 +3162,7 @@ namespace AssetStudio.Avalonia.Services
                         && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
                     {
                         matchedAnySkinned = true;
-                        var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
+                        var isActive = IsRendererActiveInHierarchy(sourceFile, binding.Renderer, binding.GameObject, animatorGameObject);
                         yield return new RendererMeshSemanticBinding(
                             binding.Renderer,
                             GetSemanticAssetId(binding.Renderer),
@@ -2540,7 +3189,7 @@ namespace AssetStudio.Avalonia.Services
                         && IsSameOrDescendantGameObject(sourceFile, binding.GameObject, animatorGameObject))
                     {
                         matchedAnyStatic = true;
-                        var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
+                        var isActive = IsRendererActiveInHierarchy(sourceFile, binding.Renderer, binding.GameObject, animatorGameObject);
                         yield return new RendererMeshSemanticBinding(
                             binding.Renderer,
                             binding.RendererId,
@@ -2567,7 +3216,7 @@ namespace AssetStudio.Avalonia.Services
                 {
                     foreach (var binding in skinnedMeshBindings)
                     {
-                        var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
+                        var isActive = IsRendererActiveInHierarchy(sourceFile, binding.Renderer, binding.GameObject, animatorGameObject);
                         yield return new RendererMeshSemanticBinding(
                             binding.Renderer,
                             GetSemanticAssetId(binding.Renderer),
@@ -2586,7 +3235,7 @@ namespace AssetStudio.Avalonia.Services
 
                 foreach (var binding in meshRendererBindings)
                 {
-                    var isActive = IsGameObjectActiveInHierarchy(sourceFile, binding.GameObject, animatorGameObject);
+                    var isActive = IsRendererActiveInHierarchy(sourceFile, binding.Renderer, binding.GameObject, animatorGameObject);
                     yield return new RendererMeshSemanticBinding(
                         binding.Renderer,
                         binding.RendererId,
@@ -2600,6 +3249,16 @@ namespace AssetStudio.Avalonia.Services
                         isActive ? "Single animator MeshRenderer file fallback" : "Single animator MeshRenderer file fallback (inactive)");
                 }
             }
+        }
+
+        public static bool IsRendererActiveInHierarchy(
+            SerializedFile sourceFile,
+            Renderer? renderer,
+            GameObject? gameObject,
+            GameObject? stopAtAncestor = null)
+        {
+            return (renderer == null || renderer.m_Enabled)
+                && IsGameObjectActiveInHierarchy(sourceFile, gameObject, stopAtAncestor);
         }
 
         public static bool IsGameObjectActiveInHierarchy(
@@ -3180,8 +3839,7 @@ namespace AssetStudio.Avalonia.Services
 
             foreach (var (rootTr, list) in buckets)
             {
-                GameObject? rootGo = null;
-                rootTr.m_GameObject?.TryGet(out rootGo);
+                var rootGo = TryGetLoadedObjectNoDeserialize(rootTr.assetsFile ?? sourceFile, rootTr.m_GameObject);
                 var rootAnim = rootGo?.m_Animator;
                 bool hasNormalScale = IsReasonablePositiveRootScale(rootTr.m_LocalScale);
 
@@ -3205,7 +3863,9 @@ namespace AssetStudio.Avalonia.Services
                 double overlapRatio = totalBones > 0 ? (double)totalOverlap / totalBones : 0.0;
                 double score = 0.0;
                 if (hasNormalScale) score += 1000.0;
-                if (rootAnim != null && rootAnim.m_Avatar != null && rootAnim.m_Avatar.TryGet(out var animAv) && ReferenceEquals(animAv, avatar))
+                if (rootAnim != null
+                    && rootAnim.m_Avatar != null
+                    && ReferenceEquals(TryGetLoadedObjectNoDeserialize(rootAnim.assetsFile ?? sourceFile, rootAnim.m_Avatar), avatar))
                 {
                     score += 500.0;
                 }
@@ -3248,9 +3908,10 @@ namespace AssetStudio.Avalonia.Services
 
             var current = start;
             var visited = new HashSet<Transform> { current };
-            while (current.m_Father != null && !current.m_Father.IsNull && current.m_Father.TryGet(out var father) && father != null)
+            while (current.m_Father != null && !current.m_Father.IsNull)
             {
-                if (!visited.Add(father))
+                var father = TryGetLoadedObjectNoDeserialize(current.assetsFile, current.m_Father);
+                if (father == null || !visited.Add(father))
                 {
                     break;
                 }
@@ -3406,6 +4067,7 @@ namespace AssetStudio.Avalonia.Services
                             }
 
                             var goId = binding.GameObject != null ? GetSemanticAssetId(binding.GameObject) : string.Empty;
+                            var isPartActive = IsRendererActiveInHierarchy(sourceFile, binding.Renderer, binding.GameObject, selectedRootGo);
                             relations.ModelGroupMeshes.Add(new SemanticModelGroupMeshRelation(
                                 groupId,
                                 binding.MeshId,
@@ -3415,8 +4077,8 @@ namespace AssetStudio.Avalonia.Services
                                 binding.GameObject?.m_Name ?? string.Empty,
                                 partSlot++,
                                 BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
-                                85,
-                                "Avatar skinned mesh co-location"));
+                                isPartActive ? 85 : 35,
+                                isPartActive ? "Avatar skinned mesh co-location" : "Avatar skinned mesh co-location (inactive)"));
                         }
                     }
                 }
@@ -3809,87 +4471,6 @@ namespace AssetStudio.Avalonia.Services
                         binding.MeshId,
                         groupId,
                         selectedHashes[i]));
-                }
-            }
-        }
-
-        private static void AddContainerAnimationRelations(
-            SemanticAssetRelations relations,
-            SerializedFile sourceFile,
-            List<(string Container, List<PPtr<AssetStudio.Object>> References)> containerReferences)
-        {
-            if (containerReferences.Count == 0)
-            {
-                return;
-            }
-
-            foreach (var container in containerReferences)
-            {
-                if (string.IsNullOrWhiteSpace(container.Container))
-                {
-                    continue;
-                }
-
-                var clipIds = new List<string>();
-                var avatarIds = new List<string>();
-                var animatorIds = new List<string>();
-                var meshIds = new List<string>();
-
-                foreach (var reference in container.References)
-                {
-                    var handle = GetSemanticHandleFromPPtr(sourceFile, reference);
-                    if (handle == null || string.IsNullOrWhiteSpace(handle.UniqueID))
-                    {
-                        continue;
-                    }
-
-                    switch (handle.Type)
-                    {
-                        case ClassIDType.AnimationClip:
-                            if (!clipIds.Contains(handle.UniqueID, StringComparer.Ordinal))
-                            {
-                                clipIds.Add(handle.UniqueID);
-                            }
-                            break;
-                        case ClassIDType.Avatar:
-                            if (!avatarIds.Contains(handle.UniqueID, StringComparer.Ordinal))
-                            {
-                                avatarIds.Add(handle.UniqueID);
-                            }
-                            break;
-                        case ClassIDType.Animator:
-                            if (!animatorIds.Contains(handle.UniqueID, StringComparer.Ordinal))
-                            {
-                                animatorIds.Add(handle.UniqueID);
-                            }
-                            break;
-                        case ClassIDType.Mesh:
-                            if (!meshIds.Contains(handle.UniqueID, StringComparer.Ordinal))
-                            {
-                                meshIds.Add(handle.UniqueID);
-                            }
-                            break;
-                    }
-                }
-
-                if (clipIds.Count == 0 || (avatarIds.Count == 0 && meshIds.Count == 0))
-                {
-                    continue;
-                }
-
-                var primaryAvatarId = avatarIds.FirstOrDefault() ?? string.Empty;
-                var primaryAnimatorId = animatorIds.FirstOrDefault() ?? string.Empty;
-                var primaryMeshId = meshIds.FirstOrDefault() ?? string.Empty;
-                foreach (var clipId in clipIds)
-                {
-                    relations.AnimationClipTargets.Add(new SemanticAnimationClipTargetRelation(
-                        clipId,
-                        primaryAnimatorId,
-                        primaryAvatarId,
-                        primaryMeshId,
-                        string.Empty,
-                        "Container",
-                        6000));
                 }
             }
         }
@@ -4362,24 +4943,48 @@ namespace AssetStudio.Avalonia.Services
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var failedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var arena = projectIndex.Arena;
+            var count = arena.Count;
+            var rememberedOriginIds = rememberHandleSourcePath != null ? new HashSet<int>() : null;
+            var resolvedOriginIds = new HashSet<int>();
 
-            foreach (var handle in projectIndex.GetHandles())
+            for (var i = 0; i < count; i++)
             {
-                if (handle == null)
+                var origin = arena.GetOrigin(i);
+                var originId = origin.OriginId;
+
+                var alreadyResolved = resolvedOriginIds.Contains(originId);
+                if (alreadyResolved && (rememberedOriginIds == null || rememberedOriginIds.Contains(originId)))
                 {
                     continue;
                 }
 
-                rememberHandleSourcePath?.Invoke(handle);
+                AssetHandle? materializedHandle = null;
+                if (rememberedOriginIds != null && rememberedOriginIds.Add(originId))
+                {
+                    materializedHandle = arena.MaterializeHandle(i);
+                    rememberHandleSourcePath!(materializedHandle);
+                }
+
+                if (alreadyResolved)
+                {
+                    continue;
+                }
 
                 // Skip pure media/leaf bundles containing only AssetBundle + Texture/Audio/Text/Shader/Sprite
                 // with zero reference types, zero Mesh, and zero MonoBehaviour (guaranteed zero semantic rows).
-                if (!IsMeaningfulLazyConnectionHandleType(handle.Type))
+                if (!IsMeaningfulLazyConnectionHandleType(arena.GetType(i)))
                 {
                     continue;
                 }
 
-                var sourcePath = resolveHandleSourcePath(handle);
+                materializedHandle ??= arena.MaterializeHandle(i);
+                var sourcePath = resolveHandleSourcePath(materializedHandle);
+                if (!string.IsNullOrWhiteSpace(origin.OriginalPath) || !string.IsNullOrWhiteSpace(sourcePath))
+                {
+                    resolvedOriginIds.Add(originId);
+                }
+
                 if (string.IsNullOrWhiteSpace(sourcePath))
                 {
                     continue;
@@ -4444,7 +5049,7 @@ namespace AssetStudio.Avalonia.Services
             };
             var failedSources = new List<string>();
             var effectiveFlushThreshold = Math.Max(1, stagingFlushRowThreshold);
-            const int batchSize = 20;
+            const int batchSize = 24;
             var parallelOptions = CreateSemanticGraphParallelOptions();
 
             for (var i = 0; i < sourcePaths.Count; i += batchSize)
@@ -4465,98 +5070,116 @@ namespace AssetStudio.Avalonia.Services
                     var sourceRelations = new SemanticAssetRelations?[batch.Count];
                     var sourceExceptions = new Exception?[batch.Count];
 
-                    using (assetsManager.LruCache.SuspendEviction())
+                    Parallel.For(0, batch.Count, parallelOptions, j =>
                     {
-                        Parallel.For(0, batch.Count, parallelOptions, j =>
+                        var filesForSource = filesBySource[j];
+                        if (filesForSource.Count == 0)
                         {
-                            var filesForSource = filesBySource[j];
-                            if (filesForSource.Count == 0)
-                            {
-                                return;
-                            }
-
-                            try
-                            {
-                                materializationResults[j] = MaterializeReferenceObjectsForConnectionFiles(assetsManager, filesForSource);
-                            }
-                            catch (Exception ex)
-                            {
-                                sourceExceptions[j] = ex;
-                            }
-                        });
-
-                        var flattenedFiles = new List<(int SourceIndex, SerializedFile File)>(batch.Count);
-                        for (var j = 0; j < batch.Count; j++)
-                        {
-                            if (sourceExceptions[j] != null)
-                            {
-                                continue;
-                            }
-
-                            var filesForSource = filesBySource[j];
-                            for (var f = 0; f < filesForSource.Count; f++)
-                            {
-                                var file = filesForSource[f];
-                                if (file != null)
-                                {
-                                    flattenedFiles.Add((j, file));
-                                }
-                            }
+                            return;
                         }
 
-                        var perFileRelations = new SemanticAssetRelations?[flattenedFiles.Count];
-                        Parallel.For(0, flattenedFiles.Count, parallelOptions, flatIndex =>
+                        try
                         {
-                            var entry = flattenedFiles[flatIndex];
-                            try
-                            {
-                                var fileRel = new SemanticAssetRelations();
-                                BuildSemanticRelationsForFilesBackground(new[] { entry.File }, fileRel, maxDegreeOfParallelism: 1);
-                                perFileRelations[flatIndex] = fileRel;
-                            }
-                            catch (Exception ex)
-                            {
-                                sourceExceptions[entry.SourceIndex] ??= ex;
-                            }
-                        });
-
-                        for (var flatIndex = 0; flatIndex < flattenedFiles.Count; flatIndex++)
+                            materializationResults[j] = MaterializeReferenceObjectsForConnectionFiles(assetsManager, filesForSource);
+                        }
+                        catch (Exception ex)
                         {
-                            var entry = flattenedFiles[flatIndex];
-                            if (sourceExceptions[entry.SourceIndex] != null)
-                            {
-                                continue;
-                            }
+                            sourceExceptions[j] = ex;
+                        }
+                    });
 
-                            var rel = perFileRelations[flatIndex];
-                            if (rel != null)
+                    var flattenedFiles = new List<(int SourceIndex, SerializedFile File)>(batch.Count);
+                    for (var j = 0; j < batch.Count; j++)
+                    {
+                        if (sourceExceptions[j] != null)
+                        {
+                            continue;
+                        }
+
+                        var filesForSource = filesBySource[j];
+                        for (var f = 0; f < filesForSource.Count; f++)
+                        {
+                            var file = filesForSource[f];
+                            if (file != null)
                             {
-                                var target = sourceRelations[entry.SourceIndex];
-                                if (target == null)
-                                {
-                                    target = new SemanticAssetRelations();
-                                    sourceRelations[entry.SourceIndex] = target;
-                                }
-                                target.Merge(rel);
+                                flattenedFiles.Add((j, file));
                             }
                         }
                     }
 
-                    Parallel.For(0, batch.Count, parallelOptions, j =>
+                    var perFileRelations = new SemanticAssetRelations?[flattenedFiles.Count];
+                    Parallel.For(0, flattenedFiles.Count, parallelOptions, flatIndex =>
                     {
-                        var filesForSource = filesBySource[j];
-                        if (filesForSource.Count > 0)
+                        var entry = flattenedFiles[flatIndex];
+                        try
                         {
-                            try
-                            {
-                                UnloadConnectionBuildObjects(assetsManager, filesForSource, isHandlePinnedForPreview);
-                            }
-                            catch
-                            {
-                                // Ignore best-effort unload errors.
-                            }
+                            var fileRel = new SemanticAssetRelations();
+                            BuildSemanticRelationsForFilesBackground(new[] { entry.File }, fileRel, maxDegreeOfParallelism: 1);
+                            perFileRelations[flatIndex] = fileRel;
+                        }
+                        catch (Exception ex)
+                        {
+                            sourceExceptions[entry.SourceIndex] ??= ex;
                         }
                     });
+
+                    for (var flatIndex = 0; flatIndex < flattenedFiles.Count; flatIndex++)
+                    {
+                        var entry = flattenedFiles[flatIndex];
+                        if (sourceExceptions[entry.SourceIndex] != null)
+                        {
+                            continue;
+                        }
+
+                        var rel = perFileRelations[flatIndex];
+                        if (rel != null)
+                        {
+                            var target = sourceRelations[entry.SourceIndex];
+                            if (target == null)
+                            {
+                                target = new SemanticAssetRelations();
+                                sourceRelations[entry.SourceIndex] = target;
+                            }
+                            target.Merge(rel);
+                        }
+                    }
+
+                    // ClearLoadedFilesKeepIndex() in finally unloads all non-kept files immediately.
+                    // Only run per-object unload for files pinned alive by ShouldKeepFileCallback.
+                    var keepFileCallback = assetsManager.ShouldKeepFileCallback;
+                    if (keepFileCallback != null)
+                    {
+                        for (var j = 0; j < batch.Count; j++)
+                        {
+                            var filesForSource = filesBySource[j];
+                            if (filesForSource.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            List<SerializedFile>? keptFiles = null;
+                            for (var f = 0; f < filesForSource.Count; f++)
+                            {
+                                var file = filesForSource[f];
+                                if (file != null && keepFileCallback(file.fileName))
+                                {
+                                    (keptFiles ??= new List<SerializedFile>()).Add(file);
+                                }
+                            }
+
+                            if (keptFiles != null)
+                            {
+                                try
+                                {
+                                    UnloadConnectionBuildObjects(assetsManager, keptFiles, isHandlePinnedForPreview);
+                                }
+                                catch
+                                {
+                                    // Ignore best-effort unload errors.
+                                }
+                            }
+                        }
+                    }
 
                     for (var j = 0; j < batch.Count; j++)
                     {
@@ -4671,35 +5294,52 @@ namespace AssetStudio.Avalonia.Services
 
             foreach (var sourceFile in filesForSource)
             {
-                var handles = assetsManager.ProjectIndex
-                    .GetHandlesForFile(sourceFile.fileName)
-                    .Where(handle => LazyConnectionReferenceTypes.Contains(handle.Type)
-                        && (ReferenceEquals(handle.SourceFile, sourceFile)
-                            || IsSameSemanticSource(handle.OriginalPath, sourceFile.originalPath)
-                            || string.IsNullOrEmpty(handle.OriginalPath)))
-                    .ToList();
-
-                stats.CandidateHandles += handles.Count;
-                foreach (var handle in handles)
+                if (sourceFile?.reader == null || sourceFile.m_Objects == null || sourceFile.m_Objects.Count == 0)
                 {
-                    if (handle.SourceFile?.reader == null)
-                    {
-                        handle.SourceFile = sourceFile;
-                    }
+                    continue;
+                }
 
-                    var obj = assetsManager.ResolveHandle(handle);
-                    if (obj == null)
+                FileReader? localReader = null;
+                try
+                {
+                    var objectInfos = sourceFile.m_Objects;
+                    for (var idx = 0; idx < objectInfos.Count; idx++)
                     {
-                        stats.FailedObjects++;
-                        continue;
-                    }
+                        var objectInfo = objectInfos[idx];
+                        var classId = ClassIDTypeHelper.FromClassId(objectInfo.classID);
+                        if (!LazyConnectionReferenceTypes.Contains(classId))
+                        {
+                            continue;
+                        }
 
-                    stats.ResolvedByType.TryGetValue(handle.Type, out var count);
-                    stats.ResolvedByType[handle.Type] = count + 1;
-                    if (handle.Tag is AssetItem item)
-                    {
-                        LazyAssetResolutionService.UpdateLazyAssetItemHandle(item, handle);
+                        stats.CandidateHandles++;
+                        if (sourceFile.TryGetObject(objectInfo.m_PathID, out var existing) && existing != null)
+                        {
+                            stats.ResolvedByType.TryGetValue(classId, out var existingCount);
+                            stats.ResolvedByType[classId] = existingCount + 1;
+                            continue;
+                        }
+
+                        localReader ??= sourceFile.reader.Clone();
+                        try
+                        {
+                            var objectReader = new ObjectReader(localReader, sourceFile, objectInfo);
+                            var obj = AssetsManager.CreateObjectFromReader(objectReader);
+                            sourceFile.AddObject(obj);
+
+                            stats.ResolvedByType.TryGetValue(classId, out var count);
+                            stats.ResolvedByType[classId] = count + 1;
+                        }
+                        catch (Exception ex)
+                        {
+                            stats.FailedObjects++;
+                            Logger.Error($"Error materializing object {classId} PathID={objectInfo.m_PathID}", ex);
+                        }
                     }
+                }
+                finally
+                {
+                    localReader?.Dispose();
                 }
             }
 
@@ -4707,14 +5347,103 @@ namespace AssetStudio.Avalonia.Services
             return stats;
         }
 
+        private static string NormalizeSemanticFullPath(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return path.Trim();
+            }
+        }
+
         private static List<SerializedFile>[] ResolveLoadedFilesForConnectionBatch(
             AssetsManager assetsManager,
             IReadOnlyList<string> batch)
         {
             var results = new List<SerializedFile>[batch.Count];
+            var byNormalizedPath = new Dictionary<string, List<SerializedFile>>(StringComparer.OrdinalIgnoreCase);
+            List<SerializedFile> loadedSnapshot;
+            lock (assetsManager.loadLock)
+            {
+                loadedSnapshot = new List<SerializedFile>(assetsManager.assetsFileList);
+            }
+
+            for (var f = 0; f < loadedSnapshot.Count; f++)
+            {
+                var file = loadedSnapshot[f];
+                if (file == null)
+                {
+                    continue;
+                }
+
+                var normOrig = NormalizeSemanticFullPath(file.originalPath);
+                if (!string.IsNullOrEmpty(normOrig))
+                {
+                    if (!byNormalizedPath.TryGetValue(normOrig, out var list))
+                    {
+                        list = new List<SerializedFile>(1);
+                        byNormalizedPath[normOrig] = list;
+                    }
+                    list.Add(file);
+                }
+
+                var normFull = NormalizeSemanticFullPath(file.fullName);
+                if (!string.IsNullOrEmpty(normFull)
+                    && !string.Equals(normFull, normOrig, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!byNormalizedPath.TryGetValue(normFull, out var list))
+                    {
+                        list = new List<SerializedFile>(1);
+                        byNormalizedPath[normFull] = list;
+                    }
+                    list.Add(file);
+                }
+            }
+
+            var arena = assetsManager.ProjectIndex?.Arena;
             for (var j = 0; j < batch.Count; j++)
             {
-                results[j] = GetLoadedFilesForConnectionSource(assetsManager, batch[j]);
+                var normBatchPath = NormalizeSemanticFullPath(batch[j]);
+                if (!string.IsNullOrEmpty(normBatchPath)
+                    && byNormalizedPath.TryGetValue(normBatchPath, out var matched))
+                {
+                    results[j] = matched;
+                    continue;
+                }
+
+                // Fallback: match against loaded files whose indexed origin matches batch[j] (O(batchSize), never scanning all 2M handles).
+                List<SerializedFile>? fallbackMatches = null;
+                if (arena != null && !string.IsNullOrEmpty(normBatchPath))
+                {
+                    for (var f = 0; f < loadedSnapshot.Count; f++)
+                    {
+                        var file = loadedSnapshot[f];
+                        if (file == null || string.IsNullOrEmpty(file.fileName))
+                        {
+                            continue;
+                        }
+
+                        var indices = arena.GetIndicesForFile(file.fileName);
+                        if (indices.Length > 0)
+                        {
+                            var origin = arena.GetOrigin(indices[0]);
+                            if (string.Equals(NormalizeSemanticFullPath(origin.OriginalPath), normBatchPath, StringComparison.OrdinalIgnoreCase))
+                            {
+                                (fallbackMatches ??= new List<SerializedFile>(1)).Add(file);
+                            }
+                        }
+                    }
+                }
+
+                results[j] = fallbackMatches ?? new List<SerializedFile>(0);
             }
 
             return results;
@@ -4891,8 +5620,9 @@ namespace AssetStudio.Avalonia.Services
             public int Confidence { get; }
             public string ConfidenceReason { get; }
 
-            public static RendererMeshSemanticBinding FromSkinned(SkinnedMeshSemanticBinding binding)
+            public static RendererMeshSemanticBinding FromSkinned(SerializedFile sourceFile, SkinnedMeshSemanticBinding binding)
             {
+                var isActive = IsRendererActiveInHierarchy(sourceFile, binding.Renderer, binding.GameObject);
                 return new RendererMeshSemanticBinding(
                     binding.Renderer,
                     GetSemanticAssetId(binding.Renderer),
@@ -4902,8 +5632,154 @@ namespace AssetStudio.Avalonia.Services
                     binding.GameObject,
                     binding.MeshFileId,
                     binding.MeshPathId,
-                    100,
-                    "SkinnedMeshRenderer hierarchy");
+                    isActive ? 100 : 40,
+                    isActive ? "SkinnedMeshRenderer hierarchy" : "SkinnedMeshRenderer hierarchy (inactive)");
+            }
+        }
+
+        internal readonly struct ResolvedSemanticPPtr
+        {
+            public ResolvedSemanticPPtr(ClassIDType type, string uniqueId)
+            {
+                Type = type;
+                UniqueId = uniqueId;
+            }
+
+            public ClassIDType Type { get; }
+            public string UniqueId { get; }
+            public bool IsValid => !string.IsNullOrEmpty(UniqueId);
+        }
+
+        private sealed class FileSemanticLookupContext
+        {
+            private readonly SerializedFile?[]? _loadedExternals;
+            private readonly (string? Cand1, string? Cand2, string? Cand3)[]? _externalNameCandidates;
+            private Dictionary<(int FileId, long PathId), (ResolvedSemanticPPtr Resolved, int ArenaIndex)>? _externalPPtrCache;
+            private AssetHandleOrigin? _localOrigin;
+            private string? _localUniqueIdPrefix;
+
+            public FileSemanticLookupContext(SerializedFile sourceFile)
+            {
+                SourceFile = sourceFile;
+
+                var externals = sourceFile.m_Externals;
+                if (externals != null && externals.Count > 0)
+                {
+                    _externalNameCandidates = new (string?, string?, string?)[externals.Count];
+                    for (var i = 0; i < externals.Count; i++)
+                    {
+                        var ext = externals[i];
+                        if (ext != null)
+                        {
+                            GetExternalFileNameCandidates(ext, out var c1, out var c2, out var c3);
+                            _externalNameCandidates[i] = (c1, c2, c3);
+                        }
+                    }
+
+                    var assetsManager = sourceFile.assetsManager;
+                    if (assetsManager != null)
+                    {
+                        _loadedExternals = new SerializedFile?[externals.Count];
+                        lock (assetsManager.loadLock)
+                        {
+                            var assetsFileList = assetsManager.assetsFileList;
+                            if (assetsFileList.Count > 0)
+                            {
+                                var byFileName = new Dictionary<string, SerializedFile>(assetsFileList.Count * 2, StringComparer.OrdinalIgnoreCase);
+                                for (var f = 0; f < assetsFileList.Count; f++)
+                                {
+                                    var candidate = assetsFileList[f];
+                                    if (candidate == null)
+                                    {
+                                        continue;
+                                    }
+
+                                    var fn = GetSemanticFileName(candidate.fileName);
+                                    if (!string.IsNullOrEmpty(fn))
+                                    {
+                                        byFileName.TryAdd(fn, candidate);
+                                    }
+
+                                    var origFn = GetSemanticFileName(candidate.originalPath);
+                                    if (!string.IsNullOrEmpty(origFn))
+                                    {
+                                        byFileName.TryAdd(origFn, candidate);
+                                    }
+
+                                    var fullFn = GetSemanticFileName(candidate.fullName);
+                                    if (!string.IsNullOrEmpty(fullFn))
+                                    {
+                                        byFileName.TryAdd(fullFn, candidate);
+                                    }
+                                }
+
+                                for (var i = 0; i < externals.Count; i++)
+                                {
+                                    var ext = externals[i];
+                                    if (ext == null)
+                                    {
+                                        continue;
+                                    }
+
+                                    var extFile = GetSemanticFileName(ext.fileName);
+                                    if (!string.IsNullOrEmpty(extFile) && byFileName.TryGetValue(extFile, out var matched))
+                                    {
+                                        _loadedExternals[i] = matched;
+                                        continue;
+                                    }
+
+                                    var extPathFile = GetSemanticFileName(ext.pathName);
+                                    if (!string.IsNullOrEmpty(extPathFile) && byFileName.TryGetValue(extPathFile, out matched))
+                                    {
+                                        _loadedExternals[i] = matched;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            public SerializedFile SourceFile { get; }
+
+            public AssetHandleOrigin LocalOrigin => _localOrigin ??= AssetHandleOrigin.Intern(SourceFile);
+
+            public string BuildLocalUniqueId(long pathId)
+            {
+                _localUniqueIdPrefix ??= LocalOrigin.UniqueIdPrefix + "#";
+                return string.Concat(_localUniqueIdPrefix, pathId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            public SerializedFile? GetLoadedExternalFile(int fileId)
+            {
+                var idx = fileId - 1;
+                return _loadedExternals != null && (uint)idx < (uint)_loadedExternals.Length
+                    ? _loadedExternals[idx]
+                    : null;
+            }
+
+            public (string? Cand1, string? Cand2, string? Cand3) GetExternalNameCandidates(int fileId)
+            {
+                var idx = fileId - 1;
+                return _externalNameCandidates != null && (uint)idx < (uint)_externalNameCandidates.Length
+                    ? _externalNameCandidates[idx]
+                    : default;
+            }
+
+            public bool TryGetCachedExternalPPtr(int fileId, long pathId, out (ResolvedSemanticPPtr Resolved, int ArenaIndex) entry)
+            {
+                if (_externalPPtrCache != null && _externalPPtrCache.TryGetValue((fileId, pathId), out entry))
+                {
+                    return true;
+                }
+
+                entry = default;
+                return false;
+            }
+
+            public void CacheExternalPPtr(int fileId, long pathId, ResolvedSemanticPPtr resolved, int arenaIndex)
+            {
+                (_externalPPtrCache ??= new Dictionary<(int, long), (ResolvedSemanticPPtr, int)>())[(fileId, pathId)] = (resolved, arenaIndex);
             }
         }
 
@@ -4932,12 +5808,40 @@ namespace AssetStudio.Avalonia.Services
 
             public GameObjectHierarchyEntry Root { get; }
             public List<RendererMeshSemanticBinding> Bindings { get; } = new();
-            public int Confidence => Bindings.Count == 0 ? 0 : Bindings.Min(binding => binding.Confidence);
-            public string ConfidenceReason => Bindings.Count == 0
-                ? string.Empty
-                : Bindings.All(binding => binding.ConfidenceReason == Bindings[0].ConfidenceReason)
-                    ? Bindings[0].ConfidenceReason
-                    : "Mixed renderer hierarchy evidence";
+
+            private List<RendererMeshSemanticBinding> ConfidenceSource
+            {
+                get
+                {
+                    var active = Bindings
+                        .Where(binding => string.IsNullOrEmpty(binding.ConfidenceReason)
+                            || !binding.ConfidenceReason.Contains("(inactive)", StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    return active.Count > 0 ? active : Bindings;
+                }
+            }
+
+            public int Confidence
+            {
+                get
+                {
+                    var source = ConfidenceSource;
+                    return source.Count == 0 ? 0 : source.Min(binding => binding.Confidence);
+                }
+            }
+
+            public string ConfidenceReason
+            {
+                get
+                {
+                    var source = ConfidenceSource;
+                    return source.Count == 0
+                        ? string.Empty
+                        : source.All(binding => binding.ConfidenceReason == source[0].ConfidenceReason)
+                            ? source[0].ConfidenceReason
+                            : "Mixed renderer hierarchy evidence";
+                }
+            }
 
             public void Add(RendererMeshSemanticBinding binding)
             {

@@ -126,6 +126,20 @@ namespace AssetStudio
             public int TotalCount;
             public int EnqueuedExternalCount;
             public int CascadeDecision; // 0 = undecided, 1 = allow, -1 = stop
+            private System.Threading.Tasks.TaskCompletionSource<bool> _queueChangedTcs =
+                new System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public System.Threading.Tasks.Task GetQueueChangedTask()
+            {
+                return System.Threading.Volatile.Read(ref _queueChangedTcs).Task;
+            }
+
+            public void SignalQueueChanged()
+            {
+                var next = new System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+                var previous = System.Threading.Interlocked.Exchange(ref _queueChangedTcs, next);
+                previous.TrySetResult(true);
+            }
 
             public LoadContext(
                 int totalCount,
@@ -509,77 +523,91 @@ namespace AssetStudio
                 tasks[t] = System.Threading.Tasks.Task.Run(async () =>
                 {
                     bool isWorkerActive = true;
-                    while (true)
+                    try
                     {
-                        await YieldForUserInteractionIfNeededAsync(highPriority);
-
-                        if (ShouldStopLoading)
+                        while (true)
                         {
-                            if (isWorkerActive)
-                            {
-                                System.Threading.Interlocked.Decrement(ref activeWorkers);
-                                isWorkerActive = false;
-                            }
-                            break;
-                        }
-
-                        if (context.Queue.TryDequeue(out var file))
-                        {
-                            ThrowIfMemoryPressureTooHigh("loading files");
+                            await YieldForUserInteractionIfNeededAsync(highPriority);
 
                             if (ShouldStopLoading)
                             {
-                                if (isWorkerActive)
-                                {
-                                    System.Threading.Interlocked.Decrement(ref activeWorkers);
-                                    isWorkerActive = false;
-                                }
                                 break;
                             }
 
-                            if (!isWorkerActive)
+                            if (context.Queue.TryDequeue(out var file))
                             {
-                                System.Threading.Interlocked.Increment(ref activeWorkers);
-                                isWorkerActive = true;
-                            }
+                                ThrowIfMemoryPressureTooHigh("loading files");
 
-                            try
-                            {
-                                if (lazyLoadGateForOperation != null)
+                                if (ShouldStopLoading)
                                 {
-                                    await lazyLoadGateForOperation.WaitAsync();
+                                    break;
+                                }
+
+                                if (!isWorkerActive)
+                                {
+                                    System.Threading.Interlocked.Increment(ref activeWorkers);
+                                    isWorkerActive = true;
                                 }
 
                                 try
                                 {
-                                    LoadFile(file, context);
+                                    if (lazyLoadGateForOperation != null)
+                                    {
+                                        await lazyLoadGateForOperation.WaitAsync();
+                                    }
+
+                                    try
+                                    {
+                                        LoadFile(file, context);
+                                    }
+                                    finally
+                                    {
+                                        lazyLoadGateForOperation?.Release();
+                                    }
                                 }
-                                finally
+                                catch (Exception ex)
                                 {
-                                    lazyLoadGateForOperation?.Release();
+                                    Logger.Error($"Error loading file {file}: {ex.Message}", ex);
                                 }
+                                var completed = incrementCompletedCount();
+                                Progress.Report(completed, System.Threading.Volatile.Read(ref context.TotalCount));
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                Logger.Error($"Error loading file {file}: {ex.Message}", ex);
+                                var waitTask = context.GetQueueChangedTask();
+                                if (isWorkerActive)
+                                {
+                                    isWorkerActive = false;
+                                    if (System.Threading.Interlocked.Decrement(ref activeWorkers) == 0 && context.Queue.IsEmpty)
+                                    {
+                                        context.SignalQueueChanged();
+                                        break;
+                                    }
+                                }
+                                else if (System.Threading.Volatile.Read(ref activeWorkers) == 0 && context.Queue.IsEmpty)
+                                {
+                                    context.SignalQueueChanged();
+                                    break;
+                                }
+
+                                if (!context.Queue.IsEmpty || ShouldStopLoading)
+                                {
+                                    continue;
+                                }
+
+                                await waitTask;
                             }
-                            var completed = incrementCompletedCount();
-                            Progress.Report(completed, System.Threading.Volatile.Read(ref context.TotalCount));
                         }
-                        else
+                    }
+                    finally
+                    {
+                        if (isWorkerActive)
                         {
-                            if (isWorkerActive)
+                            isWorkerActive = false;
+                            if (System.Threading.Interlocked.Decrement(ref activeWorkers) == 0)
                             {
-                                System.Threading.Interlocked.Decrement(ref activeWorkers);
-                                isWorkerActive = false;
+                                context.SignalQueueChanged();
                             }
-
-                            if (System.Threading.Volatile.Read(ref activeWorkers) == 0 && context.Queue.IsEmpty)
-                            {
-                                break;
-                            }
-
-                            await System.Threading.Tasks.Task.Delay(10);
                         }
                     }
                 });
@@ -788,6 +816,7 @@ namespace AssetStudio
                                         context.ImportFiles.Add(sharedFilePath);
                                         context.Queue.Enqueue(sharedFilePath);
                                         System.Threading.Interlocked.Increment(ref context.TotalCount);
+                                        context.SignalQueueChanged();
                                     }
                                 }
                                 else
@@ -948,6 +977,13 @@ namespace AssetStudio
                 for (int i = 0; i < bundleFile.fileList.Length; i++)
                 {
                     var file = bundleFile.fileList[i];
+                    if (serializedFilesOnly && IsKnownResourceFileName(file.fileName ?? file.path))
+                    {
+                        file.stream.Dispose();
+                        handedOffCount = i + 1;
+                        continue;
+                    }
+
                     var dummyPath = BuildSafeContainerPath(baseDir, file.path);
                     FileReader subReader;
                     try
@@ -964,6 +1000,10 @@ namespace AssetStudio
                     if (subReader.FileType == FileType.AssetsFile)
                     {
                         LoadAssetsFromMemory(subReader, context, originalPath ?? reader.FullPath, bundleFile.m_Header.unityRevision);
+                    }
+                    else if (serializedFilesOnly)
+                    {
+                        subReader.Dispose();
                     }
                     else
                     {
@@ -2761,6 +2801,37 @@ namespace AssetStudio
                 default:
                     return new Object(objectReader);
             }
+        }
+
+        private static bool IsKnownResourceFileName(string? name)
+        {
+            return !string.IsNullOrEmpty(name)
+                && (name.EndsWith(".resS", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith(".resource", StringComparison.OrdinalIgnoreCase));
+        }
+
+        public bool TryFindIndexedAssetByFileNameAndPathId(
+            string? fileName,
+            long pathId,
+            out int arenaIndex,
+            out ClassIDType type,
+            out string uniqueId,
+            out SourceOriginRecord origin)
+        {
+            var arena = ProjectIndex?.Arena;
+            if (arena != null && arena.TryGetIndexByFileNameAndPathId(fileName, pathId, out arenaIndex))
+            {
+                type = arena.GetType(arenaIndex);
+                uniqueId = arena.GetUniqueId(arenaIndex);
+                origin = arena.GetOrigin(arenaIndex);
+                return true;
+            }
+
+            arenaIndex = -1;
+            type = ClassIDType.UnknownType;
+            uniqueId = string.Empty;
+            origin = SourceOriginRecord.Empty;
+            return false;
         }
 
         public Object? ResolveHandle(AssetHandle? handle)

@@ -384,7 +384,7 @@ namespace AssetStudio.Avalonia
 
                         _owner.NotifyDatabaseMutated(_dbPath);
                         reporter.Report("Analyzing SQLite statistics", force: true);
-                        TryAnalyzeDatabase(conn, "staged semantic relations");
+                        TryAnalyzeSemanticTables(conn, "staged semantic relations");
                         _owner.InvalidateReadConnectionPool(_dbPath);
                         reporter.Report("Checkpointing SQLite WAL", force: true);
                         TryCheckpointWal(conn, "staged semantic relations");
@@ -536,7 +536,7 @@ namespace AssetStudio.Avalonia
                     {
                         SaveSemanticRelationsBulkReplace(conn, projectId, relations, reporter);
                         reporter.Report("Analyzing SQLite statistics", force: true);
-                        TryAnalyzeDatabase(conn, "semantic relations");
+                        TryAnalyzeSemanticTables(conn, "semantic relations");
                     }
                     else
                     {
@@ -554,6 +554,29 @@ namespace AssetStudio.Avalonia
             {
                 Logger.Warning($"Failed to save semantic asset relations: {ex.Message}");
                 return false;
+            }
+        }
+
+        private static void TryAnalyzeSemanticTables(SqliteConnection conn, string context)
+        {
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+                    ANALYZE AssetEdges;
+                    ANALYZE ModelGroups;
+                    ANALYZE ModelGroupMeshes;
+                    ANALYZE MeshRenderers;
+                    ANALYZE MeshMaterials;
+                    ANALYZE MaterialTextures;
+                    ANALYZE MaterialCache;
+                    ANALYZE MeshMaterialResolvedCache;
+                    ANALYZE AnimationClipTargets;";
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"SQLite ANALYZE for {context} failed: {ex.Message}");
             }
         }
 
