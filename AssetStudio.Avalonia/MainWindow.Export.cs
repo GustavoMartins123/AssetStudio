@@ -2686,6 +2686,27 @@ public partial class MainWindow
             animator.m_GameObject.TryGet(out rootGameObject);
         }
 
+        // Guard against multi-character avatar co-location groups (including legacy cached SQLite rows without RootGameObject):
+        // when parts span multiple unrelated top-level prefab roots, narrow cleanly to the single best upright root prefab.
+        if (rootGameObject == null && groupMeshes.Count > 1)
+        {
+            var avatarForFilter = !string.IsNullOrWhiteSpace(group.AvatarAssetId)
+                ? ResolveAvatarPreviewCandidate(group.AvatarAssetId)
+                : fallbackAvatar;
+            if (TryNarrowMultiRootModelGroupMeshes(groupMeshes, group.GroupName, avatarForFilter, out var narrowedParts, out var narrowedRootGo, out var narrowedAnimator))
+            {
+                groupMeshes = narrowedParts;
+                if (narrowedRootGo != null)
+                {
+                    rootGameObject = narrowedRootGo;
+                }
+                if (animator == null && narrowedAnimator != null)
+                {
+                    animator = narrowedAnimator;
+                }
+            }
+        }
+
         var visitedMaterials = new HashSet<Material>();
         var visitedTextures = new HashSet<string>(StringComparer.Ordinal);
 
@@ -3407,9 +3428,17 @@ public partial class MainWindow
             return false;
         }
 
-        for (int i = 0; i < groups.Count; i++)
+        // Prefer explicit Animator / RootGameObject-backed groups over avatar co-location fallback groups.
+        var orderedGroups = groups
+            .OrderByDescending(g => !string.IsNullOrWhiteSpace(g.AnimatorAssetId))
+            .ThenByDescending(g => !string.IsNullOrWhiteSpace(g.RootGameObjectAssetId))
+            .ThenByDescending(g => !g.GroupId.StartsWith("modelgroup:avatar:", StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(g => g.Confidence)
+            .ToList();
+
+        for (int i = 0; i < orderedGroups.Count; i++)
         {
-            var candidate = groups[i];
+            var candidate = orderedGroups[i];
             var meshes = LoadModelGroupMeshesForPreview(candidate.GroupId);
             if (meshes.Count > 0)
             {
@@ -3420,6 +3449,129 @@ public partial class MainWindow
         }
 
         return false;
+    }
+
+    private bool TryNarrowMultiRootModelGroupMeshes(
+        IReadOnlyList<ModelGroupMeshInfo> groupMeshes,
+        string? groupName,
+        Avatar? avatar,
+        out List<ModelGroupMeshInfo> narrowedParts,
+        out GameObject? selectedRootGo,
+        out Animator? selectedAnimator)
+    {
+        narrowedParts = new List<ModelGroupMeshInfo>();
+        selectedRootGo = null;
+        selectedAnimator = null;
+
+        var buckets = new Dictionary<Transform, List<(ModelGroupMeshInfo Info, Renderer? Renderer)>>();
+        for (int i = 0; i < groupMeshes.Count; i++)
+        {
+            var part = groupMeshes[i];
+            Renderer? renderer = !string.IsNullOrWhiteSpace(part.RendererAssetId)
+                ? ResolvePreviewCandidateAsset(part.RendererAssetId) as Renderer
+                : null;
+            GameObject? partGo = null;
+            if (renderer?.m_GameObject != null && renderer.m_GameObject.TryGet(out var rgo))
+            {
+                partGo = rgo;
+            }
+            else if (!string.IsNullOrWhiteSpace(part.GameObjectAssetId))
+            {
+                partGo = ResolvePreviewCandidateAsset(part.GameObjectAssetId) as GameObject;
+            }
+
+            var rootTr = SemanticGraphService.FindTopRootTransform(partGo?.m_Transform);
+            if (rootTr == null)
+            {
+                continue;
+            }
+
+            if (!buckets.TryGetValue(rootTr, out var list))
+            {
+                list = new List<(ModelGroupMeshInfo, Renderer?)>();
+                buckets[rootTr] = list;
+            }
+            list.Add((part, renderer));
+        }
+
+        if (buckets.Count <= 1)
+        {
+            return false;
+        }
+
+        var rigHashes = avatar != null ? SemanticGraphService.ExtractAvatarRigBoneHashes(avatar) : null;
+        string targetStem = SemanticGraphService.NormalizeModelGroupStem(avatar?.m_Name ?? groupName);
+        double bestScore = double.NegativeInfinity;
+        List<(ModelGroupMeshInfo Info, Renderer? Renderer)>? bestBucket = null;
+        GameObject? bestGo = null;
+        Animator? bestAnim = null;
+
+        foreach (var (rootTr, list) in buckets)
+        {
+            GameObject? rootGo = null;
+            rootTr.m_GameObject?.TryGet(out rootGo);
+            var rootAnim = rootGo?.m_Animator;
+
+            bool reasonableScale = SemanticGraphService.IsReasonablePositiveRootScale(rootTr.m_LocalScale);
+
+            double score = reasonableScale ? 1000.0 : 0.0;
+            if (rootAnim != null && avatar != null && rootAnim.m_Avatar != null
+                && rootAnim.m_Avatar.TryGet(out var animAv) && ReferenceEquals(animAv, avatar))
+            {
+                score += 500.0;
+            }
+
+            string rootStem = SemanticGraphService.NormalizeModelGroupStem(rootGo?.m_Name);
+            if (!string.IsNullOrEmpty(targetStem) && !string.IsNullOrEmpty(rootStem))
+            {
+                if (string.Equals(rootStem, targetStem, StringComparison.OrdinalIgnoreCase)) score += 300.0;
+                else if (rootStem.Contains(targetStem, StringComparison.OrdinalIgnoreCase)
+                    || targetStem.Contains(rootStem, StringComparison.OrdinalIgnoreCase)) score += 150.0;
+            }
+
+            if (rigHashes != null && rigHashes.Count > 0)
+            {
+                int overlap = 0;
+                int total = 0;
+                foreach (var entry in list)
+                {
+                    if (entry.Renderer is SkinnedMeshRenderer smr && smr.m_Mesh != null && smr.m_Mesh.TryGet(out var m)
+                        && m?.m_BoneNameHashes != null && m.m_BoneNameHashes.Length > 0)
+                    {
+                        total += m.m_BoneNameHashes.Length;
+                        for (int b = 0; b < m.m_BoneNameHashes.Length; b++)
+                        {
+                            if (rigHashes.Contains(m.m_BoneNameHashes[b])) overlap++;
+                        }
+                    }
+                }
+                if (total > 0)
+                {
+                    score += ((double)overlap / total) * 200.0;
+                }
+            }
+
+            score += Math.Min(list.Count, 16) * 5.0;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestBucket = list;
+                bestGo = rootGo;
+                bestAnim = rootAnim;
+            }
+        }
+
+        if (bestBucket == null || bestBucket.Count == 0)
+        {
+            return false;
+        }
+
+        narrowedParts = bestBucket.Select(x => x.Info).ToList();
+        selectedRootGo = bestGo;
+        selectedAnimator = bestAnim;
+        Logger.Info($"Narrowed multi-root ModelGroup '{groupName}' from {groupMeshes.Count} parts across {buckets.Count} prefabs to {narrowedParts.Count} part(s) under '{bestGo?.m_Name ?? "root"}'.");
+        return true;
     }
 
     private bool TryFindModelGroupForAnimator(Animator animator, out ModelGroupInfo? group, out List<ModelGroupMeshInfo> groupMeshes)

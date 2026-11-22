@@ -2856,6 +2856,160 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
+        private static List<SkinnedMeshSemanticBinding> SelectSingleRootBindingsForAvatar(
+            SerializedFile sourceFile,
+            List<SkinnedMeshSemanticBinding> matchedBindings,
+            Avatar avatar,
+            HashSet<uint> rigHashes,
+            out GameObject? selectedRootGo,
+            out Animator? selectedAnimator)
+        {
+            selectedRootGo = null;
+            selectedAnimator = null;
+            if (matchedBindings.Count == 0)
+            {
+                return matchedBindings;
+            }
+
+            var buckets = new Dictionary<Transform, List<SkinnedMeshSemanticBinding>>();
+            var unrooted = new List<SkinnedMeshSemanticBinding>();
+            foreach (var binding in matchedBindings)
+            {
+                var rootTr = FindTopRootTransform(binding.GameObject?.m_Transform);
+                if (rootTr != null)
+                {
+                    if (!buckets.TryGetValue(rootTr, out var list))
+                    {
+                        list = new List<SkinnedMeshSemanticBinding>();
+                        buckets[rootTr] = list;
+                    }
+                    list.Add(binding);
+                }
+                else
+                {
+                    unrooted.Add(binding);
+                }
+            }
+
+            if (buckets.Count == 0)
+            {
+                return unrooted;
+            }
+
+            string avatarStem = NormalizeModelGroupStem(avatar.m_Name);
+            Transform? bestRoot = null;
+            List<SkinnedMeshSemanticBinding>? bestList = null;
+            GameObject? bestRootGo = null;
+            Animator? bestRootAnim = null;
+            double bestScore = double.NegativeInfinity;
+
+            foreach (var (rootTr, list) in buckets)
+            {
+                GameObject? rootGo = null;
+                rootTr.m_GameObject?.TryGet(out rootGo);
+                var rootAnim = rootGo?.m_Animator;
+                bool hasNormalScale = IsReasonablePositiveRootScale(rootTr.m_LocalScale);
+
+                int totalOverlap = 0;
+                int totalBones = 0;
+                foreach (var b in list)
+                {
+                    if (b.Mesh?.m_BoneNameHashes != null && b.Mesh.m_BoneNameHashes.Length > 0)
+                    {
+                        totalBones += b.Mesh.m_BoneNameHashes.Length;
+                        for (int h = 0; h < b.Mesh.m_BoneNameHashes.Length; h++)
+                        {
+                            if (rigHashes.Contains(b.Mesh.m_BoneNameHashes[h]))
+                            {
+                                totalOverlap++;
+                            }
+                        }
+                    }
+                }
+
+                double overlapRatio = totalBones > 0 ? (double)totalOverlap / totalBones : 0.0;
+                double score = 0.0;
+                if (hasNormalScale) score += 1000.0;
+                if (rootAnim != null && rootAnim.m_Avatar != null && rootAnim.m_Avatar.TryGet(out var animAv) && ReferenceEquals(animAv, avatar))
+                {
+                    score += 500.0;
+                }
+                string rootStem = NormalizeModelGroupStem(rootGo?.m_Name);
+                if (!string.IsNullOrEmpty(avatarStem) && !string.IsNullOrEmpty(rootStem))
+                {
+                    if (string.Equals(rootStem, avatarStem, StringComparison.OrdinalIgnoreCase)) score += 300.0;
+                    else if (rootStem.Contains(avatarStem, StringComparison.OrdinalIgnoreCase)
+                        || avatarStem.Contains(rootStem, StringComparison.OrdinalIgnoreCase)) score += 150.0;
+                }
+                score += overlapRatio * 200.0;
+                score += Math.Min(list.Count, 16) * 5.0;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestRoot = rootTr;
+                    bestList = list;
+                    bestRootGo = rootGo;
+                    bestRootAnim = rootAnim;
+                }
+            }
+
+            if (bestList == null)
+            {
+                return matchedBindings;
+            }
+
+            selectedRootGo = bestRootGo;
+            selectedAnimator = bestRootAnim;
+            return bestList;
+        }
+
+        internal static Transform? FindTopRootTransform(Transform? start)
+        {
+            if (start == null)
+            {
+                return null;
+            }
+
+            var current = start;
+            var visited = new HashSet<Transform> { current };
+            while (current.m_Father != null && !current.m_Father.IsNull && current.m_Father.TryGet(out var father) && father != null)
+            {
+                if (!visited.Add(father))
+                {
+                    break;
+                }
+                current = father;
+            }
+            return current;
+        }
+
+        internal static bool IsReasonablePositiveRootScale(Vector3 scale)
+        {
+            return float.IsFinite(scale.X) && float.IsFinite(scale.Y) && float.IsFinite(scale.Z)
+                && scale.X > 0.0001f && scale.Y > 0.0001f && scale.Z > 0.0001f
+                && scale.X < 100f && scale.Y < 100f && scale.Z < 100f;
+        }
+
+        internal static string NormalizeModelGroupStem(string? rawName)
+        {
+            if (string.IsNullOrWhiteSpace(rawName))
+            {
+                return string.Empty;
+            }
+
+            var cleaned = rawName.Replace("Avatar", string.Empty, StringComparison.OrdinalIgnoreCase);
+            var sb = new System.Text.StringBuilder(cleaned.Length);
+            for (int i = 0; i < cleaned.Length; i++)
+            {
+                if (char.IsLetterOrDigit(cleaned[i]))
+                {
+                    sb.Append(char.ToLowerInvariant(cleaned[i]));
+                }
+            }
+            return sb.ToString();
+        }
+
         private static void AddAvatarRigRelations(
             SerializedFile sourceFile,
             Avatar avatar,
@@ -2934,50 +3088,61 @@ namespace AssetStudio.Avalonia.Services
 
                 if (string.IsNullOrEmpty(groupId) && matchedBindings.Count >= 2)
                 {
-                    groupId = $"modelgroup:avatar:{avatarId}";
-                    var groupName = !string.IsNullOrWhiteSpace(avatar.m_Name)
-                        ? avatar.m_Name.Replace("Avatar", string.Empty, StringComparison.OrdinalIgnoreCase).Trim()
-                        : "Avatar Model";
-                    if (string.IsNullOrWhiteSpace(groupName))
+                    // Group matched SkinnedMeshRenderers by their top-level prefab/root Transform so unrelated characters
+                    // sharing common humanoid bone names never get merged into a single multi-character ModelGroup.
+                    var selectedBindings = SelectSingleRootBindingsForAvatar(sourceFile, matchedBindings, avatar, rigHashes, out var selectedRootGo, out var selectedAnimator);
+                    if (selectedBindings.Count >= 2)
                     {
-                        groupName = avatar.m_Name ?? "Avatar Model";
-                    }
-
-                    relations.ModelGroups.Add(new SemanticModelGroupRelation(
-                        groupId,
-                        "Animator",
-                        groupName,
-                        string.Empty,
-                        groupName,
-                        string.Empty,
-                        avatarId,
-                        string.Empty,
-                        sourceFile.fileName ?? string.Empty,
-                        85,
-                        "Avatar skinned mesh co-location"));
-
-                    var partSlot = 0;
-                    var seenParts = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (var binding in matchedBindings)
-                    {
-                        var rendererId = GetSemanticAssetId(binding.Renderer);
-                        if (string.IsNullOrEmpty(rendererId) || !seenParts.Add($"{binding.MeshId}\u001f{rendererId}"))
+                        groupId = $"modelgroup:avatar:{avatarId}";
+                        var groupName = !string.IsNullOrWhiteSpace(selectedRootGo?.m_Name)
+                            ? selectedRootGo!.m_Name
+                            : !string.IsNullOrWhiteSpace(avatar.m_Name)
+                                ? avatar.m_Name.Replace("Avatar", string.Empty, StringComparison.OrdinalIgnoreCase).Trim()
+                                : "Avatar Model";
+                        if (string.IsNullOrWhiteSpace(groupName))
                         {
-                            continue;
+                            groupName = avatar.m_Name ?? "Avatar Model";
                         }
 
-                        var goId = binding.GameObject != null ? GetSemanticAssetId(binding.GameObject) : string.Empty;
-                        relations.ModelGroupMeshes.Add(new SemanticModelGroupMeshRelation(
+                        var selectedRootGoId = selectedRootGo != null ? GetSemanticAssetId(selectedRootGo) : string.Empty;
+                        var selectedAnimatorId = selectedAnimator != null ? GetSemanticAssetId(selectedAnimator) : string.Empty;
+
+                        relations.ModelGroups.Add(new SemanticModelGroupRelation(
                             groupId,
-                            binding.MeshId,
-                            rendererId,
-                            "SkinnedMeshRenderer",
-                            goId,
-                            binding.GameObject?.m_Name ?? string.Empty,
-                            partSlot++,
-                            BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
+                            "Animator",
+                            groupName,
+                            selectedRootGoId,
+                            selectedRootGo?.m_Name ?? groupName,
+                            selectedAnimatorId,
+                            avatarId,
+                            string.Empty,
+                            sourceFile.fileName ?? string.Empty,
                             85,
                             "Avatar skinned mesh co-location"));
+
+                        var partSlot = 0;
+                        var seenParts = new HashSet<string>(StringComparer.Ordinal);
+                        foreach (var binding in selectedBindings)
+                        {
+                            var rendererId = GetSemanticAssetId(binding.Renderer);
+                            if (string.IsNullOrEmpty(rendererId) || !seenParts.Add($"{binding.MeshId}\u001f{rendererId}"))
+                            {
+                                continue;
+                            }
+
+                            var goId = binding.GameObject != null ? GetSemanticAssetId(binding.GameObject) : string.Empty;
+                            relations.ModelGroupMeshes.Add(new SemanticModelGroupMeshRelation(
+                                groupId,
+                                binding.MeshId,
+                                rendererId,
+                                "SkinnedMeshRenderer",
+                                goId,
+                                binding.GameObject?.m_Name ?? string.Empty,
+                                partSlot++,
+                                BuildLocalToWorldMatrix(sourceFile, binding.GameObject),
+                                85,
+                                "Avatar skinned mesh co-location"));
+                        }
                     }
                 }
             }

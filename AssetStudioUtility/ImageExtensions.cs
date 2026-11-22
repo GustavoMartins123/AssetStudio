@@ -360,7 +360,8 @@ namespace AssetStudio
                 throw new InvalidOperationException("Failed to access bitmap pixels for PNG encoding.");
             }
 
-            using var data = pixmap.Encode(SKEncodedImageFormat.Png, 100);
+            // Use Sub filter + ZLib level 1: standard lossless PNG with ~4-6x faster encoding on large textures.
+            using var data = pixmap.Encode(new SKPngEncoderOptions(SKPngEncoderFilterFlags.Sub, zLibLevel: 1));
             if (data == null)
             {
                 throw new InvalidOperationException("Failed to encode bitmap as PNG.");

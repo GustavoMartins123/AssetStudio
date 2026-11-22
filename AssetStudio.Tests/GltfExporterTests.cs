@@ -3305,9 +3305,12 @@ if __name__ == "__main__":
                 partMaterials: new IReadOnlyList<Material>[] { new[] { variantMat } },
                 partNames: new[] { "BodyMesh" });
 
-            // Assert NO duplicate "Spine" frame under RootFrame
+            // Assert NO duplicate "Spine" frame under RootFrame AND renderer stayed parented under CharRoot (not flattened)
             var allSpines = converter.RootFrame.FindChilds("Spine").ToList();
             Assert.Single(allSpines);
+            var bodyFrames = converter.RootFrame.FindChilds("BodyMesh").ToList();
+            Assert.Single(bodyFrames);
+            Assert.Equal("CharRoot", bodyFrames[0].Parent?.Name);
 
             // Assert skinned bone path AND animation track path point to the EXACT same Spine frame!
             Assert.Single(converter.MeshList);

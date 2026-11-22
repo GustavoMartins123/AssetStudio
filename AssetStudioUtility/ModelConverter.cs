@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace AssetStudio
 {
@@ -27,6 +28,8 @@ namespace AssetStudio
         private Dictionary<Texture2D, string> textureNameDictionary = new Dictionary<Texture2D, string>();
         private Dictionary<Transform, ImportedFrame> transformDictionary = new Dictionary<Transform, ImportedFrame>();
         Dictionary<uint, string> morphChannelNames = new Dictionary<uint, string>();
+        private readonly List<(Texture2D Texture, string Name, string MaterialName, string PropertyName, bool ForceNormalMapUnpack)> pendingTextures = new();
+        private readonly HashSet<string> pendingTextureNames = new HashSet<string>(StringComparer.Ordinal);
 
         private void SetRootFrame(ImportedFrame frame)
         {
@@ -66,6 +69,7 @@ namespace AssetStudio
                 }
             }
             ConvertAnimations();
+            FlushPendingTextures();
         }
 
         public ModelConverter(string rootName, List<GameObject> m_GameObjects, ImageFormat imageFormat, AnimationClip[]? animationList = null)
@@ -104,6 +108,7 @@ namespace AssetStudio
                 }
             }
             ConvertAnimations();
+            FlushPendingTextures();
         }
 
         public ModelConverter(Animator m_Animator, ImageFormat imageFormat, AnimationClip[]? animationList = null)
@@ -126,6 +131,7 @@ namespace AssetStudio
                 }
             }
             ConvertAnimations();
+            FlushPendingTextures();
         }
 
         private void InitWithAnimator(Animator m_Animator)
@@ -1322,12 +1328,12 @@ namespace AssetStudio
                     {
                         texture.Name = textureName;
                     }
-                    else if (ImportedHelpers.FindTexture(m_Texture2D.m_Name + ext, TextureList) != null) //已有相同名字的图片
+                    else if (IsTextureNameAllocated(m_Texture2D.m_Name + ext)) //已有相同名字的图片
                     {
                         for (int i = 1; ; i++)
                         {
                             var name = m_Texture2D.m_Name + $" ({i}){ext}";
-                            if (ImportedHelpers.FindTexture(name, TextureList) == null)
+                            if (!IsTextureNameAllocated(name))
                             {
                                 texture.Name = name;
                                 textureNameDictionary.Add(m_Texture2D, name);
@@ -1416,34 +1422,104 @@ namespace AssetStudio
             return result;
         }
 
+        private bool IsTextureNameAllocated(string name)
+        {
+            return pendingTextureNames.Contains(name) || ImportedHelpers.FindTexture(name, TextureList) != null;
+        }
+
         private void ConvertTexture2D(Texture2D m_Texture2D, string name, string materialName, string propertyName, bool forceNormalMapUnpack = false)
         {
-            var iTex = ImportedHelpers.FindTexture(name, TextureList);
-            if (iTex != null)
+            if (IsTextureNameAllocated(name))
             {
                 return;
             }
 
-            System.IO.MemoryStream? stream;
-            try
+            pendingTextureNames.Add(name);
+            pendingTextures.Add((m_Texture2D, name, materialName, propertyName, forceNormalMapUnpack));
+        }
+
+        private void FlushPendingTextures()
+        {
+            if (pendingTextures.Count == 0)
             {
-                stream = m_Texture2D.ConvertToStream(imageFormat, true, unpackNormalMap: true, forceNormalMapUnpack: forceNormalMapUnpack);
-            }
-            catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or BadImageFormatException)
-            {
-                Logger.Warning($"Unable to decode texture {m_Texture2D.m_Name} for material {materialName}, property {propertyName}: native texture decoder unavailable ({ex.GetType().Name}).");
-                return;
-            }
-            if (stream == null)
-            {
-                Logger.Warning($"Unable to convert texture {m_Texture2D.m_Name} for material {materialName}, property {propertyName}.");
                 return;
             }
 
-            using (stream)
+            // Step 1 (sequential, thread-safe on shared asset/resS streams): decode each Texture2D into an independent SKBitmap.
+            var decoded = new List<(string Name, string MaterialName, string PropertyName, SkiaSharp.SKBitmap Bitmap)>(pendingTextures.Count);
+            for (int i = 0; i < pendingTextures.Count; i++)
             {
-                iTex = new ImportedTexture(stream, name);
-                TextureList.Add(iTex);
+                var item = pendingTextures[i];
+                SkiaSharp.SKBitmap? bitmap;
+                try
+                {
+                    bitmap = item.Texture.ConvertToImage(flip: true, unpackNormalMap: true, forceNormalMapUnpack: item.ForceNormalMapUnpack);
+                }
+                catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or BadImageFormatException)
+                {
+                    Logger.Warning($"Unable to decode texture {item.Texture.m_Name} for material {item.MaterialName}, property {item.PropertyName}: native texture decoder unavailable ({ex.GetType().Name}).");
+                    continue;
+                }
+
+                if (bitmap == null)
+                {
+                    Logger.Warning($"Unable to convert texture {item.Texture.m_Name} for material {item.MaterialName}, property {item.PropertyName}.");
+                    continue;
+                }
+
+                decoded.Add((item.Name, item.MaterialName, item.PropertyName, bitmap));
+            }
+
+            pendingTextures.Clear();
+            pendingTextureNames.Clear();
+
+            if (decoded.Count == 0)
+            {
+                return;
+            }
+
+            // Step 2 (parallel across CPU cores): encode each independent SKBitmap into PNG/JPEG/BMP/TGA.
+            var encodedStreams = new System.IO.MemoryStream?[decoded.Count];
+            if (decoded.Count == 1)
+            {
+                using (decoded[0].Bitmap)
+                {
+                    encodedStreams[0] = decoded[0].Bitmap.ConvertToStream(imageFormat);
+                }
+            }
+            else
+            {
+                int maxParallelism = Math.Clamp(Environment.ProcessorCount, 2, 8);
+                Parallel.For(0, decoded.Count, new ParallelOptions { MaxDegreeOfParallelism = maxParallelism }, i =>
+                {
+                    var entry = decoded[i];
+                    try
+                    {
+                        using (entry.Bitmap)
+                        {
+                            encodedStreams[i] = entry.Bitmap.ConvertToStream(imageFormat);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Unable to encode texture {entry.Name} for material {entry.MaterialName}, property {entry.PropertyName}: {ex.Message}");
+                    }
+                });
+            }
+
+            // Step 3 (deterministic order): append to TextureList and dispose intermediate streams.
+            for (int i = 0; i < decoded.Count; i++)
+            {
+                var stream = encodedStreams[i];
+                if (stream == null)
+                {
+                    continue;
+                }
+
+                using (stream)
+                {
+                    TextureList.Add(new ImportedTexture(stream, decoded[i].Name));
+                }
             }
         }
 
@@ -2926,8 +3002,9 @@ namespace AssetStudio
                         HydrateGameObjectHierarchy(rendererGo);
                         if (rendererGo.m_Transform != null && !transformDictionary.ContainsKey(rendererGo.m_Transform))
                         {
-                            ConvertTransforms(rendererGo.m_Transform, RootFrame);
-                            CreateBonePathHash(rendererGo.m_Transform);
+                            // Walk up to the renderer's prefab root ancestor instead of flattening rendererGo directly under RootFrame,
+                            // preserving parent rotations/scales and keeping renderer nodes unified with their skeleton hierarchy.
+                            AttachTransformChainUnderRoot(rendererGo.m_Transform);
                         }
                     }
 
@@ -3035,11 +3112,48 @@ namespace AssetStudio
             }
 
             ConvertAnimations();
+            FlushPendingTextures();
 
             if (combineMeshes)
             {
                 CombineMeshes();
             }
+        }
+
+        private void AttachTransformChainUnderRoot(Transform startTransform)
+        {
+            if (RootFrame == null || transformDictionary.ContainsKey(startTransform))
+            {
+                return;
+            }
+
+            var top = startTransform;
+            var visitedUp = new HashSet<Transform> { top };
+            ImportedFrame? attachParentFrame = null;
+
+            while (top.m_Father != null && !top.m_Father.IsNull && top.m_Father.TryGet(out var father) && father != null)
+            {
+                if (transformDictionary.TryGetValue(father, out var existingParentFrame))
+                {
+                    attachParentFrame = existingParentFrame;
+                    break;
+                }
+
+                if (!visitedUp.Add(father))
+                {
+                    break;
+                }
+
+                top = father;
+            }
+
+            if (top.m_GameObject != null && top.m_GameObject.TryGet(out var topGo) && topGo != null)
+            {
+                HydrateGameObjectHierarchy(topGo);
+            }
+
+            ConvertTransforms(top, attachParentFrame ?? RootFrame);
+            CreateBonePathHash(top);
         }
 
         private static void HydrateGameObjectHierarchy(GameObject rootGameObject)
