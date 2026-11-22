@@ -26,6 +26,10 @@ internal static class PostProcessingV2Preview
         Prefix + "TemporalAntialiasing" => new(name, [0], true, ImageEffectPass.TemporalAntialiasing),
         Prefix + "ScalableAO" => new(name, [0, 2, 4, 7], false),
         Prefix + "Debug/Overlays" => new(name, [1], false), // View-space normals.
+        PostProcessingV2MonitorPreview.LightMeter => new(name, [0], true, ImageEffectPass.PostProcessingLightMeter, "AUTO_EXPOSURE"),
+        PostProcessingV2MonitorPreview.Histogram or PostProcessingV2MonitorPreview.Waveform or
+            PostProcessingV2MonitorPreview.Vectorscope => new(name, [0], true),
+        PostProcessingV2ReflectionPreview.Name => new(name, [0, 1, 3], true, ImageEffectPass.ScreenSpaceReflection),
         Prefix + "Lut2DBaker" => new(name, [0], false),
         FinalPass => new(name, [0], true),
         Smaa => new(name, [2, 5, 6], true),
@@ -108,43 +112,11 @@ internal static class PostProcessingV2Preview
         {
             return;
         }
-        var arena = shader.assetsFile.assetsManager.ProjectIndex.Arena;
-        MonoBehaviour? resources = null;
-        for (int i = 0, count = arena.Count; i < count; i++)
-        {
-            token.ThrowIfCancellationRequested();
-            if (arena.GetType(i) != ClassIDType.MonoBehaviour || arena.GetName(i) != "PostProcessResources")
-            {
-                continue;
-            }
-            if (resolveAsset(arena.MaterializeHandle(i)) is not MonoBehaviour candidate)
-            {
-                throw new InvalidDataException("The indexed PostProcessResources asset could not be read.");
-            }
-            var script = resolveScript(candidate.assetsFile, candidate.m_Script);
-            if (script.m_ClassName != "PostProcessResources" || script.m_Namespace != "UnityEngine.Rendering.PostProcessing")
-            {
-                continue;
-            }
-            if (resources != null)
-            {
-                throw new InvalidDataException("The project has multiple Post Processing Stack resource assets.");
-            }
-            resources = candidate;
-        }
-        if (resources == null)
-        {
-            throw new NotSupportedException($"'{name}' requires the project's PostProcessResources asset.");
-        }
+        var resources = PostProcessingResourcesPreview.Find(shader, resolveAsset, resolveScript, token);
         var file = resources.assetsFile;
         using var stream = file.reader.Clone();
         var reader = new ObjectReader(stream, file, file.ObjectInfoDic[resources.m_PathID]);
-        _ = new MonoBehaviour(reader);
-        var noise64 = ReadFirstTexture(reader);
-        _ = ReadFirstTexture(reader); // blueNoise256
-        reader.CheckArrayLength(24); // The two SMAA pointers.
-        var area = new PPtr<Texture>(reader);
-        var search = new PPtr<Texture>(reader);
+        var (noise64, _, area, search) = PostProcessingResourcesPreview.ReadTextures(reader);
         if (name == FinalPass)
         {
             var noise = Read(noise64 ?? throw new InvalidDataException("The blueNoise64 resource array is empty."));
@@ -159,25 +131,6 @@ internal static class PostProcessingV2Preview
 
         ShaderPreviewTexture Read(PPtr<Texture> reference) =>
             ShaderPreviewService.ReadTexture(resolveTexture(file, reference), ShaderPreviewTextureDimension.Texture2D);
-    }
-
-    private static PPtr<Texture>? ReadFirstTexture(ObjectReader reader)
-    {
-        const int pointerSize = sizeof(int) + sizeof(long);
-        reader.CheckArrayLength(sizeof(int));
-        int count = reader.ReadInt32();
-        long remaining = reader.byteStart + reader.byteSize - reader.Position;
-        if (count < 0 || count > remaining / pointerSize)
-        {
-            throw new InvalidDataException("The Post Processing blue noise array has an invalid length.");
-        }
-        if (count == 0)
-        {
-            return null;
-        }
-        var first = new PPtr<Texture>(reader);
-        reader.Position += (count - 1L) * pointerSize;
-        return first;
     }
 
     private static ShaderPreviewDraw[] Bloom(ShaderPreviewDraw[] draws, IDictionary<string, NumericsVector4> values,

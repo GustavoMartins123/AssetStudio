@@ -17,22 +17,39 @@ namespace AssetStudio.Avalonia.Services;
 public sealed record ShaderPreviewFrame(int Width, int Height, byte[] RgbaPixels);
 
 internal abstract record ShaderPreviewOperation;
-internal sealed record ShaderPreviewRenderTarget(string Name, int Size, int Filter = 1);
-internal enum ShaderPreviewPointPass { None, Collect, Draw }
-internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPreviewLight Light, int SkyboxSide = -1) : ShaderPreviewOperation
+internal sealed record ShaderPreviewRenderTarget(string Name, int Size, int Filter = 1)
 {
-    internal ShaderPreviewRenderTarget? Output { get; init; }
+    internal int MipLevels { get; init; } = 1;
+    internal bool UnorderedAccess { get; init; }
+}
+internal sealed record ShaderPreviewComputeBuffer(string Name, int Count, int Stride);
+internal enum ShaderPreviewPointPass { None, Collect, Draw }
+internal abstract record ShaderPreviewProgramOperation : ShaderPreviewOperation
+{
+    internal abstract IEnumerable<ShaderPreviewStage> Stages { get; }
     internal IReadOnlyDictionary<string, ShaderPreviewRenderTarget>? Inputs { get; init; }
+    internal IReadOnlyDictionary<string, ShaderPreviewComputeBuffer>? ComputeBuffers { get; init; }
     internal IReadOnlyDictionary<string, NumericsVector4>? Values { get; init; }
+    internal IReadOnlyDictionary<string, string>? TextureSources { get; init; }
+    internal string TextureSource(string name) => TextureSources?.GetValueOrDefault(name) ?? name;
+}
+internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPreviewLight Light, int SkyboxSide = -1) : ShaderPreviewProgramOperation
+{
+    internal override IEnumerable<ShaderPreviewStage> Stages => Pass.Stages;
+    internal ShaderPreviewRenderTarget? Output { get; init; }
     internal IReadOnlyDictionary<string, NumericsVector4[]>? VectorArrays { get; init; }
     internal IReadOnlyDictionary<string, NumericsMatrix4x4>? Matrices { get; init; }
-    internal IReadOnlyDictionary<string, string>? TextureSources { get; init; }
     internal ShaderPreviewGeometry? Geometry { get; init; }
     internal NumericsVector4? VertexColor { get; init; }
     internal ShaderPreviewBillboard? Billboard { get; init; }
     internal ShaderPreviewPointPass PointPass { get; init; }
-    internal string TextureSource(string name) => TextureSources?.GetValueOrDefault(name) ?? name;
 }
+internal sealed record ShaderPreviewDispatch(ShaderPreviewComputeKernel Kernel, uint Width, uint Height, uint Depth = 1) : ShaderPreviewProgramOperation
+{
+    internal override IEnumerable<ShaderPreviewStage> Stages => [Kernel.Stage];
+    internal IReadOnlyDictionary<string, ShaderPreviewRenderTarget>? TextureOutputs { get; init; }
+}
+internal sealed record ShaderPreviewCopyMip(ShaderPreviewRenderTarget Source, ShaderPreviewRenderTarget Destination, int Mip) : ShaderPreviewOperation;
 internal sealed record ShaderPreviewGrab(string TextureName, bool Once) : ShaderPreviewOperation;
 internal readonly record struct ShaderPreviewLight(NumericsVector3 Direction, NumericsVector3 Color);
 internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad, Text }
@@ -310,6 +327,19 @@ internal static class ShaderPreviewService
             operations = [.. cameraPreview.Prepare(operations, values, textures, RenderSize)];
             PostProcessingV2Preview.LoadResources(reader.Name, shader, values, textures, RenderSize,
                 resolveAsset, Resolve<MonoScript>, Resolve<Texture>, cancellationToken);
+            if (PostProcessingV2MonitorPreview.Handles(reader.Name))
+            {
+                var resources = PostProcessingResourcesPreview.Find(shader, resolveAsset, Resolve<MonoScript>, cancellationToken);
+                operations = [.. PostProcessingV2MonitorPreview.Prepare(shader, reader.Name, operations.OfType<ShaderPreviewDraw>().Single(),
+                    resources, RenderSize, Resolve<AssetStudio.Object>, Resolve<Shader>,
+                    copy => Prepare(copy, null, loadExternalSources, resolveAsset, cancellationToken, lights))];
+            }
+            else if (reader.Name == PostProcessingV2ReflectionPreview.Name)
+            {
+                var resources = PostProcessingResourcesPreview.Find(shader, resolveAsset, Resolve<MonoScript>, cancellationToken);
+                operations = [.. PostProcessingV2ReflectionPreview.Prepare(shader, operations.OfType<ShaderPreviewDraw>().ToArray(),
+                    resources, values, textures, RenderSize, Resolve<AssetStudio.Object>, Resolve<Texture>)];
+            }
             geometry = ShaderPreviewGeometry.ScreenQuad;
             imageEffect = cameraPreview.Effect;
         }
@@ -366,8 +396,9 @@ internal static class ShaderPreviewService
         var cameraTextures = new HashSet<string>(StringComparer.Ordinal);
         if (geometry == ShaderPreviewGeometry.ScreenQuad && !ImageEffectPreview.HasAnimatedInput(imageEffect))
         {
-            foreach (string name in operations.OfType<ShaderPreviewDraw>()
-                .SelectMany(draw => draw.Pass.Stages.SelectMany(stage => stage.Textures).Select(binding => draw.TextureSource(binding.Name))))
+            foreach (string name in operations.OfType<ShaderPreviewProgramOperation>()
+                .SelectMany(operation => operation.Stages.SelectMany(stage => stage.Textures)
+                    .Select(binding => operation.TextureSource(binding.Name))))
             {
                 if (BuiltInLightingPreview.IsSurfaceTexture(name) || name == BuiltInLightingPreview.CameraDepth ||
                     (imageEffect == ImageEffectPass.Bokeh && name == ImageEffectPreview.BokehBlurredColor) ||
@@ -397,6 +428,8 @@ internal static class ShaderPreviewService
         }
         var captures = new HashSet<string>(StringComparer.Ordinal);
         var renderedTargets = new HashSet<ShaderPreviewRenderTarget>();
+        var writtenBuffers = new HashSet<ShaderPreviewComputeBuffer>();
+        var copiedMips = new Dictionary<ShaderPreviewRenderTarget, HashSet<int>>();
         foreach (var operation in operations)
         {
             if (operation is ShaderPreviewGrab grab)
@@ -405,26 +438,70 @@ internal static class ShaderPreviewService
                 continue;
             }
 
+            if (operation is ShaderPreviewCopyMip copy)
+            {
+                if (!renderedTargets.Contains(copy.Source) || copy.Source == copy.Destination ||
+                    copy.Destination.Size is <= 0 or > RenderSize ||
+                    copy.Destination.MipLevels < 2 ||
+                    copy.Destination.MipLevels > 1 + System.Numerics.BitOperations.Log2((uint)copy.Destination.Size) ||
+                    (uint)copy.Mip >= (uint)copy.Destination.MipLevels || copy.Source.Size != copy.Destination.Size >> copy.Mip)
+                {
+                    throw new InvalidDataException($"Invalid mip copy to '{copy.Destination.Name}'.");
+                }
+                if (!copiedMips.TryGetValue(copy.Destination, out var mips))
+                {
+                    mips = [];
+                    copiedMips.Add(copy.Destination, mips);
+                }
+                mips.Add(copy.Mip);
+                if (mips.Count == copy.Destination.MipLevels)
+                {
+                    renderedTargets.Add(copy.Destination);
+                }
+                continue;
+            }
+            if (operation is ShaderPreviewDispatch dispatch)
+            {
+                try
+                {
+                    PrepareInputs(dispatch, output: null);
+                    foreach (var binding in dispatch.Kernel.Outputs)
+                    {
+                        if (binding.Dimension == ShaderPreviewTextureDimension.Texture2D)
+                        {
+                            var target = dispatch.TextureOutputs?.GetValueOrDefault(binding.Name);
+                            if (target is not { UnorderedAccess: true, MipLevels: 1 } || target.Size is <= 0 or > RenderSize ||
+                                dispatch.Inputs?.Values.Contains(target) == true)
+                            {
+                                throw new InvalidDataException($"Invalid writable texture for '{binding.Name}'.");
+                            }
+                            renderedTargets.Add(target);
+                            continue;
+                        }
+                        if (binding.Dimension.HasValue)
+                        {
+                            throw new NotSupportedException($"Compute output '{binding.Name}' requires an unsupported texture dimension.");
+                        }
+                        var buffer = dispatch.ComputeBuffers?.GetValueOrDefault(binding.Name)
+                            ?? throw new InvalidDataException($"No writable buffer is bound for '{binding.Name}'.");
+                        if (dispatch.Kernel.Stage.StructuredBuffers.Any(input => dispatch.ComputeBuffers!.GetValueOrDefault(input.Name) == buffer))
+                        {
+                            throw new InvalidDataException($"Compute buffer '{buffer.Name}' is bound for both read and write.");
+                        }
+                        writtenBuffers.Add(buffer);
+                    }
+                }
+                catch (Exception error) when (error is NotSupportedException or InvalidDataException)
+                {
+                    throw new NotSupportedException($"{dispatch.Kernel.ShaderName}/{dispatch.Kernel.Name}. {error.Message}", error);
+                }
+                continue;
+            }
             var draw = (ShaderPreviewDraw)operation;
             var pass = draw.Pass;
             try
             {
-                foreach (var binding in pass.Stages.SelectMany(stage => stage.Textures))
-                {
-                    if (depthBlitSamples != 0 && binding.Name == ImageEffectPreview.MainTexture)
-                    {
-                        continue;
-                    }
-                    if (draw.Inputs?.TryGetValue(binding.Name, out var target) == true)
-                    {
-                        if (binding.Dimension != ShaderPreviewTextureDimension.Texture2D || target == draw.Output || !renderedTargets.Contains(target))
-                        {
-                            throw new InvalidDataException($"Render target '{target.Name}' is incompatible or unavailable for '{binding.Name}'.");
-                        }
-                        continue;
-                    }
-                    PrepareTexture(draw.TextureSource(binding.Name), binding.Dimension);
-                }
+                PrepareInputs(draw, draw.Output);
                 foreach (string name in pass.Stages.SelectMany(stage => stage.Buffers).SelectMany(buffer => buffer.Parameters)
                     .Select(parameter => parameter.Name).Where(name => name.EndsWith("_TexelSize", StringComparison.Ordinal)))
                 {
@@ -442,7 +519,7 @@ internal static class ShaderPreviewService
                         pass.State.Stencil == null;
                     if ((!depthIndependent && ((draw.Geometry ?? geometry) != ShaderPreviewGeometry.ScreenQuad || pass.State.ZWrite)) ||
                         pass.State.AlphaToMask ||
-                        output.Size is <= 0 or > RenderSize)
+                        output.Size is <= 0 or > RenderSize || output.MipLevels != 1)
                     {
                         throw new NotSupportedException($"Unsupported state for render target '{output.Name}'.");
                     }
@@ -469,6 +546,40 @@ internal static class ShaderPreviewService
 
         T Resolve<T>(SerializedFile source, PPtr<T> reference) where T : AssetStudio.Object =>
             ResolveReference(reference, source, loadExternalSources, resolveAsset, cancellationToken);
+
+        void PrepareInputs(ShaderPreviewProgramOperation operation, ShaderPreviewRenderTarget? output)
+        {
+            foreach (var binding in operation.Stages.SelectMany(stage => stage.Textures))
+            {
+                if (depthBlitSamples != 0 && binding.Name == ImageEffectPreview.MainTexture)
+                {
+                    continue;
+                }
+                if (operation.Inputs?.TryGetValue(binding.Name, out var target) == true)
+                {
+                    if (binding.Dimension != ShaderPreviewTextureDimension.Texture2D || target == output || !renderedTargets.Contains(target))
+                    {
+                        throw new InvalidDataException($"Render target '{target.Name}' is incompatible or unavailable for '{binding.Name}'.");
+                    }
+                    continue;
+                }
+                PrepareTexture(operation.TextureSource(binding.Name), binding.Dimension);
+            }
+            foreach (var binding in operation.Stages.SelectMany(stage => stage.StructuredBuffers))
+            {
+                if (operation.ComputeBuffers?.TryGetValue(binding.Name, out var buffer) == true)
+                {
+                    if (!writtenBuffers.Contains(buffer))
+                    {
+                        throw new InvalidDataException($"Compute buffer '{binding.Name}' has no earlier writer in this preview.");
+                    }
+                }
+                else if (operation is ShaderPreviewDispatch)
+                {
+                    throw new InvalidDataException($"No input buffer is bound for '{binding.Name}'.");
+                }
+            }
+        }
 
         void PrepareTexture(string name, ShaderPreviewTextureDimension dimension)
         {
@@ -823,69 +934,8 @@ internal static class ShaderPreviewService
         float time, float deltaTime, BuiltInLightingPreview? lighting, IReadOnlyDictionary<string, ShaderPreviewTexture>? cameraTextures,
         MotionPreviewFrame? motion, NumericsMatrix4x4? billboardTransform, ShaderPreviewParameter? unusedVertexParameter)
     {
-        var data = new byte[(buffer.Size + 15) & ~15];
         var light = draw.Light;
-        foreach (var parameter in buffer.Parameters)
-        {
-            if (ReferenceEquals(parameter, unusedVertexParameter))
-            {
-                continue;
-            }
-            if (parameter.Type is not (0 or 1 or 2) || parameter.ArraySize < 1 || parameter.Offset < 0)
-            {
-                throw new NotSupportedException($"Unsupported shader parameter format for '{parameter.Name}'.");
-            }
-            if (parameter.IsMatrix)
-            {
-                const int matrixBytes = 16 * sizeof(float);
-                if (parameter.Type != 0 || parameter.Rows != 4 || parameter.Columns != 4 ||
-                    parameter.ArraySize > (data.Length - parameter.Offset) / matrixBytes)
-                {
-                    throw new NotSupportedException($"Unsupported shader matrix layout for '{parameter.Name}'.");
-                }
-                for (int element = 0; element < parameter.ArraySize; element++)
-                {
-                    var matrix = ResolveMatrix(parameter.Name, parameter.ArraySize, element);
-                    MemoryMarshal.Write(data.AsSpan(parameter.Offset + matrixBytes * element), in matrix);
-                }
-            }
-            else
-            {
-                int length = parameter.Columns * sizeof(float);
-                if (parameter.Rows != 1 || parameter.Columns is < 1 or > 4 ||
-                    parameter.Offset > data.Length - length || parameter.ArraySize - 1 > (data.Length - length - parameter.Offset) / 16)
-                {
-                    throw new NotSupportedException($"Unsupported shader vector layout for '{parameter.Name}'.");
-                }
-                for (int element = 0; element < parameter.ArraySize; element++)
-                {
-                    NumericsVector4 value = ResolveVector(parameter.Name, parameter.ArraySize, element);
-                    var destination = data.AsSpan(parameter.Offset + 16 * element, length);
-                    var components = MemoryMarshal.Cast<NumericsVector4, float>(MemoryMarshal.CreateReadOnlySpan(in value, 1));
-                    if (parameter.Type == 0)
-                    {
-                        MemoryMarshal.AsBytes(components)[..length].CopyTo(destination);
-                    }
-                    else
-                    {
-                        for (int component = 0; component < parameter.Columns; component++)
-                        {
-                            float integer = components[component];
-                            if (parameter.Type == 2 && integer is not (0f or 1f))
-                            {
-                                throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires a Boolean.");
-                            }
-                            if (!float.IsFinite(integer) || MathF.Truncate(integer) != integer || integer < int.MinValue || integer >= 2147483648f)
-                            {
-                                throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires a 32-bit integer.");
-                            }
-                            BinaryPrimitives.WriteInt32LittleEndian(destination[(component * 4)..], (int)integer);
-                        }
-                    }
-                }
-            }
-        }
-        return data;
+        return PackConstants(buffer, ResolveMatrix, ResolveVector, unusedVertexParameter);
 
         NumericsMatrix4x4 ResolveMatrix(string name, int arraySize, int element)
         {
@@ -916,6 +966,12 @@ internal static class ShaderPreviewService
                 "_WorldToCameraMatrix" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection => view,
                 "_CameraToWorldMatrix" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection => Inverse(view),
                 "_ProjectToPixelMatrix" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection => ScreenSpaceReflectionPreview.ProjectToPixel(projection, RenderSize),
+                "_ViewMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name => view,
+                "_InverseViewMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name => Inverse(view),
+                "_InverseProjectionMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name =>
+                    Inverse(BuiltInLightingPreview.DepthProjection(projection, reversedDepth: true)),
+                "_ScreenSpaceProjectionMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name =>
+                    ScreenSpaceReflectionPreview.ProjectToPixel(BuiltInLightingPreview.DepthProjection(projection, reversedDepth: true), size),
                 "_NonJitteredVP" when scene.SerializedShader && motion.HasValue => view * projection,
                 "_PreviousVP" when scene.SerializedShader && motion is { } frame => frame.PreviousModelViewProjection,
                 "_FrustumCornersWS" when scene.ImageEffect == ImageEffectPass.GlobalFog => FrustumCorners(view, projection),
@@ -1109,6 +1165,79 @@ internal static class ShaderPreviewService
             var movement = scene.Values["WaveSpeed"] * WaveScale() * (time / 20);
             return new NumericsVector4(movement.X % 1, movement.Y % 1, movement.Z % 1, movement.W % 1);
         }
+    }
+
+    internal static byte[] BindComputeConstants(ShaderPreviewBuffer buffer, IReadOnlyDictionary<string, NumericsVector4>? values) =>
+        PackConstants(buffer, (name, _, _) => throw MissingValue(name),
+            (name, arraySize, _) => arraySize == 1 && values?.TryGetValue(name, out var value) == true
+                ? value : throw MissingValue(name));
+
+    private static byte[] PackConstants(ShaderPreviewBuffer buffer,
+        Func<string, int, int, NumericsMatrix4x4> resolveMatrix, Func<string, int, int, NumericsVector4> resolveVector,
+        ShaderPreviewParameter? unusedParameter = null)
+    {
+        var data = new byte[(buffer.Size + 15) & ~15];
+        foreach (var parameter in buffer.Parameters)
+        {
+            if (ReferenceEquals(parameter, unusedParameter))
+            {
+                continue;
+            }
+            if (parameter.Type is not (0 or 1 or 2) || parameter.ArraySize < 1 || parameter.Offset < 0)
+            {
+                throw new NotSupportedException($"Unsupported shader parameter format for '{parameter.Name}'.");
+            }
+            if (parameter.IsMatrix)
+            {
+                const int matrixBytes = 16 * sizeof(float);
+                if (parameter.Type != 0 || parameter.Rows != 4 || parameter.Columns != 4 ||
+                    parameter.ArraySize > (data.Length - parameter.Offset) / matrixBytes)
+                {
+                    throw new NotSupportedException($"Unsupported shader matrix layout for '{parameter.Name}'.");
+                }
+                for (int element = 0; element < parameter.ArraySize; element++)
+                {
+                    var matrix = resolveMatrix(parameter.Name, parameter.ArraySize, element);
+                    MemoryMarshal.Write(data.AsSpan(parameter.Offset + matrixBytes * element), in matrix);
+                }
+            }
+            else
+            {
+                int length = parameter.Columns * sizeof(float);
+                if (parameter.Rows != 1 || parameter.Columns is < 1 or > 4 ||
+                    parameter.Offset > data.Length - length || parameter.ArraySize - 1 > (data.Length - length - parameter.Offset) / 16)
+                {
+                    throw new NotSupportedException($"Unsupported shader vector layout for '{parameter.Name}'.");
+                }
+                for (int element = 0; element < parameter.ArraySize; element++)
+                {
+                    NumericsVector4 value = resolveVector(parameter.Name, parameter.ArraySize, element);
+                    var destination = data.AsSpan(parameter.Offset + 16 * element, length);
+                    var components = MemoryMarshal.Cast<NumericsVector4, float>(MemoryMarshal.CreateReadOnlySpan(in value, 1));
+                    if (parameter.Type == 0)
+                    {
+                        MemoryMarshal.AsBytes(components)[..length].CopyTo(destination);
+                    }
+                    else
+                    {
+                        for (int component = 0; component < parameter.Columns; component++)
+                        {
+                            float integer = components[component];
+                            if (parameter.Type == 2 && integer is not (0f or 1f))
+                            {
+                                throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires a Boolean.");
+                            }
+                            if (!float.IsFinite(integer) || MathF.Truncate(integer) != integer || integer < int.MinValue || integer >= 2147483648f)
+                            {
+                                throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires a 32-bit integer.");
+                            }
+                            BinaryPrimitives.WriteInt32LittleEndian(destination[(component * 4)..], (int)integer);
+                        }
+                    }
+                }
+            }
+        }
+        return data;
     }
 
     private static NumericsMatrix4x4 FrustumCorners(NumericsMatrix4x4 view, NumericsMatrix4x4 projection)

@@ -14,7 +14,7 @@ namespace AssetStudio
     public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot, ShaderPreviewTextureDimension Dimension);
     public sealed record ShaderPreviewStructuredBufferBinding(string Name, int Slot);
     public sealed record ShaderPreviewSamplerBinding(int Slot, int Filter, int Wrap);
-    public enum ShaderPreviewProgramKind { Pixel, Vertex, Geometry }
+    public enum ShaderPreviewProgramKind { Pixel, Vertex, Geometry, Compute = 5 }
     public sealed record ShaderPreviewStage(byte[] Bytecode, ShaderPreviewBuffer[] Buffers, ShaderPreviewTextureBinding[] Textures)
     {
         public ShaderPreviewStructuredBufferBinding[] StructuredBuffers { get; init; } = [];

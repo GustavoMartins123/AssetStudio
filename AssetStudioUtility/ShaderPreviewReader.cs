@@ -56,6 +56,16 @@ namespace AssetStudio
             _ => throw new ArgumentOutOfRangeException(nameof(stage))
         };
 
+        internal static ShaderPreviewSamplerBinding ReadInlineSampler(uint encoded, int slot)
+        {
+            // Unity encodes sampler_LinearClamp as filter Linear and Clamp on all three axes.
+            if (encoded != 0x55 || slot is < 0 or >= 16)
+            {
+                throw new NotSupportedException($"Unsupported inline sampler 0x{encoded:X} at slot {slot}.");
+            }
+            return new ShaderPreviewSamplerBinding(slot, Filter: 1, Wrap: 1);
+        }
+
         protected static T[] MatchVariants<T>(IReadOnlyList<T> programs, Func<T, string[]> keywords,
             IReadOnlySet<string> enabled, ShaderPreviewPassDefinition pass, ShaderPreviewProgramKind kind)
         {

@@ -153,6 +153,8 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
                     {
                         ShaderPreviewDraw draw => $"{draw.Pass.ShaderName} · {draw.Pass.PassName} {draw.Pass.LightMode} [{string.Join(", ", draw.Pass.Keywords)}]",
                         ShaderPreviewGrab grab => $"GrabPass · {grab.TextureName}",
+                        ShaderPreviewDispatch dispatch => $"Compute · {dispatch.Kernel.ShaderName}/{dispatch.Kernel.Name}",
+                        ShaderPreviewCopyMip copy => $"Copy mip {copy.Mip} · {copy.Destination.Name}",
                         _ => throw new InvalidOperationException("Unknown shader preview operation.")
                     }));
                     if (scene.UnusedMaterialKeywords.Count > 0)

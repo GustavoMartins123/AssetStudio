@@ -81,7 +81,7 @@ internal sealed class BuiltInLightingPreview
 
     private static bool UsesHdrColor(ImageEffectPass? effect) => effect is ImageEffectPass.Bokeh or
         ImageEffectPass.PostProcessingBloom or ImageEffectPass.ExposureHistogram or ImageEffectPass.TemporalAntialiasing or
-        ImageEffectPass.ScreenSpaceReflection;
+        ImageEffectPass.ScreenSpaceReflection or ImageEffectPass.PostProcessingLightMeter;
 
     private static ShaderPreviewTexture CreateHdrTexture(int size) =>
         new(size, size, 1, 10, 8, false, new byte[size * size * 8], 1, 1, 1, 0);

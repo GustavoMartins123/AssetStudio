@@ -15,7 +15,7 @@ internal enum ImageEffectPass
     Vignette, ChromaticAberration, SeparableBlur, Antialiasing, GlobalFog, Overlay, RenderTargetDisplay,
     SunShafts, DepthOfField, Bokeh, ReprojectionMotion, ObjectMotion, MotionBlur, Thicken, Noise, SkinDeformation,
     PostProcessingGrain, PostProcessingBloom, PostProcessingMotionBlur, VideoDecode, ExposureHistogram, TemporalAntialiasing,
-    ScreenSpaceReflection
+    ScreenSpaceReflection, PostProcessingLightMeter
 }
 
 internal sealed class ImageEffectPreview

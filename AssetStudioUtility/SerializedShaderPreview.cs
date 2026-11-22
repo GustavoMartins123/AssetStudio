@@ -294,15 +294,7 @@ namespace AssetStudio
                 }
                 return new ShaderPreviewTextureBinding(name, binding.m_Index, binding.m_SamplerIndex, dimension);
             }).ToArray();
-            var samplers = sub.m_Samplers.Select(binding =>
-            {
-                // Unity encodes sampler_LinearClamp as filter Linear and Clamp on all three axes.
-                if (binding.sampler != 0x55 || binding.bindPoint is < 0 or >= 16)
-                {
-                    throw new NotSupportedException($"Unsupported inline sampler 0x{binding.sampler:X} at slot {binding.bindPoint}.");
-                }
-                return new ShaderPreviewSamplerBinding(binding.bindPoint, Filter: 1, Wrap: 1);
-            }).ToArray();
+            var samplers = sub.m_Samplers.Select(binding => ReadInlineSampler(binding.sampler, binding.bindPoint)).ToArray();
             return new ShaderPreviewStage(code.m_ProgramCode[prefixBytes..], buffers.ToArray(), textures)
             {
                 StructuredBuffers = sub.m_BufferParams.Select(binding => new ShaderPreviewStructuredBufferBinding(NameOf(binding.m_NameIndex), binding.m_Index)).ToArray(),

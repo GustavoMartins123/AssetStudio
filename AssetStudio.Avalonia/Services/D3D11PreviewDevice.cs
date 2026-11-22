@@ -65,17 +65,30 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
 
     internal (nint ShaderView, nint AppendView, nint DrawArguments) CreateAppendBuffer(uint capacity, uint stride)
     {
-        nint points = CreateBuffer(new BufferDesc
-        {
-            ByteWidth = checked(capacity * stride), StructureStride = stride,
-            BindFlags = 0x88, MiscFlags = 0x40 // Shader resource, unordered access and structured buffer.
-        });
-        var append = new BufferUavDesc { Dimension = 1, Count = capacity, Flags = 2 }; // D3D11_BUFFER_UAV_FLAG_APPEND.
+        nint points = CreateWritableBuffer(capacity, stride);
         uint* args = stackalloc uint[] { 0, 1, 0, 0 };
         var initial = new SubresourceData { Data = args };
         nint indirect = CreateBuffer(new BufferDesc { ByteWidth = 16, MiscFlags = 0x10 }, &initial);
         return (CreateStructuredView(points, capacity),
-            CreateView(8, points, "create the append buffer view", &append), indirect);
+            CreateUnorderedBufferView(points, capacity, flags: 2 /* D3D11_BUFFER_UAV_FLAG_APPEND */), indirect);
+    }
+
+    internal (nint ShaderView, nint UnorderedView) CreateComputeBuffer(uint count, uint stride)
+    {
+        nint buffer = CreateWritableBuffer(count, stride);
+        return (CreateStructuredView(buffer, count), CreateUnorderedBufferView(buffer, count, flags: 0));
+    }
+
+    private nint CreateWritableBuffer(uint count, uint stride) => CreateBuffer(new BufferDesc
+    {
+        ByteWidth = checked(count * stride), StructureStride = stride,
+        BindFlags = 0x88, MiscFlags = 0x40 // Shader resource, unordered access and structured buffer.
+    });
+
+    private nint CreateUnorderedBufferView(nint buffer, uint count, uint flags)
+    {
+        var desc = new BufferUavDesc { Dimension = 1, Count = count, Flags = flags };
+        return CreateView(8, buffer, "create the unordered buffer view", &desc);
     }
 
     internal void UpdateBuffer<T>(nint buffer, ReadOnlySpan<T> data) where T : unmanaged
@@ -120,6 +133,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     }
     internal nint CreateRenderView(nint texture) => CreateView(9, texture, "create the render target view");
     internal nint CreateDepthView(nint texture) => CreateView(10, texture, "create the depth view");
+    internal nint CreateUnorderedTextureView(nint texture) => CreateView(8, texture, "create the unordered texture view");
 
     internal nint CreateDepth32View(nint texture, uint samples)
     {
@@ -161,7 +175,9 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         {
             ShaderPreviewProgramKind.Vertex => 12,
             ShaderPreviewProgramKind.Geometry => 13,
-            _ => 15
+            ShaderPreviewProgramKind.Pixel => 15,
+            ShaderPreviewProgramKind.Compute => 18,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
         });
         fixed (byte* code = bytecode)
         {
@@ -270,15 +286,39 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         {
             ShaderPreviewProgramKind.Vertex => 11,
             ShaderPreviewProgramKind.Geometry => 23,
-            _ => 9
+            ShaderPreviewProgramKind.Pixel => 9,
+            ShaderPreviewProgramKind.Compute => 69,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
         }))(_context, shader, null, 0);
 
     internal void SetConstantBuffer(nint buffer, int slot, ShaderPreviewProgramKind kind) =>
-        Bind(buffer, slot, kind switch { ShaderPreviewProgramKind.Vertex => 7, ShaderPreviewProgramKind.Geometry => 22, _ => 16 });
+        Bind(buffer, slot, kind switch
+        {
+            ShaderPreviewProgramKind.Vertex => 7, ShaderPreviewProgramKind.Geometry => 22,
+            ShaderPreviewProgramKind.Pixel => 16, ShaderPreviewProgramKind.Compute => 71,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        });
     internal void SetTexture(nint view, int slot, ShaderPreviewProgramKind kind) =>
-        Bind(view, slot, kind switch { ShaderPreviewProgramKind.Vertex => 25, ShaderPreviewProgramKind.Geometry => 31, _ => 8 });
+        Bind(view, slot, kind switch
+        {
+            ShaderPreviewProgramKind.Vertex => 25, ShaderPreviewProgramKind.Geometry => 31,
+            ShaderPreviewProgramKind.Pixel => 8, ShaderPreviewProgramKind.Compute => 67,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        });
     internal void SetSampler(nint sampler, int slot, ShaderPreviewProgramKind kind) =>
-        Bind(sampler, slot, kind switch { ShaderPreviewProgramKind.Vertex => 26, ShaderPreviewProgramKind.Geometry => 32, _ => 10 });
+        Bind(sampler, slot, kind switch
+        {
+            ShaderPreviewProgramKind.Vertex => 26, ShaderPreviewProgramKind.Geometry => 32,
+            ShaderPreviewProgramKind.Pixel => 10, ShaderPreviewProgramKind.Compute => 70,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        });
+
+    internal void SetComputeOutput(nint view, int slot) =>
+        ((delegate* unmanaged[Stdcall]<nint, uint, uint, nint*, uint*, void>)Slot(_context, 68))(
+            _context, (uint)slot, 1, &view, null);
+
+    internal void Dispatch(uint x, uint y, uint z) =>
+        ((delegate* unmanaged[Stdcall]<nint, uint, uint, uint, void>)Slot(_context, 41))(_context, x, y, z);
 
     internal void SetAppendTarget(nint surface, nint depth, nint appendView)
     {
@@ -323,6 +363,10 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
             ((delegate* unmanaged[Stdcall]<nint, nint, nint, void>)Slot(_context, 47))(_context, destination, source);
         }
     }
+
+    internal void CopyMip(nint source, nint destination, uint mip) =>
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, uint, uint, uint, nint, uint, void*, void>)Slot(_context, 46))(
+            _context, destination, mip, 0, 0, 0, source, 0, null);
 
     internal byte[] ReadPixels(nint source, nint staging, int format, int size)
     {
