@@ -601,10 +601,11 @@ namespace AssetStudio
 
             if ((version[0] >= 2019 && version[0] < 2021) || (version[0] == 2021 && version[1] < 2)) //2019 ~2021.1
             {
-                var m_GlobalKeywordIndices = reader.ReadUInt16Array();
+                var globalKeywordIndices = reader.ReadUInt16Array();
                 reader.AlignStream();
-                var m_LocalKeywordIndices = reader.ReadUInt16Array();
+                var localKeywordIndices = reader.ReadUInt16Array();
                 reader.AlignStream();
+                m_KeywordIndices = [.. globalKeywordIndices, .. localKeywordIndices];
             }
             else
             {

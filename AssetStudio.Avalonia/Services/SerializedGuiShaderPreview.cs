@@ -6,13 +6,20 @@ namespace AssetStudio.Avalonia.Services;
 
 internal static class SerializedGuiShaderPreview
 {
-    internal static bool IsGuiDraw(string shaderName) => shaderName is "Hidden/Internal-GUITextureClip" or
-        "Hidden/Internal-GUITextureClipText" or "Hidden/Internal-GUITextureBlit" or "Hidden/Internal-GUIRoundedRect";
+    internal static bool IsGuiDraw(string shaderName) => IsRoundedRect(shaderName) || shaderName is
+        "Hidden/Internal-GUITextureClip" or "Hidden/Internal-GUITextureClipText" or "Hidden/Internal-GUITextureBlit";
 
-    internal static void SetProperties(IDictionary<string, NumericsVector4> values)
+    internal static bool IsRoundedRect(string shaderName) => shaderName is
+        "Hidden/Internal-GUIRoundedRect" or "Hidden/Internal-GUIRoundedRectWithColorPerBorder";
+
+    internal static void SetProperties(string shaderName, IDictionary<string, NumericsVector4> values)
     {
         // The preview's GUI input and render target both use gamma-encoded colors.
         values.TryAdd("_ManualTex2SRGB", NumericsVector4.Zero);
+        if (IsRoundedRect(shaderName))
+        {
+            values.TryAdd("_SmoothCorners", NumericsVector4.One);
+        }
     }
 
     internal static readonly IReadOnlyDictionary<string, NumericsVector4[]> RoundedRectArrays =
@@ -20,6 +27,7 @@ internal static class SerializedGuiShaderPreview
         {
             ["_CornerRadiuses"] = [new(0.24f), new(0.24f), new(0.24f), new(0.24f)],
             ["_BorderWidths"] = [new(0.035f), new(0.035f), new(0.035f), new(0.035f)],
-            ["_Rect"] = [new(-1), new(-1), new(2), new(2)]
+            ["_Rect"] = [new(-1), new(-1), new(2), new(2)],
+            ["_BorderColors"] = [NumericsVector4.One, NumericsVector4.One, NumericsVector4.One, NumericsVector4.One]
         };
 }

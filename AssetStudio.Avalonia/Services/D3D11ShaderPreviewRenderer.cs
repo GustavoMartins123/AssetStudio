@@ -57,6 +57,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private readonly Dictionary<string, (nint Texture, nint View)> _grabs = new(StringComparer.Ordinal);
     private readonly Dictionary<ShaderPreviewRenderTarget, (GpuTexture Texture, nint View)> _renderTargets = new();
     private readonly Dictionary<ShaderPreviewBuffer, nint> _constantBuffers = new();
+    private readonly Dictionary<(int Filter, int Wrap), nint> _inlineSamplers = new();
     private readonly Dictionary<(ShaderPreviewGeometry Geometry, NumericsVector4? Color), (nint Vertices, nint Indices, int Count)> _drawMeshes = new();
     private nint _billboardVertices;
     private nint _grabSampler;
@@ -521,6 +522,20 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     samplers[binding.SamplerSlot] = sampling;
                     _device.SetSampler(gpu.Sampler, binding.SamplerSlot, kind);
                 }
+            }
+            foreach (var binding in stage.InlineSamplers)
+            {
+                if (!samplers.TryAdd(binding.Slot, (binding.Filter, binding.Wrap, 1, 0, false)))
+                {
+                    throw new InvalidDataException($"Conflicting inline sampler at s{binding.Slot}.");
+                }
+                var settings = (binding.Filter, binding.Wrap);
+                if (!_inlineSamplers.TryGetValue(settings, out nint sampler))
+                {
+                    sampler = CreateSampler(_device, binding.Filter, binding.Wrap, anisotropy: 1, bias: 0);
+                    _inlineSamplers.Add(settings, sampler);
+                }
+                _device.SetSampler(sampler, binding.Slot, kind);
             }
         }
     }
@@ -1000,7 +1015,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                         _ => throw new InvalidDataException($"Unsupported DXBC texture dimension '{texture.Dimension}'.")
                     })),
                     declareSampler => Array.Exists(stage.Textures, texture => texture.SamplerSlot == slot && flags ==
-                        (_lighting?.Textures.TryGetValue(texture.Name, out var lightingTexture) == true && lightingTexture.Comparison ? 1u : 0u)),
+                        (_lighting?.Textures.TryGetValue(texture.Name, out var lightingTexture) == true && lightingTexture.Comparison ? 1u : 0u))
+                        || flags == 0 && Array.Exists(stage.InlineSamplers, sampler => sampler.Slot == slot),
                     _ => ReadUInt(program, offset + 12) is var count && count is > 0 and <= 4096 &&
                          Array.Exists(stage.Buffers, buffer => buffer.Slot == slot && ((buffer.Size + 15) & ~15) >= count * 16)
                 };

@@ -1377,11 +1377,15 @@ namespace AssetStudio
         public int Length;
         public int Segment;
 
+        private static bool HasSegmentIndex(int[] version) => version[0] > 2019 || (version[0] == 2019 && version[1] >= 3);
+
+        internal static int SerializedSize(int[] version) => (HasSegmentIndex(version) ? 3 : 2) * sizeof(int);
+
         public ShaderSubProgramEntry(BinaryReader reader, int[] version)
         {
             Offset = reader.ReadInt32();
             Length = reader.ReadInt32();
-            if (version[0] > 2019 || (version[0] == 2019 && version[1] >= 3)) //2019.3 and up
+            if (HasSegmentIndex(version)) //2019.3 and up
             {
                 Segment = reader.ReadInt32();
             }

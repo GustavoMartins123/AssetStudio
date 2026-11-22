@@ -11,14 +11,15 @@ namespace AssetStudio
     internal sealed class SerializedShaderPreview : ShaderPreviewReader
     {
         private const int PreviewHardwareTier = 3;
-        private const int ProgramEntrySize = 2 * sizeof(int);
         private readonly Shader _shader;
         private readonly SerializedShader _form;
         private readonly Dictionary<string, NumericsVector4> _values = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _textureDefaults = new(StringComparer.Ordinal);
         private readonly HashSet<string> _propertyKeywords = new(StringComparer.Ordinal);
         private readonly List<string> _defaultKeywords = [];
-        private readonly Lazy<byte[]> _blob;
+        private readonly Lazy<ProgramTable> _programs;
+
+        private sealed record ProgramTable(Lazy<byte[]>[] Segments, int EntryCount, int EntrySize, int TableEnd);
 
         internal SerializedShaderPreview(Shader shader)
         {
@@ -67,7 +68,7 @@ namespace AssetStudio
             Dependencies = _form.m_Dependencies.ToDictionary(dependency => dependency.from, dependency => dependency.to, StringComparer.Ordinal);
             SubShaders = _form.m_SubShaders.Select(subShader => new ShaderPreviewSubShader(
                 ReadTags(subShader.m_Tags), "", subShader.m_Passes.Select(ReadPass).ToArray())).ToArray();
-            _blob = new Lazy<byte[]>(ReadBlob);
+            _programs = new Lazy<ProgramTable>(ReadProgramTable);
         }
 
         public override string Name => _form.m_Name;
@@ -170,26 +171,52 @@ namespace AssetStudio
             }
         }
 
-        private byte[] ReadBlob()
+        private ProgramTable ReadProgramTable()
         {
             int api = Array.IndexOf(_shader.platforms, ShaderCompilerPlatform.D3D11);
-            if (api < 0 || _shader.compressedBlob is not { } compressed ||
-                api >= _shader.offsets.Length || _shader.offsets[api] is not [var offset] ||
-                api >= _shader.compressedLengths.Length || _shader.compressedLengths[api] is not [var length] ||
-                api >= _shader.decompressedLengths.Length || _shader.decompressedLengths[api] is not [var size] ||
-                size is < sizeof(int) or > MaxBlobBytes || length == 0 || (ulong)offset + length > (ulong)compressed.Length)
+            if (api < 0 || _shader.compressedBlob is not { } compressed || api >= _shader.offsets.Length ||
+                api >= _shader.compressedLengths.Length || api >= _shader.decompressedLengths.Length)
             {
-                throw new InvalidDataException("Invalid bounds for the serialized Direct3D 11 program blob.");
+                throw new InvalidDataException("Missing serialized Direct3D 11 program data.");
+            }
+            var offsets = _shader.offsets[api];
+            var lengths = _shader.compressedLengths[api];
+            var sizes = _shader.decompressedLengths[api];
+            int entrySize = ShaderSubProgramEntry.SerializedSize(_shader.version);
+            if (offsets.Length == 0 || lengths.Length != offsets.Length || sizes.Length != offsets.Length ||
+                (entrySize == 2 * sizeof(int) && offsets.Length != 1))
+            {
+                throw new InvalidDataException("Invalid serialized Direct3D 11 program segment table.");
+            }
+            var segments = new Lazy<byte[]>[offsets.Length];
+            for (int i = 0; i < segments.Length; i++)
+            {
+                int segment = i;
+                segments[i] = new Lazy<byte[]>(() => ReadSegment(compressed, offsets[segment], lengths[segment], sizes[segment], segment));
+            }
+            var table = segments[0].Value;
+            if (table.Length < sizeof(int))
+            {
+                throw new InvalidDataException("Truncated serialized Direct3D 11 program table.");
+            }
+            int count = BinaryPrimitives.ReadInt32LittleEndian(table);
+            if (count < 0 || count > (table.Length - sizeof(int)) / entrySize)
+            {
+                throw new InvalidDataException("Invalid serialized shader program table size.");
+            }
+            return new ProgramTable(segments, count, entrySize, sizeof(int) + count * entrySize);
+        }
+
+        private static byte[] ReadSegment(byte[] compressed, uint offset, uint length, uint size, int segment)
+        {
+            if (size is 0 or > MaxBlobBytes || length == 0 || (ulong)offset + length > (ulong)compressed.Length)
+            {
+                throw new InvalidDataException($"Invalid bounds for serialized Direct3D 11 program segment {segment}.");
             }
             var bytes = new byte[size];
             if (LZ4Codec.Decode(compressed.AsSpan((int)offset, (int)length), bytes) != bytes.Length)
             {
-                throw new InvalidDataException("The serialized Direct3D 11 program blob could not be decompressed.");
-            }
-            int count = BinaryPrimitives.ReadInt32LittleEndian(bytes);
-            if (count < 0 || count > (bytes.Length - sizeof(int)) / ProgramEntrySize)
-            {
-                throw new InvalidDataException("Invalid serialized shader program table size.");
+                throw new InvalidDataException($"Serialized Direct3D 11 program segment {segment} could not be decompressed.");
             }
             return bytes;
         }
@@ -197,17 +224,22 @@ namespace AssetStudio
         private ShaderPreviewStage ReadStage(Variant variant, IReadOnlyDictionary<int, string> names)
         {
             var sub = variant.Program;
-            var bytes = _blob.Value;
-            int entryCount = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+            var programs = _programs.Value;
             uint index = sub.m_BlobIndex;
-            if (index >= entryCount)
+            if (index >= programs.EntryCount)
             {
                 throw new InvalidDataException($"Invalid serialized GPU program index {index}.");
             }
-            int entryOffset = sizeof(int) + (int)index * ProgramEntrySize;
-            using var entryReader = new BinaryReader(new MemoryStream(bytes, entryOffset, ProgramEntrySize, writable: false));
+            int entryOffset = sizeof(int) + (int)index * programs.EntrySize;
+            using var entryReader = new BinaryReader(new MemoryStream(programs.Segments[0].Value, entryOffset, programs.EntrySize, writable: false));
             var entry = new ShaderSubProgramEntry(entryReader, _shader.version);
-            if (entry.Offset < sizeof(int) + entryCount * ProgramEntrySize || (entry.Offset & 3) != 0 ||
+            if ((uint)entry.Segment >= (uint)programs.Segments.Length)
+            {
+                throw new InvalidDataException($"Invalid segment {entry.Segment} for serialized GPU program {index}.");
+            }
+            var bytes = programs.Segments[entry.Segment].Value;
+            int minOffset = entry.Segment == 0 ? programs.TableEnd : 0;
+            if (entry.Offset < minOffset || (entry.Offset & 3) != 0 ||
                 entry.Length <= 0 || entry.Offset > bytes.Length - entry.Length)
             {
                 throw new InvalidDataException($"Invalid bounds for serialized GPU program {index}.");
@@ -220,9 +252,9 @@ namespace AssetStudio
             {
                 throw new InvalidDataException($"GPU program {index} does not contain the declared Direct3D 11 stage.");
             }
-            if (sub.m_VectorParams.Length != 0 || sub.m_MatrixParams.Length != 0 || sub.m_UAVParams.Length != 0 || sub.m_Samplers.Length != 0)
+            if (sub.m_VectorParams.Length != 0 || sub.m_MatrixParams.Length != 0 || sub.m_UAVParams.Length != 0)
             {
-                throw new NotSupportedException("The stage requires ungrouped constants, UAVs or inline samplers.");
+                throw new NotSupportedException("The stage requires ungrouped constants or UAVs.");
             }
 
             string NameOf(int id) => ReadNameIndex(names, id);
@@ -262,9 +294,19 @@ namespace AssetStudio
                 }
                 return new ShaderPreviewTextureBinding(name, binding.m_Index, binding.m_SamplerIndex, dimension);
             }).ToArray();
+            var samplers = sub.m_Samplers.Select(binding =>
+            {
+                // Unity encodes sampler_LinearClamp as filter Linear and Clamp on all three axes.
+                if (binding.sampler != 0x55 || binding.bindPoint is < 0 or >= 16)
+                {
+                    throw new NotSupportedException($"Unsupported inline sampler 0x{binding.sampler:X} at slot {binding.bindPoint}.");
+                }
+                return new ShaderPreviewSamplerBinding(binding.bindPoint, Filter: 1, Wrap: 1);
+            }).ToArray();
             return new ShaderPreviewStage(code.m_ProgramCode[prefixBytes..], buffers.ToArray(), textures)
             {
-                StructuredBuffers = sub.m_BufferParams.Select(binding => new ShaderPreviewStructuredBufferBinding(NameOf(binding.m_NameIndex), binding.m_Index)).ToArray()
+                StructuredBuffers = sub.m_BufferParams.Select(binding => new ShaderPreviewStructuredBufferBinding(NameOf(binding.m_NameIndex), binding.m_Index)).ToArray(),
+                InlineSamplers = samplers
             };
         }
 

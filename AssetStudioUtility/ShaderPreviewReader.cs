@@ -17,7 +17,9 @@ namespace AssetStudio
         public virtual IReadOnlyList<string> DefaultKeywords => [];
         public abstract IReadOnlyList<ShaderPreviewSubShader> SubShaders { get; }
 
-        public static bool SupportsVersion(int[] version) => version is [5, 3, ..] or [2017, 4, ..] or [2018, 2, ..];
+        public static bool SupportsVersion(int[] version) => version is [5, 3, ..] || SupportsSerializedVersion(version);
+
+        private static bool SupportsSerializedVersion(int[] version) => version is [2017, 4, ..] or [2018, 2, ..] or [2019, 3, ..];
 
         public static ShaderPreviewReader Read(Shader shader)
         {
@@ -25,8 +27,8 @@ namespace AssetStudio
             return shader.version switch
             {
                 [5, 3, ..] => LegacyShaderPreview.Read(shader),
-                [2017, 4, ..] or [2018, 2, ..] => new SerializedShaderPreview(shader),
-                _ => throw new NotSupportedException("Shader preview supports Unity 5.3, 2017.4 and 2018.2 Built-in shaders compiled for Direct3D 11.")
+                _ when SupportsSerializedVersion(shader.version) => new SerializedShaderPreview(shader),
+                _ => throw new NotSupportedException("Shader preview supports Unity 5.3, 2017.4, 2018.2 and 2019.3 Built-in shaders compiled for Direct3D 11.")
             };
         }
 

@@ -198,7 +198,7 @@ internal static class ShaderPreviewService
         if (guiShader)
         {
             geometry = ShaderPreviewGeometry.Plane;
-            SerializedGuiShaderPreview.SetProperties(values);
+            SerializedGuiShaderPreview.SetProperties(reader.Name, values);
         }
         var passes = ExpandPasses(shader, reader, subShader, (owner, reference) => Resolve(owner.assetsFile, reference), cancellationToken)
             .Select(item => (item.Reader, item.Sub, Pass: item.Reader is LegacyShaderPreview legacy ?
@@ -282,7 +282,7 @@ internal static class ShaderPreviewService
                 else
                 {
                     var draw = new ShaderPreviewDraw(pass, lights[0], geometry == ShaderPreviewGeometry.Skybox ? GetSkyboxSide(pass) : -1);
-                    if (guiShader && reader.Name == "Hidden/Internal-GUIRoundedRect")
+                    if (guiShader && SerializedGuiShaderPreview.IsRoundedRect(reader.Name))
                     {
                         draw = draw with { VectorArrays = SerializedGuiShaderPreview.RoundedRectArrays };
                     }
@@ -308,6 +308,8 @@ internal static class ShaderPreviewService
         if (cameraPreview != null)
         {
             operations = [.. cameraPreview.Prepare(operations, values, textures, RenderSize)];
+            PostProcessingV2Preview.LoadResources(reader.Name, shader, values, textures, RenderSize,
+                resolveAsset, Resolve<MonoScript>, Resolve<Texture>, cancellationToken);
             geometry = ShaderPreviewGeometry.ScreenQuad;
             imageEffect = cameraPreview.Effect;
         }
@@ -317,10 +319,6 @@ internal static class ShaderPreviewService
         }
         else if (LegacyLightEffectsPreview.IsLightEffect(reader.Name))
         {
-            if (serialized)
-            {
-                throw new NotSupportedException($"'{reader.Name}' requires a serialized flare or halo scene. The Unity 5.3 scene reader does not apply to this asset.");
-            }
             var effect = LegacyLightEffectsPreview.Prepare(shader, reader.Name, operations.Cast<ShaderPreviewDraw>().Single(),
                 resolveAsset, Resolve<AssetStudio.Object>, Resolve<Texture>, cancellationToken);
             textures.Add(effect.TextureName, effect.Texture);
@@ -902,7 +900,7 @@ internal static class ShaderPreviewService
             }
             return draw.Matrices?.TryGetValue(name, out var matrixValue) == true ? matrixValue : name switch
             {
-                "glstate_matrix_mvp" when billboardTransform.HasValue => billboardTransform.Value,
+                "glstate_matrix_mvp" or "unity_MatrixVP" when billboardTransform.HasValue => billboardTransform.Value,
                 "unity_MatrixVP" when scene.SerializedShader && (draw.Geometry ?? scene.Geometry) == ShaderPreviewGeometry.ScreenQuad =>
                     NumericsMatrix4x4.Identity,
                 "glstate_matrix_mvp" when (draw.Geometry ?? scene.Geometry) == ShaderPreviewGeometry.ScreenQuad => NumericsMatrix4x4.Identity,
@@ -1023,7 +1021,10 @@ internal static class ShaderPreviewService
                 "_TextureSampleAdd" => scene.Textures.TryGetValue("_MainTex", out var main) && main.Format == 65
                     ? new NumericsVector4(1, 1, 1, 0) : NumericsVector4.Zero,
                 "_UndoOutputSRGB" when scene.ImageEffect == ImageEffectPass.RenderTargetDisplay => NumericsVector4.Zero,
-                "_Phase" when scene.ImageEffect == ImageEffectPass.PostProcessingGrain => new NumericsVector4(time / 20f),
+                "_Phase" when scene.ImageEffect == ImageEffectPass.PostProcessingGrain =>
+                    new NumericsVector4(scene.ShaderName == PostProcessingV2Preview.GrainBaker ? time % 10 : time / 20f),
+                // Othercide's BOHColorCorrection sets (1 / gamma, contrast, color-blind shift, brightness).
+                "_BOHUserSettingsColors" when scene.SerializedShader => new NumericsVector4(1, 1, 0, 1),
                 "_ProjInfo" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection => ScreenSpaceReflectionPreview.ProjectionInfo(projection, RenderSize),
                 "_PixelsPerMeterAtOneMeter" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection =>
                     new NumericsVector4(-RenderSize * projection.M22 / 2f),
@@ -1060,6 +1061,8 @@ internal static class ShaderPreviewService
                 "_LightDir" when lighting != null => new NumericsVector4(-light.Direction, 0),
                 "_LightColor" when lighting != null => new NumericsVector4(light.Color, 1),
                 "_Time" => new NumericsVector4(time / 20, time, time * 2, time * 3),
+                // The editor-panning offset is zero during playback. Player time comes from _Time.
+                "_TimeEditor" when scene.SerializedShader => NumericsVector4.Zero,
                 "_SinTime" => new NumericsVector4(MathF.Sin(time / 8), MathF.Sin(time / 4), MathF.Sin(time / 2), MathF.Sin(time)),
                 "_CosTime" => new NumericsVector4(MathF.Cos(time / 8), MathF.Cos(time / 4), MathF.Cos(time / 2), MathF.Cos(time)),
                 "unity_DeltaTime" => deltaTime > 0 ? new NumericsVector4(deltaTime, 1 / deltaTime, deltaTime, 1 / deltaTime) : NumericsVector4.Zero,

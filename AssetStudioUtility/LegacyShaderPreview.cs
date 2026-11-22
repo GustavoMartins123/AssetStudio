@@ -13,10 +13,12 @@ namespace AssetStudio
     public enum ShaderPreviewTextureDimension { Texture2D = 2, Texture3D = 3, Cube = 4 }
     public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot, ShaderPreviewTextureDimension Dimension);
     public sealed record ShaderPreviewStructuredBufferBinding(string Name, int Slot);
+    public sealed record ShaderPreviewSamplerBinding(int Slot, int Filter, int Wrap);
     public enum ShaderPreviewProgramKind { Pixel, Vertex, Geometry }
     public sealed record ShaderPreviewStage(byte[] Bytecode, ShaderPreviewBuffer[] Buffers, ShaderPreviewTextureBinding[] Textures)
     {
         public ShaderPreviewStructuredBufferBinding[] StructuredBuffers { get; init; } = [];
+        public ShaderPreviewSamplerBinding[] InlineSamplers { get; init; } = [];
     }
 
     public enum ShaderPreviewBlend { Zero, One, SrcColor, OneMinusSrcColor, DstColor, OneMinusDstColor, SrcAlpha, OneMinusSrcAlpha, DstAlpha, OneMinusDstAlpha, SrcAlphaSaturate }

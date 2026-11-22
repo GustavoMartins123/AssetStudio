@@ -9,9 +9,9 @@ internal static class TemporalAntialiasingPreview
 {
     internal const string HistoryTexture = "_HistoryTex";
 
-    internal static void SetProperties(IDictionary<string, NumericsVector4> values)
+    internal static void SetProperties(IDictionary<string, NumericsVector4> values, string sharpen = "_SharpenParameters")
     {
-        values.TryAdd("_SharpenParameters", new NumericsVector4(0.3f, 0, 0, 0));
+        values.TryAdd(sharpen, new NumericsVector4(0.3f, 0, 0, 0));
         values.TryAdd("_FinalBlendParameters", new NumericsVector4(0.95f, 0.85f, 6000, 0));
     }
 

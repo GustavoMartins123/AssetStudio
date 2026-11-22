@@ -150,7 +150,7 @@ internal static class LegacyLightEffectsPreview
                 {
                     throw new InvalidDataException($"The indexed {type} in '{handle.SerializedFileName}' could not be read.");
                 }
-                if (asset.version.Length >= 2 && asset.version[0] == 5 && asset.version[1] == 3)
+                if (asset.version is [5, 3, ..] or [2017, 4, ..] or [2018, 2 or 4, ..] or [2019, 3, ..])
                 {
                     yield return asset;
                 }
@@ -226,6 +226,10 @@ internal static class LegacyLightEffectsPreview
         reader.ReadSingle(); // Ambient intensity.
         reader.ReadInt32(); // Ambient mode.
         reader.AlignStream();
+        if (reader.version[0] >= 2017)
+        {
+            reader.ReadColor4(); // Subtractive shadow color.
+        }
         _ = new PPtr<Material>(reader);
         float halo = ReadFinite(reader);
         float flare = ReadFinite(reader);
@@ -233,7 +237,7 @@ internal static class LegacyLightEffectsPreview
         var texture = new PPtr<Texture>(reader);
         if (reader.Position > reader.byteStart + reader.byteSize || (useFog && fog.Mode == 1 && fog.End <= fog.Start))
         {
-            throw new InvalidDataException("The Unity 5.3 lighting settings contain an invalid fog or texture binding.");
+            throw new InvalidDataException("The scene lighting settings contain an invalid fog or texture binding.");
         }
         return new LightingSettings(texture, halo, flare, useFog ? fog : null);
     }
@@ -286,7 +290,7 @@ internal static class LegacyLightEffectsPreview
             int count = reader.ReadInt32();
             if (count <= 0 || count > 256 || reader.Position + 32L * count + 1 != reader.byteStart + reader.byteSize)
             {
-                throw new InvalidDataException("The Unity 5.3 Flare has an invalid element array.");
+                throw new InvalidDataException("The Flare asset has an invalid element array.");
             }
             Elements = new FlareElement[count];
             for (int i = 0; i < count; i++)

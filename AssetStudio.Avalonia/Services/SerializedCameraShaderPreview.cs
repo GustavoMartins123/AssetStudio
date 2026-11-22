@@ -6,7 +6,7 @@ using NumericsVector4 = System.Numerics.Vector4;
 
 namespace AssetStudio.Avalonia.Services;
 
-// Camera passes for the serialized Built-in shaders found in Unity 2017.4 and 2018.2.
+// Camera passes for serialized Built-in and Post Processing shaders.
 internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] PassIndices, bool UsesCameraColor,
     ImageEffectPass? Effect = null, string? SceneKeyword = null, uint DepthBlitSamples = 0)
 {
@@ -37,7 +37,7 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
         "Hidden/Post FX/Eye Adaptation" => new(name, [2], true, ImageEffectPass.ExposureHistogram, "AUTO_KEY_VALUE"),
         "Hidden/Post FX/Temporal Anti-aliasing" => new(name, [0], true, ImageEffectPass.TemporalAntialiasing),
         "Hidden/Post FX/Screen Space Reflection" => new(name, [0, 1, 2, 3, 5, 6, 8], true, ImageEffectPass.ScreenSpaceReflection),
-        _ => null
+        _ => PostProcessingV2Preview.Find(name)
     };
 
     internal IReadOnlyList<ShaderPreviewOperation> Prepare(IReadOnlyList<ShaderPreviewOperation> passes,
@@ -57,6 +57,10 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
             throw new NotSupportedException($"'{ShaderName}' has an unsupported depth blit pass.");
         }
 
+        if (ShaderName.StartsWith(PostProcessingV2Preview.Prefix, StringComparison.Ordinal))
+        {
+            return PostProcessingV2Preview.Prepare(ShaderName, draws, values, textures, size);
+        }
         switch (ShaderName)
         {
             case "Hidden/Post FX/FXAA":
@@ -154,9 +158,7 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
     {
         values.TryAdd("_MainTex_ST", new NumericsVector4(1, 1, 0, 0));
         values.TryAdd("_LutParams", new NumericsVector4(32, 1f / 2048, 1f / 64, 32f / 31));
-        values.TryAdd("_ChannelMixerRed", NumericsVector4.UnitX);
-        values.TryAdd("_ChannelMixerGreen", NumericsVector4.UnitY);
-        values.TryAdd("_ChannelMixerBlue", NumericsVector4.UnitZ);
+        SetIdentityChannelMixer(values);
         foreach (string name in new[] { "_Balance", "_InvGamma", "_Gain", "_Power", "_Slope", "_Saturation", "_Contrast" })
         {
             values.TryAdd(name, NumericsVector4.One);
@@ -166,7 +168,19 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
             values.TryAdd(name, NumericsVector4.Zero);
         }
 
-        // The neutral grading profile uses flat adjustment curves and identity RGB curves.
+        textures.Add("_Curves", CreateIdentityGradingCurves());
+    }
+
+    internal static void SetIdentityChannelMixer(IDictionary<string, NumericsVector4> values)
+    {
+        values.TryAdd("_ChannelMixerRed", NumericsVector4.UnitX);
+        values.TryAdd("_ChannelMixerGreen", NumericsVector4.UnitY);
+        values.TryAdd("_ChannelMixerBlue", NumericsVector4.UnitZ);
+    }
+
+    internal static ShaderPreviewTexture CreateIdentityGradingCurves()
+    {
+        // Flat hue and saturation adjustments in the first row, identity RGB and master in the second.
         const int width = 128;
         var pixels = new byte[width * 2 * 8];
         var channels = MemoryMarshal.Cast<byte, Half>(pixels.AsSpan());
@@ -175,7 +189,7 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
             channels.Slice(i * 4, 4).Fill((Half)0.5f);
             channels.Slice((i + width) * 4, 4).Fill((Half)((float)i / width));
         }
-        textures.Add("_Curves", new ShaderPreviewTexture(width, 2, 1, 10, 8, false, pixels, 1, 1, 1, 0));
+        return new ShaderPreviewTexture(width, 2, 1, 10, 8, false, pixels, 1, 1, 1, 0);
     }
 
     private static ShaderPreviewDraw[] ArtisanBloom(ShaderPreviewDraw[] draws, int size)
@@ -193,14 +207,7 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
     {
         // Full-frame circle of confusion, then the medium bokeh kernel at half resolution.
         // The preview camera has temporal anti-aliasing disabled.
-        const float focalLength = 0.05f, focusDistance = 4f, aperture = 1.4f, filmHeight = 0.024f;
-        float maxCoC = MathF.Min(0.05f, 10f / size);
-        float lensCoefficient = focalLength * focalLength / (aperture * (focusDistance - focalLength) * filmHeight * 2);
-        values.TryAdd("_Distance", new NumericsVector4(focusDistance));
-        values.TryAdd("_LensCoeff", new NumericsVector4(lensCoefficient));
-        values.TryAdd("_MaxCoC", new NumericsVector4(maxCoC));
-        values.TryAdd("_RcpMaxCoC", new NumericsVector4(1 / maxCoC));
-        values.TryAdd("_RcpAspect", NumericsVector4.One);
+        SetDepthOfFieldLens(values, size, filmHeight: 0.024f);
         var coc = new ShaderPreviewRenderTarget("Circle of confusion", size);
         var prefilter = new ShaderPreviewRenderTarget("Depth of field prefilter", size / 2);
         var bokeh = new ShaderPreviewRenderTarget("Depth of field bokeh", size / 2);
@@ -209,7 +216,19 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
             WithInput(draws[2], prefilter) with { Output = bokeh }, WithInput(draws[3], bokeh)];
     }
 
-    private static ShaderPreviewDraw[] MotionBlur(ShaderPreviewDraw[] draws, IDictionary<string, NumericsVector4> values, int size)
+    internal static void SetDepthOfFieldLens(IDictionary<string, NumericsVector4> values, int size, float filmHeight)
+    {
+        const float focalLength = 0.05f, focusDistance = 4f, aperture = 1.4f;
+        float maxCoC = MathF.Min(0.05f, 10f / size); // Medium kernel.
+        float lensCoefficient = focalLength * focalLength / (aperture * (focusDistance - focalLength) * filmHeight * 2);
+        values.TryAdd("_Distance", new NumericsVector4(focusDistance));
+        values.TryAdd("_LensCoeff", new NumericsVector4(lensCoefficient));
+        values.TryAdd("_MaxCoC", new NumericsVector4(maxCoC));
+        values.TryAdd("_RcpMaxCoC", new NumericsVector4(1 / maxCoC));
+        values.TryAdd("_RcpAspect", NumericsVector4.One);
+    }
+
+    internal static ShaderPreviewDraw[] MotionBlur(ShaderPreviewDraw[] draws, IDictionary<string, NumericsVector4> values, int size)
     {
         int radius = size * 5 / 100;
         int tileSize = ((radius - 1) / 8 + 1) * 8;
@@ -258,8 +277,7 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
         values.TryAdd("_Curve", new NumericsVector4(threshold - knee, 2 * knee, 0.25f / knee, 0));
         values.TryAdd("_PrefilterOffs", NumericsVector4.Zero);
         values.TryAdd("_SampleScale", new NumericsVector4(0.75f));
-        textures.Add("_AutoExposure", new ShaderPreviewTexture(1, 1, 1, 41 /* R32_FLOAT */, 4,
-            false, BitConverter.GetBytes(1f), 1, 1, 1, 0));
+        textures.Add("_AutoExposure", CreateFixedExposure());
         var prefilter = new ShaderPreviewRenderTarget("Bloom prefilter", size / 2);
         var first = new ShaderPreviewRenderTarget("Bloom first reduction", size / 4);
         var second = new ShaderPreviewRenderTarget("Bloom second reduction", size / 8);
@@ -271,6 +289,9 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
                 ["_BaseTex"] = first
             } }];
     }
+
+    internal static ShaderPreviewTexture CreateFixedExposure() =>
+        new(1, 1, 1, 41 /* R32_FLOAT */, 4, false, BitConverter.GetBytes(1f), 1, 1, 1, 0);
 
     internal static ShaderPreviewDraw WithInput(ShaderPreviewDraw draw, ShaderPreviewRenderTarget input) =>
         draw with { Inputs = new Dictionary<string, ShaderPreviewRenderTarget> { [ImageEffectPreview.MainTexture] = input } };
