@@ -46,6 +46,7 @@ internal sealed record ShaderPreviewScene(
 {
     internal NoisePreviewSettings? NoiseSettings { get; init; }
     internal bool SerializedShader { get; init; }
+    internal uint DepthBlitSamples { get; init; }
 }
 
 internal sealed record ShaderPreviewTexture(
@@ -132,6 +133,7 @@ internal static class ShaderPreviewService
         var reader = ShaderPreviewReader.Read(shader);
         bool serialized = reader is not LegacyShaderPreview;
         var cameraPreview = serialized ? SerializedCameraShaderPreview.Find(reader.Name) : null;
+        uint depthBlitSamples = cameraPreview?.DepthBlitSamples ?? 0;
         bool textShader = serialized && TextMeshProShaderPreview.IsTextShader(reader.Name);
         bool guiShader = serialized && SerializedGuiShaderPreview.IsGuiDraw(reader.Name);
         var values = new Dictionary<string, NumericsVector4>(reader.Values, StringComparer.Ordinal);
@@ -154,6 +156,10 @@ internal static class ShaderPreviewService
             {
                 textureSlots.Add(name, slot);
             }
+        }
+        if (serialized)
+        {
+            UnityChanToonPreview.SetGlobals(reader, values);
         }
         foreach (string name in reader.TextureDefaults.Keys.Concat(textureSlots.Keys).Distinct(StringComparer.Ordinal))
         {
@@ -407,6 +413,10 @@ internal static class ShaderPreviewService
             {
                 foreach (var binding in pass.Stages.SelectMany(stage => stage.Textures))
                 {
+                    if (depthBlitSamples != 0 && binding.Name == ImageEffectPreview.MainTexture)
+                    {
+                        continue;
+                    }
                     if (draw.Inputs?.TryGetValue(binding.Name, out var target) == true)
                     {
                         if (binding.Dimension != ShaderPreviewTextureDimension.Texture2D || target == draw.Output || !renderedTargets.Contains(target))
@@ -454,7 +464,10 @@ internal static class ShaderPreviewService
             draw.Billboard.HasValue || draw.Pass.Stages.SelectMany(stage => stage.Buffers).SelectMany(buffer => buffer.Parameters)
                 .Any(parameter => parameter.Name is "_Time" or "_SinTime" or "_CosTime" or "unity_DeltaTime" or "_WaveOffset"));
         return new ShaderPreviewScene(reader.Name, geometry, animated, operations, PreviewAmbientLinear, lights, values, textures,
-            unusedKeywords, lightingPass, imageEffect, cameraTextures) { NoiseSettings = noiseSettings, SerializedShader = serialized };
+            unusedKeywords, lightingPass, imageEffect, cameraTextures)
+        {
+            NoiseSettings = noiseSettings, SerializedShader = serialized, DepthBlitSamples = depthBlitSamples
+        };
 
         T Resolve<T>(SerializedFile source, PPtr<T> reference) where T : AssetStudio.Object =>
             ResolveReference(reference, source, loadExternalSources, resolveAsset, cancellationToken);

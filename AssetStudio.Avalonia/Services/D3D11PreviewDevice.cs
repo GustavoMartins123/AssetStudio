@@ -7,6 +7,8 @@ namespace AssetStudio.Avalonia.Services;
 
 internal sealed unsafe class D3D11PreviewDevice : IDisposable
 {
+    internal const int R32Typeless = 39, D32Float = 40, R32Float = 41;
+
     // Slots are from the Windows SDK definitions of ID3D11Device and ID3D11DeviceContext.
     private readonly nint _device;
     private readonly nint _context;
@@ -119,6 +121,21 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     internal nint CreateRenderView(nint texture) => CreateView(9, texture, "create the render target view");
     internal nint CreateDepthView(nint texture) => CreateView(10, texture, "create the depth view");
 
+    internal nint CreateDepth32View(nint texture, uint samples)
+    {
+        var desc = new DepthViewDesc { Format = D32Float, Dimension = samples == 1 ? 3 : 5 }; // TEXTURE2D or TEXTURE2DMS
+        return CreateView(10, texture, "create the 32-bit depth view", &desc);
+    }
+
+    internal nint CreateDepth32ShaderView(nint texture, uint samples)
+    {
+        var desc = new ShaderViewDesc
+        {
+            Format = R32Float, Dimension = samples == 1 ? 4 : 6, MipLevels = samples == 1 ? 1u : 0u
+        }; // TEXTURE2D or TEXTURE2DMS
+        return CreateView(7, texture, "create the depth shader resource view", &desc);
+    }
+
     private nint CreateView(int slot, nint texture, string operation, void* desc = null)
     {
         nint view = 0;
@@ -171,12 +188,16 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     internal void ClearFrame(nint surface, nint depth, int size, bool showBackgroundPattern, float background = 0.18f)
     {
         ClearColor(surface, background, 1f);
-        ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(_context, depth, 3, 1f, 0);
+        ClearDepth(depth, 1f, clearStencil: true);
         if (showBackgroundPattern)
         {
             ClearBackgroundTiles(surface, size);
         }
     }
+
+    internal void ClearDepth(nint depth, float value, bool clearStencil = false) =>
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(
+            _context, depth, clearStencil ? 3u : 1u, value, 0);
 
     internal void ClearColor(nint surface, float color = 0, float alpha = 0)
     {
@@ -224,7 +245,9 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         int size, nint secondarySurface = 0)
     {
         nint* outputs = stackalloc nint[] { surface, secondarySurface };
-        ((delegate* unmanaged[Stdcall]<nint, uint, nint*, nint, void>)Slot(_context, 33))(_context, secondarySurface == 0 ? 1u : 2u, outputs, depth);
+        uint outputCount = secondarySurface != 0 ? 2u : surface != 0 ? 1u : 0u;
+        ((delegate* unmanaged[Stdcall]<nint, uint, nint*, nint, void>)Slot(_context, 33))(
+            _context, outputCount, outputCount == 0 ? null : outputs, depth);
         ((delegate* unmanaged[Stdcall]<nint, nint, float*, uint, void>)Slot(_context, 35))(_context, blendState, null, uint.MaxValue);
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 36))(_context, depthState, stencilReference);
         ((delegate* unmanaged[Stdcall]<nint, nint, void>)Slot(_context, 43))(_context, rasterizerState);
@@ -284,7 +307,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         Check(result, "check multisampled support");
         if (levels == 0)
         {
-            throw new NotSupportedException($"D3D11 format {format} does not support {samples} samples for AlphaToMask.");
+            throw new NotSupportedException($"D3D11 format {format} does not support {samples} samples.");
         }
     }
 
@@ -406,6 +429,13 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     {
         public int Format, Dimension;
         public uint MostDetailedMip, MipLevels, Reserved0, Reserved1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DepthViewDesc
+    {
+        public int Format, Dimension;
+        public uint Flags, MipSlice, FirstArraySlice, ArraySize;
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -22,6 +22,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         BindShaderResource = 8, BindRenderTarget = 32, BindDepthStencil = 64;
     private static readonly NumericsMatrix4x4 Projection = NumericsMatrix4x4.CreatePerspectiveFieldOfView(35 * MathF.PI / 180, 1,
         ShaderPreviewCamera.Near, ShaderPreviewCamera.Far);
+    private static readonly NumericsMatrix4x4 ReversedProjection = BuiltInLightingPreview.DepthProjection(Projection, reversedDepth: true);
 
     private static readonly (Vertex[] Vertices, uint[] Indices) Plane = BuildPlane();
     private static readonly (Vertex[] Vertices, uint[] Indices) TextPlane = BuildTextPlane();
@@ -41,6 +42,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private float _lightingTime;
     private MotionPreviewFrame? _lightingMotion;
     private readonly nint _vertexBuffer, _indexBuffer, _target, _targetView, _depth, _resolved, _staging;
+    private readonly nint _depthTexture, _depthInputView, _depthInputState;
+    private readonly GpuTexture _depthInput;
     private readonly int _indexCount;
     private readonly TextureDesc _colorCopy;
     private readonly bool _multisampled, _showBackgroundPattern;
@@ -88,6 +91,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
             _multisampled = scene.Operations.OfType<ShaderPreviewDraw>().Any(draw => draw.Pass.State.AlphaToMask);
             _showBackgroundPattern = scene.Operations.Any(operation => operation is ShaderPreviewGrab);
+            bool depthBlit = scene.DepthBlitSamples != 0;
             const int depthStencilFormat = 45; // D24_UNORM_S8_UINT
             const uint sampleCount = 4;
             if (_multisampled)
@@ -100,17 +104,37 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 Width = FrameSize, Height = FrameSize, MipLevels = 1, ArraySize = 1,
                 Format = Rgba8, SampleCount = _multisampled ? sampleCount : 1, BindFlags = BindRenderTarget
             };
-            _target = _device.CreateTexture(frame);
-            _targetView = _device.CreateRenderView(_target);
-            frame.Format = depthStencilFormat;
+            if (!depthBlit)
+            {
+                _target = _device.CreateTexture(frame);
+                _targetView = _device.CreateRenderView(_target);
+            }
+            frame.Format = depthBlit ? R32Typeless : depthStencilFormat;
             frame.BindFlags = BindDepthStencil;
-            _depth = _device.CreateDepthView(_device.CreateTexture(frame));
+            _depthTexture = _device.CreateTexture(frame);
+            _depth = depthBlit ? _device.CreateDepth32View(_depthTexture, 1) : _device.CreateDepthView(_depthTexture);
+            if (depthBlit)
+            {
+                var input = frame;
+                input.SampleCount = scene.DepthBlitSamples;
+                input.BindFlags |= BindShaderResource;
+                if (input.SampleCount > 1)
+                {
+                    _device.RequireMultisampling(D32Float, input.SampleCount);
+                }
+                nint texture = _device.CreateTexture(input);
+                _depthInputView = _device.CreateDepth32View(texture, input.SampleCount);
+                _depthInput = new GpuTexture(texture, _device.CreateDepth32ShaderView(texture, input.SampleCount),
+                    input.SampleCount == 1 ? CreateSampler(_device, filterMode: 0, wrapMode: 1, anisotropy: 1, bias: 0) : 0);
+                _depthInputState = CreateDepth(_device, new ShaderPreviewState { ZTest = ShaderPreviewDepth.GEqual });
+            }
             frame.Format = Rgba8;
             frame.SampleCount = 1;
             frame.BindFlags = BindShaderResource;
             _colorCopy = frame;
             frame.BindFlags = 0;
             _resolved = _multisampled ? _device.CreateTexture(frame) : _target;
+            frame.Format = depthBlit ? R32Float : Rgba8;
             frame.Usage = 3; // staging
             frame.CpuAccess = 0x20000; // read
             _staging = _device.CreateTexture(frame);
@@ -217,7 +241,14 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             effect.RenderInputs(camera, time, token);
             UploadCameraTextures(effect.Textures);
         }
-        _device.ClearFrame(_targetView, _depth, FrameSize, _showBackgroundPattern, background: _animatedEffect == null ? 0.18f : 0f);
+        if (_scene.DepthBlitSamples != 0)
+        {
+            _device.ClearDepth(_depth, 0f);
+        }
+        else
+        {
+            _device.ClearFrame(_targetView, _depth, FrameSize, _showBackgroundPattern, background: _animatedEffect == null ? 0.18f : 0f);
+        }
         var capturedNames = new HashSet<string>(StringComparer.Ordinal);
         var renderedTargets = new HashSet<ShaderPreviewRenderTarget>();
         bool pointsCollected = false;
@@ -265,7 +296,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             _device.CopyColor(_target, _resolved, Rgba8, multisampled: true);
         }
         token.ThrowIfCancellationRequested();
-        var pixels = _device.ReadPixels(_resolved, _staging, Rgba8, FrameSize);
+        var pixels = _scene.DepthBlitSamples != 0 ? ReadDepthImage(renderCamera.Distance) :
+            _device.ReadPixels(_resolved, _staging, Rgba8, FrameSize);
         // The preview is already composited over its scene background.
         for (int alpha = 3; alpha < pixels.Length; alpha += 4)
         {
@@ -328,9 +360,23 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     {
                         FillMode = 3, CullMode = (int)pass.State.Cull, FrontCounterClockwise = 1,
                         DepthClipEnable = pass.State.ZClip ? 1 : 0, DepthBias = pass.State.OffsetUnits, SlopeScaledDepthBias = pass.State.OffsetFactor,
-                        MultisampleEnable = _multisampled ? 1 : 0
+                        MultisampleEnable = _multisampled || _scene.DepthBlitSamples > 1 ? 1 : 0
                     }), FindUnusedVertexTransform(pass));
                 _passes.Add(pass, gpu);
+            }
+            if (_scene.DepthBlitSamples != 0)
+            {
+                // This blit's vertex stage transforms positions with the supplied view-projection matrix.
+                // Use it to rasterize the preview mesh into the camera's reversed-Z depth texture first.
+                _device.ClearBindings();
+                _device.ClearDepth(_depthInputView, 0f);
+                _device.SetPass(0, _depthInputView, 0, _depthInputState, 0, gpu.Rasterizer, FrameSize);
+                var capture = draw with { Geometry = ShaderPreviewGeometry.Sphere };
+                int inputCount = BindDrawGeometry(capture, gpu.Layout, default);
+                _device.SetShader(gpu.Vertex, ShaderPreviewProgramKind.Vertex);
+                BindStage(pass.Vertex, capture, FrameSize, ShaderPreviewProgramKind.Vertex, null, gpu.UnusedVertexParameter,
+                    ReversedProjection);
+                _device.Draw(inputCount);
             }
             _device.ClearBindings();
             nint targetView = _targetView;
@@ -376,7 +422,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         }
 
         void BindStage(ShaderPreviewStage stage, ShaderPreviewDraw draw, int size, ShaderPreviewProgramKind kind,
-            NumericsMatrix4x4? billboardTransform, ShaderPreviewParameter? unusedVertexParameter = null)
+            NumericsMatrix4x4? billboardTransform, ShaderPreviewParameter? unusedVertexParameter = null,
+            NumericsMatrix4x4? projection = null)
         {
             var buffers = new HashSet<int>();
             foreach (var buffer in stage.Buffers)
@@ -386,8 +433,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 {
                     throw new InvalidDataException($"Duplicate constant buffer binding b{buffer.Slot}.");
                 }
-                var data = ShaderPreviewService.BindConstants(_scene, draw, buffer, view, Projection, eye, size, capturedNames, time, deltaTime,
-                    _lighting, _cameraTextures, motion, billboardTransform, unusedVertexParameter);
+                var data = ShaderPreviewService.BindConstants(_scene, draw, buffer, view, projection ?? Projection, eye, size, capturedNames,
+                    time, deltaTime, _lighting, _cameraTextures, motion, billboardTransform, unusedVertexParameter);
                 if (_constantBuffers.TryGetValue(buffer, out nint gpuBuffer))
                 {
                     _device.UpdateBuffer<byte>(gpuBuffer, data);
@@ -443,6 +490,11 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     gpu = GetRenderTarget(TemporalHistory[_historyReadIndex]).Texture;
                     sampling = (1, 1, 1, 0, false);
                 }
+                else if (IsDepthBlitInput(binding.Name))
+                {
+                    gpu = _depthInput;
+                    sampling = (0, 1, 1, 0, false);
+                }
                 else
                 {
                     string name = draw.TextureSource(binding.Name);
@@ -474,6 +526,26 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     }
 
     public void Dispose() => _device.Dispose();
+
+    private bool IsDepthBlitInput(string name) => _scene.DepthBlitSamples != 0 && name == ImageEffectPreview.MainTexture;
+
+    private byte[] ReadDepthImage(float cameraDistance)
+    {
+        var pixels = _device.ReadPixels(_depthTexture, _staging, R32Float, FrameSize);
+        var depths = MemoryMarshal.Cast<byte, float>(pixels);
+        var parameters = BuiltInLightingPreview.DepthParameters(reversedDepth: true);
+        const float near = ShaderPreviewCamera.Near;
+        float range = Math.Clamp(cameraDistance * 2, near + 1, ShaderPreviewCamera.Far) - near;
+        for (int i = 0; i < depths.Length; i++)
+        {
+            float eyeDepth = 1 / (parameters.Z * depths[i] + parameters.W);
+            float linearDepth = Math.Clamp((eyeDepth - near) / range, 0, 1);
+            byte shade = (byte)MathF.Round(255 * (1 - linearDepth));
+            int offset = i * 4;
+            pixels[offset] = pixels[offset + 1] = pixels[offset + 2] = shade;
+        }
+        return pixels;
+    }
 
     private (Vertex[] Vertices, uint[] Indices) GetMesh(ShaderPreviewGeometry geometry) => geometry switch
     {
@@ -854,7 +926,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         {
             var signature = FindChunk(bytecode, "OSGN"u8);
             int outputs = ReadSignatureCount(signature);
-            bool historyOutput = false;
+            bool historyOutput = false, depthOutput = false;
             for (int i = 0; i < outputs; i++)
             {
                 int start = 8 + i * 24;
@@ -865,7 +937,11 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 {
                     historyOutput = true;
                 }
-                else if (!(color && index == 0) && !semantic.Equals("SV_Depth", StringComparison.OrdinalIgnoreCase))
+                else if (semantic.Equals("SV_Depth", StringComparison.OrdinalIgnoreCase))
+                {
+                    depthOutput = true;
+                }
+                else if (!(color && index == 0))
                 {
                     throw new NotSupportedException($"Unsupported DXBC pixel output '{semantic}{index}'.");
                 }
@@ -873,6 +949,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             if (_scene.ImageEffect == ImageEffectPass.TemporalAntialiasing && !historyOutput)
             {
                 throw new NotSupportedException("The temporal pass has no history render target output.");
+            }
+            if (_scene.DepthBlitSamples != 0 && !depthOutput)
+            {
+                throw new NotSupportedException("The depth blit pass has no SV_Depth output.");
             }
         }
     }
@@ -906,14 +986,14 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 }
                 uint slot = ReadUInt(program, offset + 8);
                 uint flags = (token >> 11) & 0x1f;
-                if (opcode == declareTexture && flags is 4 or 9)
-                {
-                    throw new NotSupportedException($"Direct3D 11 texture t{slot} requires a multisampled scene input.");
-                }
+                uint samples = (token >> 16) & 0x7f;
                 bool bound = opcode switch
                 {
                     declareTexture => Array.Exists(stage.Textures, texture => texture.Slot == slot && flags == (texture.Dimension switch
                     {
+                        ShaderPreviewTextureDimension.Texture2D when IsDepthBlitInput(texture.Name) && _scene.DepthBlitSamples > 1 =>
+                            kind == ShaderPreviewProgramKind.Pixel && texture.SamplerSlot < 0 &&
+                            (samples == 0 || samples == _scene.DepthBlitSamples) ? 4u : 0u,
                         ShaderPreviewTextureDimension.Texture2D => 3u,
                         ShaderPreviewTextureDimension.Texture3D => 5u,
                         ShaderPreviewTextureDimension.Cube => 6u,
@@ -926,6 +1006,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 };
                 if (!bound)
                 {
+                    if (opcode == declareTexture && flags is 4 or 9)
+                    {
+                        throw new NotSupportedException($"Direct3D 11 texture t{slot} requires a compatible multisampled scene input.");
+                    }
                     throw new NotSupportedException($"The DXBC resource at register {slot} is incompatible or has no Unity binding.");
                 }
             }

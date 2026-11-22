@@ -8,7 +8,7 @@ namespace AssetStudio.Avalonia.Services;
 
 // Camera passes for the serialized Built-in shaders found in Unity 2017.4 and 2018.2.
 internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] PassIndices, bool UsesCameraColor,
-    ImageEffectPass? Effect = null, string? SceneKeyword = null)
+    ImageEffectPass? Effect = null, string? SceneKeyword = null, uint DepthBlitSamples = 0)
 {
     internal static string? ShadowFilter(string name) => name == "Hidden/Internal-ScreenSpaceShadows" ? "HardShadow" : null;
 
@@ -16,6 +16,8 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
     {
         "Hidden/Internal-DeferredReflections" => new(name, [0], false, SceneKeyword: "UNITY_HDR_ON"),
         "Hidden/Internal-CombineDepthNormals" => new(name, [0], false),
+        "Hidden/BlitToDepth" => new(name, [0], false, DepthBlitSamples: 1),
+        "Hidden/BlitToDepth_MSAA" => new(name, [0], false, DepthBlitSamples: 4),
         "Hidden/Internal-MotionVectors" => new(name, [1], false, ImageEffectPass.ReprojectionMotion),
         "Hidden/Post FX/FXAA" => new(name, [0], true),
         "Hidden/Post FX/Fog" => new(name, [1], true),
@@ -45,6 +47,14 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
         if (draws.Length != PassIndices.Length || draws.Length != passes.Count)
         {
             throw new NotSupportedException($"'{ShaderName}' has an unsupported Built-in camera pass layout.");
+        }
+        if (DepthBlitSamples != 0 &&
+            (draws[0].Pass.State is not { ZWrite: true, ZTest: ShaderPreviewDepth.Always, Stencil: null, AlphaToMask: false } ||
+                draws[0].Pass.Fragment.Textures is not [
+                    { Name: ImageEffectPreview.MainTexture, Dimension: ShaderPreviewTextureDimension.Texture2D } texture] ||
+                (texture.SamplerSlot >= 0) != (DepthBlitSamples == 1)))
+        {
+            throw new NotSupportedException($"'{ShaderName}' has an unsupported depth blit pass.");
         }
 
         switch (ShaderName)

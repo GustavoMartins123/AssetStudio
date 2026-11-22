@@ -6,6 +6,16 @@ namespace AssetStudio.Avalonia.Services;
 
 internal static class UnityChanToonPreview
 {
+    internal static void SetGlobals(ShaderPreviewReader shader, IDictionary<string, NumericsVector4> values)
+    {
+        if (shader.Name == "UnityChanToonShader/AngelRing/Toon_ShadingGradeMap_TransClipping_StencilOut")
+        {
+            // The compiled parameter is a global without a material property of the same name.
+            // The preview scene starts with this global unset, which reads as zero in Unity.
+            values.TryAdd("_Is_LightColor_2nd_Shade", NumericsVector4.Zero);
+        }
+    }
+
     internal static IReadOnlySet<string> PassKeywords(ShaderPreviewReader shader, ShaderPreviewPassDefinition pass,
         IReadOnlyDictionary<string, NumericsVector4> values, IReadOnlySet<string> enabled)
     {
