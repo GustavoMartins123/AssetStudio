@@ -243,6 +243,12 @@ namespace AssetStudio.Tests
             var fallbackRgba = MainWindow.ConvertPreviewBitmapToRgbaBytes(zeroAlphaBitmap, out _, out _, preserveAlpha: true);
             Assert.NotNull(fallbackRgba);
             Assert.Equal(new byte[] { 10, 20, 30, 255, 40, 50, 60, 255 }, fallbackRgba);
+
+            // 4. Multi-layer eye compositing: blends pupil + highlight over opaque iris+sclera without breaking alpha=255
+            var eyeBaseRgba = new byte[] { 200, 150, 100, 255, 236, 218, 214, 255 }; // pixel 0 = iris, pixel 1 = sclera
+            var pupilOverlayBgra = new byte[] { 20, 40, 60, 255, 100, 100, 100, 0 }; // pixel 0 = opaque dark pupil, pixel 1 = transparent
+            MainWindow.CompositeBgraOverlayOntoRgbaInPlace(eyeBaseRgba, 2, 1, pupilOverlayBgra, 2, 1);
+            Assert.Equal(new byte[] { 60, 40, 20, 255, 236, 218, 214, 255 }, eyeBaseRgba);
         }
 
         [Fact]

@@ -464,6 +464,7 @@ public partial class MainWindow
                 var allSlotSpecs = new List<(string MaterialName, global::OpenTK.Mathematics.Vector4 BaseColor)>();
                 var allSubMeshTextureIds = new List<string?>();
                 var allSubMeshPreserveAlpha = new List<bool>();
+                var allSubMeshEyeMaterialIds = new List<string?>();
                 var fallbackTexturesBySlot = new Dictionary<int, Texture2D>();
 
                 for (var partIdx = 0; partIdx < partsSnapshot.Length; partIdx++)
@@ -518,12 +519,16 @@ public partial class MainWindow
                                     ? null
                                     : resolved.MainTextureAssetId);
                                 allSubMeshPreserveAlpha.Add(ShouldPreserveResolvedSlotTextureAlphaForPreview(resolved, mesh.m_Name));
+                                allSubMeshEyeMaterialIds.Add(IsEyeIrisSlotName(resolved.MainTextureSlotName) && !string.IsNullOrWhiteSpace(resolved.MaterialAssetId)
+                                    ? resolved.MaterialAssetId
+                                    : null);
                             }
                             else
                             {
                                 allSlotSpecs.Add(("No Material", global::OpenTK.Mathematics.Vector4.One));
                                 allSubMeshTextureIds.Add(null);
                                 allSubMeshPreserveAlpha.Add(IsDecalMeshOrObjectName(mesh.m_Name));
+                                allSubMeshEyeMaterialIds.Add(null);
                             }
                         }
                     }
@@ -567,6 +572,10 @@ public partial class MainWindow
                                 allSubMeshTextureIds.Add(null);
                             }
                             allSubMeshPreserveAlpha.Add(preserveAlpha);
+                            var eyeMatId = mat != null && IsEyeIrisSlotName(MaterialPreviewBuilder.SelectMainTextureSlotName(ResolveMaterialForPreview(mat) ?? mat))
+                                ? GetPreviewObjectKey(mat)
+                                : null;
+                            allSubMeshEyeMaterialIds.Add(eyeMatId);
                         }
                     }
                 }
@@ -584,7 +593,8 @@ public partial class MainWindow
                     out var uniqueHeights,
                     out var subMeshToTextureIndex,
                     out var loadedTextureFiles,
-                    allSubMeshPreserveAlpha);
+                    allSubMeshPreserveAlpha,
+                    allSubMeshEyeMaterialIds);
 
                 if (fallbackTexturesBySlot.Count > 0)
                 {

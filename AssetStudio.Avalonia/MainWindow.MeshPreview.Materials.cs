@@ -411,6 +411,177 @@ public partial class MainWindow
         }
     }
 
+    internal static void CompositeBgraOverlayOntoRgbaInPlace(
+        byte[] dstRgba,
+        int dstWidth,
+        int dstHeight,
+        byte[] overlayBgra,
+        int ovWidth,
+        int ovHeight)
+    {
+        if (dstRgba == null || overlayBgra == null || dstWidth <= 0 || dstHeight <= 0 || ovWidth <= 0 || ovHeight <= 0)
+        {
+            return;
+        }
+
+        if (dstRgba.Length < dstWidth * dstHeight * 4 || overlayBgra.Length < ovWidth * ovHeight * 4)
+        {
+            return;
+        }
+
+        bool sameSize = dstWidth == ovWidth && dstHeight == ovHeight;
+        for (int y = 0; y < dstHeight; y++)
+        {
+            int sy = sameSize ? y : Math.Min(ovHeight - 1, (int)((long)y * ovHeight / dstHeight));
+            int dstRow = y * dstWidth * 4;
+            int srcRow = sy * ovWidth * 4;
+            for (int x = 0; x < dstWidth; x++)
+            {
+                int sx = sameSize ? x : Math.Min(ovWidth - 1, (int)((long)x * ovWidth / dstWidth));
+                int sp = srcRow + sx * 4;
+                byte sa = overlayBgra[sp + 3];
+                if (sa == 0)
+                {
+                    continue;
+                }
+
+                int dp = dstRow + x * 4;
+                byte sr = overlayBgra[sp + 2];
+                byte sg = overlayBgra[sp + 1];
+                byte sb = overlayBgra[sp];
+                if (sa == 255)
+                {
+                    dstRgba[dp] = sr;
+                    dstRgba[dp + 1] = sg;
+                    dstRgba[dp + 2] = sb;
+                }
+                else
+                {
+                    int invA = 255 - sa;
+                    dstRgba[dp] = (byte)((sr * sa + dstRgba[dp] * invA + 127) / 255);
+                    dstRgba[dp + 1] = (byte)((sg * sa + dstRgba[dp + 1] * invA + 127) / 255);
+                    dstRgba[dp + 2] = (byte)((sb * sa + dstRgba[dp + 2] * invA + 127) / 255);
+                }
+                dstRgba[dp + 3] = byte.MaxValue;
+            }
+        }
+    }
+
+    private const string PreserveAlphaDedupSuffix = "\u001falpha";
+
+    private static string? BuildPreviewTextureDedupKey(string? texKey, bool preserveAlpha, string? eyeMaterialKey = null)
+    {
+        if (string.IsNullOrWhiteSpace(texKey))
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(eyeMaterialKey))
+        {
+            return $"{texKey}\u001feye:{eyeMaterialKey}";
+        }
+
+        return preserveAlpha ? texKey + PreserveAlphaDedupSuffix : texKey;
+    }
+
+    private static bool IsEyeIrisSlotName(string? slotName)
+    {
+        return !string.IsNullOrWhiteSpace(slotName)
+            && (string.Equals(slotName, "_BaseEyeIrisMap", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(slotName, "_EyeIrisMap", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(slotName, "_IrisMap", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(slotName, "_IrisTex", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void TryApplyMultiLayerEyeOverlaysForPreview(
+        Material? material,
+        string? baseTextureAssetId,
+        byte[] baseRgba,
+        int baseWidth,
+        int baseHeight,
+        HashSet<string> seenFileNames,
+        List<string> loadedTextureFileNames)
+    {
+        if (material == null || baseRgba == null || baseWidth <= 0 || baseHeight <= 0)
+        {
+            return;
+        }
+
+        var displayMat = ResolveMaterialForPreview(material) ?? material;
+        var texEnvs = displayMat.m_SavedProperties?.m_TexEnvs;
+        if (texEnvs == null || texEnvs.Length == 0)
+        {
+            return;
+        }
+
+        static UnityTexEnv? FindTexEnv(KeyValuePair<string, UnityTexEnv>[] envs, string slotName)
+        {
+            for (int i = 0; i < envs.Length; i++)
+            {
+                if (string.Equals(envs[i].Key, slotName, StringComparison.OrdinalIgnoreCase)
+                    && envs[i].Value?.m_Texture != null
+                    && !envs[i].Value.m_Texture.IsNull)
+                {
+                    return envs[i].Value;
+                }
+            }
+
+            return null;
+        }
+
+        // Composite pupil then specular highlight layers over the opaque sclera+iris base when distinct textures exist.
+        var overlaySlots = new[] { "_BaseEyePupilMap", "_EyePupilMap", "_PupilMap", "_BaseEyeHighlightMap", "_EyeHighlightMap" };
+        var appliedTextureIds = new HashSet<string>(StringComparer.Ordinal);
+        if (!string.IsNullOrWhiteSpace(baseTextureAssetId))
+        {
+            appliedTextureIds.Add(baseTextureAssetId);
+        }
+
+        foreach (var overlaySlot in overlaySlots)
+        {
+            var texEnv = FindTexEnv(texEnvs, overlaySlot);
+            if (texEnv == null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var overlayTex = ResolveTexturePPtrForPreview(displayMat, texEnv.m_Texture);
+                if (overlayTex == null)
+                {
+                    continue;
+                }
+
+                var overlayKey = GetPreviewObjectKey(overlayTex);
+                if (!string.IsNullOrWhiteSpace(overlayKey) && !appliedTextureIds.Add(overlayKey))
+                {
+                    continue;
+                }
+
+                var fileName = overlayTex.assetsFile?.fileName;
+                if (!string.IsNullOrWhiteSpace(fileName) && seenFileNames.Add(fileName))
+                {
+                    loadedTextureFileNames.Add(fileName);
+                }
+
+                using var overlayImg = LoadTexturePreviewThumbnail(overlayTex, MaxCachedPreviewTextureDimension);
+                var bmp = overlayImg?.Image;
+                if (bmp == null || bmp.Width <= 0 || bmp.Height <= 0)
+                {
+                    continue;
+                }
+
+                var ovBgra = new byte[bmp.Width * bmp.Height * 4];
+                bmp.CopyBgraPixelsTo(ovBgra);
+                CompositeBgraOverlayOntoRgbaInPlace(baseRgba, baseWidth, baseHeight, ovBgra, bmp.Width, bmp.Height);
+            }
+            catch
+            {
+            }
+        }
+    }
+
     private void BuildDeduplicatedPreviewTexturesFromResolved(
         int slotCount,
         IReadOnlyList<ResolvedMeshSubMeshMaterial> resolvedSlots,
@@ -434,6 +605,7 @@ public partial class MainWindow
         var safeCount = Math.Max(0, slotCount);
         var subMeshTexKeys = new string?[safeCount];
         var subMeshPreserveAlpha = new bool[safeCount];
+        var subMeshEyeMaterialIds = new string?[safeCount];
         for (int i = 0; i < safeCount; i++)
         {
             if (bySubMesh.TryGetValue(i, out var resolved))
@@ -442,6 +614,10 @@ public partial class MainWindow
                     ? null
                     : resolved.MainTextureAssetId;
                 subMeshPreserveAlpha[i] = ShouldPreserveResolvedSlotTextureAlphaForPreview(resolved, meshName);
+                if (IsEyeIrisSlotName(resolved.MainTextureSlotName) && !string.IsNullOrWhiteSpace(resolved.MaterialAssetId))
+                {
+                    subMeshEyeMaterialIds[i] = resolved.MaterialAssetId;
+                }
             }
         }
 
@@ -453,7 +629,8 @@ public partial class MainWindow
             out uniqueHeights,
             out subMeshToTextureIndex,
             out loadedTextureFileNames,
-            subMeshPreserveAlpha);
+            subMeshPreserveAlpha,
+            subMeshEyeMaterialIds);
     }
 
     private void BuildDeduplicatedPreviewTexturesByAssetIds(
@@ -464,22 +641,37 @@ public partial class MainWindow
         out List<int> uniqueHeights,
         out int[] subMeshToTextureIndex,
         out List<string> loadedTextureFileNames,
-        IReadOnlyList<bool>? subMeshPreserveAlpha = null)
+        IReadOnlyList<bool>? subMeshPreserveAlpha = null,
+        IReadOnlyList<string?>? subMeshEyeMaterialIds = null)
     {
         loadedTextureFileNames = new List<string>();
-        BuildSubMeshTextureDeduplicationPlan(subMeshTextureIds.Count, subMeshTextureIds, out var uniqueTexIds, out subMeshToTextureIndex);
-
-        var uniquePreserveAlpha = new bool[uniqueTexIds.Count];
-        if (subMeshPreserveAlpha != null)
+        int slotCount = subMeshTextureIds.Count;
+        var dedupKeys = new string?[slotCount];
+        var keyToSpec = new Dictionary<string, (string TexId, bool PreserveAlpha, string? EyeMatId)>(StringComparer.Ordinal);
+        for (int s = 0; s < slotCount; s++)
         {
-            for (int s = 0; s < subMeshToTextureIndex.Length && s < subMeshPreserveAlpha.Count; s++)
+            var texId = subMeshTextureIds[s];
+            bool preserveAlpha = subMeshPreserveAlpha != null && s < subMeshPreserveAlpha.Count && subMeshPreserveAlpha[s];
+            string? eyeMatId = subMeshEyeMaterialIds != null && s < subMeshEyeMaterialIds.Count ? subMeshEyeMaterialIds[s] : null;
+            var dKey = BuildPreviewTextureDedupKey(texId, preserveAlpha, eyeMatId);
+            dedupKeys[s] = dKey;
+            if (dKey != null && !keyToSpec.ContainsKey(dKey))
             {
-                int uIdx = subMeshToTextureIndex[s];
-                if (uIdx >= 0 && uIdx < uniquePreserveAlpha.Length && subMeshPreserveAlpha[s])
-                {
-                    uniquePreserveAlpha[uIdx] = true;
-                }
+                keyToSpec[dKey] = (texId!, preserveAlpha, eyeMatId);
             }
+        }
+
+        BuildSubMeshTextureDeduplicationPlan(slotCount, dedupKeys, out var uniqueDedupKeys, out subMeshToTextureIndex);
+
+        var uniqueTexIds = new List<string>(uniqueDedupKeys.Count);
+        var uniquePreserveAlpha = new bool[uniqueDedupKeys.Count];
+        var uniqueEyeMatIds = new string?[uniqueDedupKeys.Count];
+        for (int i = 0; i < uniqueDedupKeys.Count; i++)
+        {
+            var spec = keyToSpec[uniqueDedupKeys[i]];
+            uniqueTexIds.Add(spec.TexId);
+            uniquePreserveAlpha[i] = spec.PreserveAlpha;
+            uniqueEyeMatIds[i] = spec.EyeMatId;
         }
 
         uniqueTextures = new List<byte[]?>(uniqueTexIds.Count);
@@ -498,6 +690,7 @@ public partial class MainWindow
         }
 
         var coldMisses = new List<(int UniqueIndex, string TexId, AssetHandle Handle, string SourceKey, bool PreserveAlpha)>();
+        var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Pass 1: warm PNG thumbnail cache hits (0 .assets files loaded!)
         for (int i = 0; i < uniqueTexIds.Count; i++)
@@ -533,13 +726,7 @@ public partial class MainWindow
             }
         }
 
-        if (coldMisses.Count == 0)
-        {
-            return;
-        }
-
         // Pass 2: group cold texture misses by source file so each .assets file loads at most once.
-        var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var group in coldMisses.GroupBy(item => item.SourceKey, StringComparer.OrdinalIgnoreCase))
         {
             if (isCancelled?.Invoke() == true)
@@ -580,6 +767,47 @@ public partial class MainWindow
                 }
             }
         }
+
+        // Pass 3: composite pupil + highlight overlays onto multi-layer iris eye textures.
+        for (int i = 0; i < uniqueEyeMatIds.Length; i++)
+        {
+            if (isCancelled?.Invoke() == true)
+            {
+                return;
+            }
+
+            var eyeMatId = uniqueEyeMatIds[i];
+            var baseRgba = uniqueTextures[i];
+            if (string.IsNullOrWhiteSpace(eyeMatId) || baseRgba == null || uniqueWidths[i] <= 0 || uniqueHeights[i] <= 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                var matHandle = ResolveMaterialHandleByAssetIdForPreview(eyeMatId);
+                if (matHandle != null && ResolveSemanticRelationHandleForPreview(matHandle) is Material eyeMat)
+                {
+                    var matFile = eyeMat.assetsFile?.fileName;
+                    if (!string.IsNullOrWhiteSpace(matFile) && seenFileNames.Add(matFile))
+                    {
+                        loadedTextureFileNames.Add(matFile);
+                    }
+
+                    TryApplyMultiLayerEyeOverlaysForPreview(
+                        eyeMat,
+                        uniqueTexIds[i],
+                        baseRgba,
+                        uniqueWidths[i],
+                        uniqueHeights[i],
+                        seenFileNames,
+                        loadedTextureFileNames);
+                }
+            }
+            catch
+            {
+            }
+        }
     }
 
     private void BuildDeduplicatedPreviewTexturesForMaterials(
@@ -597,8 +825,7 @@ public partial class MainWindow
         var safeCount = Math.Max(0, slotCount);
         var resolvedTexByMaterial = new Dictionary<Material, Texture2D?>();
         var subMeshTexKeys = new string?[safeCount];
-        var subMeshPreserveAlpha = new bool[safeCount];
-        var texByKey = new Dictionary<string, Texture2D>(StringComparer.Ordinal);
+        var specByDedupKey = new Dictionary<string, (Texture2D Texture, bool PreserveAlpha, Material? EyeMaterial)>(StringComparer.Ordinal);
         bool isDecalMesh = IsDecalMeshOrObjectName(meshName);
 
         for (int i = 0; i < safeCount; i++)
@@ -618,7 +845,7 @@ public partial class MainWindow
                 continue;
             }
 
-            subMeshPreserveAlpha[i] = isDecalMesh || ShouldPreserveMaterialTextureAlpha(mat);
+            bool preserveAlpha = isDecalMesh || ShouldPreserveMaterialTextureAlpha(mat);
 
             if (!resolvedTexByMaterial.TryGetValue(mat, out var tex))
             {
@@ -631,23 +858,20 @@ public partial class MainWindow
                 var key = GetPreviewObjectKey(tex);
                 if (!string.IsNullOrWhiteSpace(key))
                 {
-                    subMeshTexKeys[i] = key;
-                    texByKey.TryAdd(key, tex);
+                    var displayMat = ResolveMaterialForPreview(mat) ?? mat;
+                    var chosenSlot = MaterialPreviewBuilder.SelectMainTextureSlotName(displayMat);
+                    var eyeMatKey = IsEyeIrisSlotName(chosenSlot) ? GetPreviewObjectKey(mat) : null;
+                    var dedupKey = BuildPreviewTextureDedupKey(key, preserveAlpha, eyeMatKey);
+                    subMeshTexKeys[i] = dedupKey;
+                    if (dedupKey != null)
+                    {
+                        specByDedupKey.TryAdd(dedupKey, (tex, preserveAlpha, eyeMatKey != null ? mat : null));
+                    }
                 }
             }
         }
 
         BuildSubMeshTextureDeduplicationPlan(safeCount, subMeshTexKeys, out var uniqueKeys, out subMeshToTextureIndex);
-
-        var uniquePreserveAlpha = new bool[uniqueKeys.Count];
-        for (int s = 0; s < subMeshToTextureIndex.Length; s++)
-        {
-            int uIdx = subMeshToTextureIndex[s];
-            if (uIdx >= 0 && uIdx < uniquePreserveAlpha.Length && subMeshPreserveAlpha[s])
-            {
-                uniquePreserveAlpha[uIdx] = true;
-            }
-        }
 
         uniqueTextures = new List<byte[]?>(uniqueKeys.Count);
         uniqueWidths = new List<int>(uniqueKeys.Count);
@@ -663,8 +887,9 @@ public partial class MainWindow
 
             byte[]? tb = null;
             int tw = 0, th = 0;
-            if (texByKey.TryGetValue(uniqueKeys[i], out var tex))
+            if (specByDedupKey.TryGetValue(uniqueKeys[i], out var spec))
             {
+                var tex = spec.Texture;
                 var fileName = tex.assetsFile?.fileName;
                 if (!string.IsNullOrWhiteSpace(fileName) && seenFileNames.Add(fileName))
                 {
@@ -674,7 +899,18 @@ public partial class MainWindow
                 try
                 {
                     using var previewImage = LoadTexturePreviewThumbnail(tex, MaxCachedPreviewTextureDimension);
-                    tb = ConvertPreviewImageToRgbaBytes(previewImage, out tw, out th, uniquePreserveAlpha[i]);
+                    tb = ConvertPreviewImageToRgbaBytes(previewImage, out tw, out th, spec.PreserveAlpha);
+                    if (tb != null && spec.EyeMaterial != null)
+                    {
+                        TryApplyMultiLayerEyeOverlaysForPreview(
+                            spec.EyeMaterial,
+                            GetPreviewObjectKey(tex),
+                            tb,
+                            tw,
+                            th,
+                            seenFileNames,
+                            loadedTextureFileNames);
+                    }
                 }
                 catch
                 {
