@@ -10,7 +10,7 @@ namespace AssetStudio.Avalonia.Services
 {
     public sealed class SemanticGraphService
     {
-        public const int LazyConnectionStagingFlushRowThreshold = 100_000;
+        public const int LazyConnectionStagingFlushRowThreshold = 25_000;
         public const int MaxClipBoneHashProbes = 24;
         public const int MaxRigBoneHashProbes = 512;
 
@@ -4444,7 +4444,7 @@ namespace AssetStudio.Avalonia.Services
             };
             var failedSources = new List<string>();
             var effectiveFlushThreshold = Math.Max(1, stagingFlushRowThreshold);
-            const int batchSize = 64;
+            const int batchSize = 20;
             var parallelOptions = CreateSemanticGraphParallelOptions();
 
             for (var i = 0; i < sourcePaths.Count; i += batchSize)
@@ -4766,7 +4766,6 @@ namespace AssetStudio.Avalonia.Services
                 {
                     if (handle == null
                         || !ReferenceEquals(handle.SourceFile, file)
-                        || (!LazyConnectionReferenceTypes.Contains(handle.Type) && handle.Type != ClassIDType.Mesh)
                         || (isHandlePinnedForPreview != null && isHandlePinnedForPreview(handle)))
                     {
                         continue;

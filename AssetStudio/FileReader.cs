@@ -198,6 +198,15 @@ namespace AssetStudio
             return temp;
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                cachedMemoryBuffer = null;
+            }
+            base.Dispose(disposing);
+        }
+
         private sealed class PooledReadOnlyMemoryStream : Stream
         {
             private static readonly ConcurrentBag<PooledReadOnlyMemoryStream> Pool = new ConcurrentBag<PooledReadOnlyMemoryStream>();

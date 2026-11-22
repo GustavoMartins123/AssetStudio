@@ -1002,6 +1002,280 @@ namespace AssetStudio
             }
         }
 
+        internal int AddCanonicalRecord(
+            AssetHandleOrigin handleOrigin,
+            long pathId,
+            ClassIDType type,
+            long byteStart,
+            long byteSize,
+            ReadOnlySpan<char> name,
+            SerializedFile? sourceFile = null)
+        {
+            lock (_syncRoot)
+            {
+                SourceOriginRecord origin = GetOrAddOriginUnlocked(
+                    handleOrigin.SerializedFileName,
+                    handleOrigin.OriginalPath,
+                    handleOrigin.SourceHash,
+                    handleOrigin.UnityVersion,
+                    handleOrigin.UniqueIdFileName,
+                    handleOrigin.UniqueIdPrefix);
+
+                var key = new AssetHandleKey(origin.KeyOriginId, pathId);
+                return UpsertRecordUnlocked(
+                    key,
+                    origin,
+                    pathId,
+                    byteStart,
+                    byteSize,
+                    type,
+                    name,
+                    ReadOnlySpan<char>.Empty,
+                    sourceFile,
+                    realObject: null,
+                    tag: null,
+                    customUniqueId: null);
+            }
+        }
+
+        internal void ApplyContainerAndMaterialNameFallback(int index, string? container)
+        {
+            if (string.IsNullOrEmpty(container))
+            {
+                return;
+            }
+
+            lock (_syncRoot)
+            {
+                if ((uint)index >= (uint)_count)
+                {
+                    return;
+                }
+
+                SplitAndInternContainerUnlocked(container.AsSpan(), out int dirId, out int leafId);
+                _containerDirIds[index] = dirId;
+                _containerLeafIds[index] = leafId;
+
+                if ((ClassIDType)_classIds[index] == ClassIDType.Material)
+                {
+                    string currentName = _stringPool.GetString(_nameIds[index]);
+                    if (string.IsNullOrEmpty(currentName)
+                        || currentName.StartsWith("Unnamed_Material_", StringComparison.Ordinal))
+                    {
+                        ReadOnlySpan<char> matName = System.IO.Path.GetFileNameWithoutExtension(container.AsSpan());
+                        if (!matName.IsEmpty)
+                        {
+                            _nameIds[index] = _stringPool.GetOrAdd(matName);
+                        }
+                    }
+                }
+            }
+        }
+
+        internal bool TryGetIndexByFileNameAndPathId(string? fileName, long pathId, out int index)
+        {
+            index = -1;
+            if (string.IsNullOrEmpty(fileName))
+            {
+                return false;
+            }
+
+            lock (_syncRoot)
+            {
+                if (!_originIdsByFileName.TryGetValue(fileName, out List<int>? originIds) || originIds.Count == 0)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < originIds.Count; i++)
+                {
+                    SourceOriginRecord origin = _origins[originIds[i]];
+                    if (_indexByKey.TryGetValue(new AssetHandleKey(origin.KeyOriginId, pathId), out index))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        internal bool TryBindCachedSourceFile(
+            SerializedFile? assetsFile,
+            bool attachSourceFile,
+            Func<string?, string?, bool> isSameSource)
+        {
+            if (assetsFile == null || string.IsNullOrEmpty(assetsFile.fileName))
+            {
+                return false;
+            }
+
+            lock (_syncRoot)
+            {
+                if (!_originIdsByFileName.TryGetValue(assetsFile.fileName, out List<int>? originIds) || originIds.Count == 0)
+                {
+                    return false;
+                }
+
+                bool hasCachedHandles = false;
+                int originCount = originIds.Count;
+                for (int o = 0; o < originCount; o++)
+                {
+                    int originId = originIds[o];
+                    SourceOriginRecord current = _origins[originId];
+                    List<int> indices = _indicesByOriginId[originId];
+                    if (indices.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrEmpty(current.OriginalPath)
+                        && !isSameSource(current.OriginalPath, assetsFile.originalPath))
+                    {
+                        continue;
+                    }
+
+                    hasCachedHandles = true;
+
+                    if (string.IsNullOrEmpty(current.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
+                    {
+                        SourceOriginRecord updated = GetOrAddOriginUnlocked(
+                            current.SerializedFileName,
+                            assetsFile.originalPath,
+                            current.SourceHash,
+                            current.UnityVersion,
+                            current.UniqueIdFileName,
+                            current.UniqueIdPrefix);
+                        if (updated.OriginId != originId)
+                        {
+                            int[] snapshot = indices.ToArray();
+                            for (int k = 0; k < snapshot.Length; k++)
+                            {
+                                MoveIndexOriginUnlocked(snapshot[k], originId, updated.OriginId);
+                            }
+                            indices = _indicesByOriginId[updated.OriginId];
+                        }
+                    }
+
+                    if (attachSourceFile)
+                    {
+                        Dictionary<int, SerializedFile> map = (_sourceFilesByIndex ??= new Dictionary<int, SerializedFile>());
+                        for (int i = 0; i < indices.Count; i++)
+                        {
+                            map[indices[i]] = assetsFile;
+                        }
+                    }
+                }
+
+                return hasCachedHandles;
+            }
+        }
+
+        internal void DetachSourceFile(SerializedFile? assetsFile)
+        {
+            if (assetsFile == null || string.IsNullOrEmpty(assetsFile.fileName))
+            {
+                return;
+            }
+
+            List<IAssetHandleTag>? tagsToClear = null;
+            lock (_syncRoot)
+            {
+                if (!_originIdsByFileName.TryGetValue(assetsFile.fileName, out List<int>? originIds) || originIds.Count == 0)
+                {
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(assetsFile.originalPath))
+                {
+                    int originCount = originIds.Count;
+                    for (int o = 0; o < originCount; o++)
+                    {
+                        int originId = originIds[o];
+                        SourceOriginRecord current = _origins[originId];
+                        if (string.IsNullOrEmpty(current.OriginalPath))
+                        {
+                            List<int> indices = _indicesByOriginId[originId];
+                            if (indices.Count > 0)
+                            {
+                                SourceOriginRecord updated = GetOrAddOriginUnlocked(
+                                    current.SerializedFileName,
+                                    assetsFile.originalPath,
+                                    current.SourceHash,
+                                    current.UnityVersion,
+                                    current.UniqueIdFileName,
+                                    current.UniqueIdPrefix);
+                                if (updated.OriginId != originId)
+                                {
+                                    int[] snapshot = indices.ToArray();
+                                    for (int k = 0; k < snapshot.Length; k++)
+                                    {
+                                        MoveIndexOriginUnlocked(snapshot[k], originId, updated.OriginId);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (_sourceFilesByIndex == null && _realObjectsByIndex == null)
+                {
+                    return;
+                }
+
+                for (int o = 0; o < originIds.Count; o++)
+                {
+                    List<int> indices = _indicesByOriginId[originIds[o]];
+                    for (int i = 0; i < indices.Count; i++)
+                    {
+                        int index = indices[i];
+                        bool matchedSource = false;
+                        if (_sourceFilesByIndex != null
+                            && _sourceFilesByIndex.TryGetValue(index, out SerializedFile? sf)
+                            && ReferenceEquals(sf, assetsFile))
+                        {
+                            _sourceFilesByIndex.Remove(index);
+                            matchedSource = true;
+                        }
+
+                        if (_realObjectsByIndex != null
+                            && _realObjectsByIndex.TryGetValue(index, out Object? realObj)
+                            && (matchedSource || ReferenceEquals(realObj?.assetsFile, assetsFile)))
+                        {
+                            _realObjectsByIndex.Remove(index);
+                            matchedSource = true;
+                        }
+
+                        if (matchedSource
+                            && _tagsByIndex != null
+                            && _tagsByIndex.TryGetValue(index, out object? tagObj)
+                            && tagObj is IAssetHandleTag tag)
+                        {
+                            (tagsToClear ??= new List<IAssetHandleTag>()).Add(tag);
+                        }
+                    }
+                }
+
+                if (_sourceFilesByIndex != null && _sourceFilesByIndex.Count == 0)
+                {
+                    _sourceFilesByIndex = null;
+                }
+
+                if (_realObjectsByIndex != null && _realObjectsByIndex.Count == 0)
+                {
+                    _realObjectsByIndex = null;
+                }
+            }
+
+            if (tagsToClear != null)
+            {
+                for (int i = 0; i < tagsToClear.Count; i++)
+                {
+                    tagsToClear[i].ClearAsset();
+                }
+            }
+        }
+
         // Private helpers (caller holds _syncRoot)
 
         private int UpsertCustomOrParsedUniqueIdUnlocked(

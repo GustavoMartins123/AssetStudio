@@ -2217,6 +2217,7 @@ namespace AssetStudio
             foreach (var assetsFile in assetsFileList)
             {
                 assetsFile.Objects.Clear();
+                assetsFile.ObjectsDic.Clear();
                 assetsFile.reader.Close();
             }
             assetsFileList.Clear();
@@ -2248,6 +2249,7 @@ namespace AssetStudio
 
         public void ClearLoadedFilesKeepIndex()
         {
+            var keptAnyFile = false;
             lock (loadLock)
             {
                 var filesToRemove = new List<SerializedFile>();
@@ -2255,23 +2257,14 @@ namespace AssetStudio
                 {
                     if (ShouldKeepFileCallback != null && ShouldKeepFileCallback(assetsFile.fileName))
                     {
+                        keptAnyFile = true;
                         continue;
                     }
 
-                    foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
-                    {
-                        if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
-                        {
-                            handle.OriginalPath = assetsFile.originalPath;
-                        }
-
-                        if (ReferenceEquals(handle.SourceFile, assetsFile))
-                        {
-                            handle.SourceFile = null;
-                        }
-                    }
+                    ProjectIndex.Arena.DetachSourceFile(assetsFile);
 
                     assetsFile.Objects.Clear();
+                    assetsFile.ObjectsDic.Clear();
                     if (assetsFile.reader != null)
                     {
                         assetsFile.reader.Close();
@@ -2299,6 +2292,15 @@ namespace AssetStudio
                 }
 
                 assetsFileIndexCache.Clear();
+            }
+
+            if (!keptAnyFile)
+            {
+                LruCache.Clear();
+            }
+            else
+            {
+                LruCache.RemoveUnloaded();
             }
         }
 
@@ -2393,35 +2395,13 @@ namespace AssetStudio
         {
             await YieldForUserInteractionIfNeededAsync(highPriority);
 
-            bool hasCachedHandles = false;
-            foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
-            {
-                if (!string.IsNullOrEmpty(handle.OriginalPath)
-                    && !IsSameAssetSource(handle.OriginalPath, assetsFile.originalPath))
-                {
-                    continue;
-                }
-
-                if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
-                {
-                    handle.OriginalPath = assetsFile.originalPath;
-                }
-
-                if (string.IsNullOrEmpty(handle.SerializedFileName))
-                {
-                    handle.SerializedFileName = assetsFile.fileName;
-                }
-
-                handle.SourceFile = assetsFile;
-                hasCachedHandles = true;
-            }
-
-            if (hasCachedHandles)
+            bool keepFile = ShouldKeepFileCallback != null && ShouldKeepFileCallback(assetsFile.fileName);
+            if (ProjectIndex.Arena.TryBindCachedSourceFile(assetsFile, attachSourceFile: keepFile, IsSameAssetSource))
             {
                 return;
             }
 
-            var localObjects = new Object?[assetsFile.m_Objects.Count];
+            List<(PPtr<Object> PPtr, string Container)>? localContainers = null;
             var fileOrigin = AssetHandleOrigin.Intern(assetsFile);
             using var localReader = assetsFile.reader.Clone();
 
@@ -2451,26 +2431,33 @@ namespace AssetStudio
                 var objectReader = new ObjectReader(localReader, assetsFile, objectInfo);
                 var type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
 
-                var handle = AssetHandle.CreateCanonical(
-                    fileOrigin,
-                    objectInfo.m_PathID,
-                    type: type,
-                    byteStart: objectInfo.byteStart,
-                    byteSize: objectInfo.byteSize,
-                    sourceFile: assetsFile);
-
                 string? name = null;
                 if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
                 {
                     try
                     {
                         var obj = CreateObjectFromReader(objectReader);
-                        handle.RealObject = obj;
-                        localObjects[objectIndex] = obj;
                         if (obj is AssetBundle bundle)
+                        {
                             name = bundle.m_Name;
-                        else if (obj is ResourceManager)
+                            localContainers ??= new List<(PPtr<Object>, string)>();
+                            CollectSafeAssetBundleContainersForLazyIndex(bundle, localContainers);
+                        }
+                        else if (obj is ResourceManager rm)
+                        {
                             name = "ResourceManager";
+                            if (rm.m_Container != null && rm.m_Container.Length > 0)
+                            {
+                                localContainers ??= new List<(PPtr<Object>, string)>(rm.m_Container.Length);
+                                foreach (var entry in rm.m_Container)
+                                {
+                                    if (entry.Value != null && !entry.Value.IsNull && !string.IsNullOrEmpty(entry.Key))
+                                    {
+                                        localContainers.Add((entry.Value, entry.Key));
+                                    }
+                                }
+                            }
+                        }
                     }
                     catch
                     {
@@ -2482,15 +2469,145 @@ namespace AssetStudio
                     name = AssetHandle.TryReadObjectName(objectReader);
                 }
 
-                handle.Name = name ?? $"Unnamed_{type}_{objectInfo.m_PathID}";
-                ProjectIndex.AddHandle(handle);
+                AddLazyIndexedRecord(fileOrigin, objectInfo, type, name, sourceFile: keepFile ? assetsFile : null);
             }
 
-            foreach (var obj in localObjects)
+            if (localContainers != null && localContainers.Count > 0)
             {
-                if (obj != null)
+                ApplyLazyContainersToProjectIndex(assetsFile, fileOrigin, localContainers);
+            }
+        }
+
+        private void AddLazyIndexedRecord(
+            AssetHandleOrigin fileOrigin,
+            ObjectInfo objectInfo,
+            ClassIDType type,
+            string? name,
+            SerializedFile? sourceFile)
+        {
+            if (!string.IsNullOrEmpty(name))
+            {
+                ProjectIndex.Arena.AddCanonicalRecord(
+                    fileOrigin,
+                    objectInfo.m_PathID,
+                    type,
+                    objectInfo.byteStart,
+                    objectInfo.byteSize,
+                    name.AsSpan(),
+                    sourceFile);
+                return;
+            }
+
+            Span<char> unnamedBuf = stackalloc char[128];
+            if (unnamedBuf.TryWrite($"Unnamed_{type}_{objectInfo.m_PathID}", out int charsWritten))
+            {
+                ProjectIndex.Arena.AddCanonicalRecord(
+                    fileOrigin,
+                    objectInfo.m_PathID,
+                    type,
+                    objectInfo.byteStart,
+                    objectInfo.byteSize,
+                    unnamedBuf.Slice(0, charsWritten),
+                    sourceFile);
+            }
+            else
+            {
+                string fallback = $"Unnamed_{type}_{objectInfo.m_PathID}";
+                ProjectIndex.Arena.AddCanonicalRecord(
+                    fileOrigin,
+                    objectInfo.m_PathID,
+                    type,
+                    objectInfo.byteStart,
+                    objectInfo.byteSize,
+                    fallback.AsSpan(),
+                    sourceFile);
+            }
+        }
+
+        private static void CollectSafeAssetBundleContainersForLazyIndex(
+            AssetBundle? assetBundle,
+            List<(PPtr<Object> PPtr, string Container)> containers)
+        {
+            if (assetBundle?.m_Container == null || assetBundle.m_PreloadTable == null)
+            {
+                return;
+            }
+
+            var preloadTable = assetBundle.m_PreloadTable;
+            foreach (var entry in assetBundle.m_Container)
+            {
+                var assetInfo = entry.Value;
+                if (assetInfo == null || string.IsNullOrEmpty(entry.Key))
                 {
-                    assetsFile.AddObject(obj);
+                    continue;
+                }
+
+                var preloadIndex = assetInfo.preloadIndex;
+                var preloadSize = assetInfo.preloadSize;
+                if (preloadIndex < 0 || preloadSize <= 0 || preloadIndex >= preloadTable.Length)
+                {
+                    continue;
+                }
+
+                long preloadEnd = Math.Min((long)preloadIndex + preloadSize, preloadTable.Length);
+                for (int k = preloadIndex; k < preloadEnd; k++)
+                {
+                    containers.Add((preloadTable[k], entry.Key));
+                }
+            }
+        }
+
+        private void ApplyLazyContainersToProjectIndex(
+            SerializedFile assetsFile,
+            AssetHandleOrigin fileOrigin,
+            List<(PPtr<Object> PPtr, string Container)> containers)
+        {
+            var arena = ProjectIndex.Arena;
+            for (int i = 0; i < containers.Count; i++)
+            {
+                var (pptr, container) = containers[i];
+                if (pptr == null || pptr.IsNull || string.IsNullOrEmpty(container))
+                {
+                    continue;
+                }
+
+                int targetIdx = -1;
+                if (pptr.m_FileID == 0)
+                {
+                    ProjectIndex.TryGetIndex(new AssetHandleKey(fileOrigin.KeyOriginId, pptr.m_PathID), out targetIdx);
+                }
+                else
+                {
+                    if (pptr.TryGetAssetsFile(out var targetFile) && targetFile != null)
+                    {
+                        var targetKey = AssetHandle.BuildUniqueID(targetFile, pptr.m_PathID);
+                        ProjectIndex.TryGetIndexByUniqueId(targetKey, out targetIdx);
+                    }
+
+                    if (targetIdx < 0
+                        && assetsFile.m_Externals != null
+                        && pptr.m_FileID > 0
+                        && pptr.m_FileID - 1 < assetsFile.m_Externals.Count)
+                    {
+                        var external = assetsFile.m_Externals[pptr.m_FileID - 1];
+                        if (external != null)
+                        {
+                            if (!string.IsNullOrEmpty(external.fileName))
+                            {
+                                arena.TryGetIndexByFileNameAndPathId(external.fileName, pptr.m_PathID, out targetIdx);
+                            }
+
+                            if (targetIdx < 0 && !string.IsNullOrEmpty(external.pathName))
+                            {
+                                arena.TryGetIndexByFileNameAndPathId(Path.GetFileName(external.pathName), pptr.m_PathID, out targetIdx);
+                            }
+                        }
+                    }
+                }
+
+                if (targetIdx >= 0)
+                {
+                    arena.ApplyContainerAndMaterialNameFallback(targetIdx, container);
                 }
             }
         }
@@ -2515,20 +2632,10 @@ namespace AssetStudio
                         continue;
                     }
 
-                    foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
-                    {
-                        if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
-                        {
-                            handle.OriginalPath = assetsFile.originalPath;
-                        }
-
-                        if (ReferenceEquals(handle.SourceFile, assetsFile))
-                        {
-                            handle.SourceFile = null;
-                        }
-                    }
+                    ProjectIndex.Arena.DetachSourceFile(assetsFile);
 
                     assetsFile.Objects.Clear();
+                    assetsFile.ObjectsDic.Clear();
                     if (assetsFile.reader != null)
                     {
                         readersToClose.Add(assetsFile.reader);
@@ -2767,6 +2874,7 @@ namespace AssetStudio
                 var configuredReadThreads = GetConfiguredThreadCountOrDefault("ASSETSTUDIO_LAZY_READ_THREADS", DefaultLazyReadThreadCount);
                 var maxDegreeOfParallelism = highPriority ? 1 : configuredReadThreads;
                 var lazyReadGateForOperation = highPriority ? null : GetLazyReadGate(configuredReadThreads);
+                var deferredExternalContainers = new ConcurrentBag<(SerializedFile File, AssetHandleOrigin Origin, List<(PPtr<Object> PPtr, string Container)> Containers)>();
                 using (var semaphore = new System.Threading.SemaphoreSlim(maxDegreeOfParallelism))
                 {
                     var tasks = unprocessedFiles.Select(async assetsFile =>
@@ -2784,36 +2892,13 @@ namespace AssetStudio
                             await YieldForUserInteractionIfNeededAsync(highPriority);
 
                             // Lookup cached handles using O(1) dictionary index
-                            bool hasCachedHandles = false;
-                            foreach (var handle in ProjectIndex.GetHandlesForFile(assetsFile.fileName))
-                            {
-                                if (!string.IsNullOrEmpty(handle.OriginalPath)
-                                    && !IsSameAssetSource(handle.OriginalPath, assetsFile.originalPath))
-                                {
-                                    continue;
-                                }
-
-                                if (string.IsNullOrEmpty(handle.OriginalPath) && !string.IsNullOrEmpty(assetsFile.originalPath))
-                                {
-                                    handle.OriginalPath = assetsFile.originalPath;
-                                }
-
-                                if (string.IsNullOrEmpty(handle.SerializedFileName))
-                                {
-                                    handle.SerializedFileName = assetsFile.fileName;
-                                }
-
-                                handle.SourceFile = assetsFile;
-                                hasCachedHandles = true;
-                            }
-
-                            if (hasCachedHandles)
+                            if (ProjectIndex.Arena.TryBindCachedSourceFile(assetsFile, attachSourceFile: true, IsSameAssetSource))
                             {
                                 return;
                             }
                             else
                             {
-                                var localObjects = new Object?[assetsFile.m_Objects.Count];
+                                List<(PPtr<Object> PPtr, string Container)>? localContainers = null;
                                 var fileOrigin = AssetHandleOrigin.Intern(assetsFile);
                                 using var localReader = assetsFile.reader.Clone();
 
@@ -2844,26 +2929,33 @@ namespace AssetStudio
                                     
                                     var type = ClassIDTypeHelper.FromClassId(objectInfo.classID);
 
-                                    var handle = AssetHandle.CreateCanonical(
-                                        fileOrigin,
-                                        objectInfo.m_PathID,
-                                        type: type,
-                                        byteStart: objectInfo.byteStart,
-                                        byteSize: objectInfo.byteSize,
-                                        sourceFile: assetsFile);
-
                                     string? name = null;
                                     if (type == ClassIDType.AssetBundle || type == ClassIDType.ResourceManager)
                                     {
                                         try
                                         {
                                             var obj = CreateObjectFromReader(objectReader);
-                                            handle.RealObject = obj;
-                                            localObjects[objectIndex] = obj;
                                             if (obj is AssetBundle bundle)
+                                            {
                                                 name = bundle.m_Name;
+                                                localContainers ??= new List<(PPtr<Object>, string)>();
+                                                CollectSafeAssetBundleContainersForLazyIndex(bundle, localContainers);
+                                            }
                                             else if (obj is ResourceManager rm)
+                                            {
                                                 name = "ResourceManager";
+                                                if (rm.m_Container != null && rm.m_Container.Length > 0)
+                                                {
+                                                    localContainers ??= new List<(PPtr<Object>, string)>(rm.m_Container.Length);
+                                                    foreach (var entry in rm.m_Container)
+                                                    {
+                                                        if (entry.Value != null && !entry.Value.IsNull && !string.IsNullOrEmpty(entry.Key))
+                                                        {
+                                                            localContainers.Add((entry.Value, entry.Key));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         catch
                                         {
@@ -2875,18 +2967,22 @@ namespace AssetStudio
                                         name = AssetHandle.TryReadObjectName(objectReader);
                                     }
 
-                                    handle.Name = name ?? $"Unnamed_{type}_{objectInfo.m_PathID}";
-                                    ProjectIndex.AddHandle(handle);
+                                    AddLazyIndexedRecord(fileOrigin, objectInfo, type, name, sourceFile: assetsFile);
 
                                     var currentProgress = System.Threading.Interlocked.Increment(ref progressValue);
                                     Progress.Report(currentProgress, progressCount);
                                 }
 
-                                foreach (var obj in localObjects)
+                                if (localContainers != null && localContainers.Count > 0)
                                 {
-                                    if (obj != null)
+                                    ApplyLazyContainersToProjectIndex(assetsFile, fileOrigin, localContainers);
+                                    for (int c = 0; c < localContainers.Count; c++)
                                     {
-                                        assetsFile.AddObject(obj);
+                                        if (localContainers[c].PPtr != null && localContainers[c].PPtr.m_FileID != 0)
+                                        {
+                                            deferredExternalContainers.Add((assetsFile, fileOrigin, localContainers));
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -2902,6 +2998,11 @@ namespace AssetStudio
                         }
                     });
                     await System.Threading.Tasks.Task.WhenAll(tasks);
+                }
+
+                while (deferredExternalContainers.TryTake(out var deferred))
+                {
+                    ApplyLazyContainersToProjectIndex(deferred.File, deferred.Origin, deferred.Containers);
                 }
                 return;
             }
@@ -3516,6 +3617,25 @@ namespace AssetStudio
                 {
                     list.Clear();
                     map.Clear();
+                }
+            }
+
+            public void RemoveUnloaded()
+            {
+                lock (cacheLock)
+                {
+                    var node = list.First;
+                    while (node != null)
+                    {
+                        var next = node.Next;
+                        var handle = node.Value;
+                        if (handle.RealObject == null || handle.SourceFile == null)
+                        {
+                            list.Remove(node);
+                            map.Remove(handle.UniqueID);
+                        }
+                        node = next;
+                    }
                 }
             }
 

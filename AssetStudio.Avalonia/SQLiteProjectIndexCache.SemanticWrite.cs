@@ -336,7 +336,7 @@ namespace AssetStudio.Avalonia
                         _owner.CacheProjectId(_dbPath, _folderPath, _projectSignature, projectId);
 
                         SetSynchronousMode(conn, "OFF");
-                        SetCacheSizeKiB(conn, -262144);
+                        SetCacheSizeKiB(conn, -131072);
                         try
                         {
                             using var transaction = conn.BeginTransaction();

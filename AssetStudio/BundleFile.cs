@@ -759,7 +759,7 @@ namespace AssetStudio
                     file.fileName = Path.GetFileName(node.path.Replace('\\', '/'));
                     
                     // Directly wrap the shared buffer! Zero memory copy, zero allocation!
-                    file.stream = new MemoryStream(sharedBuffer, (int)node.offset, (int)node.size, false);
+                    file.stream = new MemoryStream(sharedBuffer, (int)node.offset, (int)node.size, writable: false, publiclyVisible: true);
                 }
             }
             else if (blocksStream is FileStream fileStream)
@@ -1180,7 +1180,7 @@ namespace AssetStudio
                 {
                     path = node.path,
                     fileName = Path.GetFileName(node.path.Replace('\\', '/')),
-                    stream = new MemoryStream(nodeBuffers[n], 0, nodeBuffers[n].Length, writable: false)
+                    stream = new MemoryStream(nodeBuffers[n], 0, nodeBuffers[n].Length, writable: false, publiclyVisible: true)
                 };
             }
 
