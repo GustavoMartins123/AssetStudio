@@ -145,8 +145,9 @@ namespace AssetStudio.Tests
                     productVersion: "2019.4.40.16762411",
                     fileVersion: "2019.4.40.16762411"));
 
-                // Sanity-check that the runtime reads the synthetic PE version resource cleanly
+                // Sanity-check that both FileVersionInfo and cross-platform PE resource parser read the synthetic PE cleanly
                 Assert.Equal("2019.4.40f1", AssetsManager.TryReadUnityVersionFromFileVersionInfo(unityPlayerPath));
+                Assert.Equal("2019.4.40f1", AssetsManager.TryReadUnityVersionFromPeResource(unityPlayerPath));
 
                 // Stripped UnityFS (0.0.0) bundle containing a stripped SerializedFile
                 var bundlePath = Path.Combine(bundleDir, "stripped_test.bundle");
@@ -184,13 +185,15 @@ namespace AssetStudio.Tests
                 File.WriteAllBytes(Path.Combine(dataDir, "globalgamemanagers"), new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 });
 
                 // No UnityPlayer.dll; place versioned main executable MyGame.exe next to MyGame_Data
-                File.WriteAllBytes(Path.Combine(gameRoot, "MyGame.exe"), BuildMinimalVersionedPeDll(
+                var exePath = Path.Combine(gameRoot, "MyGame.exe");
+                File.WriteAllBytes(exePath, BuildMinimalVersionedPeDll(
                     major: 6000,
                     minor: 3,
                     build: 2,
                     priv: 30623,
                     productVersion: "6000.3.2f1 (a9779f353c9b)",
                     fileVersion: "6000.3.2.11106207"));
+                Assert.Equal("6000.3.2f1", AssetsManager.TryReadUnityVersionFromPeResource(exePath));
 
                 var bundlePath = Path.Combine(bundleDir, "stripped_exe.bundle");
                 var strippedSfBytes = BuildMinimalSerializedFileBytes("0.0.0");

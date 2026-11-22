@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -1307,18 +1308,387 @@ namespace AssetStudio
             try
             {
                 var info = FileVersionInfo.GetVersionInfo(binaryPath);
-                return TryNormalizeUnityVersionFromFileVersionInfo(
+                var fromNative = TryNormalizeUnityVersionFromFileVersionInfo(
                     info.ProductVersion,
                     info.FileVersion,
                     info.FileMajorPart,
                     info.FileMinorPart,
                     info.FileBuildPart);
+                if (!string.IsNullOrEmpty(fromNative))
+                {
+                    return fromNative;
+                }
             }
             catch (Exception ex)
             {
-                Logger.Warning($"Could not infer Unity version from {binaryPath}: {ex.Message}");
+                Logger.Warning($"Could not infer Unity version via FileVersionInfo from {binaryPath}: {ex.Message}");
+            }
+
+            // Cross-platform fallback: on Linux/macOS FileVersionInfo does not parse native Win32 PE
+            // VS_VERSION_INFO resources from UnityPlayer.dll / game .exe binaries.
+            return TryReadUnityVersionFromPeResource(binaryPath);
+        }
+
+        public static string TryReadUnityVersionFromPeResource(string binaryPath)
+        {
+            if (string.IsNullOrEmpty(binaryPath) || !File.Exists(binaryPath))
+            {
                 return "";
             }
+
+            try
+            {
+                using var fs = new FileStream(binaryPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                if (fs.Length < 0x80)
+                {
+                    return "";
+                }
+
+                Span<byte> dosHeader = stackalloc byte[0x40];
+                if (!ReadExact(fs, dosHeader) || dosHeader[0] != (byte)'M' || dosHeader[1] != (byte)'Z')
+                {
+                    return "";
+                }
+
+                uint peOffset = BinaryPrimitives.ReadUInt32LittleEndian(dosHeader.Slice(0x3C, 4));
+                if (peOffset < 0x40 || peOffset > fs.Length - 24)
+                {
+                    return "";
+                }
+
+                fs.Position = peOffset;
+                Span<byte> coffHeader = stackalloc byte[24];
+                if (!ReadExact(fs, coffHeader)
+                    || coffHeader[0] != (byte)'P'
+                    || coffHeader[1] != (byte)'E'
+                    || coffHeader[2] != 0
+                    || coffHeader[3] != 0)
+                {
+                    return "";
+                }
+
+                ushort numberOfSections = BinaryPrimitives.ReadUInt16LittleEndian(coffHeader.Slice(6, 2));
+                ushort sizeOfOptionalHeader = BinaryPrimitives.ReadUInt16LittleEndian(coffHeader.Slice(20, 2));
+                if (numberOfSections == 0 || numberOfSections > 128 || sizeOfOptionalHeader < 0x60 || sizeOfOptionalHeader > 4096)
+                {
+                    return "";
+                }
+
+                var optHeader = new byte[sizeOfOptionalHeader];
+                if (!ReadExact(fs, optHeader))
+                {
+                    return "";
+                }
+
+                ushort magic = BinaryPrimitives.ReadUInt16LittleEndian(optHeader.AsSpan(0, 2));
+                int numRvaOffset;
+                int dataDirsOffset;
+                if (magic == 0x010B) // PE32
+                {
+                    numRvaOffset = 0x5C;
+                    dataDirsOffset = 0x60;
+                }
+                else if (magic == 0x020B) // PE32+
+                {
+                    numRvaOffset = 0x6C;
+                    dataDirsOffset = 0x70;
+                }
+                else
+                {
+                    return "";
+                }
+
+                int resourceDirOffset = dataDirsOffset + 2 * 8;
+                if (sizeOfOptionalHeader < resourceDirOffset + 8)
+                {
+                    return "";
+                }
+
+                uint numRvaAndSizes = BinaryPrimitives.ReadUInt32LittleEndian(optHeader.AsSpan(numRvaOffset, 4));
+                if (numRvaAndSizes < 3)
+                {
+                    return "";
+                }
+
+                uint rsrcRva = BinaryPrimitives.ReadUInt32LittleEndian(optHeader.AsSpan(resourceDirOffset, 4));
+                uint rsrcSize = BinaryPrimitives.ReadUInt32LittleEndian(optHeader.AsSpan(resourceDirOffset + 4, 4));
+                if (rsrcRva == 0 || rsrcSize < 16)
+                {
+                    return "";
+                }
+
+                int sectionTableBytes = numberOfSections * 40;
+                if (fs.Position + sectionTableBytes > fs.Length)
+                {
+                    return "";
+                }
+
+                var sectionTable = new byte[sectionTableBytes];
+                if (!ReadExact(fs, sectionTable))
+                {
+                    return "";
+                }
+
+                var sections = new (uint VirtualAddress, uint VirtualSize, uint RawSize, uint RawOffset)[numberOfSections];
+                for (int i = 0; i < numberOfSections; i++)
+                {
+                    var s = sectionTable.AsSpan(i * 40, 40);
+                    sections[i] = (
+                        VirtualAddress: BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(12, 4)),
+                        VirtualSize: BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(8, 4)),
+                        RawSize: BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(16, 4)),
+                        RawOffset: BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(20, 4)));
+                }
+
+                if (!TryMapPeRvaToFileOffset(sections, fs.Length, rsrcRva, out long rsrcFileBase, out _))
+                {
+                    return "";
+                }
+
+                // Walk 3-level Win32 resource directory: RT_VERSION (16) -> first ID -> first Language -> DATA_ENTRY
+                if (!TryFindPeResourceEntry(fs, rsrcFileBase, 0, targetId: 16u, expectSubdirectory: true, out uint level2Offset))
+                {
+                    return "";
+                }
+
+                if (!TryFindPeResourceEntry(fs, rsrcFileBase, level2Offset, targetId: null, expectSubdirectory: true, out uint level3Offset))
+                {
+                    return "";
+                }
+
+                if (!TryFindPeResourceEntry(fs, rsrcFileBase, level3Offset, targetId: null, expectSubdirectory: false, out uint dataEntryOffset))
+                {
+                    return "";
+                }
+
+                long dataEntryFileOffset = rsrcFileBase + dataEntryOffset;
+                if (dataEntryFileOffset < 0 || dataEntryFileOffset + 16 > fs.Length)
+                {
+                    return "";
+                }
+
+                fs.Position = dataEntryFileOffset;
+                Span<byte> dataEntry = stackalloc byte[16];
+                if (!ReadExact(fs, dataEntry))
+                {
+                    return "";
+                }
+
+                uint dataRva = BinaryPrimitives.ReadUInt32LittleEndian(dataEntry.Slice(0, 4));
+                uint dataSize = BinaryPrimitives.ReadUInt32LittleEndian(dataEntry.Slice(4, 4));
+                if (dataRva == 0 || dataSize < 32 || dataSize > 256 * 1024)
+                {
+                    return "";
+                }
+
+                if (!TryMapPeRvaToFileOffset(sections, fs.Length, dataRva, out long blobFileOffset, out long blobAvailable)
+                    || dataSize > blobAvailable)
+                {
+                    return "";
+                }
+
+                fs.Position = blobFileOffset;
+                var versionBlob = new byte[dataSize];
+                if (!ReadExact(fs, versionBlob))
+                {
+                    return "";
+                }
+
+                int fileMajor = -1;
+                int fileMinor = -1;
+                int fileBuild = -1;
+                int fixedSearchLimit = Math.Min(versionBlob.Length - 52, 256);
+                for (int i = 0; i <= fixedSearchLimit; i += 4)
+                {
+                    if (BinaryPrimitives.ReadUInt32LittleEndian(versionBlob.AsSpan(i, 4)) == 0xFEEF04BDu)
+                    {
+                        uint msVer = BinaryPrimitives.ReadUInt32LittleEndian(versionBlob.AsSpan(i + 8, 4));
+                        uint lsVer = BinaryPrimitives.ReadUInt32LittleEndian(versionBlob.AsSpan(i + 12, 4));
+                        fileMajor = (int)(msVer >> 16);
+                        fileMinor = (int)(msVer & 0xFFFF);
+                        fileBuild = (int)(lsVer >> 16);
+                        break;
+                    }
+                }
+
+                var productVersion = TryExtractVsVersionStringValue(versionBlob, "ProductVersion");
+                var fileVersion = TryExtractVsVersionStringValue(versionBlob, "FileVersion");
+
+                return TryNormalizeUnityVersionFromFileVersionInfo(productVersion, fileVersion, fileMajor, fileMinor, fileBuild);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Could not parse PE version resource from {binaryPath}: {ex.Message}");
+                return "";
+            }
+        }
+
+        private static bool ReadExact(Stream stream, Span<byte> buffer)
+        {
+            int totalRead = 0;
+            while (totalRead < buffer.Length)
+            {
+                int read = stream.Read(buffer.Slice(totalRead));
+                if (read <= 0)
+                {
+                    return false;
+                }
+                totalRead += read;
+            }
+            return true;
+        }
+
+        private static bool TryMapPeRvaToFileOffset(
+            (uint VirtualAddress, uint VirtualSize, uint RawSize, uint RawOffset)[] sections,
+            long fileLength,
+            uint rva,
+            out long fileOffset,
+            out long availableBytes)
+        {
+            for (int i = 0; i < sections.Length; i++)
+            {
+                var s = sections[i];
+                uint span = Math.Max(s.VirtualSize, s.RawSize);
+                if (rva >= s.VirtualAddress && (ulong)rva < (ulong)s.VirtualAddress + span)
+                {
+                    long delta = rva - s.VirtualAddress;
+                    if (delta >= s.RawSize)
+                    {
+                        continue;
+                    }
+
+                    long offset = (long)s.RawOffset + delta;
+                    long maxEnd = Math.Min(fileLength, (long)s.RawOffset + s.RawSize);
+                    if (offset >= 0 && offset < maxEnd)
+                    {
+                        fileOffset = offset;
+                        availableBytes = maxEnd - offset;
+                        return true;
+                    }
+                }
+            }
+
+            fileOffset = 0;
+            availableBytes = 0;
+            return false;
+        }
+
+        private static bool TryFindPeResourceEntry(
+            Stream fs,
+            long rsrcFileBase,
+            uint dirRelativeOffset,
+            uint? targetId,
+            bool expectSubdirectory,
+            out uint childOffset)
+        {
+            childOffset = 0;
+            long dirOffset = rsrcFileBase + dirRelativeOffset;
+            if (dirOffset < 0 || dirOffset + 16 > fs.Length)
+            {
+                return false;
+            }
+
+            fs.Position = dirOffset;
+            Span<byte> dirHeader = stackalloc byte[16];
+            if (!ReadExact(fs, dirHeader))
+            {
+                return false;
+            }
+
+            ushort numNamed = BinaryPrimitives.ReadUInt16LittleEndian(dirHeader.Slice(12, 2));
+            ushort numId = BinaryPrimitives.ReadUInt16LittleEndian(dirHeader.Slice(14, 2));
+            int totalEntries = numNamed + numId;
+            if (totalEntries == 0 || totalEntries > 4096)
+            {
+                return false;
+            }
+
+            int startIndex = targetId.HasValue ? numNamed : 0;
+            long entriesStart = dirOffset + 16 + (long)startIndex * 8;
+            int countToScan = totalEntries - startIndex;
+            if (countToScan <= 0 || entriesStart + (long)countToScan * 8 > fs.Length)
+            {
+                return false;
+            }
+
+            fs.Position = entriesStart;
+            Span<byte> entry = stackalloc byte[8];
+            for (int i = 0; i < countToScan; i++)
+            {
+                if (!ReadExact(fs, entry))
+                {
+                    return false;
+                }
+
+                uint nameOrId = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0, 4));
+                uint offsetToData = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(4, 4));
+                bool isSubdir = (offsetToData & 0x80000000u) != 0;
+                if (isSubdir != expectSubdirectory)
+                {
+                    continue;
+                }
+
+                if (targetId.HasValue && nameOrId != targetId.Value)
+                {
+                    continue;
+                }
+
+                childOffset = offsetToData & 0x7FFFFFFFu;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string? TryExtractVsVersionStringValue(ReadOnlySpan<byte> blob, string key)
+        {
+            var keyBytes = Encoding.Unicode.GetBytes(key + "\0");
+            int searchStart = 6;
+            while (searchStart <= blob.Length - keyBytes.Length)
+            {
+                int rel = blob.Slice(searchStart).IndexOf(keyBytes);
+                if (rel < 0)
+                {
+                    return null;
+                }
+
+                int keyPos = searchStart + rel;
+                int headerPos = keyPos - 6;
+                if (headerPos >= 0 && (headerPos & 3) == 0)
+                {
+                    ushort wLength = BinaryPrimitives.ReadUInt16LittleEndian(blob.Slice(headerPos, 2));
+                    ushort wValueLength = BinaryPrimitives.ReadUInt16LittleEndian(blob.Slice(headerPos + 2, 2));
+                    ushort wType = BinaryPrimitives.ReadUInt16LittleEndian(blob.Slice(headerPos + 4, 2));
+                    int nodeEnd = Math.Min(blob.Length, headerPos + wLength);
+                    if (wType == 1 && wLength >= 6 + keyBytes.Length && wValueLength > 0)
+                    {
+                        int valueStart = (keyPos + keyBytes.Length + 3) & ~3;
+                        if (valueStart < nodeEnd)
+                        {
+                            int maxValueBytes = Math.Min(nodeEnd - valueStart, wValueLength * 2);
+                            if (maxValueBytes >= 2)
+                            {
+                                var valSpan = blob.Slice(valueStart, maxValueBytes & ~1);
+                                var decoded = Encoding.Unicode.GetString(valSpan);
+                                int nulIdx = decoded.IndexOf('\0');
+                                if (nulIdx >= 0)
+                                {
+                                    decoded = decoded.Substring(0, nulIdx);
+                                }
+                                decoded = decoded.Trim();
+                                if (!string.IsNullOrEmpty(decoded))
+                                {
+                                    return decoded;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                searchStart = keyPos + 2;
+            }
+
+            return null;
         }
 
         public static string TryNormalizeUnityVersionFromFileVersionInfo(
