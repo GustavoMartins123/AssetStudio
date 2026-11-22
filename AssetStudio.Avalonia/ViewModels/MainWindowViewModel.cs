@@ -65,6 +65,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public Action? RotateMeshUp { get; set; }
         public Action? RotateMeshDown { get; set; }
         public Action? ResetMeshMaterialColor { get; set; }
+        public Func<Task>? ExportPreviewModelAsync { get; set; }
+        public Func<AssetReferenceItem?, Task>? NavigateToReferencedAssetAsync { get; set; }
 
         public Func<Task>? VideoPlayPauseAsync { get; set; }
         public Func<Task>? VideoStopAsync { get; set; }
@@ -137,6 +139,8 @@ namespace AssetStudio.Avalonia.ViewModels
             RotateMeshUp = null;
             RotateMeshDown = null;
             ResetMeshMaterialColor = null;
+            ExportPreviewModelAsync = null;
+            NavigateToReferencedAssetAsync = null;
 
             VideoPlayPauseAsync = null;
             VideoStopAsync = null;
@@ -204,6 +208,8 @@ namespace AssetStudio.Avalonia.ViewModels
             PreviewSession.IsDisplayInfoEnabled = Options.DisplayInfo;
 
             IndexingProgress.PropertyChanged += OnIndexingProgressPropertyChanged;
+            PreviewSession.PropertyChanged += OnPreviewSessionPropertyChanged;
+            MeshPreview.PropertyChanged += OnMeshPreviewPropertyChanged;
             Options.EnablePreviewChanged += OnOptionsEnablePreviewChanged;
             Options.DisplayInfoChanged += OnOptionsDisplayInfoChanged;
             Options.SpecifyUnityVersionChanged += OnOptionsSpecifyUnityVersionChanged;
@@ -271,6 +277,18 @@ namespace AssetStudio.Avalonia.ViewModels
             RotateMeshUpCommand = new RelayCommand(ExecuteRotateMeshUp);
             RotateMeshDownCommand = new RelayCommand(ExecuteRotateMeshDown);
             ResetMeshMaterialColorCommand = new RelayCommand(ExecuteResetMeshMaterialColor);
+            ExportPreviewModelCommand = new AsyncRelayCommand(
+                ExecuteExportPreviewModelAsync,
+                canExecute: () => CanExportPreviewModel,
+                onException: HandleCommandException);
+            NavigateToReferencedAssetCommand = new AsyncRelayCommand<AssetReferenceItem>(
+                ExecuteNavigateToReferencedAssetAsync,
+                canExecute: item => !_disposed && item?.IsNavigable == true,
+                onException: HandleCommandException);
+            NavigateToSelectedReferenceCommand = new AsyncRelayCommand(
+                () => ExecuteNavigateToReferencedAssetAsync(PreviewSession.SelectedReferenceItem),
+                canExecute: () => CanNavigateToSelectedReference,
+                onException: HandleCommandException);
 
             VideoPlayPauseCommand = new AsyncRelayCommand(ExecuteVideoPlayPauseAsync, onException: HandleCommandException);
             VideoStopCommand = new AsyncRelayCommand(ExecuteVideoStopAsync, onException: HandleCommandException);
@@ -370,6 +388,9 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand RotateMeshUpCommand { get; }
         public RelayCommand RotateMeshDownCommand { get; }
         public RelayCommand ResetMeshMaterialColorCommand { get; }
+        public AsyncRelayCommand ExportPreviewModelCommand { get; }
+        public AsyncRelayCommand<AssetReferenceItem> NavigateToReferencedAssetCommand { get; }
+        public AsyncRelayCommand NavigateToSelectedReferenceCommand { get; }
 
         public AsyncRelayCommand VideoPlayPauseCommand { get; }
         public AsyncRelayCommand VideoStopCommand { get; }
@@ -460,6 +481,38 @@ namespace AssetStudio.Avalonia.ViewModels
         }
 
         public bool CanOpenProjectManager => !_disposed && !_isReturningToProjectManager;
+
+        public bool CanExportPreviewModel =>
+            !_disposed && PreviewModelExportHelper.CanExportSurfaceKind(
+                PreviewSession.ActiveKind,
+                MeshPreview.IsGeometryControlsVisible);
+
+        public bool CanNavigateToSelectedReference =>
+            !_disposed && PreviewSession.SelectedReferenceItem?.IsNavigable == true;
+
+        private void OnPreviewSessionPropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            switch (e.PropertyName)
+            {
+                case nameof(PreviewSessionViewModel.ActiveKind):
+                    OnPropertyChanged(nameof(CanExportPreviewModel));
+                    ExportPreviewModelCommand.NotifyCanExecuteChanged();
+                    break;
+                case nameof(PreviewSessionViewModel.SelectedReferenceItem):
+                    OnPropertyChanged(nameof(CanNavigateToSelectedReference));
+                    NavigateToSelectedReferenceCommand.NotifyCanExecuteChanged();
+                    break;
+            }
+        }
+
+        private void OnMeshPreviewPropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName == nameof(MeshPreviewViewModel.IsGeometryControlsVisible))
+            {
+                OnPropertyChanged(nameof(CanExportPreviewModel));
+                ExportPreviewModelCommand.NotifyCanExecuteChanged();
+            }
+        }
 
         private void OnIndexingProgressPropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
@@ -995,6 +1048,49 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        private async Task ExecuteExportPreviewModelAsync()
+        {
+            if (CommandHandlers.ExportPreviewModelAsync != null)
+            {
+                await CommandHandlers.ExportPreviewModelAsync();
+                return;
+            }
+
+            if (!CanExportPreviewModel)
+            {
+                return;
+            }
+
+            var baseName = !string.IsNullOrWhiteSpace(MeshPreview.ActiveMeshName)
+                ? MeshPreview.ActiveMeshName
+                : !string.IsNullOrWhiteSpace(MeshPreview.ActiveAvatarName)
+                    ? MeshPreview.ActiveAvatarName
+                    : PreviewSession.ActiveAsset?.Name ?? "model";
+            var suggestedFileName = AssetExportService.FixFileName(baseName) + ".fbx";
+            var path = await _dialogService.PickSaveFileAsync(new SaveFilePickerRequest("Export Model", suggestedFileName, "fbx"));
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                StatusText = $"Selected export target: {path}";
+            }
+        }
+
+        private async Task ExecuteNavigateToReferencedAssetAsync(AssetReferenceItem? target)
+        {
+            if (target == null || !target.IsNavigable || _disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.NavigateToReferencedAssetAsync != null)
+            {
+                await CommandHandlers.NavigateToReferencedAssetAsync(target);
+                return;
+            }
+
+            PreviewSession.ActiveRightTab = RightPanelTab.Preview;
+            StatusText = $"Navigating to {target.TypeName}: {target.Name}";
+        }
+
         private async Task ExecuteVideoPlayPauseAsync()
         {
             if (CommandHandlers.VideoPlayPauseAsync != null)
@@ -1159,6 +1255,8 @@ namespace AssetStudio.Avalonia.ViewModels
 
             _disposed = true;
             IndexingProgress.PropertyChanged -= OnIndexingProgressPropertyChanged;
+            PreviewSession.PropertyChanged -= OnPreviewSessionPropertyChanged;
+            MeshPreview.PropertyChanged -= OnMeshPreviewPropertyChanged;
             Options.EnablePreviewChanged -= OnOptionsEnablePreviewChanged;
             Options.DisplayInfoChanged -= OnOptionsDisplayInfoChanged;
             Options.SpecifyUnityVersionChanged -= OnOptionsSpecifyUnityVersionChanged;
@@ -1181,7 +1279,12 @@ namespace AssetStudio.Avalonia.ViewModels
             _isReturningToProjectManager = false;
             OnPropertyChanged(nameof(IsReturningToProjectManager));
             OnPropertyChanged(nameof(CanOpenProjectManager));
+            OnPropertyChanged(nameof(CanExportPreviewModel));
+            OnPropertyChanged(nameof(CanNavigateToSelectedReference));
             OpenProjectManagerCommand.NotifyCanExecuteChanged();
+            ExportPreviewModelCommand.NotifyCanExecuteChanged();
+            NavigateToSelectedReferenceCommand.NotifyCanExecuteChanged();
+            NavigateToReferencedAssetCommand.NotifyCanExecuteChanged();
         }
 
         private sealed class NoOpDialogService : IDialogService

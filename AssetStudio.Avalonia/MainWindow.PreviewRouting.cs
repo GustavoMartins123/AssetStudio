@@ -144,6 +144,10 @@ public partial class MainWindow : Window
             {
                 await UpdateDumpForSelectedAsset();
             }
+            else if (RightTabControl.SelectedIndex == 2)
+            {
+                await UpdateReferencesForSelectedAssetAsync();
+            }
             UpdatePreloadWindow(assetItem);
             QueuePreviewAsset(assetItem);
         }
@@ -151,7 +155,9 @@ public partial class MainWindow : Window
         {
             _currentlySelectedUniqueID = null;
             _dumpRequestCoordinator.CancelCurrent();
+            _referencesRequestCoordinator.CancelCurrent();
             PreviewSession.DumpTextContent = string.Empty;
+            PreviewSession.ClearReferences();
             CancelPendingPreview();
             ClearPreview("Preview Panel");
             lock (preloaderLock)
@@ -168,7 +174,8 @@ public partial class MainWindow : Window
             PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
             if (RightTabControl.SelectedIndex == 1)
             {
-                PreviewSession.IsDumpTabActive = true;
+                PreviewSession.ActiveRightTab = RightPanelTab.Dump;
+                _referencesRequestCoordinator.CancelCurrent();
                 if (PreviewSession.IsLoading)
                 {
                     _lastPreviewedAssetUniqueId = null;
@@ -177,10 +184,23 @@ public partial class MainWindow : Window
                 GLPreviewControl?.SuspendForHiddenTab();
                 await UpdateDumpForSelectedAsset();
             }
+            else if (RightTabControl.SelectedIndex == 2)
+            {
+                PreviewSession.ActiveRightTab = RightPanelTab.References;
+                _dumpRequestCoordinator.CancelCurrent();
+                if (PreviewSession.IsLoading)
+                {
+                    _lastPreviewedAssetUniqueId = null;
+                }
+                CancelPendingPreview();
+                GLPreviewControl?.SuspendForHiddenTab();
+                await UpdateReferencesForSelectedAssetAsync();
+            }
             else if (RightTabControl.SelectedIndex == 0)
             {
-                PreviewSession.IsDumpTabActive = false;
+                PreviewSession.ActiveRightTab = RightPanelTab.Preview;
                 _dumpRequestCoordinator.CancelCurrent();
+                _referencesRequestCoordinator.CancelCurrent();
                 if (_suppressNextRightTabSelectionPreview)
                 {
                     _suppressNextRightTabSelectionPreview = false;
@@ -705,6 +725,7 @@ public partial class MainWindow : Window
         GLPreviewControl?.StopAnimation();
         currentPreviewMesh = null;
         currentPreviewAvatar = null;
+        currentPreviewAnimationClip = null;
         currentPreviewTexture = null;
         currentPreviewSprite = null;
         currentPreviewAudioClip = null;

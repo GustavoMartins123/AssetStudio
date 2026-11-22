@@ -1,11 +1,20 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia.ViewModels
 {
+    public enum RightPanelTab
+    {
+        Preview = 0,
+        Dump = 1,
+        References = 2
+    }
+
     public enum PreviewSurfaceKind
     {
         None = 0,
@@ -55,6 +64,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly object _stateLock = new();
         private readonly AsyncPreviewRequestCoordinator _previewCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _dumpCoordinator = new();
+        private readonly AsyncPreviewRequestCoordinator _referencesCoordinator = new();
         private readonly AnimationPreviewLoadCoordinator _animationCoordinator = new();
 
         private long _previewVersion;
@@ -70,7 +80,19 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _textContent = string.Empty;
         private string _dumpTextContent = string.Empty;
         private bool _isDumpLoading;
-        private bool _isDumpTabActive;
+        private RightPanelTab _activeRightTab = RightPanelTab.Preview;
+        private bool _isReferencesLoading;
+        private string _referencesFilterText = string.Empty;
+        private string _referencesTargetTitle = DefaultReferencesTargetTitle;
+        private string _referencesHeaderSummary = DefaultReferencesSummary;
+        private string _referencedBySectionHeader = DefaultReferencedByHeader;
+        private string _referencesSectionHeader = DefaultReferencesHeader;
+        private bool _hasReferencedByItems;
+        private bool _hasReferencesItems;
+        private bool _hasNoReferences;
+        private AssetReferenceItem? _selectedReferenceItem;
+        private IReadOnlyList<AssetReferenceItem> _allReferencedBy = Array.Empty<AssetReferenceItem>();
+        private IReadOnlyList<AssetReferenceItem> _allReferences = Array.Empty<AssetReferenceItem>();
         private bool _isDialogueCardsVisible;
         private bool _hasDialoguePreview;
         private TextAssetDisplayMode _dialogueDisplayMode = TextAssetDisplayMode.Cards;
@@ -91,17 +113,26 @@ namespace AssetStudio.Avalonia.ViewModels
         private string? _lastPreviewSourceKind;
         private bool _lastPreviewMaterialsLoading;
 
+        public const string DefaultReferencesTargetTitle = "No asset selected";
+        public const string DefaultReferencesSummary = "Select an asset to inspect references.";
+        public const string DefaultReferencedByHeader = "Referenced By / Used By (0)";
+        public const string DefaultReferencesHeader = "References / Uses (0)";
+
         public PreviewSessionViewModel(Action<Action>? dispatchToUi = null)
         {
             _dispatchToUi = dispatchToUi ?? (static action => action());
             ShaderPreview = new ShaderPreviewViewModel(_dispatchToUi);
             DialogueCards = new BulkObservableCollection<TextAssetDialogueCardViewModel>();
             PreviewCandidates = new BulkObservableCollection<PreviewCandidateItem>();
+            FilteredReferencedByItems = new BulkObservableCollection<AssetReferenceItem>();
+            FilteredReferencesItems = new BulkObservableCollection<AssetReferenceItem>();
         }
 
         internal AsyncPreviewRequestCoordinator PreviewCoordinator => _previewCoordinator;
 
         internal AsyncPreviewRequestCoordinator DumpCoordinator => _dumpCoordinator;
+
+        internal AsyncPreviewRequestCoordinator ReferencesCoordinator => _referencesCoordinator;
 
         internal AnimationPreviewLoadCoordinator AnimationCoordinator => _animationCoordinator;
 
@@ -113,6 +144,10 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public long CancelledDumpRequestCount => _dumpCoordinator.CancelledRequestCount;
 
+        public long CurrentReferencesRequestId => _referencesCoordinator.CurrentRequestId;
+
+        public long CancelledReferencesRequestCount => _referencesCoordinator.CancelledRequestCount;
+
         public long CurrentAnimationRequestId => _animationCoordinator.CurrentRequestId;
 
         public long CancelledAnimationRequestCount => _animationCoordinator.CancelledRequestCount;
@@ -122,6 +157,11 @@ namespace AssetStudio.Avalonia.ViewModels
         public BulkObservableCollection<TextAssetDialogueCardViewModel> DialogueCards { get; }
 
         public BulkObservableCollection<PreviewCandidateItem> PreviewCandidates { get; }
+
+        public BulkObservableCollection<AssetReferenceItem> FilteredReferencedByItems { get; }
+
+        public BulkObservableCollection<AssetReferenceItem> FilteredReferencesItems { get; }
+
         public ShaderPreviewViewModel ShaderPreview { get; }
 
         public PreviewSurfaceKind ActiveKind
@@ -280,20 +320,139 @@ namespace AssetStudio.Avalonia.ViewModels
             set => SetProperty(ref _isDumpLoading, value);
         }
 
-        public bool IsDumpTabActive
+        public RightPanelTab ActiveRightTab
         {
-            get => _isDumpTabActive;
+            get => _activeRightTab;
             set
             {
-                if (SetProperty(ref _isDumpTabActive, value))
+                var prevPreview = IsPreviewTabActive;
+                var prevDump = IsDumpTabActive;
+                var prevReferences = IsReferencesTabActive;
+                if (SetProperty(ref _activeRightTab, value))
                 {
-                    OnPropertyChanged(nameof(IsPreviewTabActive));
-                    ShaderPreview.SetSuspended(value);
+                    if (IsPreviewTabActive != prevPreview)
+                    {
+                        OnPropertyChanged(nameof(IsPreviewTabActive));
+                        ShaderPreview.SetSuspended(!IsPreviewTabActive);
+                    }
+
+                    if (IsDumpTabActive != prevDump)
+                    {
+                        OnPropertyChanged(nameof(IsDumpTabActive));
+                    }
+
+                    if (IsReferencesTabActive != prevReferences)
+                    {
+                        OnPropertyChanged(nameof(IsReferencesTabActive));
+                    }
                 }
             }
         }
 
-        public bool IsPreviewTabActive => !_isDumpTabActive;
+        public bool IsPreviewTabActive => _activeRightTab == RightPanelTab.Preview;
+
+        public bool IsDumpTabActive
+        {
+            get => _activeRightTab == RightPanelTab.Dump;
+            set
+            {
+                if (value)
+                {
+                    ActiveRightTab = RightPanelTab.Dump;
+                }
+                else if (_activeRightTab == RightPanelTab.Dump)
+                {
+                    ActiveRightTab = RightPanelTab.Preview;
+                }
+            }
+        }
+
+        public bool IsReferencesTabActive
+        {
+            get => _activeRightTab == RightPanelTab.References;
+            set
+            {
+                if (value)
+                {
+                    ActiveRightTab = RightPanelTab.References;
+                }
+                else if (_activeRightTab == RightPanelTab.References)
+                {
+                    ActiveRightTab = RightPanelTab.Preview;
+                }
+            }
+        }
+
+        public bool IsReferencesLoading
+        {
+            get => _isReferencesLoading;
+            set => SetProperty(ref _isReferencesLoading, value);
+        }
+
+        public string ReferencesFilterText
+        {
+            get => _referencesFilterText;
+            set
+            {
+                var normalized = value ?? string.Empty;
+                if (SetProperty(ref _referencesFilterText, normalized))
+                {
+                    ApplyReferencesFilterCore();
+                }
+            }
+        }
+
+        public string ReferencesTargetTitle
+        {
+            get => _referencesTargetTitle;
+            private set => SetProperty(ref _referencesTargetTitle, value ?? DefaultReferencesTargetTitle);
+        }
+
+        public string ReferencesHeaderSummary
+        {
+            get => _referencesHeaderSummary;
+            private set => SetProperty(ref _referencesHeaderSummary, value ?? DefaultReferencesSummary);
+        }
+
+        public string ReferencedBySectionHeader
+        {
+            get => _referencedBySectionHeader;
+            private set => SetProperty(ref _referencedBySectionHeader, value ?? DefaultReferencedByHeader);
+        }
+
+        public string ReferencesSectionHeader
+        {
+            get => _referencesSectionHeader;
+            private set => SetProperty(ref _referencesSectionHeader, value ?? DefaultReferencesHeader);
+        }
+
+        public bool HasReferencedByItems
+        {
+            get => _hasReferencedByItems;
+            private set => SetProperty(ref _hasReferencedByItems, value);
+        }
+
+        public bool HasReferencesItems
+        {
+            get => _hasReferencesItems;
+            private set => SetProperty(ref _hasReferencesItems, value);
+        }
+
+        public bool HasNoReferences
+        {
+            get => _hasNoReferences;
+            private set => SetProperty(ref _hasNoReferences, value);
+        }
+
+        public AssetReferenceItem? SelectedReferenceItem
+        {
+            get => _selectedReferenceItem;
+            set => SetProperty(ref _selectedReferenceItem, value);
+        }
+
+        public int TotalReferencedByCount => _allReferencedBy.Count;
+
+        public int TotalReferencesCount => _allReferences.Count;
 
         public bool IsDialogueCardsVisible
         {
@@ -601,16 +760,223 @@ namespace AssetStudio.Avalonia.ViewModels
             });
         }
 
+        public CancellationToken BeginReferencesRequest(out long requestId, AssetItem? targetAsset = null)
+        {
+            var token = _referencesCoordinator.BeginNewRequest(out requestId);
+            var title = targetAsset != null
+                ? $"{targetAsset.DisplayType}: {targetAsset.Name}"
+                : DefaultReferencesTargetTitle;
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    IsReferencesLoading = true;
+                    ReferencesTargetTitle = title;
+                    ReferencesHeaderSummary = "Scanning references...";
+                    HasNoReferences = false;
+                }
+            });
+            return token;
+        }
+
+        public bool IsReferencesRequestCurrent(long requestId, CancellationToken cancellationToken = default)
+        {
+            return !cancellationToken.IsCancellationRequested && _referencesCoordinator.IsCurrent(requestId);
+        }
+
+        public bool CompleteReferencesRequest(long requestId, AssetReferencesSnapshot snapshot)
+        {
+            ArgumentNullException.ThrowIfNull(snapshot);
+            if (!_referencesCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_referencesCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    _allReferencedBy = snapshot.ReferencedBy ?? Array.Empty<AssetReferenceItem>();
+                    _allReferences = snapshot.References ?? Array.Empty<AssetReferenceItem>();
+                    SelectedReferenceItem = null;
+                    IsReferencesLoading = false;
+                    ReferencesTargetTitle = !string.IsNullOrWhiteSpace(snapshot.TargetName)
+                        ? $"{AssetItem.GetCachedTypeString(snapshot.TargetType)}: {snapshot.TargetName}"
+                        : DefaultReferencesTargetTitle;
+                    ApplyReferencesFilterCore();
+                }
+            });
+            return true;
+        }
+
+        public bool FailReferencesRequest(long requestId, string errorMessage)
+        {
+            if (!_referencesCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_referencesCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    _allReferencedBy = Array.Empty<AssetReferenceItem>();
+                    _allReferences = Array.Empty<AssetReferenceItem>();
+                    SelectedReferenceItem = null;
+                    if (FilteredReferencedByItems.Count > 0) FilteredReferencedByItems.Clear();
+                    if (FilteredReferencesItems.Count > 0) FilteredReferencesItems.Clear();
+                    HasReferencedByItems = false;
+                    HasReferencesItems = false;
+                    HasNoReferences = false;
+                    IsReferencesLoading = false;
+                    ReferencedBySectionHeader = DefaultReferencedByHeader;
+                    ReferencesSectionHeader = DefaultReferencesHeader;
+                    ReferencesHeaderSummary = $"Error loading references: {errorMessage}";
+                }
+            });
+            return true;
+        }
+
+        public void CancelPendingReferences()
+        {
+            _referencesCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                IsReferencesLoading = false;
+            });
+        }
+
+        public void ClearReferences()
+        {
+            _referencesCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearReferencesCore();
+                }
+            });
+        }
+
+        private void ClearReferencesCore()
+        {
+            _allReferencedBy = Array.Empty<AssetReferenceItem>();
+            _allReferences = Array.Empty<AssetReferenceItem>();
+            SelectedReferenceItem = null;
+            if (FilteredReferencedByItems.Count > 0)
+            {
+                FilteredReferencedByItems.Clear();
+            }
+
+            if (FilteredReferencesItems.Count > 0)
+            {
+                FilteredReferencesItems.Clear();
+            }
+
+            IsReferencesLoading = false;
+            SetProperty(ref _referencesFilterText, string.Empty, nameof(ReferencesFilterText));
+            ReferencesTargetTitle = DefaultReferencesTargetTitle;
+            ReferencesHeaderSummary = DefaultReferencesSummary;
+            ReferencedBySectionHeader = DefaultReferencedByHeader;
+            ReferencesSectionHeader = DefaultReferencesHeader;
+            HasReferencedByItems = false;
+            HasReferencesItems = false;
+            HasNoReferences = false;
+        }
+
+        private void ApplyReferencesFilterCore()
+        {
+            var filter = _referencesFilterText?.Trim();
+            var hasFilter = !string.IsNullOrEmpty(filter);
+
+            List<AssetReferenceItem> filteredUsedBy;
+            List<AssetReferenceItem> filteredUses;
+            if (!hasFilter)
+            {
+                filteredUsedBy = _allReferencedBy.Count > 0
+                    ? new List<AssetReferenceItem>(_allReferencedBy)
+                    : new List<AssetReferenceItem>();
+                filteredUses = _allReferences.Count > 0
+                    ? new List<AssetReferenceItem>(_allReferences)
+                    : new List<AssetReferenceItem>();
+            }
+            else
+            {
+                filteredUsedBy = new List<AssetReferenceItem>();
+                for (var i = 0; i < _allReferencedBy.Count; i++)
+                {
+                    if (_allReferencedBy[i].MatchesFilter(filter))
+                    {
+                        filteredUsedBy.Add(_allReferencedBy[i]);
+                    }
+                }
+
+                filteredUses = new List<AssetReferenceItem>();
+                for (var i = 0; i < _allReferences.Count; i++)
+                {
+                    if (_allReferences[i].MatchesFilter(filter))
+                    {
+                        filteredUses.Add(_allReferences[i]);
+                    }
+                }
+            }
+
+            FilteredReferencedByItems.ReplaceAll(filteredUsedBy);
+            FilteredReferencesItems.ReplaceAll(filteredUses);
+            HasReferencedByItems = filteredUsedBy.Count > 0;
+            HasReferencesItems = filteredUses.Count > 0;
+            HasNoReferences = !_isReferencesLoading && _allReferencedBy.Count == 0 && _allReferences.Count == 0;
+
+            if (hasFilter)
+            {
+                ReferencedBySectionHeader = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Referenced By / Used By ({filteredUsedBy.Count:N0} of {_allReferencedBy.Count:N0})");
+                ReferencesSectionHeader = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"References / Uses ({filteredUses.Count:N0} of {_allReferences.Count:N0})");
+                ReferencesHeaderSummary = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Showing {filteredUsedBy.Count:N0}/{_allReferencedBy.Count:N0} Used By • {filteredUses.Count:N0}/{_allReferences.Count:N0} Uses");
+            }
+            else
+            {
+                ReferencedBySectionHeader = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Referenced By / Used By ({_allReferencedBy.Count:N0})");
+                ReferencesSectionHeader = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"References / Uses ({_allReferences.Count:N0})");
+                ReferencesHeaderSummary = _allReferencedBy.Count == 0 && _allReferences.Count == 0
+                    ? "No incoming or outgoing references found."
+                    : string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Used by {_allReferencedBy.Count:N0} asset(s) • Uses {_allReferences.Count:N0} asset(s)");
+            }
+        }
+
         public void CancelPending()
         {
             _previewCoordinator.CancelCurrent();
             _dumpCoordinator.CancelCurrent();
+            _referencesCoordinator.CancelCurrent();
             _animationCoordinator.CancelCurrent();
             Interlocked.Increment(ref _previewVersion);
             _dispatchToUi(() =>
             {
                 IsLoading = false;
                 IsDumpLoading = false;
+                IsReferencesLoading = false;
             });
         }
 
@@ -1080,7 +1446,8 @@ namespace AssetStudio.Avalonia.ViewModels
                     TextContent = string.Empty;
                     DumpTextContent = string.Empty;
                     IsDumpLoading = false;
-                    IsDumpTabActive = false;
+                    ActiveRightTab = RightPanelTab.Preview;
+                    ClearReferencesCore();
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
                     HasDialoguePreview = false;
@@ -1107,6 +1474,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ShaderPreview.Dispose();
             _previewCoordinator.Dispose();
             _dumpCoordinator.Dispose();
+            _referencesCoordinator.Dispose();
             _animationCoordinator.Dispose();
         }
     }

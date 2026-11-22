@@ -1107,6 +1107,497 @@ public partial class MainWindow
         return null;
     }
 
+    internal async Task ExportPreviewModelCommandHandlerAsync()
+    {
+        var selectedAsset = AssetListDataGrid?.SelectedItem as AssetItem;
+        var selectedCandidate = SelectedPreviewCandidate;
+        var target = PreviewModelExportHelper.ResolveExportTarget(
+            PreviewSession.ActiveKind,
+            selectedAsset,
+            selectedCandidate,
+            currentPreviewMesh,
+            currentPreviewAvatar,
+            currentPreviewAnimationClip,
+            MeshPreview.ShowFullModelGroup);
+
+        if (!target.IsValid)
+        {
+            StatusStripUpdate("No 3D model is currently active in Preview to export.");
+            return;
+        }
+
+        var suggestedName = target.BuildSuggestedFileName(exportOptions);
+        var exportFile = await PickSaveModelDialogAsync("Export Model", suggestedName);
+        if (string.IsNullOrWhiteSpace(exportFile))
+        {
+            return;
+        }
+
+        var exportFolder = Path.GetDirectoryName(exportFile);
+        if (!string.IsNullOrEmpty(exportFolder))
+        {
+            SaveExportFolder(exportFolder);
+        }
+
+        var fileDisplayName = Path.GetFileName(exportFile);
+        ExportState.BeginExport(
+            ExportOperationMode.Animator,
+            1,
+            exportFolder,
+            $"Exporting 3D Preview: {fileDisplayName}...");
+        StatusStripUpdate($"Exporting 3D Preview: {fileDisplayName}...");
+
+        bool success = false;
+        string actualExportFile = exportFile;
+        string? errorMessage = null;
+
+        await Task.Run(() =>
+        {
+            try
+            {
+                if (target.SelectedAsset != null && target.SelectedAsset.Asset == null)
+                {
+                    EnsureLazyAssetsLoadedForExport(new List<AssetItem> { target.SelectedAsset });
+                }
+
+                var clipArg = target.AnimationClip != null
+                    ? new[] { target.AnimationClip }
+                    : null;
+
+                if (target.ExportFullModelGroup)
+                {
+                    success = ExportPreviewModelGroupCore(target, clipArg, exportFile);
+                }
+
+                if (!success && target.PrimaryMesh != null && !target.ExportFullModelGroup)
+                {
+                    success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile);
+                }
+                else if (!success && target.ExportFullModelGroup && target.PrimaryMesh != null)
+                {
+                    // Graceful fallback to primary mesh if group metadata could not be materialized.
+                    success = ExportPreviewSingleMeshCore(target.PrimaryMesh, target.Avatar, clipArg, exportFile, out actualExportFile);
+                }
+                else if (!success && target.Avatar != null)
+                {
+                    success = ExportPreviewAvatarRigCore(target.Avatar, clipArg, exportFile);
+                }
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                Logger.Error($"Export 3D preview model failed for {target.SuggestedBaseName}", ex);
+            }
+        });
+
+        if (success)
+        {
+            var exportedName = Path.GetFileName(actualExportFile);
+            var status = $"Finished exporting {exportedName}";
+            ExportState.Complete(1, statusText: status);
+            StatusStripUpdate(status);
+            if (exportOptions.OpenAfterExport && !string.IsNullOrEmpty(exportFolder))
+            {
+                OpenFolder(exportFolder);
+            }
+        }
+        else
+        {
+            var status = errorMessage != null
+                ? $"Error exporting model: {errorMessage}"
+                : $"Could not export active 3D preview ({target.SuggestedBaseName}).";
+            if (errorMessage != null)
+            {
+                ExportState.Fail(status);
+            }
+            else
+            {
+                ExportState.Complete(0, statusText: status);
+            }
+            StatusStripUpdate(status);
+        }
+    }
+
+    private bool ExportPreviewModelGroupCore(
+        PreviewModelExportTarget target,
+        AnimationClip[]? clipArg,
+        string exportFile)
+    {
+        ModelGroupInfo? group = null;
+        var groupParts = new List<ModelGroupMeshInfo>();
+
+        if (!string.IsNullOrWhiteSpace(target.ModelGroupId))
+        {
+            group = LoadModelGroupByIdForPreview(target.ModelGroupId);
+            groupParts = target.CandidateMeshInfos.Count > 0
+                ? target.CandidateMeshInfos.ToList()
+                : LoadModelGroupMeshesForPreview(target.ModelGroupId);
+        }
+
+        if ((group == null || groupParts.Count == 0) && target.Avatar != null)
+        {
+            TryFindModelGroupForAvatar(target.Avatar, out group, out groupParts);
+        }
+
+        if ((group == null || groupParts.Count == 0) && target.PrimaryMesh != null)
+        {
+            TryFindModelGroupForMesh(target.PrimaryMesh, out group, out groupParts);
+        }
+
+        if (group != null && groupParts.Count > 0)
+        {
+            if (ExportResolvedPreviewModelGroup(group, groupParts, target.Avatar, clipArg, exportFile))
+            {
+                return true;
+            }
+        }
+
+        if (target.Avatar != null
+            && TryBuildEagerModelGroupForAvatar(target.Avatar, out var eagerAvatarName, out var eagerAvatarRoot, out var eagerAvatarMeshes, out var eagerAvatarRenderers)
+            && ExportModelGroupFbx(eagerAvatarName, eagerAvatarRoot, eagerAvatarMeshes, eagerAvatarRenderers, target.Avatar, clipArg, exportFile))
+        {
+            return true;
+        }
+
+        if (target.PrimaryMesh != null
+            && TryBuildEagerModelGroupForMesh(target.PrimaryMesh, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers, out var eagerAvatar)
+            && ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, eagerAvatar ?? target.Avatar, clipArg, exportFile))
+        {
+            return true;
+        }
+
+        // Direct candidate meshes fallback (e.g. composite parts loaded in memory without a SQLite group row).
+        var candidateMeshes = target.CandidateMeshes.Count > 0
+            ? target.CandidateMeshes.ToList()
+            : target.CandidateMeshInfos
+                .Select(info => !string.IsNullOrWhiteSpace(info.MeshAssetId) ? ResolveMeshPreviewCandidate(info.MeshAssetId) : null)
+                .Where(m => m != null)
+                .Cast<Mesh>()
+                .ToList();
+
+        if (candidateMeshes.Count > 0)
+        {
+            var resolvedRenderers = new List<Renderer>(candidateMeshes.Count);
+            var partMaterials = new List<IReadOnlyList<Material>>(candidateMeshes.Count);
+            var partNames = new List<string>(candidateMeshes.Count);
+            var partTransforms = new List<float[]?>(candidateMeshes.Count);
+
+            for (var i = 0; i < candidateMeshes.Count; i++)
+            {
+                var mesh = candidateMeshes[i];
+                var info = i < target.CandidateMeshInfos.Count ? target.CandidateMeshInfos[i] : null;
+                var renderer = !string.IsNullOrWhiteSpace(info?.RendererAssetId)
+                    ? ResolvePreviewCandidateAsset(info!.RendererAssetId) as Renderer
+                    : FindSingleRendererForMeshForExport(mesh);
+
+                var materials = FindMaterialsForMesh(mesh);
+                if (assetsManager.LazyLoading)
+                {
+                    EnsureMaterialTexturesLoadedForExport(materials);
+                    if (renderer != null)
+                    {
+                        EnsureRendererMaterialsLoadedForExport(renderer);
+                    }
+                }
+
+                resolvedRenderers.Add(renderer!);
+                partMaterials.Add(materials.Where(m => m != null).Cast<Material>().ToList());
+                partNames.Add(!string.IsNullOrWhiteSpace(info?.GameObjectName) ? info!.GameObjectName : (mesh.m_Name ?? $"Part_{i}"));
+                partTransforms.Add(i < target.CandidateTransforms.Count ? target.CandidateTransforms[i] : info?.TransformMatrix);
+            }
+
+            var groupName = !string.IsNullOrWhiteSpace(target.ModelGroupName)
+                ? target.ModelGroupName
+                : Path.GetFileNameWithoutExtension(exportFile);
+
+            var convert = ModelConverter.CreateFromModelGroup(
+                groupName,
+                rootGameObject: null,
+                candidateMeshes,
+                resolvedRenderers,
+                target.Avatar,
+                clipArg,
+                exportOptions.ConvertTextureFormat,
+                combineMeshes: false,
+                partTransforms: partTransforms!,
+                partMaterials: partMaterials,
+                partNames: partNames);
+            if (convert.MeshList.Count > 0)
+            {
+                AssetExportService.ExportModel(convert, exportFile, exportOptions);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool ExportResolvedPreviewModelGroup(
+        ModelGroupInfo group,
+        IReadOnlyList<ModelGroupMeshInfo> groupMeshes,
+        Avatar? fallbackAvatar,
+        AnimationClip[]? animationClips,
+        string exportFile)
+    {
+        var rootGameObject = !string.IsNullOrWhiteSpace(group.RootGameObjectAssetId)
+            ? ResolvePreviewCandidateAsset(group.RootGameObjectAssetId) as GameObject
+            : null;
+        var animator = !string.IsNullOrWhiteSpace(group.AnimatorAssetId)
+            ? ResolvePreviewCandidateAsset(group.AnimatorAssetId) as Animator
+            : rootGameObject?.m_Animator;
+        if (rootGameObject == null && animator?.m_GameObject != null)
+        {
+            animator.m_GameObject.TryGet(out rootGameObject);
+        }
+
+        // Prefer the resolved root Animator / GameObject via ModelConverter when it captures the full group.
+        if (animator != null)
+        {
+            if (assetsManager.LazyLoading && rootGameObject != null)
+            {
+                var subMeshes = new List<Mesh>();
+                var subRenderers = new List<Renderer>();
+                AssetExportService.CollectSubtreeMeshesAndRenderers(rootGameObject, subMeshes, subRenderers);
+                for (var i = 0; i < subRenderers.Count; i++)
+                {
+                    EnsureRendererMaterialsLoadedForExport(subRenderers[i]);
+                }
+            }
+
+            var directConvert = new ModelConverter(animator, exportOptions.ConvertTextureFormat, animationClips);
+            if (directConvert.MeshList.Count >= Math.Max(1, groupMeshes.Count))
+            {
+                AssetExportService.ExportModel(directConvert, exportFile, exportOptions);
+                return true;
+            }
+        }
+
+        // Fall back to composite ModelConverter.CreateFromModelGroup so cross-file / supplemental parts are always included.
+        var avatar = !string.IsNullOrWhiteSpace(group.AvatarAssetId)
+            ? ResolveAvatarPreviewCandidate(group.AvatarAssetId)
+            : null;
+        if (avatar == null && animator?.m_Avatar != null)
+        {
+            animator.m_Avatar.TryGet(out avatar);
+        }
+        avatar ??= fallbackAvatar;
+
+        var resolvedMeshes = new List<Mesh>(groupMeshes.Count);
+        var resolvedRenderers = new List<Renderer>(groupMeshes.Count);
+        var partTransforms = new List<float[]?>(groupMeshes.Count);
+        var partMaterials = new List<IReadOnlyList<Material>>(groupMeshes.Count);
+        var partNames = new List<string>(groupMeshes.Count);
+
+        for (var i = 0; i < groupMeshes.Count; i++)
+        {
+            var part = groupMeshes[i];
+            if (string.IsNullOrWhiteSpace(part.MeshAssetId))
+            {
+                continue;
+            }
+
+            var mesh = ResolveMeshPreviewCandidate(part.MeshAssetId);
+            if (mesh == null)
+            {
+                continue;
+            }
+
+            var renderer = !string.IsNullOrWhiteSpace(part.RendererAssetId)
+                ? ResolvePreviewCandidateAsset(part.RendererAssetId) as Renderer
+                : null;
+
+            var materials = FindMaterialsForMesh(mesh);
+            if (assetsManager.LazyLoading)
+            {
+                EnsureMaterialTexturesLoadedForExport(materials);
+                if (renderer != null)
+                {
+                    EnsureRendererMaterialsLoadedForExport(renderer);
+                }
+            }
+
+            resolvedMeshes.Add(mesh);
+            resolvedRenderers.Add(renderer!);
+            partTransforms.Add(part.TransformMatrix);
+            partMaterials.Add(materials.Where(m => m != null).Cast<Material>().ToList());
+            partNames.Add(!string.IsNullOrWhiteSpace(part.GameObjectName) ? part.GameObjectName : mesh.m_Name ?? $"Part_{i}");
+        }
+
+        if (resolvedMeshes.Count == 0 && rootGameObject == null)
+        {
+            return false;
+        }
+
+        var groupName = !string.IsNullOrWhiteSpace(group.GroupName)
+            ? group.GroupName
+            : !string.IsNullOrWhiteSpace(group.RootGameObjectName)
+                ? group.RootGameObjectName
+                : Path.GetFileNameWithoutExtension(exportFile);
+
+        var convert = ModelConverter.CreateFromModelGroup(
+            groupName,
+            rootGameObject,
+            resolvedMeshes,
+            resolvedRenderers,
+            avatar,
+            animationClips,
+            exportOptions.ConvertTextureFormat,
+            combineMeshes: false,
+            partTransforms: partTransforms!,
+            partMaterials: partMaterials,
+            partNames: partNames);
+        if (convert.MeshList.Count == 0)
+        {
+            return false;
+        }
+
+        AssetExportService.ExportModel(convert, exportFile, exportOptions);
+        return true;
+    }
+
+    private bool ExportPreviewSingleMeshCore(
+        Mesh mesh,
+        Avatar? avatar,
+        AnimationClip[]? clipArg,
+        string exportFile,
+        out string actualExportFile)
+    {
+        actualExportFile = exportFile;
+        mesh.EnsureProcessed();
+
+        var materials = FindMaterialsForMesh(mesh);
+        var renderer = FindSingleRendererForMeshForExport(mesh);
+        if (assetsManager.LazyLoading)
+        {
+            EnsureMaterialTexturesLoadedForExport(materials);
+            if (renderer != null)
+            {
+                EnsureRendererMaterialsLoadedForExport(renderer);
+            }
+        }
+
+        var nonNullMaterials = materials.Where(m => m != null).Cast<Material>().ToList();
+        var meshName = !string.IsNullOrWhiteSpace(mesh.m_Name)
+            ? mesh.m_Name
+            : Path.GetFileNameWithoutExtension(exportFile);
+
+        if (!string.Equals(Path.GetExtension(exportFile), ".obj", StringComparison.OrdinalIgnoreCase))
+        {
+            var convert = ModelConverter.CreateFromModelGroup(
+                meshName,
+                rootGameObject: null,
+                new[] { mesh },
+                renderer != null ? new[] { renderer } : null,
+                avatar,
+                clipArg,
+                exportOptions.ConvertTextureFormat,
+                combineMeshes: false,
+                partTransforms: new float[]?[] { null }!,
+                partMaterials: new IReadOnlyList<Material>[] { nonNullMaterials },
+                partNames: new[] { meshName });
+            if (convert.MeshList.Count > 0)
+            {
+                AssetExportService.ExportModel(convert, exportFile, exportOptions);
+                return true;
+            }
+        }
+
+        var objPath = string.Equals(Path.GetExtension(exportFile), ".obj", StringComparison.OrdinalIgnoreCase)
+            ? exportFile
+            : Path.ChangeExtension(exportFile, ".obj");
+        if (AssetExportService.ExportMeshToObj(mesh, objPath))
+        {
+            actualExportFile = objPath;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool ExportPreviewAvatarRigCore(Avatar avatar, AnimationClip[]? clipArg, string exportFile)
+    {
+        if (TryFindModelGroupForAvatar(avatar, out var avatarGroup, out var avatarGroupParts)
+            && avatarGroup != null
+            && avatarGroupParts.Count > 0)
+        {
+            return ExportResolvedPreviewModelGroup(avatarGroup, avatarGroupParts, avatar, clipArg, exportFile);
+        }
+
+        if (TryBuildEagerModelGroupForAvatar(avatar, out var eagerName, out var eagerRoot, out var eagerMeshes, out var eagerRenderers))
+        {
+            return ExportModelGroupFbx(eagerName, eagerRoot, eagerMeshes, eagerRenderers, avatar, clipArg, exportFile);
+        }
+
+        var loadedFiles = GetLoadedFilesSnapshot();
+        for (var f = 0; f < loadedFiles.Count; f++)
+        {
+            var file = loadedFiles[f];
+            if (file == null) continue;
+            AssetStudio.Object[] objs;
+            lock (file)
+            {
+                objs = file.Objects.ToArray();
+            }
+
+            for (var i = 0; i < objs.Length; i++)
+            {
+                if (objs[i] is Animator animator
+                    && animator.m_Avatar != null
+                    && animator.m_Avatar.TryGet(out var animAvatar)
+                    && AreSamePreviewObject(animAvatar, avatar))
+                {
+                    var convert = new ModelConverter(animator, exportOptions.ConvertTextureFormat, clipArg);
+                    if (convert.MeshList.Count > 0)
+                    {
+                        AssetExportService.ExportModel(convert, exportFile, exportOptions);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private Renderer? FindSingleRendererForMeshForExport(Mesh mesh)
+    {
+        var loadedFiles = GetLoadedFilesSnapshot();
+        for (var f = 0; f < loadedFiles.Count; f++)
+        {
+            var file = loadedFiles[f];
+            if (file == null) continue;
+            AssetStudio.Object[] objs;
+            lock (file)
+            {
+                objs = file.Objects.ToArray();
+            }
+
+            for (var i = 0; i < objs.Length; i++)
+            {
+                if (objs[i] is SkinnedMeshRenderer smr
+                    && smr.m_Mesh != null
+                    && smr.m_Mesh.TryGet(out var smrMesh)
+                    && AreSamePreviewObject(smrMesh, mesh))
+                {
+                    return smr;
+                }
+
+                if (objs[i] is MeshFilter mf
+                    && mf.m_Mesh != null
+                    && mf.m_Mesh.TryGet(out var mfMesh)
+                    && AreSamePreviewObject(mfMesh, mesh)
+                    && mf.m_GameObject != null
+                    && mf.m_GameObject.TryGet(out var mfGo)
+                    && mfGo?.m_MeshRenderer != null)
+                {
+                    return mfGo.m_MeshRenderer;
+                }
+            }
+        }
+
+        return null;
+    }
+
     internal async Task ExportSelectedModelGroupFbxAsync()
     {
         var selectedAssets = GetSelectedAssets();

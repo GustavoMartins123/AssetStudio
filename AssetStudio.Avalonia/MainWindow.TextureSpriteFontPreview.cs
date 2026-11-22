@@ -4,6 +4,7 @@ using AssetStudio.Avalonia.ViewModels;
 using SkiaSharp;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -33,24 +34,7 @@ public partial class MainWindow
         PreviewSession.ActivateSurface(PreviewSurfaceKind.Font, assetItem, isLoading: true);
         if (m_Font.m_FontData == null || m_Font.m_FontData.Length == 0)
         {
-            StatusStripUpdate("Font has no embedded binary data.");
-            var sb = new StringBuilder();
-            sb.AppendLine($"Font: {m_Font.m_Name}");
-            sb.AppendLine("Format: System or Custom Reference (No embedded data)");
-            sb.AppendLine("Data size: 0 bytes");
-            sb.AppendLine();
-            sb.AppendLine("This font asset does not contain embedded TrueType/OpenType binary data.");
-            sb.AppendLine("It may reference a system-installed font or use custom character textures.");
-            sb.AppendLine();
-            sb.AppendLine("Raw metadata export is still available.");
-
-            PreviewSession.ShowTextPreview(sb.ToString(), PreviewSurfaceKind.Font, assetItem);
-            SetTextWithTruncation(TextPreviewBox, sb.ToString());
-            ImagePreviewBox.IsVisible = false;
-            TextPreviewBox.IsVisible = true;
-            PreviewLabel.IsVisible = false;
-            ClearPreviewInfoOverlay();
-            ClearPreviewCacheBadge();
+            PreviewLegacyBitmapOrSystemFont(assetItem, m_Font);
             return;
         }
 
@@ -79,6 +63,7 @@ public partial class MainWindow
                 {
                     if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                     {
+                        PreviewSession.IsLoading = false;
                         ImagePreviewBox.Source = fontPreview.Bitmap;
                         ImagePreviewBox.IsVisible = true;
                         TextPreviewBox.IsVisible = false;
@@ -102,6 +87,7 @@ public partial class MainWindow
                 {
                     if (IsPreviewRequestCurrent(requestId, previewVersion, token))
                     {
+                        PreviewSession.ShowTextPreview(fallbackText, PreviewSurfaceKind.Font, assetItem, truncate: false);
                         TextPreviewBox.Text = fallbackText;
                         ImagePreviewBox.IsVisible = false;
                         TextPreviewBox.IsVisible = true;
@@ -112,6 +98,217 @@ public partial class MainWindow
                 });
             }
         }, token);
+    }
+
+    private void PreviewLegacyBitmapOrSystemFont(AssetItem assetItem, AssetStudio.Font m_Font)
+    {
+        Interlocked.Increment(ref texturePreviewIdCounter);
+        var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        ClearPreviewCacheBadge();
+        StatusStripUpdate("Loading legacy font atlas & metadata...");
+
+        _ = Task.Run(() =>
+        {
+            TexturePreviewImageResult? previewImage = null;
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                Texture2D? atlasTexture = ResolveLegacyFontAtlasTexture(m_Font);
+                token.ThrowIfCancellationRequested();
+
+                string? atlasError = null;
+                if (atlasTexture != null)
+                {
+                    try
+                    {
+                        SetActivePreviewDependencyFiles(m_Font, atlasTexture);
+                        previewImage = LoadTexturePreviewThumbnail(atlasTexture, MaxInlinePreviewTextureDimension);
+                        var image = previewImage?.Image;
+                        if (image != null)
+                        {
+                            FontAssetPreviewRenderer.EnhanceFontAtlasVisibility(image);
+                            token.ThrowIfCancellationRequested();
+                            var bitmap = CreateWriteableBitmapFromSKBitmap(image);
+                            var infoText = FontAssetPreviewRenderer.BuildLegacyFontInfoText(m_Font, atlasTexture);
+
+                            if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+                            {
+                                bitmap.Dispose();
+                                return;
+                            }
+
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                if (IsPreviewRequestCurrent(requestId, previewVersion, token))
+                                {
+                                    PreviewSession.IsLoading = false;
+                                    ImagePreviewBox.Source = bitmap;
+                                    ImagePreviewBox.IsVisible = true;
+                                    TextPreviewBox.IsVisible = false;
+                                    PreviewLabel.IsVisible = false;
+                                    SetPreviewInfoOverlay(infoText);
+                                    StatusStripUpdate($"Legacy bitmap font loaded: {m_Font.m_Name} ({atlasTexture.m_Width}x{atlasTexture.m_Height})");
+                                }
+                                else
+                                {
+                                    bitmap.Dispose();
+                                }
+                            });
+                            return;
+                        }
+
+                        atlasError = $"Atlas texture '{atlasTexture.m_Name}' ({atlasTexture.m_TextureFormat}) could not be decoded.";
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        atlasError = ex.Message;
+                    }
+                }
+
+                var fallbackText = TruncatePreviewText(FontAssetPreviewRenderer.BuildLegacyFontFallbackText(m_Font, atlasError));
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        PreviewSession.ShowTextPreview(fallbackText, PreviewSurfaceKind.Font, assetItem, truncate: false);
+                        TextPreviewBox.Text = fallbackText;
+                        ImagePreviewBox.IsVisible = false;
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
+                        ClearPreviewInfoOverlay();
+                        StatusStripUpdate(atlasError != null
+                            ? $"Legacy font metadata loaded ({atlasError})."
+                            : "Legacy system/custom font metadata loaded (no bitmap atlas).");
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                var fallbackText = TruncatePreviewText(FontAssetPreviewRenderer.BuildLegacyFontFallbackText(m_Font, ex.Message));
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsPreviewRequestCurrent(requestId, previewVersion, token))
+                    {
+                        PreviewSession.ShowTextPreview(fallbackText, PreviewSurfaceKind.Font, assetItem, truncate: false);
+                        TextPreviewBox.Text = fallbackText;
+                        ImagePreviewBox.IsVisible = false;
+                        TextPreviewBox.IsVisible = true;
+                        PreviewLabel.IsVisible = false;
+                        ClearPreviewInfoOverlay();
+                        StatusStripUpdate($"Legacy font preview error: {ex.Message}");
+                    }
+                });
+            }
+            finally
+            {
+                previewImage?.Dispose();
+            }
+        }, token);
+    }
+
+    private Texture2D? ResolveLegacyFontAtlasTexture(AssetStudio.Font m_Font)
+    {
+        if (m_Font.m_Texture != null && !m_Font.m_Texture.IsNull)
+        {
+            if (m_Font.m_Texture.TryGet<Texture2D>(out var directTex) && directTex != null)
+            {
+                return directTex;
+            }
+
+            var resolved = ResolveTexturePPtrForOwnerPreview(m_Font, m_Font.m_Texture);
+            if (resolved != null)
+            {
+                return resolved;
+            }
+        }
+
+        if (m_Font.m_DefaultMaterial != null && !m_Font.m_DefaultMaterial.IsNull)
+        {
+            if (m_Font.m_DefaultMaterial.TryGet(out var defaultMat) && defaultMat != null)
+            {
+                var matTex = FindTextureForMaterial(defaultMat);
+                if (matTex != null)
+                {
+                    return matTex;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private Texture2D? ResolveTexturePPtrForOwnerPreview(AssetStudio.Object owner, PPtr<Texture> textureRef)
+    {
+        if (owner?.assetsFile == null || textureRef == null || textureRef.IsNull)
+        {
+            return null;
+        }
+
+        if (textureRef.TryGet<Texture2D>(out var directTex) && directTex != null)
+        {
+            return directTex;
+        }
+
+        if (!assetsManager.LazyLoading)
+        {
+            return null;
+        }
+
+        if (textureRef.TryGetAssetsFile(out var loadedSourceFile) && loadedSourceFile != null)
+        {
+            var handle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(loadedSourceFile, textureRef.m_PathID));
+            if (handle != null && handle.Type == ClassIDType.Texture2D)
+            {
+                return ResolveSemanticRelationHandleForPreview(handle) as Texture2D;
+            }
+        }
+
+        var candidateFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (textureRef.m_FileID == 0)
+        {
+            if (!string.IsNullOrWhiteSpace(owner.assetsFile.fileName))
+            {
+                candidateFileNames.Add(owner.assetsFile.fileName);
+            }
+        }
+        else if (textureRef.m_FileID > 0
+            && owner.assetsFile.m_Externals != null
+            && textureRef.m_FileID - 1 < owner.assetsFile.m_Externals.Count)
+        {
+            var external = owner.assetsFile.m_Externals[textureRef.m_FileID - 1];
+            AddCandidateFileName(candidateFileNames, external.fileName);
+            AddCandidateFileName(candidateFileNames, external.pathName);
+
+            if (assetsManager.TryFindSerializedFile(external.fileName, external.pathName, out var sourceFile) && sourceFile != null)
+            {
+                AddCandidateFileName(candidateFileNames, sourceFile.fileName);
+                var handle = assetsManager.ProjectIndex.GetHandle(AssetHandle.BuildUniqueID(sourceFile, textureRef.m_PathID));
+                if (handle != null && handle.Type == ClassIDType.Texture2D)
+                {
+                    return ResolveSemanticRelationHandleForPreview(handle) as Texture2D;
+                }
+            }
+        }
+
+        foreach (var fileName in candidateFileNames)
+        {
+            var handle = assetsManager.ProjectIndex
+                .GetHandlesForFile(fileName)
+                .FirstOrDefault(candidate => candidate.PathID == textureRef.m_PathID && candidate.Type == ClassIDType.Texture2D);
+            if (handle != null)
+            {
+                return ResolveSemanticRelationHandleForPreview(handle) as Texture2D;
+            }
+        }
+
+        return null;
     }
 
     private static void ApplyPreviewChannelMask(SKBitmap image, bool[] channels, int validChannel)

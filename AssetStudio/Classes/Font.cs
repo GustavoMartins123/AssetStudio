@@ -7,22 +7,32 @@ namespace AssetStudio
 {
     public sealed class Font : NamedObject
     {
+        public float m_LineSpacing;
+        public PPtr<Material>? m_DefaultMaterial;
+        public float m_FontSize;
+        public PPtr<Texture>? m_Texture;
+        public int m_AsciiStartOffset;
+        public int m_CharacterRectCount;
+        public float m_PixelScale;
         public byte[]? m_FontData;
+        public string[]? m_FontNames;
 
         public Font(ObjectReader reader) : base(reader)
         {
+            var objectEnd = reader.byteStart + reader.byteSize;
             if ((version[0] == 5 && version[1] >= 5) || version[0] > 5)//5.5 and up
             {
-                var m_LineSpacing = reader.ReadSingle();
-                var m_DefaultMaterial = new PPtr<Material>(reader);
-                var m_FontSize = reader.ReadSingle();
-                var m_Texture = new PPtr<Texture>(reader);
-                int m_AsciiStartOffset = reader.ReadInt32();
+                m_LineSpacing = reader.ReadSingle();
+                m_DefaultMaterial = new PPtr<Material>(reader);
+                m_FontSize = reader.ReadSingle();
+                m_Texture = new PPtr<Texture>(reader);
+                m_AsciiStartOffset = reader.ReadInt32();
                 var m_Tracking = reader.ReadSingle();
                 var m_CharacterSpacing = reader.ReadInt32();
                 var m_CharacterPadding = reader.ReadInt32();
                 var m_ConvertCase = reader.ReadInt32();
                 int m_CharacterRects_size = reader.ReadInt32();
+                m_CharacterRectCount = Math.Max(0, m_CharacterRects_size);
                 for (int i = 0; i < m_CharacterRects_size; i++)
                 {
                     reader.Position += 44;//CharacterInfo data 41
@@ -32,16 +42,18 @@ namespace AssetStudio
                 {
                     reader.Position += 8;
                 }
-                var m_PixelScale = reader.ReadSingle();
+                m_PixelScale = reader.ReadSingle();
                 int m_FontData_size = reader.ReadInt32();
                 if (m_FontData_size > 0)
                 {
                     m_FontData = reader.ReadBytes(m_FontData_size);
                 }
+
+                TryReadTrailingFontNames(reader, objectEnd, hasDescent: true);
             }
             else
             {
-                int m_AsciiStartOffset = reader.ReadInt32();
+                m_AsciiStartOffset = reader.ReadInt32();
 
                 if (version[0] <= 3)
                 {
@@ -50,7 +62,7 @@ namespace AssetStudio
                 }
 
                 float m_Kerning = reader.ReadSingle();
-                float m_LineSpacing = reader.ReadSingle();
+                m_LineSpacing = reader.ReadSingle();
 
                 if (version[0] <= 3)
                 {
@@ -68,9 +80,10 @@ namespace AssetStudio
                 }
 
                 int m_ConvertCase = reader.ReadInt32();
-                var m_DefaultMaterial = new PPtr<Material>(reader);
+                m_DefaultMaterial = new PPtr<Material>(reader);
 
                 int m_CharacterRects_size = reader.ReadInt32();
+                m_CharacterRectCount = Math.Max(0, m_CharacterRects_size);
                 for (int i = 0; i < m_CharacterRects_size; i++)
                 {
                     int index = reader.ReadInt32();
@@ -93,7 +106,7 @@ namespace AssetStudio
                     }
                 }
 
-                var m_Texture = new PPtr<Texture>(reader);
+                m_Texture = new PPtr<Texture>(reader);
 
                 int m_KerningValues_size = reader.ReadInt32();
                 for (int i = 0; i < m_KerningValues_size; i++)
@@ -108,13 +121,81 @@ namespace AssetStudio
                     var m_GridFont = reader.ReadBoolean();
                     reader.AlignStream();
                 }
-                else { float m_PixelScale = reader.ReadSingle(); }
+                else { m_PixelScale = reader.ReadSingle(); }
 
                 int m_FontData_size = reader.ReadInt32();
                 if (m_FontData_size > 0)
                 {
                     m_FontData = reader.ReadBytes(m_FontData_size);
                 }
+
+                if (version[0] >= 4)
+                {
+                    var hasDescent = version[0] > 5 || (version[0] == 5 && version[1] >= 4);
+                    TryReadTrailingFontNames(reader, objectEnd, hasDescent);
+                }
+            }
+        }
+
+        private void TryReadTrailingFontNames(ObjectReader reader, long objectEnd, bool hasDescent)
+        {
+            try
+            {
+                if (reader.Position >= objectEnd)
+                {
+                    return;
+                }
+
+                reader.AlignStream();
+                var headerBytes = hasDescent ? 16 : 12; // m_Ascent, [m_Descent], m_DefaultStyle, m_FontNames.size
+                if (reader.Position + headerBytes > objectEnd)
+                {
+                    return;
+                }
+
+                var m_Ascent = reader.ReadSingle();
+                if (hasDescent)
+                {
+                    var m_Descent = reader.ReadSingle();
+                }
+                var m_DefaultStyle = reader.ReadUInt32();
+                var fontNamesCount = reader.ReadInt32();
+                if (fontNamesCount <= 0 || fontNamesCount > 64)
+                {
+                    return;
+                }
+
+                var names = new List<string>(fontNamesCount);
+                for (var i = 0; i < fontNamesCount; i++)
+                {
+                    if (reader.Position + 4 > objectEnd)
+                    {
+                        return;
+                    }
+
+                    var len = reader.ReadInt32();
+                    if (len < 0 || len > 1024 || reader.Position + len > objectEnd)
+                    {
+                        return;
+                    }
+
+                    var bytes = reader.ReadBytes(len);
+                    reader.AlignStream();
+                    var name = Encoding.UTF8.GetString(bytes).Trim();
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        names.Add(name);
+                    }
+                }
+
+                if (names.Count > 0)
+                {
+                    m_FontNames = names.ToArray();
+                }
+            }
+            catch
+            {
+                // Optional trailing Font metadata varies across Unity versions; ignore safely if unavailable.
             }
         }
     }

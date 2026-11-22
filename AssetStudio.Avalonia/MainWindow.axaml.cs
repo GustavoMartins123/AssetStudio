@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private Sprite? currentPreviewSprite;
     private Mesh? currentPreviewMesh;
     private Avatar? currentPreviewAvatar;
+    private AnimationClip? currentPreviewAnimationClip;
     private VideoClip? currentPreviewVideoClip;
     private bool useGpuTexturePreview = true;
     private readonly bool[] textureChannels = new bool[4] { true, true, true, true };
@@ -437,6 +438,8 @@ public partial class MainWindow : Window
         handlers.RotateMeshUp = ExecuteRotateMeshUp;
         handlers.RotateMeshDown = ExecuteRotateMeshDown;
         handlers.ResetMeshMaterialColor = ExecuteResetMeshMaterialColor;
+        handlers.ExportPreviewModelAsync = ExportPreviewModelCommandHandlerAsync;
+        handlers.NavigateToReferencedAssetAsync = NavigateToReferencedAssetCommandHandlerAsync;
 
         handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;
         handlers.VideoStopAsync = VideoStopAsync;
@@ -2051,6 +2054,7 @@ public partial class MainWindow : Window
         CancelPendingPreview();
         _previewRequestCoordinator.CancelCurrent();
         _dumpRequestCoordinator.CancelCurrent();
+        _referencesRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         lock (preloaderLock)
         {
@@ -2107,6 +2111,7 @@ public partial class MainWindow : Window
         _videoPreviewLoadCts = null;
         _previewRequestCoordinator.CancelCurrent();
         _dumpRequestCoordinator.CancelCurrent();
+        _referencesRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         _animationRigPreviewCache.Clear();
         treeSearchSession.Invalidate();

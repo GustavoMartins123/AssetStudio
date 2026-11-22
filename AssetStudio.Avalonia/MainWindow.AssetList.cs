@@ -306,12 +306,18 @@ public partial class MainWindow
                     {
                         _ = UpdateDumpForSelectedAsset();
                     }
+                    else if (RightTabControl.SelectedIndex == 2)
+                    {
+                        _ = UpdateReferencesForSelectedAssetAsync();
+                    }
                     QueuePreviewAsset(newSelectedItem);
                 }
                 else
                 {
                     _dumpRequestCoordinator.CancelCurrent();
+                    _referencesRequestCoordinator.CancelCurrent();
                     PreviewSession.DumpTextContent = string.Empty;
+                    PreviewSession.ClearReferences();
                     CancelPendingPreview();
                     ClearPreview("Preview Panel");
                 }

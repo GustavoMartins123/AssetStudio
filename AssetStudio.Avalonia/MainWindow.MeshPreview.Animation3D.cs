@@ -634,7 +634,7 @@ public partial class MainWindow
                         return;
                     }
 
-                    ApplyPreparedAnimationClipPreviewOnUI(outcome, rebuildCandidateControls);
+                    ApplyPreparedAnimationClipPreviewOnUI(clip, outcome, rebuildCandidateControls);
                 });
             }
             catch (OperationCanceledException)
@@ -669,6 +669,7 @@ public partial class MainWindow
     }
 
     private void ApplyPreparedAnimationClipPreviewOnUI(
+        AnimationClip clip,
         PreparedAnimationClipPreviewOutcome outcome,
         bool rebuildCandidateControls)
     {
@@ -701,6 +702,7 @@ public partial class MainWindow
                 avatarName: outcome.Avatar?.m_Name);
             currentPreviewAvatar = outcome.Avatar;
             currentPreviewMesh = outcome.Mesh;
+            currentPreviewAnimationClip = clip;
             ClearMeshMaterialControls();
             GLPreviewControl.ApplyPreparedAvatarPreview(outcome.GlData);
             GLPreviewControl.IsVisible = true;
@@ -756,6 +758,7 @@ public partial class MainWindow
         {
             currentPreviewAvatar = null;
             currentPreviewMesh = null;
+            currentPreviewAnimationClip = null;
             ClearMeshMaterialControls();
             if (GLPreviewControl != null)
             {

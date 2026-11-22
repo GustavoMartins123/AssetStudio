@@ -406,6 +406,23 @@ public partial class MainWindow
         return _sqliteCache.LoadModelGroupMeshes(folderPath, signature, groupId);
     }
 
+    private ModelGroupInfo? LoadModelGroupByIdForPreview(string groupId)
+    {
+        if (!assetsManager.LazyLoading || currentScanResult == null || string.IsNullOrWhiteSpace(groupId))
+        {
+            return null;
+        }
+
+        var folderPath = GetCurrentCacheFolderPath();
+        if (!CanUseLazySemanticRelationCache(folderPath))
+        {
+            return null;
+        }
+
+        var signature = _sqliteCache.GetFolderSignature(currentScanResult);
+        return _sqliteCache.LoadModelGroupById(folderPath, signature, groupId);
+    }
+
     private static ModelGroupMeshInfo? SelectRepresentativeModelGroupMesh(IReadOnlyList<ModelGroupMeshInfo> meshes)
     {
         return meshes
@@ -532,6 +549,11 @@ public partial class MainWindow
         var meshPreviewId = texturePreviewIdCounter;
         var localAssetItem = AssetListDataGrid.SelectedItem as AssetItem;
         var includeMeshInfo = ViewModel.Options.DisplayInfo;
+        PreviewSession.ActivateSurface(
+            ViewModels.PreviewSurfaceKind.Mesh3D,
+            localAssetItem,
+            isLoading: true,
+            loadingStatusText: $"Preparing model group preview ({meshes.Count:N0} parts)...");
         PreviewLabel.IsVisible = false;
         StatusStripUpdate($"Preparing model group preview ({meshes.Count:N0} parts)...");
         if (includeMeshInfo)
@@ -766,6 +788,7 @@ public partial class MainWindow
                     }
 
                     _activeMeshMaterialsLoading = false;
+                    PreviewSession.IsLoading = false;
                     UpdatePreviewCacheBadge(
                         fromCache: _activeMeshGeometryFromCache,
                         sourceKind: _activeMeshBadgeSourceKind ?? "model-group",
@@ -784,6 +807,7 @@ public partial class MainWindow
                     if (meshPreviewId == texturePreviewIdCounter)
                     {
                         _activeMeshMaterialsLoading = false;
+                        PreviewSession.IsLoading = false;
                         ClearPreviewCacheBadge();
                         StatusStripUpdate($"Model group preview error: {ex.Message}");
                     }

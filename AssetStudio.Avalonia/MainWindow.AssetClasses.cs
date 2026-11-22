@@ -166,7 +166,7 @@ public partial class MainWindow
             _suppressNextRightTabSelectionPreview = true;
             RightTabControl.SelectedIndex = 0;
         }
-        PreviewSession.IsDumpTabActive = false;
+        PreviewSession.ActiveRightTab = ViewModels.RightPanelTab.Preview;
         ClearTextAssetPreview();
         TextPreviewBox.Text = FormatAssetClass(item);
         TextPreviewBox.IsVisible = true;

@@ -19,6 +19,7 @@ public partial class MainWindow
         HideProjectAnalysisBanner();
         _previewRequestCoordinator.CancelCurrent();
         _dumpRequestCoordinator.CancelCurrent();
+        _referencesRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         _animationRigPreviewCache.Clear();
         treeSearchSession.Invalidate();
@@ -196,6 +197,7 @@ public partial class MainWindow
         Volatile.Write(ref _spriteDependenciesLoadedFor, null);
         currentPreviewMesh = null;
         currentPreviewAvatar = null;
+        currentPreviewAnimationClip = null;
         currentPreviewAudioClip = null;
         currentPreviewVideoClip = null;
         _previewRequestCoordinator.CancelCurrent();

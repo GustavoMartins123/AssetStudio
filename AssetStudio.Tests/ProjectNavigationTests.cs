@@ -187,6 +187,7 @@ namespace AssetStudio.Tests
                     Type t when t == typeof(Action<int>) => (Action<int>)(_ => { }),
                     Type t when t == typeof(Action<bool>) => (Action<bool>)(_ => { }),
                     Type t when t == typeof(Action<PreviewChannelMask>) => (Action<PreviewChannelMask>)(_ => { }),
+                    Type t when t == typeof(Func<AssetStudio.Avalonia.Services.AssetReferenceItem?, Task>) => (Func<AssetStudio.Avalonia.Services.AssetReferenceItem?, Task>)(_ => Task.CompletedTask),
                     _ => throw new InvalidOperationException($"Unexpected command handler delegate type: {prop.PropertyType.FullName}")
                 };
 
