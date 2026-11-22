@@ -218,7 +218,7 @@ namespace AssetStudio.Avalonia.Services
                 return ModelExportFormat.Fbx;
             }
 
-            return exportOptions?.ModelFormat ?? ModelExportFormat.Fbx;
+            return exportOptions?.ModelFormat ?? ModelExportFormat.Glb;
         }
     }
 }

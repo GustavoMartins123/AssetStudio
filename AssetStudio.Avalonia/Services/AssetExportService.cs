@@ -2230,7 +2230,7 @@ namespace AssetStudio.Avalonia.Services
         }
 
         public static string GetModelFileExtension(ExportOptionsState? exportOptions)
-            => ModelExporter.GetModelFileExtension(exportOptions?.ModelFormat ?? ModelExportFormat.Fbx);
+            => ModelExporter.GetModelFileExtension(exportOptions?.ModelFormat ?? ModelExportFormat.Glb);
 
         private static ModelExportFormat ResolveModelExportFormat(string exportFile, ExportOptionsState exportOptions)
         {

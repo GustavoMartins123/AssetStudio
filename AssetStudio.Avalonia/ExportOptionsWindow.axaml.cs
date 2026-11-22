@@ -29,7 +29,7 @@ public sealed class ExportOptionsState
     public bool CombineMeshes { get; set; } = false;
     public decimal BoneSize { get; set; } = 10m;
     public decimal ScaleFactor { get; set; } = 1m;
-    public ModelExportFormat ModelFormat { get; set; } = ModelExportFormat.Fbx;
+    public ModelExportFormat ModelFormat { get; set; } = ModelExportFormat.Glb;
     public int FbxVersion { get; set; } = 3;
     public int FbxFormat { get; set; } = 0;
     public bool ExportUnityMeta { get; set; } = true;

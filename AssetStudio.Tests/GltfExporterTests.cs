@@ -237,19 +237,19 @@ namespace AssetStudio.Tests
         public void ExportOptionsViewModel_ModelFormat_BindsSavesResetsAndTogglesFbxControls()
         {
             var state = new ExportOptionsState();
-            Assert.Equal(ModelExportFormat.Fbx, state.ModelFormat);
+            Assert.Equal(ModelExportFormat.Glb, state.ModelFormat);
 
             var vm = new ExportOptionsViewModel(state);
             Assert.Equal(3, vm.ModelFormatOptions.Count);
-            Assert.Equal(0, vm.ModelFormatIndex);
-            Assert.True(vm.IsFbxFormatSelected);
+            Assert.Equal(1, vm.ModelFormatIndex);
+            Assert.False(vm.IsFbxFormatSelected);
 
             var changedProps = new List<string>();
             vm.PropertyChanged += (_, e) => { if (e.PropertyName != null) changedProps.Add(e.PropertyName); };
 
-            vm.ModelFormatIndex = 1; // GLB
-            Assert.Equal(ModelExportFormat.Glb, vm.ModelFormat);
-            Assert.False(vm.IsFbxFormatSelected);
+            vm.ModelFormatIndex = 0; // FBX
+            Assert.Equal(ModelExportFormat.Fbx, vm.ModelFormat);
+            Assert.True(vm.IsFbxFormatSelected);
             Assert.Contains(nameof(ExportOptionsViewModel.IsFbxFormatSelected), changedProps);
 
             vm.ModelFormat = ModelExportFormat.Gltf;
@@ -263,20 +263,20 @@ namespace AssetStudio.Tests
             Assert.Equal(ModelExportFormat.Fbx, vm.ModelFormat);
             Assert.True(vm.IsFbxFormatSelected);
 
-            // Save GLB to target state
-            vm.ModelFormat = ModelExportFormat.Glb;
+            // Save Fbx to target state
+            vm.ModelFormat = ModelExportFormat.Fbx;
             vm.SaveCommand.Execute(null);
-            Assert.Equal(ModelExportFormat.Glb, state.ModelFormat);
+            Assert.Equal(ModelExportFormat.Fbx, state.ModelFormat);
 
             // Clone / CopyFrom preserves ModelFormat
             var copy = new ExportOptionsState();
             copy.CopyFrom(state);
-            Assert.Equal(ModelExportFormat.Glb, copy.ModelFormat);
+            Assert.Equal(ModelExportFormat.Fbx, copy.ModelFormat);
 
-            // ResetDefaults restores Fbx
+            // ResetDefaults restores Glb
             vm.ResetDefaultsCommand.Execute(null);
-            Assert.Equal(ModelExportFormat.Fbx, vm.ModelFormat);
-            Assert.True(vm.IsFbxFormatSelected);
+            Assert.Equal(ModelExportFormat.Glb, vm.ModelFormat);
+            Assert.False(vm.IsFbxFormatSelected);
         }
 
         [Theory]

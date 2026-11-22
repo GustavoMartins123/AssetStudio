@@ -145,6 +145,8 @@ namespace AssetStudio.Tests
             Assert.Equal(ModelExportFormat.Gltf, PreviewModelExportHelper.ResolveEffectiveFormat("C:/out/model.gltf", fbxOptions));
             Assert.Equal(ModelExportFormat.Fbx, PreviewModelExportHelper.ResolveEffectiveFormat("C:/out/model.fbx", glbOptions));
             Assert.Equal(ModelExportFormat.Glb, PreviewModelExportHelper.ResolveEffectiveFormat("C:/out/model", glbOptions));
+            Assert.Equal(ModelExportFormat.Glb, PreviewModelExportHelper.ResolveEffectiveFormat("C:/out/model", null));
+            Assert.Equal(".glb", AssetExportService.GetModelFileExtension(null));
         }
 
         [Fact]

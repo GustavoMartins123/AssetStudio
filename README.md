@@ -113,7 +113,7 @@ Use the **Export** menu.
 
 ### Export Model
 
-Choose the model format (**FBX**, **glTF Binary (`.glb`)**, or **glTF Separate (`.gltf`)**) and options under **Options → Export options...**.
+Choose the model format (**glTF Binary (`.glb`)** by default, **glTF Separate (`.gltf`)**, or **FBX**) and options under **Options → Export options...**.
 
 * Export from **Scene Hierarchy** using the **Model** menu.
 * Export an `Animator` or model group from **Asset List** using the **Export** menu.

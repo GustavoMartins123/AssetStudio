@@ -773,10 +773,10 @@ namespace AssetStudio.Avalonia.ViewModels
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportSelectedObjectsSplitWithAnimationClipAsync, "Exporting selected objects (split) + AnimationClips...");
 
         private Task ExecuteExportSelectedObjectsMergeAsync() =>
-            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedObjectsMergeAsync, "Save merged FBX", "merged.fbx");
+            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedObjectsMergeAsync, "Save merged model", "merged.glb");
 
         private Task ExecuteExportSelectedObjectsMergeWithAnimationClipAsync() =>
-            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedObjectsMergeWithAnimationClipAsync, "Save merged FBX", "merged.fbx");
+            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedObjectsMergeWithAnimationClipAsync, "Save merged model", "merged.glb");
 
         private Task ExecuteExportAllAssetsAsync() =>
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportAllAssetsAsync, "Exporting all assets...");
@@ -788,7 +788,7 @@ namespace AssetStudio.Avalonia.ViewModels
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportFilteredAssetsAsync, "Exporting filtered assets...");
 
         private Task ExecuteExportModelGroupFbxAsync() =>
-            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportModelGroupFbxAsync, "Export Model Group (FBX)", "model.fbx");
+            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportModelGroupFbxAsync, "Export Model Group", "model.glb");
 
         private Task ExecuteExportAnimatorWithSelectedAnimationClipAsync() =>
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportAnimatorWithSelectedAnimationClipAsync, "Exporting Animator + AnimationClips...");
@@ -1093,8 +1093,8 @@ namespace AssetStudio.Avalonia.ViewModels
                 : !string.IsNullOrWhiteSpace(MeshPreview.ActiveAvatarName)
                     ? MeshPreview.ActiveAvatarName
                     : PreviewSession.ActiveAsset?.Name ?? "model";
-            var suggestedFileName = AssetExportService.FixFileName(baseName) + ".fbx";
-            var path = await _dialogService.PickSaveFileAsync(new SaveFilePickerRequest("Export Model", suggestedFileName, "fbx"));
+            var suggestedFileName = AssetExportService.FixFileName(baseName) + ".glb";
+            var path = await _dialogService.PickSaveFileAsync(new SaveFilePickerRequest("Export Model", suggestedFileName, "glb"));
             if (!string.IsNullOrWhiteSpace(path))
             {
                 StatusText = $"Selected export target: {path}";

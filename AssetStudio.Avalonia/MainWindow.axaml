@@ -156,7 +156,7 @@
                     </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
-                <MenuItem Header="Export Model Group (FBX)..." Command="{Binding ExportModelGroupFbxCommand}">
+                <MenuItem Header="Export Model Group..." Command="{Binding ExportModelGroupFbxCommand}">
                     <MenuItem.Icon>
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
@@ -296,7 +296,7 @@
                                 <ContextMenu x:DataType="vm:MainWindowViewModel" Opened="AssetListContextMenu_Opened">
                                     <MenuItem Header="Copy text" Command="{Binding CopyAssetCellTextCommand}" />
                                     <MenuItem Header="Export selected assets" Command="{Binding ExportSelectedAssetsCommand}" />
-                                    <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group (FBX)..." Command="{Binding ExportModelGroupFbxCommand}" />
+                                    <MenuItem x:Name="exportModelGroupFbxMenuItem" Header="Export Model Group..." Command="{Binding ExportModelGroupFbxCommand}" />
                                     <MenuItem x:Name="exportAnimatorWithSelectedAnimationClipMenuItem" Header="Export Animator + selected AnimationClips" Command="{Binding ExportAnimatorWithSelectedAnimationClipCommand}" />
                                     <MenuItem x:Name="goToSceneHierarchyMenuItem" Header="Go to scene hierarchy" Command="{Binding GoToSceneHierarchyCommand}" />
                                     <MenuItem x:Name="showOriginalFileMenuItem" Header="Show original file" Command="{Binding ShowOriginalFileCommand}" />
