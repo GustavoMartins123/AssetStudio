@@ -94,6 +94,13 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         return Keep(create(_device, &desc, initialData, &texture), texture, "create a texture");
     }
 
+    internal nint CreateTexture3D(Texture3DDesc desc, SubresourceData* initialData)
+    {
+        nint texture = 0;
+        var create = (delegate* unmanaged[Stdcall]<nint, Texture3DDesc*, SubresourceData*, nint*, int>)Slot(_device, 6);
+        return Keep(create(_device, &desc, initialData, &texture), texture, "create a 3D texture");
+    }
+
     internal nint CreateShaderView(nint texture) => CreateView(7, texture, "create a shader resource view");
     internal nint CreateCubeView(nint texture, int format, int mips)
     {
@@ -366,6 +373,14 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         public uint Width, Height, MipLevels, ArraySize;
         public int Format;
         public uint SampleCount, SampleQuality, Usage, BindFlags, CpuAccess, MiscFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct Texture3DDesc
+    {
+        public uint Width, Height, Depth, MipLevels;
+        public int Format;
+        public uint Usage, BindFlags, CpuAccess, MiscFlags;
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -10,7 +10,7 @@ namespace AssetStudio
 {
     public sealed record ShaderPreviewParameter(string Name, int Type, int Rows, int Columns, bool IsMatrix, int ArraySize, int Offset);
     public sealed record ShaderPreviewBuffer(string Name, int Slot, int Size, ShaderPreviewParameter[] Parameters);
-    public enum ShaderPreviewTextureDimension { Texture2D = 2, Cube = 4 }
+    public enum ShaderPreviewTextureDimension { Texture2D = 2, Texture3D = 3, Cube = 4 }
     public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot, ShaderPreviewTextureDimension Dimension);
     public sealed record ShaderPreviewStructuredBufferBinding(string Name, int Slot);
     public enum ShaderPreviewProgramKind { Pixel, Vertex, Geometry }
@@ -35,6 +35,7 @@ namespace AssetStudio
         public ShaderPreviewCull Cull { get; init; } = ShaderPreviewCull.Back;
         public ShaderPreviewDepth ZTest { get; init; } = ShaderPreviewDepth.LEqual;
         public bool ZWrite { get; init; } = true;
+        public bool ZClip { get; init; } = true;
         public bool Blend { get; init; }
         public ShaderPreviewBlend Source { get; init; } = ShaderPreviewBlend.One;
         public ShaderPreviewBlend Destination { get; init; } = ShaderPreviewBlend.Zero;
@@ -49,11 +50,11 @@ namespace AssetStudio
         public bool AlphaToMask { get; init; }
     }
 
-    public sealed record ShaderPreviewPassDefinition(PassType Type, string Name, string LightMode,
+    public record ShaderPreviewPassDefinition(PassType Type, string Name, string LightMode,
         string RenderState, IReadOnlyList<int> VertexIndices, IReadOnlyList<int> FragmentIndices, bool CaptureOnce = false)
     {
         public IReadOnlyList<int> GeometryIndices { get; init; } = [];
-        public bool HasDirect3D11 => VertexIndices.Count != 0 && FragmentIndices.Count != 0;
+        public virtual bool HasDirect3D11 => VertexIndices.Count != 0 && FragmentIndices.Count != 0;
         public string DisplayName => Name.Length == 0 ? LightMode : $"{Name} ({LightMode})";
     }
 
@@ -79,9 +80,8 @@ namespace AssetStudio
         }
     }
 
-    public sealed class LegacyShaderPreview
+    public sealed class LegacyShaderPreview : ShaderPreviewReader
     {
-        private const int MaxBlobBytes = 64 * 1024 * 1024;
         private static readonly UTF8Encoding StrictUtf8 = new(false, true);
         private readonly LegacyShaderLab _lab;
         private readonly Shader _shader;
@@ -95,15 +95,15 @@ namespace AssetStudio
             _lab = lab;
         }
 
-        public string Name => _lab.Name;
-        public IReadOnlyDictionary<string, NumericsVector4> Values => _lab.Values;
-        public IReadOnlyDictionary<string, string> TextureDefaults => _lab.TextureDefaults;
-        public IReadOnlyDictionary<string, string> Dependencies => _lab.Dependencies;
-        public IReadOnlySet<string> PropertyKeywords => _lab.PropertyKeywords;
-        public IReadOnlyList<ShaderPreviewSubShader> SubShaders => _lab.SubShaders;
+        public override string Name => _lab.Name;
+        public override IReadOnlyDictionary<string, NumericsVector4> Values => _lab.Values;
+        public override IReadOnlyDictionary<string, string> TextureDefaults => _lab.TextureDefaults;
+        public override IReadOnlyDictionary<string, string> Dependencies => _lab.Dependencies;
+        public override IReadOnlySet<string> PropertyKeywords => _lab.PropertyKeywords;
+        public override IReadOnlyList<ShaderPreviewSubShader> SubShaders => _lab.SubShaders;
         public string? DeclaredFallback => _lab.DeclaredFallback;
 
-        public static LegacyShaderPreview Read(Shader shader)
+        public new static LegacyShaderPreview Read(Shader shader)
         {
             ArgumentNullException.ThrowIfNull(shader);
             if (shader.version.Length < 2 || shader.version[0] != 5 || shader.version[1] != 3)
@@ -128,7 +128,7 @@ namespace AssetStudio
             return new LegacyShaderPreview(shader, lab);
         }
 
-        public static string ReadName(Shader shader)
+        public new static string ReadName(Shader shader)
         {
             if (shader.m_Script is not { Length: > 0 and <= MaxBlobBytes } script)
             {
@@ -137,15 +137,10 @@ namespace AssetStudio
             return LegacyShaderLab.ReadShaderName(StrictUtf8.GetString(script));
         }
 
-        public IEnumerable<string> GetKeywords(ShaderPreviewPassDefinition pass) =>
-            pass.VertexIndices.SelectMany(index => GetHeader(index, true).Keywords)
-                .Concat(pass.FragmentIndices.SelectMany(index => GetHeader(index, false).Keywords))
-                .Concat(pass.GeometryIndices.SelectMany(index => GetProgramHeader(index, ShaderPreviewProgramKind.Geometry).Keywords));
+        protected override IEnumerable<IReadOnlyList<string>> GetVariantKeywords(ShaderPreviewPassDefinition pass, ShaderPreviewProgramKind kind) =>
+            GetIndices(pass, kind).Select(index => (IReadOnlyList<string>)GetProgramHeader(index, kind).Keywords);
 
-        public IEnumerable<IReadOnlyList<string>> GetVariantKeywords(ShaderPreviewPassDefinition pass, bool vertex) =>
-            (vertex ? pass.VertexIndices : pass.FragmentIndices).Select(index => (IReadOnlyList<string>)GetHeader(index, vertex).Keywords);
-
-        public LegacyShaderPreviewPass PreparePass(ShaderPreviewSubShader subShader, ShaderPreviewPassDefinition pass,
+        public override LegacyShaderPreviewPass PreparePass(ShaderPreviewSubShader subShader, ShaderPreviewPassDefinition pass,
             IReadOnlySet<string> enabledKeywords, IReadOnlyDictionary<string, NumericsVector4> values)
         {
             if (!pass.HasDirect3D11)
@@ -166,26 +161,24 @@ namespace AssetStudio
 
             ProgramHeader SelectStage(IReadOnlyList<int> indices, ShaderPreviewProgramKind kind)
             {
-                var programs = indices.Select(i => GetProgramHeader(i, kind)).ToArray();
-                var expected = new HashSet<string>(programs.SelectMany(p => p.Keywords), StringComparer.Ordinal);
-                expected.IntersectWith(enabledKeywords);
-                var matches = programs.Where(p => expected.SetEquals(p.Keywords)).Distinct().ToArray();
-                string stage = kind.ToString().ToLowerInvariant();
-                if (matches.Length == 0)
-                {
-                    throw new NotSupportedException($"Pass '{pass.DisplayName}' has no exact D3D11 {stage} variant for [{string.Join(", ", expected.Order(StringComparer.Ordinal))}].");
-                }
+                var matches = MatchVariants(indices.Select(i => GetProgramHeader(i, kind)).Distinct().ToArray(),
+                    program => program.Keywords, enabledKeywords, pass, kind);
                 if (matches.Length > 1 && matches.Skip(1).Any(other =>
                     !_bytes!.AsSpan(matches[0].Offset, matches[0].Length).SequenceEqual(_bytes.AsSpan(other.Offset, other.Length))))
                 {
-                    throw new NotSupportedException($"Pass '{pass.DisplayName}' has ambiguous D3D11 {stage} variants for [{string.Join(", ", expected.Order(StringComparer.Ordinal))}].");
+                    throw AmbiguousVariant(pass, kind, matches[0].Keywords);
                 }
                 return matches[0];
             }
         }
 
-        private ProgramHeader GetHeader(int index, bool vertex) =>
-            GetProgramHeader(index, vertex ? ShaderPreviewProgramKind.Vertex : ShaderPreviewProgramKind.Pixel);
+        private static IReadOnlyList<int> GetIndices(ShaderPreviewPassDefinition pass, ShaderPreviewProgramKind kind) => kind switch
+        {
+            ShaderPreviewProgramKind.Vertex => pass.VertexIndices,
+            ShaderPreviewProgramKind.Pixel => pass.FragmentIndices,
+            ShaderPreviewProgramKind.Geometry => pass.GeometryIndices,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        };
 
         private ProgramHeader GetProgramHeader(int index, ShaderPreviewProgramKind stage)
         {
@@ -241,14 +234,7 @@ namespace AssetStudio
                 throw new NotSupportedException("This Unity 5.3 shader program layout is unsupported.");
             }
             var kind = (ShaderGpuProgramType)reader.ReadInt32();
-            bool expected = stage switch
-            {
-                ShaderPreviewProgramKind.Vertex => kind is ShaderGpuProgramType.DX11VertexSM40 or ShaderGpuProgramType.DX11VertexSM50,
-                ShaderPreviewProgramKind.Pixel => kind is ShaderGpuProgramType.DX11PixelSM40 or ShaderGpuProgramType.DX11PixelSM50,
-                ShaderPreviewProgramKind.Geometry => kind is ShaderGpuProgramType.DX11GeometrySM40 or ShaderGpuProgramType.DX11GeometrySM50,
-                _ => false
-            };
-            if (!expected)
+            if (!IsDirect3D11Stage(kind, stage))
             {
                 throw new InvalidDataException($"GpuProgramIndex {index} contains {kind} in an unexpected stage.");
             }

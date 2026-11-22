@@ -293,7 +293,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     CreateDepth(_device, pass.State), _device.CreateRasterizerState(new RasterizerDesc
                     {
                         FillMode = 3, CullMode = (int)pass.State.Cull, FrontCounterClockwise = 1,
-                        DepthClipEnable = 1, DepthBias = pass.State.OffsetUnits, SlopeScaledDepthBias = pass.State.OffsetFactor,
+                        DepthClipEnable = pass.State.ZClip ? 1 : 0, DepthBias = pass.State.OffsetUnits, SlopeScaledDepthBias = pass.State.OffsetFactor,
                         MultisampleEnable = _multisampled ? 1 : 0
                     }), FindUnusedVertexTransform(pass));
                 _passes.Add(pass, gpu);
@@ -680,24 +680,32 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 int columns = texture.BlockCompressed ? (width + 3) / 4 : width;
                 int rows = texture.BlockCompressed ? (height + 3) / 4 : height;
                 int pitch = checked(texture.BytesPerBlock * columns);
-                int length = checked(rows * pitch);
+                int slicePitch = checked(rows * pitch);
+                int length = checked(slicePitch * Math.Max(1, texture.VolumeDepth >> mip));
                 if (consumed > texture.Pixels.Length - length)
                 {
                     throw new InvalidDataException($"Incomplete mip data for texture '{name}'.");
                 }
-                levels[index] = new SubresourceData { Data = data + consumed, RowPitch = (uint)pitch, SlicePitch = (uint)length };
+                levels[index] = new SubresourceData { Data = data + consumed, RowPitch = (uint)pitch, SlicePitch = (uint)slicePitch };
                 consumed += length;
             }
             if (consumed != texture.Pixels.Length)
             {
                 throw new InvalidDataException($"Unexpected data after the mips for texture '{name}'.");
             }
-            nint image = device.CreateTexture(new TextureDesc
-            {
-                Width = (uint)texture.Width, Height = (uint)texture.Height, MipLevels = (uint)texture.MipCount,
-                ArraySize = (uint)texture.Faces, Format = texture.Format, SampleCount = 1, Usage = mutable ? 0u : 1u, BindFlags = BindShaderResource,
-                MiscFlags = texture.Faces == 6 ? 4u : 0u // D3D11_RESOURCE_MISC_TEXTURECUBE
-            }, levels);
+            uint usage = mutable ? 0u : 1u;
+            nint image = texture.VolumeDepth > 0
+                ? device.CreateTexture3D(new Texture3DDesc
+                {
+                    Width = (uint)texture.Width, Height = (uint)texture.Height, Depth = (uint)texture.VolumeDepth,
+                    MipLevels = (uint)texture.MipCount, Format = texture.Format, Usage = usage, BindFlags = BindShaderResource
+                }, levels)
+                : device.CreateTexture(new TextureDesc
+                {
+                    Width = (uint)texture.Width, Height = (uint)texture.Height, MipLevels = (uint)texture.MipCount,
+                    ArraySize = (uint)texture.Faces, Format = texture.Format, SampleCount = 1, Usage = usage, BindFlags = BindShaderResource,
+                    MiscFlags = texture.Faces == 6 ? 4u : 0u // D3D11_RESOURCE_MISC_TEXTURECUBE
+                }, levels);
             nint sampler = CreateSampler(device, texture.Filter, texture.Wrap, texture.Anisotropy, texture.MipBias, texture.Comparison);
             var view = texture.Faces == 6 ? device.CreateCubeView(image, texture.Format, texture.MipCount) : device.CreateShaderView(image);
             return new GpuTexture(image, view, sampler);
@@ -801,7 +809,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     private void ValidateResources(ReadOnlySpan<byte> program, ShaderPreviewStage stage, ShaderPreviewProgramKind kind, ShaderPreviewDraw draw)
     {
-        // The Unity 5.3 DXBC can omit RDEF. Compare the actual SM4/5 resource declarations with Unity's metadata.
+        // Unity can strip RDEF. Compare the actual SM4/5 resource declarations with Unity's metadata.
         const uint customData = 53, declareTexture = 88, declareBuffer = 89, declareSampler = 90;
         int offset = 8;
         while (offset < program.Length)
@@ -830,8 +838,13 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 uint flags = (token >> 11) & 0x1f;
                 bool bound = opcode switch
                 {
-                    declareTexture => Array.Exists(stage.Textures, texture => texture.Slot == slot &&
-                        flags == (texture.Dimension == ShaderPreviewTextureDimension.Cube ? 6u : 3u)),
+                    declareTexture => Array.Exists(stage.Textures, texture => texture.Slot == slot && flags == (texture.Dimension switch
+                    {
+                        ShaderPreviewTextureDimension.Texture2D => 3u,
+                        ShaderPreviewTextureDimension.Texture3D => 5u,
+                        ShaderPreviewTextureDimension.Cube => 6u,
+                        _ => throw new InvalidDataException($"Unsupported DXBC texture dimension '{texture.Dimension}'.")
+                    })),
                     declareSampler => Array.Exists(stage.Textures, texture => texture.SamplerSlot == slot && flags ==
                         (_lighting?.Textures.TryGetValue(texture.Name, out var lightingTexture) == true && lightingTexture.Comparison ? 1u : 0u)),
                     _ => ReadUInt(program, offset + 12) is var count && count is > 0 and <= 4096 &&

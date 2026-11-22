@@ -48,7 +48,11 @@ internal sealed record ShaderPreviewScene(
 
 internal sealed record ShaderPreviewTexture(
     int Width, int Height, int MipCount, int Format, int BytesPerBlock, bool BlockCompressed, byte[] Pixels,
-    int Filter, int Wrap, int Anisotropy, float MipBias, int Faces = 1, bool Comparison = false);
+    int Filter, int Wrap, int Anisotropy, float MipBias, int Faces = 1, bool Comparison = false, int VolumeDepth = 0)
+{
+    internal ShaderPreviewTextureDimension Dimension => VolumeDepth > 0 ? ShaderPreviewTextureDimension.Texture3D :
+        Faces == 6 ? ShaderPreviewTextureDimension.Cube : ShaderPreviewTextureDimension.Texture2D;
+}
 
 internal readonly record struct ShaderPreviewCamera(float Yaw, float Pitch, float Distance, System.Numerics.Vector2 Pan = default)
 {
@@ -70,7 +74,7 @@ internal static class ShaderPreviewService
         "DIRECTIONAL", "SHADOWS_OFF", "LIGHTMAP_OFF", "DIRLIGHTMAP_OFF", "DYNAMICLIGHTMAP_OFF", "SOFTPARTICLES_OFF"
     ];
 
-    internal static bool UsesShaderPreview(int[] version) => OperatingSystem.IsWindows() && version.Length >= 2 && version[0] == 5 && version[1] == 3;
+    internal static bool UsesShaderPreview(int[] version) => OperatingSystem.IsWindows() && ShaderPreviewReader.SupportsVersion(version);
 
     internal static T ResolveReference<T>(PPtr<T> reference, SerializedFile source,
         Action<SerializedFile, CancellationToken> loadExternalSources, Func<AssetHandle, AssetStudio.Object?> resolveAsset,
@@ -123,7 +127,7 @@ internal static class ShaderPreviewService
         {
             throw new ArgumentException("The Built-in preview scene requires between one and eight directional lights.", nameof(lights));
         }
-        var reader = LegacyShaderPreview.Read(shader);
+        var reader = ShaderPreviewReader.Read(shader);
         var values = new Dictionary<string, NumericsVector4>(reader.Values, StringComparer.Ordinal);
         var textureSlots = new Dictionary<string, UnityTexEnv>(StringComparer.Ordinal);
         if (material != null)
@@ -168,7 +172,8 @@ internal static class ShaderPreviewService
         var geometry = lightingPass != BuiltInLightingPass.None ? ShaderPreviewGeometry.ScreenQuad :
             subShader.Tags.GetValueOrDefault("PreviewType", "sphere").ToLowerInvariant() switch
         {
-            "sphere" when reader.Name.StartsWith("Particles/", StringComparison.OrdinalIgnoreCase) => ShaderPreviewGeometry.Particles,
+            "sphere" or "plane" when reader.Name.StartsWith("Particles/", StringComparison.OrdinalIgnoreCase) ||
+                reader.Name.Contains("/Particles/", StringComparison.OrdinalIgnoreCase) => ShaderPreviewGeometry.Particles,
             "sphere" when reader.Name.Equals("Hidden/FogVolume", StringComparison.Ordinal) => ShaderPreviewGeometry.Volume,
             "sphere" when subShader.Tags.ContainsKey("WaterMode") || reader.Name.StartsWith("UI/", StringComparison.Ordinal) => ShaderPreviewGeometry.Plane,
             "sphere" => ShaderPreviewGeometry.Sphere,
@@ -405,9 +410,10 @@ internal static class ShaderPreviewService
         {
             cancellationToken.ThrowIfCancellationRequested();
             bool cube = dimension == ShaderPreviewTextureDimension.Cube;
+            bool image = dimension == ShaderPreviewTextureDimension.Texture2D;
             if (cameraTextures.Contains(name) || ImageEffectPreview.ProvidesTexture(imageEffect, name))
             {
-                if (cube)
+                if (!image)
                 {
                     throw new InvalidDataException($"The preview's camera texture '{name}' requires a 2D binding.");
                 }
@@ -415,7 +421,7 @@ internal static class ShaderPreviewService
             }
             if (captures.Contains(name))
             {
-                if (cube)
+                if (!image)
                 {
                     throw new InvalidDataException($"GrabPass texture '{name}' must be a 2D resource.");
                 }
@@ -423,7 +429,7 @@ internal static class ShaderPreviewService
             }
             if (textures.TryGetValue(name, out var prepared))
             {
-                if ((prepared.Faces == 6) != cube)
+                if (prepared.Dimension != dimension)
                 {
                     throw new InvalidDataException($"Conflicting texture dimensions for '{name}'.");
                 }
@@ -436,20 +442,28 @@ internal static class ShaderPreviewService
             }
             else if (reader.TextureDefaults.TryGetValue(name, out string? declared))
             {
+                if (!(image || cube))
+                {
+                    throw new NotSupportedException($"No {dimension} default texture is available for '{name}'.");
+                }
                 texture = CreateDeclaredTexture(name, declared, cube);
             }
             else if (cube && name is "unity_SpecCube0" or "unity_SpecCube1")
             {
                 texture = CreateReflectionProbe(PreviewAmbientLinear);
             }
-            else if (!cube && name is "_CameraDepthTexture" or "_DepthTex")
+            else if (dimension == ShaderPreviewTextureDimension.Texture3D && name == "unity_ProbeVolumeSH")
+            {
+                texture = CreateProbeVolume(PreviewAmbientLinear);
+            }
+            else if (image && name is "_CameraDepthTexture" or "_DepthTex")
             {
                 // Depth of the preview's backdrop, cleared to the camera's far plane.
                 var depth = new byte[sizeof(float)];
                 BinaryPrimitives.WriteSingleLittleEndian(depth, 1f);
                 texture = new ShaderPreviewTexture(1, 1, 1, 41 /* R32_FLOAT */, 4, false, depth, 0, 1, 1, 0);
             }
-            else if (!cube && name is "_ClipTex" or "_GUIClipTexture")
+            else if (image && name is "_ClipTex" or "_GUIClipTexture")
             {
                 texture = CreateClipMask();
                 if (name == "_GUIClipTexture")
@@ -458,7 +472,7 @@ internal static class ShaderPreviewService
                     values.TryAdd("_Color", NumericsVector4.One);
                 }
             }
-            else if (!cube && imageEffect == ImageEffectPass.Bokeh && name == ImageEffectPreview.BokehAperture)
+            else if (image && imageEffect == ImageEffectPass.Bokeh && name == ImageEffectPreview.BokehAperture)
             {
                 texture = material != null && textureSlots.TryGetValue(ImageEffectPreview.MainTexture, out var aperture) && !aperture.m_Texture.IsNull
                     ? ReadTexture(Resolve(material.assetsFile, aperture.m_Texture), dimension)
@@ -478,9 +492,10 @@ internal static class ShaderPreviewService
     private static bool IsMode(ShaderPreviewPassDefinition pass, string mode) =>
         pass.LightMode.Equals(mode, StringComparison.OrdinalIgnoreCase);
 
-    private static ShaderPreviewPassDefinition ResolvePassLightMode(LegacyShaderPreview reader, ShaderPreviewPassDefinition pass)
+    private static ShaderPreviewPassDefinition ResolvePassLightMode(ShaderPreviewReader reader, ShaderPreviewPassDefinition pass)
     {
-        if (!IsMode(pass, "ShadowCaster") || !pass.HasDirect3D11 || !pass.Name.Equals("FORWARD", StringComparison.OrdinalIgnoreCase))
+        if (reader is not LegacyShaderPreview || !IsMode(pass, "ShadowCaster") || !pass.HasDirect3D11 ||
+            !pass.Name.Equals("FORWARD", StringComparison.OrdinalIgnoreCase))
         {
             return pass;
         }
@@ -504,7 +519,7 @@ internal static class ShaderPreviewService
         pass.Type == PassType.Normal && (IsMode(pass, "Always") || IsMode(pass, "ForwardBase")
             || IsMode(pass, "ForwardAdd") || IsMode(pass, "Vertex"));
 
-    private static bool IsShadowOnly(LegacyShaderPreview reader, ShaderPreviewPassDefinition pass) =>
+    private static bool IsShadowOnly(ShaderPreviewReader reader, ShaderPreviewPassDefinition pass) =>
         IsMode(pass, "Always") && pass.HasDirect3D11 && reader.GetVariantKeywords(pass, vertex: true)
             .All(keywords => keywords.Contains("SHADOWS_DEPTH") || keywords.Contains("SHADOWS_CUBE"));
 
@@ -514,11 +529,11 @@ internal static class ShaderPreviewService
         return Array.FindIndex(faces, face => pass.Fragment.Textures.Any(texture => texture.Name == face));
     }
 
-    private static IEnumerable<(LegacyShaderPreview Reader, ShaderPreviewSubShader Sub, ShaderPreviewPassDefinition Pass)> ExpandPasses(
-        Shader shader, LegacyShaderPreview reader, ShaderPreviewSubShader subShader, Func<Shader, PPtr<Shader>, Shader> resolve,
+    private static IEnumerable<(ShaderPreviewReader Reader, ShaderPreviewSubShader Sub, ShaderPreviewPassDefinition Pass)> ExpandPasses(
+        Shader shader, ShaderPreviewReader reader, ShaderPreviewSubShader subShader, Func<Shader, PPtr<Shader>, Shader> resolve,
         CancellationToken token)
     {
-        var dependencies = new Dictionary<string, LegacyShaderPreview>(StringComparer.Ordinal);
+        var dependencies = new Dictionary<string, ShaderPreviewReader>(StringComparer.Ordinal);
         foreach (var pass in subShader.Passes)
         {
             token.ThrowIfCancellationRequested();
@@ -537,7 +552,7 @@ internal static class ShaderPreviewService
             string passName = pass.Name[(separator + 1)..];
             if (!dependencies.TryGetValue(shaderName, out var referenced))
             {
-                referenced = LegacyShaderPreview.Read(ResolveUsePassShader(shader, shaderName, resolve, token));
+                referenced = ShaderPreviewReader.Read(ResolveUsePassShader(shader, shaderName, resolve, token));
                 dependencies.Add(shaderName, referenced);
             }
             var sourceSub = referenced.SubShaders.FirstOrDefault(sub => IsBuiltIn(sub) &&
@@ -560,6 +575,7 @@ internal static class ShaderPreviewService
         Func<Shader, PPtr<Shader>, Shader> resolve, CancellationToken token)
     {
         // Unity 5.3 can serialize the Legacy Shaders namespace on a dependency while UsePass retains the source name.
+        bool unity53 = shader.version is [5, 3, ..];
         string referencedName = UsePassShaderName(shaderName);
         Shader? match = null;
         foreach (var dependency in shader.m_Dependencies)
@@ -570,7 +586,7 @@ internal static class ShaderPreviewService
             try
             {
                 linked = resolve(shader, dependency);
-                actual = LegacyShaderPreview.ReadName(linked);
+                actual = ShaderPreviewReader.ReadName(linked);
             }
             catch (Exception error) when (error is InvalidDataException or EndOfStreamException or DecoderFallbackException)
             {
@@ -589,10 +605,10 @@ internal static class ShaderPreviewService
         }
         return match ?? throw new InvalidDataException($"UsePass shader '{shaderName}' could not be resolved from the shader dependencies.");
 
-        static string UsePassShaderName(string name)
+        string UsePassShaderName(string name)
         {
             const string prefix = "Legacy Shaders/";
-            return name.StartsWith(prefix, StringComparison.Ordinal) ? name[prefix.Length..] : name;
+            return unity53 && name.StartsWith(prefix, StringComparison.Ordinal) ? name[prefix.Length..] : name;
         }
     }
 
@@ -641,6 +657,14 @@ internal static class ShaderPreviewService
         // A constant environment has the same value in every direction and at every roughness.
         static byte Encode(float value) => (byte)Math.Clamp(MathF.Round(MathF.Pow(value, 1 / 2.2f) * 255), 0, 255);
         return CreateSolidTexture([Encode(ambient.X), Encode(ambient.Y), Encode(ambient.Z), 255], 6);
+    }
+
+    private static ShaderPreviewTexture CreateProbeVolume(NumericsVector3 ambient)
+    {
+        // Built-in probe volumes pack the RGB spherical harmonics and the occlusion mask in four X slices.
+        float[] coefficients = [0, 0, 0, ambient.X, 0, 0, 0, ambient.Y, 0, 0, 0, ambient.Z, 1, 1, 1, 1];
+        return new ShaderPreviewTexture(4, 1, 1, 2 /* R32G32B32A32_FLOAT */, 16, false,
+            MemoryMarshal.AsBytes(coefficients.AsSpan()).ToArray(), 1, 1, 1, 0, VolumeDepth: 1);
     }
 
     internal static ShaderPreviewTexture ReadTexture(Texture asset, ShaderPreviewTextureDimension dimension)
@@ -796,6 +820,7 @@ internal static class ShaderPreviewService
                     "unity_World2Shadow0" when scene.LightingPass == BuiltInLightingPass.CollectShadows => lighting!.WorldToShadow,
                     "unity_World2Shadow1" or "unity_World2Shadow2" or "unity_World2Shadow3"
                         when scene.LightingPass == BuiltInLightingPass.CollectShadows => default,
+                    "unity_ProbeVolumeWorldToObject" => NumericsMatrix4x4.Identity,
                     "_GUIClipTextureMatrix" => NumericsMatrix4x4.CreateScale(0.5f, 0.5f, 1) * NumericsMatrix4x4.CreateTranslation(0.5f, 0.5f, 0),
                     "_TerrainEngineBendTree" => NumericsMatrix4x4.CreateRotationZ(0.08f * MathF.Sin(time)),
                     "_Object2World" or "_World2Object" or "unity_ObjectToWorld" or "unity_WorldToObject" => NumericsMatrix4x4.Identity,
@@ -960,6 +985,11 @@ internal static class ShaderPreviewService
                 "unity_SHAg" => new NumericsVector4(0, 0, 0, scene.AmbientLinear.Y),
                 "unity_SHAb" => new NumericsVector4(0, 0, 0, scene.AmbientLinear.Z),
                 "unity_SHBr" or "unity_SHBg" or "unity_SHBb" or "unity_SHC" => NumericsVector4.Zero,
+                // The shader dots the selector with the unoccluded mask even with the proxy volume disabled.
+                "unity_OcclusionMaskSelector" => new NumericsVector4(1, 0, 0, 0),
+                "unity_ProbesOcclusion" => NumericsVector4.One,
+                "unity_ProbeVolumeParams" or "unity_ProbeVolumeMin" => NumericsVector4.Zero,
+                "unity_ProbeVolumeSizeInv" => NumericsVector4.One,
                 "unity_VertexLightParams" => new NumericsVector4(scene.Lights.Count, 0, 0, 0),
                 "glstate_lightmodel_ambient" or "UNITY_LIGHTMODEL_AMBIENT" or "unity_AmbientSky"
                     or "unity_AmbientEquator" or "unity_AmbientGround" => new NumericsVector4(ToGamma(scene.AmbientLinear), 1),

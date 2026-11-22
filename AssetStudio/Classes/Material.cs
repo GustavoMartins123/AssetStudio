@@ -125,18 +125,14 @@ namespace AssetStudio
                     m_ValidKeywords = reader.ReadStringArray();
                     m_InvalidKeywords = reader.ReadStringArray();
                 }
-                else if (version[0] >= 5) //5.0 ~ 2021.2
+                else //2021.1 ~ 2021.2
                 {
-                    var m_ShaderKeywords = reader.ReadAlignedString();
+                    m_ValidKeywords = SplitShaderKeywords(reader.ReadAlignedString());
                 }
             }
             else if (version[0] >= 5 && version[0] < 2021) //5.0 ~ 2020.3
             {
-                var m_ShaderKeywords = reader.ReadAlignedString();
-                if (version[0] == 5 && version[1] == 3)
-                {
-                    m_ValidKeywords = m_ShaderKeywords.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-                }
+                m_ValidKeywords = SplitShaderKeywords(reader.ReadAlignedString());
             }
 
             if (version[0] >= 5) //5.0 and up
@@ -221,12 +217,12 @@ namespace AssetStudio
                         case "m_Parent":
                             parent = ReadPPtrStreaming<Material>(nodes, nextSibling, reader, ref i, reader.assetsFile, depth: 0);
                             break;
-                        case "m_ShaderKeywords" when version[0] == 5 && version[1] == 3:
+                        case "m_ShaderKeywords" when nodes[i].m_Type == "string":
                             if (!TypeTreeHelper.TryReadString(nodes, nextSibling, reader, ref i, out string keywords, depth: 0))
                             {
                                 throw new InvalidDataException("Invalid Material.m_ShaderKeywords node.");
                             }
-                            shaderKeywords = keywords.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                            shaderKeywords = SplitShaderKeywords(keywords);
                             break;
                         case "m_SavedProperties":
                             savedProperties = ReadUnityPropertySheetStreaming(nodes, nextSibling, reader, ref i, reader.assetsFile);
@@ -253,6 +249,8 @@ namespace AssetStudio
                 return false;
             }
         }
+
+        private static string[] SplitShaderKeywords(string keywords) => keywords.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
 
         private static UnityPropertySheet? ReadUnityPropertySheetStreaming(
             List<TypeTreeNode> nodes,

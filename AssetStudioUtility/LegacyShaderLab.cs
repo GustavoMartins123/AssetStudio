@@ -115,18 +115,7 @@ namespace AssetStudio
                 string name = Read();
                 foreach (var (attribute, arguments) in keywordAttributes)
                 {
-                    string property = name.ToUpperInvariant();
-                    if (attribute == "KeywordEnum")
-                    {
-                        foreach (string argument in arguments)
-                        {
-                            PropertyKeywords.Add(property + "_" + argument.ToUpperInvariant());
-                        }
-                    }
-                    else
-                    {
-                        PropertyKeywords.Add(arguments.Length == 1 ? arguments[0].Trim('"') : property + (attribute == "ToggleOff" ? "_OFF" : "_ON"));
-                    }
+                    ShaderPreviewReader.AddPropertyKeywords(PropertyKeywords, name, attribute, arguments);
                 }
                 Require("(");
                 ReadString();
