@@ -190,6 +190,24 @@ namespace AssetStudio.Tests
             };
             Assert.False(MainWindow.ShouldPreserveMaterialTextureAlpha(opaqueMat, "Custom/CharaEyeShader"));
 
+            // 1b. Character AlphaTest / Cutout / *_BLEND material (diffuse alpha stores specular/rim mask, NOT glass translucency) -> must stay opaque
+            var cutoutMat = CreateMaterialWithTexEnvs("Hero_Body_BK_BLEND");
+            cutoutMat.m_CustomRenderQueue = 2450;
+            cutoutMat.m_ValidKeywords = new[] { "_ALPHATEST_ON" };
+            cutoutMat.stringTagMap = new[]
+            {
+                new KeyValuePair<string, string>("RenderType", "TransparentCutout")
+            };
+            cutoutMat.m_SavedProperties.m_Floats = new[]
+            {
+                new KeyValuePair<string, float>("_AlphaClip", 1f)
+            };
+            cutoutMat.m_SavedProperties.m_Colors = new[]
+            {
+                new KeyValuePair<string, Color>("_BaseColor", new Color(1f, 1f, 1f, 0.5f))
+            };
+            Assert.False(MainWindow.ShouldPreserveMaterialTextureAlpha(cutoutMat, "Custom/CharaShader"));
+
             var opaqueRgba = MainWindow.ConvertPreviewBitmapToRgbaBytes(bitmap, out var ow, out var oh, preserveAlpha: false);
             Assert.NotNull(opaqueRgba);
             Assert.Equal(2, ow);

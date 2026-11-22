@@ -162,7 +162,9 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            if (expectedMesh != null && !ReferenceEquals(meshPreviewSource, expectedMesh))
+            if (expectedMesh != null
+                && !ReferenceEquals(meshPreviewSource, expectedMesh)
+                && !(avatarCompositeParts?.Any(p => ReferenceEquals(p.Mesh, expectedMesh)) ?? false))
             {
                 return;
             }

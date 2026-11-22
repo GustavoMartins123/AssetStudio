@@ -19,11 +19,13 @@ public partial class MainWindow
             return false;
         }
 
-        return name.Contains("Decal", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Transparent", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Blend", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Alpha", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Cutout", StringComparison.OrdinalIgnoreCase);
+        if (name.Contains("Decal", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return name.Contains("Transparent", StringComparison.OrdinalIgnoreCase)
+            && !name.Contains("Cutout", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static bool IsDecalMeshOrObjectName(string? name)
@@ -39,7 +41,7 @@ public partial class MainWindow
             return IsTransparentOrDecalName(shaderName);
         }
 
-        if (IsTransparentOrDecalName(material.m_Name) || IsTransparentOrDecalName(shaderName))
+        if (IsDecalMeshOrObjectName(material.m_Name) || IsTransparentOrDecalName(shaderName))
         {
             return true;
         }
@@ -56,46 +58,34 @@ public partial class MainWindow
             }
         }
 
-        if (material.m_CustomRenderQueue >= 2450)
+        // Only true Transparent / Overlay queues (>= 2900), never AlphaTest / Cutout (2450)
+        // whose diffuse alpha channel often stores specular/rim/outline masks on character shaders.
+        if (material.m_CustomRenderQueue >= 2900)
         {
             return true;
         }
 
-        bool explicitlyOpaqueTag = false;
         if (material.stringTagMap != null)
         {
             foreach (var tag in material.stringTagMap)
             {
-                if (string.Equals(tag.Key, "RenderType", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(tag.Key, "Queue", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(tag.Key, "RenderType", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (IsTransparentOrDecalName(tag.Value)
-                        || (!string.IsNullOrWhiteSpace(tag.Value)
-                            && tag.Value.Contains("Overlay", StringComparison.OrdinalIgnoreCase)))
+                    if (string.Equals(tag.Value, "Transparent", StringComparison.OrdinalIgnoreCase))
                     {
                         return true;
                     }
 
-                    if (string.Equals(tag.Key, "RenderType", StringComparison.OrdinalIgnoreCase)
-                        && string.Equals(tag.Value, "Opaque", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(tag.Value, "Opaque", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(tag.Value, "TransparentCutout", StringComparison.OrdinalIgnoreCase))
                     {
-                        explicitlyOpaqueTag = true;
+                        return false;
                     }
                 }
-            }
-        }
-
-        if (material.m_ValidKeywords != null)
-        {
-            foreach (var keyword in material.m_ValidKeywords)
-            {
-                if (!string.IsNullOrWhiteSpace(keyword)
-                    && (keyword.Contains("TRANSPARENT", StringComparison.OrdinalIgnoreCase)
-                        || keyword.Contains("ALPHATEST", StringComparison.OrdinalIgnoreCase)
-                        || keyword.Contains("ALPHABLEND", StringComparison.OrdinalIgnoreCase)
-                        || keyword.Contains("ALPHAPREMULTIPLY", StringComparison.OrdinalIgnoreCase)
-                        || keyword.Contains("ALPHACLIP", StringComparison.OrdinalIgnoreCase)
-                        || keyword.Contains("ALPHA_CLIP", StringComparison.OrdinalIgnoreCase)))
+                else if (string.Equals(tag.Key, "Queue", StringComparison.OrdinalIgnoreCase)
+                    && !string.IsNullOrWhiteSpace(tag.Value)
+                    && (tag.Value.Contains("Transparent", StringComparison.OrdinalIgnoreCase)
+                        || tag.Value.Contains("Overlay", StringComparison.OrdinalIgnoreCase)))
                 {
                     return true;
                 }
@@ -105,38 +95,16 @@ public partial class MainWindow
         var props = material.m_SavedProperties;
         if (props != null)
         {
-            if (TryGetMaterialNumericProperty(props, "_Surface", out var surface) && surface >= 0.5f)
+            bool isTransparentSurface = TryGetMaterialNumericProperty(props, "_Surface", out var surface) && surface >= 0.5f;
+            bool hasTransparentKeyword = material.m_ValidKeywords != null
+                && material.m_ValidKeywords.Any(k => !string.IsNullOrWhiteSpace(k)
+                    && (k.Contains("_SURFACE_TYPE_TRANSPARENT", StringComparison.OrdinalIgnoreCase)
+                        || k.Contains("_ALPHABLEND_ON", StringComparison.OrdinalIgnoreCase)));
+            bool zWriteOff = TryGetMaterialNumericProperty(props, "_ZWrite", out var zWrite) && Math.Abs(zWrite) < 0.001f;
+
+            if ((isTransparentSurface || hasTransparentKeyword) && zWriteOff)
             {
                 return true;
-            }
-
-            if ((TryGetMaterialNumericProperty(props, "_AlphaClip", out var alphaClip) && alphaClip > 0f)
-                || (TryGetMaterialNumericProperty(props, "_AlphaTest", out var alphaTest) && alphaTest > 0f)
-                || (TryGetMaterialNumericProperty(props, "_UseAlphaClip", out var useAlphaClip) && useAlphaClip > 0f))
-            {
-                return true;
-            }
-
-            bool isEyeOpaque = explicitlyOpaqueTag
-                && material.m_CustomRenderQueue < 2450
-                && (!string.IsNullOrWhiteSpace(material.m_Name) && material.m_Name.Contains("Eye", StringComparison.OrdinalIgnoreCase));
-            if (!isEyeOpaque && TryGetMaterialNumericProperty(props, "_ZWrite", out var zWrite) && Math.Abs(zWrite) < 0.001f)
-            {
-                return true;
-            }
-
-            if (props.m_Colors != null)
-            {
-                foreach (var colorProp in props.m_Colors)
-                {
-                    if ((string.Equals(colorProp.Key, "_BaseColor", StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(colorProp.Key, "_Color", StringComparison.OrdinalIgnoreCase))
-                        && colorProp.Value.A > 0f
-                        && colorProp.Value.A < 0.99f)
-                    {
-                        return true;
-                    }
-                }
             }
         }
 
@@ -150,9 +118,11 @@ public partial class MainWindow
         string? shaderName = null,
         Material? loadedMaterial = null)
     {
-        if (loadedMaterial != null && ShouldPreserveMaterialTextureAlpha(loadedMaterial, shaderName))
+        if (loadedMaterial != null)
         {
-            return true;
+            return IsDecalMeshOrObjectName(meshName)
+                || IsDecalMeshOrObjectName(gameObjectName)
+                || ShouldPreserveMaterialTextureAlpha(loadedMaterial, shaderName);
         }
 
         if (IsDecalMeshOrObjectName(meshName) || IsDecalMeshOrObjectName(gameObjectName))
@@ -165,12 +135,7 @@ public partial class MainWindow
             return IsTransparentOrDecalName(shaderName);
         }
 
-        if (IsTransparentOrDecalName(slot.MaterialName) || IsTransparentOrDecalName(shaderName))
-        {
-            return true;
-        }
-
-        if (slot.BaseColorA > 0f && slot.BaseColorA < 0.99f)
+        if (IsDecalMeshOrObjectName(slot.MaterialName) || IsTransparentOrDecalName(shaderName))
         {
             return true;
         }
