@@ -228,7 +228,20 @@ public partial class MainWindow
             }
         }
         if (AudioPlayButton != null) AudioPlayButton.IsEnabled = true;
-        if (AudioPauseButton != null) AudioPauseButton.IsEnabled = true;
+    }
+
+    private async Task ExecuteAudioPlayPauseAsync()
+    {
+        var service = _audioPlaybackService;
+        if ((MediaPlayback.IsPlaying || MediaPlayback.IsPaused)
+            && service != null
+            && service.HasActiveBackend)
+        {
+            ExecuteAudioPause();
+            return;
+        }
+
+        await ExecuteAudioPlayAsync();
     }
 
     private async Task ExecuteAudioPlayAsync()
@@ -545,7 +558,6 @@ public partial class MainWindow
     private void SetAudioTransportButtonsEnabled(bool enabled)
     {
         if (AudioPlayButton != null) AudioPlayButton.IsEnabled = enabled;
-        if (AudioPauseButton != null) AudioPauseButton.IsEnabled = enabled;
     }
 
     private void PreviewAudioClip(AssetItem assetItem, AudioClip m_AudioClip)

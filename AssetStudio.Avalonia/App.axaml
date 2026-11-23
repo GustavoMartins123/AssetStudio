@@ -22,6 +22,7 @@
     <Application.Styles>
         <FluentTheme />
         <StyleInclude Source="avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml"/>
+        <StyleInclude Source="avares://AssetStudio.Avalonia/Themes/DesignSystem.axaml"/>
         <Style Selector="TextBlock">
             <Setter Property="FontFamily" Value="Inter, Roboto, Segoe UI, -apple-system, sans-serif" />
         </Style>

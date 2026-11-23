@@ -59,6 +59,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public Action<TextAssetDisplayMode>? SetTextAssetDisplayMode { get; set; }
         public Action? ToggleAnimationPlayPause { get; set; }
+        public Action? StopAnimation { get; set; }
         public Action? RestartAnimation { get; set; }
         public Action? ResetMeshView { get; set; }
         public Action? RotateMeshLeft { get; set; }
@@ -78,6 +79,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? VideoPlayPauseAsync { get; set; }
         public Func<Task>? VideoStopAsync { get; set; }
         public Func<Task>? VideoExportAsync { get; set; }
+        public Func<Task>? AudioPlayPauseAsync { get; set; }
         public Func<Task>? AudioPlayAsync { get; set; }
         public Action? AudioPause { get; set; }
         public Action? AudioStop { get; set; }
@@ -140,6 +142,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
             SetTextAssetDisplayMode = null;
             ToggleAnimationPlayPause = null;
+            StopAnimation = null;
             RestartAnimation = null;
             ResetMeshView = null;
             RotateMeshLeft = null;
@@ -159,6 +162,7 @@ namespace AssetStudio.Avalonia.ViewModels
             VideoPlayPauseAsync = null;
             VideoStopAsync = null;
             VideoExportAsync = null;
+            AudioPlayPauseAsync = null;
             AudioPlayAsync = null;
             AudioPause = null;
             AudioStop = null;
@@ -285,6 +289,7 @@ namespace AssetStudio.Avalonia.ViewModels
             ShowTextAssetInfoCommand = new RelayCommand(() => ExecuteSetTextAssetDisplayMode(TextAssetDisplayMode.Info));
             TogglePreviewInfoCommand = new RelayCommand(() => PreviewSession.ToggleInfoExpanded());
             ToggleAnimationPlayPauseCommand = new RelayCommand(ExecuteToggleAnimationPlayPause);
+            StopAnimationCommand = new RelayCommand(ExecuteStopAnimation);
             RestartAnimationCommand = new RelayCommand(ExecuteRestartAnimation);
             ToggleMeshControlsCommand = new RelayCommand(() => MeshPreview.ToggleControlsExpanded());
             ResetMeshViewCommand = new RelayCommand(ExecuteResetMeshView);
@@ -336,6 +341,7 @@ namespace AssetStudio.Avalonia.ViewModels
             VideoPlayPauseCommand = new AsyncRelayCommand(ExecuteVideoPlayPauseAsync, onException: HandleCommandException);
             VideoStopCommand = new AsyncRelayCommand(ExecuteVideoStopAsync, onException: HandleCommandException);
             VideoExportCommand = new AsyncRelayCommand(ExecuteVideoExportAsync, onException: HandleCommandException);
+            AudioPlayPauseCommand = new AsyncRelayCommand(ExecuteAudioPlayPauseAsync, onException: HandleCommandException);
             AudioPlayCommand = new AsyncRelayCommand(ExecuteAudioPlayAsync, onException: HandleCommandException);
             AudioPauseCommand = new RelayCommand(ExecuteAudioPause);
             AudioStopCommand = new RelayCommand(ExecuteAudioStop);
@@ -424,6 +430,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public RelayCommand ShowTextAssetInfoCommand { get; }
         public RelayCommand TogglePreviewInfoCommand { get; }
         public RelayCommand ToggleAnimationPlayPauseCommand { get; }
+        public RelayCommand StopAnimationCommand { get; }
         public RelayCommand RestartAnimationCommand { get; }
         public RelayCommand ToggleMeshControlsCommand { get; }
         public RelayCommand ResetMeshViewCommand { get; }
@@ -451,6 +458,7 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand VideoPlayPauseCommand { get; }
         public AsyncRelayCommand VideoStopCommand { get; }
         public AsyncRelayCommand VideoExportCommand { get; }
+        public AsyncRelayCommand AudioPlayPauseCommand { get; }
         public AsyncRelayCommand AudioPlayCommand { get; }
         public RelayCommand AudioPauseCommand { get; }
         public RelayCommand AudioStopCommand { get; }
@@ -1125,6 +1133,21 @@ namespace AssetStudio.Avalonia.ViewModels
             MeshPreview.TogglePlayPause();
         }
 
+        private void ExecuteStopAnimation()
+        {
+            if (CommandHandlers.StopAnimation != null)
+            {
+                CommandHandlers.StopAnimation();
+                return;
+            }
+
+            if (MeshPreview.IsAnimationLoaded)
+            {
+                MeshPreview.Pause();
+                MeshPreview.Seek(0.0);
+            }
+        }
+
         private void ExecuteRestartAnimation()
         {
             if (CommandHandlers.RestartAnimation != null)
@@ -1380,6 +1403,24 @@ namespace AssetStudio.Avalonia.ViewModels
             if (!string.IsNullOrWhiteSpace(folder))
             {
                 StatusText = $"Ready to export video to: {folder}";
+            }
+        }
+
+        private async Task ExecuteAudioPlayPauseAsync()
+        {
+            if (CommandHandlers.AudioPlayPauseAsync != null)
+            {
+                await CommandHandlers.AudioPlayPauseAsync();
+                return;
+            }
+
+            if (MediaPlayback.IsPlaying)
+            {
+                MediaPlayback.SetPaused();
+            }
+            else if (MediaPlayback.IsAudioActive)
+            {
+                MediaPlayback.SetPlaying();
             }
         }
 

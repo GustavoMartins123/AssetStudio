@@ -528,40 +528,30 @@
                                         </StackPanel>
                                         <WrapPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                                             <Button x:Name="MonoBehaviourTreeModeButton"
+                                                    Classes="toolbar-btn"
                                                     Content="Tree"
-                                                    Height="26"
-                                                    Padding="8,2"
-                                                    FontSize="11"
                                                     Margin="0,0,4,0"
                                                     Command="{Binding ShowMonoBehaviourTreeCommand}" />
                                             <Button x:Name="MonoBehaviourJsonModeButton"
+                                                    Classes="toolbar-btn"
                                                     Content="JSON"
-                                                    Height="26"
-                                                    Padding="8,2"
-                                                    FontSize="11"
                                                     Margin="0,0,4,0"
                                                     Command="{Binding ShowMonoBehaviourJsonCommand}" />
                                             <Button x:Name="MonoBehaviourExpandAllButton"
+                                                    Classes="toolbar-btn"
                                                     Content="Expand"
-                                                    Height="26"
-                                                    Padding="8,2"
-                                                    FontSize="11"
                                                     Margin="0,0,4,0"
                                                     IsVisible="{Binding PreviewSession.IsMonoBehaviourTreeViewVisible}"
                                                     Command="{Binding ExpandAllMonoBehaviourCommand}" />
                                             <Button x:Name="MonoBehaviourCollapseAllButton"
+                                                    Classes="toolbar-btn"
                                                     Content="Collapse"
-                                                    Height="26"
-                                                    Padding="8,2"
-                                                    FontSize="11"
                                                     Margin="0,0,4,0"
                                                     IsVisible="{Binding PreviewSession.IsMonoBehaviourTreeViewVisible}"
                                                     Command="{Binding CollapseAllMonoBehaviourCommand}" />
                                             <Button x:Name="MonoBehaviourCopyJsonButton"
+                                                    Classes="toolbar-btn"
                                                     Content="Copy JSON"
-                                                    Height="26"
-                                                    Padding="8,2"
-                                                    FontSize="11"
                                                     Command="{Binding CopyMonoBehaviourJsonCommand}" />
                                         </WrapPanel>
                                     </Grid>
@@ -590,12 +580,7 @@
                                                                FontWeight="SemiBold"
                                                                FontSize="12"
                                                                VerticalAlignment="Center" />
-                                                    <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
-                                                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
-                                                            BorderThickness="1"
-                                                            CornerRadius="3"
-                                                            Padding="4,1"
-                                                            VerticalAlignment="Center"
+                                                    <Border Classes="badge-chip"
                                                             IsVisible="{Binding HasTypeHint, Mode=OneTime}">
                                                         <TextBlock Text="{Binding TypeHint, Mode=OneTime}"
                                                                    FontSize="10"
@@ -603,23 +588,14 @@
                                                                    VerticalAlignment="Center" />
                                                     </Border>
                                                     <TextBlock Text="{Binding ValueText, Mode=OneTime}"
-                                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                               FontFamily="{StaticResource AppMonoFontFamily}"
                                                                FontSize="12"
                                                                Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
                                                                VerticalAlignment="Center"
                                                                IsVisible="{Binding HasScalarOrSummaryValue, Mode=OneTime}" />
-                                                    <Button Content="{Binding PPtrDisplayLabel, Mode=OneTime}"
+                                                    <Button Classes="pptr-link"
+                                                            Content="{Binding PPtrDisplayLabel, Mode=OneTime}"
                                                             ToolTip.Tip="{Binding PPtrTooltip, Mode=OneTime}"
-                                                            Padding="7,1"
-                                                            MinHeight="22"
-                                                            FontSize="11"
-                                                            FontWeight="SemiBold"
-                                                            Foreground="#4EA1FF"
-                                                            Background="Transparent"
-                                                            BorderBrush="#554EA1FF"
-                                                            BorderThickness="1"
-                                                            CornerRadius="4"
-                                                            VerticalAlignment="Center"
                                                             IsVisible="{Binding IsPPtr, Mode=OneTime}"
                                                             IsEnabled="{Binding IsNavigablePPtr, Mode=OneTime}"
                                                             Command="{Binding $parent[local:MainWindow].ViewModel.NavigateToPPtrCommand}"
@@ -646,12 +622,7 @@
                                 VerticalAlignment="Stretch"
                                 IsVisible="{Binding PreviewSession.IsGameObjectInspectorVisible}">
                             <Grid RowDefinitions="Auto,Auto,*" Margin="8" RowSpacing="8">
-                                <Border Grid.Row="0"
-                                        Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
-                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
-                                        BorderThickness="1"
-                                        CornerRadius="6"
-                                        Padding="10,8">
+                                <Border Grid.Row="0" Classes="inspector-card">
                                     <StackPanel Spacing="4">
                                         <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                                             <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
@@ -661,22 +632,15 @@
                                                            FontWeight="SemiBold"
                                                            TextTrimming="CharacterEllipsis"
                                                            VerticalAlignment="Center" />
-                                                <Border Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
-                                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
-                                                        BorderThickness="1"
-                                                        CornerRadius="3"
-                                                        Padding="5,1"
-                                                        VerticalAlignment="Center">
+                                                <Border Classes="badge-chip">
                                                     <TextBlock Text="{Binding PreviewSession.InspectedGameObject.ActiveStateText}"
                                                                FontSize="10"
                                                                FontWeight="SemiBold" />
                                                 </Border>
                                             </StackPanel>
                                             <Button Grid.Column="1"
+                                                    Classes="toolbar-btn"
                                                     Content="Open Asset"
-                                                    Height="24"
-                                                    Padding="8,2"
-                                                    FontSize="11"
                                                     VerticalAlignment="Center"
                                                     IsVisible="{Binding PreviewSession.InspectedGameObject.HasGameObjectTarget}"
                                                     Command="{Binding NavigateToInspectorTargetCommand}"
@@ -688,24 +652,20 @@
                                                    TextWrapping="Wrap"
                                                    IsVisible="{Binding PreviewSession.InspectedGameObject.HasHierarchyPath}" />
                                         <TextBlock Text="{Binding PreviewSession.InspectedGameObject.HeaderMetadataLine}"
-                                                   FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                   FontFamily="{StaticResource AppMonoFontFamily}"
                                                    FontSize="11"
                                                    Opacity="0.82"
                                                    TextWrapping="Wrap" />
                                         <TextBlock Text="{Binding PreviewSession.InspectedGameObject.LazyNoticeText}"
                                                    FontSize="11"
-                                                   Foreground="#E0A84C"
+                                                   Foreground="{DynamicResource AppWarningAccentBrush}"
                                                    TextWrapping="Wrap"
                                                    IsVisible="{Binding PreviewSession.InspectedGameObject.HasLazyNotice}" />
                                     </StackPanel>
                                 </Border>
 
                                 <StackPanel Grid.Row="1" Spacing="6">
-                                    <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
-                                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
-                                            BorderThickness="1"
-                                            CornerRadius="6"
-                                            Padding="10,8"
+                                    <Border Classes="inspector-card"
                                             IsVisible="{Binding PreviewSession.InspectedGameObject.Transform.HasTransform}">
                                         <StackPanel Spacing="4">
                                             <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.HeaderTitle}"
@@ -713,32 +673,25 @@
                                                        FontSize="12" />
                                             <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="10" RowSpacing="2">
                                                 <TextBlock Grid.Row="0" Grid.Column="0" Text="Position" FontSize="11" Opacity="0.75" />
-                                                <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.PositionText}" FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace" FontSize="11" />
+                                                <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.PositionText}" FontFamily="{StaticResource AppMonoFontFamily}" FontSize="11" />
                                                 <TextBlock Grid.Row="1" Grid.Column="0" Text="Rotation" FontSize="11" Opacity="0.75" />
-                                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.RotationEulerText}" FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace" FontSize="11" />
+                                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.RotationEulerText}" FontFamily="{StaticResource AppMonoFontFamily}" FontSize="11" />
                                                 <TextBlock Grid.Row="2" Grid.Column="0" Text="Scale" FontSize="11" Opacity="0.75" />
-                                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.ScaleText}" FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace" FontSize="11" />
+                                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.ScaleText}" FontFamily="{StaticResource AppMonoFontFamily}" FontSize="11" />
                                                 <TextBlock Grid.Row="3" Grid.Column="0" Text="Hierarchy" FontSize="11" Opacity="0.75" />
                                                 <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                                                     <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.ChildCount, StringFormat='Children: {0}'}" FontSize="11" VerticalAlignment="Center" />
                                                     <TextBlock Text="• Parent:" FontSize="11" Opacity="0.75" VerticalAlignment="Center" />
                                                     <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.ParentName}" FontSize="11" VerticalAlignment="Center" IsVisible="{Binding !PreviewSession.InspectedGameObject.Transform.HasParentTarget}" />
-                                                    <Button Content="{Binding PreviewSession.InspectedGameObject.Transform.ParentName}"
-                                                            Padding="5,1"
-                                                            MinHeight="20"
-                                                            FontSize="11"
-                                                            Foreground="#4EA1FF"
-                                                            Background="Transparent"
-                                                            BorderBrush="#554EA1FF"
-                                                            BorderThickness="1"
-                                                            CornerRadius="3"
+                                                    <Button Classes="pptr-link"
+                                                            Content="{Binding PreviewSession.InspectedGameObject.Transform.ParentName}"
                                                             IsVisible="{Binding PreviewSession.InspectedGameObject.Transform.HasParentTarget}"
                                                             Command="{Binding NavigateToInspectorTargetCommand}"
                                                             CommandParameter="{Binding PreviewSession.InspectedGameObject.Transform.ParentTarget}" />
                                                 </StackPanel>
                                             </Grid>
                                             <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.RectSummaryText}"
-                                                       FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                       FontFamily="{StaticResource AppMonoFontFamily}"
                                                        FontSize="10"
                                                        Opacity="0.82"
                                                        TextWrapping="Wrap"
@@ -817,15 +770,8 @@
                                                             </ItemsControl.ItemsPanel>
                                                             <ItemsControl.ItemTemplate>
                                                                 <DataTemplate x:DataType="svc:AssetReferenceItem" x:CompileBindings="True">
-                                                                    <Button Margin="0,2,4,2"
-                                                                            Padding="6,2"
-                                                                            MinHeight="22"
-                                                                            FontSize="11"
-                                                                            Foreground="#4EA1FF"
-                                                                            Background="Transparent"
-                                                                            BorderBrush="#554EA1FF"
-                                                                            BorderThickness="1"
-                                                                            CornerRadius="4"
+                                                                    <Button Classes="pptr-link"
+                                                                            Margin="0,2,4,2"
                                                                             ToolTip.Tip="{Binding DetailLine, Mode=OneTime}"
                                                                             IsEnabled="{Binding IsNavigable, Mode=OneTime}"
                                                                             Command="{Binding $parent[local:MainWindow].ViewModel.NavigateToInspectorTargetCommand}"
@@ -852,31 +798,40 @@
                                                   IsMaterialShaderPreview="{Binding PreviewSession.ShaderPreview.IsActive}"
                                                   MaterialShaderFrame="{Binding PreviewSession.ShaderPreview.Frame}" />
                         <local:TextureGLPreviewControl x:Name="TextureGLPreview" IsVisible="False" Focusable="True" />
-                        <Border x:Name="PreviewInfoBorder" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="{Binding PreviewSession.IsInfoOverlayVisible}">
+                        <Border x:Name="PreviewInfoBorder" Classes="overlay-panel" Width="300" MaxHeight="500" HorizontalAlignment="Left" VerticalAlignment="Bottom" IsVisible="{Binding PreviewSession.IsInfoOverlayVisible}">
                             <Grid RowDefinitions="Auto,*">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="8,4,8,4">
-                                    <TextBlock Text="Preview Information" VerticalAlignment="Center" Foreground="#AAA" FontWeight="Bold" FontSize="11" />
-                                    <Button Grid.Column="1" x:Name="TogglePreviewInfoBtn" Content="{Binding PreviewSession.InfoToggleGlyph}" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="White" BorderBrush="Transparent" Command="{Binding TogglePreviewInfoCommand}" />
+                                    <TextBlock Text="Preview Information" VerticalAlignment="Center" Foreground="{DynamicResource AppOverlayMutedTextBrush}" FontWeight="Bold" FontSize="11" />
+                                    <Button Grid.Column="1" x:Name="TogglePreviewInfoBtn" Content="{Binding PreviewSession.InfoToggleGlyph}" Width="24" Height="24" Padding="0" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Background="Transparent" Foreground="{DynamicResource AppOverlayTextBrush}" BorderBrush="Transparent" Command="{Binding TogglePreviewInfoCommand}" />
                                 </Grid>
                                 <ScrollViewer Grid.Row="1" x:Name="PreviewInfoScroll" IsVisible="{Binding PreviewSession.IsInfoExpanded}" MaxHeight="450" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
-                                    <TextBlock x:Name="PreviewInfoOverlay" Text="{Binding PreviewSession.PreviewMetadataSummary}" Foreground="White" FontFamily="Monospace" FontSize="11" LineHeight="15" Margin="8,0,8,8" />
+                                    <TextBlock x:Name="PreviewInfoOverlay" Text="{Binding PreviewSession.PreviewMetadataSummary}" Foreground="{DynamicResource AppOverlayTextBrush}" FontFamily="{StaticResource AppMonoFontFamily}" FontSize="11" LineHeight="15" Margin="8,0,8,8" />
                                 </ScrollViewer>
                             </Grid>
                         </Border>
 
-                        <Border x:Name="AnimationPlaybackPanel" Background="#B0111111" BorderBrush="#33ffffff" BorderThickness="1" CornerRadius="6" Margin="10" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="8,4" IsVisible="{Binding MeshPreview.IsAnimationLoaded}">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <Button x:Name="AnimPlayPauseBtn" Content="{Binding MeshPreview.PlayPauseButtonText}" Width="60" Height="28" FontSize="11" Command="{Binding ToggleAnimationPlayPauseCommand}" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
-                                <Button x:Name="AnimRestartBtn" Content="Replay" Width="60" Height="28" FontSize="11" Command="{Binding RestartAnimationCommand}" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" />
-                                <TextBlock x:Name="AnimFrameLabel" Text="{Binding MeshPreview.FormattedFrameText}" Foreground="White" VerticalAlignment="Center" FontSize="11" Margin="4,0" />
+                        <Border x:Name="AnimationPlaybackPanel" Classes="overlay-panel" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="10,8" MinWidth="320" IsVisible="{Binding MeshPreview.IsAnimationLoaded}">
+                            <StackPanel Spacing="6">
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                    <Slider x:Name="AnimationProgressBar" Minimum="0" Maximum="1" Value="0" Focusable="False" Height="26" VerticalAlignment="Center" ValueChanged="AnimationProgressBar_ValueChanged" />
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                        <TextBlock x:Name="AnimFrameLabel" Classes="overlay-counter" Text="{Binding MeshPreview.FormattedFrameText}" />
+                                        <TextBlock x:Name="AnimTimeLabel" Classes="overlay-counter" Opacity="0.85" Text="{Binding MeshPreview.FormattedTimeText}" />
+                                    </StackPanel>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button x:Name="AnimPlayPauseBtn" Classes="transport-btn" Content="{Binding MeshPreview.PlayPauseButtonText}" Command="{Binding ToggleAnimationPlayPauseCommand}" />
+                                    <Button x:Name="AnimStopBtn" Classes="transport-btn" Content="Stop" Command="{Binding StopAnimationCommand}" />
+                                    <Button x:Name="AnimRestartBtn" Classes="transport-btn" Content="Replay" Command="{Binding RestartAnimationCommand}" />
+                                </StackPanel>
                             </StackPanel>
                         </Border>
 
-                        <Border x:Name="VideoClipPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Margin="10" IsVisible="{Binding MediaPlayback.IsVideoActive}" BoxShadow="0 8 32 0 #40000000">
+                        <Border x:Name="VideoClipPanel" Classes="media-card" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" IsVisible="{Binding MediaPlayback.IsVideoActive}">
                             <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="VideoTitleLabel" Text="{Binding MediaPlayback.MediaTitle}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="VideoStatusLabel" Grid.Column="1" Text="{Binding MediaPlayback.StatusText}" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="VideoTitleLabel" Classes="media-title" Text="{Binding MediaPlayback.MediaTitle}"/>
+                                    <TextBlock x:Name="VideoStatusLabel" Grid.Column="1" Classes="status-label" Text="{Binding MediaPlayback.StatusText}"/>
                                 </Grid>
                                 
                                 <StackPanel Grid.Row="1" Spacing="4">
@@ -896,43 +851,42 @@
                                 <Grid Grid.Row="3" ColumnDefinitions="*,Auto" Margin="0,4">
                                     <Slider x:Name="VideoProgressBar" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32"
                                             ValueChanged="VideoProgressBar_ValueChanged"/>
-                                    <TextBlock x:Name="VideoTimerLabel" Grid.Column="1" Text="{Binding MediaPlayback.FormattedTimeRange}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                    <TextBlock x:Name="VideoTimerLabel" Grid.Column="1" Classes="mono-counter" Text="{Binding MediaPlayback.FormattedTimeRange}" Margin="8,0,0,0"/>
                                 </Grid>
                                 
                                 <WrapPanel Grid.Row="4" Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Button x:Name="VideoPlayButton" Content="{Binding MediaPlayback.VideoPlayButtonText}" Command="{Binding VideoPlayPauseCommand}" Width="60" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="VideoStopButton" Content="Stop" Command="{Binding VideoStopCommand}" Width="60" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="VideoPlayButton" Classes="transport-btn" Content="{Binding MediaPlayback.PlayPauseButtonText}" Command="{Binding VideoPlayPauseCommand}" Margin="0,0,8,4"/>
+                                    <Button x:Name="VideoStopButton" Classes="transport-btn" Content="Stop" Command="{Binding VideoStopCommand}" Margin="0,0,8,4"/>
                                     <CheckBox x:Name="VideoLoopButton" Content="Loop" IsChecked="{Binding MediaPlayback.IsLooping, Mode=TwoWay}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
                                     
                                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,16,4">
                                         <TextBlock Text="Vol" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="11"/>
                                         <Slider x:Name="VideoVolumeBar" Minimum="0" Maximum="100" Value="80" Width="80" Focusable="False" VerticalAlignment="Center" ValueChanged="VideoVolumeBar_ValueChanged"/>
                                     </StackPanel>
-                                    <Button x:Name="VideoExportButton" Content="Export" Command="{Binding VideoExportCommand}" Width="70" HorizontalContentAlignment="Center" Margin="0,0,0,4"/>
+                                    <Button x:Name="VideoExportButton" Classes="transport-btn" Content="Export" Command="{Binding VideoExportCommand}" MinWidth="70" Margin="0,0,0,4"/>
                                 </WrapPanel>
                             </Grid>
                         </Border>
 
 
-                        <Border x:Name="AudioPanel" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}" BorderThickness="1" CornerRadius="16" Padding="20" HorizontalAlignment="Stretch" VerticalAlignment="Center" MaxWidth="450" Margin="10" IsVisible="{Binding MediaPlayback.IsAudioActive}" BoxShadow="0 8 32 0 #40000000">
+                        <Border x:Name="AudioPanel" Classes="media-card" HorizontalAlignment="Stretch" VerticalAlignment="Center" MaxWidth="460" IsVisible="{Binding MediaPlayback.IsAudioActive}">
                             <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="12">
                                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="AudioTitleLabel" Text="{Binding MediaPlayback.MediaTitle}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="AudioStatusLabel" Grid.Column="1" Text="{Binding MediaPlayback.StatusText}" Foreground="#00e676" FontSize="12" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AudioTitleLabel" Classes="media-title" Text="{Binding MediaPlayback.MediaTitle}"/>
+                                    <TextBlock x:Name="AudioStatusLabel" Grid.Column="1" Classes="status-label" Text="{Binding MediaPlayback.StatusText}"/>
                                 </Grid>
                                 
-                                <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
-                                    <TextBlock x:Name="AudioInfoLabel" Text="{Binding MediaPlayback.MediaInfoText}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center"/>
-                                    <TextBlock x:Name="AudioTimerLabel" Grid.Column="1" Text="{Binding MediaPlayback.FormattedTimeRange}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" FontFamily="Monospace" FontSize="12" VerticalAlignment="Center"/>
+                                <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                    <TextBlock x:Name="AudioInfoLabel" Text="{Binding MediaPlayback.MediaInfoText}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="AudioTimerLabel" Grid.Column="1" Classes="mono-counter" Text="{Binding MediaPlayback.FormattedTimeRange}"/>
                                 </Grid>
                                 
                                 <Slider x:Name="AudioProgressBar" Grid.Row="2" Minimum="0" Maximum="1000" Value="0" Focusable="False" Height="32" 
                                         ValueChanged="AudioProgressBar_ValueChanged"/>
                                 
                                 <WrapPanel Grid.Row="3" Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Button x:Name="AudioPlayButton" Content="Play" Command="{Binding AudioPlayCommand}" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="AudioPauseButton" Content="{Binding MediaPlayback.AudioPauseButtonText}" Command="{Binding AudioPauseCommand}" Width="65" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
-                                    <Button x:Name="AudioStopButton" Content="Stop" Command="{Binding AudioStopCommand}" Width="55" HorizontalContentAlignment="Center" Margin="0,0,8,4"/>
+                                    <Button x:Name="AudioPlayButton" Classes="transport-btn" Content="{Binding MediaPlayback.PlayPauseButtonText}" Command="{Binding AudioPlayPauseCommand}" Margin="0,0,8,4"/>
+                                    <Button x:Name="AudioStopButton" Classes="transport-btn" Content="Stop" Command="{Binding AudioStopCommand}" Margin="0,0,8,4"/>
                                     <CheckBox x:Name="AudioloopButton" Content="Loop" IsChecked="{Binding MediaPlayback.IsLooping, Mode=TwoWay}" Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" VerticalAlignment="Center" Margin="0,0,16,4"/>
                                     
                                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,4">

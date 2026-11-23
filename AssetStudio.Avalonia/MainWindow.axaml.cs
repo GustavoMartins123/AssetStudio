@@ -264,6 +264,8 @@ public partial class MainWindow : Window
 
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
+        AnimationProgressBar?.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, AnimationProgressBar_DragStarted);
+        AnimationProgressBar?.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, AnimationProgressBar_DragCompleted);
         InitializeVideoPlayer();
         FfmpegVideoPlayer.MediaEnded += FfmpegVideoPlayer_MediaEnded;
         FfmpegVideoPlayer.PositionUpdated += FfmpegVideoPlayer_PositionUpdated;
@@ -435,6 +437,7 @@ public partial class MainWindow : Window
 
         handlers.SetTextAssetDisplayMode = ExecuteSetTextAssetDisplayMode;
         handlers.ToggleAnimationPlayPause = ExecuteToggleAnimationPlayPause;
+        handlers.StopAnimation = ExecuteStopAnimation;
         handlers.RestartAnimation = ExecuteRestartAnimation;
         handlers.ResetMeshView = ExecuteResetMeshView;
         handlers.RotateMeshLeft = ExecuteRotateMeshLeft;
@@ -454,6 +457,7 @@ public partial class MainWindow : Window
         handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;
         handlers.VideoStopAsync = VideoStopAsync;
         handlers.VideoExportAsync = ExecuteVideoExportAsync;
+        handlers.AudioPlayPauseAsync = ExecuteAudioPlayPauseAsync;
         handlers.AudioPlayAsync = ExecuteAudioPlayAsync;
         handlers.AudioPause = ExecuteAudioPause;
         handlers.AudioStop = AudioStop;
@@ -2282,6 +2286,8 @@ public partial class MainWindow : Window
         RemoveHandler(DragDrop.DropEvent, Window_Drop);
         VideoProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, VideoProgressBar_DragStarted);
         VideoProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
+        AnimationProgressBar?.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, AnimationProgressBar_DragStarted);
+        AnimationProgressBar?.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, AnimationProgressBar_DragCompleted);
         if (_audioProgressHandlersAttached && AudioProgressBar != null)
         {
             AudioProgressBar.RemoveHandler(global::Avalonia.Controls.Primitives.Thumb.DragStartedEvent, AudioProgressBar_DragStarted);

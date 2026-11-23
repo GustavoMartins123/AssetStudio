@@ -197,6 +197,7 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 if (SetProperty(ref _isPlaying, value))
                 {
+                    OnPropertyChanged(nameof(PlayPauseButtonText));
                     OnPropertyChanged(nameof(VideoPlayButtonText));
                 }
             }
@@ -214,7 +215,10 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
-        public string VideoPlayButtonText => _isPlaying ? "Pause" : "Play";
+        /// <summary>Unified Play/Pause toggle caption shared across Audio and Video transports.</summary>
+        public string PlayPauseButtonText => _isPlaying ? "Pause" : "Play";
+
+        public string VideoPlayButtonText => PlayPauseButtonText;
 
         public string AudioPauseButtonText => _isPaused ? "Resume" : "Pause";
 
