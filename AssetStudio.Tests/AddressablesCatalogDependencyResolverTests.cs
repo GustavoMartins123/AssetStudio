@@ -685,6 +685,24 @@ namespace AssetStudio.Tests
             return ms.ToArray();
         }
 
+        [Fact]
+        public void AddressablesCatalogAnalyzer_IsBundleProvider_ExcludesBundledAssetAndBundledSceneProviders()
+        {
+            Assert.True(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(
+                "UnityEngine.ResourceManagement.ResourceProviders.AssetBundleProvider"));
+            Assert.True(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(
+                "Custom.ResourceProviders.CustomAssetBundleProvider"));
+            Assert.True(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(
+                "Custom.ResourceProviders.CustomDlcAssetBundleProvider"));
+
+            Assert.False(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(
+                "UnityEngine.ResourceManagement.ResourceProviders.BundledAssetProvider"));
+            Assert.False(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(
+                "UnityEngine.ResourceManagement.ResourceProviders.BundledSceneProvider"));
+            Assert.False(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(null));
+            Assert.False(AssetStudio.Avalonia.Services.ProjectAnalysis.AddressablesCatalogAnalyzer.IsBundleProvider(string.Empty));
+        }
+
         private static string CreateTempDirectory(string prefix)
         {
             var path = Path.Combine(Path.GetTempPath(), "AssetStudioTests_" + prefix + "_" + Guid.NewGuid().ToString("N"));

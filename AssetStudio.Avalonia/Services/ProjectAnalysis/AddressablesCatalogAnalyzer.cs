@@ -645,10 +645,20 @@ public sealed class AddressablesCatalogAnalyzer
         return !providerId.StartsWith("UnityEngine.ResourceManagement.ResourceProviders.", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsBundleProvider(string? providerId)
+    internal static bool IsBundleProvider(string? providerId)
     {
-        return !string.IsNullOrWhiteSpace(providerId)
-            && providerId.Contains("Bundle", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(providerId))
+        {
+            return false;
+        }
+
+        if (providerId.Contains("BundledAsset", StringComparison.OrdinalIgnoreCase)
+            || providerId.Contains("BundledScene", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return providerId.Contains("Bundle", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool LooksLikeProviderClassName(string token)
