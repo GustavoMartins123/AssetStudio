@@ -1,6 +1,7 @@
 using Avalonia.Input;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.ViewModels;
 using SkiaSharp;
 using System;
@@ -19,13 +20,13 @@ public partial class MainWindow
     private const double TwoDAnimationMaxPreviewFill = 1.0;
     private const double TwoDAnimationZoomFactor = 1.12;
 
+    private readonly FrameTimelineClock _2dAnimClock = new();
     private DispatcherTimer? _2dAnimTimer;
     private List<(float time, AssetStudio.Object asset)> _2dAnimFrames = new();
+    private double[] _2dAnimKeyframeTimes = Array.Empty<double>();
     private Dictionary<AssetStudio.Object, global::Avalonia.Media.Imaging.Bitmap> _2dAnimBitmaps = new();
     private global::Avalonia.Media.Imaging.Bitmap? _2dAnimCurrentBitmap;
-    private DateTime _2dAnimStartTime;
     private float _2dAnimDuration;
-    private float _2dAnimPausedElapsedSeconds;
     private int _2dAnimCurrentFrameIndex;
     private bool _2dAnimPaused;
     private bool _is2dAnimationPreviewActive;
@@ -170,6 +171,7 @@ public partial class MainWindow
 
                     Stop2DAnimation();
                     _2dAnimFrames = orderedFrames;
+                    _2dAnimKeyframeTimes = orderedFrames.Select(f => (double)f.time).ToArray();
                     _2dAnimDuration = duration;
                     _2dAnimBitmaps = finalBitmaps;
 
@@ -184,12 +186,19 @@ public partial class MainWindow
                         ImagePreviewBox.StretchDirection = global::Avalonia.Media.StretchDirection.Both;
                     }
 
+                    var sampleRate = clip.m_SampleRate > 0 ? clip.m_SampleRate : 30.0;
                     _is2dAnimationPreviewActive = true;
                     _2dAnimPaused = false;
-                    _2dAnimPausedElapsedSeconds = 0;
                     _2dAnimCurrentFrameIndex = 0;
                     _2dAnimPreviewFill = TwoDAnimationDefaultPreviewFill;
-                    _2dAnimStartTime = DateTime.UtcNow;
+                    _2dAnimClock.Configure(
+                        totalFrames: _2dAnimFrames.Count,
+                        fps: sampleRate,
+                        durationSeconds: _2dAnimDuration,
+                        isLooping: true,
+                        playbackSpeed: 1.0);
+                    _2dAnimClock.Play();
+
                     PreviewSession.ActivateSurface(
                         PreviewSurfaceKind.Animation2D,
                         AssetListDataGrid?.SelectedItem as AssetItem,
@@ -201,13 +210,13 @@ public partial class MainWindow
                         currentTimeSeconds: 0.0,
                         isPlaying: true,
                         totalFrames: _2dAnimFrames.Count,
-                        sampleRate: clip.m_SampleRate > 0 ? clip.m_SampleRate : 30.0);
+                        sampleRate: sampleRate);
                     ShowAnimationPlayback(_2dAnimFrames.Count);
-                    Render2DAnimationFrame(0);
+                    Render2DAnimationFrame(0.0, forceUpdate: true);
 
                     _2dAnimTimer = new DispatcherTimer
                     {
-                        Interval = TimeSpan.FromMilliseconds(30)
+                        Interval = TimeSpan.FromMilliseconds(16)
                     };
                     _2dAnimTimer.Tick += On2DAnimTimerTick;
                     _2dAnimTimer.Start();
@@ -257,28 +266,21 @@ public partial class MainWindow
             return;
         }
 
-        Render2DAnimationFrame(Get2DAnimationLoopTime());
+        var snapshot = _2dAnimClock.Advance();
+        Render2DAnimationFrame(snapshot.CurrentTimeSeconds, forceUpdate: false);
     }
 
-    private float Get2DAnimationLoopTime()
-    {
-        var elapsedSeconds = _2dAnimPaused
-            ? _2dAnimPausedElapsedSeconds
-            : (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
-        return _2dAnimDuration > 0 ? elapsedSeconds % _2dAnimDuration : 0f;
-    }
-
-    private void Render2DAnimationFrame(float loopTime)
+    private void Render2DAnimationFrame(double loopTimeSeconds, bool forceUpdate = true)
     {
         if (_2dAnimFrames.Count == 0)
         {
             return;
         }
 
-        var frameIndex = _2dAnimFrames.FindLastIndex(f => f.time <= loopTime);
-        if (frameIndex < 0)
+        var frameIndex = FrameTimelineClock.FindKeyframeIndex(_2dAnimKeyframeTimes, loopTimeSeconds);
+        if (!forceUpdate && frameIndex == _2dAnimCurrentFrameIndex)
         {
-            frameIndex = 0;
+            return;
         }
 
         var frame = _2dAnimFrames[frameIndex];
@@ -286,8 +288,7 @@ public partial class MainWindow
         {
             _2dAnimCurrentFrameIndex = frameIndex;
             Set2DAnimationFrame(bitmap);
-            MeshPreview.SeekFrame(_2dAnimCurrentFrameIndex, _2dAnimFrames.Count);
-            UpdateAnimationPlaybackFrame(_2dAnimCurrentFrameIndex, _2dAnimFrames.Count);
+            UpdateAnimationPlaybackFrame(_2dAnimCurrentFrameIndex, _2dAnimFrames.Count, loopTimeSeconds);
         }
     }
 
@@ -298,7 +299,7 @@ public partial class MainWindow
             return;
         }
 
-        _2dAnimPausedElapsedSeconds = (float)(DateTime.UtcNow - _2dAnimStartTime).TotalSeconds;
+        _2dAnimClock.Pause();
         _2dAnimPaused = true;
         _2dAnimTimer?.Stop();
         MeshPreview.Pause();
@@ -312,7 +313,7 @@ public partial class MainWindow
             return;
         }
 
-        _2dAnimStartTime = DateTime.UtcNow - TimeSpan.FromSeconds(_2dAnimPausedElapsedSeconds);
+        _2dAnimClock.Resume();
         _2dAnimPaused = false;
         _2dAnimTimer?.Start();
         MeshPreview.Play();
@@ -327,12 +328,24 @@ public partial class MainWindow
         }
 
         _2dAnimPaused = false;
-        _2dAnimPausedElapsedSeconds = 0;
-        _2dAnimStartTime = DateTime.UtcNow;
+        var snapshot = _2dAnimClock.Restart();
         MeshPreview.Restart();
-        Render2DAnimationFrame(0);
+        Render2DAnimationFrame(snapshot.CurrentTimeSeconds, forceUpdate: true);
         _2dAnimTimer?.Start();
         SetAnimationPlaybackPaused(false);
+    }
+
+    private void Seek2DAnimationFrame(int frameIndex)
+    {
+        if (!_is2dAnimationPreviewActive || _2dAnimFrames.Count == 0 || _2dAnimKeyframeTimes.Length == 0)
+        {
+            return;
+        }
+
+        var clamped = Math.Clamp(frameIndex, 0, _2dAnimFrames.Count - 1);
+        var targetTime = _2dAnimKeyframeTimes[clamped];
+        _2dAnimClock.SeekTime(targetTime);
+        Render2DAnimationFrame(targetTime, forceUpdate: true);
     }
 
     private void Set2DAnimationFrame(global::Avalonia.Media.Imaging.Bitmap bitmap)
@@ -394,7 +407,8 @@ public partial class MainWindow
         var wasActive = _is2dAnimationPreviewActive;
         _is2dAnimationPreviewActive = false;
         _2dAnimPaused = false;
-        _2dAnimPausedElapsedSeconds = 0;
+        _2dAnimClock.Reset();
+        _2dAnimKeyframeTimes = Array.Empty<double>();
         if (_2dAnimTimer != null)
         {
             _2dAnimTimer.Stop();

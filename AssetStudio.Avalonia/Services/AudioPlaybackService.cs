@@ -525,6 +525,8 @@ namespace AssetStudio.Avalonia.Services
         private readonly Action<Action> _dispatchToUi;
         private readonly Action<string>? _log;
         private readonly string _tempDirectory;
+        private readonly Func<long> _nowTickMsProvider;
+        private readonly MediaTimelineTracker _timeline = new();
 
         private long _sessionId;
         private CancellationTokenSource? _loadCts;
@@ -540,12 +542,14 @@ namespace AssetStudio.Avalonia.Services
             IEnumerable<IAudioPreviewBackendFactory> factories,
             Action<Action>? dispatchToUi = null,
             string? tempDirectory = null,
-            Action<string>? log = null)
+            Action<string>? log = null,
+            Func<long>? nowTickMsProvider = null)
         {
             _factories = (factories ?? throw new ArgumentNullException(nameof(factories))).ToArray();
             _dispatchToUi = dispatchToUi ?? (static action => action());
             _tempDirectory = string.IsNullOrEmpty(tempDirectory) ? Path.GetTempPath() : tempDirectory;
             _log = log;
+            _nowTickMsProvider = nowTickMsProvider ?? (static () => Environment.TickCount64);
         }
 
         /// <summary>
@@ -632,6 +636,24 @@ namespace AssetStudio.Avalonia.Services
 
         public int Volume => Volatile.Read(ref _volume);
 
+        public bool HasPendingSeek => _timeline.HasPendingSeek;
+
+        /// <summary>
+        /// Begins a user scrub/drag seek barrier on the unified timeline tracker so polling ticks
+        /// cannot snap the slider or timestamp readout backward before <see cref="Seek"/> commits.
+        /// </summary>
+        public long BeginUserSeek(long targetMs)
+        {
+            var durationMs = DurationMs;
+            var clamped = durationMs > 0 ? Math.Clamp(targetMs, 0L, durationMs) : Math.Max(0L, targetMs);
+            return _timeline.BeginSeek(clamped);
+        }
+
+        public void CancelUserSeek(long seekGeneration)
+        {
+            _timeline.CancelSeek(seekGeneration);
+        }
+
         /// <summary>The asset is prepared, its temp file still exists and a backend has it open.</summary>
         public bool IsLoaded(string assetId)
         {
@@ -668,6 +690,7 @@ namespace AssetStudio.Avalonia.Services
                 _assetId = null;
             }
 
+            _timeline.Reset(0L);
             TryCancel(loadCts);
             TryCancel(playCts);
             DisposeBackend(backend);
@@ -818,6 +841,8 @@ namespace AssetStudio.Avalonia.Services
                     candidate = null;
                     adopted.EndReached += OnBackendEndReached;
                     adopted.SetVolume(Volume);
+                    _timeline.Reset(media.DurationMs);
+                    _timeline.OnMediaOpened(media.DurationMs);
                     return new AudioPreviewResult(AudioPreviewResultStatus.Ready, string.Empty);
                 }
 
@@ -906,9 +931,13 @@ namespace AssetStudio.Avalonia.Services
                     return AudioPreviewResult.Cancelled;
                 }
 
-                return started
-                    ? new AudioPreviewResult(AudioPreviewResultStatus.Started, string.Empty)
-                    : new AudioPreviewResult(AudioPreviewResultStatus.Unsupported, backend.PlaybackFailureMessage);
+                if (started)
+                {
+                    _timeline.OnMediaOpened(DurationMs);
+                    return new AudioPreviewResult(AudioPreviewResultStatus.Started, string.Empty);
+                }
+
+                return new AudioPreviewResult(AudioPreviewResultStatus.Unsupported, backend.PlaybackFailureMessage);
             }
             finally
             {
@@ -924,7 +953,17 @@ namespace AssetStudio.Avalonia.Services
             }
         }
 
-        public void Pause() => ActiveBackend?.Pause();
+        public void Pause()
+        {
+            var backend = ActiveBackend;
+            if (backend == null)
+            {
+                return;
+            }
+
+            backend.Pause();
+            _timeline.TryCommitReachedSeek(backend.PositionSeconds * 1000.0);
+        }
 
         public void Resume()
         {
@@ -936,9 +975,14 @@ namespace AssetStudio.Avalonia.Services
 
             backend.SetVolume(Volume);
             backend.Play();
+            _timeline.TryCommitReachedSeek(backend.PositionSeconds * 1000.0);
         }
 
-        public void Stop() => ActiveBackend?.Stop();
+        public void Stop()
+        {
+            ActiveBackend?.Stop();
+            _timeline.StopClock();
+        }
 
         public void RestartForLoop()
         {
@@ -950,9 +994,10 @@ namespace AssetStudio.Avalonia.Services
 
             backend.SetVolume(Volume);
             backend.Restart();
+            _timeline.OnMediaOpened(DurationMs);
         }
 
-        /// <summary>Seeks the active backend (clamped to the media duration); ignored for non-seekable backends.</summary>
+        /// <summary>Seeks the active backend (clamped to the media duration) through a seek barrier; ignored for non-seekable backends.</summary>
         public void Seek(long positionMs)
         {
             var backend = ActiveBackend;
@@ -962,7 +1007,17 @@ namespace AssetStudio.Avalonia.Services
                 return;
             }
 
-            backend.Seek(Math.Clamp(positionMs, 0, durationMs) / 1000.0);
+            var targetMs = Math.Clamp(positionMs, 0L, durationMs);
+            var seekGeneration = _timeline.BeginSeek(targetMs);
+            try
+            {
+                backend.Seek(targetMs / 1000.0);
+            }
+            finally
+            {
+                _timeline.MarkSeekBarrierReached(seekGeneration, _nowTickMsProvider());
+                _timeline.TryCommitReachedSeek(backend.PositionSeconds * 1000.0);
+            }
         }
 
         /// <summary>Stores the 0..100 volume (applied to future backends too) and forwards it to the active backend.</summary>
@@ -981,12 +1036,22 @@ namespace AssetStudio.Avalonia.Services
                 return default;
             }
 
+            var durationMs = DurationMs;
+            if (durationMs > 0L && _timeline.DurationMs != durationMs)
+            {
+                _timeline.SetDurationMs(durationMs);
+            }
+
+            var effectivePosMs = _timeline.ResolvePolledPositionMs(
+                backend.PositionSeconds * 1000.0,
+                _nowTickMsProvider());
+
             return new AudioPlaybackSnapshot(
                 true,
-                (long)Math.Max(0, backend.PositionSeconds * 1000.0),
-                DurationMs,
+                effectivePosMs,
+                durationMs,
                 backend.IsPlaying,
-                backend.IsEnded);
+                !_timeline.HasPendingSeek && backend.IsEnded);
         }
 
         public void Dispose()
@@ -1139,52 +1204,82 @@ namespace AssetStudio.Avalonia.Services
         }
     }
 
-    /// <summary>Stopwatch-based playback clock for backends whose players do not report a reliable position.</summary>
+    /// <summary>
+    /// Thread-safe, monotonic Stopwatch-based playback clock backed by <see cref="MediaTimelineTracker"/>
+    /// for audio backends whose players do not push per-frame timestamps.
+    /// </summary>
     internal sealed class AudioPreviewClock
     {
-        private readonly Stopwatch _stopwatch = new();
-        private long _baseMs;
+        private readonly MediaTimelineTracker _tracker;
 
-        public bool IsRunning => _stopwatch.IsRunning;
+        public AudioPreviewClock(Func<long>? tickProvider = null, long tickFrequency = 0)
+        {
+            _tracker = new MediaTimelineTracker(tickProvider, tickFrequency);
+        }
 
-        public long PositionMs => _stopwatch.IsRunning ? _baseMs + _stopwatch.ElapsedMilliseconds : _baseMs;
+        public bool IsRunning => _tracker.IsClockRunning;
+
+        public long DurationMs => _tracker.DurationMs;
+
+        public bool HasPendingSeek => _tracker.HasPendingSeek;
+
+        public long PositionMs => _tracker.GetClockPositionMs();
+
+        public void SetDuration(long durationMs)
+        {
+            if (durationMs > 0L)
+            {
+                _tracker.SetDurationMs(durationMs);
+            }
+            else
+            {
+                _tracker.Reset(0L);
+            }
+        }
 
         public void Reset()
         {
-            _stopwatch.Reset();
-            _baseMs = 0;
+            _tracker.StopClock();
         }
 
         public void Start(long baseMs = -1)
         {
-            _baseMs = baseMs >= 0 ? baseMs : PositionMs;
-            _stopwatch.Restart();
+            if (baseMs >= 0L)
+            {
+                _tracker.StartClock(baseMs);
+            }
+            else
+            {
+                _tracker.ResumeClock();
+            }
         }
 
         public void Pause()
         {
-            _baseMs = PositionMs;
-            _stopwatch.Reset();
+            _tracker.PauseClock();
         }
 
         public void SetPosition(long positionMs)
         {
-            _baseMs = Math.Max(0, positionMs);
-            if (_stopwatch.IsRunning)
-            {
-                _stopwatch.Restart();
-            }
+            _tracker.SeekClock(positionMs);
         }
+
+        public long BeginSeek(long targetMs) => _tracker.BeginSeek(targetMs);
+
+        public void MarkSeekBarrierReached(long seekGeneration, long nowTickMs) =>
+            _tracker.MarkSeekBarrierReached(seekGeneration, nowTickMs);
     }
 
     /// <summary>
     /// Windows WinMM PCM WAV player (UnityAudioDecoder / transcoded WAV output). The underlying player is shared and
     /// reused across clips, so loads are serialised through <c>loadGate</c> to keep a stale load from clobbering a newer one.
+    /// Uses <see cref="MediaTimelineTracker"/> for monotonic clamping and seek-barrier stability across thread restarts.
     /// </summary>
     internal sealed class PcmWaveAudioPreviewBackend : IAudioPreviewBackend
     {
         private readonly WinMmAudioPlayer _player;
         private readonly SemaphoreSlim _loadGate;
+        private readonly MediaTimelineTracker _timeline = new();
         private long _durationMs;
         private volatile int _volume = 80;
         private bool _hasStarted;
@@ -1217,11 +1312,13 @@ namespace AssetStudio.Avalonia.Services
 
         public bool IsEnded =>
             _hasStarted
+            && !_timeline.HasPendingSeek
             && !IsPlaying
             && (_player.IsCompleted
                 || (_durationMs > 0 && _player.GetPositionMs() >= _durationMs - AudioPlaybackService.PrematureEndToleranceMs));
 
-        public double PositionSeconds => _player.GetPositionMs() / 1000.0;
+        public double PositionSeconds =>
+            _timeline.ResolvePolledPositionMs(_player.GetPositionMs(), Environment.TickCount64) / 1000.0;
 
         public double DurationSeconds => _durationMs / 1000.0;
 
@@ -1256,6 +1353,8 @@ namespace AssetStudio.Avalonia.Services
             }
 
             _durationMs = media.DurationMs > 0 ? media.DurationMs : _player.DurationMs;
+            _timeline.Reset(_durationMs);
+            _timeline.OnMediaOpened(_durationMs);
             _hasStarted = false;
             _startPending = false;
             _player.SetVolume(_volume);
@@ -1273,12 +1372,14 @@ namespace AssetStudio.Avalonia.Services
             _hasStarted = true;
             _player.SetVolume(_volume);
             _player.ResumeWav();
+            _timeline.TryCommitReachedSeek(_player.GetPositionMs());
         }
 
         public void Pause()
         {
             _startPending = false;
             _player.PauseWav();
+            _timeline.TryCommitReachedSeek(_player.GetPositionMs());
         }
 
         public void Stop()
@@ -1286,19 +1387,39 @@ namespace AssetStudio.Avalonia.Services
             _hasStarted = false;
             _startPending = false;
             _player.StopWav();
+            _timeline.StopClock();
         }
 
         public void Restart()
         {
             _hasStarted = true;
             _player.SetVolume(_volume);
+            _timeline.OnMediaOpened(_durationMs);
             _player.Play(0);
             _startPending = true;
         }
 
         public void Seek(double seconds)
         {
-            _player.Seek((long)(seconds * 1000.0));
+            var rawMs = double.IsFinite(seconds) && seconds > 0.0 ? (long)Math.Round(seconds * 1000.0) : 0L;
+            var targetMs = _durationMs > 0L ? Math.Clamp(rawMs, 0L, _durationMs) : Math.Max(0L, rawMs);
+            var wasPlayingOrPaused = _player.IsPlaying || _player.IsPaused || _startPending;
+
+            var seekGen = _timeline.BeginSeek(targetMs);
+            try
+            {
+                if (wasPlayingOrPaused)
+                {
+                    _startPending = true;
+                }
+
+                _player.Seek(targetMs);
+            }
+            finally
+            {
+                _timeline.MarkSeekBarrierReached(seekGen, Environment.TickCount64);
+                _timeline.TryCommitReachedSeek(_player.GetPositionMs());
+            }
         }
 
         public void SetVolume(int volume)
@@ -1317,6 +1438,7 @@ namespace AssetStudio.Avalonia.Services
             _disposed = true;
             _hasStarted = false;
             _startPending = false;
+            _timeline.Reset(0L);
             try
             {
                 _player.StopWav();
@@ -1330,6 +1452,8 @@ namespace AssetStudio.Avalonia.Services
     /// <summary>
     /// FFmpeg streaming player (WinMM / OpenAL audio sinks). Opens happen on the thread pool; players are torn down on
     /// the thread pool (and deferred until an in-flight <c>Open</c> finishes) so clip switching never blocks or races.
+    /// Uses <see cref="MediaTimelineTracker"/> via <see cref="AudioPreviewClock"/>, disables FFmpeg disk logging,
+    /// and guards seeks with <see cref="VideoPreviewService.SafeSeekPlayer"/>.
     /// </summary>
     internal sealed class FFmpegAudioPreviewBackend : IAudioPreviewBackend
     {
@@ -1378,6 +1502,7 @@ namespace AssetStudio.Avalonia.Services
             {
                 var player = _handle?.Player;
                 return _hasStarted
+                    && !_clock.HasPendingSeek
                     && player != null
                     && !player.IsPlaying
                     && _durationMs > 0
@@ -1395,6 +1520,7 @@ namespace AssetStudio.Avalonia.Services
         {
             _path = media.FilePath;
             _durationMs = media.DurationMs;
+            _clock.SetDuration(_durationMs);
             _hasStarted = false;
             return OpenNewPlayerAsync(cancellationToken);
         }
@@ -1447,7 +1573,7 @@ namespace AssetStudio.Avalonia.Services
         public void Stop()
         {
             _hasStarted = false;
-            _handle?.Player.Stop();
+            VideoPreviewService.SafeStopPlayer(_handle?.Player);
             _clock.Reset();
         }
 
@@ -1459,10 +1585,10 @@ namespace AssetStudio.Avalonia.Services
                 return;
             }
 
-            player.Stop();
+            VideoPreviewService.SafeStopPlayer(player);
             try
             {
-                player.Seek(0f);
+                VideoPreviewService.SafeSeekPlayer(player, 0f);
             }
             catch
             {
@@ -1482,9 +1608,18 @@ namespace AssetStudio.Avalonia.Services
                 return;
             }
 
-            var positionMs = (long)(seconds * 1000.0);
-            _clock.SetPosition(positionMs);
-            player.Seek(positionMs / (float)_durationMs);
+            var rawMs = double.IsFinite(seconds) && seconds > 0.0 ? (long)Math.Round(seconds * 1000.0) : 0L;
+            var positionMs = Math.Clamp(rawMs, 0L, _durationMs);
+            var seekGen = _clock.BeginSeek(positionMs);
+            try
+            {
+                _clock.SetPosition(positionMs);
+                VideoPreviewService.SafeSeekPlayer(player, (float)(positionMs / (double)_durationMs));
+            }
+            finally
+            {
+                _clock.MarkSeekBarrierReached(seekGen, Environment.TickCount64);
+            }
         }
 
         public void SetVolume(int volume)
@@ -1530,6 +1665,8 @@ namespace AssetStudio.Avalonia.Services
                 return false;
             }
 
+            VideoPreviewService.DisablePlayerDiskLogger(player);
+
             var handle = new PlayerHandle(player);
             player.EndReached += OnPlayerEndReached;
             _handle = handle;
@@ -1572,6 +1709,12 @@ namespace AssetStudio.Avalonia.Services
                 return false;
             }
 
+            if (_durationMs <= 0 && player.Length > 0)
+            {
+                _durationMs = player.Length;
+                _clock.SetDuration(_durationMs);
+            }
+
             return true;
         }
 
@@ -1610,9 +1753,7 @@ namespace AssetStudio.Avalonia.Services
 
         private static void DisposePlayerQuietly(FFmpegMediaPlayer player)
         {
-            try { player.Stop(); } catch { }
-            try { player.Close(); } catch { }
-            try { player.Dispose(); } catch { }
+            VideoPreviewService.SafeDisposePlayer(player);
         }
 
         private static void TrySetVolume(FFmpegMediaPlayer player, int volume)
@@ -1629,7 +1770,7 @@ namespace AssetStudio.Avalonia.Services
 
     /// <summary>
     /// Linux system player process (bundled ffplay, pw-play, paplay or aplay). Pause/resume use SIGSTOP/SIGCONT;
-    /// position comes from a playback clock; seeking is not supported.
+    /// position comes from a monotonic playback clock; seeking is not supported.
     /// </summary>
     internal sealed class ProcessAudioPreviewBackend : IAudioPreviewBackend
     {
@@ -1665,6 +1806,7 @@ namespace AssetStudio.Avalonia.Services
             cancellationToken.ThrowIfCancellationRequested();
             _path = media.FilePath;
             _durationMs = media.DurationMs;
+            _clock.SetDuration(_durationMs);
             return Task.FromResult(File.Exists(media.FilePath));
         }
 

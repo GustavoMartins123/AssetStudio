@@ -1264,9 +1264,27 @@ namespace AssetStudio.Avalonia
 
         private void StartAnimationTimer()
         {
+            if (animTimer != null)
+            {
+                animTimer.Stop();
+                animTimer.Tick -= OnAnimationTick;
+                animTimer = null;
+            }
+
+            var totalFrames = AnimTotalFrames;
+            var safeFps = animFps > 0f && float.IsFinite(animFps) ? animFps : 30f;
+            animFps = safeFps;
+            animClock.Configure(
+                totalFrames: totalFrames,
+                fps: safeFps,
+                durationSeconds: 0.0,
+                isLooping: true,
+                playbackSpeed: 1.0);
+            animCurrentFrame = 0;
+
             animTimer = new global::Avalonia.Threading.DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(1000.0 / animFps)
+                Interval = TimeSpan.FromMilliseconds(16)
             };
             animTimer.Tick += OnAnimationTick;
             PlayAnimation();
@@ -1275,9 +1293,12 @@ namespace AssetStudio.Avalonia
         internal void StartMaterialShaderAnimation(int frames, float fps)
         {
             StopAnimation();
-            materialShaderFrameCount = frames;
-            animFps = fps;
-            StartAnimationTimer();
+            materialShaderFrameCount = Math.Max(0, frames);
+            animFps = fps > 0f && float.IsFinite(fps) ? fps : 30f;
+            if (materialShaderFrameCount > 0)
+            {
+                StartAnimationTimer();
+            }
         }
 
         public void PlayAnimation()
@@ -1289,6 +1310,8 @@ namespace AssetStudio.Avalonia
 
             if (!isAnimPlaying)
             {
+                animPausedByHiddenTab = false;
+                animClock.Resume();
                 animTimer.Start();
                 isAnimPlaying = true;
             }
@@ -1299,6 +1322,7 @@ namespace AssetStudio.Avalonia
             animPausedByHiddenTab = false;
             if (animTimer != null && isAnimPlaying)
             {
+                animClock.Pause();
                 animTimer.Stop();
                 isAnimPlaying = false;
             }
@@ -1308,6 +1332,7 @@ namespace AssetStudio.Avalonia
         {
             if (animTimer != null && isAnimPlaying)
             {
+                animClock.Pause();
                 animTimer.Stop();
                 isAnimPlaying = false;
                 animPausedByHiddenTab = true;
@@ -1321,6 +1346,7 @@ namespace AssetStudio.Avalonia
                 animPausedByHiddenTab = false;
                 if (AnimTotalFrames > 0 && animTimer != null && !isAnimPlaying)
                 {
+                    animClock.Resume();
                     animTimer.Start();
                     isAnimPlaying = true;
                 }
@@ -1334,25 +1360,31 @@ namespace AssetStudio.Avalonia
 
         public void RestartAnimation()
         {
-            if (materialShaderFrameCount > 0)
-            {
-                animCurrentFrame = 0;
-                AnimationFrameChanged?.Invoke(0, materialShaderFrameCount);
-                PlayAnimation();
-                return;
-            }
-            if (animationFrames == null)
+            if (AnimTotalFrames == 0)
             {
                 return;
             }
 
-            animCurrentFrame = 0;
+            animPausedByHiddenTab = false;
+            var snapshot = animClock.Restart();
             if (animTimer != null && !isAnimPlaying)
             {
                 animTimer.Start();
                 isAnimPlaying = true;
             }
-            OnAnimationTick(null, EventArgs.Empty);
+
+            ApplyAnimationFrame(snapshot.CurrentFrame, forceUpdate: true);
+        }
+
+        public void SeekAnimationFrame(int frame)
+        {
+            if (AnimTotalFrames == 0)
+            {
+                return;
+            }
+
+            var snapshot = animClock.SeekFrame(frame);
+            ApplyAnimationFrame(snapshot.CurrentFrame, forceUpdate: true);
         }
 
         public void StopAnimation()
@@ -1363,6 +1395,7 @@ namespace AssetStudio.Avalonia
                 animTimer.Tick -= OnAnimationTick;
                 animTimer = null;
             }
+            animClock.Reset();
             animationFrames = null;
             materialShaderFrameCount = 0;
             animParentIndices = null;
@@ -1948,18 +1981,48 @@ namespace AssetStudio.Avalonia
 
         private void OnAnimationTick(object? sender, EventArgs e)
         {
+            if (!isAnimPlaying || AnimTotalFrames <= 0)
+            {
+                return;
+            }
+
+            var snapshot = animClock.Advance();
+            ApplyAnimationFrame(snapshot.CurrentFrame, forceUpdate: false);
+
+            if (snapshot.IsCompleted && !snapshot.IsPlaying)
+            {
+                animTimer?.Stop();
+                isAnimPlaying = false;
+            }
+        }
+
+        private void ApplyAnimationFrame(int targetFrame, bool forceUpdate)
+        {
             if (materialShaderFrameCount > 0)
             {
-                animCurrentFrame = (animCurrentFrame + 1) % materialShaderFrameCount;
+                var clampedShaderFrame = Math.Clamp(targetFrame, 0, materialShaderFrameCount - 1);
+                if (!forceUpdate && clampedShaderFrame == animCurrentFrame)
+                {
+                    return;
+                }
+
+                animCurrentFrame = clampedShaderFrame;
                 AnimationFrameChanged?.Invoke(animCurrentFrame, materialShaderFrameCount);
                 return;
             }
+
             if (animationFrames == null || animParentIndices == null || animationFrames.Length == 0)
             {
                 return;
             }
 
-            animCurrentFrame = (animCurrentFrame + 1) % animationFrames.Length;
+            var clampedFrame = Math.Clamp(targetFrame, 0, animationFrames.Length - 1);
+            if (!forceUpdate && clampedFrame == animCurrentFrame)
+            {
+                return;
+            }
+
+            animCurrentFrame = clampedFrame;
             var bonePositions = animationFrames[animCurrentFrame];
             var skeletonVerts = BuildSkeletonVertices(bonePositions, animParentIndices, out int boneLines, out int jointPoints);
 

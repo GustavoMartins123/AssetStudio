@@ -63,123 +63,28 @@ namespace AssetStudio.Avalonia.Services
     /// the frame actually painted on screen, prevents stale pre-seek frames from snapping the scrubber backward,
     /// handles both FFmpegMediaPlayer event orders (playback: PositionChanged-&gt;FrameReady; paused single-frame:
     /// FrameReady-&gt;PositionChanged), and works even when a container omits duration metadata.
+    /// Delegates to the unified <see cref="MediaTimelineTracker"/>.
     /// </summary>
     public sealed class VideoPlaybackTimelineTracker
     {
-        public const long DefaultSeekBarrierTimeoutMs = 1200;
+        public const long DefaultSeekBarrierTimeoutMs = MediaTimelineTracker.DefaultSeekBarrierTimeoutMs;
 
-        private readonly object _gate = new();
-        private long _durationMs;
-        private long _presentedPositionMs;
-        private bool _hasPresentedPosition;
-        private long _stagedPlaybackPositionMs = -1;
-        private long _activeSeekGeneration;
-        private long _completedSeekGeneration;
-        private long _pendingSeekTargetMs = -1;
-        private long _pendingSeekBarrierTickMs;
+        private readonly MediaTimelineTracker _tracker = new();
 
-        public long DurationMs
-        {
-            get
-            {
-                lock (_gate)
-                {
-                    return _durationMs;
-                }
-            }
-        }
+        public long DurationMs => _tracker.DurationMs;
 
-        public bool HasPendingSeek
-        {
-            get
-            {
-                lock (_gate)
-                {
-                    return _pendingSeekTargetMs >= 0;
-                }
-            }
-        }
+        public bool HasPendingSeek => _tracker.HasPendingSeek;
 
-        public void Reset(long durationMs = 0)
-        {
-            lock (_gate)
-            {
-                _durationMs = Math.Max(0L, durationMs);
-                _presentedPositionMs = 0L;
-                _hasPresentedPosition = false;
-                _stagedPlaybackPositionMs = -1L;
-                _activeSeekGeneration++;
-                _completedSeekGeneration = _activeSeekGeneration;
-                _pendingSeekTargetMs = -1L;
-                _pendingSeekBarrierTickMs = 0L;
-            }
-        }
+        public void Reset(long durationMs = 0) => _tracker.Reset(durationMs);
 
-        public void SetDurationMs(long durationMs)
-        {
-            if (durationMs <= 0)
-            {
-                return;
-            }
+        public void SetDurationMs(long durationMs) => _tracker.SetDurationMs(durationMs);
 
-            lock (_gate)
-            {
-                _durationMs = durationMs;
-                if (_presentedPositionMs > _durationMs)
-                {
-                    _presentedPositionMs = _durationMs;
-                }
-                if (_pendingSeekTargetMs > _durationMs)
-                {
-                    _pendingSeekTargetMs = _durationMs;
-                }
-            }
-        }
+        public void OnMediaOpened(long durationMs) => _tracker.OnMediaOpened(durationMs);
 
-        public void OnMediaOpened(long durationMs)
-        {
-            lock (_gate)
-            {
-                if (durationMs > 0)
-                {
-                    _durationMs = durationMs;
-                }
-                _presentedPositionMs = 0L;
-                _hasPresentedPosition = true;
-                _stagedPlaybackPositionMs = -1L;
-                _activeSeekGeneration++;
-                _completedSeekGeneration = _activeSeekGeneration;
-                _pendingSeekTargetMs = -1L;
-                _pendingSeekBarrierTickMs = 0L;
-            }
-        }
+        public long BeginSeek(long targetMs) => _tracker.BeginSeek(targetMs);
 
-        public long BeginSeek(long targetMs)
-        {
-            lock (_gate)
-            {
-                var clamped = ClampPositionLocked(targetMs);
-                _activeSeekGeneration++;
-                _pendingSeekTargetMs = clamped;
-                _pendingSeekBarrierTickMs = 0L;
-                _stagedPlaybackPositionMs = -1L;
-                return _activeSeekGeneration;
-            }
-        }
-
-        public void MarkSeekBarrierReached(long seekGeneration, long nowTickMs)
-        {
-            lock (_gate)
-            {
-                if (seekGeneration != _activeSeekGeneration)
-                {
-                    return;
-                }
-
-                _completedSeekGeneration = seekGeneration;
-                _pendingSeekBarrierTickMs = nowTickMs;
-            }
-        }
+        public void MarkSeekBarrierReached(long seekGeneration, long nowTickMs) =>
+            _tracker.MarkSeekBarrierReached(seekGeneration, nowTickMs);
 
         /// <summary>
         /// Handles <c>FFmpegMediaPlayer.PositionChanged</c> on the UI thread.
@@ -191,33 +96,8 @@ namespace AssetStudio.Avalonia.Services
         public bool OnPositionChangedFromPlayer(
             double positionMs,
             bool isPlaying,
-            out long effectivePositionMs)
-        {
-            lock (_gate)
-            {
-                if (_activeSeekGeneration != _completedSeekGeneration)
-                {
-                    effectivePositionMs = GetEffectivePositionLocked(positionMs, 0L, allowBarrierTimeout: false);
-                    return false;
-                }
-
-                var normalized = NormalizeMsLocked(positionMs);
-                if (isPlaying)
-                {
-                    _stagedPlaybackPositionMs = normalized;
-                    effectivePositionMs = GetEffectivePositionLocked(positionMs, 0L, allowBarrierTimeout: false);
-                    return false;
-                }
-
-                _presentedPositionMs = normalized;
-                _hasPresentedPosition = true;
-                _stagedPlaybackPositionMs = -1L;
-                _pendingSeekTargetMs = -1L;
-                _pendingSeekBarrierTickMs = 0L;
-                effectivePositionMs = _presentedPositionMs;
-                return true;
-            }
-        }
+            out long effectivePositionMs) =>
+            _tracker.OnPositionChangedFromPlayer(positionMs, isPlaying, out effectivePositionMs);
 
         /// <summary>
         /// Handles <c>FFmpegMediaPlayer.FrameReady</c> on the UI thread immediately after the frame is painted.
@@ -225,96 +105,11 @@ namespace AssetStudio.Avalonia.Services
         /// </summary>
         public bool OnFramePresented(
             double fallbackPositionMs,
-            out long effectivePositionMs)
-        {
-            lock (_gate)
-            {
-                if (_activeSeekGeneration != _completedSeekGeneration)
-                {
-                    _stagedPlaybackPositionMs = -1L;
-                    effectivePositionMs = GetEffectivePositionLocked(fallbackPositionMs, 0L, allowBarrierTimeout: false);
-                    return false;
-                }
+            out long effectivePositionMs) =>
+            _tracker.OnFramePresented(fallbackPositionMs, out effectivePositionMs);
 
-                long frameMs;
-                if (_stagedPlaybackPositionMs >= 0)
-                {
-                    frameMs = _stagedPlaybackPositionMs;
-                    _stagedPlaybackPositionMs = -1L;
-                }
-                else
-                {
-                    frameMs = NormalizeMsLocked(fallbackPositionMs);
-                }
-
-                _presentedPositionMs = frameMs;
-                _hasPresentedPosition = true;
-                _pendingSeekTargetMs = -1L;
-                _pendingSeekBarrierTickMs = 0L;
-                effectivePositionMs = _presentedPositionMs;
-                return true;
-            }
-        }
-
-        public long GetEffectivePositionMs(double fallbackPlayerPositionMs, long nowTickMs)
-        {
-            lock (_gate)
-            {
-                return GetEffectivePositionLocked(fallbackPlayerPositionMs, nowTickMs, allowBarrierTimeout: true);
-            }
-        }
-
-        private long GetEffectivePositionLocked(double fallbackPlayerPositionMs, long nowTickMs, bool allowBarrierTimeout)
-        {
-            if (_pendingSeekTargetMs >= 0)
-            {
-                if (_activeSeekGeneration != _completedSeekGeneration)
-                {
-                    return _pendingSeekTargetMs;
-                }
-
-                if (!allowBarrierTimeout
-                    || _pendingSeekBarrierTickMs == 0
-                    || (nowTickMs - _pendingSeekBarrierTickMs) < DefaultSeekBarrierTimeoutMs)
-                {
-                    return _pendingSeekTargetMs;
-                }
-
-                // Seek completed and no new frame arrived within timeout (e.g. sought to EOF); commit seek target.
-                _presentedPositionMs = _pendingSeekTargetMs;
-                _hasPresentedPosition = true;
-                _pendingSeekTargetMs = -1L;
-                _pendingSeekBarrierTickMs = 0L;
-                return _presentedPositionMs;
-            }
-
-            if (_hasPresentedPosition)
-            {
-                return _presentedPositionMs;
-            }
-
-            return NormalizeMsLocked(fallbackPlayerPositionMs);
-        }
-
-        private long NormalizeMsLocked(double rawMs)
-        {
-            if (double.IsNaN(rawMs) || double.IsInfinity(rawMs) || rawMs <= 0.0)
-            {
-                return 0L;
-            }
-
-            return ClampPositionLocked((long)Math.Round(rawMs));
-        }
-
-        private long ClampPositionLocked(long ms)
-        {
-            if (ms <= 0L)
-            {
-                return 0L;
-            }
-
-            return _durationMs > 0L && ms > _durationMs ? _durationMs : ms;
-        }
+        public long GetEffectivePositionMs(double fallbackPlayerPositionMs, long nowTickMs) =>
+            _tracker.GetEffectivePositionMs(fallbackPlayerPositionMs, nowTickMs);
     }
 
     /// <summary>

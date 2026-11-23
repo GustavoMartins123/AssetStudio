@@ -1,4 +1,5 @@
 using System;
+using AssetStudio.Avalonia.ViewModels;
 
 namespace AssetStudio.Avalonia;
 
@@ -11,9 +12,19 @@ public partial class MainWindow
 
     private void ShowAnimationPlayback(int totalFrames)
     {
+        var effectiveSampleRate = !_is2dAnimationPreviewActive
+            && GLPreviewControl != null
+            && GLPreviewControl.AnimFps > 0f
+            ? GLPreviewControl.AnimFps
+            : MeshPreviewViewModel.DefaultSampleRate;
+
         if (!MeshPreview.IsAnimationLoaded || MeshPreview.TotalFrames != totalFrames)
         {
-            MeshPreview.SetAnimationState(isLoaded: true, totalFrames: Math.Max(0, totalFrames), isPlaying: true);
+            MeshPreview.SetAnimationState(
+                isLoaded: true,
+                totalFrames: Math.Max(0, totalFrames),
+                sampleRate: effectiveSampleRate,
+                isPlaying: true);
         }
         else
         {
@@ -27,12 +38,34 @@ public partial class MainWindow
         MeshPreview.IsPlaying = !paused;
     }
 
-    private void UpdateAnimationPlaybackFrame(int currentFrame, int totalFrames)
+    private void UpdateAnimationPlaybackFrame(int currentFrame, int totalFrames, double? exactTimeSeconds = null)
     {
-        MeshPreview.SeekFrame(currentFrame, totalFrames);
+        if (exactTimeSeconds.HasValue)
+        {
+            MeshPreview.SyncFromTimeline(currentFrame, totalFrames, exactTimeSeconds.Value);
+        }
+        else
+        {
+            MeshPreview.SeekFrame(currentFrame, totalFrames);
+        }
+
         if (GLPreviewControl?.IsMaterialShaderPreview == true && GLPreviewControl.AnimTotalFrames == totalFrames)
         {
             PreviewSession.ShaderPreview.UpdateTime(currentFrame, GLPreviewControl.AnimFps);
+        }
+    }
+
+    private void SeekActiveAnimationFrame(int frame)
+    {
+        if (_is2dAnimationPreviewActive)
+        {
+            Seek2DAnimationFrame(frame);
+            return;
+        }
+
+        if (GLPreviewControl != null && GLPreviewControl.IsVisible && GLPreviewControl.AnimTotalFrames > 0)
+        {
+            GLPreviewControl.SeekAnimationFrame(frame);
         }
     }
 

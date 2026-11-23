@@ -21,6 +21,7 @@ public partial class MainWindow
     private bool _audioProgressHandlersAttached;
     private bool _isUpdatingAudioProgress;
     private bool _isAudioDragging;
+    private long _audioDragSeekGeneration;
 
     private static bool UseLinuxAudioFallback => RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
 
@@ -32,9 +33,13 @@ public partial class MainWindow
         {
             _audioTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(100)
+                Interval = TimeSpan.FromMilliseconds(50)
             };
             _audioTimer.Tick += AudioTimer_Tick;
+        }
+        else if (_audioTimer.Interval != TimeSpan.FromMilliseconds(50))
+        {
+            _audioTimer.Interval = TimeSpan.FromMilliseconds(50);
         }
     }
 
@@ -148,25 +153,28 @@ public partial class MainWindow
             return;
         }
 
-        if (snapshot.DurationMs > 0)
+        if (!_isAudioDragging)
         {
-            MediaPlayback.UpdatePosition(snapshot.PositionMs / 1000.0, snapshot.DurationMs / 1000.0);
-        }
-        else
-        {
-            MediaPlayback.UpdatePosition(snapshot.PositionMs / 1000.0);
-        }
-
-        if (AudioProgressBar != null && !_isAudioDragging && snapshot.DurationMs > 0)
-        {
-            _isUpdatingAudioProgress = true;
-            try
+            if (snapshot.DurationMs > 0)
             {
-                AudioProgressBar.Value = MediaPlayback.ProgressPermille;
+                MediaPlayback.UpdatePosition(snapshot.PositionMs / 1000.0, snapshot.DurationMs / 1000.0);
             }
-            finally
+            else
             {
-                _isUpdatingAudioProgress = false;
+                MediaPlayback.UpdatePosition(snapshot.PositionMs / 1000.0);
+            }
+
+            if (AudioProgressBar != null && snapshot.DurationMs > 0)
+            {
+                _isUpdatingAudioProgress = true;
+                try
+                {
+                    AudioProgressBar.Value = MediaPlayback.ProgressPermille;
+                }
+                finally
+                {
+                    _isUpdatingAudioProgress = false;
+                }
             }
         }
 
@@ -182,6 +190,8 @@ public partial class MainWindow
 
     private void AudioReset(bool recreateAudioPlayer = true)
     {
+        _isAudioDragging = false;
+        _audioDragSeekGeneration = 0L;
         try
         {
             _audioTimer?.Stop();
@@ -205,7 +215,18 @@ public partial class MainWindow
 
         MediaPlayback.ResetIfActive(ActiveMediaKind.Audio);
 
-        if (AudioProgressBar != null) AudioProgressBar.Value = 0;
+        if (AudioProgressBar != null)
+        {
+            _isUpdatingAudioProgress = true;
+            try
+            {
+                AudioProgressBar.Value = 0;
+            }
+            finally
+            {
+                _isUpdatingAudioProgress = false;
+            }
+        }
         if (AudioPlayButton != null) AudioPlayButton.IsEnabled = true;
         if (AudioPauseButton != null) AudioPauseButton.IsEnabled = true;
     }
@@ -276,19 +297,38 @@ public partial class MainWindow
     private void AudioProgressBar_DragStarted(object? sender, EventArgs e)
     {
         _isAudioDragging = true;
+        var service = _audioPlaybackService;
+        if (service != null && service.DurationMs > 0 && AudioProgressBar != null)
+        {
+            var previewMs = Math.Clamp(
+                (long)Math.Round(service.DurationMs * (AudioProgressBar.Value / 1000.0)),
+                0L,
+                service.DurationMs);
+            _audioDragSeekGeneration = service.BeginUserSeek(previewMs);
+        }
     }
 
     private void AudioProgressBar_DragCompleted(object? sender, EventArgs e)
     {
         _isAudioDragging = false;
+        var dragGen = _audioDragSeekGeneration;
+        _audioDragSeekGeneration = 0L;
+
         var service = _audioPlaybackService;
         if (service == null || service.DurationMs <= 0 || AudioProgressBar == null)
         {
+            if (dragGen != 0L)
+            {
+                service?.CancelUserSeek(dragGen);
+            }
             return;
         }
 
-        var newMs = (long)(service.DurationMs * (AudioProgressBar.Value / 1000.0));
-        MediaPlayback.UpdatePosition(newMs / 1000.0);
+        var newMs = Math.Clamp(
+            (long)Math.Round(service.DurationMs * (AudioProgressBar.Value / 1000.0)),
+            0L,
+            service.DurationMs);
+        MediaPlayback.UpdatePosition(newMs / 1000.0, service.DurationMs / 1000.0);
 
         try
         {
@@ -416,12 +456,25 @@ public partial class MainWindow
 
     private void AudioStop()
     {
+        _isAudioDragging = false;
+        _audioDragSeekGeneration = 0L;
         try
         {
             _audioPlaybackService?.Stop();
             _audioTimer?.Stop();
             MediaPlayback.SetStopped();
-            if (AudioProgressBar != null) AudioProgressBar.Value = 0;
+            if (AudioProgressBar != null)
+            {
+                _isUpdatingAudioProgress = true;
+                try
+                {
+                    AudioProgressBar.Value = 0;
+                }
+                finally
+                {
+                    _isUpdatingAudioProgress = false;
+                }
+            }
         }
         catch { }
     }
@@ -446,10 +499,17 @@ public partial class MainWindow
             return;
         }
 
-        var newMs = (long)(service.DurationMs * (AudioProgressBar.Value / 1000.0));
-        MediaPlayback.UpdatePosition(newMs / 1000.0);
+        var newMs = Math.Clamp(
+            (long)Math.Round(service.DurationMs * (AudioProgressBar.Value / 1000.0)),
+            0L,
+            service.DurationMs);
+        MediaPlayback.UpdatePosition(newMs / 1000.0, service.DurationMs / 1000.0);
 
-        if (!_isAudioDragging)
+        if (_isAudioDragging)
+        {
+            _audioDragSeekGeneration = service.BeginUserSeek(newMs);
+        }
+        else
         {
             try
             {

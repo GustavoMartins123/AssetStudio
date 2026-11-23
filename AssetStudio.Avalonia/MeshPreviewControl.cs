@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Avalonia;
 using Avalonia.Media;
 using Avalonia.OpenGL.Controls;
+using AssetStudio.Avalonia.Services;
 
 namespace AssetStudio.Avalonia
 {
@@ -55,6 +56,7 @@ namespace AssetStudio.Avalonia
         private Matrix4[]? avatarStaticSkeletonWorldMatrices;
 
         // Animation playback state
+        private readonly FrameTimelineClock animClock = new();
         private Vector3[][]? animationFrames;
         private int[]? animParentIndices;
         private int animCurrentFrame;
@@ -282,6 +284,8 @@ namespace AssetStudio.Avalonia
         public int AnimCurrentFrame => animCurrentFrame;
         public int AnimTotalFrames => animationFrames?.Length ?? materialShaderFrameCount;
         public float AnimFps => animFps;
+        public double AnimCurrentTimeSeconds => animClock.CurrentTimeSeconds;
+        public double AnimDurationSeconds => animClock.DurationSeconds;
 
         public override void Render(DrawingContext context)
         {

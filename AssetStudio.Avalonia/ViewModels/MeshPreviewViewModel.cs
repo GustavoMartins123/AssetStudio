@@ -683,6 +683,43 @@ namespace AssetStudio.Avalonia.ViewModels
             });
         }
 
+        /// <summary>
+        /// Synchronizes frame index and exact monotonic playback time from <c>FrameTimelineClock</c> without
+        /// re-deriving seconds from <c>frame / SampleRate</c> (critical for uneven 2D keyframe intervals).
+        /// </summary>
+        public void SyncFromTimeline(int currentFrame, int totalFrames, double currentTimeSeconds, double? durationSeconds = null)
+        {
+            _dispatchToUi(() =>
+            {
+                var safeTotal = Math.Max(0, totalFrames);
+                SetProperty(ref _totalFrames, safeTotal, nameof(TotalFrames));
+
+                if (durationSeconds.HasValue)
+                {
+                    var safeDur = SanitizeNonNegative(durationSeconds.Value);
+                    SetProperty(ref _durationSeconds, safeDur, nameof(DurationSeconds));
+                }
+                else if (_sampleRate > 0.0 && safeTotal > 0 && _durationSeconds <= 0.0)
+                {
+                    SetProperty(ref _durationSeconds, safeTotal / _sampleRate, nameof(DurationSeconds));
+                }
+
+                var maxFrame = Math.Max(0, _totalFrames);
+                var clampedFrame = Math.Clamp(currentFrame, 0, maxFrame);
+                SetProperty(ref _currentFrame, clampedFrame, nameof(CurrentFrame));
+
+                var safeTime = SanitizeNonNegative(currentTimeSeconds);
+                if (_durationSeconds > 0.0)
+                {
+                    safeTime = Math.Clamp(safeTime, 0.0, _durationSeconds);
+                }
+
+                SetProperty(ref _currentTimeSeconds, safeTime, nameof(CurrentTimeSeconds));
+                FormattedFrameText = FormatFrameDisplay(_currentFrame, _totalFrames);
+                FormattedTimeText = FormatAnimationTime(_currentTimeSeconds, _durationSeconds);
+            });
+        }
+
         public double AdvanceTime(double deltaSeconds)
         {
             if (!_isAnimationLoaded || !_isPlaying || !double.IsFinite(deltaSeconds) || deltaSeconds <= 0.0)
