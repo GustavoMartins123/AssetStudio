@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.Services.ProjectAnalysis;
 using AssetStudio.Avalonia.ViewModels;
 using Avalonia.Controls;
 using Avalonia.Threading;
@@ -120,13 +121,22 @@ public partial class MainWindow : Window
 
         ApplyScanCoverageToUi(scanResult);
 
+        var catalogHints = await CollectCatalogDecryptionHintsAsync(
+            folderPath,
+            scanResult.EncryptionBarriers.Select(static b => b.FilePath));
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+        {
+            return scanResult;
+        }
+
         var context = new DecryptionDialogContext(
             IsInitialLoadPrompt: true,
             ProjectRoot: folderPath,
             ReadableAssetFileCount: scanResult.ReadableAssetFileCount,
             EncryptedFileCount: scanResult.EncryptedFileCount,
             CoveragePercent: scanResult.CoveragePercent,
-            DetectedBarriers: scanResult.EncryptionBarriers);
+            DetectedBarriers: scanResult.EncryptionBarriers,
+            CatalogHints: catalogHints);
 
         var dialogResult = await ViewModel.DialogService.ShowDecryptionKeyDialogAsync(context);
         if (IsWindowClosingOrClosed || _isReturningToProjectManager)
@@ -173,13 +183,20 @@ public partial class MainWindow : Window
         {
             ApplyManualCoverageToUi(readable, encrypted, barriers);
             var folder = filePaths.Length > 0 ? Path.GetDirectoryName(filePaths[0]) : null;
+            var catalogHints = await CollectCatalogDecryptionHintsAsync(folder, filePaths);
+            if (IsWindowClosingOrClosed || _isReturningToProjectManager)
+            {
+                return (readable, encrypted, barriers);
+            }
+
             var context = new DecryptionDialogContext(
                 IsInitialLoadPrompt: true,
                 ProjectRoot: folder,
                 ReadableAssetFileCount: readable,
                 EncryptedFileCount: encrypted,
                 CoveragePercent: ProjectScanResult.ComputeCoveragePercent(readable, encrypted),
-                DetectedBarriers: barriers);
+                DetectedBarriers: barriers,
+                CatalogHints: catalogHints);
 
             var dialogResult = await ViewModel.DialogService.ShowDecryptionKeyDialogAsync(context);
             if (dialogResult?.Action == DecryptionDialogAction.ApplyAndReanalyze)
@@ -233,16 +250,32 @@ public partial class MainWindow : Window
         EnsureLocalDecryptionLoaded(currentRoot);
 
         var barriers = new List<StreamEncryptionBarrier>(_lastDetectedBarriers);
-        if (barriers.Count == 0 && _currentProjectAnalysis?.DecryptionHints?.Hints != null)
+        var catalogHints = await CollectCatalogDecryptionHintsAsync(
+            currentRoot,
+            barriers.Select(static b => b.FilePath));
+        if (IsWindowClosingOrClosed || _isReturningToProjectManager)
         {
-            foreach (var hint in _currentProjectAnalysis.DecryptionHints.Hints.Take(10))
+            return;
+        }
+
+        if (barriers.Count == 0 && catalogHints.Count > 0)
+        {
+            foreach (var hint in catalogHints.Take(10))
             {
+                var targetPath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : hint.CatalogPath;
+                var candidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                    ReadOnlySpan<byte>.Empty,
+                    totalStreamLength: 0,
+                    filePath: targetPath,
+                    providerHint: hint.Provider,
+                    reasonHint: hint.Reason);
                 barriers.Add(new StreamEncryptionBarrier(
                     providerId: hint.Provider,
-                    filePath: string.IsNullOrWhiteSpace(hint.CatalogPath) ? hint.Bundle : hint.CatalogPath,
+                    filePath: targetPath,
                     reason: hint.Reason,
                     confidence: hint.Confidence,
-                    headerPrefixHex: hint.MetadataSummary));
+                    headerPrefixHex: hint.MetadataSummary,
+                    candidateAlgorithms: candidates));
             }
         }
 
@@ -252,7 +285,8 @@ public partial class MainWindow : Window
             ReadableAssetFileCount: _lastReadableAssetFileCount,
             EncryptedFileCount: _lastEncryptedFileCount,
             CoveragePercent: ProjectScanResult.ComputeCoveragePercent(_lastReadableAssetFileCount, _lastEncryptedFileCount),
-            DetectedBarriers: barriers);
+            DetectedBarriers: barriers,
+            CatalogHints: catalogHints);
 
         var result = await ViewModel.DialogService.ShowDecryptionKeyDialogAsync(context);
         if (result == null || IsWindowClosingOrClosed || _isReturningToProjectManager)
@@ -264,6 +298,100 @@ public partial class MainWindow : Window
         {
             await ReanalyzeWithCurrentDecryptionSettingsAsync(currentRoot);
         }
+    }
+
+    private async Task<IReadOnlyList<DecryptionHintEntry>> CollectCatalogDecryptionHintsAsync(
+        string? projectRoot,
+        IEnumerable<string>? sampleFilePaths)
+    {
+        var existingHints = _currentProjectAnalysis?.DecryptionHints?.Hints
+            ?? ViewModel.ProjectSession.CurrentAnalysisResult?.DecryptionHints?.Hints;
+        if (existingHints != null && existingHints.Count > 0)
+        {
+            return existingHints;
+        }
+
+        var filesSnapshot = sampleFilePaths?
+            .Where(static p => !string.IsNullOrWhiteSpace(p))
+            .Take(16)
+            .ToArray()
+            ?? Array.Empty<string>();
+
+        if (string.IsNullOrWhiteSpace(projectRoot) && filesSnapshot.Length == 0)
+        {
+            return Array.Empty<DecryptionHintEntry>();
+        }
+
+        return await Task.Run<IReadOnlyList<DecryptionHintEntry>>(() =>
+        {
+            try
+            {
+                var catalogPaths = AddressablesCatalogDependencyResolver
+                    .FindCatalogPathsForFiles(filesSnapshot, projectRoot)
+                    .Take(4)
+                    .ToList();
+
+                if (catalogPaths.Count == 0 && !string.IsNullOrWhiteSpace(projectRoot) && Directory.Exists(projectRoot))
+                {
+                    var probeDirs = new[]
+                    {
+                        projectRoot,
+                        Path.Combine(projectRoot, "aa"),
+                        Path.Combine(projectRoot, "StreamingAssets", "aa")
+                    };
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var dir in probeDirs)
+                    {
+                        if (!Directory.Exists(dir))
+                        {
+                            continue;
+                        }
+
+                        foreach (var pattern in new[] { "catalog*.json", "catalog*.bin" })
+                        {
+                            foreach (var file in Directory.EnumerateFiles(dir, pattern, SearchOption.TopDirectoryOnly))
+                            {
+                                if (seen.Add(file))
+                                {
+                                    catalogPaths.Add(file);
+                                    if (catalogPaths.Count >= 4)
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (catalogPaths.Count >= 4)
+                            {
+                                break;
+                            }
+                        }
+
+                        if (catalogPaths.Count >= 4)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if (catalogPaths.Count == 0)
+                {
+                    return Array.Empty<DecryptionHintEntry>();
+                }
+
+                var analyzer = new AddressablesCatalogAnalyzer();
+                var warnings = new List<string>();
+                var (_, hintsReport) = analyzer.AnalyzeCatalogs(
+                    projectRoot ?? Path.GetDirectoryName(catalogPaths[0]) ?? string.Empty,
+                    catalogPaths,
+                    warnings);
+                return hintsReport.Hints;
+            }
+            catch
+            {
+                return Array.Empty<DecryptionHintEntry>();
+            }
+        });
     }
 
     private string? ResolveCurrentDecryptionTargetRoot()

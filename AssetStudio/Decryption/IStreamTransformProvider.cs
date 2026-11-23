@@ -29,7 +29,7 @@ namespace AssetStudio
         public bool Enabled { get; set; } = true;
 
         /// <summary>
-        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", or "none" (header skip only).
+        /// Cipher algorithm: "xor", "aes-cbc", "aes-ecb", "aes-ctr", "chacha20", "block512", or "none" (header skip only).
         /// When omitted, defaults to "xor" if xorKeyHex/keyHex/keyUtf8 is provided, else "none".
         /// </summary>
         [JsonPropertyName("algorithm")]
@@ -143,6 +143,20 @@ namespace AssetStudio
         public long RangeLength { get; set; } = -1;
 
         /// <summary>
+        /// Optional explicit Addressables catalog path (catalog.json / catalog_*.json / catalog.bin)
+        /// used by "block512" profiles when auto-discovery cannot find the catalog adjacent to the bundle.
+        /// </summary>
+        [JsonPropertyName("catalogPath")]
+        public string? CatalogPath { get; set; }
+
+        /// <summary>
+        /// Optional direct Block 512 token (e.g. "bundleName_hash-crc") used by "block512" profiles
+        /// when no Addressables catalog is available.
+        /// </summary>
+        [JsonPropertyName("block512Token")]
+        public string? Block512Token { get; set; }
+
+        /// <summary>
         /// When true, skips already-plaintext Unity files and verifies that the transformed stream
         /// begins with a recognizable Unity bundle, SerializedFile, WebFile, or compressed container header.
         /// </summary>
@@ -184,6 +198,8 @@ namespace AssetStudio
                 DerivedKeyLength = DerivedKeyLength,
                 RangeStart = RangeStart,
                 RangeLength = RangeLength,
+                CatalogPath = CatalogPath,
+                Block512Token = Block512Token,
                 ValidateUnityHeader = ValidateUnityHeader
             };
         }
@@ -193,6 +209,10 @@ namespace AssetStudio
             var raw = (Algorithm ?? string.Empty).Trim().ToLowerInvariant();
             if (string.IsNullOrEmpty(raw))
             {
+                if (!string.IsNullOrWhiteSpace(CatalogPath) || !string.IsNullOrWhiteSpace(Block512Token))
+                {
+                    return StreamCipherAlgorithm.Block512;
+                }
                 if (!string.IsNullOrWhiteSpace(XorKeyHex)
                     || !string.IsNullOrWhiteSpace(KeyHex)
                     || !string.IsNullOrEmpty(KeyUtf8))
@@ -209,6 +229,7 @@ namespace AssetStudio
                 "aes-ecb" or "aesecb" or "aes_ecb" => StreamCipherAlgorithm.AesEcb,
                 "aes-ctr" or "aesctr" or "aes_ctr" => StreamCipherAlgorithm.AesCtr,
                 "chacha20" or "chacha" or "chacha-20" => StreamCipherAlgorithm.ChaCha20,
+                "block512" or "block-512" or "block_512" => StreamCipherAlgorithm.Block512,
                 "none" or "skip" or "offset" => StreamCipherAlgorithm.None,
                 _ => throw new ArgumentException($"Unsupported decryption algorithm '{Algorithm}'.")
             };
@@ -247,6 +268,31 @@ namespace AssetStudio
                     error = "Offset-skip profile requires SkipBytes > 0.";
                     return false;
                 }
+                return true;
+            }
+
+            if (algo == StreamCipherAlgorithm.Block512)
+            {
+                bool hasToken = !string.IsNullOrWhiteSpace(Block512Token) || !string.IsNullOrEmpty(KeyUtf8);
+                bool hasCatalog = !string.IsNullOrWhiteSpace(CatalogPath);
+                if (!hasToken && !hasCatalog)
+                {
+                    error = "Block 512 profile requires an Addressables catalog path or a direct Block 512 token.";
+                    return false;
+                }
+
+                if (hasCatalog && !File.Exists(CatalogPath!.Trim()))
+                {
+                    error = $"Block 512 catalog file not found: '{CatalogPath}'.";
+                    return false;
+                }
+
+                if (!string.IsNullOrWhiteSpace(MagicHex) && DeclarativeProfileTransformProvider.TryParseHexBytes(MagicHex) == null)
+                {
+                    error = "Magic hex contains invalid hexadecimal characters.";
+                    return false;
+                }
+
                 return true;
             }
 
@@ -342,7 +388,7 @@ namespace AssetStudio
                 }
 
                 stream.Position = originalPos;
-                var candidate = TryCreateTransformedStream(profile, stream, fileName, originalPos);
+                var candidate = TryCreateTransformedStream(profile, stream, filePath, fileName, originalPos);
                 if (candidate == null)
                 {
                     stream.Position = originalPos;
@@ -354,7 +400,7 @@ namespace AssetStudio
                     return candidate;
                 }
 
-                if (ValidateDecryptedUnityHeader(candidate))
+                if (ValidateDecryptedUnityHeader(candidate, out _))
                 {
                     if (candidate is SubStream sub && profile.SkipBytes > 0 && profile.SkipBytes < stream.Length)
                     {
@@ -377,7 +423,50 @@ namespace AssetStudio
             return null;
         }
 
-        private static Stream? TryCreateTransformedStream(DecryptionProfile profile, Stream stream, string fileName, long originalPos)
+        internal static bool TryTestProfileOnStream(
+            DecryptionProfile profile,
+            Stream stream,
+            string filePath,
+            out string? headerSummary)
+        {
+            headerSummary = null;
+            if (profile == null || stream == null || !stream.CanRead || !stream.CanSeek)
+            {
+                return false;
+            }
+
+            long originalPos = stream.Position;
+            var testProfile = profile.Clone();
+            testProfile.Enabled = true;
+            testProfile.ValidateUnityHeader = true;
+
+            string fileName = Path.GetFileName(filePath);
+            var candidate = TryCreateTransformedStream(testProfile, stream, filePath, fileName, originalPos);
+            if (candidate == null)
+            {
+                stream.Position = originalPos;
+                return false;
+            }
+
+            try
+            {
+                SetLeaveBaseStreamOpen(candidate, leaveOpen: true);
+                return ValidateDecryptedUnityHeader(candidate, out headerSummary);
+            }
+            finally
+            {
+                SetLeaveBaseStreamOpen(candidate, leaveOpen: true);
+                candidate.Dispose();
+                stream.Position = originalPos;
+            }
+        }
+
+        private static Stream? TryCreateTransformedStream(
+            DecryptionProfile profile,
+            Stream stream,
+            string? filePath,
+            string fileName,
+            long originalPos)
         {
             StreamCipherAlgorithm algo;
             try
@@ -387,6 +476,31 @@ namespace AssetStudio
             catch
             {
                 return null;
+            }
+
+            if (algo == StreamCipherAlgorithm.Block512)
+            {
+                if (stream.Length < 26)
+                {
+                    return null;
+                }
+
+                string? token = !string.IsNullOrWhiteSpace(profile.Block512Token)
+                    ? profile.Block512Token!.Trim()
+                    : (!string.IsNullOrEmpty(profile.KeyUtf8)
+                        ? profile.KeyUtf8
+                        : DecryptionHelper.TryResolveBlock512Token(filePath, profile.CatalogPath));
+
+                if (string.IsNullOrWhiteSpace(token))
+                {
+                    return null;
+                }
+
+                var decrypted = new DecryptedStream(stream, token)
+                {
+                    LeaveBaseStreamOpen = profile.ValidateUnityHeader
+                };
+                return decrypted;
             }
 
             long skipBytes = Math.Max(0, profile.SkipBytes);
@@ -497,8 +611,9 @@ namespace AssetStudio
             }
         }
 
-        private static bool ValidateDecryptedUnityHeader(Stream candidate)
+        internal static bool ValidateDecryptedUnityHeader(Stream candidate, out string? headerSummary)
         {
+            headerSummary = null;
             try
             {
                 if (candidate.Length < 20)
@@ -523,31 +638,36 @@ namespace AssetStudio
                 }
 
                 var span = buf.Slice(0, read);
-                if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, candidate.Length, out _, out _, out _, out _, requireStrictValidation: true))
+                if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, candidate.Length, out var bundleSig, out _, out var unityVersion, out _, requireStrictValidation: true))
                 {
+                    headerSummary = string.IsNullOrWhiteSpace(unityVersion) ? bundleSig : $"{bundleSig} ({unityVersion})";
                     return true;
                 }
 
                 if (UnityHeaderProbe.IsSerializedFileHeader(span, candidate.Length))
                 {
+                    headerSummary = "Unity SerializedFile";
                     return true;
                 }
 
                 string sig = UnityHeaderProbe.ReadNullTerminatedAscii(span, 0, 20, out _);
                 if (string.Equals(sig, "UnityWebData1.0", StringComparison.Ordinal))
                 {
+                    headerSummary = "UnityWebData1.0";
                     return true;
                 }
 
                 // GZip magic (1F 8B) or Brotli marker at 0x20
                 if (span[0] == 0x1F && span[1] == 0x8B)
                 {
+                    headerSummary = "GZip container";
                     return true;
                 }
                 if (span.Length >= 0x26
                     && span[0x20] == 'b' && span[0x21] == 'r' && span[0x22] == 'o'
                     && span[0x23] == 't' && span[0x24] == 'l' && span[0x25] == 'i')
                 {
+                    headerSummary = "Brotli container";
                     return true;
                 }
 
@@ -568,6 +688,10 @@ namespace AssetStudio
             else if (stream is XorTransformStream xor)
             {
                 xor.LeaveBaseStreamOpen = leaveOpen;
+            }
+            else if (stream is DecryptedStream block512)
+            {
+                block512.LeaveBaseStreamOpen = leaveOpen;
             }
         }
 

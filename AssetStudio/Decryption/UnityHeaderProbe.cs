@@ -1,12 +1,25 @@
 #nullable enable
 using System;
 using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Text;
 
 namespace AssetStudio
 {
+    public sealed record DetectedCipherCandidate(
+        StreamCipherAlgorithm? CipherAlgorithm,
+        string SchemeId,
+        string DisplayName,
+        double Confidence,
+        string Evidence,
+        long SuggestedSkipBytes = 0,
+        long SuggestedRangeStart = 0,
+        long SuggestedRangeLength = -1,
+        bool? SuggestedPkcs7 = null,
+        bool SuggestedIvFromPrefix = false);
+
     public readonly struct StreamEncryptionBarrier
     {
         public StreamEncryptionBarrier(
@@ -15,12 +28,24 @@ namespace AssetStudio
             string reason,
             double confidence,
             string headerPrefixHex)
+            : this(providerId, filePath, reason, confidence, headerPrefixHex, candidateAlgorithms: null)
+        {
+        }
+
+        public StreamEncryptionBarrier(
+            string providerId,
+            string filePath,
+            string reason,
+            double confidence,
+            string headerPrefixHex,
+            IReadOnlyList<DetectedCipherCandidate>? candidateAlgorithms)
         {
             ProviderId = providerId ?? string.Empty;
             FilePath = filePath ?? string.Empty;
             Reason = reason ?? string.Empty;
             Confidence = confidence;
             HeaderPrefixHex = headerPrefixHex ?? string.Empty;
+            CandidateAlgorithms = candidateAlgorithms;
         }
 
         public string ProviderId { get; }
@@ -28,6 +53,7 @@ namespace AssetStudio
         public string Reason { get; }
         public double Confidence { get; }
         public string HeaderPrefixHex { get; }
+        public IReadOnlyList<DetectedCipherCandidate>? CandidateAlgorithms { get; }
     }
 
     public static class UnityHeaderProbe
@@ -474,6 +500,612 @@ namespace AssetStudio
             return key.ToArray();
         }
 
+        public static IReadOnlyList<DetectedCipherCandidate> AnalyzeExplicitProviderHint(
+            string? providerHint,
+            string? reasonHint = null)
+        {
+            var candidates = new List<DetectedCipherCandidate>();
+            TryBuildExplicitHintCandidates(
+                providerHint,
+                reasonHint,
+                ReadOnlySpan<byte>.Empty,
+                totalStreamLength: 0,
+                rangeStart: 0,
+                rangeLength: -1,
+                candidates);
+            return candidates;
+        }
+
+        public static IReadOnlyList<DetectedCipherCandidate> AnalyzeEncryptionCandidates(
+            ReadOnlySpan<byte> probeBuffer,
+            long totalStreamLength,
+            string? filePath,
+            string? providerHint = null,
+            string? reasonHint = null)
+        {
+            var candidates = new List<DetectedCipherCandidate>();
+
+            // 1. Deterministic single match: Block 512 "Encryption" magic header at offset 0
+            if (probeBuffer.Length >= 26 && MatchesAt(probeBuffer, 0, DecryptionHelper.EncryptionMagicBytes))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.Block512,
+                    "block512",
+                    "Block 512",
+                    0.98,
+                    "Block 512 'Encryption' magic header (26-byte prefix)",
+                    SuggestedSkipBytes: 26));
+                return candidates;
+            }
+
+            // 2. Deterministic single match: offset-shifted valid Unity bundle header
+            if (probeBuffer.Length >= 32
+                && !TryParseUnityBundleHeader(probeBuffer, 0, totalStreamLength, out _, out _, out _, out _)
+                && TryFindOffsetUnityBundleHeader(probeBuffer, totalStreamLength, out int bundleOffset, out string sig, out _, out _)
+                && bundleOffset > 0)
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.None,
+                    "none",
+                    "Offset Skip (None)",
+                    0.96,
+                    $"Valid {sig} header detected at byte offset {bundleOffset}",
+                    SuggestedSkipBytes: bundleOffset));
+                return candidates;
+            }
+
+            // Detect structural clues from probeBuffer (partial header range / duplicate 16B ECB blocks)
+            bool hasPartialRange = TryDetectPartialEncryptionRange(probeBuffer, out long partialRangeLength);
+            if (!hasPartialRange
+                && string.Equals(providerHint, "PartialHeaderEncryptedSerializedFile", StringComparison.OrdinalIgnoreCase))
+            {
+                hasPartialRange = true;
+                partialRangeLength = 0x400;
+            }
+
+            long effectiveRangeStart = 0;
+            long effectiveRangeLength = hasPartialRange ? partialRangeLength : -1;
+
+            // 3. Explicit provider or catalog hint naming one or more schemes
+            if (TryBuildExplicitHintCandidates(
+                providerHint,
+                reasonHint,
+                probeBuffer,
+                totalStreamLength,
+                effectiveRangeStart,
+                effectiveRangeLength,
+                candidates))
+            {
+                return candidates;
+            }
+
+            // 4. Structural partial-header encryption narrowing
+            if (hasPartialRange)
+            {
+                int checkLen = (int)Math.Min(partialRangeLength, probeBuffer.Length);
+                bool rangeAligned16 = (partialRangeLength % 16) == 0;
+                bool duplicateBlocksInRange = rangeAligned16 && checkLen >= 64 && HasDuplicate16ByteBlocks(probeBuffer.Slice(0, checkLen));
+
+                if (duplicateBlocksInRange)
+                {
+                    candidates.Add(new DetectedCipherCandidate(
+                        StreamCipherAlgorithm.AesEcb,
+                        "aes-ecb",
+                        "AES-ECB",
+                        0.88,
+                        $"Partial header encryption (0x0..0x{partialRangeLength:X}, {partialRangeLength}B) with repeated 16-byte ciphertext blocks",
+                        SuggestedRangeStart: 0,
+                        SuggestedRangeLength: partialRangeLength,
+                        SuggestedPkcs7: false));
+                }
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.Xor,
+                    "xor",
+                    "XOR",
+                    duplicateBlocksInRange ? 0.80 : 0.84,
+                    $"Partial header encryption boundary detected (0x0..0x{partialRangeLength:X}, {partialRangeLength}B) — XOR candidate",
+                    SuggestedRangeStart: 0,
+                    SuggestedRangeLength: partialRangeLength));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCtr,
+                    "aes-ctr",
+                    "AES-CTR",
+                    0.82,
+                    $"Partial header encryption boundary detected (0x0..0x{partialRangeLength:X}, {partialRangeLength}B) — stream cipher candidate",
+                    SuggestedRangeStart: 0,
+                    SuggestedRangeLength: partialRangeLength));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.ChaCha20,
+                    "chacha20",
+                    "ChaCha20",
+                    0.80,
+                    $"Partial header encryption boundary detected (0x0..0x{partialRangeLength:X}, {partialRangeLength}B) — stream cipher candidate",
+                    SuggestedRangeStart: 0,
+                    SuggestedRangeLength: partialRangeLength));
+
+                if (rangeAligned16)
+                {
+                    candidates.Add(new DetectedCipherCandidate(
+                        StreamCipherAlgorithm.AesCbc,
+                        "aes-cbc",
+                        "AES-CBC",
+                        0.78,
+                        $"Partial header encryption boundary detected (0x0..0x{partialRangeLength:X}, {partialRangeLength}B, 16-byte aligned)",
+                        SuggestedRangeStart: 0,
+                        SuggestedRangeLength: partialRangeLength,
+                        SuggestedPkcs7: false));
+                }
+
+                return candidates;
+            }
+
+            // 5. Duplicate 16-byte ciphertext blocks on 16-byte aligned stream -> AES-ECB ranked first
+            bool knownLength = totalStreamLength > 0;
+            bool is16ByteAligned = knownLength && (totalStreamLength % 16) == 0;
+            if ((is16ByteAligned || (!knownLength && probeBuffer.Length >= 64))
+                && probeBuffer.Length >= 64
+                && HasDuplicate16ByteBlocks(probeBuffer))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesEcb,
+                    "aes-ecb",
+                    "AES-ECB",
+                    0.88,
+                    "16-byte aligned ciphertext contains repeated 16-byte blocks (AES-ECB indicator)",
+                    SuggestedPkcs7: false));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCbc,
+                    "aes-cbc",
+                    "AES-CBC",
+                    0.72,
+                    "16-byte aligned stream (secondary AES-CBC block cipher candidate)",
+                    SuggestedPkcs7: true));
+
+                return candidates;
+            }
+
+            // 6. Full-stream alignment narrowing
+            if (is16ByteAligned)
+            {
+                string cbcEvidence = totalStreamLength >= 32
+                    ? $"16-byte aligned full stream ({totalStreamLength}B) — compatible with AES-CBC (fixed or 16B prefix IV)"
+                    : $"16-byte aligned full stream ({totalStreamLength}B) — AES-CBC block cipher candidate";
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCbc,
+                    "aes-cbc",
+                    "AES-CBC",
+                    0.78,
+                    cbcEvidence,
+                    SuggestedPkcs7: true));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCtr,
+                    "aes-ctr",
+                    "AES-CTR",
+                    0.72,
+                    "High-entropy encrypted stream compatible with AES-CTR"));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.ChaCha20,
+                    "chacha20",
+                    "ChaCha20",
+                    0.70,
+                    "High-entropy encrypted stream compatible with ChaCha20"));
+
+                return candidates;
+            }
+
+            if (knownLength)
+            {
+                // Non-16-byte-aligned full stream excludes full-stream AES-CBC/AES-ECB
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCtr,
+                    "aes-ctr",
+                    "AES-CTR",
+                    0.80,
+                    $"Unaligned stream length ({totalStreamLength}B, not a multiple of 16) — excludes full-stream block ciphers; AES-CTR candidate"));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.ChaCha20,
+                    "chacha20",
+                    "ChaCha20",
+                    0.78,
+                    $"Unaligned stream length ({totalStreamLength}B, not a multiple of 16) — ChaCha20 stream cipher candidate"));
+
+                bool lowerEntropy = probeBuffer.Length >= 64 && HasLowerByteEntropy(probeBuffer);
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.Xor,
+                    "xor",
+                    "XOR",
+                    lowerEntropy ? 0.74 : 0.64,
+                    lowerEntropy
+                        ? $"Unaligned stream ({totalStreamLength}B) with non-uniform byte distribution — repeating/stream XOR candidate"
+                        : $"Unaligned stream ({totalStreamLength}B) — fallback XOR stream candidate"));
+
+                return candidates;
+            }
+
+            // 7. Fallback when neither probe bytes nor stream length are available (e.g. generic barrier metadata)
+            if (!string.IsNullOrWhiteSpace(providerHint)
+                || !string.IsNullOrWhiteSpace(reasonHint)
+                || !string.IsNullOrWhiteSpace(filePath))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCbc,
+                    "aes-cbc",
+                    "AES-CBC",
+                    0.75,
+                    "Generic encrypted container — AES-CBC candidate",
+                    SuggestedPkcs7: true));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCtr,
+                    "aes-ctr",
+                    "AES-CTR",
+                    0.70,
+                    "Generic encrypted container — AES-CTR candidate"));
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.ChaCha20,
+                    "chacha20",
+                    "ChaCha20",
+                    0.68,
+                    "Generic encrypted container — ChaCha20 candidate"));
+            }
+
+            return candidates;
+        }
+
+        private static bool TryBuildExplicitHintCandidates(
+            string? providerHint,
+            string? reasonHint,
+            ReadOnlySpan<byte> probeBuffer,
+            long totalStreamLength,
+            long rangeStart,
+            long rangeLength,
+            List<DetectedCipherCandidate> candidates)
+        {
+            string combined = string.IsNullOrWhiteSpace(providerHint)
+                ? (reasonHint ?? string.Empty)
+                : (string.IsNullOrWhiteSpace(reasonHint) ? providerHint : $"{providerHint} {reasonHint}");
+
+            if (string.IsNullOrWhiteSpace(combined))
+            {
+                return false;
+            }
+
+            // Block 512 explicit provider / catalog hint
+            if (combined.Contains("Block512", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("EncryptionMagic", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("'Encryption' magic", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.Block512,
+                    "block512",
+                    "Block 512",
+                    0.98,
+                    $"Explicit Block 512 hint ({providerHint ?? "catalog"})",
+                    SuggestedSkipBytes: 26));
+                return true;
+            }
+
+            string hintLabel = !string.IsNullOrWhiteSpace(providerHint) ? providerHint! : "catalog hint";
+
+            if (combined.Contains("chacha", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.ChaCha20,
+                    "chacha20",
+                    "ChaCha20",
+                    0.95,
+                    $"Provider/catalog hint identifies ChaCha20 ('{hintLabel}')",
+                    SuggestedRangeStart: rangeStart,
+                    SuggestedRangeLength: rangeLength));
+            }
+
+            if (combined.Contains("aes-ctr", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("aesctr", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("aes_ctr", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCtr,
+                    "aes-ctr",
+                    "AES-CTR",
+                    0.95,
+                    $"Provider/catalog hint identifies AES-CTR ('{hintLabel}')",
+                    SuggestedRangeStart: rangeStart,
+                    SuggestedRangeLength: rangeLength));
+            }
+
+            if (combined.Contains("aes-ecb", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("aesecb", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("aes_ecb", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesEcb,
+                    "aes-ecb",
+                    "AES-ECB",
+                    0.95,
+                    $"Provider/catalog hint identifies AES-ECB ('{hintLabel}')",
+                    SuggestedRangeStart: rangeStart,
+                    SuggestedRangeLength: rangeLength,
+                    SuggestedPkcs7: false));
+            }
+
+            if (combined.Contains("aes-cbc", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("aescbc", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("aes_cbc", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCbc,
+                    "aes-cbc",
+                    "AES-CBC",
+                    0.95,
+                    $"Provider/catalog hint identifies AES-CBC ('{hintLabel}')",
+                    SuggestedRangeStart: rangeStart,
+                    SuggestedRangeLength: rangeLength,
+                    SuggestedPkcs7: rangeLength < 0));
+            }
+
+            // Avoid matching the generic "without a recognizable UnityFS signature or repeating XOR key" barrier reason as a positive XOR hint
+            bool mentionsNegativeXor = combined.Contains("without a recognizable", StringComparison.OrdinalIgnoreCase)
+                && combined.Contains("repeating XOR key", StringComparison.OrdinalIgnoreCase);
+
+            if (!mentionsNegativeXor && ContainsCipherToken(combined, "xor"))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.Xor,
+                    "xor",
+                    "XOR",
+                    0.94,
+                    $"Provider/catalog hint identifies XOR ('{hintLabel}')",
+                    SuggestedRangeStart: rangeStart,
+                    SuggestedRangeLength: rangeLength));
+            }
+
+            if (combined.Contains("offsetbundle", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("offsetskip", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("offset-skip", StringComparison.OrdinalIgnoreCase)
+                || combined.Contains("headerskip", StringComparison.OrdinalIgnoreCase))
+            {
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.None,
+                    "none",
+                    "Offset Skip (None)",
+                    0.92,
+                    $"Provider/catalog hint identifies header offset skip ('{hintLabel}')"));
+            }
+
+            if (candidates.Count > 0)
+            {
+                return true;
+            }
+
+            // Generic "AES" hint without explicit mode (CBC/CTR/ECB)
+            if (ContainsCipherToken(combined, "aes"))
+            {
+                bool knownLength = totalStreamLength > 0;
+                bool is16Aligned = !knownLength || (totalStreamLength % 16) == 0 || rangeLength > 0;
+                bool hasDup = probeBuffer.Length >= 64 && is16Aligned && HasDuplicate16ByteBlocks(probeBuffer);
+
+                if (hasDup)
+                {
+                    candidates.Add(new DetectedCipherCandidate(
+                        StreamCipherAlgorithm.AesEcb,
+                        "aes-ecb",
+                        "AES-ECB",
+                        0.92,
+                        $"Provider/catalog hint identifies AES ('{hintLabel}') + repeated 16B blocks",
+                        SuggestedRangeStart: rangeStart,
+                        SuggestedRangeLength: rangeLength,
+                        SuggestedPkcs7: false));
+                }
+
+                if (is16Aligned)
+                {
+                    candidates.Add(new DetectedCipherCandidate(
+                        StreamCipherAlgorithm.AesCbc,
+                        "aes-cbc",
+                        "AES-CBC",
+                        hasDup ? 0.84 : 0.90,
+                        $"Provider/catalog hint identifies AES ('{hintLabel}') — CBC mode candidate",
+                        SuggestedRangeStart: rangeStart,
+                        SuggestedRangeLength: rangeLength,
+                        SuggestedPkcs7: rangeLength < 0));
+                }
+
+                candidates.Add(new DetectedCipherCandidate(
+                    StreamCipherAlgorithm.AesCtr,
+                    "aes-ctr",
+                    "AES-CTR",
+                    is16Aligned ? 0.85 : 0.92,
+                    $"Provider/catalog hint identifies AES ('{hintLabel}') — CTR mode candidate",
+                    SuggestedRangeStart: rangeStart,
+                    SuggestedRangeLength: rangeLength));
+
+                if (!hasDup && is16Aligned)
+                {
+                    candidates.Add(new DetectedCipherCandidate(
+                        StreamCipherAlgorithm.AesEcb,
+                        "aes-ecb",
+                        "AES-ECB",
+                        0.76,
+                        $"Provider/catalog hint identifies AES ('{hintLabel}') — ECB mode candidate",
+                        SuggestedRangeStart: rangeStart,
+                        SuggestedRangeLength: rangeLength,
+                        SuggestedPkcs7: false));
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool ContainsCipherToken(string text, string token)
+        {
+            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(token))
+            {
+                return false;
+            }
+
+            int start = 0;
+            while (start <= text.Length - token.Length)
+            {
+                int idx = text.IndexOf(token, start, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                {
+                    return false;
+                }
+
+                bool leftOk = idx == 0
+                    || !char.IsLetter(text[idx - 1])
+                    || (char.IsUpper(text[idx]) && char.IsLower(text[idx - 1]));
+
+                int afterIdx = idx + token.Length;
+                bool rightOk = afterIdx >= text.Length
+                    || !char.IsLetter(text[afterIdx])
+                    || (char.IsUpper(text[afterIdx]) && char.IsLower(text[afterIdx - 1]))
+                    || (char.IsUpper(text[idx]) && char.IsUpper(text[afterIdx - 1]) && char.IsUpper(text[afterIdx])
+                        && (afterIdx + 1 < text.Length && char.IsLower(text[afterIdx + 1])));
+
+                if (leftOk && rightOk)
+                {
+                    return true;
+                }
+
+                start = idx + 1;
+            }
+
+            return false;
+        }
+
+        private static bool TryDetectPartialEncryptionRange(ReadOnlySpan<byte> probeBuffer, out long rangeLength)
+        {
+            rangeLength = -1;
+            if (probeBuffer.Length < 512)
+            {
+                return false;
+            }
+
+            // Check 128-byte partial prefix encryption (0x000..0x07F encrypted, 0x080+ structured zeros)
+            int nonZeroFirst128 = CountNonZeroBytes(probeBuffer.Slice(0, 128));
+            if (nonZeroFirst128 >= 112)
+            {
+                int zerosSecond128 = 128 - CountNonZeroBytes(probeBuffer.Slice(128, 128));
+                int zerosNext256 = 256 - CountNonZeroBytes(probeBuffer.Slice(256, 256));
+                if (zerosSecond128 >= 48 && zerosNext256 >= 96)
+                {
+                    rangeLength = 128;
+                    return true;
+                }
+            }
+
+            // Scan 256-byte pages for transition from encrypted header to zero-heavy structured pages
+            int firstPageNonZero = CountNonZeroBytes(probeBuffer.Slice(0, 256));
+            if (firstPageNonZero < 210)
+            {
+                return false;
+            }
+
+            for (int pageOffset = 256; pageOffset + 256 <= probeBuffer.Length; pageOffset += 256)
+            {
+                int zeros = 256 - CountNonZeroBytes(probeBuffer.Slice(pageOffset, 256));
+                if (zeros >= 96)
+                {
+                    rangeLength = pageOffset;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasDuplicate16ByteBlocks(ReadOnlySpan<byte> buffer)
+        {
+            int blockCount = buffer.Length / 16;
+            if (blockCount < 2)
+            {
+                return false;
+            }
+
+            var seen = new HashSet<(ulong Lo, ulong Hi)>();
+            for (int i = 0; i < blockCount; i++)
+            {
+                var block = buffer.Slice(i * 16, 16);
+                byte first = block[0];
+                bool allSame = true;
+                for (int j = 1; j < 16; j++)
+                {
+                    if (block[j] != first)
+                    {
+                        allSame = false;
+                        break;
+                    }
+                }
+
+                if (allSame)
+                {
+                    continue;
+                }
+
+                ulong lo = BinaryPrimitives.ReadUInt64LittleEndian(block.Slice(0, 8));
+                ulong hi = BinaryPrimitives.ReadUInt64LittleEndian(block.Slice(8, 8));
+                if (!seen.Add((lo, hi)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasLowerByteEntropy(ReadOnlySpan<byte> buffer)
+        {
+            int sampleLen = Math.Min(buffer.Length, 1024);
+            if (sampleLen < 64)
+            {
+                return false;
+            }
+
+            Span<int> counts = stackalloc int[256];
+            int maxFreq = 0;
+            for (int i = 0; i < sampleLen; i++)
+            {
+                int c = ++counts[buffer[i]];
+                if (c > maxFreq)
+                {
+                    maxFreq = c;
+                }
+            }
+
+            // Uniform random data over 64..1024 bytes rarely exceeds ~4% for a single byte;
+            // structured or weakly obfuscated payloads exhibit strong frequency spikes or low Shannon entropy.
+            if (sampleLen >= 256 && maxFreq * 25 >= sampleLen) // >= 4% single byte frequency
+            {
+                return true;
+            }
+
+            double entropy = 0.0;
+            double invLen = 1.0 / sampleLen;
+            for (int i = 0; i < 256; i++)
+            {
+                if (counts[i] > 0)
+                {
+                    double p = counts[i] * invLen;
+                    entropy -= p * Math.Log2(p);
+                }
+            }
+
+            double threshold = sampleLen >= 512 ? 7.0 : 6.4;
+            return entropy < threshold;
+        }
+
         public static bool TryDetectEncryptionBarrier(
             ReadOnlySpan<byte> probeBuffer,
             long totalStreamLength,
@@ -481,7 +1113,27 @@ namespace AssetStudio
             out StreamEncryptionBarrier barrier)
         {
             barrier = default;
-            if (string.IsNullOrWhiteSpace(filePath) || probeBuffer.Length < 32)
+            if (string.IsNullOrWhiteSpace(filePath) || probeBuffer.Length < 26)
+            {
+                return false;
+            }
+
+            // 0. Check for unresolved Block 512 "Encryption" magic header
+            if (MatchesAt(probeBuffer, 0, DecryptionHelper.EncryptionMagicBytes))
+            {
+                string prefixHex = FormatHexPrefix(probeBuffer, 16);
+                var candidates = AnalyzeEncryptionCandidates(probeBuffer, totalStreamLength, filePath, "Block512MissingCatalog");
+                barrier = new StreamEncryptionBarrier(
+                    providerId: "Block512MissingCatalog",
+                    filePath: filePath,
+                    reason: $"Block 512 'Encryption' container header detected (prefix: {prefixHex}), but no matching Addressables catalog entry was found to derive the decryption token.",
+                    confidence: 0.98,
+                    headerPrefixHex: prefixHex,
+                    candidateAlgorithms: candidates);
+                return true;
+            }
+
+            if (probeBuffer.Length < 32)
             {
                 return false;
             }
@@ -500,12 +1152,14 @@ namespace AssetStudio
                     string kindLabel = string.Equals(ext, ".blc", StringComparison.OrdinalIgnoreCase)
                         ? "VFS block index (.blc)"
                         : "VFS data chunk (.chk)";
+                    var candidates = AnalyzeEncryptionCandidates(probeBuffer, totalStreamLength, filePath, "VfsChunkContainer");
                     barrier = new StreamEncryptionBarrier(
                         providerId: "VfsChunkContainer",
                         filePath: filePath,
                         reason: $"File is a proprietary {kindLabel} outside UnityFS format (header: {prefixHex}).",
                         confidence: 0.95,
-                        headerPrefixHex: prefixHex);
+                        headerPrefixHex: prefixHex,
+                        candidateAlgorithms: candidates);
                     return true;
                 }
             }
@@ -531,17 +1185,19 @@ namespace AssetStudio
                 if (nonZeroInHeader >= 220 && maxZerosInLaterPage >= 96)
                 {
                     string prefixHex = FormatHexPrefix(probeBuffer, 16);
+                    var candidates = AnalyzeEncryptionCandidates(probeBuffer, totalStreamLength, filePath, "PartialHeaderEncryptedSerializedFile");
                     barrier = new StreamEncryptionBarrier(
                         providerId: "PartialHeaderEncryptedSerializedFile",
                         filePath: filePath,
                         reason: $"SerializedFile header (0x0000..0x03FF) appears encrypted (prefix: {prefixHex}) while subsequent pages (0x0400+) contain structured serialized data.",
                         confidence: 0.94,
-                        headerPrefixHex: prefixHex);
+                        headerPrefixHex: prefixHex,
+                        candidateAlgorithms: candidates);
                     return true;
                 }
             }
 
-            // 3. Check for encrypted .enc / .bundle.enc containers (high-entropy non-Unity, non-media payloads)
+            // 3. Check for encrypted .enc / .bundle.enc containers (high-entropy or ECB repeated-block non-Unity, non-media payloads)
             if (string.Equals(ext, ".enc", StringComparison.OrdinalIgnoreCase)
                 && totalStreamLength >= 128
                 && !TryParseUnityBundleHeader(probeBuffer, 0, totalStreamLength, out _, out _, out _, out _)
@@ -549,23 +1205,29 @@ namespace AssetStudio
                 && !HasKnownPlainMediaOrArchiveSignature(probeBuffer))
             {
                 int headerCheckLen = Math.Min(probeBuffer.Length, 256);
-                int nonZero = CountNonZeroBytes(probeBuffer.Slice(0, headerCheckLen));
-                int distinct = CountDistinctBytes(probeBuffer.Slice(0, headerCheckLen));
-                if (nonZero >= (headerCheckLen * 7) / 8 && distinct >= Math.Min(96, headerCheckLen / 2))
+                var headerSlice = probeBuffer.Slice(0, headerCheckLen);
+                int nonZero = CountNonZeroBytes(headerSlice);
+                int distinct = CountDistinctBytes(headerSlice);
+                bool looksHighEntropy = distinct >= Math.Min(96, headerCheckLen / 2);
+                bool looksEcbCiphertext = (totalStreamLength % 16) == 0
+                    && HasDuplicate16ByteBlocks(probeBuffer)
+                    && CountHighBitBytes(headerSlice) >= headerCheckLen / 8;
+                if (nonZero >= (headerCheckLen * 7) / 8 && (looksHighEntropy || looksEcbCiphertext))
                 {
                     string prefixHex = FormatHexPrefix(probeBuffer, 16);
+                    var candidates = AnalyzeEncryptionCandidates(probeBuffer, totalStreamLength, filePath, "EncryptedBundleContainer");
                     barrier = new StreamEncryptionBarrier(
                         providerId: "EncryptedBundleContainer",
                         filePath: filePath,
                         reason: $"Encrypted container ({fileName}) uses a non-standard cipher without a recognizable UnityFS header (prefix: {prefixHex}).",
                         confidence: 0.92,
-                        headerPrefixHex: prefixHex);
+                        headerPrefixHex: prefixHex,
+                        candidateAlgorithms: candidates);
                     return true;
                 }
             }
 
-            // 4. Check for partial-header-encrypted .bundle files (high-entropy encrypted header/blocksInfo prefix
-            //    followed by zero-padded or structured payload pages)
+            // 4. Check for cipher-encrypted .bundle files (high-entropy or ECB repeated-block encrypted header/blocksInfo prefix)
             if (string.Equals(ext, ".bundle", StringComparison.OrdinalIgnoreCase)
                 && totalStreamLength >= 128
                 && probeBuffer.Length >= 128
@@ -575,17 +1237,24 @@ namespace AssetStudio
                 && !TryFindOffsetUnityBundleHeader(probeBuffer, totalStreamLength, out _, out _, out _, out _)
                 && !TryDetectRepeatingXorUnityFsKey(probeBuffer, totalStreamLength, out _, out _, out _))
             {
-                int nonZero128 = CountNonZeroBytes(probeBuffer.Slice(0, 128));
-                int distinct128 = CountDistinctBytes(probeBuffer.Slice(0, 128));
-                if (nonZero128 >= 112 && distinct128 >= 72)
+                var header128 = probeBuffer.Slice(0, 128);
+                int nonZero128 = CountNonZeroBytes(header128);
+                int distinct128 = CountDistinctBytes(header128);
+                bool looksHighEntropy = distinct128 >= 72;
+                bool looksEcbCiphertext = (totalStreamLength % 16) == 0
+                    && HasDuplicate16ByteBlocks(probeBuffer)
+                    && CountHighBitBytes(header128) >= 16;
+                if (nonZero128 >= 112 && (looksHighEntropy || looksEcbCiphertext))
                 {
                     string prefixHex = FormatHexPrefix(probeBuffer, 16);
+                    var candidates = AnalyzeEncryptionCandidates(probeBuffer, totalStreamLength, filePath, "EncryptedUnityBundle");
                     barrier = new StreamEncryptionBarrier(
                         providerId: "EncryptedUnityBundle",
                         filePath: filePath,
                         reason: $"Bundle header appears cipher-encrypted without a recognizable UnityFS signature or repeating XOR key (prefix: {prefixHex}).",
                         confidence: 0.90,
-                        headerPrefixHex: prefixHex);
+                        headerPrefixHex: prefixHex,
+                        candidateAlgorithms: candidates);
                     return true;
                 }
             }
@@ -669,6 +1338,19 @@ namespace AssetStudio
             for (int i = 0; i < span.Length; i++)
             {
                 if (span[i] != 0)
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private static int CountHighBitBytes(ReadOnlySpan<byte> span)
+        {
+            int count = 0;
+            for (int i = 0; i < span.Length; i++)
+            {
+                if ((span[i] & 0x80) != 0)
                 {
                     count++;
                 }

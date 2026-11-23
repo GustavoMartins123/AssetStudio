@@ -5,8 +5,10 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia;
+using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.Services.ProjectAnalysis;
 using AssetStudio.Avalonia.ViewModels;
 using K4os.Compression.LZ4;
@@ -497,6 +499,654 @@ namespace AssetStudio.Tests
             {
                 DecryptionHelper.Clear();
             }
+        }
+
+        [Fact]
+        public void Block512_Detection_CatalogDiscovery_ScannerBarrier_AndProfileResolution()
+        {
+            DecryptionHelper.Clear();
+            var tempRoot = Path.Combine(Path.GetTempPath(), "AssetStudio_Block512Tests_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+
+            try
+            {
+                byte[] nodePayload = BuildValidSerializedHeaderPayload(1024);
+                byte[] plainBundle = BuildValidLz4UnityFsBundle("CAB-block512-test", nodePayload);
+
+                const string bundleFileName = "pack_block512.bundle";
+                const string bundleName = "synthetic_pack";
+                const string hashHex = "0123456789abcdef0123456789abcdef";
+                const uint crcVal = 424242u;
+                string token = $"{bundleName}_{hashHex}-{crcVal}";
+                byte[] encryptedBlock512 = EncryptBlock512Bundle(plainBundle, token);
+
+                // 1. Unresolved Block 512 (no catalog): ProjectScanner classifies as Encrypted with Block512MissingCatalog barrier,
+                //    and DecryptionKeyDialogViewModel pre-selects Block 512 (index 6, SkipBytes=26)
+                var orphanDir = Path.Combine(tempRoot, "orphan");
+                Directory.CreateDirectory(orphanDir);
+                var orphanBundlePath = Path.Combine(orphanDir, bundleFileName);
+                File.WriteAllBytes(orphanBundlePath, encryptedBlock512);
+
+                var orphanScan = ProjectScanner.ScanFolder(orphanDir);
+                Assert.Equal(0, orphanScan.UnityBundleCount);
+                Assert.Equal(1, orphanScan.EncryptedFileCount);
+                Assert.Equal(0.0, orphanScan.CoveragePercent);
+                Assert.Single(orphanScan.EncryptionBarriers);
+                var blockBarrier = orphanScan.EncryptionBarriers[0];
+                Assert.Equal("Block512MissingCatalog", blockBarrier.ProviderId);
+                Assert.NotNull(blockBarrier.CandidateAlgorithms);
+                Assert.Single(blockBarrier.CandidateAlgorithms!);
+                Assert.Equal("block512", blockBarrier.CandidateAlgorithms![0].SchemeId);
+                Assert.Equal(26, blockBarrier.CandidateAlgorithms![0].SuggestedSkipBytes);
+
+                Assert.True(DecryptionHelper.InspectFileBarrier(orphanBundlePath, out var inspectedBarrier));
+                Assert.Equal("Block512MissingCatalog", inspectedBarrier.ProviderId);
+
+                var dialogContext = new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: orphanDir,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: orphanScan.EncryptionBarriers);
+
+                var profilesDir = Path.Combine(tempRoot, "profiles");
+                var dialogVm = new DecryptionKeyDialogViewModel(dialogContext, userProfilesDirectoryOverride: profilesDir);
+                Assert.True(dialogVm.HasDetectedAlgorithms);
+                Assert.Single(dialogVm.DetectedAlgorithms);
+                Assert.Equal(6, dialogVm.SelectedAlgorithmIndex); // Block 512
+                Assert.True(dialogVm.IsBlock512Selected);
+                Assert.False(dialogVm.IsKeySectionVisible);
+                Assert.True(dialogVm.IsSelectedAlgorithmAutoDetected);
+                Assert.Equal("26", dialogVm.SkipBytesText);
+                Assert.Equal("*.bundle", dialogVm.FileNamePattern);
+                Assert.True(dialogVm.DetectedAlgorithms[0].IsSelected);
+                Assert.True(dialogVm.DetectedAlgorithms[0].IsChecked);
+
+                // 2. Explicit non-adjacent catalog via Block 512 profile + TestKeyCommand verification
+                var remoteCatalogDir = Path.Combine(tempRoot, "remote_catalog");
+                Directory.CreateDirectory(remoteCatalogDir);
+                var remoteCatalogPath = Path.Combine(remoteCatalogDir, "catalog_external.json");
+                File.WriteAllText(remoteCatalogPath, BuildSyntheticJsonCatalog(bundleFileName, bundleName, hashHex, crcVal.ToString()), Encoding.UTF8);
+
+                dialogVm.Block512CatalogPath = remoteCatalogPath;
+                dialogVm.TestKeyCommand.Execute(null);
+                Assert.False(dialogVm.HasValidationError);
+                Assert.Contains("verified", dialogVm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+
+                dialogVm.ProfileId = "block512-remote-catalog";
+                dialogVm.SaveProfileCommand.Execute(null);
+                Assert.False(dialogVm.HasValidationError);
+
+                using (var reader = new FileReader(orphanBundlePath))
+                {
+                    Assert.Equal("DeclarativeProfile", reader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, reader.FileType);
+                    using var bundle = new BundleFile(reader);
+                    Assert.Single(bundle.fileList);
+                    using var ms = new MemoryStream();
+                    bundle.fileList[0].stream.CopyTo(ms);
+                    Assert.Equal(nodePayload, ms.ToArray());
+                }
+
+                // 3. Direct Block 512 token profile (no catalog file needed)
+                DecryptionHelper.Clear();
+                DecryptionHelper.RegisterProfile(new DecryptionProfile
+                {
+                    Id = "block512-direct-token",
+                    Algorithm = "block512",
+                    FileNamePattern = "*.bundle",
+                    Block512Token = token,
+                    ValidateUnityHeader = true
+                });
+
+                using (var tokenReader = new FileReader(orphanBundlePath))
+                {
+                    Assert.Equal("DeclarativeProfile", tokenReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, tokenReader.FileType);
+                }
+
+                // 4. Automatic catalog discovery for catalog_*.json, catalog-*.json, and catalog.bin
+                DecryptionHelper.Clear();
+                foreach (var catalogFileName in new[] { "catalog_2026.01.json", "catalog-patch.json" })
+                {
+                    DecryptionHelper.Clear();
+                    var jsonDir = Path.Combine(tempRoot, "auto_" + Path.GetFileNameWithoutExtension(catalogFileName));
+                    var embedDir = Path.Combine(jsonDir, "Embed");
+                    Directory.CreateDirectory(embedDir);
+                    File.WriteAllText(
+                        Path.Combine(jsonDir, catalogFileName),
+                        BuildSyntheticJsonCatalog(bundleFileName, bundleName, hashHex, crcVal.ToString()),
+                        Encoding.UTF8);
+                    var bundlePath = Path.Combine(embedDir, bundleFileName);
+                    File.WriteAllBytes(bundlePath, encryptedBlock512);
+
+                    using var autoReader = new FileReader(bundlePath);
+                    Assert.Equal("Block512Catalog", autoReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, autoReader.FileType);
+                    Assert.False(autoReader.EncryptionBarrier.HasValue);
+                }
+
+                // Binary catalog.bin auto-discovery
+                DecryptionHelper.Clear();
+                var binDir = Path.Combine(tempRoot, "auto_bin");
+                var binEmbedDir = Path.Combine(binDir, "Embed");
+                Directory.CreateDirectory(binEmbedDir);
+                var binCatalogBytes = BuildSyntheticBinaryCatalog(
+                    $"aa/Embed/{bundleFileName}",
+                    bundleName,
+                    Convert.FromHexString(hashHex),
+                    crcVal);
+                File.WriteAllBytes(Path.Combine(binDir, "catalog.bin"), binCatalogBytes);
+                var binBundlePath = Path.Combine(binEmbedDir, bundleFileName);
+                File.WriteAllBytes(binBundlePath, encryptedBlock512);
+
+                using (var binReader = new FileReader(binBundlePath))
+                {
+                    Assert.Equal("Block512Catalog", binReader.AppliedDecryptionProvider);
+                    Assert.Equal(FileType.BundleFile, binReader.FileType);
+                    Assert.False(binReader.EncryptionBarrier.HasValue);
+                }
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+                try { Directory.Delete(tempRoot, recursive: true); } catch { }
+            }
+        }
+
+        [Fact]
+        public async Task AutoDetectedAlgorithms_SingleDeterministicMatches_EcbDuplicateBlocks_OffsetSkip_AndCatalogHints()
+        {
+            DecryptionHelper.Clear();
+            var tempRoot = Path.Combine(Path.GetTempPath(), "AssetStudio_SingleDetectTests_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+
+            try
+            {
+                // 1. AES-ECB duplicate 16-byte blocks -> AES-ECB ranked #1 and pre-selected
+                byte[] structuredPlain = new byte[1024];
+                byte[] repeatedBlock = Encoding.ASCII.GetBytes("REPEATED_16BYTE!");
+                for (int off = 0; off < 1024; off += 16)
+                {
+                    Buffer.BlockCopy(repeatedBlock, 0, structuredPlain, off, 16);
+                }
+                // Vary first block so header isn't constant, keep blocks 1..63 repeating
+                Encoding.ASCII.GetBytes("SYNTHETIC_HDR_01").CopyTo(structuredPlain, 0);
+                byte[] ecbKey = Convert.FromHexString("00112233445566778899AABBCCDDEEFF");
+                byte[] ecbCipher = EncryptAes(structuredPlain, ecbKey, new byte[16], CipherMode.ECB, PaddingMode.None);
+
+                var ecbPath = Path.Combine(tempRoot, "ecb_pack.enc");
+                File.WriteAllBytes(ecbPath, ecbCipher);
+                Assert.True(DecryptionHelper.InspectFileBarrier(ecbPath, out var ecbBarrier));
+                Assert.NotNull(ecbBarrier.CandidateAlgorithms);
+                Assert.Equal("aes-ecb", ecbBarrier.CandidateAlgorithms![0].SchemeId);
+
+                var ecbVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[] { ecbBarrier }));
+                Assert.Equal(2, ecbVm.SelectedAlgorithmIndex); // AES-ECB
+                Assert.True(ecbVm.IsSelectedAlgorithmAutoDetected);
+                Assert.Equal("aes-ecb", ecbVm.DetectedAlgorithms[0].SchemeId);
+
+                // 2. Offset skip structural detection -> Offset Skip (None) with SuggestedSkipBytes = 24
+                byte[] nodePayload = BuildValidSerializedHeaderPayload(512);
+                byte[] plainBundle = BuildValidLz4UnityFsBundle("CAB-offset-test", nodePayload);
+                byte[] shiftedBundle = new byte[24 + plainBundle.Length];
+                for (int i = 0; i < 24; i++) shiftedBundle[i] = (byte)(0xC0 + i);
+                Buffer.BlockCopy(plainBundle, 0, shiftedBundle, 24, plainBundle.Length);
+
+                var offsetCandidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(shiftedBundle, shiftedBundle.Length, "shifted.bundle");
+                Assert.Single(offsetCandidates);
+                Assert.Equal("none", offsetCandidates[0].SchemeId);
+                Assert.Equal(24, offsetCandidates[0].SuggestedSkipBytes);
+
+                var offsetVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: false,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[]
+                    {
+                        new StreamEncryptionBarrier("CustomOffset", "shifted.bundle", "Shifted bundle", 0.96, "C0 C1", offsetCandidates)
+                    }));
+                Assert.Equal(5, offsetVm.SelectedAlgorithmIndex); // Offset Skip (None)
+                Assert.Equal("24", offsetVm.SkipBytesText);
+                Assert.True(offsetVm.IsAdvancedOptionsExpanded);
+
+                // 3. Explicit catalog hints preserved alongside file barriers (not discarded!)
+                byte[] key256 = Convert.FromHexString("11223344556677889900AABBCCDDEEFF11223344556677889900AABBCCDDEEFF");
+                byte[] iv16 = Convert.FromHexString("0102030405060708090A0B0C0D0E0F10");
+                byte[] alignedCipher = EncryptAes(plainBundle, key256, iv16, CipherMode.CBC, PaddingMode.PKCS7);
+                var alignedBundlePath = Path.Combine(tempRoot, "catalog_hinted.bundle");
+                File.WriteAllBytes(alignedBundlePath, alignedCipher);
+                Assert.True(DecryptionHelper.InspectFileBarrier(alignedBundlePath, out var alignedBarrier));
+
+                var chachaHint = new DecryptionHintEntry
+                {
+                    Provider = "Synthetic.ResourceProviders.ChaCha20BundleProvider",
+                    CatalogPath = Path.Combine(tempRoot, "catalog.json"),
+                    Bundle = string.Empty,
+                    Reason = "Custom ChaCha20 provider detected in catalog.",
+                    Confidence = 0.95
+                };
+
+                var combinedVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: false,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[] { alignedBarrier },
+                    CatalogHints: new[] { chachaHint }));
+
+                Assert.Equal(3, combinedVm.SelectedAlgorithmIndex); // ChaCha20 from catalog hint wins over generic structural CBC
+                Assert.True(combinedVm.IsSelectedAlgorithmAutoDetected);
+                Assert.Equal("*.bundle", combinedVm.FileNamePattern); // Inherited from file barrier!
+                Assert.True(combinedVm.HasMultipleDetectedAlgorithms);
+                Assert.Contains(combinedVm.DetectedAlgorithms, c => c.SchemeId == "aes-cbc");
+
+                // 4. MainWindowViewModel fallback forwards ProjectSession.CurrentAnalysisResult.DecryptionHints
+                var captureDialogs = new CapturingDecryptionDialogService();
+                using var mainVm = new MainWindowViewModel(dialogService: captureDialogs);
+                var analysis = new ProjectAnalysisResult
+                {
+                    Report = new ProjectAnalysisReport
+                    {
+                        ProjectRoot = tempRoot,
+                        Status = ProjectAnalysisStatus.Ready,
+                        DecryptionHintCount = 1
+                    },
+                    DecryptionHints = new DecryptionHintsReport
+                    {
+                        ProjectRoot = tempRoot,
+                        Hints = new List<DecryptionHintEntry>
+                        {
+                            new()
+                            {
+                                Provider = "Synthetic.XorAssetBundleProvider",
+                                CatalogPath = Path.Combine(tempRoot, "catalog.json"),
+                                Bundle = "stage01.bundle",
+                                Reason = "Custom XOR provider",
+                                Confidence = 0.95
+                            }
+                        }
+                    }
+                };
+                mainVm.ProjectSession.ApplyProjectAnalysis(analysis);
+                await mainVm.OpenDecryptionSettingsCommand.ExecuteAsync();
+
+                Assert.NotNull(captureDialogs.LastDecryptionContext);
+                Assert.NotNull(captureDialogs.LastDecryptionContext!.CatalogHints);
+                Assert.Single(captureDialogs.LastDecryptionContext.CatalogHints!);
+                Assert.Single(captureDialogs.LastDecryptionContext.DetectedBarriers);
+
+                var forwardedVm = new DecryptionKeyDialogViewModel(captureDialogs.LastDecryptionContext);
+                Assert.Equal(4, forwardedVm.SelectedAlgorithmIndex); // XOR pre-selected!
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+                try { Directory.Delete(tempRoot, recursive: true); } catch { }
+            }
+        }
+
+        [Fact]
+        public void AutoDetectedAlgorithms_MultiCandidate_AlignedVsUnaligned_PartialHeader_ChipSwitching_AndTestKeyAutoSelect()
+        {
+            DecryptionHelper.Clear();
+            var tempRoot = Path.Combine(Path.GetTempPath(), "AssetStudio_MultiDetectTests_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+
+            try
+            {
+                byte[] nodePayload = BuildValidSerializedHeaderPayload(1024);
+                byte[] plainBundle = BuildValidLz4UnityFsBundle("CAB-multi-test", nodePayload);
+
+                // Ensure unaligned payload length (% 16 != 0) for unaligned CTR test,
+                // and aligned payload length (% 16 == 0) for 16B-aligned multi-candidate + TestKey auto-switch test.
+                byte[] key128 = Convert.FromHexString("00112233445566778899AABBCCDDEEFF");
+                byte[] iv16 = Convert.FromHexString("102030405060708090A0B0C0D0E0F000");
+
+                // 1. 16-byte aligned .bundle encrypted with AES-CTR -> detects 3 candidates (AES-CBC, AES-CTR, ChaCha20),
+                //    all pre-checked, AES-CBC initially pre-selected; TestKey auto-switches to AES-CTR!
+                byte[] alignedBundlePlain = plainBundle;
+                if ((alignedBundlePlain.Length % 16) != 0)
+                {
+                    int pad = 16 - (alignedBundlePlain.Length % 16);
+                    // Pad inside nodePayload so UnityFS declared size matches exact 16B-aligned stream length
+                    nodePayload = BuildValidSerializedHeaderPayload(1024 + pad);
+                    alignedBundlePlain = BuildValidLz4UnityFsBundle("CAB-multi-aligned", nodePayload);
+                    while ((alignedBundlePlain.Length % 16) != 0)
+                    {
+                        nodePayload = BuildValidSerializedHeaderPayload(nodePayload.Length + 1);
+                        alignedBundlePlain = BuildValidLz4UnityFsBundle("CAB-multi-aligned", nodePayload);
+                    }
+                }
+                Assert.Equal(0, alignedBundlePlain.Length % 16);
+
+                byte[] alignedCtrCipher = EncryptAesCtr(alignedBundlePlain, key128, iv16, counterStart: 0, littleEndian: false, rangeStart: 0, rangeLength: -1);
+                var alignedPath = Path.Combine(tempRoot, "aligned_ctr.bundle");
+                File.WriteAllBytes(alignedPath, alignedCtrCipher);
+
+                Assert.True(DecryptionHelper.InspectFileBarrier(alignedPath, out var alignedBarrier));
+                Assert.NotNull(alignedBarrier.CandidateAlgorithms);
+                Assert.Equal(3, alignedBarrier.CandidateAlgorithms!.Count);
+                Assert.Equal("aes-cbc", alignedBarrier.CandidateAlgorithms[0].SchemeId);
+                Assert.Equal("aes-ctr", alignedBarrier.CandidateAlgorithms[1].SchemeId);
+                Assert.Equal("chacha20", alignedBarrier.CandidateAlgorithms[2].SchemeId);
+
+                var alignedVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[] { alignedBarrier }));
+
+                Assert.True(alignedVm.HasMultipleDetectedAlgorithms);
+                Assert.Equal(3, alignedVm.DetectedAlgorithms.Count);
+                Assert.All(alignedVm.DetectedAlgorithms, c => Assert.True(c.IsChecked));
+                Assert.Equal(0, alignedVm.SelectedAlgorithmIndex); // AES-CBC initially pre-selected
+                Assert.True(alignedVm.DetectedAlgorithms[0].IsSelected);
+                Assert.True(alignedVm.IsSelectedAlgorithmAutoDetected);
+
+                // Uncheck AES-CTR -> TestKey should NOT switch to unchecked candidate
+                var ctrCandidate = alignedVm.DetectedAlgorithms.Single(c => c.SchemeId == "aes-ctr");
+                ctrCandidate.IsChecked = false;
+                alignedVm.KeyInput = Convert.ToHexString(key128);
+                alignedVm.IvInput = Convert.ToHexString(iv16);
+                alignedVm.TestKeyCommand.Execute(null);
+                Assert.True(alignedVm.HasValidationError);
+                Assert.Equal(0, alignedVm.SelectedAlgorithmIndex);
+
+                // Re-check AES-CTR -> TestKey automatically tries AES-CTR and auto-selects it!
+                ctrCandidate.IsChecked = true;
+                alignedVm.TestKeyCommand.Execute(null);
+                Assert.False(alignedVm.HasValidationError);
+                Assert.Equal(1, alignedVm.SelectedAlgorithmIndex); // Auto-switched to AES-CTR!
+                Assert.True(ctrCandidate.IsSelected);
+                Assert.Contains("AES-CTR", alignedVm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+
+                // 2. Unaligned .enc (length % 16 != 0) -> excludes AES-CBC and AES-ECB, pre-selects AES-CTR
+                var unalignedNode = BuildValidSerializedHeaderPayload(1024);
+                var unalignedPlain = BuildValidLz4UnityFsBundle("CAB-multi-unaligned", unalignedNode);
+                while ((unalignedPlain.Length % 16) == 0)
+                {
+                    unalignedNode = BuildValidSerializedHeaderPayload(unalignedNode.Length + 1);
+                    unalignedPlain = BuildValidLz4UnityFsBundle("CAB-multi-unaligned", unalignedNode);
+                }
+                Assert.NotEqual(0, unalignedPlain.Length % 16);
+
+                byte[] unalignedCtr = EncryptAesCtr(unalignedPlain, key128, iv16, counterStart: 0, littleEndian: false, rangeStart: 0, rangeLength: -1);
+                var unalignedPath = Path.Combine(tempRoot, "unaligned_stream.enc");
+                File.WriteAllBytes(unalignedPath, unalignedCtr);
+
+                Assert.True(DecryptionHelper.InspectFileBarrier(unalignedPath, out var unalignedBarrier));
+                var unalignedVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[] { unalignedBarrier }));
+
+                Assert.Equal(1, unalignedVm.SelectedAlgorithmIndex); // AES-CTR pre-selected!
+                Assert.DoesNotContain(unalignedVm.DetectedAlgorithms, c => c.SchemeId == "aes-cbc");
+                Assert.DoesNotContain(unalignedVm.DetectedAlgorithms, c => c.SchemeId == "aes-ecb");
+                Assert.Contains(unalignedVm.DetectedAlgorithms, c => c.SchemeId == "aes-ctr");
+                Assert.Contains(unalignedVm.DetectedAlgorithms, c => c.SchemeId == "chacha20");
+
+                // 3. Heterogeneous folder: PartialHeaderEncryptedSerializedFile (globalgamemanagers, 0x400) + Block512 bundle
+                //    Clicking candidate chips switches algorithm + structural range while preserving user key/IV!
+                byte[] partialHeaderAsset = new byte[0x1200];
+                for (int i = 0; i < 0x400; i++)
+                {
+                    partialHeaderAsset[i] = (byte)(((i * 73) + 0x4E) | 1);
+                }
+                partialHeaderAsset[0x400] = 0x0F;
+                partialHeaderAsset[0x404] = 0x19;
+                var partialPath = Path.Combine(tempRoot, "globalgamemanagers");
+                File.WriteAllBytes(partialPath, partialHeaderAsset);
+                Assert.True(DecryptionHelper.InspectFileBarrier(partialPath, out var partialBarrier));
+
+                var block512Path = Path.Combine(tempRoot, "hero.bundle");
+                File.WriteAllBytes(block512Path, EncryptBlock512Bundle(plainBundle, "hero_00112233-99"));
+                Assert.True(DecryptionHelper.InspectFileBarrier(block512Path, out var heroBlockBarrier));
+
+                var heteroVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 2,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[] { partialBarrier, heroBlockBarrier }));
+
+                Assert.True(heteroVm.DetectedAlgorithms.Count >= 3);
+                Assert.Equal(6, heteroVm.SelectedAlgorithmIndex); // Block 512 (98%) highest confidence
+                Assert.Equal("26", heteroVm.SkipBytesText);
+
+                // Enter user key & IV, then click XOR candidate chip (from partial header barrier)
+                heteroVm.KeyInput = "AABBCCDDEEFF00112233445566778899";
+                heteroVm.IvInput = "0102030405060708090A0B0C0D0E0F10";
+                var xorChip = heteroVm.DetectedAlgorithms.Single(c => c.SchemeId == "xor");
+                xorChip.SelectCommand.Execute(null);
+
+                Assert.Equal(4, heteroVm.SelectedAlgorithmIndex); // XOR
+                Assert.True(xorChip.IsSelected);
+                Assert.Equal("globalgamemanagers", heteroVm.FileNamePattern);
+                Assert.Equal("0", heteroVm.SkipBytesText);
+                Assert.Equal("0", heteroVm.RangeStartText);
+                Assert.Equal("1024", heteroVm.RangeLengthText);
+                Assert.True(heteroVm.IsAdvancedOptionsExpanded);
+                // User key & IV must be preserved across chip switch!
+                Assert.Equal("AABBCCDDEEFF00112233445566778899", heteroVm.KeyInput);
+                Assert.Equal("0102030405060708090A0B0C0D0E0F10", heteroVm.IvInput);
+
+                // 4. TestKey auto-detects Stream Prefix IV on AES-CBC when IV is left blank
+                byte[] prefixIv = Convert.FromHexString("A1B2C3D4E5F60718293A4B5C6D7E8F90");
+                byte[] cbcBody = EncryptAes(plainBundle, key128, prefixIv, CipherMode.CBC, PaddingMode.PKCS7);
+                byte[] withPrefixIv = new byte[prefixIv.Length + cbcBody.Length];
+                Buffer.BlockCopy(prefixIv, 0, withPrefixIv, 0, prefixIv.Length);
+                Buffer.BlockCopy(cbcBody, 0, withPrefixIv, prefixIv.Length, cbcBody.Length);
+                var prefixPath = Path.Combine(tempRoot, "prefix_iv.bundle");
+                File.WriteAllBytes(prefixPath, withPrefixIv);
+
+                Assert.True(DecryptionHelper.InspectFileBarrier(prefixPath, out var prefixBarrier));
+                var prefixVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: 1,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: new[] { prefixBarrier }));
+
+                Assert.Equal(0, prefixVm.SelectedAlgorithmIndex); // AES-CBC pre-selected
+                prefixVm.KeyInput = Convert.ToHexString(key128);
+                prefixVm.IvInput = string.Empty;
+                prefixVm.SelectedIvModeIndex = 0;
+                prefixVm.TestKeyCommand.Execute(null);
+
+                Assert.False(prefixVm.HasValidationError);
+                Assert.Equal(2, prefixVm.SelectedIvModeIndex); // Auto-switched to Read from Stream Prefix!
+                Assert.Contains("verified", prefixVm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+                try { Directory.Delete(tempRoot, recursive: true); } catch { }
+            }
+        }
+
+        private sealed class CapturingDecryptionDialogService : IDialogService
+        {
+            public DecryptionDialogContext? LastDecryptionContext { get; private set; }
+
+            public Task<IReadOnlyList<string>> PickOpenFilesAsync(FilePickerRequest request) => Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+            public Task<string?> PickOpenFolderAsync(FolderPickerRequest request) => Task.FromResult<string?>(null);
+            public Task<string?> PickSaveFileAsync(SaveFilePickerRequest request) => Task.FromResult<string?>(null);
+            public Task ShowMessageAsync(string title, string message) => Task.CompletedTask;
+            public Task ShowErrorAsync(string title, string message) => Task.CompletedTask;
+            public Task<bool> ConfirmAsync(string title, string message) => Task.FromResult(false);
+            public Task<RiskyLoadChoice> ShowRiskyLoadDialogAsync(string title, string message) => Task.FromResult(RiskyLoadChoice.Cancel);
+            public Task<bool> ShowExportOptionsAsync(AvaloniaAppSettings settings) => Task.FromResult(false);
+            public Task<ProjectManagerDialogResult?> ShowProjectManagerAsync(string? activeProjectPath) => Task.FromResult<ProjectManagerDialogResult?>(null);
+            public Task<bool> CopyTextToClipboardAsync(string text) => Task.FromResult(true);
+            public Task<bool> OpenPathInExplorerAsync(string path) => Task.FromResult(true);
+            public Task<bool> OpenUrlAsync(string url) => Task.FromResult(true);
+
+            public Task<DecryptionKeyDialogResult?> ShowDecryptionKeyDialogAsync(DecryptionDialogContext context)
+            {
+                LastDecryptionContext = context;
+                return Task.FromResult<DecryptionKeyDialogResult?>(new DecryptionKeyDialogResult(DecryptionDialogAction.Close, false));
+            }
+        }
+
+        private static byte[] EncryptBlock512Bundle(byte[] plainBundle, string token)
+        {
+            var output = new byte[26 + plainBundle.Length];
+            Encoding.ASCII.GetBytes("Encryption").CopyTo(output, 0);
+            Buffer.BlockCopy(plainBundle, 0, output, 26, plainBundle.Length);
+
+            var keyGen = new Block512KeyGenerator(token);
+            var keyBlock = new byte[512];
+            int offset = 0;
+            uint blockIndex = 0;
+            while (offset < plainBundle.Length)
+            {
+                keyGen.FillKey(blockIndex++, keyBlock);
+                int count = Math.Min(512, plainBundle.Length - offset);
+                UnityHeaderProbe.XorBytes(output, 26 + offset, keyBlock, 0, count);
+                offset += count;
+            }
+
+            return output;
+        }
+
+        private static string BuildSyntheticJsonCatalog(string bundleFileName, string bundleName, string hash, string crc)
+        {
+            var entryBytes = new byte[4 + 28];
+            BinaryPrimitives.WriteInt32LittleEndian(entryBytes.AsSpan(0, 4), 1);
+            BinaryPrimitives.WriteInt32LittleEndian(entryBytes.AsSpan(4, 4), 0);
+            BinaryPrimitives.WriteInt32LittleEndian(entryBytes.AsSpan(4 + 16, 4), 0);
+
+            string extraJson = $"{{\"m_BundleName\":\"{bundleName}\",\"m_Hash\":\"{hash}\",\"m_Crc\":{crc}}}";
+            var extraJsonBytes = Encoding.ASCII.GetBytes(extraJson);
+            var extraBytes = new byte[1 + 4 + extraJsonBytes.Length];
+            extraBytes[0] = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(extraBytes.AsSpan(1, 4), extraJsonBytes.Length);
+            Buffer.BlockCopy(extraJsonBytes, 0, extraBytes, 5, extraJsonBytes.Length);
+
+            return "{\n"
+                + $"  \"m_InternalIds\": [\"0#Embed/{bundleFileName}\"],\n"
+                + "  \"m_InternalIdPrefixes\": [\"aa/\"],\n"
+                + $"  \"m_EntryDataString\": \"{Convert.ToBase64String(entryBytes)}\",\n"
+                + $"  \"m_ExtraDataString\": \"{Convert.ToBase64String(extraBytes)}\"\n"
+                + "}";
+        }
+
+        private static byte[] BuildSyntheticBinaryCatalog(string internalId, string bundleName, byte[] hash16, uint crc)
+        {
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+            const uint keysOffset = 36u;
+            const int keysByteSize = 8;
+            bw.Write(new byte[32]);
+            bw.Write(keysByteSize);
+            bw.Write(new byte[keysByteSize]);
+
+            uint WriteAsciiString(string s)
+            {
+                var bytes = Encoding.ASCII.GetBytes(s);
+                bw.Write(bytes.Length);
+                uint offset = (uint)ms.Position;
+                bw.Write(bytes);
+                return offset;
+            }
+
+            uint WriteDynamicPathString(string path, char sep)
+            {
+                var segments = path.Split(new[] { sep }, StringSplitOptions.RemoveEmptyEntries);
+                uint nextId = uint.MaxValue;
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    uint partStrId = WriteAsciiString(segments[i]);
+                    uint nodeOffset = (uint)ms.Position;
+                    bw.Write(partStrId);
+                    bw.Write(nextId);
+                    nextId = nodeOffset | 0x40000000u;
+                }
+                return nextId;
+            }
+
+            uint WriteUInt32Array(uint[] values)
+            {
+                bw.Write(values.Length * 4);
+                uint offset = (uint)ms.Position;
+                foreach (var v in values)
+                {
+                    bw.Write(v);
+                }
+                return offset;
+            }
+
+            uint idOffset = WriteAsciiString("synthetic_locator");
+            uint providerOffset = WriteDynamicPathString("UnityEngine.ResourceManagement.ResourceProviders.AssetBundleProvider", '.');
+            uint locationOffset = (uint)ms.Position;
+            bw.Write(new byte[28]);
+
+            uint primaryKeyOff = WriteAsciiString(bundleName);
+            uint internalIdOff = WriteDynamicPathString(internalId.Replace('\\', '/'), '/');
+
+            uint hashOff = (uint)ms.Position;
+            bw.Write(hash16);
+            uint bundleNameOff = WriteAsciiString(bundleName);
+            uint serializedDataOff = (uint)ms.Position;
+            bw.Write(hashOff);
+            bw.Write(bundleNameOff);
+            bw.Write(crc);
+            bw.Write(4096u);
+            bw.Write(uint.MaxValue);
+
+            uint extraDataOff = (uint)ms.Position;
+            bw.Write(uint.MaxValue);
+            bw.Write(serializedDataOff);
+
+            long savedPos = ms.Position;
+            ms.Position = locationOffset;
+            bw.Write(primaryKeyOff);
+            bw.Write(internalIdOff);
+            bw.Write(providerOffset);
+            bw.Write(uint.MaxValue);
+            bw.Write(0);
+            bw.Write(extraDataOff);
+            bw.Write(uint.MaxValue);
+            ms.Position = savedPos;
+
+            uint locSetOff = WriteUInt32Array(new[] { locationOffset });
+            savedPos = ms.Position;
+            ms.Position = keysOffset;
+            bw.Write(primaryKeyOff);
+            bw.Write(locSetOff);
+            ms.Position = savedPos;
+
+            ms.Position = 0;
+            bw.Write(AddressablesCatalogDependencyResolver.BinaryCatalogMagic);
+            bw.Write(2);
+            bw.Write(keysOffset);
+            bw.Write(idOffset);
+            bw.Write(uint.MaxValue);
+            bw.Write(uint.MaxValue);
+            bw.Write(uint.MaxValue);
+            bw.Write(uint.MaxValue);
+            bw.Flush();
+            return ms.ToArray();
         }
 
         private static byte[] CreatePatternPayload(int length)

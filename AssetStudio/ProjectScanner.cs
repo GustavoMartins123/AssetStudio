@@ -441,17 +441,25 @@ namespace AssetStudio
                         transformed.Dispose();
                     }
                 }
-                else if (read >= 26 && UnityHeaderProbe.MatchesAt(span, 0, DecryptionHelper.EncryptionMagicBytes))
-                {
-                    // Legacy Block512 container header when catalog.json is not adjacent
-                    result.Kind = ProjectFileKind.UnityBundle;
-                    result.BundleSignature = "Encryption";
-                    return result;
-                }
                 else if (barrier.HasValue)
                 {
                     result.Kind = ProjectFileKind.Encrypted;
                     result.EncryptionBarrier = barrier.Value;
+                    return result;
+                }
+                else if (read >= 26 && UnityHeaderProbe.MatchesAt(span, 0, DecryptionHelper.EncryptionMagicBytes))
+                {
+                    // Unresolved Block512 container header when catalog could not resolve a token
+                    var prefixHex = UnityHeaderProbe.FormatHexPrefix(span, 16);
+                    var candidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(span, fileSize, path, "Block512MissingCatalog");
+                    result.Kind = ProjectFileKind.Encrypted;
+                    result.EncryptionBarrier = new StreamEncryptionBarrier(
+                        providerId: "Block512MissingCatalog",
+                        filePath: path,
+                        reason: $"Block 512 'Encryption' container header detected (prefix: {prefixHex}), but no matching Addressables catalog entry was found to derive the decryption token.",
+                        confidence: 0.98,
+                        headerPrefixHex: prefixHex,
+                        candidateAlgorithms: candidates);
                     return result;
                 }
             }

@@ -9,6 +9,7 @@ namespace AssetStudio
     {
         public Stream BaseStream { get; }
         public string Token { get; }
+        internal bool LeaveBaseStreamOpen { get; set; }
         private readonly Block512KeyGenerator keyGen;
         private readonly long length;
         private long position;
@@ -112,7 +113,7 @@ namespace AssetStudio
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && !LeaveBaseStreamOpen)
             {
                 BaseStream.Dispose();
             }

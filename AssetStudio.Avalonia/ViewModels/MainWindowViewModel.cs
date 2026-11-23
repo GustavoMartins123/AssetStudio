@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.Services.ProjectAnalysis;
 
 namespace AssetStudio.Avalonia.ViewModels
 {
@@ -873,13 +874,42 @@ namespace AssetStudio.Avalonia.ViewModels
                 return;
             }
 
+            var catalogHints = ProjectSession.CurrentAnalysisResult?.DecryptionHints?.Hints;
+            var barriers = new List<StreamEncryptionBarrier>();
+            if (catalogHints != null && catalogHints.Count > 0)
+            {
+                foreach (var hint in catalogHints)
+                {
+                    if (barriers.Count >= 10)
+                    {
+                        break;
+                    }
+
+                    var targetPath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : hint.CatalogPath;
+                    var candidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                        ReadOnlySpan<byte>.Empty,
+                        totalStreamLength: 0,
+                        filePath: targetPath,
+                        providerHint: hint.Provider,
+                        reasonHint: hint.Reason);
+                    barriers.Add(new StreamEncryptionBarrier(
+                        providerId: hint.Provider,
+                        filePath: targetPath,
+                        reason: hint.Reason,
+                        confidence: hint.Confidence,
+                        headerPrefixHex: hint.MetadataSummary,
+                        candidateAlgorithms: candidates));
+                }
+            }
+
             var ctx = new DecryptionDialogContext(
                 IsInitialLoadPrompt: false,
                 ProjectRoot: ProjectSession.ProjectFolderPath,
                 ReadableAssetFileCount: ProjectSession.ReadableAssetFileCount,
                 EncryptedFileCount: ProjectSession.EncryptedFileCount,
                 CoveragePercent: ProjectSession.CoveragePercent,
-                DetectedBarriers: Array.Empty<StreamEncryptionBarrier>());
+                DetectedBarriers: barriers,
+                CatalogHints: catalogHints);
             var result = await _dialogService.ShowDecryptionKeyDialogAsync(ctx);
             if (result?.Action == DecryptionDialogAction.ApplyAndReanalyze)
             {

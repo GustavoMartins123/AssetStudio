@@ -582,7 +582,7 @@ namespace AssetStudio
             try
             {
                 using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                if (fs.Length < 32)
+                if (fs.Length < 26)
                 {
                     return false;
                 }
@@ -612,6 +612,67 @@ namespace AssetStudio
             }
         }
 
+        public static bool TryTestProfileOnFile(DecryptionProfile profile, string filePath, out string? unlockedHeaderSummary)
+        {
+            unlockedHeaderSummary = null;
+            if (profile == null || string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            {
+                return false;
+            }
+
+            try
+            {
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                if (fs.Length < 20)
+                {
+                    return false;
+                }
+
+                return DeclarativeProfileTransformProvider.TryTestProfileOnStream(profile, fs, filePath, out unlockedHeaderSummary);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static string? TryResolveBlock512Token(string? filePath, string? explicitCatalogPath = null)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                return null;
+            }
+
+            string fileName = Path.GetFileName(filePath);
+            if (string.IsNullOrEmpty(fileName))
+            {
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(explicitCatalogPath))
+            {
+                string trimmedCatalog = explicitCatalogPath.Trim();
+                if (File.Exists(trimmedCatalog))
+                {
+                    if (TryResolveTokenFromExplicitCatalog(trimmedCatalog, fileName, out var directToken))
+                    {
+                        return directToken;
+                    }
+                }
+            }
+
+            if (!metadataMap.TryGetValue(fileName, out var meta))
+            {
+                LocateAndParseCatalog(filePath);
+                if (!metadataMap.TryGetValue(fileName, out meta))
+                {
+                    return null;
+                }
+            }
+
+            return $"{meta.BundleName}_{meta.Hash}-{meta.Crc}";
+        }
+
         public sealed class Block512CatalogTransformProvider : IStreamTransformProvider
         {
             public string Id => "Block512Catalog";
@@ -624,24 +685,65 @@ namespace AssetStudio
                     return null;
                 }
 
-                string fileName = Path.GetFileName(filePath);
-                if (string.IsNullOrEmpty(fileName))
+                string? token = TryResolveBlock512Token(filePath);
+                if (string.IsNullOrEmpty(token))
                 {
                     return null;
                 }
 
-                if (!metadataMap.TryGetValue(fileName, out var meta))
+                return new DecryptedStream(stream, token);
+            }
+        }
+
+        private static bool TryResolveTokenFromExplicitCatalog(string catalogPath, string fileName, out string? token)
+        {
+            token = null;
+            try
+            {
+                string fullCatalogPath = Path.GetFullPath(catalogPath);
+                if (AddressablesCatalogDependencyResolver.TryLoadCatalog(fullCatalogPath, out var parsed) && parsed != null)
                 {
-                    LocateAndParseCatalog(filePath);
-                    if (!metadataMap.TryGetValue(fileName, out meta))
+                    if (parsed.ByFileName.TryGetValue(fileName, out var nodes))
                     {
-                        return null;
+                        for (int i = 0; i < nodes.Count; i++)
+                        {
+                            var node = nodes[i];
+                            if (!string.IsNullOrEmpty(node.BundleName) && !string.IsNullOrEmpty(node.Hash))
+                            {
+                                string crc = string.IsNullOrEmpty(node.Crc) ? "0" : node.Crc;
+                                token = $"{node.BundleName}_{node.Hash}-{crc}";
+                                return true;
+                            }
+                        }
+                    }
+
+                    for (int i = 0; i < parsed.Bundles.Count; i++)
+                    {
+                        var node = parsed.Bundles[i];
+                        if (string.Equals(node.BundleFileName, fileName, StringComparison.OrdinalIgnoreCase)
+                            && !string.IsNullOrEmpty(node.BundleName)
+                            && !string.IsNullOrEmpty(node.Hash))
+                        {
+                            string crc = string.IsNullOrEmpty(node.Crc) ? "0" : node.Crc;
+                            token = $"{node.BundleName}_{node.Hash}-{crc}";
+                            return true;
+                        }
                     }
                 }
 
-                string token = $"{meta.BundleName}_{meta.Hash}-{meta.Crc}";
-                return new DecryptedStream(stream, token);
+                // Also parse into shared cache as JSON fallback
+                ParseCatalog(fullCatalogPath);
+                if (metadataMap.TryGetValue(fileName, out var meta))
+                {
+                    token = $"{meta.BundleName}_{meta.Hash}-{meta.Crc}";
+                    return true;
+                }
             }
+            catch
+            {
+            }
+
+            return false;
         }
 
         private static void LocateAndParseCatalog(string? filePath)
@@ -650,37 +752,53 @@ namespace AssetStudio
                 return;
             try
             {
-                string? dir = Path.GetDirectoryName(filePath);
-                if (string.IsNullOrEmpty(dir))
-                    return;
+                var catalogPaths = AddressablesCatalogDependencyResolver.FindCatalogPathsForFiles(new[] { filePath });
 
-                // Check parent directories for catalog.json (standard Addressables layout: Embed is in aa/Embed/, catalog is in aa/)
-                string? currentDir = dir;
-                for (int i = 0; i < 3; i++)
+                // Also check application base directory only (never walk parent directories of app base)
+                string appBase = AppDomain.CurrentDomain.BaseDirectory;
+                if (!string.IsNullOrEmpty(appBase) && Directory.Exists(appBase))
                 {
-                    if (string.IsNullOrEmpty(currentDir))
-                        break;
-
-                    string catalogPath = Path.Combine(currentDir, "catalog.json");
-                    if (File.Exists(catalogPath))
-                    {
-                        ParseCatalog(catalogPath);
-                        return; // Found and parsed
-                    }
-
-                    currentDir = Path.GetDirectoryName(currentDir);
+                    AddTopLevelCatalogCandidates(appBase, catalogPaths);
                 }
 
-                // Also try application directory
-                string appCatalog = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "catalog.json");
-                if (File.Exists(appCatalog))
+                for (int i = 0; i < catalogPaths.Count; i++)
                 {
-                    ParseCatalog(appCatalog);
+                    ParseCatalog(catalogPaths[i]);
                 }
             }
             catch
             {
                 // Ignore errors locating catalog
+            }
+        }
+
+        private static void AddTopLevelCatalogCandidates(string directory, List<string> target)
+        {
+            void TryAdd(string path)
+            {
+                if (File.Exists(path) && !target.Contains(path, StringComparer.OrdinalIgnoreCase))
+                {
+                    target.Add(path);
+                }
+            }
+
+            TryAdd(Path.Combine(directory, "catalog.json"));
+            TryAdd(Path.Combine(directory, "catalog.bin"));
+
+            try
+            {
+                foreach (var candidate in Directory.EnumerateFiles(directory, "catalog*.json", SearchOption.TopDirectoryOnly))
+                {
+                    TryAdd(candidate);
+                }
+
+                foreach (var candidate in Directory.EnumerateFiles(directory, "catalog*.bin", SearchOption.TopDirectoryOnly))
+                {
+                    TryAdd(candidate);
+                }
+            }
+            catch
+            {
             }
         }
 
@@ -709,6 +827,28 @@ namespace AssetStudio
         {
             try
             {
+                int addedFromResolver = 0;
+                if (AddressablesCatalogDependencyResolver.TryLoadCatalog(fullPath, out var parsed) && parsed != null)
+                {
+                    for (int i = 0; i < parsed.Bundles.Count; i++)
+                    {
+                        var node = parsed.Bundles[i];
+                        if (!string.IsNullOrEmpty(node.BundleFileName)
+                            && !string.IsNullOrEmpty(node.BundleName)
+                            && !string.IsNullOrEmpty(node.Hash))
+                        {
+                            string crc = string.IsNullOrEmpty(node.Crc) ? "0" : node.Crc;
+                            metadataMap[node.BundleFileName] = (node.BundleName, node.Hash, crc);
+                            addedFromResolver++;
+                        }
+                    }
+                }
+
+                if (addedFromResolver > 0 || string.Equals(Path.GetExtension(fullPath), ".bin", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
                 string content = File.ReadAllText(fullPath);
 
                 string? entryDataString = null;

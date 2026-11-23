@@ -13,7 +13,8 @@ namespace AssetStudio
         AesCbc = 2,
         AesEcb = 3,
         AesCtr = 4,
-        ChaCha20 = 5
+        ChaCha20 = 5,
+        Block512 = 6
     }
 
     /// <summary>

@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.Services.ProjectAnalysis;
 
 namespace AssetStudio.Avalonia.ViewModels
 {
@@ -27,7 +28,8 @@ namespace AssetStudio.Avalonia.ViewModels
         int ReadableAssetFileCount,
         int EncryptedFileCount,
         double CoveragePercent,
-        IReadOnlyList<StreamEncryptionBarrier> DetectedBarriers);
+        IReadOnlyList<StreamEncryptionBarrier> DetectedBarriers,
+        IReadOnlyList<DecryptionHintEntry>? CatalogHints = null);
 
     public sealed class DecryptionBarrierSampleItem
     {
@@ -48,6 +50,95 @@ namespace AssetStudio.Avalonia.ViewModels
             : $"{FileName} ({ProviderId}) — {HeaderPrefixHex}";
     }
 
+    public sealed class DetectedAlgorithmCandidateItem : ViewModelBase
+    {
+        private bool _isSelected;
+        private bool _isChecked = true;
+
+        public DetectedAlgorithmCandidateItem(
+            string schemeId,
+            int algorithmIndex,
+            string displayName,
+            double confidence,
+            int matchedFileCount,
+            string filePattern,
+            string evidenceSummary,
+            long suggestedSkipBytes,
+            long suggestedRangeStart,
+            long suggestedRangeLength,
+            int suggestedPaddingIndex,
+            int suggestedIvModeIndex,
+            bool suggestedIvFromPrefix,
+            string? suggestedCatalogPath,
+            Action<DetectedAlgorithmCandidateItem> onSelect)
+        {
+            SchemeId = schemeId;
+            AlgorithmIndex = algorithmIndex;
+            DisplayName = displayName;
+            Confidence = confidence;
+            MatchedFileCount = matchedFileCount;
+            FilePattern = filePattern;
+            EvidenceSummary = evidenceSummary;
+            SuggestedSkipBytes = suggestedSkipBytes;
+            SuggestedRangeStart = suggestedRangeStart;
+            SuggestedRangeLength = suggestedRangeLength;
+            SuggestedPaddingIndex = suggestedPaddingIndex;
+            SuggestedIvModeIndex = suggestedIvModeIndex;
+            SuggestedIvFromPrefix = suggestedIvFromPrefix;
+            SuggestedCatalogPath = suggestedCatalogPath;
+            SelectCommand = new RelayCommand(() => onSelect(this));
+        }
+
+        public string SchemeId { get; }
+        public int AlgorithmIndex { get; }
+        public string DisplayName { get; }
+        public double Confidence { get; }
+        public string ConfidencePercentText => string.Create(CultureInfo.InvariantCulture, $"{Math.Round(Confidence * 100.0):0}%");
+        public int MatchedFileCount { get; }
+        public string FilePattern { get; }
+        public string EvidenceSummary { get; }
+        public long SuggestedSkipBytes { get; }
+        public long SuggestedRangeStart { get; }
+        public long SuggestedRangeLength { get; }
+        public int SuggestedPaddingIndex { get; }
+        public int SuggestedIvModeIndex { get; }
+        public bool SuggestedIvFromPrefix { get; }
+        public string? SuggestedCatalogPath { get; }
+        public bool IsDetected => true;
+
+        public bool IsChecked
+        {
+            get => _isChecked;
+            set => SetProperty(ref _isChecked, value);
+        }
+
+        public bool IsSelected
+        {
+            get => _isSelected;
+            internal set
+            {
+                if (SetProperty(ref _isSelected, value))
+                {
+                    OnPropertyChanged(nameof(ChipLabel));
+                }
+            }
+        }
+
+        public string ChipLabel
+        {
+            get
+            {
+                var marker = IsSelected ? "\u25CF " : string.Empty;
+                var scope = !string.IsNullOrWhiteSpace(FilePattern) ? $" \u00B7 {FilePattern}" : string.Empty;
+                var skip = SuggestedSkipBytes > 0 ? $" \u00B7 +{SuggestedSkipBytes}B" : string.Empty;
+                var range = SuggestedRangeLength > 0 ? $" \u00B7 0x{SuggestedRangeLength:X}B" : string.Empty;
+                return $"{marker}{DisplayName} ({ConfidencePercentText}){scope}{skip}{range}";
+            }
+        }
+
+        public RelayCommand SelectCommand { get; }
+    }
+
     public sealed class DecryptionProfileListItemViewModel : ViewModelBase
     {
         public DecryptionProfileListItemViewModel(DecryptionProfile profile)
@@ -58,7 +149,9 @@ namespace AssetStudio.Avalonia.ViewModels
         public DecryptionProfile Profile { get; }
         public string Id => Profile.Id;
         public string AlgorithmLabel => string.IsNullOrWhiteSpace(Profile.Algorithm)
-            ? (!string.IsNullOrWhiteSpace(Profile.XorKeyHex) ? "xor" : "none")
+            ? (!string.IsNullOrWhiteSpace(Profile.CatalogPath) || !string.IsNullOrWhiteSpace(Profile.Block512Token)
+                ? "block512"
+                : (!string.IsNullOrWhiteSpace(Profile.XorKeyHex) ? "xor" : "none"))
             : Profile.Algorithm!;
         public string PatternLabel => string.IsNullOrWhiteSpace(Profile.FileNamePattern)
             ? (string.IsNullOrWhiteSpace(Profile.PathPattern) ? "*" : Profile.PathPattern!)
@@ -105,6 +198,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private int _selectedDerivedKeyLengthIndex;
         private string _counterStartText = "0";
         private bool _counterLittleEndian;
+        private string _block512CatalogPath = string.Empty;
+        private string _block512Token = string.Empty;
+        private bool _isAdvancedOptionsExpanded;
         private string _validationError = string.Empty;
         private string _statusMessage = string.Empty;
         private string _pluginsSummaryText = string.Empty;
@@ -125,7 +221,8 @@ namespace AssetStudio.Avalonia.ViewModels
                 "AES-ECB",
                 "ChaCha20",
                 "XOR",
-                "Offset Skip (None)"
+                "Offset Skip (None)",
+                "Block 512"
             };
             KeyFormatOptions = new[] { "Hex", "UTF-8 Text" };
             IvModeOptions = new[] { "Hex", "UTF-8 Text", "Read from Stream Prefix", "None (All Zeros)", "Derive from Filename (MD5)" };
@@ -136,6 +233,14 @@ namespace AssetStudio.Avalonia.ViewModels
 
             Profiles = new ObservableCollection<DecryptionProfileListItemViewModel>();
             BarrierSamples = new ObservableCollection<DecryptionBarrierSampleItem>();
+            DetectedAlgorithms = new ObservableCollection<DetectedAlgorithmCandidateItem>();
+
+            var defaultPattern = DeriveFilePatternFromPaths(
+                _context.DetectedBarriers?.Select(static b => b.FilePath));
+            if (!string.IsNullOrWhiteSpace(defaultPattern))
+            {
+                _fileNamePattern = defaultPattern;
+            }
 
             if (_context.DetectedBarriers != null && _context.DetectedBarriers.Count > 0)
             {
@@ -143,22 +248,13 @@ namespace AssetStudio.Avalonia.ViewModels
                 {
                     BarrierSamples.Add(new DecryptionBarrierSampleItem(barrier));
                 }
-
-                var detectedPatterns = _context.DetectedBarriers
-                    .Select(b => Path.GetExtension(b.FilePath))
-                    .Where(ext => !string.IsNullOrWhiteSpace(ext))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Select(ext => "*" + ext)
-                    .ToArray();
-                if (detectedPatterns.Length > 0)
-                {
-                    _fileNamePattern = string.Join(";", detectedPatterns);
-                }
             }
 
             NewProfileCommand = new RelayCommand(ResetEditorForm);
             LoadSelectedProfileCommand = new RelayCommand(LoadSelectedProfileIntoEditor, () => SelectedProfile != null);
             SaveProfileCommand = new RelayCommand(ExecuteSaveProfile);
+            TestKeyCommand = new RelayCommand(ExecuteTestKey);
+            BrowseBlock512CatalogCommand = new AsyncRelayCommand(ExecuteBrowseBlock512CatalogAsync);
             DeleteSelectedProfileCommand = new RelayCommand(ExecuteDeleteSelectedProfile, () => SelectedProfile != null);
             ImportJsonCommand = new AsyncRelayCommand(ExecuteImportJsonAsync);
             OpenProfilesFolderCommand = new AsyncRelayCommand(ExecuteOpenProfilesFolderAsync);
@@ -167,7 +263,14 @@ namespace AssetStudio.Avalonia.ViewModels
             ApplyAndReanalyzeCommand = new RelayCommand(ExecuteApplyAndReanalyze);
             SecondaryCloseCommand = new RelayCommand(ExecuteSecondaryClose);
 
+            PopulateDetectedAlgorithmCandidates(defaultPattern);
+            if (DetectedAlgorithms.Count > 0)
+            {
+                ApplyDetectedCandidate(DetectedAlgorithms[0], preserveUserInputs: false);
+            }
+
             RefreshProfilesAndPluginsList();
+            TryHighlightMatchingExistingProfile();
         }
 
         public event Action<DecryptionKeyDialogResult>? RequestClose;
@@ -182,11 +285,37 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public ObservableCollection<DecryptionProfileListItemViewModel> Profiles { get; }
         public ObservableCollection<DecryptionBarrierSampleItem> BarrierSamples { get; }
+        public ObservableCollection<DetectedAlgorithmCandidateItem> DetectedAlgorithms { get; }
 
         public bool IsInitialLoadPrompt => _context.IsInitialLoadPrompt;
         public bool HasEncryptedFiles => _context.EncryptedFileCount > 0;
         public bool HasBarrierSamples => BarrierSamples.Count > 0;
+        public bool HasDetectedAlgorithms => DetectedAlgorithms.Count > 0;
+        public bool HasMultipleDetectedAlgorithms => DetectedAlgorithms.Count > 1;
         public bool HasProfiles => Profiles.Count > 0;
+
+        public bool IsSelectedAlgorithmAutoDetected =>
+            DetectedAlgorithms.Any(c => c.AlgorithmIndex == _selectedAlgorithmIndex);
+
+        public string DetectedAlgorithmsBannerText
+        {
+            get
+            {
+                if (DetectedAlgorithms.Count == 0)
+                {
+                    return string.Empty;
+                }
+
+                if (DetectedAlgorithms.Count == 1)
+                {
+                    var only = DetectedAlgorithms[0];
+                    return $"Auto-detected 1 candidate: {only.DisplayName} ({only.ConfidencePercentText}) — pre-selected below";
+                }
+
+                var active = DetectedAlgorithms.FirstOrDefault(static c => c.IsSelected) ?? DetectedAlgorithms[0];
+                return $"Auto-detected {DetectedAlgorithms.Count} candidates ({active.DisplayName} pre-selected; click any chip to switch or use Test Key to auto-match)";
+            }
+        }
 
         public string DialogTitle => _context.IsInitialLoadPrompt && HasEncryptedFiles
             ? "Decryption Key Optional — Encrypted Files Detected"
@@ -253,11 +382,17 @@ namespace AssetStudio.Avalonia.ViewModels
             {
                 if (SetProperty(ref _selectedAlgorithmIndex, value))
                 {
+                    SyncSelectedCandidateHighlight();
+                    OnPropertyChanged(nameof(IsBlock512Selected));
                     OnPropertyChanged(nameof(IsKeySectionVisible));
                     OnPropertyChanged(nameof(IsIvSectionVisible));
                     OnPropertyChanged(nameof(IsIvTextInputEnabled));
                     OnPropertyChanged(nameof(IsPaddingVisible));
                     OnPropertyChanged(nameof(IsCtrOptionsVisible));
+                    OnPropertyChanged(nameof(IsKdfSaltVisible));
+                    OnPropertyChanged(nameof(IsKdfLengthVisible));
+                    OnPropertyChanged(nameof(IsSelectedAlgorithmAutoDetected));
+                    OnPropertyChanged(nameof(DetectedAlgorithmsBannerText));
                     ClearFeedback();
                 }
             }
@@ -416,6 +551,36 @@ namespace AssetStudio.Avalonia.ViewModels
             set => SetProperty(ref _counterLittleEndian, value);
         }
 
+        public string Block512CatalogPath
+        {
+            get => _block512CatalogPath;
+            set
+            {
+                if (SetProperty(ref _block512CatalogPath, value ?? string.Empty))
+                {
+                    ClearFeedback();
+                }
+            }
+        }
+
+        public string Block512Token
+        {
+            get => _block512Token;
+            set
+            {
+                if (SetProperty(ref _block512Token, value ?? string.Empty))
+                {
+                    ClearFeedback();
+                }
+            }
+        }
+
+        public bool IsAdvancedOptionsExpanded
+        {
+            get => _isAdvancedOptionsExpanded;
+            set => SetProperty(ref _isAdvancedOptionsExpanded, value);
+        }
+
         public string ValidationError
         {
             get => _validationError;
@@ -444,17 +609,20 @@ namespace AssetStudio.Avalonia.ViewModels
 
         public bool HasStatusMessage => !string.IsNullOrWhiteSpace(_statusMessage);
 
-        public bool IsKeySectionVisible => SelectedAlgorithmIndex != 5;
+        public bool IsBlock512Selected => SelectedAlgorithmIndex == 6;
+        public bool IsKeySectionVisible => SelectedAlgorithmIndex != 5 && !IsBlock512Selected;
         public bool IsIvSectionVisible => SelectedAlgorithmIndex is 0 or 1 or 3;
         public bool IsIvTextInputEnabled => IsIvSectionVisible && SelectedIvModeIndex is 0 or 1;
         public bool IsPaddingVisible => SelectedAlgorithmIndex is 0 or 2;
         public bool IsCtrOptionsVisible => SelectedAlgorithmIndex is 1 or 3;
-        public bool IsKdfSaltVisible => SelectedKdfIndex is 3 or 4;
-        public bool IsKdfLengthVisible => SelectedKdfIndex > 0;
+        public bool IsKdfSaltVisible => IsKeySectionVisible && SelectedKdfIndex is 3 or 4;
+        public bool IsKdfLengthVisible => IsKeySectionVisible && SelectedKdfIndex > 0;
 
         public RelayCommand NewProfileCommand { get; }
         public RelayCommand LoadSelectedProfileCommand { get; }
         public RelayCommand SaveProfileCommand { get; }
+        public RelayCommand TestKeyCommand { get; }
+        public AsyncRelayCommand BrowseBlock512CatalogCommand { get; }
         public RelayCommand DeleteSelectedProfileCommand { get; }
         public AsyncRelayCommand ImportJsonCommand { get; }
         public AsyncRelayCommand OpenProfilesFolderCommand { get; }
@@ -470,6 +638,11 @@ namespace AssetStudio.Avalonia.ViewModels
                 return long.TryParse(SkipBytesText.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var skip) && skip > 0;
             }
 
+            if (IsBlock512Selected)
+            {
+                return !string.IsNullOrWhiteSpace(Block512CatalogPath) || !string.IsNullOrWhiteSpace(Block512Token);
+            }
+
             return !string.IsNullOrWhiteSpace(KeyInput);
         }
 
@@ -477,17 +650,6 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             profile = null;
             error = null;
-
-            string algoName = SelectedAlgorithmIndex switch
-            {
-                0 => "aes-cbc",
-                1 => "aes-ctr",
-                2 => "aes-ecb",
-                3 => "chacha20",
-                4 => "xor",
-                5 => "none",
-                _ => "aes-cbc"
-            };
 
             if (!long.TryParse(string.IsNullOrWhiteSpace(SkipBytesText) ? "0" : SkipBytesText.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var skipBytes) || skipBytes < 0)
             {
@@ -507,6 +669,32 @@ namespace AssetStudio.Avalonia.ViewModels
                 return false;
             }
 
+            return TryBuildProfileForSettings(
+                SelectedAlgorithmIndex,
+                skipBytes,
+                rangeStart,
+                rangeLength,
+                SelectedPaddingIndex,
+                SelectedIvModeIndex,
+                out profile,
+                out error);
+        }
+
+        private bool TryBuildProfileForSettings(
+            int algorithmIndex,
+            long skipBytes,
+            long rangeStart,
+            long rangeLength,
+            int paddingIndex,
+            int ivModeIndex,
+            out DecryptionProfile? profile,
+            out string? error)
+        {
+            profile = null;
+            error = null;
+
+            string algoName = AlgorithmIndexToSchemeId(algorithmIndex);
+
             if (!int.TryParse(string.IsNullOrWhiteSpace(MagicOffsetText) ? "0" : MagicOffsetText.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var magicOffset) || magicOffset < 0)
             {
                 error = "Magic Offset must be a non-negative integer.";
@@ -525,6 +713,12 @@ namespace AssetStudio.Avalonia.ViewModels
                 return false;
             }
 
+            bool isBlock512 = algorithmIndex == 6;
+            bool usesKey = algorithmIndex != 5 && !isBlock512;
+            bool usesIv = algorithmIndex is 0 or 1 or 3;
+            bool usesPadding = algorithmIndex is 0 or 2;
+            bool usesKdfSalt = usesKey && SelectedKdfIndex is 3 or 4;
+
             var candidate = new DecryptionProfile
             {
                 Id = string.IsNullOrWhiteSpace(ProfileId)
@@ -540,12 +734,22 @@ namespace AssetStudio.Avalonia.ViewModels
                 RangeStart = rangeStart,
                 RangeLength = rangeLength,
                 ValidateUnityHeader = ValidateUnityHeader,
-                Padding = IsPaddingVisible && SelectedPaddingIndex == 1 ? "pkcs7" : "none",
+                Padding = usesPadding && paddingIndex == 1 ? "pkcs7" : "none",
                 CounterStart = counterStart,
                 CounterLittleEndian = CounterLittleEndian
             };
 
-            if (IsKeySectionVisible)
+            if (isBlock512)
+            {
+                candidate.CatalogPath = string.IsNullOrWhiteSpace(Block512CatalogPath) ? null : Block512CatalogPath.Trim();
+                candidate.Block512Token = string.IsNullOrWhiteSpace(Block512Token) ? null : Block512Token.Trim();
+                if (candidate.SkipBytes == 0)
+                {
+                    candidate.SkipBytes = 26;
+                }
+            }
+
+            if (usesKey)
             {
                 if (SelectedKeyFormatIndex == 0)
                 {
@@ -575,7 +779,7 @@ namespace AssetStudio.Avalonia.ViewModels
                         3 => 32,
                         _ => 0
                     };
-                    if (IsKdfSaltVisible && !string.IsNullOrEmpty(SaltInput))
+                    if (usesKdfSalt && !string.IsNullOrEmpty(SaltInput))
                     {
                         if (SelectedSaltFormatIndex == 1)
                         {
@@ -589,14 +793,14 @@ namespace AssetStudio.Avalonia.ViewModels
                 }
             }
 
-            if (IsIvSectionVisible)
+            if (usesIv)
             {
-                switch (SelectedIvModeIndex)
+                switch (ivModeIndex)
                 {
                     case 0:
                         if (!string.IsNullOrWhiteSpace(IvInput))
                         {
-                            if (SelectedAlgorithmIndex == 3)
+                            if (algorithmIndex == 3)
                             {
                                 candidate.NonceHex = IvInput.Trim();
                             }
@@ -671,6 +875,12 @@ namespace AssetStudio.Avalonia.ViewModels
             SelectedDerivedKeyLengthIndex = 0;
             CounterStartText = "0";
             CounterLittleEndian = false;
+            Block512CatalogPath = string.Empty;
+            Block512Token = string.Empty;
+            IsAdvancedOptionsExpanded = false;
+            SyncSelectedCandidateHighlight();
+            OnPropertyChanged(nameof(IsSelectedAlgorithmAutoDetected));
+            OnPropertyChanged(nameof(DetectedAlgorithmsBannerText));
             ClearFeedback();
         }
 
@@ -701,8 +911,12 @@ namespace AssetStudio.Avalonia.ViewModels
                 StreamCipherAlgorithm.ChaCha20 => 3,
                 StreamCipherAlgorithm.Xor => 4,
                 StreamCipherAlgorithm.None => 5,
+                StreamCipherAlgorithm.Block512 => 6,
                 _ => 0
             };
+
+            Block512CatalogPath = p.CatalogPath ?? string.Empty;
+            Block512Token = p.Block512Token ?? string.Empty;
 
             if (!string.IsNullOrWhiteSpace(p.KeyHex))
             {
@@ -950,6 +1164,546 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             ValidationError = string.Empty;
             StatusMessage = string.Empty;
+        }
+
+        private sealed class CandidateAccumulator
+        {
+            public CandidateAccumulator(DetectedCipherCandidate initial, int algorithmIndex)
+            {
+                BestCandidate = initial;
+                AlgorithmIndex = algorithmIndex;
+            }
+
+            public DetectedCipherCandidate BestCandidate { get; set; }
+            public int AlgorithmIndex { get; }
+            public HashSet<string> MatchedFilePaths { get; } = new(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> PrimaryVariantFilePaths { get; } = new(StringComparer.OrdinalIgnoreCase);
+            public string? SuggestedCatalogPath { get; set; }
+            public int HitCount { get; set; }
+        }
+
+        private void PopulateDetectedAlgorithmCandidates(string defaultBarrierPattern)
+        {
+            DetectedAlgorithms.Clear();
+
+            var accumulators = new Dictionary<string, CandidateAccumulator>(StringComparer.OrdinalIgnoreCase);
+
+            void RecordCandidate(DetectedCipherCandidate candidate, string? sourceFilePath, string? catalogPath)
+            {
+                int algoIndex = SchemeIdToAlgorithmIndex(candidate.SchemeId);
+                if (algoIndex < 0)
+                {
+                    return;
+                }
+
+                if (!accumulators.TryGetValue(candidate.SchemeId, out var acc))
+                {
+                    acc = new CandidateAccumulator(candidate, algoIndex);
+                    accumulators[candidate.SchemeId] = acc;
+                }
+                else
+                {
+                    bool replaceBest = candidate.Confidence > acc.BestCandidate.Confidence
+                        || (Math.Abs(candidate.Confidence - acc.BestCandidate.Confidence) < 0.0001
+                            && HasMoreSpecificStructure(candidate, acc.BestCandidate));
+                    if (replaceBest)
+                    {
+                        acc.BestCandidate = candidate;
+                        acc.PrimaryVariantFilePaths.Clear();
+                    }
+                }
+
+                acc.HitCount++;
+                if (!string.IsNullOrWhiteSpace(sourceFilePath))
+                {
+                    acc.MatchedFilePaths.Add(sourceFilePath);
+                    if (candidate.SuggestedSkipBytes == acc.BestCandidate.SuggestedSkipBytes
+                        && candidate.SuggestedRangeStart == acc.BestCandidate.SuggestedRangeStart
+                        && candidate.SuggestedRangeLength == acc.BestCandidate.SuggestedRangeLength)
+                    {
+                        acc.PrimaryVariantFilePaths.Add(sourceFilePath);
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(acc.SuggestedCatalogPath)
+                    && !string.IsNullOrWhiteSpace(catalogPath)
+                    && File.Exists(catalogPath))
+                {
+                    acc.SuggestedCatalogPath = catalogPath;
+                }
+            }
+
+            var hasFileBarriers = _context.DetectedBarriers != null && _context.DetectedBarriers.Count > 0;
+            if (hasFileBarriers)
+            {
+                foreach (var barrier in _context.DetectedBarriers!)
+                {
+                    var barrierCandidates = barrier.CandidateAlgorithms;
+                    if (barrierCandidates == null || barrierCandidates.Count == 0)
+                    {
+                        barrierCandidates = AnalyzeBarrierFallback(barrier);
+                    }
+
+                    if (barrierCandidates != null)
+                    {
+                        foreach (var candidate in barrierCandidates)
+                        {
+                            RecordCandidate(candidate, barrier.FilePath, catalogPath: null);
+                        }
+                    }
+                }
+            }
+
+            if (_context.CatalogHints != null && _context.CatalogHints.Count > 0)
+            {
+                bool anyExplicitCatalogHint = false;
+                foreach (var hint in _context.CatalogHints)
+                {
+                    var explicitCandidates = UnityHeaderProbe.AnalyzeExplicitProviderHint(hint.Provider, hint.Reason);
+                    if (explicitCandidates.Count > 0)
+                    {
+                        anyExplicitCatalogHint = true;
+                        var sourcePath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : null;
+                        foreach (var candidate in explicitCandidates)
+                        {
+                            RecordCandidate(candidate, sourcePath, hint.CatalogPath);
+                        }
+                    }
+                }
+
+                if (!hasFileBarriers && !anyExplicitCatalogHint)
+                {
+                    foreach (var hint in _context.CatalogHints)
+                    {
+                        var sourcePath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : hint.CatalogPath;
+                        var fallbackCandidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                            ReadOnlySpan<byte>.Empty,
+                            totalStreamLength: 0,
+                            filePath: sourcePath,
+                            providerHint: hint.Provider,
+                            reasonHint: hint.Reason);
+                        foreach (var candidate in fallbackCandidates)
+                        {
+                            RecordCandidate(candidate, !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : null, hint.CatalogPath);
+                        }
+                    }
+                }
+            }
+
+            var ordered = accumulators.Values
+                .OrderByDescending(static a => a.BestCandidate.Confidence)
+                .ThenByDescending(static a => Math.Max(a.MatchedFilePaths.Count, a.HitCount))
+                .ThenBy(static a => a.AlgorithmIndex)
+                .ToList();
+
+            foreach (var acc in ordered)
+            {
+                var best = acc.BestCandidate;
+                var patternPaths = acc.PrimaryVariantFilePaths.Count > 0
+                    ? acc.PrimaryVariantFilePaths
+                    : acc.MatchedFilePaths;
+                var candidatePattern = DeriveFilePatternFromPaths(patternPaths);
+                if (string.IsNullOrWhiteSpace(candidatePattern))
+                {
+                    candidatePattern = defaultBarrierPattern;
+                }
+
+                int suggestedPaddingIndex = best.SuggestedPkcs7.HasValue
+                    ? (best.SuggestedPkcs7.Value ? 1 : 0)
+                    : -1;
+                int suggestedIvModeIndex = best.SuggestedIvFromPrefix ? 2 : -1;
+
+                var item = new DetectedAlgorithmCandidateItem(
+                    schemeId: best.SchemeId,
+                    algorithmIndex: acc.AlgorithmIndex,
+                    displayName: best.DisplayName,
+                    confidence: best.Confidence,
+                    matchedFileCount: Math.Max(acc.MatchedFilePaths.Count, 1),
+                    filePattern: candidatePattern,
+                    evidenceSummary: best.Evidence,
+                    suggestedSkipBytes: best.SuggestedSkipBytes,
+                    suggestedRangeStart: best.SuggestedRangeStart,
+                    suggestedRangeLength: best.SuggestedRangeLength,
+                    suggestedPaddingIndex: suggestedPaddingIndex,
+                    suggestedIvModeIndex: suggestedIvModeIndex,
+                    suggestedIvFromPrefix: best.SuggestedIvFromPrefix,
+                    suggestedCatalogPath: acc.SuggestedCatalogPath,
+                    onSelect: selected => ApplyDetectedCandidate(selected, preserveUserInputs: true));
+
+                DetectedAlgorithms.Add(item);
+            }
+
+            OnPropertyChanged(nameof(HasDetectedAlgorithms));
+            OnPropertyChanged(nameof(HasMultipleDetectedAlgorithms));
+            OnPropertyChanged(nameof(IsSelectedAlgorithmAutoDetected));
+            OnPropertyChanged(nameof(DetectedAlgorithmsBannerText));
+        }
+
+        private static IReadOnlyList<DetectedCipherCandidate> AnalyzeBarrierFallback(StreamEncryptionBarrier barrier)
+        {
+            if (!string.IsNullOrWhiteSpace(barrier.FilePath) && File.Exists(barrier.FilePath))
+            {
+                try
+                {
+                    using var fs = new FileStream(barrier.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    int probeLen = (int)Math.Min(UnityHeaderProbe.DefaultProbeBufferSize, fs.Length);
+                    if (probeLen >= 26)
+                    {
+                        var buf = new byte[probeLen];
+                        int read = 0;
+                        while (read < probeLen)
+                        {
+                            int n = fs.Read(buf, read, probeLen - read);
+                            if (n <= 0) break;
+                            read += n;
+                        }
+
+                        return UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                            buf.AsSpan(0, read),
+                            fs.Length,
+                            barrier.FilePath,
+                            barrier.ProviderId,
+                            barrier.Reason);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                ReadOnlySpan<byte>.Empty,
+                totalStreamLength: 0,
+                filePath: barrier.FilePath,
+                providerHint: barrier.ProviderId,
+                reasonHint: barrier.Reason);
+        }
+
+        private void ApplyDetectedCandidate(DetectedAlgorithmCandidateItem candidate, bool preserveUserInputs)
+        {
+            if (candidate == null)
+            {
+                return;
+            }
+
+            SelectedAlgorithmIndex = candidate.AlgorithmIndex;
+            if (!string.IsNullOrWhiteSpace(candidate.FilePattern))
+            {
+                FileNamePattern = candidate.FilePattern;
+            }
+
+            SkipBytesText = candidate.SuggestedSkipBytes.ToString(CultureInfo.InvariantCulture);
+            RangeStartText = candidate.SuggestedRangeStart.ToString(CultureInfo.InvariantCulture);
+            RangeLengthText = candidate.SuggestedRangeLength.ToString(CultureInfo.InvariantCulture);
+
+            if (candidate.SuggestedPaddingIndex >= 0)
+            {
+                SelectedPaddingIndex = candidate.SuggestedPaddingIndex;
+            }
+            else if (!preserveUserInputs)
+            {
+                SelectedPaddingIndex = 0;
+            }
+
+            if (candidate.SuggestedIvModeIndex >= 0)
+            {
+                SelectedIvModeIndex = candidate.SuggestedIvModeIndex;
+            }
+            else if (!preserveUserInputs)
+            {
+                SelectedIvModeIndex = 0;
+            }
+
+            if (candidate.AlgorithmIndex == 6
+                && !string.IsNullOrWhiteSpace(candidate.SuggestedCatalogPath)
+                && string.IsNullOrWhiteSpace(Block512CatalogPath))
+            {
+                Block512CatalogPath = candidate.SuggestedCatalogPath;
+            }
+
+            if ((candidate.AlgorithmIndex != 6 && candidate.SuggestedSkipBytes > 0)
+                || candidate.SuggestedRangeStart > 0
+                || candidate.SuggestedRangeLength > 0)
+            {
+                IsAdvancedOptionsExpanded = true;
+            }
+
+            SyncSelectedCandidateHighlight(candidate);
+            OnPropertyChanged(nameof(IsSelectedAlgorithmAutoDetected));
+            OnPropertyChanged(nameof(DetectedAlgorithmsBannerText));
+        }
+
+        private void SyncSelectedCandidateHighlight(DetectedAlgorithmCandidateItem? explicitSelected = null)
+        {
+            for (int i = 0; i < DetectedAlgorithms.Count; i++)
+            {
+                var item = DetectedAlgorithms[i];
+                item.IsSelected = explicitSelected != null
+                    ? ReferenceEquals(item, explicitSelected)
+                    : item.AlgorithmIndex == _selectedAlgorithmIndex;
+            }
+        }
+
+        private void TryHighlightMatchingExistingProfile()
+        {
+            if (Profiles.Count == 0 || DetectedAlgorithms.Count == 0)
+            {
+                return;
+            }
+
+            var primary = DetectedAlgorithms[0];
+            foreach (var item in Profiles)
+            {
+                if (!item.Profile.Enabled)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var algo = item.Profile.ResolveAlgorithm();
+                    int idx = algo switch
+                    {
+                        StreamCipherAlgorithm.AesCbc => 0,
+                        StreamCipherAlgorithm.AesCtr => 1,
+                        StreamCipherAlgorithm.AesEcb => 2,
+                        StreamCipherAlgorithm.ChaCha20 => 3,
+                        StreamCipherAlgorithm.Xor => 4,
+                        StreamCipherAlgorithm.None => 5,
+                        StreamCipherAlgorithm.Block512 => 6,
+                        _ => -1
+                    };
+                    if (idx == primary.AlgorithmIndex)
+                    {
+                        SelectedProfile = item;
+                        return;
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private async Task ExecuteBrowseBlock512CatalogAsync()
+        {
+            if (_dialogService == null)
+            {
+                return;
+            }
+
+            var files = await _dialogService.PickOpenFilesAsync(new FilePickerRequest(
+                title: "Select Addressables Catalog (JSON or BIN)",
+                allowMultiple: false,
+                suggestedStartDirectory: _context.ProjectRoot,
+                fileTypeFilters: new[]
+                {
+                    new FileTypeFilterSpec("Addressables Catalogs", "*.json", "*.bin")
+                }));
+
+            if (files.Count > 0 && !string.IsNullOrWhiteSpace(files[0]))
+            {
+                Block512CatalogPath = files[0];
+            }
+        }
+
+        private void ExecuteTestKey()
+        {
+            ClearFeedback();
+
+            var sampleFiles = (_context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
+                .Where(static b => !string.IsNullOrWhiteSpace(b.FilePath) && File.Exists(b.FilePath))
+                .Select(static b => b.FilePath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(4)
+                .ToArray();
+
+            if (sampleFiles.Length == 0)
+            {
+                if (!TryBuildProfileFromEditor(out _, out var syntaxError))
+                {
+                    ValidationError = syntaxError ?? "Invalid decryption profile.";
+                    return;
+                }
+
+                StatusMessage = "Parameters are valid. No accessible sample encrypted file on disk to test against — click Apply & Re-analyze to test on load.";
+                return;
+            }
+
+            int testedAttempts = 0;
+
+            // 1. Test the currently selected algorithm first
+            bool currentValid = TryBuildProfileFromEditor(out var currentProfile, out var currentError);
+            if (currentValid && currentProfile != null)
+            {
+                testedAttempts++;
+                foreach (var sampleFile in sampleFiles)
+                {
+                    if (DecryptionHelper.TryTestProfileOnFile(currentProfile, sampleFile, out var unlockedHeader))
+                    {
+                        StatusMessage = $"Key verified! Unlocked '{Path.GetFileName(sampleFile)}' as {unlockedHeader} using {AlgorithmOptions[SelectedAlgorithmIndex]}.";
+                        return;
+                    }
+                }
+
+                // If IV was left blank in Hex mode for AES-CBC/AES-CTR/ChaCha20, also probe stream-prefix IV
+                if (SelectedAlgorithmIndex is 0 or 1 or 3
+                    && SelectedIvModeIndex == 0
+                    && string.IsNullOrWhiteSpace(IvInput))
+                {
+                    var prefixProbe = currentProfile.Clone();
+                    prefixProbe.IvFromStreamPrefix = true;
+                    foreach (var sampleFile in sampleFiles)
+                    {
+                        if (DecryptionHelper.TryTestProfileOnFile(prefixProbe, sampleFile, out var unlockedHeader))
+                        {
+                            SelectedIvModeIndex = 2; // Read from Stream Prefix
+                            StatusMessage = $"Key verified (auto-enabled Stream Prefix IV)! Unlocked '{Path.GetFileName(sampleFile)}' as {unlockedHeader} using {AlgorithmOptions[SelectedAlgorithmIndex]}.";
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // 2. Automatically test remaining checked detected candidates and switch to the winning algorithm
+            var otherCandidates = DetectedAlgorithms
+                .Where(c => c.IsChecked && c.AlgorithmIndex != SelectedAlgorithmIndex)
+                .ToList();
+
+            foreach (var candidate in otherCandidates)
+            {
+                int trialPadding = candidate.SuggestedPaddingIndex >= 0
+                    ? candidate.SuggestedPaddingIndex
+                    : SelectedPaddingIndex;
+                int trialIvMode = candidate.SuggestedIvModeIndex >= 0
+                    ? candidate.SuggestedIvModeIndex
+                    : SelectedIvModeIndex;
+
+                if (!TryBuildProfileForSettings(
+                    candidate.AlgorithmIndex,
+                    candidate.SuggestedSkipBytes,
+                    candidate.SuggestedRangeStart,
+                    candidate.SuggestedRangeLength,
+                    trialPadding,
+                    trialIvMode,
+                    out var trialProfile,
+                    out _) || trialProfile == null)
+                {
+                    continue;
+                }
+
+                testedAttempts++;
+                foreach (var sampleFile in sampleFiles)
+                {
+                    if (DecryptionHelper.TryTestProfileOnFile(trialProfile, sampleFile, out var winnerHeader))
+                    {
+                        ApplyDetectedCandidate(candidate, preserveUserInputs: true);
+                        StatusMessage = $"Auto-selected {candidate.DisplayName}! Key verified on '{Path.GetFileName(sampleFile)}' ({winnerHeader}).";
+                        return;
+                    }
+                }
+
+                if (candidate.AlgorithmIndex is 0 or 1 or 3
+                    && trialIvMode == 0
+                    && string.IsNullOrWhiteSpace(IvInput))
+                {
+                    var prefixTrial = trialProfile.Clone();
+                    prefixTrial.IvFromStreamPrefix = true;
+                    foreach (var sampleFile in sampleFiles)
+                    {
+                        if (DecryptionHelper.TryTestProfileOnFile(prefixTrial, sampleFile, out var winnerHeader))
+                        {
+                            ApplyDetectedCandidate(candidate, preserveUserInputs: true);
+                            SelectedIvModeIndex = 2;
+                            StatusMessage = $"Auto-selected {candidate.DisplayName} (Stream Prefix IV)! Key verified on '{Path.GetFileName(sampleFile)}' ({winnerHeader}).";
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (!currentValid && !string.IsNullOrWhiteSpace(currentError))
+            {
+                ValidationError = currentError;
+                return;
+            }
+
+            ValidationError = $"Key did not unlock a valid Unity header on '{Path.GetFileName(sampleFiles[0])}' (tested {Math.Max(1, testedAttempts)} algorithm(s)). Check key, IV/nonce, range, or padding.";
+        }
+
+        private static bool HasMoreSpecificStructure(DetectedCipherCandidate candidate, DetectedCipherCandidate existing)
+        {
+            int Score(DetectedCipherCandidate c)
+                => (c.SuggestedSkipBytes > 0 ? 1 : 0)
+                   + (c.SuggestedRangeLength > 0 ? 2 : 0)
+                   + (c.SuggestedRangeStart > 0 ? 1 : 0)
+                   + (c.SuggestedIvFromPrefix ? 1 : 0);
+
+            return Score(candidate) > Score(existing);
+        }
+
+        private static string DeriveFilePatternFromPaths(IEnumerable<string>? paths)
+        {
+            if (paths == null)
+            {
+                return string.Empty;
+            }
+
+            var patterns = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var rawPath in paths)
+            {
+                if (string.IsNullOrWhiteSpace(rawPath))
+                {
+                    continue;
+                }
+
+                var fileName = Path.GetFileName(rawPath.Replace('\\', '/'));
+                if (string.IsNullOrWhiteSpace(fileName))
+                {
+                    continue;
+                }
+
+                var ext = Path.GetExtension(fileName);
+                string pattern = !string.IsNullOrWhiteSpace(ext) ? "*" + ext : fileName;
+                if (seen.Add(pattern))
+                {
+                    patterns.Add(pattern);
+                }
+            }
+
+            return string.Join(";", patterns);
+        }
+
+        private static int SchemeIdToAlgorithmIndex(string? schemeId)
+        {
+            return (schemeId ?? string.Empty).Trim().ToLowerInvariant() switch
+            {
+                "aes-cbc" => 0,
+                "aes-ctr" => 1,
+                "aes-ecb" => 2,
+                "chacha20" => 3,
+                "xor" => 4,
+                "none" => 5,
+                "block512" => 6,
+                _ => -1
+            };
+        }
+
+        private static string AlgorithmIndexToSchemeId(int algorithmIndex)
+        {
+            return algorithmIndex switch
+            {
+                0 => "aes-cbc",
+                1 => "aes-ctr",
+                2 => "aes-ecb",
+                3 => "chacha20",
+                4 => "xor",
+                5 => "none",
+                6 => "block512",
+                _ => "aes-cbc"
+            };
         }
     }
 }
