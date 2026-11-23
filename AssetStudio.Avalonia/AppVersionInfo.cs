@@ -8,7 +8,7 @@ namespace AssetStudio.Avalonia;
 /// </summary>
 internal static class AppVersionInfo
 {
-    public const string FallbackVersion = "0.19.0";
+    public const string FallbackVersion = "0.20.0";
 
     public static string Version => GetVersion(typeof(AppVersionInfo).Assembly);
 

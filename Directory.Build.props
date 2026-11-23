@@ -13,7 +13,7 @@
         3. Highest of (latest reachable git v* release tag, DefaultReleaseVersion)
     -->
     <Version>0.17.1</Version>
-    <DefaultReleaseVersion>0.19.0</DefaultReleaseVersion>
+    <DefaultReleaseVersion>0.20.0</DefaultReleaseVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <ReleaseVersion Condition="'$(ReleaseVersion)' == ''">$(RELEASE_VERSION)</ReleaseVersion>

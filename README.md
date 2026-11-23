@@ -10,6 +10,8 @@ This update is an independent community maintenance effort. Its purpose is to ke
 
 AssetStudio is a tool for exploring, extracting and exporting assets and AssetBundles.
 
+For a plain-language overview of what is currently supported, known limits, and features still under study, see [`SUPPORTED_FEATURES.md`](SUPPORTED_FEATURES.md).
+
 ## Features
 
 * Supported Unity versions:
@@ -19,14 +21,14 @@ AssetStudio is a tool for exploring, extracting and exporting assets and AssetBu
   * **Sprite**: crop `Texture2D` / `SpriteAtlas` to `png`, `tga`, `jpeg`, `bmp`.
   * **AudioClip**: export to `wav`, `ogg`, `mp3`, `m4a`, `fsb` (including FSB5 Vorbis decoding), with audio playback preview.
   * **Font**: export `ttf`, `otf`; preview embedded fonts, bitmap font atlases, and TextMeshPro font atlases.
-  * **Mesh, Avatar, Animator & AnimationClip**: export to `glb`, `gltf`, `fbx`, `obj`, and Unity `.anim` / `.meta`; 3D OpenGL preview with textures, skeleton overlay, multi-part model groups, animation playback, and direct export from the preview panel.
+  * **Mesh, Avatar, Animator & AnimationClip**: export to `glb`, `gltf`, `fbx`, `obj`, and Unity `.anim` / `.meta`; 3D OpenGL preview with textures, skeleton overlay, multi-part model groups, synchronized animation playback with frame scrubber, batch animation export, and direct export from the preview panel.
   * **TextAsset**: text viewer plus detection, preview, and export for common embedded video, audio, image, font, and binary formats.
   * **Shader & Material**: ShaderLab export, plus Direct3D 11 shader and material preview on Windows.
   * **MovieTexture & VideoClip**: video playback preview and export.
-  * **MonoBehaviour**: export to `json`.
+  * **MonoBehaviour & GameObject**: searchable tree and JSON viewer with clickable asset links, Scene Hierarchy GameObject component inspector, and export to `json`.
 * Cross-Platform Support (Windows & Linux):
   * **AssetStudio.Avalonia**
-  * Avalonia UI frontend on .NET 10 with Project Manager, Scene Hierarchy search & check propagation, Asset List sorting & filters, Asset Classes explorer, Preview / Dump / References tabs, Log Viewer, and saved settings.
+  * Avalonia UI frontend on .NET 10 with Light/Dark theme, Project Manager, Scene Hierarchy search & GameObject inspector, Asset List sorting & filters, Asset Classes explorer, Preview / Dump / References tabs with Back/Forward navigation, Log Viewer, and saved settings.
 
 ## Requirements
 
