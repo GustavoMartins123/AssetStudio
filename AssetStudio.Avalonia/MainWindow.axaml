@@ -1241,7 +1241,7 @@
                             </Grid>
                         </Grid>
                     </Border>
-                    <!-- Phase 2: Integrated Script Decompiler (Mono ILSpy + IL2CPP global-metadata / dump.cs / script.json + Ghidra Export) -->
+                    <!-- Integrated Script Viewer (Mono / IL2CPP / TypeTree / Ghidra Export) -->
                     <Border x:Name="ScriptTabContent"
                             Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
                             IsVisible="{Binding PreviewSession.IsScriptTabActive}">
@@ -1300,7 +1300,7 @@
                                                 Content="Scripts Folder..."
                                                 Margin="0,0,0,4"
                                                 Command="{Binding SelectScriptsFolderCommand}"
-                                                ToolTip.Tip="Override auto-discovery with a custom Mono Managed/ or Il2CppDumper folder (dump.cs, script.json, DummyDll)" />
+                                                ToolTip.Tip="Override auto-discovery by selecting a custom folder containing script assemblies or IL2CPP dump files" />
                                     </WrapPanel>
                                 </StackPanel>
                             </Border>

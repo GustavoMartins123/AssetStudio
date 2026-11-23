@@ -16,7 +16,8 @@ public enum ScriptSourceKind
     Il2CppDummyAssemblyDecompiled = 3,
     Il2CppScriptJsonOutline = 4,
     Unavailable = 5,
-    Il2CppGlobalMetadata = 6
+    Il2CppGlobalMetadata = 6,
+    UnityTypeTree = 7
 }
 
 public sealed class ScriptMethodSymbol
@@ -51,6 +52,8 @@ public sealed class ScriptLookupRequest
     public string? GlobalMetadataPath { get; init; }
     public string? ProjectAnalysisCacheDirectory { get; init; }
     public UnityScriptingBackend ScriptingBackend { get; init; } = UnityScriptingBackend.Unknown;
+    public TypeTree? FallbackTypeTree { get; init; }
+    public string? FallbackTypeTreeSourceFile { get; init; }
 
     public string FullTypeName =>
         !string.IsNullOrWhiteSpace(Namespace) && !string.IsNullOrWhiteSpace(ClassName)
@@ -100,7 +103,6 @@ public sealed class ScriptDecompilationResult
     public static string BuildMetadataStub(ScriptLookupRequest request, string reason)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("// AssetStudio Script Viewer");
         if (!string.IsNullOrWhiteSpace(request.AssemblyName))
         {
             sb.AppendLine($"// Assembly: {request.AssemblyName}");
@@ -111,7 +113,7 @@ public sealed class ScriptDecompilationResult
         }
         if (!string.IsNullOrWhiteSpace(request.ClassName))
         {
-            sb.AppendLine($"// Class: {request.ClassName}");
+            sb.AppendLine($"// Type: {request.ClassName}");
         }
         sb.AppendLine($"// Status: {reason}");
         sb.AppendLine();
@@ -123,8 +125,7 @@ public sealed class ScriptDecompilationResult
             sb.AppendLine("{");
             sb.AppendLine($"    public partial class {safeClassName}");
             sb.AppendLine("    {");
-            sb.AppendLine("        // Source assembly or IL2CPP metadata was not found.");
-            sb.AppendLine("        // Use 'Scripts Folder...' for Managed/ or Il2CppDumper output.");
+            sb.AppendLine("        // Script source is not available in the loaded project.");
             sb.AppendLine("    }");
             sb.AppendLine("}");
         }
@@ -132,8 +133,7 @@ public sealed class ScriptDecompilationResult
         {
             sb.AppendLine($"public partial class {safeClassName}");
             sb.AppendLine("{");
-            sb.AppendLine("    // Source assembly or IL2CPP metadata was not found.");
-            sb.AppendLine("    // Use 'Scripts Folder...' for Managed/ or Il2CppDumper output.");
+            sb.AppendLine("    // Script source is not available in the loaded project.");
             sb.AppendLine("}");
         }
 

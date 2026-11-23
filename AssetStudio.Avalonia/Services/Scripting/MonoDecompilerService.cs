@@ -231,17 +231,15 @@ public sealed class MonoDecompilerService : IDisposable
             : ScriptSourceKind.MonoAssemblyDecompiled;
         var backendBadge = isIl2CppDummy
             ? "IL2CPP (Dummy DLL)"
-            : "Mono (ILSpy)";
+            : "Mono";
 
         var displayTitle = !string.IsNullOrWhiteSpace(matchedType.Namespace)
             ? $"{matchedType.Namespace}.{matchedType.Name}"
             : matchedType.Name;
 
         var header = new StringBuilder();
-        header.AppendLine($"// Decompiled by AssetStudio using ICSharpCode.Decompiler (ILSpy)");
         header.AppendLine($"// Assembly: {actualAssemblyName}");
         header.AppendLine($"// Type: {matchedType.FullName}");
-        header.AppendLine($"// Backend: {backendBadge}");
         header.AppendLine();
         header.Append(decompiled.TrimEnd());
 
@@ -261,7 +259,7 @@ public sealed class MonoDecompilerService : IDisposable
             SourceCode = fullCode,
             SummaryText = $"{actualAssemblyName} • {lineCount:N0} lines • {backendBadge}",
             DiagnosticMessage = isIl2CppDummy
-                ? "Showing type layout reconstructed from IL2CPP DummyDll (method bodies are compiled natively in GameAssembly; use dump.cs / script.json + Export Ghidra for native RVAs)."
+                ? "Showing type layout from IL2CPP stub assembly (method implementations are compiled to native code)."
                 : string.Empty
         };
     }

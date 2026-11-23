@@ -46,8 +46,10 @@ namespace AssetStudio.Tests
                 Assert.NotNull(result);
                 Assert.True(result!.Success);
                 Assert.Equal(ScriptSourceKind.MonoAssemblyDecompiled, result.SourceKind);
-                Assert.Equal("Mono (ILSpy)", result.BackendBadge);
+                Assert.Equal("Mono", result.BackendBadge);
                 Assert.Equal("AssetStudio.MonoScript", result.Title);
+                Assert.DoesNotContain("ICSharpCode.Decompiler", result.SourceCode, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("ILSpy", result.SourceCode, StringComparison.OrdinalIgnoreCase);
                 Assert.Contains("class MonoScript", result.SourceCode, StringComparison.Ordinal);
                 Assert.Contains("m_ClassName", result.SourceCode, StringComparison.Ordinal);
                 Assert.Contains("m_Namespace", result.SourceCode, StringComparison.Ordinal);
@@ -247,7 +249,7 @@ public class GenericInventory<T> // TypeDefIndex: 4211
 
                 Assert.False(unavailable.Success);
                 Assert.Equal(ScriptSourceKind.Unavailable, unavailable.SourceKind);
-                Assert.Contains("Il2CppDumper", unavailable.DiagnosticMessage, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("Scripts Folder...", unavailable.DiagnosticMessage, StringComparison.OrdinalIgnoreCase);
                 Assert.Contains("class HeroBehaviour", unavailable.SourceCode, StringComparison.Ordinal);
 
                 // 2) DummyDll folder (detected by folder name / Il2CppDummyDll.dll marker)
@@ -423,13 +425,13 @@ namespace Demo
             {
                 Success = true,
                 SourceKind = ScriptSourceKind.MonoAssemblyDecompiled,
-                BackendBadge = "Mono (ILSpy)",
+                BackendBadge = "Mono",
                 Title = "Game.Player",
                 AssemblyName = "Assembly-CSharp.dll",
                 Namespace = "Game",
                 ClassName = "Player",
                 SourceCode = "public class Player\n{\n    public int Health;\n}",
-                SummaryText = "Assembly-CSharp.dll • 4 lines • Mono (ILSpy)"
+                SummaryText = "Assembly-CSharp.dll • 4 lines • Mono"
             };
 
             Assert.False(session.CompleteScriptRequest(req1, sampleResult));
@@ -438,7 +440,7 @@ namespace Demo
             Assert.True(session.CanSaveOrCopyScript);
             Assert.True(vm.CopyScriptCodeCommand.CanExecute());
             Assert.True(vm.SaveScriptCodeCommand.CanExecute());
-            Assert.Equal("Mono (ILSpy)", session.ScriptBackendBadge);
+            Assert.Equal("Mono", session.ScriptBackendBadge);
             Assert.True(session.HasScriptBackendBadge);
 
             // Search updates match summary and filter-only display
@@ -586,7 +588,7 @@ namespace Demo
                 Assert.Equal($"IL2CPP (metadata v{metadataVersion})", classResult.BackendBadge);
                 Assert.Equal("Demo.Gameplay.InventoryBag`1", classResult.Title);
                 Assert.Equal("Assembly-CSharp.dll", classResult.AssemblyName);
-                Assert.Contains($"global-metadata.dat (v{metadataVersion})", classResult.SourceCode, StringComparison.Ordinal);
+                Assert.Contains($"IL2CPP Metadata v{metadataVersion}", classResult.SourceCode, StringComparison.Ordinal);
                 Assert.Contains("namespace Demo.Gameplay", classResult.SourceCode, StringComparison.Ordinal);
                 Assert.Contains("public class InventoryBag<TItem> : BaseController", classResult.SourceCode, StringComparison.Ordinal);
                 Assert.Contains("Capacity;", classResult.SourceCode, StringComparison.Ordinal);
@@ -756,6 +758,191 @@ namespace Demo
                 Assert.True(dumpPreferred.Success);
                 Assert.Equal(ScriptSourceKind.Il2CppDumpCs, dumpPreferred.SourceKind);
                 Assert.Contains("FromDump", dumpPreferred.SourceCode, StringComparison.Ordinal);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void Il2CppMetadataReader_AutoUnmasksShiftedAndRepeatingXorMetadata_WithoutHardcodedKeys()
+        {
+            var tempRoot = CreateTempDirectory();
+            try
+            {
+                var plainPath = Path.Combine(tempRoot, "plain.dat");
+                WriteSyntheticIl2CppMetadata(plainPath, version: 31);
+                var plainBytes = File.ReadAllBytes(plainPath);
+                var headerSize = BinaryPrimitives.ReadInt32LittleEndian(plainBytes.AsSpan(8, 4));
+
+                // Construct a synthetic shifted (+25 bytes) + repeating 16-byte XOR-masked metadata file
+                const int extraPrefixLen = 25;
+                var syntheticMask = new byte[]
+                {
+                    0x5A, 0xC3, 0x19, 0x8E, 0x42, 0xF1, 0x77, 0x2D,
+                    0xB4, 0x61, 0x0E, 0x9C, 0x35, 0xD8, 0x83, 0x4F
+                };
+
+                var bodyLen = plainBytes.Length - headerSize;
+                var obfuscated = new byte[headerSize + extraPrefixLen + bodyLen];
+                Buffer.BlockCopy(plainBytes, 0, obfuscated, 0, headerSize);
+                for (var i = 0; i < extraPrefixLen; i++)
+                {
+                    obfuscated[headerSize + i] = (byte)(0xA0 + i);
+                }
+                Buffer.BlockCopy(plainBytes, headerSize, obfuscated, headerSize + extraPrefixLen, bodyLen);
+
+                // XOR the entire body after the unencrypted header using file-offset modulo 16
+                for (var i = headerSize; i < obfuscated.Length; i++)
+                {
+                    obfuscated[i] ^= syntheticMask[i % syntheticMask.Length];
+                }
+
+                var maskedPath = Path.Combine(tempRoot, "global-metadata.dat");
+                File.WriteAllBytes(maskedPath, obfuscated);
+
+                var reader = new Il2CppMetadataReader();
+                var inspect = reader.InspectMetadata(maskedPath);
+                Assert.True(inspect.Success, inspect.DiagnosticMessage);
+                Assert.Equal(31, inspect.MetadataVersion);
+                Assert.Equal(2, inspect.ImageCount);
+
+                // Verify generic class, methods, and TypeTree field-type enrichment work on unmasked metadata
+                var enrichTree = new TypeTree
+                {
+                    m_Nodes = new List<TypeTreeNode>
+                    {
+                        new("MonoBehaviour", "Base", 0, false),
+                        new("PPtr<GameObject>", "m_GameObject", 1, false),
+                        new("UInt8", "m_Enabled", 1, true),
+                        new("PPtr<MonoScript>", "m_Script", 1, false),
+                        new("string", "m_Name", 1, true),
+                        new("SInt32", "Capacity", 1, false)
+                    }
+                };
+
+                var cls = reader.TryExtractType(
+                    maskedPath,
+                    new ScriptLookupRequest
+                    {
+                        AssemblyName = "Assembly-CSharp.dll",
+                        Namespace = "Demo.Gameplay",
+                        ClassName = "InventoryBag`1",
+                        FallbackTypeTree = enrichTree
+                    });
+
+                Assert.NotNull(cls);
+                Assert.True(cls!.Success);
+                Assert.Equal(ScriptSourceKind.Il2CppGlobalMetadata, cls.SourceKind);
+                Assert.Contains("public class InventoryBag<TItem> : BaseController", cls.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("int Capacity;", cls.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("AddItem(int slotIndex, string itemKey);", cls.SourceCode, StringComparison.Ordinal);
+
+                // Verify enum default values (binary search over FieldDefaultValues + DefaultValueData) also unmask properly!
+                var enumRes = reader.TryExtractType(
+                    maskedPath,
+                    new ScriptLookupRequest
+                    {
+                        AssemblyName = "Assembly-CSharp.dll",
+                        Namespace = "Demo.Gameplay",
+                        ClassName = "ActorState"
+                    });
+                Assert.NotNull(enumRes);
+                Assert.True(enumRes!.Success);
+                Assert.Contains("Idle = 0", enumRes.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("Moving = 1", enumRes.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("Attacking = 250", enumRes.SourceCode, StringComparison.Ordinal);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void TypeTreeScriptReconstructor_ReconstructsFieldsCollectionsNestedTypes_AndActsAsViewerFallback()
+        {
+            var tree = new TypeTree
+            {
+                m_Nodes = new List<TypeTreeNode>
+                {
+                    new("MonoBehaviour", "Base", 0, false),
+                    new("PPtr<GameObject>", "m_GameObject", 1, false),
+                    new("int", "m_FileID", 2, false),
+                    new("SInt64", "m_PathID", 2, false),
+                    new("UInt8", "m_Enabled", 1, true),
+                    new("PPtr<MonoScript>", "m_Script", 1, false),
+                    new("int", "m_FileID", 2, false),
+                    new("SInt64", "m_PathID", 2, false),
+                    new("string", "m_Name", 1, true),
+                    new("float", "m_MoveSpeed", 1, false),
+                    new("Vector3f", "m_Offset", 1, false),
+                    new("float", "x", 2, false),
+                    new("float", "y", 2, false),
+                    new("float", "z", 2, false),
+                    new("ColorRGBA", "m_Tint", 1, false),
+                    new("PPtr<$Texture2D>", "m_MainTex", 1, false),
+                    new("int", "m_FileID", 2, false),
+                    new("SInt64", "m_PathID", 2, false),
+                    new("vector", "m_Renderers", 1, false),
+                    new("Array", "Array", 2, false) { m_TypeFlags = 1 },
+                    new("int", "size", 3, false),
+                    new("PPtr<$MeshRenderer>", "data", 3, false),
+                    new("vector", "m_Entries", 1, false),
+                    new("Array", "Array", 2, false) { m_TypeFlags = 1 },
+                    new("int", "size", 3, false),
+                    new("DecalEntry", "data", 3, false),
+                    new("string", "m_Key", 4, true),
+                    new("float", "m_Opacity", 4, false),
+                    new("map", "m_Weights", 1, false),
+                    new("Array", "Array", 2, false) { m_TypeFlags = 1 },
+                    new("int", "size", 3, false),
+                    new("pair", "data", 3, false),
+                    new("string", "first", 4, true),
+                    new("SInt32", "second", 4, false)
+                }
+            };
+
+            var tempRoot = CreateTempDirectory();
+            try
+            {
+                // Write a strongly-corrupted global-metadata.dat so metadata parsing fails and TypeTree fallback kicks in!
+                var metaDir = Path.Combine(tempRoot, "Demo_Data", "il2cpp_data", "Metadata");
+                Directory.CreateDirectory(metaDir);
+                var badMeta = Path.Combine(metaDir, "global-metadata.dat");
+                File.WriteAllBytes(badMeta, Enumerable.Repeat((byte)0x99, 512).ToArray());
+
+                using var viewer = new ScriptViewerService();
+                var result = viewer.ResolveScript(new ScriptLookupRequest
+                {
+                    AssemblyName = "Demo.Framework.dll",
+                    Namespace = "Demo.Visuals",
+                    ClassName = "DecalController",
+                    ProjectRoot = tempRoot,
+                    ScriptingBackend = UnityScriptingBackend.Il2Cpp,
+                    FallbackTypeTree = tree,
+                    FallbackTypeTreeSourceFile = "CAB-sample"
+                });
+
+                Assert.True(result.Success);
+                Assert.Equal(ScriptSourceKind.UnityTypeTree, result.SourceKind);
+                Assert.Equal("Unity TypeTree", result.BackendBadge);
+                Assert.Contains("namespace Demo.Visuals", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public class DecalController : MonoBehaviour", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public float m_MoveSpeed;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public Vector3 m_Offset;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public Color m_Tint;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public Texture2D m_MainTex;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public List<MeshRenderer> m_Renderers;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public List<DecalEntry> m_Entries;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public Dictionary<string, int> m_Weights;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("[Serializable]", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public class DecalEntry", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public string m_Key;", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public float m_Opacity;", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("m_GameObject", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("m_Script", result.SourceCode, StringComparison.Ordinal);
             }
             finally
             {

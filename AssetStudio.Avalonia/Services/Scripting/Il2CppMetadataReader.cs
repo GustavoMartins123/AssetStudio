@@ -91,6 +91,8 @@ public sealed class Il2CppMetadataReader
         public required long FileLength { get; init; }
         public required long LastWriteTicks { get; init; }
         public required int Version { get; init; }
+        public long BodyOffsetDelta { get; init; }
+        public byte[]? BodyXorKey { get; init; }
         public required TableSlice Strings { get; init; }
         public required TableSlice Events { get; init; }
         public required TableSlice Properties { get; init; }
@@ -181,7 +183,10 @@ public sealed class Il2CppMetadataReader
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return ReconstructTypeResult(index, typeDefIndex, cancellationToken);
+        var fieldTypeOverrides = request.FallbackTypeTree != null
+            ? TypeTreeScriptReconstructor.ExtractTopLevelFieldTypes(request.FallbackTypeTree)
+            : null;
+        return ReconstructTypeResult(index, typeDefIndex, fieldTypeOverrides, cancellationToken);
     }
 
     public ScriptDecompilationResult? TryExtractType(
@@ -377,6 +382,7 @@ public sealed class Il2CppMetadataReader
             }
 
             var pairs = new TableSlice[pairCount];
+            long maxTableEnd = headerSize;
             for (var i = 0; i < pairCount; i++)
             {
                 var off = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.AsSpan(8 + i * 8, 4));
@@ -395,6 +401,11 @@ public sealed class Il2CppMetadataReader
                 else
                 {
                     pairs[i] = new TableSlice(off, sz);
+                    var tableEnd = (long)off + sz;
+                    if (tableEnd > maxTableEnd)
+                    {
+                        maxTableEnd = tableEnd;
+                    }
                 }
             }
 
@@ -421,43 +432,36 @@ public sealed class Il2CppMetadataReader
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Read string table once during indexing (released right after index build!)
-            var stringBytes = ReadTableBytes(stream, stringsSlice);
-
-            // Self-validating detection of images table & TypeDef struct size
-            if (!TryDetectImagesAndTypeDefSize(
+            // Resolve standard plaintext tables first; if those fail validation, probe for a
+            // generic post-header body shift (fileLength - maxTableEnd) and/or repeating XOR mask
+            // validated strictly against image table layout and TypeDefinition metadata tokens.
+            if (!TryResolveTablesAndTransform(
                     stream,
+                    fileLength,
+                    maxTableEnd,
                     pairs,
-                    stringBytes,
+                    stringsSlice,
                     typeDefsSlice,
+                    cancellationToken,
+                    out var bodyOffsetDelta,
+                    out var bodyXorKey,
+                    out var stringBytes,
                     out var images,
                     out var totalTypes,
-                    out var typeDefStructSize))
+                    out var typeDefStructSize,
+                    out var typeDefBytes))
             {
                 return Fail(
                     $"global-metadata.dat (v{version}) tables appear encrypted, obfuscated, or use an unrecognized layout.",
                     isObfuscated: true);
             }
 
-            cancellationToken.ThrowIfCancellationRequested();
-
-            // Read TypeDefinitions table once during indexing (released right after index build!)
-            var typeDefBytes = ReadTableBytes(stream, typeDefsSlice);
-
-            // Validate TypeDef token byte (0x02) on first entries
-            if (!ValidateTypeDefTokens(typeDefBytes, totalTypes, typeDefStructSize))
-            {
-                return Fail(
-                    $"global-metadata.dat (v{version}) TypeDefinition records failed token validation (possibly obfuscated).",
-                    isObfuscated: true);
-            }
-
             // Detect method/field/param/property/event struct sizes via metadata token validation
-            var methodLayout = DetectMethodLayout(stream, methodsSlice, stringBytes, version, totalTypes);
-            var fieldStructSize = DetectFixedTableStructSize(stream, fieldsSlice, stringBytes, new[] { 12, 16 }, tokenOffsetFromEnd: 4, expectedTokenTable: 0x04, checkNameAt0: true);
-            var paramStructSize = DetectParamStructSize(stream, parametersSlice);
-            var propertyStructSize = DetectFixedTableStructSize(stream, propertiesSlice, stringBytes, new[] { 20, 24 }, tokenOffsetFromEnd: 4, expectedTokenTable: 0x17, checkNameAt0: true);
-            var eventStructSize = DetectFixedTableStructSize(stream, eventsSlice, stringBytes, new[] { 24, 28 }, tokenOffsetFromEnd: 4, expectedTokenTable: 0x14, checkNameAt0: true);
+            var methodLayout = DetectMethodLayout(stream, methodsSlice, stringBytes, version, totalTypes, bodyOffsetDelta, bodyXorKey);
+            var fieldStructSize = DetectFixedTableStructSize(stream, fieldsSlice, stringBytes, new[] { 12, 16 }, tokenOffsetFromEnd: 4, expectedTokenTable: 0x04, checkNameAt0: true, bodyOffsetDelta, bodyXorKey);
+            var paramStructSize = DetectParamStructSize(stream, parametersSlice, bodyOffsetDelta, bodyXorKey);
+            var propertyStructSize = DetectFixedTableStructSize(stream, propertiesSlice, stringBytes, new[] { 20, 24 }, tokenOffsetFromEnd: 4, expectedTokenTable: 0x17, checkNameAt0: true, bodyOffsetDelta, bodyXorKey);
+            var eventStructSize = DetectFixedTableStructSize(stream, eventsSlice, stringBytes, new[] { 24, 28 }, tokenOffsetFromEnd: 4, expectedTokenTable: 0x14, checkNameAt0: true, bodyOffsetDelta, bodyXorKey);
 
             var totalMethods = methodLayout.StructSize > 0 ? methodsSlice.Size / methodLayout.StructSize : 0;
             var totalFields = fieldStructSize > 0 ? fieldsSlice.Size / fieldStructSize : 0;
@@ -548,6 +552,8 @@ public sealed class Il2CppMetadataReader
                 FileLength = fileLength,
                 LastWriteTicks = lastWriteTicks,
                 Version = version,
+                BodyOffsetDelta = bodyOffsetDelta,
+                BodyXorKey = bodyXorKey,
                 Strings = stringsSlice,
                 Events = eventsSlice,
                 Properties = propertiesSlice,
@@ -603,11 +609,320 @@ public sealed class Il2CppMetadataReader
         });
     }
 
+    private static bool TryResolveTablesAndTransform(
+        FileStream stream,
+        long fileLength,
+        long maxTableEnd,
+        TableSlice[] pairs,
+        TableSlice stringsSlice,
+        TableSlice typeDefsSlice,
+        CancellationToken cancellationToken,
+        out long bodyOffsetDelta,
+        out byte[]? bodyXorKey,
+        out byte[] stringBytes,
+        out ImageEntry[] images,
+        out int totalTypes,
+        out int typeDefStructSize,
+        out byte[] typeDefBytes)
+    {
+        bodyOffsetDelta = 0;
+        bodyXorKey = null;
+        stringBytes = Array.Empty<byte>();
+        images = Array.Empty<ImageEntry>();
+        totalTypes = 0;
+        typeDefStructSize = 0;
+        typeDefBytes = Array.Empty<byte>();
+
+        var candidateShifts = new List<long>(2) { 0 };
+        var trailingDelta = fileLength - maxTableEnd;
+        if (trailingDelta > 0 && trailingDelta <= 4096)
+        {
+            candidateShifts.Add(trailingDelta);
+        }
+
+        // 1. Standard plaintext (and plaintext with post-header shift)
+        foreach (var shift in candidateShifts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (TryValidateTablesWithTransform(
+                    stream,
+                    fileLength,
+                    pairs,
+                    stringsSlice,
+                    typeDefsSlice,
+                    shift,
+                    xorKey: null,
+                    out stringBytes,
+                    out images,
+                    out totalTypes,
+                    out typeDefStructSize,
+                    out typeDefBytes))
+            {
+                bodyOffsetDelta = shift;
+                bodyXorKey = null;
+                return true;
+            }
+        }
+
+        // 2. Generic repeating-XOR detection (periods 1, 2, 4, 8, 16, 32) derived purely
+        //    from UTF-8/ASCII string-table frequency + binary-table zero-byte frequency,
+        //    validated strictly by image & TypeDefinition metadata token tables.
+        int[] xorPeriods = { 1, 2, 4, 8, 16, 32 };
+        var methodsSlice = pairs[5];
+        var fieldsSlice = pairs[11];
+        foreach (var shift in candidateShifts)
+        {
+            var strFileOffset = (long)stringsSlice.Offset + shift;
+            if (strFileOffset < 0 || strFileOffset + stringsSlice.Size > fileLength)
+            {
+                continue;
+            }
+
+            var sampleLen = Math.Min(stringsSlice.Size, 32 * 1024);
+            if (sampleLen < 32)
+            {
+                continue;
+            }
+
+            var sample = ReadBytesAt(stream, strFileOffset, sampleLen, xorKey: null);
+            var binarySamples = CollectBinarySamples(stream, fileLength, shift, typeDefsSlice, methodsSlice, fieldsSlice);
+
+            foreach (var period in xorPeriods)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!TryInferRepeatingXorKey(sample, strFileOffset, binarySamples, period, out var candidateKey))
+                {
+                    continue;
+                }
+
+                if (TryValidateTablesWithTransform(
+                        stream,
+                        fileLength,
+                        pairs,
+                        stringsSlice,
+                        typeDefsSlice,
+                        shift,
+                        candidateKey,
+                        out stringBytes,
+                        out images,
+                        out totalTypes,
+                        out typeDefStructSize,
+                        out typeDefBytes))
+                {
+                    bodyOffsetDelta = shift;
+                    bodyXorKey = candidateKey;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static List<(long FileOffset, byte[] Bytes)> CollectBinarySamples(
+        FileStream stream,
+        long fileLength,
+        long shift,
+        params TableSlice[] slices)
+    {
+        var results = new List<(long FileOffset, byte[] Bytes)>(slices.Length);
+        foreach (var slice in slices)
+        {
+            if (slice.Size <= 0)
+            {
+                continue;
+            }
+
+            var fileOff = (long)slice.Offset + shift;
+            if (fileOff < 0 || fileOff >= fileLength)
+            {
+                continue;
+            }
+
+            var len = (int)Math.Min(Math.Min(slice.Size, 16 * 1024), fileLength - fileOff);
+            if (len >= 16)
+            {
+                results.Add((fileOff, ReadBytesAt(stream, fileOff, len, xorKey: null)));
+            }
+        }
+        return results;
+    }
+
+    private static bool TryValidateTablesWithTransform(
+        FileStream stream,
+        long fileLength,
+        TableSlice[] pairs,
+        TableSlice stringsSlice,
+        TableSlice typeDefsSlice,
+        long bodyOffsetDelta,
+        byte[]? xorKey,
+        out byte[] stringBytes,
+        out ImageEntry[] images,
+        out int totalTypes,
+        out int typeDefStructSize,
+        out byte[] typeDefBytes)
+    {
+        stringBytes = Array.Empty<byte>();
+        images = Array.Empty<ImageEntry>();
+        totalTypes = 0;
+        typeDefStructSize = 0;
+        typeDefBytes = Array.Empty<byte>();
+
+        if ((long)stringsSlice.Offset + bodyOffsetDelta + stringsSlice.Size > fileLength
+            || (long)typeDefsSlice.Offset + bodyOffsetDelta + typeDefsSlice.Size > fileLength)
+        {
+            return false;
+        }
+
+        stringBytes = ReadTableBytes(stream, stringsSlice, bodyOffsetDelta, xorKey);
+        if (!TryDetectImagesAndTypeDefSize(
+                stream,
+                pairs,
+                stringBytes,
+                typeDefsSlice,
+                bodyOffsetDelta,
+                xorKey,
+                out images,
+                out totalTypes,
+                out typeDefStructSize))
+        {
+            return false;
+        }
+
+        typeDefBytes = ReadTableBytes(stream, typeDefsSlice, bodyOffsetDelta, xorKey);
+        return ValidateTypeDefTokens(typeDefBytes, totalTypes, typeDefStructSize);
+    }
+
+    private static bool TryInferRepeatingXorKey(
+        byte[] stringSample,
+        long sampleFileOffset,
+        List<(long FileOffset, byte[] Bytes)> binarySamples,
+        int period,
+        out byte[] xorKey)
+    {
+        xorKey = Array.Empty<byte>();
+        if (period <= 0 || stringSample.Length < period * 4)
+        {
+            return false;
+        }
+
+        var key = new byte[period];
+        var strHist = new int[256];
+        var binHist = new int[256];
+        var anyNonZero = false;
+        long totalValidBytes = 0;
+        long totalEvaluated = 0;
+
+        for (var lane = 0; lane < period; lane++)
+        {
+            Array.Clear(strHist);
+            Array.Clear(binHist);
+            var strLaneCount = 0;
+            var binLaneCount = 0;
+
+            var firstStrOffset = (int)((period - ((sampleFileOffset - lane) % period + period) % period) % period);
+            for (var i = firstStrOffset; i < stringSample.Length; i += period)
+            {
+                strHist[stringSample[i]]++;
+                strLaneCount++;
+            }
+
+            if (strLaneCount < 4)
+            {
+                return false;
+            }
+
+            for (var s = 0; s < binarySamples.Count; s++)
+            {
+                var (bOff, bBuf) = binarySamples[s];
+                var firstBinOffset = (int)((period - ((bOff - lane) % period + period) % period) % period);
+                for (var i = firstBinOffset; i < bBuf.Length; i += period)
+                {
+                    binHist[bBuf[i]]++;
+                    binLaneCount++;
+                }
+            }
+
+            var bestK = -1;
+            var bestScore = double.NegativeInfinity;
+            var bestValidCount = 0;
+
+            for (var k = 0; k < 256; k++)
+            {
+                var validCount = 0;
+                var identCount = 0;
+                for (var b = 0; b < 256; b++)
+                {
+                    var count = strHist[b];
+                    if (count == 0)
+                    {
+                        continue;
+                    }
+
+                    var d = b ^ k;
+                    if (d == 0
+                        || (d >= 'A' && d <= 'Z')
+                        || (d >= 'a' && d <= 'z')
+                        || (d >= '0' && d <= '9')
+                        || d == '_' || d == '.' || d == '<' || d == '>' || d == '`' || d == '$')
+                    {
+                        validCount += count;
+                        identCount += count;
+                    }
+                    else if (d >= 0x20 && d <= 0x7E)
+                    {
+                        validCount += count;
+                    }
+                }
+
+                var validRatio = validCount / (double)strLaneCount;
+                if (validRatio < 0.94)
+                {
+                    continue;
+                }
+
+                var identRatio = identCount / (double)strLaneCount;
+                var binZeroRatio = binLaneCount > 0 ? binHist[k] / (double)binLaneCount : 0.0;
+                var score = validRatio * 10.0 + identRatio * 3.0 + binZeroRatio * 6.0;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestValidCount = validCount;
+                    bestK = k;
+                }
+            }
+
+            if (bestK < 0)
+            {
+                return false;
+            }
+
+            key[lane] = (byte)bestK;
+            if (bestK != 0)
+            {
+                anyNonZero = true;
+            }
+            totalValidBytes += bestValidCount;
+            totalEvaluated += strLaneCount;
+        }
+
+        if (!anyNonZero || totalEvaluated <= 0 || totalValidBytes < totalEvaluated * 0.96)
+        {
+            return false;
+        }
+
+        xorKey = key;
+        return true;
+    }
+
     private static bool TryDetectImagesAndTypeDefSize(
         FileStream stream,
         TableSlice[] pairs,
         byte[] stringBytes,
         TableSlice typeDefsSlice,
+        long bodyOffsetDelta,
+        byte[]? xorKey,
         out ImageEntry[] images,
         out int totalTypes,
         out int typeDefStructSize)
@@ -628,12 +943,12 @@ public sealed class Il2CppMetadataReader
             }
 
             var slice = pairs[pairIdx];
-            if (slice.Size < 28 || slice.Size > 8 * 1024 * 1024)
+            if (slice.Size < 28 || slice.Size > 8 * 1024 * 1024 || (long)slice.Offset + bodyOffsetDelta + slice.Size > stream.Length)
             {
                 continue;
             }
 
-            var raw = ReadTableBytes(stream, slice);
+            var raw = ReadTableBytes(stream, slice, bodyOffsetDelta, xorKey);
             foreach (var imgStructSize in structSizeCandidates)
             {
                 if (slice.Size % imgStructSize != 0)
@@ -734,7 +1049,9 @@ public sealed class Il2CppMetadataReader
         TableSlice methodsSlice,
         byte[] stringBytes,
         int version,
-        int totalTypes)
+        int totalTypes,
+        long bodyOffsetDelta,
+        byte[]? xorKey)
     {
         if (methodsSlice.Size <= 0)
         {
@@ -746,7 +1063,7 @@ public sealed class Il2CppMetadataReader
             : (version >= 27 ? new[] { 32, 36, 40, 48, 56 } : new[] { 32, 56, 48, 36, 40 });
 
         var sampleLen = Math.Min(methodsSlice.Size, 56 * 8);
-        var sample = ReadBytesAt(stream, methodsSlice.Offset, sampleLen);
+        var sample = ReadBytesAt(stream, methodsSlice.Offset + bodyOffsetDelta, sampleLen, xorKey);
 
         foreach (var msz in candidates)
         {
@@ -817,7 +1134,9 @@ public sealed class Il2CppMetadataReader
         int[] candidates,
         int tokenOffsetFromEnd,
         uint expectedTokenTable,
-        bool checkNameAt0)
+        bool checkNameAt0,
+        long bodyOffsetDelta,
+        byte[]? xorKey)
     {
         if (slice.Size <= 0)
         {
@@ -826,7 +1145,7 @@ public sealed class Il2CppMetadataReader
 
         var maxCand = candidates.Max();
         var sampleLen = Math.Min(slice.Size, maxCand * 8);
-        var sample = ReadBytesAt(stream, slice.Offset, sampleLen);
+        var sample = ReadBytesAt(stream, slice.Offset + bodyOffsetDelta, sampleLen, xorKey);
 
         foreach (var cand in candidates)
         {
@@ -872,7 +1191,7 @@ public sealed class Il2CppMetadataReader
         return candidates[0];
     }
 
-    private static int DetectParamStructSize(FileStream stream, TableSlice parametersSlice)
+    private static int DetectParamStructSize(FileStream stream, TableSlice parametersSlice, long bodyOffsetDelta, byte[]? xorKey)
     {
         if (parametersSlice.Size <= 0)
         {
@@ -881,7 +1200,7 @@ public sealed class Il2CppMetadataReader
 
         int[] candidates = { 12, 16 };
         var sampleLen = Math.Min(parametersSlice.Size, 16 * 8);
-        var sample = ReadBytesAt(stream, parametersSlice.Offset, sampleLen);
+        var sample = ReadBytesAt(stream, parametersSlice.Offset + bodyOffsetDelta, sampleLen, xorKey);
 
         foreach (var cand in candidates)
         {
@@ -1177,12 +1496,13 @@ public sealed class Il2CppMetadataReader
     private static ScriptDecompilationResult ReconstructTypeResult(
         MetadataIndex index,
         int typeDefIndex,
+        IReadOnlyDictionary<string, string>? fieldTypeOverrides,
         CancellationToken cancellationToken)
     {
         using var stream = new FileStream(index.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024);
 
         var tdLayout = index.TypeDefLayout;
-        var tdBytes = ReadBytesAt(stream, index.TypeDefinitions.Offset + typeDefIndex * tdLayout.StructSize, tdLayout.StructSize);
+        var tdBytes = ReadBytesAt(stream, index.TypeDefinitions.Offset + index.BodyOffsetDelta + (long)typeDefIndex * tdLayout.StructSize, tdLayout.StructSize, index.BodyXorKey);
 
         var summary = index.Types[typeDefIndex];
         var assemblyName = summary.ImageIndex >= 0 && summary.ImageIndex < index.Images.Length
@@ -1217,7 +1537,7 @@ public sealed class Il2CppMetadataReader
         var parsedMethods = ReadMethods(stream, index, methodStart, methodCount, isInterface, cancellationToken);
         var parsedProperties = ReadProperties(stream, index, propertyStart, propertyCount, parsedMethods);
         var parsedEvents = ReadEvents(stream, index, eventStart, eventCount, parsedMethods);
-        var parsedFields = ReadFields(stream, index, fieldStart, fieldCount, isEnum, parsedProperties);
+        var parsedFields = ReadFields(stream, index, fieldStart, fieldCount, isEnum, parsedProperties, fieldTypeOverrides);
         var typeGenericParams = ReadGenericParameterNames(stream, index, genericContainerIdx);
         var interfaceNames = ReadInterfaceNames(stream, index, interfacesStart, interfacesCount);
         var nestedNames = ReadNestedTypeNames(stream, index, nestedStart, nestedCount);
@@ -1231,14 +1551,13 @@ public sealed class Il2CppMetadataReader
             : summary.Name;
 
         var sb = new StringBuilder(2048);
-        sb.AppendLine($"// Reconstructed from IL2CPP global-metadata.dat (v{index.Version})");
         if (!string.IsNullOrWhiteSpace(assemblyName))
         {
             sb.AppendLine($"// Assembly: {assemblyName}");
         }
-        sb.AppendLine($"// TypeDefIndex: {typeDefIndex}");
-        sb.AppendLine($"// Metadata Token: 0x{typeToken:X8}");
-        sb.AppendLine("// Note: Exact field types/modifiers & native method RVAs require dump.cs / script.json (auto-used when present).");
+        sb.AppendLine($"// Type: {fullTitle}");
+        sb.AppendLine($"// Source: IL2CPP Metadata v{index.Version}");
+        sb.AppendLine($"// TypeDefIndex: {typeDefIndex} | Token: 0x{typeToken:X8}");
         sb.AppendLine();
 
         var indent = string.Empty;
@@ -1481,7 +1800,7 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(methodCount, totalMethods - methodStart);
-        var buf = ReadBytesAt(stream, index.Methods.Offset + methodStart * ml.StructSize, safeCount * ml.StructSize);
+        var buf = ReadBytesAt(stream, index.Methods.Offset + index.BodyOffsetDelta + (long)methodStart * ml.StructSize, safeCount * ml.StructSize, index.BodyXorKey);
         var totalParams = index.ParameterStructSize > 0 ? index.Parameters.Size / index.ParameterStructSize : 0;
 
         for (var i = 0; i < safeCount; i++)
@@ -1500,7 +1819,7 @@ public sealed class Il2CppMetadataReader
             var flags = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(off + ml.FlagsOffset, 2));
             var paramCount = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(off + ml.ParameterCountOffset, 2));
 
-            var methodName = ReadStringAt(stream, index.Strings, nameIdx) ?? $"Method_{i}";
+            var methodName = ReadStringAt(stream, index, nameIdx) ?? $"Method_{i}";
             var returnType = ResolveTypeName(index, returnTypeIdx, includeNamespace: true);
             var genParams = ReadGenericParameterNames(stream, index, genContainerIdx);
 
@@ -1510,14 +1829,15 @@ public sealed class Il2CppMetadataReader
                 var safeParamCount = Math.Min((int)paramCount, totalParams - paramStart);
                 var pBuf = ReadBytesAt(
                     stream,
-                    index.Parameters.Offset + paramStart * index.ParameterStructSize,
-                    safeParamCount * index.ParameterStructSize);
+                    index.Parameters.Offset + index.BodyOffsetDelta + (long)paramStart * index.ParameterStructSize,
+                    safeParamCount * index.ParameterStructSize,
+                    index.BodyXorKey);
                 for (var p = 0; p < safeParamCount; p++)
                 {
                     var pOff = p * index.ParameterStructSize;
                     var pNameIdx = BinaryPrimitives.ReadInt32LittleEndian(pBuf.AsSpan(pOff, 4));
                     var pTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(pBuf.AsSpan(pOff + index.ParameterStructSize - 4, 4));
-                    var pName = ReadStringAt(stream, index.Strings, pNameIdx) ?? $"arg{p}";
+                    var pName = ReadStringAt(stream, index, pNameIdx) ?? $"arg{p}";
                     var pType = ResolveTypeName(index, pTypeIdx, includeNamespace: true);
                     parameters.Add(new ParsedParam(p, pName, pType));
                 }
@@ -1551,7 +1871,7 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(propertyCount, totalProps - propertyStart);
-        var buf = ReadBytesAt(stream, index.Properties.Offset + propertyStart * psz, safeCount * psz);
+        var buf = ReadBytesAt(stream, index.Properties.Offset + index.BodyOffsetDelta + (long)propertyStart * psz, safeCount * psz, index.BodyXorKey);
 
         for (var i = 0; i < safeCount; i++)
         {
@@ -1561,7 +1881,7 @@ public sealed class Il2CppMetadataReader
             var setIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 8, 4));
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + psz - 4, 4));
 
-            var name = ReadStringAt(stream, index.Strings, nameIdx) ?? $"Property_{i}";
+            var name = ReadStringAt(stream, index, nameIdx) ?? $"Property_{i}";
             var getter = getIdx >= 0 && getIdx < declaringMethods.Count ? declaringMethods[getIdx] : null;
             var setter = setIdx >= 0 && setIdx < declaringMethods.Count ? declaringMethods[setIdx] : null;
 
@@ -1599,7 +1919,7 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(eventCount, totalEvents - eventStart);
-        var buf = ReadBytesAt(stream, index.Events.Offset + eventStart * esz, safeCount * esz);
+        var buf = ReadBytesAt(stream, index.Events.Offset + index.BodyOffsetDelta + (long)eventStart * esz, safeCount * esz, index.BodyXorKey);
 
         for (var i = 0; i < safeCount; i++)
         {
@@ -1610,7 +1930,7 @@ public sealed class Il2CppMetadataReader
             var removeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 12, 4));
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + esz - 4, 4));
 
-            var name = ReadStringAt(stream, index.Strings, nameIdx) ?? $"Event_{i}";
+            var name = ReadStringAt(stream, index, nameIdx) ?? $"Event_{i}";
             var addMethod = addIdx >= 0 && addIdx < declaringMethods.Count ? declaringMethods[addIdx] : null;
             var removeMethod = removeIdx >= 0 && removeIdx < declaringMethods.Count ? declaringMethods[removeIdx] : null;
 
@@ -1633,7 +1953,8 @@ public sealed class Il2CppMetadataReader
         int fieldStart,
         int fieldCount,
         bool isEnum,
-        List<ParsedProperty> properties)
+        List<ParsedProperty> properties,
+        IReadOnlyDictionary<string, string>? fieldTypeOverrides)
     {
         var results = new List<ParsedField>(fieldCount);
         var fsz = index.FieldStructSize;
@@ -1649,7 +1970,7 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(fieldCount, totalFields - fieldStart);
-        var buf = ReadBytesAt(stream, index.Fields.Offset + fieldStart * fsz, safeCount * fsz);
+        var buf = ReadBytesAt(stream, index.Fields.Offset + index.BodyOffsetDelta + (long)fieldStart * fsz, safeCount * fsz, index.BodyXorKey);
 
         Dictionary<string, string>? propTypes = null;
         if (!isEnum && properties.Count > 0)
@@ -1672,7 +1993,7 @@ public sealed class Il2CppMetadataReader
             var typeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 4, 4));
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + fsz - 4, 4));
 
-            var name = ReadStringAt(stream, index.Strings, nameIdx) ?? $"field_{i}";
+            var name = ReadStringAt(stream, index, nameIdx) ?? $"field_{i}";
             var resolvedType = ResolveTypeName(index, typeIdx, includeNamespace: true);
             string? defaultLiteral = null;
 
@@ -1685,6 +2006,15 @@ public sealed class Il2CppMetadataReader
                 }
 
                 defaultLiteral = TryReadDefaultValueLiteral(stream, index, defTypeName, defDataIdx);
+            }
+
+            // Enrich unresolved serialized field types using Unity's TypeTree when available
+            if (string.IsNullOrEmpty(resolvedType)
+                && fieldTypeOverrides != null
+                && fieldTypeOverrides.TryGetValue(name, out var typeTreeFieldType)
+                && !string.IsNullOrWhiteSpace(typeTreeFieldType))
+            {
+                resolvedType = typeTreeFieldType;
             }
 
             // Infer compiler-generated auto-property backing field type when available
@@ -1728,11 +2058,13 @@ public sealed class Il2CppMetadataReader
         while (lo <= hi)
         {
             var mid = lo + ((hi - lo) >> 1);
-            stream.Position = index.FieldDefaultValues.Offset + (long)mid * entrySize;
+            var fileOffset = index.FieldDefaultValues.Offset + index.BodyOffsetDelta + (long)mid * entrySize;
+            stream.Position = fileOffset;
             if (stream.Read(entry) != entrySize)
             {
                 return false;
             }
+            ApplyXorInPlace(entry, fileOffset, index.BodyXorKey);
 
             var fieldIdx = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(0, 4));
             if (fieldIdx == targetFieldIndex)
@@ -1773,7 +2105,7 @@ public sealed class Il2CppMetadataReader
             return null;
         }
 
-        var buf = ReadBytesAt(stream, index.DefaultValueData.Offset + dataIndex, readLen);
+        var buf = ReadBytesAt(stream, index.DefaultValueData.Offset + index.BodyOffsetDelta + dataIndex, readLen, index.BodyXorKey);
         var pos = 0;
 
         return fullTypeName switch
@@ -1878,7 +2210,7 @@ public sealed class Il2CppMetadataReader
             return names;
         }
 
-        var gcBuf = ReadBytesAt(stream, index.GenericContainers.Offset + genericContainerIndex * gcSize, gcSize);
+        var gcBuf = ReadBytesAt(stream, index.GenericContainers.Offset + index.BodyOffsetDelta + (long)genericContainerIndex * gcSize, gcSize, index.BodyXorKey);
         var typeArgCount = BinaryPrimitives.ReadInt32LittleEndian(gcBuf.AsSpan(4, 4));
         var paramStart = BinaryPrimitives.ReadInt32LittleEndian(gcBuf.AsSpan(12, 4));
         var totalParams = index.GenericParameters.Size / gpSize;
@@ -1888,11 +2220,11 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(typeArgCount, totalParams - paramStart);
-        var gpBuf = ReadBytesAt(stream, index.GenericParameters.Offset + paramStart * gpSize, safeCount * gpSize);
+        var gpBuf = ReadBytesAt(stream, index.GenericParameters.Offset + index.BodyOffsetDelta + (long)paramStart * gpSize, safeCount * gpSize, index.BodyXorKey);
         for (var i = 0; i < safeCount; i++)
         {
             var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(gpBuf.AsSpan(i * gpSize + 4, 4));
-            var name = ReadStringAt(stream, index.Strings, nameIdx);
+            var name = ReadStringAt(stream, index, nameIdx);
             names.Add(!string.IsNullOrWhiteSpace(name) ? name : $"T{i}");
         }
 
@@ -1918,7 +2250,7 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(interfacesCount, totalEntries - interfacesStart);
-        var buf = ReadBytesAt(stream, index.Interfaces.Offset + interfacesStart * 4, safeCount * 4);
+        var buf = ReadBytesAt(stream, index.Interfaces.Offset + index.BodyOffsetDelta + (long)interfacesStart * 4, safeCount * 4, index.BodyXorKey);
         for (var i = 0; i < safeCount; i++)
         {
             var ifaceTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(i * 4, 4));
@@ -1951,7 +2283,7 @@ public sealed class Il2CppMetadataReader
         }
 
         var safeCount = Math.Min(nestedCount, totalEntries - nestedStart);
-        var buf = ReadBytesAt(stream, index.NestedTypes.Offset + nestedStart * 4, safeCount * 4);
+        var buf = ReadBytesAt(stream, index.NestedTypes.Offset + index.BodyOffsetDelta + (long)nestedStart * 4, safeCount * 4, index.BodyXorKey);
         for (var i = 0; i < safeCount; i++)
         {
             var nestedTdIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(i * 4, 4));
@@ -2212,12 +2544,12 @@ public sealed class Il2CppMetadataReader
         }
     }
 
-    private static byte[] ReadTableBytes(FileStream stream, TableSlice slice)
+    private static byte[] ReadTableBytes(FileStream stream, TableSlice slice, long bodyOffsetDelta, byte[]? xorKey)
     {
-        return ReadBytesAt(stream, slice.Offset, slice.Size);
+        return ReadBytesAt(stream, slice.Offset + bodyOffsetDelta, slice.Size, xorKey);
     }
 
-    private static byte[] ReadBytesAt(FileStream stream, long offset, int length)
+    private static byte[] ReadBytesAt(FileStream stream, long offset, int length, byte[]? xorKey)
     {
         if (length <= 0 || offset < 0 || offset + length > stream.Length)
         {
@@ -2227,7 +2559,32 @@ public sealed class Il2CppMetadataReader
         var buffer = new byte[length];
         stream.Position = offset;
         ReadExactlyOrFail(stream, buffer, 0, length);
+        ApplyXorInPlace(buffer, offset, xorKey);
         return buffer;
+    }
+
+    private static void ApplyXorInPlace(Span<byte> buffer, long fileOffset, byte[]? xorKey)
+    {
+        if (xorKey == null || xorKey.Length == 0 || buffer.IsEmpty)
+        {
+            return;
+        }
+
+        var period = xorKey.Length;
+        var lane = (int)(fileOffset % period);
+        if (lane < 0)
+        {
+            lane += period;
+        }
+
+        for (var i = 0; i < buffer.Length; i++)
+        {
+            buffer[i] ^= xorKey[lane];
+            if (++lane == period)
+            {
+                lane = 0;
+            }
+        }
     }
 
     private static void ReadExactlyOrFail(Stream stream, byte[] buffer, int offset, int count)
@@ -2244,8 +2601,9 @@ public sealed class Il2CppMetadataReader
         }
     }
 
-    private static string? ReadStringAt(FileStream stream, TableSlice stringTable, int nameIndex)
+    private static string? ReadStringAt(FileStream stream, MetadataIndex index, int nameIndex)
     {
+        var stringTable = index.Strings;
         if (nameIndex < 0 || nameIndex >= stringTable.Size)
         {
             return null;
@@ -2253,13 +2611,20 @@ public sealed class Il2CppMetadataReader
 
         var maxRead = Math.Min(stringTable.Size - nameIndex, MaxStringReadBytes);
         var buf = new byte[maxRead];
-        stream.Position = stringTable.Offset + (long)nameIndex;
+        var fileOffset = stringTable.Offset + index.BodyOffsetDelta + (long)nameIndex;
+        if (fileOffset < 0 || fileOffset >= stream.Length)
+        {
+            return null;
+        }
+
+        stream.Position = fileOffset;
         var read = stream.Read(buf, 0, maxRead);
         if (read <= 0)
         {
             return string.Empty;
         }
 
+        ApplyXorInPlace(buf.AsSpan(0, read), fileOffset, index.BodyXorKey);
         var zero = Array.IndexOf(buf, (byte)0, 0, read);
         var len = zero >= 0 ? zero : read;
         return Encoding.UTF8.GetString(buf, 0, len);

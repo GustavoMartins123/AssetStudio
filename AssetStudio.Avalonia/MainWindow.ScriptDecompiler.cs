@@ -45,16 +45,31 @@ public partial class MainWindow
         PreviewLabel.IsVisible = false;
         StatusStripUpdate($"Resolving C# source for {fullName}...");
 
-        var lookupRequest = BuildScriptLookupRequest(
-            assemblyName: m_MonoScript.m_AssemblyName,
-            ns: m_MonoScript.m_Namespace,
-            className: m_MonoScript.m_ClassName,
-            assetName: assetItem.Name);
+        var scanSnapshot = currentScanResult;
+        var cacheFolder = GetCurrentCacheFolderPath();
 
         _ = Task.Run(async () =>
         {
             try
             {
+                token.ThrowIfCancellationRequested();
+                var (fallbackTypeTree, fallbackSourceFile) = TryResolveTypeTreeForScriptBackground(
+                    assetItem,
+                    m_MonoScript,
+                    m_MonoScript.m_AssemblyName,
+                    m_MonoScript.m_Namespace,
+                    m_MonoScript.m_ClassName,
+                    scanSnapshot,
+                    cacheFolder,
+                    token);
+                var lookupRequest = BuildScriptLookupRequest(
+                    assemblyName: m_MonoScript.m_AssemblyName,
+                    ns: m_MonoScript.m_Namespace,
+                    className: m_MonoScript.m_ClassName,
+                    assetName: assetItem.Name,
+                    fallbackTypeTree: fallbackTypeTree,
+                    fallbackTypeTreeSourceFile: fallbackSourceFile);
+
                 token.ThrowIfCancellationRequested();
                 var result = await _scriptViewerService.ResolveScriptAsync(lookupRequest, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
@@ -76,7 +91,7 @@ public partial class MainWindow
                     PreviewLabel.IsVisible = false;
                     StatusStripUpdate(result.Success
                         ? $"Script loaded: {result.Title} ({result.BackendBadge})"
-                        : $"Script metadata loaded: {result.Title} (use Script tab -> Scripts Folder... to locate assemblies/dump.cs)");
+                        : $"Script source unavailable: {result.Title}");
                 });
             }
             catch (OperationCanceledException)
@@ -137,6 +152,9 @@ public partial class MainWindow
             Interlocked.Increment(ref foregroundLazyLoadCount);
         }
 
+        var scanSnapshot = currentScanResult;
+        var cacheFolder = GetCurrentCacheFolderPath();
+
         try
         {
             var result = await Task.Run(() =>
@@ -152,11 +170,23 @@ public partial class MainWindow
                 var scriptIdentity = ResolveScriptIdentityBackground(assetItem, asset, token);
                 token.ThrowIfCancellationRequested();
 
+                var (fallbackTypeTree, fallbackSourceFile) = TryResolveTypeTreeForScriptBackground(
+                    assetItem,
+                    asset,
+                    scriptIdentity.AssemblyName,
+                    scriptIdentity.Namespace,
+                    scriptIdentity.ClassName,
+                    scanSnapshot,
+                    cacheFolder,
+                    token);
+
                 var request = BuildScriptLookupRequest(
                     assemblyName: scriptIdentity.AssemblyName,
                     ns: scriptIdentity.Namespace,
                     className: scriptIdentity.ClassName,
-                    assetName: assetItem.Name);
+                    assetName: assetItem.Name,
+                    fallbackTypeTree: fallbackTypeTree,
+                    fallbackTypeTreeSourceFile: fallbackSourceFile);
 
                 return _scriptViewerService.ResolveScript(request, token);
             }, token);
@@ -305,11 +335,227 @@ public partial class MainWindow
         return null;
     }
 
+    private (TypeTree? TypeTree, string? SourceFileName) TryResolveTypeTreeForScriptBackground(
+        AssetItem assetItem,
+        AssetStudio.Object? asset,
+        string? assemblyName,
+        string? ns,
+        string? className,
+        ProjectScanResult? scanSnapshot,
+        string? cacheFolder,
+        CancellationToken token)
+    {
+        // 1. Direct TypeTree on selected MonoBehaviour (zero extra I/O)
+        if (asset is MonoBehaviour directMb && directMb.serializedType?.m_Type?.m_Nodes is { Count: > 1 })
+        {
+            return (directMb.serializedType.m_Type, directMb.assetsFile?.fileName);
+        }
+
+        var cleanClass = className?.Trim() ?? string.Empty;
+        var cleanNs = ns?.Trim() ?? string.Empty;
+        var cleanAsm = NormalizeAssemblyShortName(assemblyName);
+
+        // 2. Scan already-loaded SerializedFiles (m_RefTypes / m_Types / loaded MonoBehaviours referencing this MonoScript)
+        var targetScriptPathId = asset is MonoScript msObj ? msObj.m_PathID : (assetItem.Type == ClassIDType.MonoScript ? assetItem.PathID : 0L);
+        var targetScriptFile = asset?.assetsFile ?? assetItem.SourceFile;
+        var targetScriptFileName = targetScriptFile?.fileName ?? assetItem.Handle?.SerializedFileName ?? string.Empty;
+
+        var loadedFiles = assetsManager.assetsFileList.ToArray();
+        for (var f = 0; f < loadedFiles.Length; f++)
+        {
+            token.ThrowIfCancellationRequested();
+            var file = loadedFiles[f];
+            if (file == null)
+            {
+                continue;
+            }
+
+            // 2a. Check SerializedType metadata tables (m_Types / m_RefTypes)
+            var matchedType = TryMatchSerializedTypeTree(file.m_Types, cleanClass, cleanNs, cleanAsm)
+                ?? TryMatchSerializedTypeTree(file.m_RefTypes, cleanClass, cleanNs, cleanAsm);
+            if (matchedType != null)
+            {
+                return (matchedType, file.fileName);
+            }
+
+            // 2b. Check loaded MonoBehaviour objects in this SerializedFile referencing the selected MonoScript
+            if (targetScriptPathId != 0)
+            {
+                AssetStudio.Object[] objectsSnapshot;
+                lock (file)
+                {
+                    objectsSnapshot = file.Objects.ToArray();
+                }
+
+                for (var i = 0; i < objectsSnapshot.Length; i++)
+                {
+                    if (objectsSnapshot[i] is not MonoBehaviour candidateMb
+                        || candidateMb.serializedType?.m_Type?.m_Nodes is not { Count: > 1 }
+                        || candidateMb.m_Script == null
+                        || candidateMb.m_Script.IsNull
+                        || candidateMb.m_Script.m_PathID != targetScriptPathId)
+                    {
+                        continue;
+                    }
+
+                    if (DoesPPtrTargetFile(file, candidateMb.m_Script.m_FileID, targetScriptFile, targetScriptFileName))
+                    {
+                        return (candidateMb.serializedType.m_Type, file.fileName);
+                    }
+                }
+            }
+        }
+
+        // 3. Lazy Mode: query SQLite semantic cache for 1 MonoBehaviour referencing this MonoScript and materialize ONLY that handle
+        if (assetsManager.LazyLoading
+            && assetItem.Type == ClassIDType.MonoScript
+            && scanSnapshot != null
+            && !string.IsNullOrWhiteSpace(cacheFolder))
+        {
+            try
+            {
+                var selfUid = asset?.assetsFile != null
+                    ? AssetHandle.BuildUniqueID(asset.assetsFile, asset.m_PathID)
+                    : (assetItem.Handle?.UniqueID ?? assetItem.UniqueID);
+                if (!string.IsNullOrWhiteSpace(selfUid))
+                {
+                    var signature = _sqliteCache.GetFolderSignature(scanSnapshot);
+                    var usedBy = new List<AssetReferenceItem>();
+                    var uses = new List<AssetReferenceItem>();
+                    _sqliteCache.LoadAssetReferencesFromSemanticCache(cacheFolder, signature, selfUid, usedBy, uses, maxPerDirection: 32);
+
+                    foreach (var refItem in usedBy)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if (refItem.AssetType != ClassIDType.MonoBehaviour || string.IsNullOrWhiteSpace(refItem.AssetUniqueId))
+                        {
+                            continue;
+                        }
+
+                        var mbHandle = assetsManager.ProjectIndex.GetHandle(refItem.AssetUniqueId);
+                        if (mbHandle == null)
+                        {
+                            continue;
+                        }
+
+                        if (mbHandle.RealObject is MonoBehaviour cachedMb && cachedMb.serializedType?.m_Type?.m_Nodes is { Count: > 1 })
+                        {
+                            return (cachedMb.serializedType.m_Type, cachedMb.assetsFile?.fileName);
+                        }
+
+                        var tempMbItem = new AssetItem(mbHandle, 0);
+                        EnsureLazyAssetReadyForPreview(tempMbItem);
+                        if (tempMbItem.Asset is MonoBehaviour loadedMb && loadedMb.serializedType?.m_Type?.m_Nodes is { Count: > 1 })
+                        {
+                            return (loadedMb.serializedType.m_Type, loadedMb.assetsFile?.fileName);
+                        }
+
+                        // Stop after trying the first referencing MonoBehaviour to avoid I/O amplification
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Best-effort fallback; never break script resolution
+            }
+        }
+
+        return (null, null);
+    }
+
+    private static TypeTree? TryMatchSerializedTypeTree(
+        IReadOnlyList<SerializedType>? types,
+        string cleanClass,
+        string cleanNs,
+        string cleanAsm)
+    {
+        if (types == null || types.Count == 0 || string.IsNullOrWhiteSpace(cleanClass))
+        {
+            return null;
+        }
+
+        TypeTree? looseMatch = null;
+        for (var i = 0; i < types.Count; i++)
+        {
+            var st = types[i];
+            if (st?.m_Type?.m_Nodes is not { Count: > 1 } || string.IsNullOrWhiteSpace(st.m_KlassName))
+            {
+                continue;
+            }
+
+            if (!string.Equals(st.m_KlassName, cleanClass, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var nsMatch = string.IsNullOrEmpty(cleanNs)
+                || string.Equals(st.m_NameSpace ?? string.Empty, cleanNs, StringComparison.OrdinalIgnoreCase);
+            var asmMatch = string.IsNullOrEmpty(cleanAsm)
+                || string.Equals(NormalizeAssemblyShortName(st.m_AsmName), cleanAsm, StringComparison.OrdinalIgnoreCase);
+
+            if (nsMatch && asmMatch)
+            {
+                return st.m_Type;
+            }
+
+            if (nsMatch)
+            {
+                looseMatch ??= st.m_Type;
+            }
+        }
+
+        return looseMatch;
+    }
+
+    private static bool DoesPPtrTargetFile(
+        SerializedFile ownerFile,
+        int fileId,
+        SerializedFile? targetFile,
+        string targetFileName)
+    {
+        if (fileId == 0)
+        {
+            return ReferenceEquals(ownerFile, targetFile)
+                || (!string.IsNullOrWhiteSpace(targetFileName)
+                    && string.Equals(ownerFile.fileName, targetFileName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (fileId > 0 && ownerFile.m_Externals != null && fileId - 1 < ownerFile.m_Externals.Count)
+        {
+            var ext = ownerFile.m_Externals[fileId - 1];
+            var extName = NormalizeExternalFileNameForInspector(ext?.fileName, ext?.pathName);
+            return !string.IsNullOrWhiteSpace(targetFileName)
+                && string.Equals(extName, targetFileName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
+    private static string NormalizeAssemblyShortName(string? assemblyName)
+    {
+        if (string.IsNullOrWhiteSpace(assemblyName))
+        {
+            return string.Empty;
+        }
+
+        var trimmed = Path.GetFileName(assemblyName.Trim());
+        return trimmed.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+            ? trimmed.Substring(0, trimmed.Length - 4)
+            : trimmed;
+    }
+
     private ScriptLookupRequest BuildScriptLookupRequest(
         string? assemblyName,
         string? ns,
         string? className,
-        string? assetName)
+        string? assetName,
+        TypeTree? fallbackTypeTree = null,
+        string? fallbackTypeTreeSourceFile = null)
     {
         var projectRoot = ResolveEffectiveScriptProjectRoot();
         var report = CurrentProjectAnalysisReport;
@@ -341,7 +587,9 @@ public partial class MainWindow
             GameAssemblyPath = discovered.GameAssemblyPath,
             GlobalMetadataPath = discovered.GlobalMetadataPath,
             ProjectAnalysisCacheDirectory = projectAnalysisCacheDir,
-            ScriptingBackend = report?.ScriptingBackend ?? UnityScriptingBackend.Unknown
+            ScriptingBackend = report?.ScriptingBackend ?? UnityScriptingBackend.Unknown,
+            FallbackTypeTree = fallbackTypeTree,
+            FallbackTypeTreeSourceFile = fallbackTypeTreeSourceFile
         };
     }
 
@@ -536,7 +784,7 @@ public partial class MainWindow
         }
 
         var folder = await ViewModel.DialogService.PickOpenFolderAsync(new FolderPickerRequest(
-            title: "Select Managed/ or Il2CppDumper Folder (dump.cs / script.json / DummyDll)"));
+            title: "Select Scripts Folder (Managed / dump.cs / DummyDll)"));
         if (string.IsNullOrWhiteSpace(folder))
         {
             return;

@@ -151,13 +151,12 @@ public sealed class Il2CppDumpScriptService
             : $"{request.Namespace}.{request.ClassName}";
 
         var sb = new StringBuilder();
-        sb.AppendLine("// Source: IL2CPP script.json symbol outline (dump.cs not present)");
         if (!string.IsNullOrWhiteSpace(request.AssemblyName))
         {
             sb.AppendLine($"// Assembly: {request.AssemblyName}");
         }
         sb.AppendLine($"// Type: {fullTitle}");
-        sb.AppendLine($"// Matched Methods: {methods.Count}");
+        sb.AppendLine($"// Source: script.json ({methods.Count} methods)");
         sb.AppendLine();
 
         var indent = string.Empty;
@@ -923,14 +922,14 @@ public sealed class Il2CppDumpScriptService
         List<ScriptMethodSymbol> scriptJsonMethods)
     {
         var sb = new StringBuilder(rawBlock.Length + 512);
-        sb.AppendLine($"// Source: {Path.GetFileName(dumpCsPath)} (IL2CPP Dump)");
+        sb.AppendLine($"// Source: {Path.GetFileName(dumpCsPath)}");
         if (span.TypeDefIndex.HasValue)
         {
             sb.AppendLine($"// TypeDefIndex: {span.TypeDefIndex.Value}");
         }
         if (scriptJsonMethods.Count > 0)
         {
-            sb.AppendLine($"// Correlated script.json symbols: {scriptJsonMethods.Count}");
+            sb.AppendLine($"// Matched RVAs: {scriptJsonMethods.Count}");
         }
         sb.AppendLine();
         sb.AppendLine(rawBlock);

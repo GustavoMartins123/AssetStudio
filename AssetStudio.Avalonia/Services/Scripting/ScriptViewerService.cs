@@ -75,7 +75,7 @@ public sealed class ScriptViewerService : IDisposable
         var scriptJsonPath = FirstExistingFile(request.ScriptJsonPath, discovered.ScriptJsonPath);
         var globalMetadataPath = FirstExistingFile(request.GlobalMetadataPath, discovered.GlobalMetadataPath);
 
-        // 1. Mono managed assemblies first (produces full real C# method bodies via ICSharpCode.Decompiler)
+        // 1. Mono managed assemblies first (produces full C# method bodies)
         if (managedDirs.Count > 0)
         {
             var monoResult = _monoDecompiler.TryDecompile(
@@ -103,7 +103,7 @@ public sealed class ScriptViewerService : IDisposable
             }
         }
 
-        // 3. IL2CPP DummyDll decompilation via ICSharpCode.Decompiler (optionally enriched with script.json RVAs)
+        // 3. IL2CPP DummyDll decompilation (optionally enriched with script.json RVAs)
         if (dummyDirs.Count > 0)
         {
             var dummyResult = _monoDecompiler.TryDecompile(
@@ -132,7 +132,20 @@ public sealed class ScriptViewerService : IDisposable
             }
         }
 
-        // 5. Fallback: script.json alone (method list + RVAs outline)
+        // 5. Automatic Unity TypeTree reconstruction (works even when metadata is absent or strongly encrypted)
+        if (request.FallbackTypeTree != null)
+        {
+            var typeTreeResult = TypeTreeScriptReconstructor.TryReconstruct(
+                request,
+                request.FallbackTypeTree,
+                request.FallbackTypeTreeSourceFile);
+            if (typeTreeResult != null && typeTreeResult.Success)
+            {
+                return EnrichWithScriptJson(typeTreeResult, scriptJsonPath, cancellationToken);
+            }
+        }
+
+        // 6. Fallback: script.json alone (method list + RVAs outline)
         if (!string.IsNullOrWhiteSpace(scriptJsonPath))
         {
             var outlineResult = _il2CppService.TryBuildScriptJsonOutline(
@@ -257,7 +270,7 @@ public sealed class ScriptViewerService : IDisposable
     {
         if (!string.IsNullOrWhiteSpace(metadataDiagnostic) && !hadManagedDirs && !hadDummyDirs && !hadDumpCs && !hadScriptJson)
         {
-            return $"{metadataDiagnostic} Click 'Scripts Folder...' to select a decrypted Il2CppDumper output folder (dump.cs / script.json / DummyDll).";
+            return $"{metadataDiagnostic} Use 'Scripts Folder...' to choose a folder with script files (dump.cs, script.json, or DummyDll).";
         }
 
         if (hadManagedDirs || hadDummyDirs || hadDumpCs || hadGlobalMetadata || hadScriptJson)
@@ -276,11 +289,11 @@ public sealed class ScriptViewerService : IDisposable
         return request.ScriptingBackend switch
         {
             UnityScriptingBackend.Il2Cpp =>
-                "IL2CPP project detected, but no global-metadata.dat, dump.cs, script.json, or DummyDll folder was found. Click 'Scripts Folder...' to select an Il2CppDumper output folder.",
+                "IL2CPP project detected, but no readable metadata, dump.cs, script.json, DummyDll, or embedded TypeTree was found. Use 'Scripts Folder...' to choose a folder with script files.",
             UnityScriptingBackend.Mono =>
-                "Mono project detected, but the target assembly was not found. Click 'Scripts Folder...' to select the game's Managed/ folder.",
+                "Mono project detected, but the target assembly was not found. Use 'Scripts Folder...' to select the project's Managed/ folder.",
             _ =>
-                "No Managed assemblies, global-metadata.dat, or IL2CPP dump artifacts were detected. Click 'Scripts Folder...' to select a Managed/ or Il2CppDumper folder."
+                "No script assemblies, metadata, or embedded TypeTree were detected. Use 'Scripts Folder...' to select a folder with script files."
         };
     }
 }
