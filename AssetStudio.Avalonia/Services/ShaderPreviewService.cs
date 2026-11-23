@@ -23,6 +23,8 @@ internal sealed record ShaderPreviewRenderTarget(string Name, int Size, int Filt
     internal int ArraySize { get; init; } = 1;
     internal int MipLevels { get; init; } = 1;
     internal bool UnorderedAccess { get; init; }
+    internal int Wrap { get; init; } = 1;
+    internal NumericsVector4 ClearColor { get; init; }
     internal ShaderPreviewTextureDimension Dimension => ArraySize > 1
         ? ShaderPreviewTextureDimension.Texture2DArray : ShaderPreviewTextureDimension.Texture2D;
 }
@@ -102,6 +104,7 @@ internal readonly record struct ShaderPreviewCamera(float Yaw, float Pitch, floa
 internal static class ShaderPreviewService
 {
     internal const int RenderSize = 384;
+    internal const int MaxDrawTargetSize = 2048;
     internal const int FramesPerSecond = 30;
     private static readonly ShaderPreviewLight[] PreviewLights =
     [
@@ -453,6 +456,12 @@ internal static class ShaderPreviewService
             }
         }
 
+        if (shader.version is [2019, 3, ..] && OthercideRainPreview.Handles(reader.Name))
+        {
+            OthercideRainPreview.AddRipplePass(shader, material, operations, textures,
+                loadExternalSources, resolveAsset, cancellationToken);
+        }
+
         var cameraTextures = new HashSet<string>(StringComparer.Ordinal);
         if (geometry == ShaderPreviewGeometry.ScreenQuad && !ImageEffectPreview.HasAnimatedInput(imageEffect))
         {
@@ -587,11 +596,12 @@ internal static class ShaderPreviewService
                 }
                 if (draw.Output is { } output)
                 {
+                    int maxSize = output.ArraySize == 1 ? MaxDrawTargetSize : RenderSize;
                     bool depthIndependent = pass.State.ZTest is ShaderPreviewDepth.Always or ShaderPreviewDepth.Off &&
                         pass.State.Stencil == null;
                     if ((!depthIndependent && ((draw.Geometry ?? geometry) != ShaderPreviewGeometry.ScreenQuad || pass.State.ZWrite)) ||
                         pass.State.AlphaToMask ||
-                        output.Size is <= 0 or > RenderSize || output.MipLevels != 1 || output.ArraySize is <= 0 or > 2048 ||
+                        output.Size <= 0 || output.Size > maxSize || output.MipLevels != 1 || output.ArraySize is <= 0 or > 2048 ||
                         (output.ArraySize > 1 && !depthIndependent))
                     {
                         throw new NotSupportedException($"Unsupported state for render target '{output.Name}'.");

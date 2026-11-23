@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using NumericsVector4 = System.Numerics.Vector4;
 
 namespace AssetStudio.Avalonia.Services;
 
@@ -218,9 +219,12 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(
             _context, depth, clearStencil ? 3u : 1u, value, 0);
 
-    internal void ClearColor(nint surface, float color = 0, float alpha = 0)
+    internal void ClearColor(nint surface, float color = 0, float alpha = 0) =>
+        ClearColor(surface, new NumericsVector4(color, color, color, alpha));
+
+    internal void ClearColor(nint surface, NumericsVector4 color)
     {
-        float* clear = stackalloc float[] { color, color, color, alpha };
+        float* clear = stackalloc float[] { color.X, color.Y, color.Z, color.W };
         ((delegate* unmanaged[Stdcall]<nint, nint, float*, void>)Slot(_context, 50))(_context, surface, clear);
     }
 

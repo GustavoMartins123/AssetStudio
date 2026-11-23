@@ -458,7 +458,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             {
                 targetView = GetRenderTarget(output).View;
                 size = output.Size;
-                _device.ClearColor(targetView);
+                _device.ClearColor(targetView, output.ClearColor);
             }
             nint depthView = draw.Output == null ? _depth : 0;
             nint secondaryView = temporal ? GetRenderTarget(TemporalHistory[_historyReadIndex ^ 1]).View : 0;
@@ -617,7 +617,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                         throw new InvalidDataException($"Render target '{input.Name}' is unavailable before this pass.");
                     }
                     gpu = GetRenderTarget(input).Texture;
-                    sampling = (input.Filter, 1, 1, 0, false);
+                    sampling = (input.Filter, input.Wrap, 1, 0, false);
                 }
                 else if (capturedNames.Contains(binding.Name) && _grabs.TryGetValue(binding.Name, out var grab))
                 {
@@ -929,7 +929,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 Format = target.Format,
                 SampleCount = 1, BindFlags = BindShaderResource | BindRenderTarget | (target.UnorderedAccess ? BindUnorderedAccess : 0u)
             });
-            var texture = new GpuTexture(image, _device.CreateShaderView(image), CreateSampler(_device, target.Filter, 1, 1, 0));
+            var texture = new GpuTexture(image, _device.CreateShaderView(image), CreateSampler(_device, target.Filter, target.Wrap, 1, 0));
             resource = (texture, _device.CreateRenderView(image),
                 target.UnorderedAccess ? _device.CreateUnorderedTextureView(image) : 0);
             _renderTargets.Add(target, resource);
