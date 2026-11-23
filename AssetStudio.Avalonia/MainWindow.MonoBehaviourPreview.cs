@@ -21,9 +21,18 @@ public partial class MainWindow
         public required string StatusMessage { get; init; }
     }
 
+    private sealed class PreparedMonoBehaviourTreeResult
+    {
+        public required MonoBehaviourTreeBuildResult TreeResult { get; init; }
+        public required string FullJsonText { get; init; }
+        public required string DisplayJsonText { get; init; }
+        public required string StatusMessage { get; init; }
+    }
+
     private void PreviewMonoBehaviour(AssetItem assetItem, MonoBehaviour m_MonoBehaviour, string fbxHeader)
     {
         var token = BeginAsyncPreviewRequest(out var requestId, out var previewVersion);
+        PreviewSession.ClearMonoBehaviourTree();
         PreviewSession.ActivateSurface(
             PreviewSurfaceKind.MonoBehaviour,
             assetItem,
@@ -46,10 +55,13 @@ public partial class MainWindow
         long previewVersion,
         CancellationToken token)
     {
+        var scanResultSnapshot = currentScanResult;
+        var folderPath = GetCurrentCacheFolderPath();
+
         try
         {
             // Fast path: attempt direct ToType() off the UI thread, checking for TextMeshPro TMP_FontAsset first.
-            var directResult = await Task.Run<(bool Succeeded, string? Text, PreparedTmpFontPreviewResult? TmpFont)>(() =>
+            var directResult = await Task.Run<(bool Succeeded, PreparedMonoBehaviourTreeResult? Tree, PreparedTmpFontPreviewResult? TmpFont)>(() =>
             {
                 token.ThrowIfCancellationRequested();
                 try
@@ -64,9 +76,15 @@ public partial class MainWindow
                             return (true, null, tmpFontPreview);
                         }
 
-                        var json = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
-                        token.ThrowIfCancellationRequested();
-                        return (true, TruncatePreviewText(fbxHeader + json), null);
+                        var preparedTree = BuildPreparedMonoBehaviourTreeBackground(
+                            assetItem,
+                            m_MonoBehaviour,
+                            obj,
+                            fbxHeader,
+                            scanResultSnapshot,
+                            folderPath,
+                            token);
+                        return (true, preparedTree, null);
                     }
                 }
                 catch (OperationCanceledException)
@@ -87,9 +105,9 @@ public partial class MainWindow
                 return;
             }
 
-            if (directResult.Succeeded && directResult.Text != null)
+            if (directResult.Succeeded && directResult.Tree != null)
             {
-                ApplyMonoBehaviourPreviewText(requestId, previewVersion, token, directResult.Text, "MonoBehaviour preview loaded (JSON format).");
+                ApplyMonoBehaviourTreePreview(assetItem, requestId, previewVersion, token, directResult.Tree);
                 return;
             }
 
@@ -118,7 +136,7 @@ public partial class MainWindow
                 return;
             }
 
-            var resolved = await Task.Run<(string? Text, string Status, PreparedTmpFontPreviewResult? TmpFont)>(() =>
+            var resolved = await Task.Run<(PreparedMonoBehaviourTreeResult? Tree, string? Text, string Status, PreparedTmpFontPreviewResult? TmpFont)>(() =>
             {
                 token.ThrowIfCancellationRequested();
 
@@ -133,12 +151,18 @@ public partial class MainWindow
                             var tmpFontPreview = TryPrepareTmpFontPreviewBackground(m_MonoBehaviour, obj, token);
                             if (tmpFontPreview != null)
                             {
-                                return (null, tmpFontPreview.StatusMessage, tmpFontPreview);
+                                return (null, null, tmpFontPreview.StatusMessage, tmpFontPreview);
                             }
 
-                            var json = Newtonsoft.Json.JsonConvert.SerializeObject(obj, Newtonsoft.Json.Formatting.Indented);
-                            token.ThrowIfCancellationRequested();
-                            return (TruncatePreviewText(fbxHeader + json), "MonoBehaviour preview loaded (JSON format).", null);
+                            var preparedTree = BuildPreparedMonoBehaviourTreeBackground(
+                                assetItem,
+                                m_MonoBehaviour,
+                                obj,
+                                fbxHeader,
+                                scanResultSnapshot,
+                                folderPath,
+                                token);
+                            return (preparedTree, null, preparedTree.StatusMessage, null);
                         }
                     }
                     catch (OperationCanceledException)
@@ -167,13 +191,19 @@ public partial class MainWindow
 
                 token.ThrowIfCancellationRequested();
                 return dumpStr != null
-                    ? (TruncatePreviewText(fbxHeader + dumpStr), "MonoBehaviour loaded (text dump).", null)
-                    : (null, "MonoBehaviour loaded (no dump/types available).", null);
+                    ? (null, TruncatePreviewText(fbxHeader + dumpStr), "MonoBehaviour loaded (text dump).", null)
+                    : (null, null, "MonoBehaviour loaded (no dump/types available).", null);
             }, token);
 
             if (resolved.TmpFont != null)
             {
                 ApplyTmpFontPreview(assetItem, requestId, previewVersion, token, resolved.TmpFont);
+                return;
+            }
+
+            if (resolved.Tree != null)
+            {
+                ApplyMonoBehaviourTreePreview(assetItem, requestId, previewVersion, token, resolved.Tree);
                 return;
             }
 
@@ -188,6 +218,314 @@ public partial class MainWindow
             var errorText = TruncatePreviewText($"Failed to preview MonoBehaviour {assetItem.Name}:{Environment.NewLine}{ex.Message}");
             ApplyMonoBehaviourPreviewText(requestId, previewVersion, token, errorText, $"MonoBehaviour preview error: {ex.Message}");
         }
+    }
+
+    private PreparedMonoBehaviourTreeResult BuildPreparedMonoBehaviourTreeBackground(
+        AssetItem assetItem,
+        MonoBehaviour monoBehaviour,
+        OrderedDictionary fields,
+        string fbxHeader,
+        ProjectScanResult? scanResultSnapshot,
+        string? folderPath,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
+        var sourceFile = monoBehaviour.assetsFile;
+        var semanticLookup = BuildSemanticOutgoingLookupBackground(sourceFile, monoBehaviour.m_PathID, scanResultSnapshot, folderPath);
+        var scriptTitle = ResolveMonoBehaviourScriptTitle(monoBehaviour, assetItem, sourceFile);
+
+        var treeResult = MonoBehaviourTreeBuilder.Build(
+            fields,
+            pptrResolver: (fileId, pathId) => ResolvePPtrMetadataForInspector(
+                sourceFile,
+                fileId,
+                pathId,
+                ClassIDType.UnknownType,
+                relation: string.Empty,
+                semanticLookup),
+            scriptTitle: scriptTitle,
+            options: MonoBehaviourTreeBuildOptions.Default,
+            cancellationToken: token);
+
+        token.ThrowIfCancellationRequested();
+        var json = Newtonsoft.Json.JsonConvert.SerializeObject(fields, Newtonsoft.Json.Formatting.Indented);
+        token.ThrowIfCancellationRequested();
+        var fullJson = string.IsNullOrEmpty(fbxHeader) ? json : fbxHeader + json;
+        var displayJson = TruncatePreviewText(fullJson);
+
+        var status = $"MonoBehaviour loaded: {scriptTitle} ({treeResult.SummaryText})";
+        return new PreparedMonoBehaviourTreeResult
+        {
+            TreeResult = treeResult,
+            FullJsonText = fullJson,
+            DisplayJsonText = displayJson,
+            StatusMessage = status
+        };
+    }
+
+    internal Dictionary<string, AssetReferenceItem>? BuildSemanticOutgoingLookupBackground(
+        SerializedFile? sourceFile,
+        long pathId,
+        ProjectScanResult? scanResultSnapshot,
+        string? folderPath)
+    {
+        if (sourceFile == null || pathId == 0 || scanResultSnapshot == null || string.IsNullOrWhiteSpace(folderPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var selfUid = AssetHandle.BuildUniqueID(sourceFile, pathId);
+            if (string.IsNullOrWhiteSpace(selfUid))
+            {
+                return null;
+            }
+
+            var signature = _sqliteCache.GetFolderSignature(scanResultSnapshot);
+            var usedBy = new List<AssetReferenceItem>();
+            var uses = new List<AssetReferenceItem>();
+            _sqliteCache.LoadAssetReferencesFromSemanticCache(folderPath, signature, selfUid, usedBy, uses, maxPerDirection: 256);
+            if (uses.Count == 0)
+            {
+                return null;
+            }
+
+            var lookup = new Dictionary<string, AssetReferenceItem>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < uses.Count; i++)
+            {
+                var item = uses[i];
+                if (!string.IsNullOrWhiteSpace(item.AssetUniqueId) && !lookup.ContainsKey(item.AssetUniqueId))
+                {
+                    lookup[item.AssetUniqueId] = item;
+                }
+            }
+
+            return lookup.Count > 0 ? lookup : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal AssetReferenceItem? ResolvePPtrMetadataForInspector(
+        SerializedFile? sourceFile,
+        int fileId,
+        long pathId,
+        ClassIDType fallbackType,
+        string relation,
+        Dictionary<string, AssetReferenceItem>? semanticLookup)
+    {
+        if (pathId == 0)
+        {
+            return null;
+        }
+
+        // 1) In-memory already-loaded object (NEVER triggers disk/bundle loads in Lazy Mode).
+        AssetStudio.Object? loadedObj = null;
+        string serializedFileName = string.Empty;
+        string uniqueId = string.Empty;
+
+        if (sourceFile != null)
+        {
+            if (fileId == 0)
+            {
+                serializedFileName = sourceFile.fileName ?? string.Empty;
+                uniqueId = AssetHandle.BuildUniqueID(sourceFile, pathId);
+                sourceFile.TryGetObject(pathId, out loadedObj);
+            }
+            else if (fileId > 0 && sourceFile.m_Externals != null && fileId - 1 < sourceFile.m_Externals.Count)
+            {
+                var ext = sourceFile.m_Externals[fileId - 1];
+                serializedFileName = NormalizeExternalFileNameForInspector(ext?.fileName, ext?.pathName);
+                if (assetsManager.TryFindSerializedFile(ext?.fileName, ext?.pathName, out var extFile) && extFile != null)
+                {
+                    serializedFileName = extFile.fileName ?? serializedFileName;
+                    uniqueId = AssetHandle.BuildUniqueID(extFile, pathId);
+                    extFile.TryGetObject(pathId, out loadedObj);
+                }
+                else if (!string.IsNullOrWhiteSpace(serializedFileName))
+                {
+                    uniqueId = $"{serializedFileName}#{pathId.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
+                }
+            }
+        }
+
+        if (loadedObj != null)
+        {
+            var objName = loadedObj switch
+            {
+                NamedObject named when !string.IsNullOrWhiteSpace(named.m_Name) => named.m_Name,
+                GameObject go when !string.IsNullOrWhiteSpace(go.m_Name) => go.m_Name,
+                MonoBehaviour mb when !string.IsNullOrWhiteSpace(mb.m_Name) => mb.m_Name,
+                _ => $"{AssetItem.GetCachedTypeString(loadedObj.type)} ({loadedObj.m_PathID.ToString(System.Globalization.CultureInfo.InvariantCulture)})"
+            };
+
+            return new AssetReferenceItem
+            {
+                AssetUniqueId = loadedObj.assetsFile != null ? AssetHandle.BuildUniqueID(loadedObj.assetsFile, loadedObj.m_PathID) : uniqueId,
+                Name = objName,
+                AssetType = loadedObj.type,
+                TypeName = AssetItem.GetCachedTypeString(loadedObj.type),
+                Relation = relation,
+                PathId = loadedObj.m_PathID,
+                SerializedFileName = loadedObj.assetsFile?.fileName ?? serializedFileName,
+                Direction = AssetReferenceDirection.References
+            };
+        }
+
+        // 2) ProjectIndex O(1) in-memory lookup (zero disk I/O).
+        AssetHandle? handle = !string.IsNullOrWhiteSpace(uniqueId)
+            ? assetsManager.ProjectIndex.GetHandle(uniqueId)
+            : null;
+        if (handle == null && !string.IsNullOrWhiteSpace(serializedFileName))
+        {
+            handle = assetsManager.ProjectIndex.GetHandlesForFile(serializedFileName)
+                .FirstOrDefault(h => h.PathID == pathId);
+        }
+
+        if (handle != null)
+        {
+            return new AssetReferenceItem
+            {
+                AssetUniqueId = handle.UniqueID,
+                Name = !string.IsNullOrWhiteSpace(handle.Name) ? handle.Name : $"{handle.Type} ({handle.PathID})",
+                AssetType = handle.Type,
+                TypeName = AssetItem.GetCachedTypeString(handle.Type),
+                Relation = relation,
+                PathId = handle.PathID,
+                SerializedFileName = handle.SerializedFileName ?? serializedFileName,
+                Direction = AssetReferenceDirection.References
+            };
+        }
+
+        // 3) SQLite semantic cache fallback (preloaded for this asset without touching bundles).
+        if (semanticLookup != null && !string.IsNullOrWhiteSpace(uniqueId) && semanticLookup.TryGetValue(uniqueId, out var cachedRef))
+        {
+            return new AssetReferenceItem
+            {
+                AssetUniqueId = cachedRef.AssetUniqueId,
+                Name = cachedRef.Name,
+                AssetType = cachedRef.AssetType,
+                TypeName = cachedRef.TypeName,
+                Relation = !string.IsNullOrWhiteSpace(relation) ? relation : cachedRef.Relation,
+                PathId = cachedRef.PathId != 0 ? cachedRef.PathId : pathId,
+                SerializedFileName = !string.IsNullOrWhiteSpace(cachedRef.SerializedFileName) ? cachedRef.SerializedFileName : serializedFileName,
+                Direction = AssetReferenceDirection.References
+            };
+        }
+
+        // 4) Local SerializedFile ObjectInfo metadata fallback.
+        var resolvedType = fallbackType;
+        if (fileId == 0 && sourceFile != null && sourceFile.ObjectInfoDic != null && sourceFile.ObjectInfoDic.TryGetValue(pathId, out var objInfo))
+        {
+            resolvedType = (ClassIDType)objInfo.classID;
+        }
+
+        var typeLabel = resolvedType != ClassIDType.UnknownType
+            ? AssetItem.GetCachedTypeString(resolvedType)
+            : "Object";
+        return new AssetReferenceItem
+        {
+            AssetUniqueId = uniqueId,
+            Name = $"{typeLabel} ({pathId.ToString(System.Globalization.CultureInfo.InvariantCulture)})",
+            AssetType = resolvedType,
+            TypeName = typeLabel,
+            Relation = relation,
+            PathId = pathId,
+            SerializedFileName = serializedFileName,
+            Direction = AssetReferenceDirection.References
+        };
+    }
+
+    private string ResolveMonoBehaviourScriptTitle(MonoBehaviour monoBehaviour, AssetItem assetItem, SerializedFile? sourceFile)
+    {
+        if (monoBehaviour.m_Script != null && !monoBehaviour.m_Script.IsNull && sourceFile != null)
+        {
+            AssetStudio.Object? scriptObj = null;
+            if (monoBehaviour.m_Script.m_FileID == 0)
+            {
+                sourceFile.TryGetObject(monoBehaviour.m_Script.m_PathID, out scriptObj);
+            }
+            else if (monoBehaviour.m_Script.m_FileID > 0
+                && sourceFile.m_Externals != null
+                && monoBehaviour.m_Script.m_FileID - 1 < sourceFile.m_Externals.Count)
+            {
+                var ext = sourceFile.m_Externals[monoBehaviour.m_Script.m_FileID - 1];
+                if (assetsManager.TryFindSerializedFile(ext?.fileName, ext?.pathName, out var extFile) && extFile != null)
+                {
+                    extFile.TryGetObject(monoBehaviour.m_Script.m_PathID, out scriptObj);
+                }
+            }
+
+            if (scriptObj is MonoScript ms && !string.IsNullOrWhiteSpace(ms.m_ClassName))
+            {
+                var fullType = !string.IsNullOrWhiteSpace(ms.m_Namespace)
+                    ? $"{ms.m_Namespace}.{ms.m_ClassName}"
+                    : ms.m_ClassName;
+                if (!string.IsNullOrWhiteSpace(assetItem.Name)
+                    && !string.Equals(assetItem.Name, ms.m_ClassName, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(assetItem.Name, fullType, StringComparison.OrdinalIgnoreCase))
+                {
+                    return $"{assetItem.Name} ({fullType})";
+                }
+
+                return fullType;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(assetItem.Name))
+        {
+            return assetItem.Name;
+        }
+
+        if (!string.IsNullOrWhiteSpace(monoBehaviour.m_Name))
+        {
+            return monoBehaviour.m_Name;
+        }
+
+        return "MonoBehaviour";
+    }
+
+    private static string NormalizeExternalFileNameForInspector(string? fileName, string? pathName)
+    {
+        var candidate = !string.IsNullOrWhiteSpace(fileName) ? fileName! : (pathName ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return string.Empty;
+        }
+
+        var normalized = candidate.Replace('\\', '/').TrimEnd('/');
+        var slash = normalized.LastIndexOf('/');
+        return slash >= 0 ? normalized.Substring(slash + 1) : normalized;
+    }
+
+    private void ApplyMonoBehaviourTreePreview(
+        AssetItem assetItem,
+        long requestId,
+        long previewVersion,
+        CancellationToken token,
+        PreparedMonoBehaviourTreeResult prepared)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!IsPreviewRequestCurrent(requestId, previewVersion, token))
+            {
+                return;
+            }
+
+            PreviewSession.ShowMonoBehaviourTree(
+                assetItem,
+                prepared.TreeResult,
+                prepared.FullJsonText,
+                prepared.DisplayJsonText);
+            TextPreviewBox.Text = string.Empty;
+            TextPreviewBox.IsVisible = false;
+            PreviewLabel.IsVisible = false;
+            StatusStripUpdate(prepared.StatusMessage);
+        });
     }
 
     private PreparedTmpFontPreviewResult? TryPrepareTmpFontPreviewBackground(

@@ -3,6 +3,7 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Threading;
 using AssetStudio;
+using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.ViewModels;
 using System;
 using System.Collections.Generic;
@@ -110,6 +111,117 @@ public partial class MainWindow
         treeSearchResults.Clear();
         treeSearchResults.AddRange(matches);
         nextGameObjectSearchIndex = 0;
+    }
+
+    private void SceneTreeView_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        var selectedNode = SceneTreeView?.SelectedItem as GameObjectNode;
+        SceneHierarchy.SelectedNode = selectedNode;
+
+        if (selectedNode == null)
+        {
+            if (PreviewSession.IsGameObjectInspectorVisible)
+            {
+                PreviewSession.ClearGameObjectInspector();
+            }
+            return;
+        }
+
+        if (!ViewModel.Options.EnablePreview)
+        {
+            return;
+        }
+
+        InspectSceneHierarchyNode(selectedNode);
+    }
+
+    private void InspectSceneHierarchyNode(GameObjectNode node)
+    {
+        PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
+        var token = PreviewSession.BeginGameObjectInspectorRequest(out var requestId);
+        var scanResultSnapshot = currentScanResult;
+        var folderPath = GetCurrentCacheFolderPath();
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                Dictionary<string, AssetReferenceItem>? semanticLookup = null;
+                if (node.GameObject != null)
+                {
+                    semanticLookup = BuildSemanticOutgoingLookupBackground(
+                        node.GameObject.assetsFile,
+                        node.GameObject.m_PathID,
+                        scanResultSnapshot,
+                        folderPath);
+                }
+
+                var snapshot = GameObjectInspectorService.BuildFromNode(
+                    node,
+                    pptrResolver: (srcFile, fileId, pathId, fallbackType, relation) =>
+                        ResolvePPtrMetadataForInspector(srcFile, fileId, pathId, fallbackType, relation, semanticLookup),
+                    projectIndex: assetsManager.ProjectIndex,
+                    cancellationToken: token);
+
+                token.ThrowIfCancellationRequested();
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (IsWindowClosingOrClosed
+                        || !PreviewSession.IsGameObjectInspectorRequestCurrent(requestId, token)
+                        || !ReferenceEquals(SceneTreeView?.SelectedItem, node))
+                    {
+                        return;
+                    }
+
+                    if (RightTabControl != null && RightTabControl.SelectedIndex != 0)
+                    {
+                        _suppressNextRightTabSelectionPreview = true;
+                        RightTabControl.SelectedIndex = 0;
+                    }
+
+                    TextPreviewBox.IsVisible = false;
+                    if (ImagePreviewBox != null)
+                    {
+                        ImagePreviewBox.IsVisible = false;
+                    }
+                    if (GLPreviewControl != null)
+                    {
+                        GLPreviewControl.IsVisible = false;
+                    }
+                    if (TextureGLPreview != null)
+                    {
+                        TextureGLPreview.IsVisible = false;
+                    }
+                    PreviewLabel.IsVisible = false;
+
+                    PreviewSession.CompleteGameObjectInspectorRequest(requestId, snapshot);
+                    var compCount = snapshot.Components.Count;
+                    StatusStripUpdate($"Inspecting GameObject: {snapshot.Name} ({compCount} {(compCount == 1 ? "component" : "components")})");
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LoggerEvent.Warning, $"Failed to inspect scene node '{node.Name}': {ex.Message}");
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (!IsWindowClosingOrClosed && PreviewSession.IsGameObjectInspectorRequestCurrent(requestId, token))
+                    {
+                        PreviewSession.IsGameObjectInspectorLoading = false;
+                        StatusStripUpdate($"GameObject inspection error: {ex.Message}");
+                    }
+                });
+            }
+        }, token);
     }
 
     private void ExecuteGoToSceneHierarchy()

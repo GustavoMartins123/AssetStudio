@@ -196,6 +196,7 @@ public partial class MainWindow : Window
         Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
         InitializeComponent();
         AssetListDataGrid.ItemsSource = visibleAssetItems;
+        AssetListDataGrid.SelectionChanged += OnAssetListSelectionChangedForPhase1;
         AssetClassesDataGrid.ItemsSource = visibleAssetClassItems;
         GLPreviewControl.LoadMeshPreviewGeometryCache = LoadMeshPreviewGeometryCache;
         GLPreviewControl.SaveMeshPreviewGeometryCache = SaveMeshPreviewGeometryCache;
@@ -444,6 +445,11 @@ public partial class MainWindow : Window
         handlers.ExportPreviewModelAsync = ExportPreviewModelCommandHandlerAsync;
         handlers.BatchExportPreviewAnimationsAsync = BatchExportPreviewAnimationsCommandHandlerAsync;
         handlers.NavigateToReferencedAssetAsync = NavigateToReferencedAssetCommandHandlerAsync;
+        handlers.CopyMonoBehaviourJsonAsync = CopyMonoBehaviourJsonCommandHandlerAsync;
+        handlers.NavigateToPPtrAsync = NavigateToReferencedAssetCommandHandlerAsync;
+        handlers.NavigateToInspectorTargetAsync = NavigateToReferencedAssetCommandHandlerAsync;
+        handlers.NavigateBackAsync = NavigateBackCommandHandlerAsync;
+        handlers.NavigateForwardAsync = NavigateForwardCommandHandlerAsync;
 
         handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;
         handlers.VideoStopAsync = VideoStopAsync;
@@ -493,6 +499,41 @@ public partial class MainWindow : Window
         ViewModel.Options.AutoLoadExternalDependenciesChanged += OnAutoLoadExternalDependenciesOptionChanged;
         ViewModel.Options.ShowErrorMessageChanged += OnShowErrorMessageOptionChanged;
         ViewModel.Options.ThemeChanged += OnThemeOptionChanged;
+    }
+
+    private void OnAssetListSelectionChangedForPhase1(object? sender, SelectionChangedEventArgs e)
+    {
+        if (isRefreshingFilterList || IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        if (AssetListDataGrid.SelectedItem is AssetItem assetItem)
+        {
+            PreviewSession.ClearGameObjectInspector();
+            RecordCurrentAssetInNavigationHistory(assetItem);
+        }
+        else
+        {
+            PreviewSession.ClearMonoBehaviourTree();
+            PreviewSession.ClearGameObjectInspector();
+        }
+    }
+
+    private async Task CopyMonoBehaviourJsonCommandHandlerAsync()
+    {
+        var json = !string.IsNullOrEmpty(PreviewSession.MonoBehaviourFullJsonText)
+            ? PreviewSession.MonoBehaviourFullJsonText
+            : PreviewSession.MonoBehaviourJsonText;
+        if (string.IsNullOrEmpty(json))
+        {
+            return;
+        }
+
+        if (await ViewModel.DialogService.CopyTextToClipboardAsync(json))
+        {
+            StatusStripUpdate("Copied MonoBehaviour JSON to clipboard.");
+        }
     }
 
     private void UnwireViewModelOptions()
@@ -2315,6 +2356,7 @@ public partial class MainWindow : Window
         sceneTreeNodes.Clear();
         treeSearchResults.Clear();
         SceneTreeView.ItemsSource = null;
+        AssetListDataGrid.SelectionChanged -= OnAssetListSelectionChangedForPhase1;
         AssetListDataGrid.ItemsSource = null;
         AssetClassesDataGrid.ItemsSource = null;
         assetContextItem = null;

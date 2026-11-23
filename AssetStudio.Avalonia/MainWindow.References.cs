@@ -15,6 +15,63 @@ namespace AssetStudio.Avalonia;
 public partial class MainWindow
 {
     private AsyncPreviewRequestCoordinator _referencesRequestCoordinator => PreviewSession.ReferencesCoordinator;
+    private bool _isNavigatingHistory;
+
+    private void RecordCurrentAssetInNavigationHistory(AssetItem? item)
+    {
+        if (_isNavigatingHistory || item == null)
+        {
+            return;
+        }
+
+        PreviewSession.RecordNavigation(AssetNavigationEntry.FromAssetItem(item));
+    }
+
+    private async Task NavigateBackCommandHandlerAsync()
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        if (!PreviewSession.TryNavigateBack(out var entry) || entry == null)
+        {
+            return;
+        }
+
+        _isNavigatingHistory = true;
+        try
+        {
+            await NavigateToReferencedAssetCoreAsync(entry.ToReferenceItem(), recordHistory: false);
+        }
+        finally
+        {
+            _isNavigatingHistory = false;
+        }
+    }
+
+    private async Task NavigateForwardCommandHandlerAsync()
+    {
+        if (IsWindowClosingOrClosed)
+        {
+            return;
+        }
+
+        if (!PreviewSession.TryNavigateForward(out var entry) || entry == null)
+        {
+            return;
+        }
+
+        _isNavigatingHistory = true;
+        try
+        {
+            await NavigateToReferencedAssetCoreAsync(entry.ToReferenceItem(), recordHistory: false);
+        }
+        finally
+        {
+            _isNavigatingHistory = false;
+        }
+    }
 
     private async Task UpdateReferencesForSelectedAssetAsync()
     {
@@ -106,7 +163,12 @@ public partial class MainWindow
         }
     }
 
-    private async Task NavigateToReferencedAssetCommandHandlerAsync(AssetReferenceItem? target)
+    private Task NavigateToReferencedAssetCommandHandlerAsync(AssetReferenceItem? target)
+    {
+        return NavigateToReferencedAssetCoreAsync(target, recordHistory: true);
+    }
+
+    private async Task NavigateToReferencedAssetCoreAsync(AssetReferenceItem? target, bool recordHistory)
     {
         if (target == null || !target.IsNavigable || IsWindowClosingOrClosed)
         {
@@ -114,6 +176,14 @@ public partial class MainWindow
         }
 
         PrioritizeUserInteraction(UserPreviewPriorityMilliseconds);
+
+        // Ensure the asset we are jumping FROM is recorded before jumping to the target.
+        if (recordHistory && AssetListDataGrid.SelectedItem is AssetItem currentItem)
+        {
+            RecordCurrentAssetInNavigationHistory(currentItem);
+        }
+
+        PreviewSession.ClearGameObjectInspector();
 
         // Switch left panel to Asset List tab so the target row is visible.
         if (LeftTabControl != null && LeftTabControl.SelectedIndex != 1)
@@ -141,8 +211,25 @@ public partial class MainWindow
         }
 
         // Select, scroll into view, and switch RightTabControl to Preview tab so it previews immediately.
-        AssetListDataGrid.SelectedItem = locatedItem;
-        AssetListDataGrid.ScrollIntoView(locatedItem, null);
+        var previousHistoryFlag = _isNavigatingHistory;
+        if (!recordHistory)
+        {
+            _isNavigatingHistory = true;
+        }
+        try
+        {
+            AssetListDataGrid.SelectedItem = locatedItem;
+            AssetListDataGrid.ScrollIntoView(locatedItem, null);
+            if (recordHistory)
+            {
+                RecordCurrentAssetInNavigationHistory(locatedItem);
+            }
+        }
+        finally
+        {
+            _isNavigatingHistory = previousHistoryFlag;
+        }
+
         if (RightTabControl != null && RightTabControl.SelectedIndex != 0)
         {
             RightTabControl.SelectedIndex = 0;

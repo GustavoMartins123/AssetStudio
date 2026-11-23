@@ -65,7 +65,9 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly AsyncPreviewRequestCoordinator _previewCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _dumpCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _referencesCoordinator = new();
+        private readonly AsyncPreviewRequestCoordinator _inspectorCoordinator = new();
         private readonly AnimationPreviewLoadCoordinator _animationCoordinator = new();
+        private readonly AssetNavigationHistory _navigationHistory = new();
 
         private long _previewVersion;
         private PreviewSurfaceKind _activeKind = PreviewSurfaceKind.None;
@@ -113,10 +115,38 @@ namespace AssetStudio.Avalonia.ViewModels
         private string? _lastPreviewSourceKind;
         private bool _lastPreviewMaterialsLoading;
 
+        // Phase 1: MonoBehaviour Searchable Tree / JSON Viewer
+        private IReadOnlyList<AssetPropertyNode> _allMonoBehaviourTreeRoots = Array.Empty<AssetPropertyNode>();
+        private string _monoBehaviourFilterText = string.Empty;
+        private bool _hasMonoBehaviourTree;
+        private bool _isMonoBehaviourJsonMode;
+        private string _monoBehaviourScriptTitle = string.Empty;
+        private string _monoBehaviourSummaryText = string.Empty;
+        private int _monoBehaviourPPtrCount;
+        private string _monoBehaviourJsonText = string.Empty;
+        private string _monoBehaviourFullJsonText = string.Empty;
+
+        // Phase 1: Scene Hierarchy GameObject Component Inspector
+        private bool _isGameObjectInspectorVisible;
+        private bool _isGameObjectInspectorLoading;
+        private GameObjectInspectorSnapshot? _inspectedGameObject;
+        private IReadOnlyList<GameObjectComponentInfo> _allInspectorComponents = Array.Empty<GameObjectComponentInfo>();
+        private string _inspectorFilterText = string.Empty;
+        private string _inspectorComponentsHeader = DefaultInspectorComponentsHeader;
+
+        // Phase 1: Back / Forward Navigation History
+        private bool _canNavigateBack;
+        private bool _canNavigateForward;
+        private string _navigateBackTooltip = DefaultNavigateBackTooltip;
+        private string _navigateForwardTooltip = DefaultNavigateForwardTooltip;
+
         public const string DefaultReferencesTargetTitle = "No asset selected";
         public const string DefaultReferencesSummary = "Select an asset to inspect references.";
         public const string DefaultReferencedByHeader = "Referenced By / Used By (0)";
         public const string DefaultReferencesHeader = "References / Uses (0)";
+        public const string DefaultInspectorComponentsHeader = "Components (0)";
+        public const string DefaultNavigateBackTooltip = "Back (Alt+Left)";
+        public const string DefaultNavigateForwardTooltip = "Forward (Alt+Right)";
 
         public PreviewSessionViewModel(Action<Action>? dispatchToUi = null)
         {
@@ -126,6 +156,8 @@ namespace AssetStudio.Avalonia.ViewModels
             PreviewCandidates = new BulkObservableCollection<PreviewCandidateItem>();
             FilteredReferencedByItems = new BulkObservableCollection<AssetReferenceItem>();
             FilteredReferencesItems = new BulkObservableCollection<AssetReferenceItem>();
+            MonoBehaviourTreeRoots = new BulkObservableCollection<AssetPropertyNode>();
+            InspectorComponents = new BulkObservableCollection<GameObjectComponentInfo>();
         }
 
         internal AsyncPreviewRequestCoordinator PreviewCoordinator => _previewCoordinator;
@@ -134,7 +166,11 @@ namespace AssetStudio.Avalonia.ViewModels
 
         internal AsyncPreviewRequestCoordinator ReferencesCoordinator => _referencesCoordinator;
 
+        internal AsyncPreviewRequestCoordinator InspectorCoordinator => _inspectorCoordinator;
+
         internal AnimationPreviewLoadCoordinator AnimationCoordinator => _animationCoordinator;
+
+        public AssetNavigationHistory NavigationHistory => _navigationHistory;
 
         public long CurrentPreviewRequestId => _previewCoordinator.CurrentRequestId;
 
@@ -147,6 +183,10 @@ namespace AssetStudio.Avalonia.ViewModels
         public long CurrentReferencesRequestId => _referencesCoordinator.CurrentRequestId;
 
         public long CancelledReferencesRequestCount => _referencesCoordinator.CancelledRequestCount;
+
+        public long CurrentInspectorRequestId => _inspectorCoordinator.CurrentRequestId;
+
+        public long CancelledInspectorRequestCount => _inspectorCoordinator.CancelledRequestCount;
 
         public long CurrentAnimationRequestId => _animationCoordinator.CurrentRequestId;
 
@@ -161,6 +201,10 @@ namespace AssetStudio.Avalonia.ViewModels
         public BulkObservableCollection<AssetReferenceItem> FilteredReferencedByItems { get; }
 
         public BulkObservableCollection<AssetReferenceItem> FilteredReferencesItems { get; }
+
+        public BulkObservableCollection<AssetPropertyNode> MonoBehaviourTreeRoots { get; }
+
+        public BulkObservableCollection<GameObjectComponentInfo> InspectorComponents { get; }
 
         public ShaderPreviewViewModel ShaderPreview { get; }
 
@@ -187,7 +231,9 @@ namespace AssetStudio.Avalonia.ViewModels
                 or PreviewSurfaceKind.MonoBehaviour
                 or PreviewSurfaceKind.AnimatorGraph
                 or PreviewSurfaceKind.Prefab
-            && !_isDialogueCardsVisible;
+            && !_isDialogueCardsVisible
+            && !_hasMonoBehaviourTree
+            && !_isGameObjectInspectorVisible;
 
         public bool IsImageSurfaceVisible =>
             _activeKind is PreviewSurfaceKind.Texture
@@ -214,7 +260,17 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool IsPreviewEnabled
         {
             get => _isPreviewEnabled;
-            set => SetProperty(ref _isPreviewEnabled, value);
+            set
+            {
+                if (SetProperty(ref _isPreviewEnabled, value) && !value)
+                {
+                    lock (_stateLock)
+                    {
+                        ClearMonoBehaviourTreeCore();
+                        ClearGameObjectInspectorCore();
+                    }
+                }
+            }
         }
 
         public bool IsDisplayInfoEnabled
@@ -560,6 +616,162 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             get => _lastPreviewMaterialsLoading;
             private set => SetProperty(ref _lastPreviewMaterialsLoading, value);
+        }
+
+        // Phase 1: MonoBehaviour Searchable Tree / JSON Viewer properties
+
+        public string MonoBehaviourFilterText
+        {
+            get => _monoBehaviourFilterText;
+            set
+            {
+                var normalized = value ?? string.Empty;
+                if (SetProperty(ref _monoBehaviourFilterText, normalized))
+                {
+                    ApplyMonoBehaviourFilterCore();
+                }
+            }
+        }
+
+        public bool HasMonoBehaviourTree
+        {
+            get => _hasMonoBehaviourTree;
+            private set
+            {
+                if (SetProperty(ref _hasMonoBehaviourTree, value))
+                {
+                    OnPropertyChanged(nameof(IsMonoBehaviourPanelVisible));
+                    OnPropertyChanged(nameof(IsMonoBehaviourTreeViewVisible));
+                    OnPropertyChanged(nameof(IsMonoBehaviourJsonViewVisible));
+                    OnPropertyChanged(nameof(IsTextSurfaceVisible));
+                }
+            }
+        }
+
+        public bool IsMonoBehaviourJsonMode
+        {
+            get => _isMonoBehaviourJsonMode;
+            set
+            {
+                if (SetProperty(ref _isMonoBehaviourJsonMode, value))
+                {
+                    OnPropertyChanged(nameof(IsMonoBehaviourTreeViewVisible));
+                    OnPropertyChanged(nameof(IsMonoBehaviourJsonViewVisible));
+                    OnPropertyChanged(nameof(MonoBehaviourModeToggleLabel));
+                }
+            }
+        }
+
+        public bool IsMonoBehaviourPanelVisible => _hasMonoBehaviourTree && !_isGameObjectInspectorVisible;
+
+        public bool IsMonoBehaviourTreeViewVisible => _hasMonoBehaviourTree && !_isMonoBehaviourJsonMode && !_isGameObjectInspectorVisible;
+
+        public bool IsMonoBehaviourJsonViewVisible => _hasMonoBehaviourTree && _isMonoBehaviourJsonMode && !_isGameObjectInspectorVisible;
+
+        public string MonoBehaviourModeToggleLabel => _isMonoBehaviourJsonMode ? "Tree" : "JSON";
+
+        public string MonoBehaviourScriptTitle
+        {
+            get => _monoBehaviourScriptTitle;
+            private set => SetProperty(ref _monoBehaviourScriptTitle, value ?? string.Empty);
+        }
+
+        public string MonoBehaviourSummaryText
+        {
+            get => _monoBehaviourSummaryText;
+            private set => SetProperty(ref _monoBehaviourSummaryText, value ?? string.Empty);
+        }
+
+        public int MonoBehaviourPPtrCount
+        {
+            get => _monoBehaviourPPtrCount;
+            private set => SetProperty(ref _monoBehaviourPPtrCount, value);
+        }
+
+        public string MonoBehaviourJsonText
+        {
+            get => _monoBehaviourJsonText;
+            private set => SetProperty(ref _monoBehaviourJsonText, value ?? string.Empty);
+        }
+
+        public string MonoBehaviourFullJsonText
+        {
+            get => _monoBehaviourFullJsonText;
+            private set => SetProperty(ref _monoBehaviourFullJsonText, value ?? string.Empty);
+        }
+
+        // Phase 1: Scene Hierarchy GameObject Component Inspector properties
+
+        public bool IsGameObjectInspectorVisible
+        {
+            get => _isGameObjectInspectorVisible;
+            private set
+            {
+                if (SetProperty(ref _isGameObjectInspectorVisible, value))
+                {
+                    OnPropertyChanged(nameof(IsMonoBehaviourPanelVisible));
+                    OnPropertyChanged(nameof(IsMonoBehaviourTreeViewVisible));
+                    OnPropertyChanged(nameof(IsMonoBehaviourJsonViewVisible));
+                    OnPropertyChanged(nameof(IsTextSurfaceVisible));
+                }
+            }
+        }
+
+        public bool IsGameObjectInspectorLoading
+        {
+            get => _isGameObjectInspectorLoading;
+            set => SetProperty(ref _isGameObjectInspectorLoading, value);
+        }
+
+        public GameObjectInspectorSnapshot? InspectedGameObject
+        {
+            get => _inspectedGameObject;
+            private set => SetProperty(ref _inspectedGameObject, value);
+        }
+
+        public string InspectorFilterText
+        {
+            get => _inspectorFilterText;
+            set
+            {
+                var normalized = value ?? string.Empty;
+                if (SetProperty(ref _inspectorFilterText, normalized))
+                {
+                    ApplyInspectorFilterCore();
+                }
+            }
+        }
+
+        public string InspectorComponentsHeader
+        {
+            get => _inspectorComponentsHeader;
+            private set => SetProperty(ref _inspectorComponentsHeader, value ?? DefaultInspectorComponentsHeader);
+        }
+
+        // Phase 1: Back / Forward Navigation History properties
+
+        public bool CanNavigateBack
+        {
+            get => _canNavigateBack;
+            private set => SetProperty(ref _canNavigateBack, value);
+        }
+
+        public bool CanNavigateForward
+        {
+            get => _canNavigateForward;
+            private set => SetProperty(ref _canNavigateForward, value);
+        }
+
+        public string NavigateBackTooltip
+        {
+            get => _navigateBackTooltip;
+            private set => SetProperty(ref _navigateBackTooltip, value ?? DefaultNavigateBackTooltip);
+        }
+
+        public string NavigateForwardTooltip
+        {
+            get => _navigateForwardTooltip;
+            private set => SetProperty(ref _navigateForwardTooltip, value ?? DefaultNavigateForwardTooltip);
         }
 
         public static string TruncatePreviewText(string? text, string fallbackText = "")
@@ -970,6 +1182,7 @@ namespace AssetStudio.Avalonia.ViewModels
             _previewCoordinator.CancelCurrent();
             _dumpCoordinator.CancelCurrent();
             _referencesCoordinator.CancelCurrent();
+            _inspectorCoordinator.CancelCurrent();
             _animationCoordinator.CancelCurrent();
             Interlocked.Increment(ref _previewVersion);
             _dispatchToUi(() =>
@@ -977,7 +1190,344 @@ namespace AssetStudio.Avalonia.ViewModels
                 IsLoading = false;
                 IsDumpLoading = false;
                 IsReferencesLoading = false;
+                IsGameObjectInspectorLoading = false;
             });
+        }
+
+        // Phase 1: MonoBehaviour Tree / JSON Viewer operations
+
+        public void ShowMonoBehaviourTree(
+            AssetItem? asset,
+            MonoBehaviourTreeBuildResult treeResult,
+            string? fullJsonText,
+            string? displayJsonText = null)
+        {
+            ArgumentNullException.ThrowIfNull(treeResult);
+            var fullJson = fullJsonText ?? string.Empty;
+            var displayJson = displayJsonText ?? TruncatePreviewText(fullJson);
+
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearGameObjectInspectorCore();
+                    ActiveKind = PreviewSurfaceKind.MonoBehaviour;
+                    if (asset != null)
+                    {
+                        ActiveAsset = asset;
+                    }
+
+                    var title = !string.IsNullOrWhiteSpace(treeResult.ScriptTitle)
+                        ? treeResult.ScriptTitle
+                        : (asset?.Name ?? "MonoBehaviour");
+                    PreviewTitle = title;
+                    MonoBehaviourScriptTitle = title;
+                    MonoBehaviourSummaryText = treeResult.SummaryText ?? string.Empty;
+                    MonoBehaviourPPtrCount = treeResult.PPtrCount;
+                    MonoBehaviourFullJsonText = fullJson;
+                    MonoBehaviourJsonText = displayJson;
+                    HasDialoguePreview = false;
+                    IsDialogueCardsVisible = false;
+                    TextContent = displayJson;
+
+                    _allMonoBehaviourTreeRoots = treeResult.Roots ?? Array.Empty<AssetPropertyNode>();
+                    SetProperty(ref _monoBehaviourFilterText, string.Empty, nameof(MonoBehaviourFilterText));
+                    IsMonoBehaviourJsonMode = false;
+                    HasMonoBehaviourTree = true;
+                    MonoBehaviourTreeRoots.ReplaceAll(_allMonoBehaviourTreeRoots);
+                    IsLoading = false;
+                }
+            });
+        }
+
+        public void SetMonoBehaviourViewMode(bool jsonMode)
+        {
+            _dispatchToUi(() =>
+            {
+                IsMonoBehaviourJsonMode = jsonMode;
+            });
+        }
+
+        public bool ToggleMonoBehaviourViewMode()
+        {
+            var next = !_isMonoBehaviourJsonMode;
+            SetMonoBehaviourViewMode(next);
+            return next;
+        }
+
+        public void ExpandAllMonoBehaviourNodes()
+        {
+            _dispatchToUi(() =>
+            {
+                MonoBehaviourTreeBuilder.SetExpandedRecursive(MonoBehaviourTreeRoots, isExpanded: true);
+            });
+        }
+
+        public void CollapseAllMonoBehaviourNodes()
+        {
+            _dispatchToUi(() =>
+            {
+                MonoBehaviourTreeBuilder.SetExpandedRecursive(MonoBehaviourTreeRoots, isExpanded: false);
+            });
+        }
+
+        public void ClearMonoBehaviourTree()
+        {
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearMonoBehaviourTreeCore();
+                }
+            });
+        }
+
+        private void ClearMonoBehaviourTreeCore()
+        {
+            _allMonoBehaviourTreeRoots = Array.Empty<AssetPropertyNode>();
+            if (MonoBehaviourTreeRoots.Count > 0)
+            {
+                MonoBehaviourTreeRoots.Clear();
+            }
+
+            SetProperty(ref _monoBehaviourFilterText, string.Empty, nameof(MonoBehaviourFilterText));
+            HasMonoBehaviourTree = false;
+            IsMonoBehaviourJsonMode = false;
+            MonoBehaviourScriptTitle = string.Empty;
+            MonoBehaviourSummaryText = string.Empty;
+            MonoBehaviourPPtrCount = 0;
+            MonoBehaviourJsonText = string.Empty;
+            MonoBehaviourFullJsonText = string.Empty;
+        }
+
+        private void ApplyMonoBehaviourFilterCore()
+        {
+            if (_allMonoBehaviourTreeRoots.Count == 0)
+            {
+                if (MonoBehaviourTreeRoots.Count > 0)
+                {
+                    MonoBehaviourTreeRoots.Clear();
+                }
+                return;
+            }
+
+            var filtered = MonoBehaviourTreeBuilder.FilterTree(_allMonoBehaviourTreeRoots, _monoBehaviourFilterText);
+            MonoBehaviourTreeRoots.ReplaceAll(filtered);
+        }
+
+        // Phase 1: Scene Hierarchy GameObject Component Inspector operations
+
+        public CancellationToken BeginGameObjectInspectorRequest(out long requestId)
+        {
+            var token = _inspectorCoordinator.BeginNewRequest(out requestId);
+            _dispatchToUi(() =>
+            {
+                IsGameObjectInspectorLoading = true;
+            });
+            return token;
+        }
+
+        public bool IsGameObjectInspectorRequestCurrent(long requestId, CancellationToken cancellationToken = default)
+        {
+            return !cancellationToken.IsCancellationRequested && _inspectorCoordinator.IsCurrent(requestId);
+        }
+
+        public bool CompleteGameObjectInspectorRequest(long requestId, GameObjectInspectorSnapshot snapshot)
+        {
+            ArgumentNullException.ThrowIfNull(snapshot);
+            if (!_inspectorCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_inspectorCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    ApplyGameObjectInspectorCore(snapshot);
+                }
+            });
+            return true;
+        }
+
+        public void ShowGameObjectInspector(GameObjectInspectorSnapshot snapshot)
+        {
+            ArgumentNullException.ThrowIfNull(snapshot);
+            _inspectorCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ApplyGameObjectInspectorCore(snapshot);
+                }
+            });
+        }
+
+        public void ClearGameObjectInspector()
+        {
+            _inspectorCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearGameObjectInspectorCore();
+                }
+            });
+        }
+
+        private void ApplyGameObjectInspectorCore(GameObjectInspectorSnapshot snapshot)
+        {
+            IsGameObjectInspectorLoading = false;
+            InspectedGameObject = snapshot;
+            _allInspectorComponents = snapshot.Components ?? Array.Empty<GameObjectComponentInfo>();
+            SetProperty(ref _inspectorFilterText, string.Empty, nameof(InspectorFilterText));
+            ApplyInspectorFilterCore();
+            IsGameObjectInspectorVisible = true;
+        }
+
+        private void ClearGameObjectInspectorCore()
+        {
+            IsGameObjectInspectorLoading = false;
+            IsGameObjectInspectorVisible = false;
+            InspectedGameObject = null;
+            _allInspectorComponents = Array.Empty<GameObjectComponentInfo>();
+            if (InspectorComponents.Count > 0)
+            {
+                InspectorComponents.Clear();
+            }
+
+            SetProperty(ref _inspectorFilterText, string.Empty, nameof(InspectorFilterText));
+            InspectorComponentsHeader = DefaultInspectorComponentsHeader;
+        }
+
+        private void ApplyInspectorFilterCore()
+        {
+            var filter = _inspectorFilterText?.Trim();
+            if (string.IsNullOrEmpty(filter))
+            {
+                InspectorComponents.ReplaceAll(_allInspectorComponents);
+                InspectorComponentsHeader = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Components ({_allInspectorComponents.Count:N0})");
+                return;
+            }
+
+            var filtered = new List<GameObjectComponentInfo>();
+            for (var i = 0; i < _allInspectorComponents.Count; i++)
+            {
+                if (_allInspectorComponents[i].MatchesFilter(filter))
+                {
+                    filtered.Add(_allInspectorComponents[i]);
+                }
+            }
+
+            InspectorComponents.ReplaceAll(filtered);
+            InspectorComponentsHeader = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Components ({filtered.Count:N0} of {_allInspectorComponents.Count:N0})");
+        }
+
+        // Phase 1: Back / Forward Navigation History operations
+
+        public bool RecordNavigation(AssetNavigationEntry? entry)
+        {
+            bool pushed;
+            lock (_stateLock)
+            {
+                pushed = _navigationHistory.Push(entry);
+            }
+
+            if (pushed)
+            {
+                SyncNavigationHistoryState();
+            }
+
+            return pushed;
+        }
+
+        public bool TryNavigateBack(out AssetNavigationEntry? entry)
+        {
+            bool moved;
+            lock (_stateLock)
+            {
+                moved = _navigationHistory.TryGoBack(out entry);
+            }
+
+            if (moved)
+            {
+                SyncNavigationHistoryState();
+            }
+
+            return moved;
+        }
+
+        public bool TryNavigateForward(out AssetNavigationEntry? entry)
+        {
+            bool moved;
+            lock (_stateLock)
+            {
+                moved = _navigationHistory.TryGoForward(out entry);
+            }
+
+            if (moved)
+            {
+                SyncNavigationHistoryState();
+            }
+
+            return moved;
+        }
+
+        public void ClearNavigationHistory()
+        {
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearNavigationHistoryCore();
+                }
+            });
+        }
+
+        private void ClearNavigationHistoryCore()
+        {
+            if (_navigationHistory.Count > 0)
+            {
+                _navigationHistory.Clear();
+            }
+
+            SyncNavigationHistoryStateCore();
+        }
+
+        private void SyncNavigationHistoryState()
+        {
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    SyncNavigationHistoryStateCore();
+                }
+            });
+        }
+
+        private void SyncNavigationHistoryStateCore()
+        {
+            CanNavigateBack = _navigationHistory.CanGoBack;
+            CanNavigateForward = _navigationHistory.CanGoForward;
+
+            var prev = _navigationHistory.PreviousEntry;
+            NavigateBackTooltip = prev != null && !string.IsNullOrWhiteSpace(prev.Name)
+                ? $"Back to {prev.Name} (Alt+Left)"
+                : DefaultNavigateBackTooltip;
+
+            var next = _navigationHistory.NextEntry;
+            NavigateForwardTooltip = next != null && !string.IsNullOrWhiteSpace(next.Name)
+                ? $"Forward to {next.Name} (Alt+Right)"
+                : DefaultNavigateForwardTooltip;
         }
 
         public void ActivateSurface(
@@ -990,6 +1540,15 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             _dispatchToUi(() =>
             {
+                lock (_stateLock)
+                {
+                    ClearGameObjectInspectorCore();
+                    if (kind != PreviewSurfaceKind.MonoBehaviour)
+                    {
+                        ClearMonoBehaviourTreeCore();
+                    }
+                }
+
                 ActiveKind = kind;
                 ActiveAsset = asset;
                 if (title != null)
@@ -1038,6 +1597,12 @@ namespace AssetStudio.Avalonia.ViewModels
 
             _dispatchToUi(() =>
             {
+                lock (_stateLock)
+                {
+                    ClearGameObjectInspectorCore();
+                    ClearMonoBehaviourTreeCore();
+                }
+
                 ActiveKind = kind;
                 if (asset != null)
                 {
@@ -1071,6 +1636,12 @@ namespace AssetStudio.Avalonia.ViewModels
             var cardList = cards ?? Array.Empty<TextAssetDialogueCardViewModel>();
             _dispatchToUi(() =>
             {
+                lock (_stateLock)
+                {
+                    ClearGameObjectInspectorCore();
+                    ClearMonoBehaviourTreeCore();
+                }
+
                 ActiveKind = PreviewSurfaceKind.Text;
                 ActiveAsset = asset;
                 PreviewTitle = asset?.Name ?? "TextAsset";
@@ -1418,6 +1989,8 @@ namespace AssetStudio.Avalonia.ViewModels
 
                     ApplyChannelMaskCore(PreviewChannelMask.All);
                     ClearCandidatesCore();
+                    ClearMonoBehaviourTreeCore();
+                    ClearGameObjectInspectorCore();
                     LastPreviewWasFromCache = false;
                     LastPreviewSourceKind = null;
                     LastPreviewMaterialsLoading = false;
@@ -1448,6 +2021,9 @@ namespace AssetStudio.Avalonia.ViewModels
                     IsDumpLoading = false;
                     ActiveRightTab = RightPanelTab.Preview;
                     ClearReferencesCore();
+                    ClearMonoBehaviourTreeCore();
+                    ClearGameObjectInspectorCore();
+                    ClearNavigationHistoryCore();
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
                     HasDialoguePreview = false;
@@ -1475,6 +2051,7 @@ namespace AssetStudio.Avalonia.ViewModels
             _previewCoordinator.Dispose();
             _dumpCoordinator.Dispose();
             _referencesCoordinator.Dispose();
+            _inspectorCoordinator.Dispose();
             _animationCoordinator.Dispose();
         }
     }

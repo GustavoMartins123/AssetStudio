@@ -9,6 +9,23 @@ public partial class MainWindow
     {
         base.OnKeyDown(e);
 
+        if (!e.Handled && e.KeyModifiers == KeyModifiers.Alt)
+        {
+            if (e.Key == Key.Left && ViewModel.NavigateBackCommand.CanExecute())
+            {
+                ViewModel.NavigateBackCommand.Execute();
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Key == Key.Right && ViewModel.NavigateForwardCommand.CanExecute())
+            {
+                ViewModel.NavigateForwardCommand.Execute();
+                e.Handled = true;
+                return;
+            }
+        }
+
         if (e.KeyModifiers == KeyModifiers.Control && GLPreviewControl != null && GLPreviewControl.IsVisible)
         {
             bool handled = false;

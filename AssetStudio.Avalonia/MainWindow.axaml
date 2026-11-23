@@ -287,7 +287,7 @@
                 <TabItem Header="Scene Hierarchy">
                     <Grid RowDefinitions="Auto, *">
                         <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2" Text="{Binding SceneHierarchy.SearchQuery, Mode=TwoWay}" TextChanged="TreeSearch_TextChanged" KeyDown="TreeSearch_KeyDown"/>
-                        <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False" AutoScrollToSelectedItem="True">
+                        <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False" AutoScrollToSelectedItem="True" SelectionChanged="SceneTreeView_SelectionChanged">
                             <TreeView.Styles>
                                 <Style Selector="TreeViewItem">
                                     <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
@@ -365,11 +365,37 @@
             <GridSplitter Grid.Column="1" Background="{DynamicResource SystemControlBorderBackgroundBrush}" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
 
             <Grid Grid.Column="2" RowDefinitions="Auto,*" Margin="2">
-                <TabStrip x:Name="RightTabControl" Grid.Row="0" SelectedIndex="0" SelectionChanged="RightTabControl_SelectionChanged">
-                    <TabStripItem Content="Preview" />
-                    <TabStripItem Content="Dump" />
-                    <TabStripItem Content="References" />
-                </TabStrip>
+                <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="4">
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="2" VerticalAlignment="Center" Margin="0,0,4,0">
+                        <Button x:Name="NavigateBackButton"
+                                Content="←"
+                                Width="28"
+                                Height="26"
+                                Padding="0"
+                                FontSize="12"
+                                FontWeight="SemiBold"
+                                HorizontalContentAlignment="Center"
+                                VerticalContentAlignment="Center"
+                                Command="{Binding NavigateBackCommand}"
+                                ToolTip.Tip="{Binding PreviewSession.NavigateBackTooltip}" />
+                        <Button x:Name="NavigateForwardButton"
+                                Content="→"
+                                Width="28"
+                                Height="26"
+                                Padding="0"
+                                FontSize="12"
+                                FontWeight="SemiBold"
+                                HorizontalContentAlignment="Center"
+                                VerticalContentAlignment="Center"
+                                Command="{Binding NavigateForwardCommand}"
+                                ToolTip.Tip="{Binding PreviewSession.NavigateForwardTooltip}" />
+                    </StackPanel>
+                    <TabStrip x:Name="RightTabControl" Grid.Column="1" SelectedIndex="0" SelectionChanged="RightTabControl_SelectionChanged">
+                        <TabStripItem Content="Preview" />
+                        <TabStripItem Content="Dump" />
+                        <TabStripItem Content="References" />
+                    </TabStrip>
+                </Grid>
 
                 <Panel Grid.Row="1">
                     <!-- Persistent Preview container: stays attached to the visual tree across Preview/Dump tab switches so OpenGlControlBase surfaces never tear down. -->
@@ -472,6 +498,352 @@
                                              Text="{Binding PreviewSession.TextContent, Mode=OneWay}"
                                              IsVisible="{Binding PreviewSession.IsDialogueDetailsVisible}" />
                                 </Grid>
+                            </Grid>
+                        </Border>
+                        <!-- Phase 1: MonoBehaviour / ScriptableObject Searchable Tree + JSON Viewer -->
+                        <Border x:Name="MonoBehaviourPreviewPanel"
+                                Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
+                                HorizontalAlignment="Stretch"
+                                VerticalAlignment="Stretch"
+                                IsVisible="{Binding PreviewSession.IsMonoBehaviourPanelVisible}">
+                            <Grid RowDefinitions="Auto,Auto,*">
+                                <Border Grid.Row="0"
+                                        Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                        BorderThickness="0,0,0,1"
+                                        Padding="10,8">
+                                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                        <StackPanel Grid.Column="0" Spacing="2">
+                                            <TextBlock x:Name="MonoBehaviourScriptTitleText"
+                                                       Text="{Binding PreviewSession.MonoBehaviourScriptTitle}"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                                       FontSize="13"
+                                                       FontWeight="SemiBold"
+                                                       TextTrimming="CharacterEllipsis" />
+                                            <TextBlock x:Name="MonoBehaviourSummaryText"
+                                                       Text="{Binding PreviewSession.MonoBehaviourSummaryText}"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                       FontSize="11"
+                                                       TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                        <WrapPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <Button x:Name="MonoBehaviourTreeModeButton"
+                                                    Content="Tree"
+                                                    Height="26"
+                                                    Padding="8,2"
+                                                    FontSize="11"
+                                                    Margin="0,0,4,0"
+                                                    Command="{Binding ShowMonoBehaviourTreeCommand}" />
+                                            <Button x:Name="MonoBehaviourJsonModeButton"
+                                                    Content="JSON"
+                                                    Height="26"
+                                                    Padding="8,2"
+                                                    FontSize="11"
+                                                    Margin="0,0,4,0"
+                                                    Command="{Binding ShowMonoBehaviourJsonCommand}" />
+                                            <Button x:Name="MonoBehaviourExpandAllButton"
+                                                    Content="Expand"
+                                                    Height="26"
+                                                    Padding="8,2"
+                                                    FontSize="11"
+                                                    Margin="0,0,4,0"
+                                                    IsVisible="{Binding PreviewSession.IsMonoBehaviourTreeViewVisible}"
+                                                    Command="{Binding ExpandAllMonoBehaviourCommand}" />
+                                            <Button x:Name="MonoBehaviourCollapseAllButton"
+                                                    Content="Collapse"
+                                                    Height="26"
+                                                    Padding="8,2"
+                                                    FontSize="11"
+                                                    Margin="0,0,4,0"
+                                                    IsVisible="{Binding PreviewSession.IsMonoBehaviourTreeViewVisible}"
+                                                    Command="{Binding CollapseAllMonoBehaviourCommand}" />
+                                            <Button x:Name="MonoBehaviourCopyJsonButton"
+                                                    Content="Copy JSON"
+                                                    Height="26"
+                                                    Padding="8,2"
+                                                    FontSize="11"
+                                                    Command="{Binding CopyMonoBehaviourJsonCommand}" />
+                                        </WrapPanel>
+                                    </Grid>
+                                </Border>
+                                <TextBox x:Name="MonoBehaviourFilterTextBox"
+                                         Grid.Row="1"
+                                         Margin="8,6,8,4"
+                                         PlaceholderText="Filter fields, values, types, or PPtr targets..."
+                                         IsVisible="{Binding PreviewSession.IsMonoBehaviourTreeViewVisible}"
+                                         Text="{Binding PreviewSession.MonoBehaviourFilterText, Mode=TwoWay}" />
+                                <Grid Grid.Row="2">
+                                    <TreeView x:Name="MonoBehaviourTreeView"
+                                              Margin="4,0,4,4"
+                                              IsVisible="{Binding PreviewSession.IsMonoBehaviourTreeViewVisible}"
+                                              ItemsSource="{Binding PreviewSession.MonoBehaviourTreeRoots}">
+                                        <TreeView.Styles>
+                                            <Style Selector="TreeViewItem" x:DataType="svc:AssetPropertyNode">
+                                                <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                                            </Style>
+                                        </TreeView.Styles>
+                                        <TreeView.ItemTemplate>
+                                            <TreeDataTemplate ItemsSource="{Binding Children, Mode=OneTime}" x:DataType="svc:AssetPropertyNode" x:CompileBindings="True">
+                                                <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding Name, Mode=OneTime}"
+                                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                               FontWeight="SemiBold"
+                                                               FontSize="12"
+                                                               VerticalAlignment="Center" />
+                                                    <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                            BorderThickness="1"
+                                                            CornerRadius="3"
+                                                            Padding="4,1"
+                                                            VerticalAlignment="Center"
+                                                            IsVisible="{Binding HasTypeHint, Mode=OneTime}">
+                                                        <TextBlock Text="{Binding TypeHint, Mode=OneTime}"
+                                                                   FontSize="10"
+                                                                   Opacity="0.8"
+                                                                   VerticalAlignment="Center" />
+                                                    </Border>
+                                                    <TextBlock Text="{Binding ValueText, Mode=OneTime}"
+                                                               FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                               FontSize="12"
+                                                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                               VerticalAlignment="Center"
+                                                               IsVisible="{Binding HasScalarOrSummaryValue, Mode=OneTime}" />
+                                                    <Button Content="{Binding PPtrDisplayLabel, Mode=OneTime}"
+                                                            ToolTip.Tip="{Binding PPtrTooltip, Mode=OneTime}"
+                                                            Padding="7,1"
+                                                            MinHeight="22"
+                                                            FontSize="11"
+                                                            FontWeight="SemiBold"
+                                                            Foreground="#4EA1FF"
+                                                            Background="Transparent"
+                                                            BorderBrush="#554EA1FF"
+                                                            BorderThickness="1"
+                                                            CornerRadius="4"
+                                                            VerticalAlignment="Center"
+                                                            IsVisible="{Binding IsPPtr, Mode=OneTime}"
+                                                            IsEnabled="{Binding IsNavigablePPtr, Mode=OneTime}"
+                                                            Command="{Binding $parent[local:MainWindow].ViewModel.NavigateToPPtrCommand}"
+                                                            CommandParameter="{Binding PPtrTarget, Mode=OneTime}" />
+                                                </StackPanel>
+                                            </TreeDataTemplate>
+                                        </TreeView.ItemTemplate>
+                                    </TreeView>
+                                    <TextBox x:Name="MonoBehaviourJsonTextBox"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             IsReadOnly="True"
+                                             FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                             FontSize="12"
+                                             IsVisible="{Binding PreviewSession.IsMonoBehaviourJsonViewVisible}"
+                                             Text="{Binding PreviewSession.MonoBehaviourJsonText, Mode=OneWay}" />
+                                </Grid>
+                            </Grid>
+                        </Border>
+                        <!-- Phase 1: Scene Hierarchy GameObject Component Inspector -->
+                        <Border x:Name="GameObjectInspectorPanel"
+                                Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
+                                HorizontalAlignment="Stretch"
+                                VerticalAlignment="Stretch"
+                                IsVisible="{Binding PreviewSession.IsGameObjectInspectorVisible}">
+                            <Grid RowDefinitions="Auto,Auto,*" Margin="8" RowSpacing="8">
+                                <Border Grid.Row="0"
+                                        Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="6"
+                                        Padding="10,8">
+                                    <StackPanel Spacing="4">
+                                        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                                <TextBlock x:Name="InspectorGameObjectNameText"
+                                                           Text="{Binding PreviewSession.InspectedGameObject.Name}"
+                                                           FontSize="14"
+                                                           FontWeight="SemiBold"
+                                                           TextTrimming="CharacterEllipsis"
+                                                           VerticalAlignment="Center" />
+                                                <Border Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
+                                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="3"
+                                                        Padding="5,1"
+                                                        VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding PreviewSession.InspectedGameObject.ActiveStateText}"
+                                                               FontSize="10"
+                                                               FontWeight="SemiBold" />
+                                                </Border>
+                                            </StackPanel>
+                                            <Button Grid.Column="1"
+                                                    Content="Open Asset"
+                                                    Height="24"
+                                                    Padding="8,2"
+                                                    FontSize="11"
+                                                    VerticalAlignment="Center"
+                                                    IsVisible="{Binding PreviewSession.InspectedGameObject.HasGameObjectTarget}"
+                                                    Command="{Binding NavigateToInspectorTargetCommand}"
+                                                    CommandParameter="{Binding PreviewSession.InspectedGameObject.GameObjectTarget}" />
+                                        </Grid>
+                                        <TextBlock Text="{Binding PreviewSession.InspectedGameObject.HierarchyPath}"
+                                                   FontSize="11"
+                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                   TextWrapping="Wrap"
+                                                   IsVisible="{Binding PreviewSession.InspectedGameObject.HasHierarchyPath}" />
+                                        <TextBlock Text="{Binding PreviewSession.InspectedGameObject.HeaderMetadataLine}"
+                                                   FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                   FontSize="11"
+                                                   Opacity="0.82"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock Text="{Binding PreviewSession.InspectedGameObject.LazyNoticeText}"
+                                                   FontSize="11"
+                                                   Foreground="#E0A84C"
+                                                   TextWrapping="Wrap"
+                                                   IsVisible="{Binding PreviewSession.InspectedGameObject.HasLazyNotice}" />
+                                    </StackPanel>
+                                </Border>
+
+                                <StackPanel Grid.Row="1" Spacing="6">
+                                    <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="6"
+                                            Padding="10,8"
+                                            IsVisible="{Binding PreviewSession.InspectedGameObject.Transform.HasTransform}">
+                                        <StackPanel Spacing="4">
+                                            <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.HeaderTitle}"
+                                                       FontWeight="SemiBold"
+                                                       FontSize="12" />
+                                            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="10" RowSpacing="2">
+                                                <TextBlock Grid.Row="0" Grid.Column="0" Text="Position" FontSize="11" Opacity="0.75" />
+                                                <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.PositionText}" FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace" FontSize="11" />
+                                                <TextBlock Grid.Row="1" Grid.Column="0" Text="Rotation" FontSize="11" Opacity="0.75" />
+                                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.RotationEulerText}" FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace" FontSize="11" />
+                                                <TextBlock Grid.Row="2" Grid.Column="0" Text="Scale" FontSize="11" Opacity="0.75" />
+                                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding PreviewSession.InspectedGameObject.Transform.ScaleText}" FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace" FontSize="11" />
+                                                <TextBlock Grid.Row="3" Grid.Column="0" Text="Hierarchy" FontSize="11" Opacity="0.75" />
+                                                <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.ChildCount, StringFormat='Children: {0}'}" FontSize="11" VerticalAlignment="Center" />
+                                                    <TextBlock Text="• Parent:" FontSize="11" Opacity="0.75" VerticalAlignment="Center" />
+                                                    <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.ParentName}" FontSize="11" VerticalAlignment="Center" IsVisible="{Binding !PreviewSession.InspectedGameObject.Transform.HasParentTarget}" />
+                                                    <Button Content="{Binding PreviewSession.InspectedGameObject.Transform.ParentName}"
+                                                            Padding="5,1"
+                                                            MinHeight="20"
+                                                            FontSize="11"
+                                                            Foreground="#4EA1FF"
+                                                            Background="Transparent"
+                                                            BorderBrush="#554EA1FF"
+                                                            BorderThickness="1"
+                                                            CornerRadius="3"
+                                                            IsVisible="{Binding PreviewSession.InspectedGameObject.Transform.HasParentTarget}"
+                                                            Command="{Binding NavigateToInspectorTargetCommand}"
+                                                            CommandParameter="{Binding PreviewSession.InspectedGameObject.Transform.ParentTarget}" />
+                                                </StackPanel>
+                                            </Grid>
+                                            <TextBlock Text="{Binding PreviewSession.InspectedGameObject.Transform.RectSummaryText}"
+                                                       FontFamily="Consolas, Menlo, DejaVu Sans Mono, monospace"
+                                                       FontSize="10"
+                                                       Opacity="0.82"
+                                                       TextWrapping="Wrap"
+                                                       IsVisible="{Binding PreviewSession.InspectedGameObject.Transform.HasRectSummary}" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                        <TextBlock Grid.Column="0"
+                                                   Text="{Binding PreviewSession.InspectorComponentsHeader}"
+                                                   FontWeight="SemiBold"
+                                                   FontSize="12"
+                                                   VerticalAlignment="Center" />
+                                    </Grid>
+                                    <TextBox x:Name="InspectorFilterTextBox"
+                                             PlaceholderText="Filter components or linked assets..."
+                                             Text="{Binding PreviewSession.InspectorFilterText, Mode=TwoWay}" />
+                                </StackPanel>
+
+                                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                    <ItemsControl x:Name="InspectorComponentsList" ItemsSource="{Binding PreviewSession.InspectorComponents}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="svc:GameObjectComponentInfo" x:CompileBindings="True">
+                                                <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                                                        BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="5"
+                                                        Padding="9,7"
+                                                        Margin="0,0,0,6">
+                                                    <StackPanel Spacing="4">
+                                                        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                                            <StackPanel Grid.Column="0" Spacing="1">
+                                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                                    <TextBlock Text="{Binding DisplayTitle, Mode=OneTime}"
+                                                                               FontWeight="SemiBold"
+                                                                               FontSize="12"
+                                                                               TextTrimming="CharacterEllipsis" />
+                                                                    <Border Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
+                                                                            BorderBrush="{DynamicResource SystemControlBorderBackgroundBrush}"
+                                                                            BorderThickness="1"
+                                                                            CornerRadius="3"
+                                                                            Padding="4,0"
+                                                                            IsVisible="{Binding HasEnabledBadge, Mode=OneTime}">
+                                                                        <TextBlock Text="{Binding EnabledBadge, Mode=OneTime}"
+                                                                                   FontSize="10"
+                                                                                   Opacity="0.85" />
+                                                                    </Border>
+                                                                </StackPanel>
+                                                                <TextBlock Text="{Binding Subtitle, Mode=OneTime}"
+                                                                           FontSize="10"
+                                                                           Opacity="0.72"
+                                                                           TextTrimming="CharacterEllipsis"
+                                                                           IsVisible="{Binding HasSubtitle, Mode=OneTime}" />
+                                                            </StackPanel>
+                                                            <Button Grid.Column="1"
+                                                                    Content="Inspect →"
+                                                                    Height="22"
+                                                                    Padding="7,1"
+                                                                    FontSize="11"
+                                                                    VerticalAlignment="Top"
+                                                                    IsVisible="{Binding HasComponentTarget, Mode=OneTime}"
+                                                                    Command="{Binding $parent[local:MainWindow].ViewModel.NavigateToInspectorTargetCommand}"
+                                                                    CommandParameter="{Binding ComponentTarget, Mode=OneTime}" />
+                                                        </Grid>
+                                                        <TextBlock Text="{Binding Summary, Mode=OneTime}"
+                                                                   FontSize="11"
+                                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                                   TextWrapping="Wrap"
+                                                                   IsVisible="{Binding HasSummary, Mode=OneTime}" />
+                                                        <ItemsControl ItemsSource="{Binding LinkedAssets, Mode=OneTime}"
+                                                                      IsVisible="{Binding HasLinkedAssets, Mode=OneTime}">
+                                                            <ItemsControl.ItemsPanel>
+                                                                <ItemsPanelTemplate>
+                                                                    <WrapPanel Orientation="Horizontal" />
+                                                                </ItemsPanelTemplate>
+                                                            </ItemsControl.ItemsPanel>
+                                                            <ItemsControl.ItemTemplate>
+                                                                <DataTemplate x:DataType="svc:AssetReferenceItem" x:CompileBindings="True">
+                                                                    <Button Margin="0,2,4,2"
+                                                                            Padding="6,2"
+                                                                            MinHeight="22"
+                                                                            FontSize="11"
+                                                                            Foreground="#4EA1FF"
+                                                                            Background="Transparent"
+                                                                            BorderBrush="#554EA1FF"
+                                                                            BorderThickness="1"
+                                                                            CornerRadius="4"
+                                                                            ToolTip.Tip="{Binding DetailLine, Mode=OneTime}"
+                                                                            IsEnabled="{Binding IsNavigable, Mode=OneTime}"
+                                                                            Command="{Binding $parent[local:MainWindow].ViewModel.NavigateToInspectorTargetCommand}"
+                                                                            CommandParameter="{Binding}">
+                                                                        <StackPanel Orientation="Horizontal" Spacing="4">
+                                                                            <TextBlock Text="{Binding Relation, StringFormat='{}{0}:', Mode=OneTime}" Opacity="0.75" />
+                                                                            <TextBlock Text="{Binding Name, Mode=OneTime}" FontWeight="SemiBold" />
+                                                                        </StackPanel>
+                                                                    </Button>
+                                                                </DataTemplate>
+                                                            </ItemsControl.ItemTemplate>
+                                                        </ItemsControl>
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
                             </Grid>
                         </Border>
                         <TextBlock x:Name="PreviewLabel" Text="[Preview Panel]" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />

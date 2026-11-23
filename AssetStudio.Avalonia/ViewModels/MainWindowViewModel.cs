@@ -69,6 +69,11 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? ExportPreviewModelAsync { get; set; }
         public Func<Task>? BatchExportPreviewAnimationsAsync { get; set; }
         public Func<AssetReferenceItem?, Task>? NavigateToReferencedAssetAsync { get; set; }
+        public Func<Task>? CopyMonoBehaviourJsonAsync { get; set; }
+        public Func<AssetReferenceItem?, Task>? NavigateToPPtrAsync { get; set; }
+        public Func<AssetReferenceItem?, Task>? NavigateToInspectorTargetAsync { get; set; }
+        public Func<Task>? NavigateBackAsync { get; set; }
+        public Func<Task>? NavigateForwardAsync { get; set; }
 
         public Func<Task>? VideoPlayPauseAsync { get; set; }
         public Func<Task>? VideoStopAsync { get; set; }
@@ -145,6 +150,11 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportPreviewModelAsync = null;
             BatchExportPreviewAnimationsAsync = null;
             NavigateToReferencedAssetAsync = null;
+            CopyMonoBehaviourJsonAsync = null;
+            NavigateToPPtrAsync = null;
+            NavigateToInspectorTargetAsync = null;
+            NavigateBackAsync = null;
+            NavigateForwardAsync = null;
 
             VideoPlayPauseAsync = null;
             VideoStopAsync = null;
@@ -300,6 +310,29 @@ namespace AssetStudio.Avalonia.ViewModels
                 canExecute: () => CanNavigateToSelectedReference,
                 onException: HandleCommandException);
 
+            ToggleMonoBehaviourViewModeCommand = new RelayCommand(() => PreviewSession.ToggleMonoBehaviourViewMode());
+            ShowMonoBehaviourTreeCommand = new RelayCommand(() => PreviewSession.SetMonoBehaviourViewMode(jsonMode: false));
+            ShowMonoBehaviourJsonCommand = new RelayCommand(() => PreviewSession.SetMonoBehaviourViewMode(jsonMode: true));
+            ExpandAllMonoBehaviourCommand = new RelayCommand(() => PreviewSession.ExpandAllMonoBehaviourNodes());
+            CollapseAllMonoBehaviourCommand = new RelayCommand(() => PreviewSession.CollapseAllMonoBehaviourNodes());
+            CopyMonoBehaviourJsonCommand = new AsyncRelayCommand(ExecuteCopyMonoBehaviourJsonAsync, onException: HandleCommandException);
+            NavigateToPPtrCommand = new AsyncRelayCommand<AssetReferenceItem>(
+                ExecuteNavigateToPPtrAsync,
+                canExecute: item => !_disposed && item?.IsNavigable == true,
+                onException: HandleCommandException);
+            NavigateToInspectorTargetCommand = new AsyncRelayCommand<AssetReferenceItem>(
+                ExecuteNavigateToInspectorTargetAsync,
+                canExecute: item => !_disposed && item?.IsNavigable == true,
+                onException: HandleCommandException);
+            NavigateBackCommand = new AsyncRelayCommand(
+                ExecuteNavigateBackAsync,
+                canExecute: () => CanNavigateBack,
+                onException: HandleCommandException);
+            NavigateForwardCommand = new AsyncRelayCommand(
+                ExecuteNavigateForwardAsync,
+                canExecute: () => CanNavigateForward,
+                onException: HandleCommandException);
+
             VideoPlayPauseCommand = new AsyncRelayCommand(ExecuteVideoPlayPauseAsync, onException: HandleCommandException);
             VideoStopCommand = new AsyncRelayCommand(ExecuteVideoStopAsync, onException: HandleCommandException);
             VideoExportCommand = new AsyncRelayCommand(ExecuteVideoExportAsync, onException: HandleCommandException);
@@ -404,6 +437,17 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand<AssetReferenceItem> NavigateToReferencedAssetCommand { get; }
         public AsyncRelayCommand NavigateToSelectedReferenceCommand { get; }
 
+        public RelayCommand ToggleMonoBehaviourViewModeCommand { get; }
+        public RelayCommand ShowMonoBehaviourTreeCommand { get; }
+        public RelayCommand ShowMonoBehaviourJsonCommand { get; }
+        public RelayCommand ExpandAllMonoBehaviourCommand { get; }
+        public RelayCommand CollapseAllMonoBehaviourCommand { get; }
+        public AsyncRelayCommand CopyMonoBehaviourJsonCommand { get; }
+        public AsyncRelayCommand<AssetReferenceItem> NavigateToPPtrCommand { get; }
+        public AsyncRelayCommand<AssetReferenceItem> NavigateToInspectorTargetCommand { get; }
+        public AsyncRelayCommand NavigateBackCommand { get; }
+        public AsyncRelayCommand NavigateForwardCommand { get; }
+
         public AsyncRelayCommand VideoPlayPauseCommand { get; }
         public AsyncRelayCommand VideoStopCommand { get; }
         public AsyncRelayCommand VideoExportCommand { get; }
@@ -505,6 +549,12 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool CanNavigateToSelectedReference =>
             !_disposed && PreviewSession.SelectedReferenceItem?.IsNavigable == true;
 
+        public bool CanNavigateBack =>
+            !_disposed && PreviewSession.CanNavigateBack;
+
+        public bool CanNavigateForward =>
+            !_disposed && PreviewSession.CanNavigateForward;
+
         private void OnPreviewSessionPropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
             switch (e.PropertyName)
@@ -518,6 +568,14 @@ namespace AssetStudio.Avalonia.ViewModels
                 case nameof(PreviewSessionViewModel.SelectedReferenceItem):
                     OnPropertyChanged(nameof(CanNavigateToSelectedReference));
                     NavigateToSelectedReferenceCommand.NotifyCanExecuteChanged();
+                    break;
+                case nameof(PreviewSessionViewModel.CanNavigateBack):
+                    OnPropertyChanged(nameof(CanNavigateBack));
+                    NavigateBackCommand.NotifyCanExecuteChanged();
+                    break;
+                case nameof(PreviewSessionViewModel.CanNavigateForward):
+                    OnPropertyChanged(nameof(CanNavigateForward));
+                    NavigateForwardCommand.NotifyCanExecuteChanged();
                     break;
             }
         }
@@ -1176,8 +1234,101 @@ namespace AssetStudio.Avalonia.ViewModels
                 return;
             }
 
+            PreviewSession.RecordNavigation(AssetNavigationEntry.FromReferenceItem(target));
             PreviewSession.ActiveRightTab = RightPanelTab.Preview;
             StatusText = $"Navigating to {target.TypeName}: {target.Name}";
+        }
+
+        private async Task ExecuteCopyMonoBehaviourJsonAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.CopyMonoBehaviourJsonAsync != null)
+            {
+                await CommandHandlers.CopyMonoBehaviourJsonAsync();
+                return;
+            }
+
+            var json = !string.IsNullOrEmpty(PreviewSession.MonoBehaviourFullJsonText)
+                ? PreviewSession.MonoBehaviourFullJsonText
+                : PreviewSession.MonoBehaviourJsonText;
+            if (!string.IsNullOrEmpty(json) && await _dialogService.CopyTextToClipboardAsync(json))
+            {
+                StatusText = "Copied MonoBehaviour JSON to clipboard.";
+            }
+        }
+
+        private async Task ExecuteNavigateToPPtrAsync(AssetReferenceItem? target)
+        {
+            if (target == null || !target.IsNavigable || _disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.NavigateToPPtrAsync != null)
+            {
+                await CommandHandlers.NavigateToPPtrAsync(target);
+                return;
+            }
+
+            await ExecuteNavigateToReferencedAssetAsync(target);
+        }
+
+        private async Task ExecuteNavigateToInspectorTargetAsync(AssetReferenceItem? target)
+        {
+            if (target == null || !target.IsNavigable || _disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.NavigateToInspectorTargetAsync != null)
+            {
+                await CommandHandlers.NavigateToInspectorTargetAsync(target);
+                return;
+            }
+
+            await ExecuteNavigateToReferencedAssetAsync(target);
+        }
+
+        private async Task ExecuteNavigateBackAsync()
+        {
+            if (_disposed || !CanNavigateBack)
+            {
+                return;
+            }
+
+            if (CommandHandlers.NavigateBackAsync != null)
+            {
+                await CommandHandlers.NavigateBackAsync();
+                return;
+            }
+
+            if (PreviewSession.TryNavigateBack(out var entry) && entry != null)
+            {
+                StatusText = $"Navigated back to {entry.TypeName}: {entry.Name}";
+            }
+        }
+
+        private async Task ExecuteNavigateForwardAsync()
+        {
+            if (_disposed || !CanNavigateForward)
+            {
+                return;
+            }
+
+            if (CommandHandlers.NavigateForwardAsync != null)
+            {
+                await CommandHandlers.NavigateForwardAsync();
+                return;
+            }
+
+            if (PreviewSession.TryNavigateForward(out var entry) && entry != null)
+            {
+                StatusText = $"Navigated forward to {entry.TypeName}: {entry.Name}";
+            }
         }
 
         private async Task ExecuteVideoPlayPauseAsync()
@@ -1372,11 +1523,17 @@ namespace AssetStudio.Avalonia.ViewModels
             OnPropertyChanged(nameof(CanExportPreviewModel));
             OnPropertyChanged(nameof(CanStartPreviewModelExport));
             OnPropertyChanged(nameof(CanNavigateToSelectedReference));
+            OnPropertyChanged(nameof(CanNavigateBack));
+            OnPropertyChanged(nameof(CanNavigateForward));
             OpenProjectManagerCommand.NotifyCanExecuteChanged();
             ExportPreviewModelCommand.NotifyCanExecuteChanged();
             BatchExportPreviewAnimationsCommand.NotifyCanExecuteChanged();
             NavigateToSelectedReferenceCommand.NotifyCanExecuteChanged();
             NavigateToReferencedAssetCommand.NotifyCanExecuteChanged();
+            NavigateToPPtrCommand.NotifyCanExecuteChanged();
+            NavigateToInspectorTargetCommand.NotifyCanExecuteChanged();
+            NavigateBackCommand.NotifyCanExecuteChanged();
+            NavigateForwardCommand.NotifyCanExecuteChanged();
         }
 
         private sealed class NoOpDialogService : IDialogService
