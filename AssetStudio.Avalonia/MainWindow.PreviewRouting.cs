@@ -148,6 +148,10 @@ public partial class MainWindow : Window
             {
                 await UpdateReferencesForSelectedAssetAsync();
             }
+            else if (RightTabControl.SelectedIndex == 3)
+            {
+                await UpdateScriptForSelectedAssetAsync();
+            }
             UpdatePreloadWindow(assetItem);
             QueuePreviewAsset(assetItem);
         }
@@ -156,8 +160,10 @@ public partial class MainWindow : Window
             _currentlySelectedUniqueID = null;
             _dumpRequestCoordinator.CancelCurrent();
             _referencesRequestCoordinator.CancelCurrent();
+            _scriptRequestCoordinator.CancelCurrent();
             PreviewSession.DumpTextContent = string.Empty;
             PreviewSession.ClearReferences();
+            PreviewSession.ClearScript();
             CancelPendingPreview();
             ClearPreview("Preview Panel");
             lock (preloaderLock)
@@ -176,6 +182,7 @@ public partial class MainWindow : Window
             {
                 PreviewSession.ActiveRightTab = RightPanelTab.Dump;
                 _referencesRequestCoordinator.CancelCurrent();
+                _scriptRequestCoordinator.CancelCurrent();
                 if (PreviewSession.IsLoading)
                 {
                     _lastPreviewedAssetUniqueId = null;
@@ -188,6 +195,7 @@ public partial class MainWindow : Window
             {
                 PreviewSession.ActiveRightTab = RightPanelTab.References;
                 _dumpRequestCoordinator.CancelCurrent();
+                _scriptRequestCoordinator.CancelCurrent();
                 if (PreviewSession.IsLoading)
                 {
                     _lastPreviewedAssetUniqueId = null;
@@ -196,11 +204,25 @@ public partial class MainWindow : Window
                 GLPreviewControl?.SuspendForHiddenTab();
                 await UpdateReferencesForSelectedAssetAsync();
             }
+            else if (RightTabControl.SelectedIndex == 3)
+            {
+                PreviewSession.ActiveRightTab = RightPanelTab.Script;
+                _dumpRequestCoordinator.CancelCurrent();
+                _referencesRequestCoordinator.CancelCurrent();
+                if (PreviewSession.IsLoading)
+                {
+                    _lastPreviewedAssetUniqueId = null;
+                }
+                CancelPendingPreview();
+                GLPreviewControl?.SuspendForHiddenTab();
+                await UpdateScriptForSelectedAssetAsync();
+            }
             else if (RightTabControl.SelectedIndex == 0)
             {
                 PreviewSession.ActiveRightTab = RightPanelTab.Preview;
                 _dumpRequestCoordinator.CancelCurrent();
                 _referencesRequestCoordinator.CancelCurrent();
+                _scriptRequestCoordinator.CancelCurrent();
                 if (_suppressNextRightTabSelectionPreview)
                 {
                     _suppressNextRightTabSelectionPreview = false;
@@ -474,6 +496,7 @@ public partial class MainWindow : Window
         var localPath = await PickLoadFolderDialogAsync("Select Assembly Folder");
         if (!string.IsNullOrWhiteSpace(localPath))
         {
+            _lastLoadedAssemblyDirectory = localPath;
             SaveLoadFolder(localPath);
             return localPath;
         }
@@ -775,15 +798,7 @@ public partial class MainWindow : Window
                     PreviewMonoBehaviour(assetItem, m_MonoBehaviour, fbxHeader);
                     break;
                 case MonoScript m_MonoScript:
-                    {
-                        var sb = new StringBuilder();
-                        sb.AppendLine($"Assembly: {m_MonoScript.m_AssemblyName}");
-                        sb.AppendLine($"Namespace: {m_MonoScript.m_Namespace}");
-                        sb.AppendLine($"Class: {m_MonoScript.m_ClassName}");
-                        SetTextWithTruncation(TextPreviewBox, sb.ToString());
-                        TextPreviewBox.IsVisible = true;
-                        PreviewLabel.IsVisible = false;
-                    }
+                    PreviewMonoScript(assetItem, m_MonoScript);
                     break;
                 case Mesh m_Mesh:
                     PreviewMesh(assetItem, m_Mesh);

@@ -75,6 +75,12 @@
           "FFmpegVideoPlayer.Core": "2.7.0"
         }
       },
+      "ICSharpCode.Decompiler": {
+        "type": "Direct",
+        "requested": "[11.2.0.10050, )",
+        "resolved": "11.2.0.10050",
+        "contentHash": "H8cD1Sast2Zkex1RxdUiZvCmc1ZZ8Fkf+Mfs9WYzlPq74zW6xqMmZgip9l0rt5z9akh1fnSUg72hIGtClEI4zw=="
+      },
       "Microsoft.Data.Sqlite": {
         "type": "Direct",
         "requested": "[10.0.15, )",

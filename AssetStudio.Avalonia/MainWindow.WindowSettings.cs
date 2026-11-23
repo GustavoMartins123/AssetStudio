@@ -74,6 +74,7 @@ public partial class MainWindow
         {
             assemblyLoader.Clear();
         }
+        ResetScriptDecompilerCaches();
         nextGameObjectSearchIndex = 0;
         SceneTreeView.ItemsSource = null;
         TextPreviewBox.Text = string.Empty;

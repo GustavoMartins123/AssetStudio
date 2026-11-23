@@ -17,6 +17,7 @@ This document gives a plain-language overview of what **AssetStudio** supports t
 - **Asset List & Asset Classes**: Fast search, sorting, type filters, and class overview.
 - **Scene Hierarchy & GameObject Inspector**: Browse object trees and click any object to inspect its position, rotation, scale, active state, and attached components, with clickable links to jump straight to related meshes, materials, scripts, or assets.
 - **MonoBehaviour / ScriptableObject Viewer**: Inspect script data in a searchable tree view or raw JSON view, with clickable links on asset references so you can jump directly to referenced textures, audio clips, meshes, materials, or prefabs.
+- **Built-in Script Code Viewer & Ghidra Export**: Open the **Script** tab (or click **View C#** on a MonoBehaviour or select a `MonoScript`) to view reconstructed C# source code directly inside AssetStudio — decompiling real C# from Mono `Managed/` assemblies and slicing class definitions + method addresses from IL2CPP `dump.cs`, `script.json`, or `DummyDll/` folders, with in-code search/line filtering, copy/save `.cs`, and one-click export of a symbol table and ready-to-run Python script for **Ghidra**.
 - **References Tab & Navigation History**: See what uses an asset and what it depends on, and step back or forward through visited assets (`Alt+Left` / `Alt+Right` or header buttons).
 - **Light & Dark Theme**: Shared interface theme that adapts across cards, inspectors, overlays, and media controls.
 
@@ -50,7 +51,6 @@ This document gives a plain-language overview of what **AssetStudio** supports t
 
 The capabilities below are actively being designed or studied for upcoming releases and are **not yet implemented**:
 
-1. **Built-in Script Code Viewer & Analysis Export**: Clicking a script asset to read reconstructed C# source code directly inside AssetStudio (for both Mono and IL2CPP projects), plus exporting symbol scripts for external analysis tools such as Ghidra.
-2. **Full Scene Export to `.glb`**: Exporting an entire game level or scene hierarchy as one complete 3D scene file while reusing repeated meshes efficiently.
-3. **Global Content Search & Version Comparison**: Searching text across the contents of an entire project and comparing two builds or updates side by side to list added, removed, and modified assets.
-4. **Safe Asset Editing & Repacking**: Replacing textures, text files, or script fields with automatic `.bak` backups, repacking bundle files, and updating Addressables catalog checksums.
+1. **Full Scene Export to `.glb`**: Exporting an entire game level or scene hierarchy as one complete 3D scene file while reusing repeated meshes efficiently.
+2. **Global Content Search & Version Comparison**: Searching text across the contents of an entire project and comparing two builds or updates side by side to list added, removed, and modified assets.
+3. **Safe Asset Editing & Repacking**: Replacing textures, text files, or script fields with automatic `.bak` backups, repacking bundle files, and updating Addressables catalog checksums.

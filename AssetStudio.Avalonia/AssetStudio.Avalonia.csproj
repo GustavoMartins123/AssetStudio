@@ -22,6 +22,7 @@
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
     <PackageReference Include="FFmpegVideoPlayer.Avalonia" />
+    <PackageReference Include="ICSharpCode.Decompiler" />
     <PackageReference Include="OpenTK" />
     <PackageReference Include="Newtonsoft.Json" />
     <PackageReference Include="Microsoft.Data.Sqlite" />

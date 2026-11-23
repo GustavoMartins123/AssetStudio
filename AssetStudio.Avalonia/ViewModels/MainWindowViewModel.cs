@@ -76,6 +76,12 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? NavigateBackAsync { get; set; }
         public Func<Task>? NavigateForwardAsync { get; set; }
 
+        public Func<Task>? ViewSelectedScriptAsync { get; set; }
+        public Func<Task>? CopyScriptCodeAsync { get; set; }
+        public Func<Task>? SaveScriptCodeAsync { get; set; }
+        public Func<Task>? ExportGhidraScriptAsync { get; set; }
+        public Func<Task>? SelectScriptsFolderAsync { get; set; }
+
         public Func<Task>? VideoPlayPauseAsync { get; set; }
         public Func<Task>? VideoStopAsync { get; set; }
         public Func<Task>? VideoExportAsync { get; set; }
@@ -158,6 +164,12 @@ namespace AssetStudio.Avalonia.ViewModels
             NavigateToInspectorTargetAsync = null;
             NavigateBackAsync = null;
             NavigateForwardAsync = null;
+
+            ViewSelectedScriptAsync = null;
+            CopyScriptCodeAsync = null;
+            SaveScriptCodeAsync = null;
+            ExportGhidraScriptAsync = null;
+            SelectScriptsFolderAsync = null;
 
             VideoPlayPauseAsync = null;
             VideoStopAsync = null;
@@ -338,6 +350,27 @@ namespace AssetStudio.Avalonia.ViewModels
                 canExecute: () => CanNavigateForward,
                 onException: HandleCommandException);
 
+            ViewSelectedScriptCommand = new AsyncRelayCommand(
+                ExecuteViewSelectedScriptAsync,
+                canExecute: () => !_disposed,
+                onException: HandleCommandException);
+            CopyScriptCodeCommand = new AsyncRelayCommand(
+                ExecuteCopyScriptCodeAsync,
+                canExecute: () => CanCopyOrSaveScript,
+                onException: HandleCommandException);
+            SaveScriptCodeCommand = new AsyncRelayCommand(
+                ExecuteSaveScriptCodeAsync,
+                canExecute: () => CanCopyOrSaveScript,
+                onException: HandleCommandException);
+            ExportGhidraScriptCommand = new AsyncRelayCommand(
+                ExecuteExportGhidraScriptAsync,
+                canExecute: () => !_disposed,
+                onException: HandleCommandException);
+            SelectScriptsFolderCommand = new AsyncRelayCommand(
+                ExecuteSelectScriptsFolderAsync,
+                canExecute: () => !_disposed,
+                onException: HandleCommandException);
+
             VideoPlayPauseCommand = new AsyncRelayCommand(ExecuteVideoPlayPauseAsync, onException: HandleCommandException);
             VideoStopCommand = new AsyncRelayCommand(ExecuteVideoStopAsync, onException: HandleCommandException);
             VideoExportCommand = new AsyncRelayCommand(ExecuteVideoExportAsync, onException: HandleCommandException);
@@ -455,6 +488,12 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand NavigateBackCommand { get; }
         public AsyncRelayCommand NavigateForwardCommand { get; }
 
+        public AsyncRelayCommand ViewSelectedScriptCommand { get; }
+        public AsyncRelayCommand CopyScriptCodeCommand { get; }
+        public AsyncRelayCommand SaveScriptCodeCommand { get; }
+        public AsyncRelayCommand ExportGhidraScriptCommand { get; }
+        public AsyncRelayCommand SelectScriptsFolderCommand { get; }
+
         public AsyncRelayCommand VideoPlayPauseCommand { get; }
         public AsyncRelayCommand VideoStopCommand { get; }
         public AsyncRelayCommand VideoExportCommand { get; }
@@ -563,6 +602,9 @@ namespace AssetStudio.Avalonia.ViewModels
         public bool CanNavigateForward =>
             !_disposed && PreviewSession.CanNavigateForward;
 
+        public bool CanCopyOrSaveScript =>
+            !_disposed && PreviewSession.CanSaveOrCopyScript;
+
         private void OnPreviewSessionPropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
             switch (e.PropertyName)
@@ -584,6 +626,11 @@ namespace AssetStudio.Avalonia.ViewModels
                 case nameof(PreviewSessionViewModel.CanNavigateForward):
                     OnPropertyChanged(nameof(CanNavigateForward));
                     NavigateForwardCommand.NotifyCanExecuteChanged();
+                    break;
+                case nameof(PreviewSessionViewModel.CanSaveOrCopyScript):
+                    OnPropertyChanged(nameof(CanCopyOrSaveScript));
+                    CopyScriptCodeCommand.NotifyCanExecuteChanged();
+                    SaveScriptCodeCommand.NotifyCanExecuteChanged();
                     break;
             }
         }
@@ -1354,6 +1401,107 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        private async Task ExecuteViewSelectedScriptAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ViewSelectedScriptAsync != null)
+            {
+                await CommandHandlers.ViewSelectedScriptAsync();
+                return;
+            }
+
+            PreviewSession.ActiveRightTab = RightPanelTab.Script;
+            StatusText = "Switched to Script tab.";
+        }
+
+        private async Task ExecuteCopyScriptCodeAsync()
+        {
+            if (_disposed || !CanCopyOrSaveScript)
+            {
+                return;
+            }
+
+            if (CommandHandlers.CopyScriptCodeAsync != null)
+            {
+                await CommandHandlers.CopyScriptCodeAsync();
+                return;
+            }
+
+            var code = PreviewSession.ScriptFullSourceCode;
+            if (!string.IsNullOrEmpty(code) && await _dialogService.CopyTextToClipboardAsync(code))
+            {
+                StatusText = "Copied C# source to clipboard.";
+            }
+        }
+
+        private async Task ExecuteSaveScriptCodeAsync()
+        {
+            if (_disposed || !CanCopyOrSaveScript)
+            {
+                return;
+            }
+
+            if (CommandHandlers.SaveScriptCodeAsync != null)
+            {
+                await CommandHandlers.SaveScriptCodeAsync();
+                return;
+            }
+
+            var baseName = !string.IsNullOrWhiteSpace(PreviewSession.ScriptClassName)
+                ? PreviewSession.ScriptClassName
+                : (!string.IsNullOrWhiteSpace(PreviewSession.ScriptTitle) ? PreviewSession.ScriptTitle : "Script");
+            var suggestedFileName = AssetExportService.FixFileName(baseName) + ".cs";
+            var path = await _dialogService.PickSaveFileAsync(new SaveFilePickerRequest("Save C# Script", suggestedFileName, "cs"));
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                StatusText = $"Selected script output: {path}";
+            }
+        }
+
+        private async Task ExecuteExportGhidraScriptAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.ExportGhidraScriptAsync != null)
+            {
+                await CommandHandlers.ExportGhidraScriptAsync();
+                return;
+            }
+
+            var folder = await _dialogService.PickOpenFolderAsync(new FolderPickerRequest("Select Ghidra Export Folder"));
+            if (!string.IsNullOrWhiteSpace(folder))
+            {
+                StatusText = $"Ready to export Ghidra symbols to: {folder}";
+            }
+        }
+
+        private async Task ExecuteSelectScriptsFolderAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (CommandHandlers.SelectScriptsFolderAsync != null)
+            {
+                await CommandHandlers.SelectScriptsFolderAsync();
+                return;
+            }
+
+            var folder = await _dialogService.PickOpenFolderAsync(new FolderPickerRequest("Select Managed or Il2CppDumper Folder"));
+            if (!string.IsNullOrWhiteSpace(folder))
+            {
+                StatusText = $"Scripts folder set to: {folder}";
+            }
+        }
+
         private async Task ExecuteVideoPlayPauseAsync()
         {
             if (CommandHandlers.VideoPlayPauseAsync != null)
@@ -1566,6 +1714,7 @@ namespace AssetStudio.Avalonia.ViewModels
             OnPropertyChanged(nameof(CanNavigateToSelectedReference));
             OnPropertyChanged(nameof(CanNavigateBack));
             OnPropertyChanged(nameof(CanNavigateForward));
+            OnPropertyChanged(nameof(CanCopyOrSaveScript));
             OpenProjectManagerCommand.NotifyCanExecuteChanged();
             ExportPreviewModelCommand.NotifyCanExecuteChanged();
             BatchExportPreviewAnimationsCommand.NotifyCanExecuteChanged();
@@ -1575,6 +1724,11 @@ namespace AssetStudio.Avalonia.ViewModels
             NavigateToInspectorTargetCommand.NotifyCanExecuteChanged();
             NavigateBackCommand.NotifyCanExecuteChanged();
             NavigateForwardCommand.NotifyCanExecuteChanged();
+            ViewSelectedScriptCommand.NotifyCanExecuteChanged();
+            CopyScriptCodeCommand.NotifyCanExecuteChanged();
+            SaveScriptCodeCommand.NotifyCanExecuteChanged();
+            ExportGhidraScriptCommand.NotifyCanExecuteChanged();
+            SelectScriptsFolderCommand.NotifyCanExecuteChanged();
         }
 
         private sealed class NoOpDialogService : IDialogService

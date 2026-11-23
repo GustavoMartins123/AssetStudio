@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AssetStudio;
 using AssetStudio.Avalonia.Services;
+using AssetStudio.Avalonia.Services.Scripting;
 
 namespace AssetStudio.Avalonia.ViewModels
 {
@@ -12,7 +13,8 @@ namespace AssetStudio.Avalonia.ViewModels
     {
         Preview = 0,
         Dump = 1,
-        References = 2
+        References = 2,
+        Script = 3
     }
 
     public enum PreviewSurfaceKind
@@ -66,6 +68,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private readonly AsyncPreviewRequestCoordinator _dumpCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _referencesCoordinator = new();
         private readonly AsyncPreviewRequestCoordinator _inspectorCoordinator = new();
+        private readonly AsyncPreviewRequestCoordinator _scriptCoordinator = new();
         private readonly AnimationPreviewLoadCoordinator _animationCoordinator = new();
         private readonly AssetNavigationHistory _navigationHistory = new();
 
@@ -140,6 +143,23 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _navigateBackTooltip = DefaultNavigateBackTooltip;
         private string _navigateForwardTooltip = DefaultNavigateForwardTooltip;
 
+        // Phase 2: Integrated Script Decompiler & Ghidra Export
+        private bool _isScriptLoading;
+        private bool _hasScriptSource;
+        private string _scriptTitle = DefaultScriptTitle;
+        private string _scriptSummaryText = DefaultScriptSummary;
+        private string _scriptBackendBadge = string.Empty;
+        private string _scriptSourceCode = string.Empty;
+        private string _scriptFullSourceCode = string.Empty;
+        private string _scriptSearchText = string.Empty;
+        private string _scriptSearchMatchSummary = string.Empty;
+        private bool _isScriptSearchFilterOnly;
+        private string _scriptDiagnosticText = string.Empty;
+        private string _scriptAssemblyName = string.Empty;
+        private string _scriptNamespace = string.Empty;
+        private string _scriptClassName = string.Empty;
+        private IReadOnlyList<ScriptMethodSymbol> _scriptMethodSymbols = Array.Empty<ScriptMethodSymbol>();
+
         public const string DefaultReferencesTargetTitle = "No asset selected";
         public const string DefaultReferencesSummary = "Select an asset to inspect references.";
         public const string DefaultReferencedByHeader = "Referenced By / Used By (0)";
@@ -147,6 +167,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public const string DefaultInspectorComponentsHeader = "Components (0)";
         public const string DefaultNavigateBackTooltip = "Back (Alt+Left)";
         public const string DefaultNavigateForwardTooltip = "Forward (Alt+Right)";
+        public const string DefaultScriptTitle = "No script selected";
+        public const string DefaultScriptSummary = "Select a MonoScript or MonoBehaviour to view C# code.";
 
         public PreviewSessionViewModel(Action<Action>? dispatchToUi = null)
         {
@@ -168,6 +190,8 @@ namespace AssetStudio.Avalonia.ViewModels
 
         internal AsyncPreviewRequestCoordinator InspectorCoordinator => _inspectorCoordinator;
 
+        internal AsyncPreviewRequestCoordinator ScriptCoordinator => _scriptCoordinator;
+
         internal AnimationPreviewLoadCoordinator AnimationCoordinator => _animationCoordinator;
 
         public AssetNavigationHistory NavigationHistory => _navigationHistory;
@@ -187,6 +211,10 @@ namespace AssetStudio.Avalonia.ViewModels
         public long CurrentInspectorRequestId => _inspectorCoordinator.CurrentRequestId;
 
         public long CancelledInspectorRequestCount => _inspectorCoordinator.CancelledRequestCount;
+
+        public long CurrentScriptRequestId => _scriptCoordinator.CurrentRequestId;
+
+        public long CancelledScriptRequestCount => _scriptCoordinator.CancelledRequestCount;
 
         public long CurrentAnimationRequestId => _animationCoordinator.CurrentRequestId;
 
@@ -384,6 +412,7 @@ namespace AssetStudio.Avalonia.ViewModels
                 var prevPreview = IsPreviewTabActive;
                 var prevDump = IsDumpTabActive;
                 var prevReferences = IsReferencesTabActive;
+                var prevScript = IsScriptTabActive;
                 if (SetProperty(ref _activeRightTab, value))
                 {
                     if (IsPreviewTabActive != prevPreview)
@@ -400,6 +429,11 @@ namespace AssetStudio.Avalonia.ViewModels
                     if (IsReferencesTabActive != prevReferences)
                     {
                         OnPropertyChanged(nameof(IsReferencesTabActive));
+                    }
+
+                    if (IsScriptTabActive != prevScript)
+                    {
+                        OnPropertyChanged(nameof(IsScriptTabActive));
                     }
                 }
             }
@@ -433,6 +467,22 @@ namespace AssetStudio.Avalonia.ViewModels
                     ActiveRightTab = RightPanelTab.References;
                 }
                 else if (_activeRightTab == RightPanelTab.References)
+                {
+                    ActiveRightTab = RightPanelTab.Preview;
+                }
+            }
+        }
+
+        public bool IsScriptTabActive
+        {
+            get => _activeRightTab == RightPanelTab.Script;
+            set
+            {
+                if (value)
+                {
+                    ActiveRightTab = RightPanelTab.Script;
+                }
+                else if (_activeRightTab == RightPanelTab.Script)
                 {
                     ActiveRightTab = RightPanelTab.Preview;
                 }
@@ -773,6 +823,147 @@ namespace AssetStudio.Avalonia.ViewModels
             get => _navigateForwardTooltip;
             private set => SetProperty(ref _navigateForwardTooltip, value ?? DefaultNavigateForwardTooltip);
         }
+
+        // Phase 2: Integrated Script Decompiler properties
+
+        public bool IsScriptLoading
+        {
+            get => _isScriptLoading;
+            private set => SetProperty(ref _isScriptLoading, value);
+        }
+
+        public bool HasScriptSource
+        {
+            get => _hasScriptSource;
+            private set => SetProperty(ref _hasScriptSource, value);
+        }
+
+        public string ScriptTitle
+        {
+            get => _scriptTitle;
+            private set => SetProperty(ref _scriptTitle, value ?? DefaultScriptTitle);
+        }
+
+        public string ScriptSummaryText
+        {
+            get => _scriptSummaryText;
+            private set => SetProperty(ref _scriptSummaryText, value ?? DefaultScriptSummary);
+        }
+
+        public string ScriptBackendBadge
+        {
+            get => _scriptBackendBadge;
+            private set
+            {
+                var normalized = value ?? string.Empty;
+                var prevHas = HasScriptBackendBadge;
+                if (SetProperty(ref _scriptBackendBadge, normalized) && HasScriptBackendBadge != prevHas)
+                {
+                    OnPropertyChanged(nameof(HasScriptBackendBadge));
+                }
+            }
+        }
+
+        public bool HasScriptBackendBadge => !string.IsNullOrWhiteSpace(_scriptBackendBadge);
+
+        public string ScriptSourceCode
+        {
+            get => _scriptSourceCode;
+            private set => SetProperty(ref _scriptSourceCode, value ?? string.Empty);
+        }
+
+        public string ScriptFullSourceCode
+        {
+            get => _scriptFullSourceCode;
+            private set
+            {
+                var normalized = value ?? string.Empty;
+                var prevCanSave = CanSaveOrCopyScript;
+                if (SetProperty(ref _scriptFullSourceCode, normalized) && CanSaveOrCopyScript != prevCanSave)
+                {
+                    OnPropertyChanged(nameof(CanSaveOrCopyScript));
+                }
+            }
+        }
+
+        public bool CanSaveOrCopyScript => !string.IsNullOrWhiteSpace(_scriptFullSourceCode);
+
+        public string ScriptSearchText
+        {
+            get => _scriptSearchText;
+            set
+            {
+                var normalized = value ?? string.Empty;
+                if (SetProperty(ref _scriptSearchText, normalized))
+                {
+                    ApplyScriptSearchCore();
+                }
+            }
+        }
+
+        public string ScriptSearchMatchSummary
+        {
+            get => _scriptSearchMatchSummary;
+            private set
+            {
+                var normalized = value ?? string.Empty;
+                var prevHas = HasScriptSearchMatchSummary;
+                if (SetProperty(ref _scriptSearchMatchSummary, normalized) && HasScriptSearchMatchSummary != prevHas)
+                {
+                    OnPropertyChanged(nameof(HasScriptSearchMatchSummary));
+                }
+            }
+        }
+
+        public bool HasScriptSearchMatchSummary => !string.IsNullOrWhiteSpace(_scriptSearchMatchSummary);
+
+        public bool IsScriptSearchFilterOnly
+        {
+            get => _isScriptSearchFilterOnly;
+            set
+            {
+                if (SetProperty(ref _isScriptSearchFilterOnly, value))
+                {
+                    ApplyScriptSearchCore();
+                }
+            }
+        }
+
+        public string ScriptDiagnosticText
+        {
+            get => _scriptDiagnosticText;
+            private set
+            {
+                var normalized = value ?? string.Empty;
+                var prevHas = HasScriptDiagnostic;
+                if (SetProperty(ref _scriptDiagnosticText, normalized) && HasScriptDiagnostic != prevHas)
+                {
+                    OnPropertyChanged(nameof(HasScriptDiagnostic));
+                }
+            }
+        }
+
+        public bool HasScriptDiagnostic => !string.IsNullOrWhiteSpace(_scriptDiagnosticText);
+
+        public string ScriptAssemblyName
+        {
+            get => _scriptAssemblyName;
+            private set => SetProperty(ref _scriptAssemblyName, value ?? string.Empty);
+        }
+
+        public string ScriptNamespace
+        {
+            get => _scriptNamespace;
+            private set => SetProperty(ref _scriptNamespace, value ?? string.Empty);
+        }
+
+        public string ScriptClassName
+        {
+            get => _scriptClassName;
+            private set => SetProperty(ref _scriptClassName, value ?? string.Empty);
+        }
+
+        public IReadOnlyList<ScriptMethodSymbol> ScriptMethodSymbols => _scriptMethodSymbols;
 
         public static string TruncatePreviewText(string? text, string fallbackText = "")
         {
@@ -1183,6 +1374,7 @@ namespace AssetStudio.Avalonia.ViewModels
             _dumpCoordinator.CancelCurrent();
             _referencesCoordinator.CancelCurrent();
             _inspectorCoordinator.CancelCurrent();
+            _scriptCoordinator.CancelCurrent();
             _animationCoordinator.CancelCurrent();
             Interlocked.Increment(ref _previewVersion);
             _dispatchToUi(() =>
@@ -1191,7 +1383,175 @@ namespace AssetStudio.Avalonia.ViewModels
                 IsDumpLoading = false;
                 IsReferencesLoading = false;
                 IsGameObjectInspectorLoading = false;
+                IsScriptLoading = false;
             });
+        }
+
+        // Phase 2: Integrated Script Decompiler operations
+
+        public CancellationToken BeginScriptRequest(out long requestId, string? title = null)
+        {
+            var token = _scriptCoordinator.BeginNewRequest(out requestId);
+            var effectiveTitle = !string.IsNullOrWhiteSpace(title) ? title! : "Loading script...";
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    IsScriptLoading = true;
+                    ScriptTitle = effectiveTitle;
+                    ScriptSummaryText = "Decompiling / resolving C# source...";
+                    ScriptDiagnosticText = string.Empty;
+                }
+            });
+            return token;
+        }
+
+        public bool IsScriptRequestCurrent(long requestId, CancellationToken cancellationToken = default)
+        {
+            return !cancellationToken.IsCancellationRequested && _scriptCoordinator.IsCurrent(requestId);
+        }
+
+        public bool CompleteScriptRequest(long requestId, ScriptDecompilationResult result)
+        {
+            ArgumentNullException.ThrowIfNull(result);
+            if (!_scriptCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_scriptCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    ApplyScriptResultCore(result);
+                }
+            });
+            return true;
+        }
+
+        public bool FailScriptRequest(long requestId, string errorMessage)
+        {
+            if (!_scriptCoordinator.IsCurrent(requestId))
+            {
+                return false;
+            }
+
+            _dispatchToUi(() =>
+            {
+                if (!_scriptCoordinator.IsCurrent(requestId))
+                {
+                    return;
+                }
+
+                lock (_stateLock)
+                {
+                    IsScriptLoading = false;
+                    HasScriptSource = false;
+                    ScriptBackendBadge = "Error";
+                    ScriptSummaryText = "Failed to load script source.";
+                    ScriptDiagnosticText = errorMessage ?? "Unknown script decompilation error.";
+                    ScriptFullSourceCode = string.Empty;
+                    ScriptSourceCode = string.Empty;
+                    ScriptSearchMatchSummary = string.Empty;
+                    _scriptMethodSymbols = Array.Empty<ScriptMethodSymbol>();
+                }
+            });
+            return true;
+        }
+
+        public void ShowScriptResult(ScriptDecompilationResult result)
+        {
+            ArgumentNullException.ThrowIfNull(result);
+            _scriptCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ApplyScriptResultCore(result);
+                }
+            });
+        }
+
+        public void CancelPendingScript()
+        {
+            _scriptCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                IsScriptLoading = false;
+            });
+        }
+
+        public void ClearScript()
+        {
+            _scriptCoordinator.CancelCurrent();
+            _dispatchToUi(() =>
+            {
+                lock (_stateLock)
+                {
+                    ClearScriptCore();
+                }
+            });
+        }
+
+        private void ApplyScriptResultCore(ScriptDecompilationResult result)
+        {
+            IsScriptLoading = false;
+            HasScriptSource = result.Success;
+            ScriptTitle = !string.IsNullOrWhiteSpace(result.Title) ? result.Title : DefaultScriptTitle;
+            ScriptSummaryText = !string.IsNullOrWhiteSpace(result.SummaryText) ? result.SummaryText : DefaultScriptSummary;
+            ScriptBackendBadge = result.BackendBadge ?? string.Empty;
+            ScriptDiagnosticText = result.DiagnosticMessage ?? string.Empty;
+            ScriptAssemblyName = result.AssemblyName ?? string.Empty;
+            ScriptNamespace = result.Namespace ?? string.Empty;
+            ScriptClassName = result.ClassName ?? string.Empty;
+            _scriptMethodSymbols = result.MethodSymbols ?? Array.Empty<ScriptMethodSymbol>();
+            ScriptFullSourceCode = result.SourceCode ?? string.Empty;
+            ApplyScriptSearchCore();
+        }
+
+        private void ClearScriptCore()
+        {
+            IsScriptLoading = false;
+            HasScriptSource = false;
+            ScriptTitle = DefaultScriptTitle;
+            ScriptSummaryText = DefaultScriptSummary;
+            ScriptBackendBadge = string.Empty;
+            ScriptDiagnosticText = string.Empty;
+            ScriptAssemblyName = string.Empty;
+            ScriptNamespace = string.Empty;
+            ScriptClassName = string.Empty;
+            _scriptMethodSymbols = Array.Empty<ScriptMethodSymbol>();
+            SetProperty(ref _scriptSearchText, string.Empty, nameof(ScriptSearchText));
+            SetProperty(ref _isScriptSearchFilterOnly, false, nameof(IsScriptSearchFilterOnly));
+            ScriptSearchMatchSummary = string.Empty;
+            ScriptFullSourceCode = string.Empty;
+            ScriptSourceCode = string.Empty;
+        }
+
+        private void ApplyScriptSearchCore()
+        {
+            if (string.IsNullOrEmpty(_scriptFullSourceCode))
+            {
+                ScriptSearchMatchSummary = string.Empty;
+                ScriptSourceCode = string.Empty;
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(_scriptSearchText))
+            {
+                ScriptSearchMatchSummary = string.Empty;
+                ScriptSourceCode = TruncatePreviewText(_scriptFullSourceCode);
+                return;
+            }
+
+            var searchResult = ScriptCodeSearchHelper.ApplySearch(_scriptFullSourceCode, _scriptSearchText, _isScriptSearchFilterOnly);
+            ScriptSearchMatchSummary = searchResult.MatchSummary;
+            ScriptSourceCode = TruncatePreviewText(searchResult.DisplayText);
         }
 
         // Phase 1: MonoBehaviour Tree / JSON Viewer operations
@@ -2024,6 +2384,7 @@ namespace AssetStudio.Avalonia.ViewModels
                     ClearMonoBehaviourTreeCore();
                     ClearGameObjectInspectorCore();
                     ClearNavigationHistoryCore();
+                    ClearScriptCore();
                     _dialoguePlainTextScript = string.Empty;
                     _dialogueDetailsText = string.Empty;
                     HasDialoguePreview = false;
@@ -2052,6 +2413,7 @@ namespace AssetStudio.Avalonia.ViewModels
             _dumpCoordinator.Dispose();
             _referencesCoordinator.Dispose();
             _inspectorCoordinator.Dispose();
+            _scriptCoordinator.Dispose();
             _animationCoordinator.Dispose();
         }
     }

@@ -454,6 +454,12 @@ public partial class MainWindow : Window
         handlers.NavigateBackAsync = NavigateBackCommandHandlerAsync;
         handlers.NavigateForwardAsync = NavigateForwardCommandHandlerAsync;
 
+        handlers.ViewSelectedScriptAsync = ViewSelectedScriptCommandHandlerAsync;
+        handlers.CopyScriptCodeAsync = CopyScriptCodeCommandHandlerAsync;
+        handlers.SaveScriptCodeAsync = SaveScriptCodeCommandHandlerAsync;
+        handlers.ExportGhidraScriptAsync = ExportGhidraScriptCommandHandlerAsync;
+        handlers.SelectScriptsFolderAsync = SelectScriptsFolderCommandHandlerAsync;
+
         handlers.VideoPlayPauseAsync = ExecuteVideoPlayPauseAsync;
         handlers.VideoStopAsync = VideoStopAsync;
         handlers.VideoExportAsync = ExecuteVideoExportAsync;
@@ -2213,6 +2219,7 @@ public partial class MainWindow : Window
         _previewRequestCoordinator.CancelCurrent();
         _dumpRequestCoordinator.CancelCurrent();
         _referencesRequestCoordinator.CancelCurrent();
+        _scriptRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         lock (preloaderLock)
         {
@@ -2270,6 +2277,7 @@ public partial class MainWindow : Window
         _previewRequestCoordinator.CancelCurrent();
         _dumpRequestCoordinator.CancelCurrent();
         _referencesRequestCoordinator.CancelCurrent();
+        _scriptRequestCoordinator.CancelCurrent();
         _animationPreviewCoordinator.CancelCurrent();
         _animationRigPreviewCache.Clear();
         treeSearchSession.Invalidate();
@@ -2405,6 +2413,7 @@ public partial class MainWindow : Window
         {
             assemblyLoader.Clear();
         }
+        DisposeScriptDecompilerService();
 
         ViewModel.ResetSession();
         ViewModel.Dispose();

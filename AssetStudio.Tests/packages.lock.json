@@ -398,6 +398,7 @@
           "Avalonia.Themes.Fluent": "[12.0.3, )",
           "AvaloniaUI.DiagnosticsSupport": "[2.2.1, )",
           "FFmpegVideoPlayer.Avalonia": "[2.8.0, )",
+          "ICSharpCode.Decompiler": "[11.2.0.10050, )",
           "Microsoft.Data.Sqlite": "[10.0.15, )",
           "Newtonsoft.Json": "[13.0.3, )",
           "OpenTK": "[4.8.2, )"
@@ -489,6 +490,12 @@
           "FFmpegVideoPlayer.Audio.OpenTK": "2.1.8",
           "FFmpegVideoPlayer.Core": "2.7.0"
         }
+      },
+      "ICSharpCode.Decompiler": {
+        "type": "CentralTransitive",
+        "requested": "[11.2.0.10050, )",
+        "resolved": "11.2.0.10050",
+        "contentHash": "H8cD1Sast2Zkex1RxdUiZvCmc1ZZ8Fkf+Mfs9WYzlPq74zW6xqMmZgip9l0rt5z9akh1fnSUg72hIGtClEI4zw=="
       },
       "K4os.Compression.LZ4": {
         "type": "CentralTransitive",
