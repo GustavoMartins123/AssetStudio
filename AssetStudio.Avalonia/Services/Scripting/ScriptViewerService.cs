@@ -13,15 +13,18 @@ public sealed class ScriptViewerService : IDisposable
 {
     private readonly MonoDecompilerService _monoDecompiler;
     private readonly Il2CppDumpScriptService _il2CppService;
+    private readonly Il2CppMetadataReader _metadataReader;
     private readonly GhidraExportService _ghidraExportService;
 
     public ScriptViewerService(
         MonoDecompilerService? monoDecompiler = null,
         Il2CppDumpScriptService? il2CppService = null,
-        GhidraExportService? ghidraExportService = null)
+        GhidraExportService? ghidraExportService = null,
+        Il2CppMetadataReader? metadataReader = null)
     {
         _monoDecompiler = monoDecompiler ?? new MonoDecompilerService();
         _il2CppService = il2CppService ?? new Il2CppDumpScriptService();
+        _metadataReader = metadataReader ?? new Il2CppMetadataReader();
         _ghidraExportService = ghidraExportService ?? new GhidraExportService();
     }
 
@@ -52,7 +55,9 @@ public sealed class ScriptViewerService : IDisposable
             customScriptsDirectory: request.CustomScriptsDirectory,
             knownIl2CppArtifacts: CollectExplicitArtifacts(request),
             gameAssemblyPath: request.GameAssemblyPath,
-            loadedAssemblyDirectory: null);
+            loadedAssemblyDirectory: null,
+            globalMetadataPath: request.GlobalMetadataPath,
+            projectAnalysisCacheDirectory: request.ProjectAnalysisCacheDirectory);
 
         var managedDirs = request.ManagedDirectories
             .Concat(discovered.ManagedDirectories)
@@ -68,6 +73,7 @@ public sealed class ScriptViewerService : IDisposable
 
         var dumpCsPath = FirstExistingFile(request.DumpCsPath, discovered.DumpCsPath);
         var scriptJsonPath = FirstExistingFile(request.ScriptJsonPath, discovered.ScriptJsonPath);
+        var globalMetadataPath = FirstExistingFile(request.GlobalMetadataPath, discovered.GlobalMetadataPath);
 
         // 1. Mono managed assemblies first (produces full real C# method bodies via ICSharpCode.Decompiler)
         if (managedDirs.Count > 0)
@@ -107,11 +113,26 @@ public sealed class ScriptViewerService : IDisposable
                 cancellationToken: cancellationToken);
             if (dummyResult != null && dummyResult.Success)
             {
-                return EnrichDummyResultWithScriptJson(dummyResult, scriptJsonPath, cancellationToken);
+                return EnrichWithScriptJson(dummyResult, scriptJsonPath, cancellationToken);
             }
         }
 
-        // 4. Fallback: script.json alone (method list + RVAs outline)
+        // 4. Built-in pure-C# IL2CPP global-metadata.dat reader (automatic, zero external tool required)
+        string? metadataDiagnostic = null;
+        if (!string.IsNullOrWhiteSpace(globalMetadataPath))
+        {
+            var metadataResult = _metadataReader.TryExtractType(
+                globalMetadataPath,
+                request,
+                out metadataDiagnostic,
+                cancellationToken);
+            if (metadataResult != null && metadataResult.Success)
+            {
+                return EnrichWithScriptJson(metadataResult, scriptJsonPath, cancellationToken);
+            }
+        }
+
+        // 5. Fallback: script.json alone (method list + RVAs outline)
         if (!string.IsNullOrWhiteSpace(scriptJsonPath))
         {
             var outlineResult = _il2CppService.TryBuildScriptJsonOutline(
@@ -124,7 +145,14 @@ public sealed class ScriptViewerService : IDisposable
             }
         }
 
-        var hint = BuildUnavailableHint(request, managedDirs.Count > 0, dummyDirs.Count > 0, !string.IsNullOrWhiteSpace(dumpCsPath), !string.IsNullOrWhiteSpace(scriptJsonPath));
+        var hint = BuildUnavailableHint(
+            request,
+            managedDirs.Count > 0,
+            dummyDirs.Count > 0,
+            !string.IsNullOrWhiteSpace(dumpCsPath),
+            !string.IsNullOrWhiteSpace(globalMetadataPath),
+            !string.IsNullOrWhiteSpace(scriptJsonPath),
+            metadataDiagnostic);
         return ScriptDecompilationResult.Unavailable(request, hint);
     }
 
@@ -139,36 +167,38 @@ public sealed class ScriptViewerService : IDisposable
     {
         _monoDecompiler.ClearCache();
         _il2CppService.ClearCache();
+        _metadataReader.ClearCache();
     }
 
     public void Dispose()
     {
         _monoDecompiler.Dispose();
         _il2CppService.ClearCache();
+        _metadataReader.ClearCache();
     }
 
-    private ScriptDecompilationResult EnrichDummyResultWithScriptJson(
-        ScriptDecompilationResult dummyResult,
+    private ScriptDecompilationResult EnrichWithScriptJson(
+        ScriptDecompilationResult baseResult,
         string? scriptJsonPath,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(scriptJsonPath) || !File.Exists(scriptJsonPath))
         {
-            return dummyResult;
+            return baseResult;
         }
 
         var methods = _il2CppService.QueryScriptJsonMethodsForClass(
             scriptJsonPath,
-            dummyResult.Namespace,
-            dummyResult.ClassName,
+            baseResult.Namespace,
+            baseResult.ClassName,
             cancellationToken);
         if (methods.Count == 0)
         {
-            return dummyResult;
+            return baseResult;
         }
 
-        var sb = new StringBuilder(dummyResult.SourceCode.Length + 512);
-        sb.AppendLine(dummyResult.SourceCode);
+        var sb = new StringBuilder(baseResult.SourceCode.Length + 512);
+        sb.AppendLine(baseResult.SourceCode);
         sb.AppendLine();
         sb.AppendLine("// --- Matched script.json RVAs (for Ghidra / Native Analysis) ---");
         foreach (var sym in methods.Take(200))
@@ -179,18 +209,18 @@ public sealed class ScriptViewerService : IDisposable
 
         return new ScriptDecompilationResult
         {
-            Success = dummyResult.Success,
-            SourceKind = dummyResult.SourceKind,
-            BackendBadge = dummyResult.BackendBadge,
-            Title = dummyResult.Title,
-            AssemblyName = dummyResult.AssemblyName,
-            Namespace = dummyResult.Namespace,
-            ClassName = dummyResult.ClassName,
-            SourceFilePath = dummyResult.SourceFilePath,
+            Success = baseResult.Success,
+            SourceKind = baseResult.SourceKind,
+            BackendBadge = baseResult.BackendBadge,
+            Title = baseResult.Title,
+            AssemblyName = baseResult.AssemblyName,
+            Namespace = baseResult.Namespace,
+            ClassName = baseResult.ClassName,
+            SourceFilePath = baseResult.SourceFilePath,
             SourceCode = sb.ToString().TrimEnd(),
-            SummaryText = $"{dummyResult.SummaryText} • {methods.Count} script.json RVA{(methods.Count == 1 ? string.Empty : "s")}",
-            DiagnosticMessage = dummyResult.DiagnosticMessage,
-            TypeDefIndex = dummyResult.TypeDefIndex,
+            SummaryText = $"{baseResult.SummaryText} • {methods.Count} script.json RVA{(methods.Count == 1 ? string.Empty : "s")}",
+            DiagnosticMessage = baseResult.DiagnosticMessage,
+            TypeDefIndex = baseResult.TypeDefIndex,
             MethodSymbols = methods
         };
     }
@@ -221,27 +251,36 @@ public sealed class ScriptViewerService : IDisposable
         bool hadManagedDirs,
         bool hadDummyDirs,
         bool hadDumpCs,
-        bool hadScriptJson)
+        bool hadGlobalMetadata,
+        bool hadScriptJson,
+        string? metadataDiagnostic)
     {
-        if (hadManagedDirs || hadDummyDirs || hadDumpCs || hadScriptJson)
+        if (!string.IsNullOrWhiteSpace(metadataDiagnostic) && !hadManagedDirs && !hadDummyDirs && !hadDumpCs && !hadScriptJson)
+        {
+            return $"{metadataDiagnostic} Click 'Scripts Folder...' to select a decrypted Il2CppDumper output folder (dump.cs / script.json / DummyDll).";
+        }
+
+        if (hadManagedDirs || hadDummyDirs || hadDumpCs || hadGlobalMetadata || hadScriptJson)
         {
             var searched = new List<string>();
             if (hadManagedDirs) searched.Add("Managed DLLs");
             if (hadDumpCs) searched.Add("dump.cs");
             if (hadDummyDirs) searched.Add("DummyDll");
+            if (hadGlobalMetadata) searched.Add("global-metadata.dat");
             if (hadScriptJson) searched.Add("script.json");
 
-            return $"Type '{request.FullTypeName}' was not found in the available script sources ({string.Join(", ", searched)}). Try choosing another folder via 'Scripts Folder...'.";
+            var extra = !string.IsNullOrWhiteSpace(metadataDiagnostic) ? $" ({metadataDiagnostic})" : string.Empty;
+            return $"Type '{request.FullTypeName}' was not found in available sources ({string.Join(", ", searched)}){extra}. Use 'Scripts Folder...' to choose another folder.";
         }
 
         return request.ScriptingBackend switch
         {
             UnityScriptingBackend.Il2Cpp =>
-                "IL2CPP project detected, but no dump.cs, script.json, or DummyDll folder was found yet. Click 'Scripts Folder...' to point to your Il2CppDumper output folder.",
+                "IL2CPP project detected, but no global-metadata.dat, dump.cs, script.json, or DummyDll folder was found. Click 'Scripts Folder...' to select an Il2CppDumper output folder.",
             UnityScriptingBackend.Mono =>
                 "Mono project detected, but the target assembly was not found. Click 'Scripts Folder...' to select the game's Managed/ folder.",
             _ =>
-                "No Managed assemblies or IL2CPP dump artifacts were detected automatically. Click 'Scripts Folder...' to select a Managed/ folder (Mono) or Il2CppDumper output folder (dump.cs / script.json / DummyDll)."
+                "No Managed assemblies, global-metadata.dat, or IL2CPP dump artifacts were detected. Click 'Scripts Folder...' to select a Managed/ or Il2CppDumper folder."
         };
     }
 }

@@ -154,6 +154,7 @@ namespace AssetStudio.Avalonia.ViewModels
         private string _scriptSearchText = string.Empty;
         private string _scriptSearchMatchSummary = string.Empty;
         private bool _isScriptSearchFilterOnly;
+        private bool _isScriptWordWrapEnabled = true;
         private string _scriptDiagnosticText = string.Empty;
         private string _scriptAssemblyName = string.Empty;
         private string _scriptNamespace = string.Empty;
@@ -929,6 +930,12 @@ namespace AssetStudio.Avalonia.ViewModels
             }
         }
 
+        public bool IsScriptWordWrapEnabled
+        {
+            get => _isScriptWordWrapEnabled;
+            set => SetProperty(ref _isScriptWordWrapEnabled, value);
+        }
+
         public string ScriptDiagnosticText
         {
             get => _scriptDiagnosticText;
@@ -1528,6 +1535,7 @@ namespace AssetStudio.Avalonia.ViewModels
             _scriptMethodSymbols = Array.Empty<ScriptMethodSymbol>();
             SetProperty(ref _scriptSearchText, string.Empty, nameof(ScriptSearchText));
             SetProperty(ref _isScriptSearchFilterOnly, false, nameof(IsScriptSearchFilterOnly));
+            SetProperty(ref _isScriptWordWrapEnabled, true, nameof(IsScriptWordWrapEnabled));
             ScriptSearchMatchSummary = string.Empty;
             ScriptFullSourceCode = string.Empty;
             ScriptSourceCode = string.Empty;

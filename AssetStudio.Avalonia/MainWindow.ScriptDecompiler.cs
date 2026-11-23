@@ -3,9 +3,12 @@ using AssetStudio.Avalonia.Services;
 using AssetStudio.Avalonia.Services.ProjectAnalysis;
 using AssetStudio.Avalonia.Services.Scripting;
 using AssetStudio.Avalonia.ViewModels;
+using Avalonia.Data.Converters;
+using Avalonia.Media;
 using Avalonia.Threading;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -310,12 +313,17 @@ public partial class MainWindow
     {
         var projectRoot = ResolveEffectiveScriptProjectRoot();
         var report = CurrentProjectAnalysisReport;
+        var projectAnalysisCacheDir = !string.IsNullOrWhiteSpace(projectRoot)
+            ? ProjectAnalysisService.Shared.GetProjectCacheDirectory(projectRoot)
+            : null;
         var discovered = ScriptSourceDiscovery.Discover(
             projectRoot: projectRoot,
             customScriptsDirectory: _customScriptsDirectory,
             knownIl2CppArtifacts: report?.Il2CppDumperArtifactPaths,
             gameAssemblyPath: report?.GameAssemblyPath,
-            loadedAssemblyDirectory: _lastLoadedAssemblyDirectory);
+            loadedAssemblyDirectory: _lastLoadedAssemblyDirectory,
+            globalMetadataPath: report?.GlobalMetadataPath,
+            projectAnalysisCacheDirectory: projectAnalysisCacheDir);
 
         return new ScriptLookupRequest
         {
@@ -331,6 +339,8 @@ public partial class MainWindow
             ScriptJsonPath = discovered.ScriptJsonPath,
             Il2CppHeaderPath = discovered.Il2CppHeaderPath,
             GameAssemblyPath = discovered.GameAssemblyPath,
+            GlobalMetadataPath = discovered.GlobalMetadataPath,
+            ProjectAnalysisCacheDirectory = projectAnalysisCacheDir,
             ScriptingBackend = report?.ScriptingBackend ?? UnityScriptingBackend.Unknown
         };
     }
@@ -435,12 +445,17 @@ public partial class MainWindow
 
         var projectRoot = ResolveEffectiveScriptProjectRoot();
         var report = CurrentProjectAnalysisReport;
+        var projectAnalysisCacheDir = !string.IsNullOrWhiteSpace(projectRoot)
+            ? ProjectAnalysisService.Shared.GetProjectCacheDirectory(projectRoot)
+            : null;
         var discovered = ScriptSourceDiscovery.Discover(
             projectRoot: projectRoot,
             customScriptsDirectory: _customScriptsDirectory,
             knownIl2CppArtifacts: report?.Il2CppDumperArtifactPaths,
             gameAssemblyPath: report?.GameAssemblyPath,
-            loadedAssemblyDirectory: _lastLoadedAssemblyDirectory);
+            loadedAssemblyDirectory: _lastLoadedAssemblyDirectory,
+            globalMetadataPath: report?.GlobalMetadataPath,
+            projectAnalysisCacheDirectory: projectAnalysisCacheDir);
 
         var hasProjectScriptJson = !string.IsNullOrWhiteSpace(discovered.ScriptJsonPath)
             && File.Exists(discovered.ScriptJsonPath);
@@ -554,5 +569,18 @@ public partial class MainWindow
     {
         _scriptRequestCoordinator.CancelCurrent();
         _scriptViewerService.Dispose();
+    }
+}
+
+public sealed class BoolToTextWrappingConverter : IValueConverter
+{
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        return value is true ? TextWrapping.Wrap : TextWrapping.NoWrap;
+    }
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        return value is TextWrapping wrapping && wrapping != TextWrapping.NoWrap;
     }
 }

@@ -1241,61 +1241,68 @@
                             </Grid>
                         </Grid>
                     </Border>
-                    <!-- Phase 2: Integrated Script Decompiler (Mono ILSpy + IL2CPP dump.cs/script.json + Ghidra Export) -->
+                    <!-- Phase 2: Integrated Script Decompiler (Mono ILSpy + IL2CPP global-metadata / dump.cs / script.json + Ghidra Export) -->
                     <Border x:Name="ScriptTabContent"
                             Background="{DynamicResource SystemControlPageBackgroundChromeLowBrush}"
                             IsVisible="{Binding PreviewSession.IsScriptTabActive}">
+                        <Border.Resources>
+                            <local:BoolToTextWrappingConverter x:Key="ScriptWordWrapConverter" />
+                        </Border.Resources>
                         <Grid RowDefinitions="Auto,Auto,Auto,*" Margin="8" RowSpacing="8">
                             <Border Grid.Row="0" Classes="inspector-card">
-                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
-                                    <StackPanel Grid.Column="0" Spacing="3">
-                                        <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                <StackPanel Spacing="6">
+                                    <StackPanel Spacing="3">
+                                        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                                             <TextBlock x:Name="ScriptTitleText"
+                                                       Grid.Column="0"
                                                        Text="{Binding PreviewSession.ScriptTitle}"
                                                        FontWeight="SemiBold"
                                                        FontSize="13"
                                                        TextTrimming="CharacterEllipsis"
                                                        VerticalAlignment="Center" />
-                                            <Border Classes="badge-chip"
+                                            <Border Grid.Column="1"
+                                                    Classes="badge-chip"
+                                                    VerticalAlignment="Center"
                                                     IsVisible="{Binding PreviewSession.HasScriptBackendBadge}">
                                                 <TextBlock x:Name="ScriptBackendBadgeText"
                                                            Text="{Binding PreviewSession.ScriptBackendBadge}"
                                                            FontSize="10"
                                                            FontWeight="SemiBold" />
                                             </Border>
-                                        </StackPanel>
+                                        </Grid>
                                         <TextBlock x:Name="ScriptSummaryText"
                                                    Text="{Binding PreviewSession.ScriptSummaryText}"
                                                    FontSize="11"
                                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
                                                    TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
-                                    <WrapPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
                                         <Button x:Name="ScriptCopyButton"
                                                 Classes="toolbar-btn"
                                                 Content="Copy C#"
-                                                Margin="0,0,4,0"
+                                                Margin="0,0,4,4"
                                                 Command="{Binding CopyScriptCodeCommand}"
                                                 ToolTip.Tip="Copy full reconstructed C# source code to clipboard" />
                                         <Button x:Name="ScriptSaveButton"
                                                 Classes="toolbar-btn"
                                                 Content="Save .cs"
-                                                Margin="0,0,4,0"
+                                                Margin="0,0,4,4"
                                                 Command="{Binding SaveScriptCodeCommand}"
                                                 ToolTip.Tip="Save the reconstructed C# class to a .cs file" />
                                         <Button x:Name="ScriptExportGhidraButton"
                                                 Classes="toolbar-btn"
                                                 Content="Export Ghidra..."
-                                                Margin="0,0,4,0"
+                                                Margin="0,0,4,4"
                                                 Command="{Binding ExportGhidraScriptCommand}"
                                                 ToolTip.Tip="Export symbols JSON and a ready-to-run Python apply script for Ghidra" />
                                         <Button x:Name="ScriptSelectFolderButton"
                                                 Classes="toolbar-btn"
                                                 Content="Scripts Folder..."
+                                                Margin="0,0,0,4"
                                                 Command="{Binding SelectScriptsFolderCommand}"
-                                                ToolTip.Tip="Select a Mono Managed/ folder or an Il2CppDumper output folder (dump.cs, script.json, DummyDll)" />
+                                                ToolTip.Tip="Override auto-discovery with a custom Mono Managed/ or Il2CppDumper folder (dump.cs, script.json, DummyDll)" />
                                     </WrapPanel>
-                                </Grid>
+                                </StackPanel>
                             </Border>
 
                             <Border Grid.Row="1"
@@ -1308,7 +1315,7 @@
                                            TextWrapping="Wrap" />
                             </Border>
 
-                            <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                            <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
                                 <TextBox x:Name="ScriptSearchTextBox"
                                          Grid.Column="0"
                                          PlaceholderText="Search C# code (fields, methods, types, RVAs)..."
@@ -1318,8 +1325,15 @@
                                           Content="Filter lines"
                                           VerticalAlignment="Center"
                                           IsChecked="{Binding PreviewSession.IsScriptSearchFilterOnly, Mode=TwoWay}" />
-                                <Border Grid.Column="2"
+                                <CheckBox x:Name="ScriptWordWrapCheckBox"
+                                          Grid.Column="2"
+                                          Content="Wrap"
+                                          VerticalAlignment="Center"
+                                          IsChecked="{Binding PreviewSession.IsScriptWordWrapEnabled, Mode=TwoWay}"
+                                          ToolTip.Tip="Wrap long lines in the C# script viewer" />
+                                <Border Grid.Column="3"
                                         Classes="badge-chip"
+                                        VerticalAlignment="Center"
                                         IsVisible="{Binding PreviewSession.HasScriptSearchMatchSummary}">
                                     <TextBlock x:Name="ScriptSearchMatchSummaryText"
                                                Text="{Binding PreviewSession.ScriptSearchMatchSummary}"
@@ -1330,7 +1344,7 @@
                             <TextBox x:Name="ScriptCodeTextBox"
                                      Grid.Row="3"
                                      AcceptsReturn="True"
-                                     TextWrapping="NoWrap"
+                                     TextWrapping="{Binding PreviewSession.IsScriptWordWrapEnabled, Converter={StaticResource ScriptWordWrapConverter}}"
                                      IsReadOnly="True"
                                      FontFamily="{StaticResource AppMonoFontFamily}"
                                      FontSize="12"
