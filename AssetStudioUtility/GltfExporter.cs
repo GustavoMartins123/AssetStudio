@@ -6,15 +6,54 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
 namespace AssetStudio
 {
+    public sealed class GltfExportStatistics
+    {
+        public int TotalNodes { get; init; }
+        public int TotalMeshInstances { get; init; }
+        public int UniqueGltfMeshes { get; init; }
+        public int UniqueGeometryBuffers { get; init; }
+        public int ReusedMeshCount { get; init; }
+        public int ReusedGeometryCount { get; init; }
+        public int MaterialsCount { get; init; }
+        public int TexturesCount { get; init; }
+        public int SkinsCount { get; init; }
+        public int AnimationsCount { get; init; }
+        public long OutputBytes { get; init; }
+
+        public double InstancingPercent =>
+            TotalMeshInstances > 0
+                ? (double)ReusedGeometryCount / TotalMeshInstances * 100.0
+                : 0.0;
+
+        public string BuildSummary(string fileName)
+        {
+            var sizeText = OutputBytes >= 1024 * 1024
+                ? $"{OutputBytes / (1024.0 * 1024.0):F2} MB"
+                : $"{OutputBytes / 1024.0:F1} KB";
+
+            if (ReusedGeometryCount > 0)
+            {
+                return string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Exported {fileName} ({sizeText}): {TotalNodes:N0} nodes, {TotalMeshInstances:N0} mesh instances reusing {UniqueGeometryBuffers:N0} unique geometries ({UniqueGltfMeshes:N0} glTF meshes, {InstancingPercent:F0}% instanced), {MaterialsCount:N0} materials, {TexturesCount:N0} textures.");
+            }
+
+            return string.Create(
+                CultureInfo.InvariantCulture,
+                $"Exported {fileName} ({sizeText}): {TotalNodes:N0} nodes, {UniqueGltfMeshes:N0} meshes, {MaterialsCount:N0} materials, {TexturesCount:N0} textures.");
+        }
+    }
+
     /// <summary>
     /// Pure-C#, zero-extra-dependency glTF 2.0 (.gltf) and binary GLB v2 (.glb) exporter
     /// consuming AssetStudio's <see cref="IImported"/> model graph (meshes, PBR materials,
-    /// node hierarchy, skinning, morph targets / blend shapes, and keyframed animations).
+    /// node hierarchy, skinning, morph targets / blend shapes, mesh instancing, and keyframed animations).
     /// </summary>
     public sealed class GltfExporter
     {
@@ -40,8 +79,10 @@ namespace AssetStudio
         private readonly bool _exportAnimations;
         private readonly bool _exportBlendShape;
         private readonly bool _exportVertexColors;
+        private readonly bool _enableInstancing;
 
         public bool ExportVertexColors { get; set; }
+        public GltfExportStatistics LastExportStats { get; private set; } = new GltfExportStatistics();
 
         private readonly BufferBuilder _buffer = new BufferBuilder();
         private readonly List<GltfNode> _nodes = new List<GltfNode>();
@@ -56,7 +97,14 @@ namespace AssetStudio
 
         private readonly List<System.Numerics.Matrix4x4> _nodeGlobalRowMatrices = new List<System.Numerics.Matrix4x4>();
         private readonly List<int> _nodeParentIndices = new List<int>();
+        private readonly Dictionary<ImportedFrame, int> _nodeByFrame = new Dictionary<ImportedFrame, int>();
         private readonly Dictionary<string, int> _nodeByPath = new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly Dictionary<string, SharedGeometryEntry> _sharedGeometryByKey = new Dictionary<string, SharedGeometryEntry>(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> _sharedMeshIndexByInstanceKey = new Dictionary<string, int>(StringComparer.Ordinal);
+        private int _totalMeshInstances;
+        private int _uniqueGeometryBuffers;
+        private int _reusedMeshCount;
+        private int _reusedGeometryCount;
         private readonly Dictionary<string, string?> _uniqueSuffixToPath = new Dictionary<string, string?>(StringComparer.Ordinal);
         private readonly Dictionary<string, int?> _uniqueLeafToNode = new Dictionary<string, int?>(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _materialIndexByName = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -83,7 +131,8 @@ namespace AssetStudio
             bool exportSkins = true,
             bool exportAnimations = true,
             bool exportBlendShape = true,
-            bool exportVertexColors = false)
+            bool exportVertexColors = false,
+            bool enableInstancing = true)
         {
             _binary = binary;
             _scaleFactor = float.IsFinite(scaleFactor) && scaleFactor > 0f ? scaleFactor : 1f;
@@ -91,6 +140,7 @@ namespace AssetStudio
             _exportAnimations = exportAnimations;
             _exportBlendShape = exportBlendShape;
             _exportVertexColors = exportVertexColors;
+            _enableInstancing = enableInstancing;
             ExportVertexColors = exportVertexColors;
         }
 
@@ -162,6 +212,33 @@ namespace AssetStudio
                 }
 
                 WriteOutput(exportPath);
+
+                long outputBytes = 0;
+                try
+                {
+                    if (File.Exists(exportPath))
+                    {
+                        outputBytes = new FileInfo(exportPath).Length;
+                    }
+                }
+                catch
+                {
+                }
+
+                LastExportStats = new GltfExportStatistics
+                {
+                    TotalNodes = _nodes.Count,
+                    TotalMeshInstances = _totalMeshInstances,
+                    UniqueGltfMeshes = _meshes.Count,
+                    UniqueGeometryBuffers = _uniqueGeometryBuffers,
+                    ReusedMeshCount = _reusedMeshCount,
+                    ReusedGeometryCount = _reusedGeometryCount,
+                    MaterialsCount = _materials.Count,
+                    TexturesCount = _textures.Count,
+                    SkinsCount = _skins.Count,
+                    AnimationsCount = _animations.Count,
+                    OutputBytes = outputBytes
+                };
             }
             finally
             {
@@ -184,7 +261,14 @@ namespace AssetStudio
             _extensionsUsed.Clear();
             _nodeGlobalRowMatrices.Clear();
             _nodeParentIndices.Clear();
+            _nodeByFrame.Clear();
             _nodeByPath.Clear();
+            _sharedGeometryByKey.Clear();
+            _sharedMeshIndexByInstanceKey.Clear();
+            _totalMeshInstances = 0;
+            _uniqueGeometryBuffers = 0;
+            _reusedMeshCount = 0;
+            _reusedGeometryCount = 0;
             _uniqueSuffixToPath.Clear();
             _uniqueLeafToNode.Clear();
             _materialIndexByName.Clear();
@@ -244,6 +328,7 @@ namespace AssetStudio
             _nodes.Add(node);
             _nodeGlobalRowMatrices.Add(globalRow);
             _nodeParentIndices.Add(parentIndex);
+            _nodeByFrame[frame] = nodeIdx;
 
             if (parentIndex >= 0)
             {
@@ -1429,14 +1514,18 @@ namespace AssetStudio
                 return;
             }
 
-            string meshName = string.IsNullOrWhiteSpace(mesh.Path)
-                ? $"Mesh_{_meshes.Count}"
-                : mesh.Path.Substring(mesh.Path.LastIndexOf('/') + 1);
+            string meshName = !string.IsNullOrWhiteSpace(mesh.SourceMeshName)
+                ? mesh.SourceMeshName!
+                : (string.IsNullOrWhiteSpace(mesh.Path)
+                    ? $"Mesh_{_meshes.Count}"
+                    : mesh.Path.Substring(mesh.Path.LastIndexOf('/') + 1));
 
             // 2. Resolve skinning joints, mesh attachment node, and optional Armature-space canonicalization.
             bool isSkinned = _exportSkins && mesh.BoneList != null && mesh.BoneList.Count > 0;
             List<int>? skinJointNodes = null;
-            int resolvedTargetNode = TryResolveNodeIndex(mesh.Path, out int foundTargetNode) ? foundTargetNode : -1;
+            int resolvedTargetNode = mesh.TargetFrame != null && _nodeByFrame.TryGetValue(mesh.TargetFrame, out int exactFrameNode)
+                ? exactFrameNode
+                : (TryResolveNodeIndex(mesh.Path, out int foundTargetNode) ? foundTargetNode : -1);
 
             if (isSkinned)
             {
@@ -1697,6 +1786,88 @@ namespace AssetStudio
                 }
             }
 
+            // 2b. Check morph presence up front so non-skinned, non-morph meshes can reuse shared glTF meshes/buffers.
+            var normMeshPath = NormalizeFramePath(mesh.Path);
+            ImportedMorph? preResolvedMorph = null;
+            if (_exportBlendShape)
+            {
+                if (!morphByPath.TryGetValue(normMeshPath, out preResolvedMorph) && resolvedTargetNode >= 0)
+                {
+                    morphByNode.TryGetValue(resolvedTargetNode, out preResolvedMorph);
+                }
+            }
+
+            bool hasMorphChannels = preResolvedMorph != null && preResolvedMorph.Channels != null && preResolvedMorph.Channels.Count > 0;
+            bool canUseInstancing = _enableInstancing && !isSkinned && !hasMorphChannels && !flipWinding;
+            string? geometryCacheKey = null;
+            string? meshInstanceCacheKey = null;
+
+            if (canUseInstancing)
+            {
+                geometryCacheKey = ComputeGeometryCacheKey(mesh, primitivePayloads);
+                meshInstanceCacheKey = BuildMeshInstanceCacheKey(geometryCacheKey, primitivePayloads);
+
+                // Tier 1: Exact same geometry + exact same materials -> direct glTF node mesh instancing!
+                if (_sharedMeshIndexByInstanceKey.TryGetValue(meshInstanceCacheKey, out int existingMeshIdx))
+                {
+                    _nodes[meshNodeIdx].Mesh = existingMeshIdx;
+                    _totalMeshInstances++;
+                    _reusedMeshCount++;
+                    _reusedGeometryCount++;
+                    return;
+                }
+
+                // Tier 2: Exact same geometry + different material slots -> reuse vertex & index accessors with zero duplicate bytes!
+                if (_sharedGeometryByKey.TryGetValue(geometryCacheKey, out var cachedGeometry)
+                    && cachedGeometry.PrimitiveIndicesAccessors.Count == primitivePayloads.Count)
+                {
+                    var variantMesh = new GltfMesh
+                    {
+                        Name = meshName
+                    };
+
+                    if ((_exportVertexColors || ExportVertexColors) && mesh.hasColor)
+                    {
+                        EnsureVertexColorAccessorsForGeometry(mesh, vertexCount, primitivePayloads, cachedGeometry);
+                    }
+
+                    for (int p = 0; p < primitivePayloads.Count; p++)
+                    {
+                        var matIdx = primitivePayloads[p].MaterialIndex;
+                        var primAttributes = new Dictionary<string, int>(cachedGeometry.SharedAttributes, StringComparer.Ordinal);
+                        if (cachedGeometry.OpaqueVertexColorAccessor.HasValue || cachedGeometry.BlendVertexColorAccessor.HasValue)
+                        {
+                            bool isBlend = matIdx.HasValue
+                                && matIdx.Value >= 0
+                                && matIdx.Value < _materials.Count
+                                && string.Equals(_materials[matIdx.Value].AlphaMode, "BLEND", StringComparison.Ordinal);
+                            int? colorAccessor = isBlend
+                                ? (cachedGeometry.BlendVertexColorAccessor ?? cachedGeometry.OpaqueVertexColorAccessor)
+                                : (cachedGeometry.OpaqueVertexColorAccessor ?? cachedGeometry.BlendVertexColorAccessor);
+                            if (colorAccessor.HasValue)
+                            {
+                                primAttributes["COLOR_0"] = colorAccessor.Value;
+                            }
+                        }
+
+                        variantMesh.Primitives.Add(new GltfPrimitive
+                        {
+                            Attributes = primAttributes,
+                            Indices = cachedGeometry.PrimitiveIndicesAccessors[p],
+                            Material = matIdx
+                        });
+                    }
+
+                    int variantMeshIdx = _meshes.Count;
+                    _meshes.Add(variantMesh);
+                    _nodes[meshNodeIdx].Mesh = variantMeshIdx;
+                    _sharedMeshIndexByInstanceKey[meshInstanceCacheKey] = variantMeshIdx;
+                    _totalMeshInstances++;
+                    _reusedGeometryCount++;
+                    return;
+                }
+            }
+
             // 3. Build shared vertex attribute accessors.
             var sharedAttributes = new Dictionary<string, int>(StringComparer.Ordinal);
 
@@ -1871,19 +2042,11 @@ namespace AssetStudio
             }
 
             // 4. Morph targets (BlendShapes).
-            var normMeshPath = NormalizeFramePath(mesh.Path);
             List<Dictionary<string, int>>? morphTargets = null;
             List<string>? targetNames = null;
             List<float>? targetFullWeights = null;
 
-            ImportedMorph? morph = null;
-            if (_exportBlendShape)
-            {
-                if (!morphByPath.TryGetValue(normMeshPath, out morph) && resolvedTargetNode >= 0)
-                {
-                    morphByNode.TryGetValue(resolvedTargetNode, out morph);
-                }
-            }
+            ImportedMorph? morph = preResolvedMorph;
 
             if (morph != null && morph.Channels != null && morph.Channels.Count > 0)
             {
@@ -2014,10 +2177,12 @@ namespace AssetStudio
                 gltfMesh.TargetNames = targetNames;
             }
 
+            var primitiveIndicesAccessors = new List<int>(primitivePayloads.Count);
             for (int p = 0; p < primitivePayloads.Count; p++)
             {
                 var (indices, maxIdx, matIdx) = primitivePayloads[p];
                 int indicesAccessor = _buffer.AddIndicesAccessor(indices, maxIdx);
+                primitiveIndicesAccessors.Add(indicesAccessor);
                 var primAttributes = new Dictionary<string, int>(sharedAttributes, StringComparer.Ordinal);
                 if (opaqueVertexColorAccessor.HasValue || blendVertexColorAccessor.HasValue)
                 {
@@ -2046,6 +2211,20 @@ namespace AssetStudio
             int meshIdx = _meshes.Count;
             _meshes.Add(gltfMesh);
             _nodes[meshNodeIdx].Mesh = meshIdx;
+            _totalMeshInstances++;
+            _uniqueGeometryBuffers++;
+
+            if (canUseInstancing && geometryCacheKey != null && meshInstanceCacheKey != null)
+            {
+                _sharedGeometryByKey[geometryCacheKey] = new SharedGeometryEntry
+                {
+                    SharedAttributes = sharedAttributes,
+                    OpaqueVertexColorAccessor = opaqueVertexColorAccessor,
+                    BlendVertexColorAccessor = blendVertexColorAccessor,
+                    PrimitiveIndicesAccessors = primitiveIndicesAccessors
+                };
+                _sharedMeshIndexByInstanceKey[meshInstanceCacheKey] = meshIdx;
+            }
 
             if (morphTargets != null && targetNames != null && targetFullWeights != null)
             {
@@ -3367,6 +3546,186 @@ namespace AssetStudio
         // ------------------------------------------------------------------
         // Internal Model Types & Binary Buffer Builder
         // ------------------------------------------------------------------
+
+        private void EnsureVertexColorAccessorsForGeometry(
+            ImportedMesh mesh,
+            int vertexCount,
+            List<(List<int> Indices, int MaxIndex, int? MaterialIndex)> primitivePayloads,
+            SharedGeometryEntry cachedGeometry)
+        {
+            bool needsOpaque = false;
+            bool needsBlend = false;
+            for (int p = 0; p < primitivePayloads.Count; p++)
+            {
+                var matIdx = primitivePayloads[p].MaterialIndex;
+                bool isBlend = matIdx.HasValue
+                    && matIdx.Value >= 0
+                    && matIdx.Value < _materials.Count
+                    && string.Equals(_materials[matIdx.Value].AlphaMode, "BLEND", StringComparison.Ordinal);
+                if (isBlend) needsBlend = true;
+                else needsOpaque = true;
+            }
+
+            if (needsOpaque && !cachedGeometry.OpaqueVertexColorAccessor.HasValue)
+            {
+                var opaqueColors = new System.Numerics.Vector4[vertexCount];
+                for (int i = 0; i < vertexCount; i++)
+                {
+                    var c = mesh.VertexList[i].Color;
+                    opaqueColors[i] = new System.Numerics.Vector4(
+                        Clamp01(SanitizeFloat(c.R, 1f)),
+                        Clamp01(SanitizeFloat(c.G, 1f)),
+                        Clamp01(SanitizeFloat(c.B, 1f)),
+                        1f);
+                }
+                cachedGeometry.OpaqueVertexColorAccessor = _buffer.AddVec4Accessor(opaqueColors, target: TargetArrayBuffer);
+            }
+
+            if (needsBlend && !cachedGeometry.BlendVertexColorAccessor.HasValue)
+            {
+                var blendColors = new System.Numerics.Vector4[vertexCount];
+                for (int i = 0; i < vertexCount; i++)
+                {
+                    var c = mesh.VertexList[i].Color;
+                    blendColors[i] = new System.Numerics.Vector4(
+                        Clamp01(SanitizeFloat(c.R, 1f)),
+                        Clamp01(SanitizeFloat(c.G, 1f)),
+                        Clamp01(SanitizeFloat(c.B, 1f)),
+                        Clamp01(SanitizeFloat(c.A, 1f)));
+                }
+                cachedGeometry.BlendVertexColorAccessor = _buffer.AddVec4Accessor(blendColors, target: TargetArrayBuffer);
+            }
+        }
+
+        private string ComputeGeometryCacheKey(
+            ImportedMesh mesh,
+            List<(List<int> Indices, int MaxIndex, int? MaterialIndex)> primitivePayloads)
+        {
+            var exportColors = _exportVertexColors || ExportVertexColors;
+            if (!string.IsNullOrWhiteSpace(mesh.GeometryKey))
+            {
+                var sb = new StringBuilder(mesh.GeometryKey.Length + 48);
+                sb.Append("asset:");
+                sb.Append(mesh.GeometryKey);
+                sb.Append("|v:");
+                sb.Append(mesh.VertexList.Count);
+                sb.Append("|vc:");
+                sb.Append(exportColors ? '1' : '0');
+                sb.Append("|p:");
+                for (int p = 0; p < primitivePayloads.Count; p++)
+                {
+                    if (p > 0) sb.Append(',');
+                    sb.Append(primitivePayloads[p].Indices.Count);
+                }
+                return sb.ToString();
+            }
+
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+            void AppendInt(int value)
+            {
+                Span<byte> buf = stackalloc byte[4];
+                BinaryPrimitives.WriteInt32LittleEndian(buf, value);
+                hasher.AppendData(buf);
+            }
+
+            void AppendFloat(float value)
+            {
+                Span<byte> buf = stackalloc byte[4];
+                float clean = SanitizeFloat(value);
+                BinaryPrimitives.WriteInt32LittleEndian(buf, BitConverter.SingleToInt32Bits(clean));
+                hasher.AppendData(buf);
+            }
+
+            AppendInt(mesh.VertexList.Count);
+            AppendInt((mesh.hasNormal ? 1 : 0) | (mesh.hasTangent ? 2 : 0) | (mesh.hasColor && exportColors ? 4 : 0));
+            AppendInt(mesh.hasUV?.Length ?? 0);
+            if (mesh.hasUV != null)
+            {
+                for (int u = 0; u < mesh.hasUV.Length; u++)
+                {
+                    AppendInt(mesh.hasUV[u] ? 1 : 0);
+                }
+            }
+
+            for (int i = 0; i < mesh.VertexList.Count; i++)
+            {
+                var v = mesh.VertexList[i];
+                AppendFloat(v.Vertex.X);
+                AppendFloat(v.Vertex.Y);
+                AppendFloat(v.Vertex.Z);
+                if (mesh.hasNormal)
+                {
+                    AppendFloat(v.Normal.X);
+                    AppendFloat(v.Normal.Y);
+                    AppendFloat(v.Normal.Z);
+                }
+                if (mesh.hasTangent)
+                {
+                    AppendFloat(v.Tangent.X);
+                    AppendFloat(v.Tangent.Y);
+                    AppendFloat(v.Tangent.Z);
+                    AppendFloat(v.Tangent.W);
+                }
+                if (mesh.hasUV != null && v.UV != null)
+                {
+                    for (int u = 0; u < mesh.hasUV.Length; u++)
+                    {
+                        if (mesh.hasUV[u] && u < v.UV.Length && v.UV[u] != null && v.UV[u].Length > 0)
+                        {
+                            AppendFloat(v.UV[u][0]);
+                            AppendFloat(v.UV[u].Length > 1 ? v.UV[u][1] : 0f);
+                        }
+                    }
+                }
+                if (exportColors && mesh.hasColor)
+                {
+                    AppendFloat(v.Color.R);
+                    AppendFloat(v.Color.G);
+                    AppendFloat(v.Color.B);
+                    AppendFloat(v.Color.A);
+                }
+            }
+
+            AppendInt(primitivePayloads.Count);
+            for (int p = 0; p < primitivePayloads.Count; p++)
+            {
+                var idxList = primitivePayloads[p].Indices;
+                AppendInt(idxList.Count);
+                for (int k = 0; k < idxList.Count; k++)
+                {
+                    AppendInt(idxList[k]);
+                }
+            }
+
+            return "hash:" + Convert.ToHexString(hasher.GetHashAndReset());
+        }
+
+        private static string BuildMeshInstanceCacheKey(
+            string geometryKey,
+            List<(List<int> Indices, int MaxIndex, int? MaterialIndex)> primitivePayloads)
+        {
+            var sb = new StringBuilder(geometryKey.Length + primitivePayloads.Count * 6 + 8);
+            sb.Append(geometryKey);
+            sb.Append("|m:");
+            for (int p = 0; p < primitivePayloads.Count; p++)
+            {
+                if (p > 0) sb.Append(',');
+                var matIdx = primitivePayloads[p].MaterialIndex;
+                sb.Append(matIdx.HasValue
+                    ? matIdx.Value.ToString(CultureInfo.InvariantCulture)
+                    : "-");
+            }
+            return sb.ToString();
+        }
+
+        private sealed class SharedGeometryEntry
+        {
+            public required Dictionary<string, int> SharedAttributes { get; init; }
+            public int? OpaqueVertexColorAccessor { get; set; }
+            public int? BlendVertexColorAccessor { get; set; }
+            public required List<int> PrimitiveIndicesAccessors { get; init; }
+        }
 
         private sealed class GltfNode
         {

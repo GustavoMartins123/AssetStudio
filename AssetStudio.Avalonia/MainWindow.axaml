@@ -153,6 +153,17 @@
                         <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
                     </MenuItem.Icon>
                 </MenuItem>
+                <Separator />
+                <MenuItem x:Name="exportSceneGlbMenuItem" Header="Export Scene to .glb (Instanced)..." Command="{Binding ExportSceneGlbCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="exportSelectedSubtreeGlbMenuItem" Header="Export Selected Subtree to .glb (Instanced)..." Command="{Binding ExportSelectedSubtreeGlbCommand}">
+                    <MenuItem.Icon>
+                        <PathIcon Data="{StaticResource icon_cube}" Width="16" Height="16" />
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Export">
                 <MenuItem Header="All assets" Command="{Binding ExportAllAssetsCommand}">
@@ -288,6 +299,12 @@
                     <Grid RowDefinitions="Auto, *">
                         <TextBox x:Name="treeSearch" Grid.Row="0" PlaceholderText=" Search " Margin="0,0,0,2" Text="{Binding SceneHierarchy.SearchQuery, Mode=TwoWay}" TextChanged="TreeSearch_TextChanged" KeyDown="TreeSearch_KeyDown"/>
                         <TreeView x:Name="SceneTreeView" Grid.Row="1" x:CompileBindings="False" AutoScrollToSelectedItem="True" SelectionChanged="SceneTreeView_SelectionChanged">
+                            <TreeView.ContextMenu>
+                                <ContextMenu x:DataType="vm:MainWindowViewModel" x:CompileBindings="True">
+                                    <MenuItem Header="Export Scene to .glb (Instanced)..." Command="{Binding ExportSceneGlbCommand}" />
+                                    <MenuItem Header="Export Selected Subtree to .glb (Instanced)..." Command="{Binding ExportSelectedSubtreeGlbCommand}" />
+                                </ContextMenu>
+                            </TreeView.ContextMenu>
                             <TreeView.Styles>
                                 <Style Selector="TreeViewItem">
                                     <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
@@ -645,13 +662,17 @@
                                                                FontWeight="SemiBold" />
                                                 </Border>
                                             </StackPanel>
-                                            <Button Grid.Column="1"
-                                                    Classes="toolbar-btn"
-                                                    Content="Open Asset"
-                                                    VerticalAlignment="Center"
-                                                    IsVisible="{Binding PreviewSession.InspectedGameObject.HasGameObjectTarget}"
-                                                    Command="{Binding NavigateToInspectorTargetCommand}"
-                                                    CommandParameter="{Binding PreviewSession.InspectedGameObject.GameObjectTarget}" />
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                                                <Button Classes="toolbar-btn"
+                                                        Content="Export .glb"
+                                                        ToolTip.Tip="Export this GameObject subtree to .glb with mesh instancing"
+                                                        Command="{Binding ExportSelectedSubtreeGlbCommand}" />
+                                                <Button Classes="toolbar-btn"
+                                                        Content="Open Asset"
+                                                        IsVisible="{Binding PreviewSession.InspectedGameObject.HasGameObjectTarget}"
+                                                        Command="{Binding NavigateToInspectorTargetCommand}"
+                                                        CommandParameter="{Binding PreviewSession.InspectedGameObject.GameObjectTarget}" />
+                                            </StackPanel>
                                         </Grid>
                                         <TextBlock Text="{Binding PreviewSession.InspectedGameObject.HierarchyPath}"
                                                    FontSize="11"

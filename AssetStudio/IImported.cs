@@ -182,6 +182,9 @@ namespace AssetStudio
     public class ImportedMesh
     {
         public string Path { get; set; } = string.Empty;
+        public string? SourceMeshName { get; set; }
+        public string? GeometryKey { get; set; }
+        public ImportedFrame? TargetFrame { get; set; }
         public List<ImportedVertex> VertexList { get; set; } = new List<ImportedVertex>();
         public List<ImportedSubmesh> SubmeshList { get; set; } = new List<ImportedSubmesh>();
         public List<ImportedBone>? BoneList { get; set; }

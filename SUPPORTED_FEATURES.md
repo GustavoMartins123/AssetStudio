@@ -31,6 +31,7 @@ This document gives a plain-language overview of what **AssetStudio** supports t
 
 ### Exporting
 - **3D Models & Animations**: Export to **glTF Binary (`.glb`, default)**, **glTF Separate (`.gltf`)**, **FBX (`.fbx`)**, **OBJ (`.obj`)**, and Unity `.anim` files, including direct export from the 3D preview and **Batch Export Animations** to export multiple animations with one model.
+- **Full Scene Export to `.glb` (with Instancing)**: Export an entire Unity scene (`levelN` or scene bundle) or selected GameObject subtree as one `.glb` / `.gltf` file, preserving the full Transform hierarchy and automatically reusing repeated meshes and geometry buffers via glTF 2.0 instancing.
 - **Images & Sprites**: Export to `png`, `tga`, `jpeg`, and `bmp`.
 - **Audio & Video**: Export audio to `wav`, `ogg`, `mp3`, `m4a`, or `fsb` (including FSB5 Vorbis decoding), and export video clips directly.
 - **Other Assets**: Export fonts (`ttf`/`otf`), shaders, text files, MonoBehaviour JSON, raw binary data, text dumps, and XML.
@@ -51,6 +52,5 @@ This document gives a plain-language overview of what **AssetStudio** supports t
 
 The capabilities below are actively being designed or studied for upcoming releases and are **not yet implemented**:
 
-1. **Full Scene Export to `.glb`**: Exporting an entire game level or scene hierarchy as one complete 3D scene file while reusing repeated meshes efficiently.
-2. **Global Content Search & Version Comparison**: Searching text across the contents of an entire project and comparing two builds or updates side by side to list added, removed, and modified assets.
-3. **Safe Asset Editing & Repacking**: Replacing textures, text files, or script fields with automatic `.bak` backups, repacking bundle files, and updating Addressables catalog checksums.
+1. **Global Content Search & Version Comparison**: Searching text across the contents of an entire project and comparing two builds or updates side by side to list added, removed, and modified assets.
+2. **Safe Asset Editing & Repacking**: Replacing textures, text files, or script fields with automatic `.bak` backups, repacking bundle files, and updating Addressables catalog checksums.

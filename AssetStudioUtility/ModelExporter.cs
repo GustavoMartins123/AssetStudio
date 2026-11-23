@@ -38,7 +38,14 @@ namespace AssetStudio
 
         public static void ExportGltf(string path, IImported imported,
             bool binary = true, bool skins = true, bool animation = true, bool blendShape = true, float scaleFactor = 1f,
-            bool combineMeshes = false)
+            bool combineMeshes = false, bool enableInstancing = true)
+        {
+            _ = ExportGltfWithStats(path, imported, binary, skins, animation, blendShape, scaleFactor, combineMeshes, enableInstancing);
+        }
+
+        public static GltfExportStatistics ExportGltfWithStats(string path, IImported imported,
+            bool binary = true, bool skins = true, bool animation = true, bool blendShape = true, float scaleFactor = 1f,
+            bool combineMeshes = false, bool enableInstancing = true)
         {
             if (imported == null)
             {
@@ -51,8 +58,9 @@ namespace AssetStudio
                 exportSource = ModelConverter.CreateCombinedView(imported) ?? imported;
             }
 
-            var exporter = new GltfExporter(binary, scaleFactor, skins, animation, blendShape);
+            var exporter = new GltfExporter(binary, scaleFactor, skins, animation, blendShape, enableInstancing: enableInstancing);
             exporter.Export(exportSource, path);
+            return exporter.LastExportStats;
         }
 
         public static void ExportModel(string path, IImported imported,

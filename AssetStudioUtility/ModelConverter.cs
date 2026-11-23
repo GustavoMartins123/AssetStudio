@@ -49,6 +49,17 @@ namespace AssetStudio
             }
         }
 
+        private sealed class CachedConvertedStaticMesh
+        {
+            public required string GeometryKey { get; init; }
+            public required bool HasNormal { get; init; }
+            public required bool[] HasUV { get; init; }
+            public required bool HasTangent { get; init; }
+            public required bool HasColor { get; init; }
+            public required List<ImportedVertex> VertexList { get; init; }
+            public required List<(int BaseVertex, List<ImportedFace> FaceList)> Submeshes { get; init; }
+        }
+
         private ImageFormat imageFormat;
         private Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver;
         private Avatar? avatar;
@@ -59,6 +70,7 @@ namespace AssetStudio
         private Dictionary<uint, string> bonePathHash = new Dictionary<uint, string>();
         private Dictionary<Texture2D, string> textureNameDictionary = new Dictionary<Texture2D, string>();
         private Dictionary<Transform, ImportedFrame> transformDictionary = new Dictionary<Transform, ImportedFrame>();
+        private readonly Dictionary<Mesh, CachedConvertedStaticMesh> _staticMeshGeometryCache = new Dictionary<Mesh, CachedConvertedStaticMesh>();
         Dictionary<uint, string> morphChannelNames = new Dictionary<uint, string>();
         private readonly List<(Texture2D Texture, string Name, string MaterialName, string PropertyName, bool ForceNormalMapUnpack)> pendingTextures = new();
         private readonly HashSet<string> pendingTextureNames = new HashSet<string>(StringComparer.Ordinal);
@@ -144,6 +156,286 @@ namespace AssetStudio
             }
             ConvertAnimations();
             FlushPendingTextures();
+        }
+
+        /// <summary>
+        /// Converts an entire Unity scene (all root GameObjects and their Transform hierarchy) into an
+        /// <see cref="IImported"/> graph optimized for glTF 2.0 instancing: repeated static meshes reuse
+        /// cached vertex/index buffers and carry stable <see cref="ImportedMesh.GeometryKey"/> and
+        /// <see cref="ImportedMesh.TargetFrame"/> bindings so duplicate sibling GameObject names never collide.
+        /// </summary>
+        public static ModelConverter CreateForScene(
+            string sceneName,
+            IReadOnlyList<GameObject> rootGameObjects,
+            ImageFormat imageFormat = ImageFormat.Png,
+            bool includeInactive = true,
+            bool includeAnimations = false,
+            Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null,
+            Action<int, int, string>? progressCallback = null,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(rootGameObjects);
+
+            var converter = new ModelConverter(imageFormat, textureResolver);
+            var safeSceneName = string.IsNullOrWhiteSpace(sceneName) ? "Scene" : sceneName.Trim();
+            converter.SetRootFrame(CreateFrame(safeSceneName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One));
+
+            var totalRoots = rootGameObjects.Count;
+            for (int i = 0; i < totalRoots; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var go = rootGameObjects[i];
+                if (go == null || (!includeInactive && !go.m_IsActive))
+                {
+                    continue;
+                }
+
+                if (includeAnimations && go.m_Animator != null)
+                {
+                    converter.CollectAnimationClip(go.m_Animator);
+                }
+
+                var tr = go.m_Transform;
+                if (tr != null)
+                {
+                    converter.ConvertTransformsForScene(tr, converter.RootFrame, includeInactive, cancellationToken);
+                    converter.CreateBonePathHash(tr);
+                }
+
+                if ((i & 31) == 0 || i == totalRoots - 1)
+                {
+                    progressCallback?.Invoke(i + 1, Math.Max(1, totalRoots * 2), $"Building Transform tree ({i + 1}/{totalRoots})...");
+                }
+            }
+
+            var visitedRenderers = new HashSet<Transform>();
+            for (int i = 0; i < totalRoots; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var go = rootGameObjects[i];
+                if (go == null || (!includeInactive && !go.m_IsActive))
+                {
+                    continue;
+                }
+
+                var tr = go.m_Transform;
+                if (tr != null)
+                {
+                    converter.ConvertMeshRendererForScene(tr, visitedRenderers, includeInactive, includeAnimations, cancellationToken);
+                }
+
+                if ((i & 31) == 0 || i == totalRoots - 1)
+                {
+                    progressCallback?.Invoke(totalRoots + i + 1, Math.Max(1, totalRoots * 2), $"Converting scene meshes ({i + 1}/{totalRoots})...");
+                }
+            }
+
+            if (includeAnimations)
+            {
+                if (converter.avatar == null)
+                {
+                    for (int i = 0; i < totalRoots; i++)
+                    {
+                        var go = rootGameObjects[i];
+                        if (go != null)
+                        {
+                            converter.avatar = converter.FindAvatar(go);
+                            if (converter.avatar != null) break;
+                        }
+                    }
+                }
+                converter.ConvertAnimations();
+            }
+
+            converter.FlushPendingTextures();
+            return converter;
+        }
+
+        private void ConvertTransformsForScene(
+            Transform? trans,
+            ImportedFrame parent,
+            bool includeInactive,
+            CancellationToken cancellationToken)
+        {
+            if (trans == null || transformDictionary.ContainsKey(trans))
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!includeInactive && TryResolveTransformGameObject(trans, out var go) && go != null && !go.m_IsActive)
+            {
+                return;
+            }
+
+            var frame = ConvertTransform(trans);
+            parent.AddChild(frame);
+
+            if (trans.m_Children == null)
+            {
+                return;
+            }
+
+            foreach (var pptr in trans.m_Children)
+            {
+                var childPtr = pptr;
+                if (childPtr == null || childPtr.IsNull)
+                {
+                    continue;
+                }
+
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in trans.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+
+                if (child != null)
+                {
+                    ConvertTransformsForScene(child, frame, includeInactive, cancellationToken);
+                }
+            }
+        }
+
+        private void ConvertMeshRendererForScene(
+            Transform? m_Transform,
+            HashSet<Transform> visited,
+            bool includeInactive,
+            bool includeAnimations,
+            CancellationToken cancellationToken)
+        {
+            if (m_Transform == null || !visited.Add(m_Transform))
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (TryResolveTransformGameObject(m_Transform, out var m_GameObject) && m_GameObject != null)
+            {
+                if (!includeInactive && !m_GameObject.m_IsActive)
+                {
+                    return;
+                }
+
+                if (m_GameObject.m_MeshRenderer != null)
+                {
+                    ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
+                }
+
+                if (m_GameObject.m_SkinnedMeshRenderer != null)
+                {
+                    ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
+                }
+
+                if (includeAnimations && m_GameObject.m_Animation != null)
+                {
+                    foreach (var animation in m_GameObject.m_Animation.m_Animations)
+                    {
+                        var animationPtr = animation;
+                        if (animationPtr == null || animationPtr.IsNull)
+                        {
+                            continue;
+                        }
+                        if (!animationPtr.TryGet(out var animationClip))
+                        {
+                            foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                            {
+                                if (sf.ObjectsDic.TryGetValue(animationPtr.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                {
+                                    animationClip = foundClip;
+                                    break;
+                                }
+                            }
+                        }
+                        if (animationClip != null)
+                        {
+                            var transformPath = GetTransformPath(m_Transform);
+                            if (transformPath != null && !boundAnimationPathDic.ContainsKey(animationClip))
+                            {
+                                boundAnimationPathDic.Add(animationClip, transformPath);
+                            }
+                            animationClipHashSet.Add(animationClip);
+                        }
+                    }
+                }
+            }
+
+            if (m_Transform.m_Children == null)
+            {
+                return;
+            }
+
+            foreach (var pptr in m_Transform.m_Children)
+            {
+                var childPtr = pptr;
+                if (childPtr == null || childPtr.IsNull)
+                {
+                    continue;
+                }
+
+                if (!childPtr.TryGet(out var child))
+                {
+                    foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                    {
+                        if (sf.ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        {
+                            child = foundChild;
+                            break;
+                        }
+                    }
+                }
+
+                if (child != null)
+                {
+                    ConvertMeshRendererForScene(child, visited, includeInactive, includeAnimations, cancellationToken);
+                }
+            }
+        }
+
+        private static bool TryResolveTransformGameObject(Transform trans, out GameObject? gameObject)
+        {
+            gameObject = null;
+            if (trans.m_GameObject == null || trans.m_GameObject.IsNull)
+            {
+                return false;
+            }
+
+            if (trans.m_GameObject.TryGet(out gameObject) && gameObject != null)
+            {
+                return true;
+            }
+
+            if (trans.assetsFile?.assetsManager?.assetsFileList != null)
+            {
+                foreach (var sf in trans.assetsFile.assetsManager.assetsFileList)
+                {
+                    if (sf.ObjectsDic.TryGetValue(trans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                    {
+                        gameObject = foundGo;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static string BuildStaticMeshGeometryKey(Mesh mesh)
+        {
+            var fileName = mesh.assetsFile?.fileName;
+            if (!string.IsNullOrEmpty(fileName) && mesh.m_PathID != 0)
+            {
+                return $"{fileName}#{mesh.m_PathID}";
+            }
+
+            return $"mem#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(mesh)}";
         }
 
         public ModelConverter(Animator m_Animator, ImageFormat imageFormat, AnimationClip[]? animationList = null, Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null)
@@ -635,6 +927,14 @@ namespace AssetStudio
                 }
             }
             iMesh.Path = (m_GameObject2 != null ? GetTransformPath(m_GameObject2.m_Transform) : null) ?? "";
+            if (m_GameObject2?.m_Transform != null && transformDictionary.TryGetValue(m_GameObject2.m_Transform, out var exactTargetFrame))
+            {
+                iMesh.TargetFrame = exactTargetFrame;
+            }
+            if (!string.IsNullOrWhiteSpace(mesh.m_Name))
+            {
+                iMesh.SourceMeshName = mesh.m_Name;
+            }
             iMesh.SubmeshList = new List<ImportedSubmesh>();
             var subHashSet = new HashSet<int>();
             var combine = false;
@@ -659,6 +959,35 @@ namespace AssetStudio
                 combine = true;
             }
 
+            // Fast instancing path for repeated non-batched static MeshRenderers:
+            // reuse already-converted vertex & face arrays so scenes with hundreds of repeated
+            // props avoid rebuilding identical geometry and share buffers cleanly in glTF 2.0.
+            bool canUseStaticGeometryCache = !combine && meshR is not SkinnedMeshRenderer;
+            if (canUseStaticGeometryCache && _staticMeshGeometryCache.TryGetValue(mesh, out var cachedStatic))
+            {
+                iMesh.GeometryKey = cachedStatic.GeometryKey;
+                iMesh.hasNormal = cachedStatic.HasNormal;
+                iMesh.hasUV = cachedStatic.HasUV;
+                iMesh.hasTangent = cachedStatic.HasTangent;
+                iMesh.hasColor = cachedStatic.HasColor;
+                iMesh.VertexList = cachedStatic.VertexList;
+
+                for (int i = 0; i < cachedStatic.Submeshes.Count; i++)
+                {
+                    Material? mat = ResolveRendererSubmeshMaterial(meshR, i, firstSubMesh);
+                    ImportedMaterial iMat = ConvertMaterial(mat);
+                    iMesh.SubmeshList.Add(new ImportedSubmesh
+                    {
+                        Material = iMat.Name,
+                        BaseVertex = cachedStatic.Submeshes[i].BaseVertex,
+                        FaceList = cachedStatic.Submeshes[i].FaceList
+                    });
+                }
+
+                MeshList.Add(iMesh);
+                return;
+            }
+
             iMesh.hasNormal = mesh.m_Normals?.Length > 0;
             iMesh.hasUV = new bool[8];
             for (int uv = 0; uv < 8; uv++)
@@ -679,37 +1008,7 @@ namespace AssetStudio
                 }
                 var submesh = mesh.m_SubMeshes[i];
                 var iSubmesh = new ImportedSubmesh();
-                Material? mat = null;
-                if (i - firstSubMesh >= 0 && i - firstSubMesh < meshR.m_Materials.Length)
-                {
-                    var matPPtr = meshR.m_Materials[i - firstSubMesh];
-                    if (matPPtr != null && !matPPtr.IsNull)
-                    {
-                        if (!matPPtr.TryGet(out var m_Material))
-                        {
-                            Logger.Warning($"Material TryGet failed for submesh {i}: FileID={matPPtr.m_FileID}, PathID={matPPtr.m_PathID}. Searching all loaded files...");
-                            // Fallback: search all loaded files for this material by PathID
-                            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
-                            {
-                                if (sf.ObjectsDic.TryGetValue(matPPtr.m_PathID, out var obj) && obj is Material foundMat)
-                                {
-                                    m_Material = foundMat;
-                                    Logger.Info($"Found material '{foundMat.m_Name}' by PathID fallback in file '{sf.fileName}'.");
-                                    break;
-                                }
-                            }
-                        }
-                        mat = m_Material;
-                    }
-                    else
-                    {
-                        Logger.Warning($"Material PPtr is null for submesh {i} (m_Materials.Length={meshR.m_Materials.Length}).");
-                    }
-                }
-                else
-                {
-                    Logger.Warning($"No material slot for submesh {i}: index {i - firstSubMesh} >= m_Materials.Length {meshR.m_Materials.Length}.");
-                }
+                Material? mat = ResolveRendererSubmeshMaterial(meshR, i, firstSubMesh);
                 ImportedMaterial iMat = ConvertMaterial(mat);
                 iSubmesh.Material = iMat.Name;
                 iSubmesh.BaseVertex = checked((int)(mesh.m_SubMeshes[i].firstVertex + mesh.m_SubMeshes[i].baseVertex));
@@ -970,8 +1269,62 @@ namespace AssetStudio
             {
                 UnbakeStaticBatchedMeshToLocalSpace(iMesh);
             }
+            else if (canUseStaticGeometryCache)
+            {
+                var geomKey = BuildStaticMeshGeometryKey(mesh);
+                iMesh.GeometryKey = geomKey;
+                var cachedSubmeshes = new List<(int BaseVertex, List<ImportedFace> FaceList)>(iMesh.SubmeshList.Count);
+                for (int s = 0; s < iMesh.SubmeshList.Count; s++)
+                {
+                    cachedSubmeshes.Add((iMesh.SubmeshList[s].BaseVertex, iMesh.SubmeshList[s].FaceList));
+                }
+                _staticMeshGeometryCache[mesh] = new CachedConvertedStaticMesh
+                {
+                    GeometryKey = geomKey,
+                    HasNormal = iMesh.hasNormal,
+                    HasUV = iMesh.hasUV,
+                    HasTangent = iMesh.hasTangent,
+                    HasColor = iMesh.hasColor,
+                    VertexList = iMesh.VertexList,
+                    Submeshes = cachedSubmeshes
+                };
+            }
 
             MeshList.Add(iMesh);
+        }
+
+        private static Material? ResolveRendererSubmeshMaterial(Renderer meshR, int submeshIndex, int firstSubMesh)
+        {
+            if (submeshIndex - firstSubMesh >= 0 && submeshIndex - firstSubMesh < meshR.m_Materials.Length)
+            {
+                var matPPtr = meshR.m_Materials[submeshIndex - firstSubMesh];
+                if (matPPtr != null && !matPPtr.IsNull)
+                {
+                    if (!matPPtr.TryGet(out var m_Material))
+                    {
+                        Logger.Warning($"Material TryGet failed for submesh {submeshIndex}: FileID={matPPtr.m_FileID}, PathID={matPPtr.m_PathID}. Searching all loaded files...");
+                        if (meshR.assetsFile?.assetsManager?.assetsFileList != null)
+                        {
+                            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                            {
+                                if (sf.ObjectsDic.TryGetValue(matPPtr.m_PathID, out var obj) && obj is Material foundMat)
+                                {
+                                    m_Material = foundMat;
+                                    Logger.Info($"Found material '{foundMat.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return m_Material;
+                }
+
+                Logger.Warning($"Material PPtr is null for submesh {submeshIndex} (m_Materials.Length={meshR.m_Materials.Length}).");
+                return null;
+            }
+
+            Logger.Warning($"No material slot for submesh {submeshIndex}: index {submeshIndex - firstSubMesh} >= m_Materials.Length {meshR.m_Materials.Length}.");
+            return null;
         }
 
         private void UnbakeStaticBatchedMeshToLocalSpace(ImportedMesh iMesh)

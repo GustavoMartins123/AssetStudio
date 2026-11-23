@@ -406,6 +406,8 @@ public partial class MainWindow : Window
         handlers.ExportSelectedObjectsSplitWithAnimationClipAsync = () => ExportSelectedObjectsSplit(true);
         handlers.ExportSelectedObjectsMergeAsync = () => ExportSelectedObjectsMerge(false);
         handlers.ExportSelectedObjectsMergeWithAnimationClipAsync = () => ExportSelectedObjectsMerge(true);
+        handlers.ExportSceneGlbAsync = ExportSceneGlbCommandHandlerAsync;
+        handlers.ExportSelectedSubtreeGlbAsync = ExportSelectedSubtreeGlbCommandHandlerAsync;
 
         handlers.ExportAllAssetsAsync = () => ExportAllAssetsAsync(ExportMode.Convert);
         handlers.ExportSelectedAssetsAsync = () => ExportAssets(GetSelectedAssets(), ExportMode.Convert);

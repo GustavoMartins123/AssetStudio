@@ -26,6 +26,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public Func<Task>? ExportSelectedObjectsSplitWithAnimationClipAsync { get; set; }
         public Func<Task>? ExportSelectedObjectsMergeAsync { get; set; }
         public Func<Task>? ExportSelectedObjectsMergeWithAnimationClipAsync { get; set; }
+        public Func<Task>? ExportSceneGlbAsync { get; set; }
+        public Func<Task>? ExportSelectedSubtreeGlbAsync { get; set; }
 
         public Func<Task>? ExportAllAssetsAsync { get; set; }
         public Func<Task>? ExportSelectedAssetsAsync { get; set; }
@@ -115,6 +117,8 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportSelectedObjectsSplitWithAnimationClipAsync = null;
             ExportSelectedObjectsMergeAsync = null;
             ExportSelectedObjectsMergeWithAnimationClipAsync = null;
+            ExportSceneGlbAsync = null;
+            ExportSelectedSubtreeGlbAsync = null;
 
             ExportAllAssetsAsync = null;
             ExportSelectedAssetsAsync = null;
@@ -265,6 +269,8 @@ namespace AssetStudio.Avalonia.ViewModels
             ExportSelectedObjectsSplitWithAnimationClipCommand = new AsyncRelayCommand(ExecuteExportSelectedObjectsSplitWithAnimationClipAsync, onException: HandleCommandException);
             ExportSelectedObjectsMergeCommand = new AsyncRelayCommand(ExecuteExportSelectedObjectsMergeAsync, onException: HandleCommandException);
             ExportSelectedObjectsMergeWithAnimationClipCommand = new AsyncRelayCommand(ExecuteExportSelectedObjectsMergeWithAnimationClipAsync, onException: HandleCommandException);
+            ExportSceneGlbCommand = new AsyncRelayCommand(ExecuteExportSceneGlbAsync, onException: HandleCommandException);
+            ExportSelectedSubtreeGlbCommand = new AsyncRelayCommand(ExecuteExportSelectedSubtreeGlbAsync, onException: HandleCommandException);
 
             ExportAllAssetsCommand = new AsyncRelayCommand(ExecuteExportAllAssetsAsync, onException: HandleCommandException);
             ExportSelectedAssetsCommand = new AsyncRelayCommand(ExecuteExportSelectedAssetsAsync, onException: HandleCommandException);
@@ -427,6 +433,8 @@ namespace AssetStudio.Avalonia.ViewModels
         public AsyncRelayCommand ExportSelectedObjectsSplitWithAnimationClipCommand { get; }
         public AsyncRelayCommand ExportSelectedObjectsMergeCommand { get; }
         public AsyncRelayCommand ExportSelectedObjectsMergeWithAnimationClipCommand { get; }
+        public AsyncRelayCommand ExportSceneGlbCommand { get; }
+        public AsyncRelayCommand ExportSelectedSubtreeGlbCommand { get; }
 
         public AsyncRelayCommand ExportAllAssetsCommand { get; }
         public AsyncRelayCommand ExportSelectedAssetsCommand { get; }
@@ -926,6 +934,12 @@ namespace AssetStudio.Avalonia.ViewModels
 
         private Task ExecuteExportSelectedObjectsMergeWithAnimationClipAsync() =>
             InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedObjectsMergeWithAnimationClipAsync, "Save merged model", "merged.glb");
+
+        private Task ExecuteExportSceneGlbAsync() =>
+            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSceneGlbAsync, "Export Scene to .glb (Instanced)", "scene.glb");
+
+        private Task ExecuteExportSelectedSubtreeGlbAsync() =>
+            InvokeExportHandlerOrSavePickAsync(CommandHandlers.ExportSelectedSubtreeGlbAsync, "Export Subtree to .glb (Instanced)", "subtree.glb");
 
         private Task ExecuteExportAllAssetsAsync() =>
             InvokeExportHandlerOrFolderPickAsync(CommandHandlers.ExportAllAssetsAsync, "Exporting all assets...");
