@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
+using System.IO.Enumeration;
 using System.Linq;
 using System.Threading.Tasks;
 using AssetStudio;
@@ -236,7 +237,9 @@ namespace AssetStudio.Avalonia.ViewModels
             DetectedAlgorithms = new ObservableCollection<DetectedAlgorithmCandidateItem>();
 
             var defaultPattern = DeriveFilePatternFromPaths(
-                _context.DetectedBarriers?.Select(static b => b.FilePath));
+                _context.DetectedBarriers?
+                    .Where(static b => !UnityHeaderProbe.IsNonStreamDiagnosticHint(b.ProviderId))
+                    .Select(static b => b.FilePath));
             if (!string.IsNullOrWhiteSpace(defaultPattern))
             {
                 _fileNamePattern = defaultPattern;
@@ -1233,10 +1236,13 @@ namespace AssetStudio.Avalonia.ViewModels
                 }
             }
 
-            var hasFileBarriers = _context.DetectedBarriers != null && _context.DetectedBarriers.Count > 0;
+            var streamBarriers = (_context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
+                .Where(static b => !UnityHeaderProbe.IsNonStreamDiagnosticHint(b.ProviderId))
+                .ToList();
+            var hasFileBarriers = streamBarriers.Count > 0;
             if (hasFileBarriers)
             {
-                foreach (var barrier in _context.DetectedBarriers!)
+                foreach (var barrier in streamBarriers)
                 {
                     var barrierCandidates = barrier.CandidateAlgorithms;
                     if (barrierCandidates == null || barrierCandidates.Count == 0)
@@ -1256,8 +1262,12 @@ namespace AssetStudio.Avalonia.ViewModels
 
             if (_context.CatalogHints != null && _context.CatalogHints.Count > 0)
             {
+                var streamCatalogHints = _context.CatalogHints
+                    .Where(static h => !UnityHeaderProbe.IsNonStreamDiagnosticHint(h.Provider))
+                    .ToList();
+
                 bool anyExplicitCatalogHint = false;
-                foreach (var hint in _context.CatalogHints)
+                foreach (var hint in streamCatalogHints)
                 {
                     var explicitCandidates = UnityHeaderProbe.AnalyzeExplicitProviderHint(hint.Provider, hint.Reason);
                     if (explicitCandidates.Count > 0)
@@ -1273,7 +1283,7 @@ namespace AssetStudio.Avalonia.ViewModels
 
                 if (!hasFileBarriers && !anyExplicitCatalogHint)
                 {
-                    foreach (var hint in _context.CatalogHints)
+                    foreach (var hint in streamCatalogHints)
                     {
                         var sourcePath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : hint.CatalogPath;
                         var fallbackCandidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(
@@ -1511,14 +1521,9 @@ namespace AssetStudio.Avalonia.ViewModels
         {
             ClearFeedback();
 
-            var sampleFiles = (_context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
-                .Where(static b => !string.IsNullOrWhiteSpace(b.FilePath) && File.Exists(b.FilePath))
-                .Select(static b => b.FilePath)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(4)
-                .ToArray();
+            var sampleEntries = SelectRepresentativeSampleBarriers(maxSamples: 8);
 
-            if (sampleFiles.Length == 0)
+            if (sampleEntries.Length == 0)
             {
                 if (!TryBuildProfileFromEditor(out _, out var syntaxError))
                 {
@@ -1532,16 +1537,17 @@ namespace AssetStudio.Avalonia.ViewModels
 
             int testedAttempts = 0;
 
-            // 1. Test the currently selected algorithm first
+            // 1. Test the currently selected algorithm first (prioritizing files matching current FileNamePattern)
             bool currentValid = TryBuildProfileFromEditor(out var currentProfile, out var currentError);
             if (currentValid && currentProfile != null)
             {
                 testedAttempts++;
-                foreach (var sampleFile in sampleFiles)
+                var orderedForCurrent = OrderSampleBarriersForPattern(sampleEntries, FileNamePattern);
+                foreach (var entry in orderedForCurrent)
                 {
-                    if (DecryptionHelper.TryTestProfileOnFile(currentProfile, sampleFile, out var unlockedHeader))
+                    if (DecryptionHelper.TryTestProfileOnFile(currentProfile, entry.FilePath, out var unlockedHeader))
                     {
-                        StatusMessage = $"Key verified! Unlocked '{Path.GetFileName(sampleFile)}' as {unlockedHeader} using {AlgorithmOptions[SelectedAlgorithmIndex]}.";
+                        StatusMessage = $"Key verified! Unlocked '{Path.GetFileName(entry.FilePath)}' as {unlockedHeader} using {AlgorithmOptions[SelectedAlgorithmIndex]}.";
                         return;
                     }
                 }
@@ -1553,69 +1559,72 @@ namespace AssetStudio.Avalonia.ViewModels
                 {
                     var prefixProbe = currentProfile.Clone();
                     prefixProbe.IvFromStreamPrefix = true;
-                    foreach (var sampleFile in sampleFiles)
+                    foreach (var entry in orderedForCurrent)
                     {
-                        if (DecryptionHelper.TryTestProfileOnFile(prefixProbe, sampleFile, out var unlockedHeader))
+                        if (DecryptionHelper.TryTestProfileOnFile(prefixProbe, entry.FilePath, out var unlockedHeader))
                         {
                             SelectedIvModeIndex = 2; // Read from Stream Prefix
-                            StatusMessage = $"Key verified (auto-enabled Stream Prefix IV)! Unlocked '{Path.GetFileName(sampleFile)}' as {unlockedHeader} using {AlgorithmOptions[SelectedAlgorithmIndex]}.";
+                            StatusMessage = $"Key verified (auto-enabled Stream Prefix IV)! Unlocked '{Path.GetFileName(entry.FilePath)}' as {unlockedHeader} using {AlgorithmOptions[SelectedAlgorithmIndex]}.";
                             return;
                         }
                     }
                 }
             }
 
-            // 2. Automatically test remaining checked detected candidates and switch to the winning algorithm
+            // 2. Automatically test remaining checked detected candidates and switch to the winning algorithm.
+            //    When a heterogeneous folder mixes different barrier structures (e.g. partial-header .assets + full-stream .bundle),
+            //    also honor each sample barrier's own structural candidate parameters for that scheme.
             var otherCandidates = DetectedAlgorithms
                 .Where(c => c.IsChecked && c.AlgorithmIndex != SelectedAlgorithmIndex)
                 .ToList();
 
             foreach (var candidate in otherCandidates)
             {
-                int trialPadding = candidate.SuggestedPaddingIndex >= 0
-                    ? candidate.SuggestedPaddingIndex
-                    : SelectedPaddingIndex;
-                int trialIvMode = candidate.SuggestedIvModeIndex >= 0
-                    ? candidate.SuggestedIvModeIndex
-                    : SelectedIvModeIndex;
-
-                if (!TryBuildProfileForSettings(
-                    candidate.AlgorithmIndex,
-                    candidate.SuggestedSkipBytes,
-                    candidate.SuggestedRangeStart,
-                    candidate.SuggestedRangeLength,
-                    trialPadding,
-                    trialIvMode,
-                    out var trialProfile,
-                    out _) || trialProfile == null)
+                var orderedForCandidate = OrderSampleBarriersForPattern(sampleEntries, candidate.FilePattern);
+                foreach (var entry in orderedForCandidate)
                 {
-                    continue;
-                }
+                    var barrierMatch = FindMatchingCandidateForBarrier(entry, candidate.SchemeId);
+                    long trialSkip = barrierMatch?.SuggestedSkipBytes ?? candidate.SuggestedSkipBytes;
+                    long trialRangeStart = barrierMatch?.SuggestedRangeStart ?? candidate.SuggestedRangeStart;
+                    long trialRangeLength = barrierMatch?.SuggestedRangeLength ?? candidate.SuggestedRangeLength;
+                    int trialPadding = barrierMatch?.SuggestedPkcs7.HasValue == true
+                        ? (barrierMatch.SuggestedPkcs7.Value ? 1 : 0)
+                        : (candidate.SuggestedPaddingIndex >= 0 ? candidate.SuggestedPaddingIndex : SelectedPaddingIndex);
+                    int trialIvMode = barrierMatch?.SuggestedIvFromPrefix == true
+                        ? 2
+                        : (candidate.SuggestedIvModeIndex >= 0 ? candidate.SuggestedIvModeIndex : SelectedIvModeIndex);
 
-                testedAttempts++;
-                foreach (var sampleFile in sampleFiles)
-                {
-                    if (DecryptionHelper.TryTestProfileOnFile(trialProfile, sampleFile, out var winnerHeader))
+                    if (!TryBuildProfileForSettings(
+                        candidate.AlgorithmIndex,
+                        trialSkip,
+                        trialRangeStart,
+                        trialRangeLength,
+                        trialPadding,
+                        trialIvMode,
+                        out var trialProfile,
+                        out _) || trialProfile == null)
                     {
-                        ApplyDetectedCandidate(candidate, preserveUserInputs: true);
-                        StatusMessage = $"Auto-selected {candidate.DisplayName}! Key verified on '{Path.GetFileName(sampleFile)}' ({winnerHeader}).";
+                        continue;
+                    }
+
+                    testedAttempts++;
+                    if (DecryptionHelper.TryTestProfileOnFile(trialProfile, entry.FilePath, out var winnerHeader))
+                    {
+                        ApplyVerifiedCandidateWin(candidate, entry.FilePath, trialSkip, trialRangeStart, trialRangeLength, trialPadding, trialIvMode);
+                        StatusMessage = $"Auto-selected {candidate.DisplayName}! Key verified on '{Path.GetFileName(entry.FilePath)}' ({winnerHeader}).";
                         return;
                     }
-                }
 
-                if (candidate.AlgorithmIndex is 0 or 1 or 3
-                    && trialIvMode == 0
-                    && string.IsNullOrWhiteSpace(IvInput))
-                {
-                    var prefixTrial = trialProfile.Clone();
-                    prefixTrial.IvFromStreamPrefix = true;
-                    foreach (var sampleFile in sampleFiles)
+                    if (candidate.AlgorithmIndex is 0 or 1 or 3
+                        && trialIvMode == 0
+                        && string.IsNullOrWhiteSpace(IvInput))
                     {
-                        if (DecryptionHelper.TryTestProfileOnFile(prefixTrial, sampleFile, out var winnerHeader))
+                        var prefixTrial = trialProfile.Clone();
+                        prefixTrial.IvFromStreamPrefix = true;
+                        if (DecryptionHelper.TryTestProfileOnFile(prefixTrial, entry.FilePath, out var prefixHeader))
                         {
-                            ApplyDetectedCandidate(candidate, preserveUserInputs: true);
-                            SelectedIvModeIndex = 2;
-                            StatusMessage = $"Auto-selected {candidate.DisplayName} (Stream Prefix IV)! Key verified on '{Path.GetFileName(sampleFile)}' ({winnerHeader}).";
+                            ApplyVerifiedCandidateWin(candidate, entry.FilePath, trialSkip, trialRangeStart, trialRangeLength, trialPadding, ivModeIndex: 2);
+                            StatusMessage = $"Auto-selected {candidate.DisplayName} (Stream Prefix IV)! Key verified on '{Path.GetFileName(entry.FilePath)}' ({prefixHeader}).";
                             return;
                         }
                     }
@@ -1628,7 +1637,199 @@ namespace AssetStudio.Avalonia.ViewModels
                 return;
             }
 
-            ValidationError = $"Key did not unlock a valid Unity header on '{Path.GetFileName(sampleFiles[0])}' (tested {Math.Max(1, testedAttempts)} algorithm(s)). Check key, IV/nonce, range, or padding.";
+            ValidationError = $"Key did not unlock a valid Unity header on '{Path.GetFileName(sampleEntries[0].FilePath)}' (tested {Math.Max(1, testedAttempts)} algorithm(s)). Check key, IV/nonce, range, or padding.";
+        }
+
+        private void ApplyVerifiedCandidateWin(
+            DetectedAlgorithmCandidateItem candidate,
+            string matchedFilePath,
+            long skipBytes,
+            long rangeStart,
+            long rangeLength,
+            int paddingIndex,
+            int ivModeIndex)
+        {
+            ApplyDetectedCandidate(candidate, preserveUserInputs: true);
+            var matchedPattern = DeriveFilePatternFromPaths(new[] { matchedFilePath });
+            if (!string.IsNullOrWhiteSpace(matchedPattern))
+            {
+                FileNamePattern = matchedPattern;
+            }
+            SkipBytesText = skipBytes.ToString(CultureInfo.InvariantCulture);
+            RangeStartText = rangeStart.ToString(CultureInfo.InvariantCulture);
+            RangeLengthText = rangeLength.ToString(CultureInfo.InvariantCulture);
+            if (paddingIndex >= 0)
+            {
+                SelectedPaddingIndex = paddingIndex;
+            }
+            if (ivModeIndex >= 0)
+            {
+                SelectedIvModeIndex = ivModeIndex;
+            }
+            IsAdvancedOptionsExpanded = (candidate.AlgorithmIndex != 6 && skipBytes > 0) || rangeStart > 0 || rangeLength > 0;
+        }
+
+        private static DetectedCipherCandidate? FindMatchingCandidateForBarrier(StreamEncryptionBarrier barrier, string schemeId)
+        {
+            var list = barrier.CandidateAlgorithms;
+            if (list == null || list.Count == 0)
+            {
+                return null;
+            }
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i].SchemeId, schemeId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return list[i];
+                }
+            }
+
+            return null;
+        }
+
+        private StreamEncryptionBarrier[] SelectRepresentativeSampleBarriers(int maxSamples)
+        {
+            var accessibleBarriers = new List<StreamEncryptionBarrier>();
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var barrier in _context.DetectedBarriers ?? Array.Empty<StreamEncryptionBarrier>())
+            {
+                if (UnityHeaderProbe.IsNonStreamDiagnosticHint(barrier.ProviderId)
+                    || string.IsNullOrWhiteSpace(barrier.FilePath)
+                    || !File.Exists(barrier.FilePath))
+                {
+                    continue;
+                }
+
+                if (seenPaths.Add(barrier.FilePath))
+                {
+                    accessibleBarriers.Add(barrier);
+                }
+            }
+
+            if (accessibleBarriers.Count == 0)
+            {
+                return Array.Empty<StreamEncryptionBarrier>();
+            }
+
+            var selected = new List<StreamEncryptionBarrier>(Math.Min(maxSamples, accessibleBarriers.Count));
+            var selectedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var coveredGroups = new HashSet<(string ProviderId, string ExtensionKey)>();
+
+            static (string ProviderId, string ExtensionKey) BuildGroupKey(StreamEncryptionBarrier b)
+            {
+                var fileName = Path.GetFileName(b.FilePath.Replace('\\', '/'));
+                var ext = Path.GetExtension(fileName);
+                var extKey = string.IsNullOrWhiteSpace(ext) ? "(no-ext)" : ext.ToLowerInvariant();
+                return ((b.ProviderId ?? string.Empty).ToLowerInvariant(), extKey);
+            }
+
+            // Pass 1: 1 representative per distinct (ProviderId, Extension) matching the active FileNamePattern
+            if (!string.IsNullOrWhiteSpace(FileNamePattern))
+            {
+                foreach (var barrier in accessibleBarriers)
+                {
+                    if (selected.Count >= maxSamples)
+                    {
+                        break;
+                    }
+
+                    var fileName = Path.GetFileName(barrier.FilePath.Replace('\\', '/'));
+                    if (!MatchesPatternList(fileName, FileNamePattern))
+                    {
+                        continue;
+                    }
+
+                    var groupKey = BuildGroupKey(barrier);
+                    if (coveredGroups.Add(groupKey) && selectedPaths.Add(barrier.FilePath))
+                    {
+                        selected.Add(barrier);
+                    }
+                }
+            }
+
+            // Pass 2: 1 representative per remaining distinct (ProviderId, Extension) across all barrier types
+            foreach (var barrier in accessibleBarriers)
+            {
+                if (selected.Count >= maxSamples)
+                {
+                    break;
+                }
+
+                var groupKey = BuildGroupKey(barrier);
+                if (coveredGroups.Add(groupKey) && selectedPaths.Add(barrier.FilePath))
+                {
+                    selected.Add(barrier);
+                }
+            }
+
+            // Pass 3: Fill remaining slots up to maxSamples
+            foreach (var barrier in accessibleBarriers)
+            {
+                if (selected.Count >= maxSamples)
+                {
+                    break;
+                }
+
+                if (selectedPaths.Add(barrier.FilePath))
+                {
+                    selected.Add(barrier);
+                }
+            }
+
+            return selected.ToArray();
+        }
+
+        private static StreamEncryptionBarrier[] OrderSampleBarriersForPattern(StreamEncryptionBarrier[] samples, string? patternList)
+        {
+            if (samples.Length <= 1 || string.IsNullOrWhiteSpace(patternList))
+            {
+                return samples;
+            }
+
+            var matching = new List<StreamEncryptionBarrier>(samples.Length);
+            var others = new List<StreamEncryptionBarrier>(samples.Length);
+            foreach (var barrier in samples)
+            {
+                var fileName = Path.GetFileName(barrier.FilePath.Replace('\\', '/'));
+                if (MatchesPatternList(fileName, patternList!))
+                {
+                    matching.Add(barrier);
+                }
+                else
+                {
+                    others.Add(barrier);
+                }
+            }
+
+            if (matching.Count == 0 || others.Count == 0)
+            {
+                return samples;
+            }
+
+            matching.AddRange(others);
+            return matching.ToArray();
+        }
+
+        private static bool MatchesPatternList(string fileName, string patternList)
+        {
+            if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrWhiteSpace(patternList))
+            {
+                return false;
+            }
+
+            var parts = patternList.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                var pattern = parts[i].Trim();
+                if (pattern.Length > 0 && FileSystemName.MatchesSimpleExpression(pattern, fileName, ignoreCase: true))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool HasMoreSpecificStructure(DetectedCipherCandidate candidate, DetectedCipherCandidate existing)

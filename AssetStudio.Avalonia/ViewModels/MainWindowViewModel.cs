@@ -885,6 +885,11 @@ namespace AssetStudio.Avalonia.ViewModels
                         break;
                     }
 
+                    if (UnityHeaderProbe.IsNonStreamDiagnosticHint(hint.Provider))
+                    {
+                        continue;
+                    }
+
                     var targetPath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : hint.CatalogPath;
                     var candidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(
                         ReadOnlySpan<byte>.Empty,

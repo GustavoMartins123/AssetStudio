@@ -260,8 +260,18 @@ public partial class MainWindow : Window
 
         if (barriers.Count == 0 && catalogHints.Count > 0)
         {
-            foreach (var hint in catalogHints.Take(10))
+            foreach (var hint in catalogHints)
             {
+                if (barriers.Count >= 10)
+                {
+                    break;
+                }
+
+                if (UnityHeaderProbe.IsNonStreamDiagnosticHint(hint.Provider))
+                {
+                    continue;
+                }
+
                 var targetPath = !string.IsNullOrWhiteSpace(hint.Bundle) ? hint.Bundle : hint.CatalogPath;
                 var candidates = UnityHeaderProbe.AnalyzeEncryptionCandidates(
                     ReadOnlySpan<byte>.Empty,

@@ -983,6 +983,192 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public async Task NonStreamDiagnosticHints_DoNotFabricateCipherCandidates_And_TestKeySamplesAllBarrierGroups()
+        {
+            DecryptionHelper.Clear();
+            var tempRoot = Path.Combine(Path.GetTempPath(), "AssetStudio_EdgeCasesTest_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+
+            try
+            {
+                // 1. Il2CppGlobalMetadata & CustomCatalogSchema hints must NOT fabricate AES-CBC or *.dat / *.json
+                Assert.Empty(UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                    ReadOnlySpan<byte>.Empty,
+                    0,
+                    "global-metadata.dat",
+                    providerHint: "Il2CppGlobalMetadata",
+                    reasonHint: "IL2CPP global-metadata header does not match standard magic."));
+
+                Assert.Empty(UnityHeaderProbe.AnalyzeEncryptionCandidates(
+                    ReadOnlySpan<byte>.Empty,
+                    0,
+                    "catalog.json",
+                    providerHint: "CustomCatalogSchema",
+                    reasonHint: "Catalog JSON uses non-standard field names."));
+
+                var diagHints = new[]
+                {
+                    new DecryptionHintEntry
+                    {
+                        Provider = "Il2CppGlobalMetadata",
+                        CatalogPath = string.Empty,
+                        Bundle = "global-metadata.dat",
+                        Reason = "IL2CPP metadata obfuscated",
+                        Confidence = 0.90
+                    },
+                    new DecryptionHintEntry
+                    {
+                        Provider = "CustomCatalogSchema",
+                        CatalogPath = Path.Combine(tempRoot, "catalog.json"),
+                        Bundle = string.Empty,
+                        Reason = "Custom catalog JSON schema",
+                        Confidence = 0.65
+                    }
+                };
+
+                var diagVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: false,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 10,
+                    EncryptedFileCount: 0,
+                    CoveragePercent: 100.0,
+                    DetectedBarriers: Array.Empty<StreamEncryptionBarrier>(),
+                    CatalogHints: diagHints));
+
+                Assert.False(diagVm.HasDetectedAlgorithms);
+                Assert.Empty(diagVm.DetectedAlgorithms);
+                Assert.False(diagVm.IsSelectedAlgorithmAutoDetected);
+                Assert.Equal("*.bundle;*.enc", diagVm.FileNamePattern);
+                Assert.DoesNotContain(".dat", diagVm.FileNamePattern, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain(".json", diagVm.FileNamePattern, StringComparison.OrdinalIgnoreCase);
+
+                // MainWindowViewModel fallback also skips converting diagnostic hints into cipher barriers
+                var captureDialogs = new CapturingDecryptionDialogService();
+                using var mainVm = new MainWindowViewModel(dialogService: captureDialogs);
+                mainVm.ProjectSession.ApplyProjectAnalysis(new ProjectAnalysisResult
+                {
+                    Report = new ProjectAnalysisReport
+                    {
+                        ProjectRoot = tempRoot,
+                        Status = ProjectAnalysisStatus.Ready,
+                        DecryptionHintCount = diagHints.Length
+                    },
+                    DecryptionHints = new DecryptionHintsReport
+                    {
+                        ProjectRoot = tempRoot,
+                        Hints = diagHints.ToList()
+                    }
+                });
+                await mainVm.OpenDecryptionSettingsCommand.ExecuteAsync();
+
+                Assert.NotNull(captureDialogs.LastDecryptionContext);
+                Assert.Empty(captureDialogs.LastDecryptionContext!.DetectedBarriers);
+                var fromMainVm = new DecryptionKeyDialogViewModel(captureDialogs.LastDecryptionContext);
+                Assert.False(fromMainVm.HasDetectedAlgorithms);
+                Assert.False(fromMainVm.IsSelectedAlgorithmAutoDetected);
+                Assert.Equal("*.bundle;*.enc", fromMainVm.FileNamePattern);
+
+                // 2. Heterogeneous folder with 5 .assets barriers alphabetically BEFORE a 16B-aligned AES-CBC+PKCS7 .bundle barrier
+                //    AND an unaligned AES-CTR .enc barrier:
+                //    TestKeyCommand must NOT starve on the first 4 .assets files; it must sample across barrier groups,
+                //    honor each barrier's structural range/padding, unlock the .bundle/.enc file, and auto-select the winner!
+                var rng = new Random(90210);
+                byte[] partialAssetsPayload = new byte[0x1200];
+                rng.NextBytes(partialAssetsPayload.AsSpan(0, 0x400));
+                for (int i = 0; i < 0x400; i++)
+                {
+                    if (partialAssetsPayload[i] == 0)
+                    {
+                        partialAssetsPayload[i] = 1;
+                    }
+                }
+                partialAssetsPayload[0x400] = 0x0F;
+                partialAssetsPayload[0x404] = 0x19;
+
+                var assetBarriers = new List<StreamEncryptionBarrier>();
+                var assetNames = new[] { "a_core0.assets", "b_core1.assets", "c_core2.assets", "d_core3.assets", "e_core4.assets" };
+                foreach (var name in assetNames)
+                {
+                    var p = Path.Combine(tempRoot, name);
+                    File.WriteAllBytes(p, partialAssetsPayload);
+                    Assert.True(DecryptionHelper.InspectFileBarrier(p, out var assetBarrier));
+                    assetBarriers.Add(assetBarrier);
+                }
+
+                byte[] nodePayload = BuildValidSerializedHeaderPayload(2048);
+                byte[] plainBundle = BuildValidLz4UnityFsBundle("CAB-hetero-bundle", nodePayload);
+                byte[] key128 = Convert.FromHexString("00112233445566778899AABBCCDDEEFF");
+                byte[] iv16 = Convert.FromHexString("102030405060708090A0B0C0D0E0F000");
+
+                // 2a. 5 .assets barriers FIRST + 6th barrier is full-stream AES-CBC+PKCS7 .bundle
+                byte[] cbcBundleCipher = EncryptAes(plainBundle, key128, iv16, CipherMode.CBC, PaddingMode.PKCS7);
+                var cbcBundlePath = Path.Combine(tempRoot, "z_pack.bundle");
+                File.WriteAllBytes(cbcBundlePath, cbcBundleCipher);
+                Assert.True(DecryptionHelper.InspectFileBarrier(cbcBundlePath, out var cbcBundleBarrier));
+
+                var cbcStarvedBarriers = assetBarriers.Append(cbcBundleBarrier).ToList();
+                var cbcStarvedVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: cbcStarvedBarriers.Count,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: cbcStarvedBarriers));
+
+                // XOR (0.84, *.assets, range 1024) is pre-selected; user enters AES-CBC key+IV for z_pack.bundle and clicks Test Key!
+                Assert.Equal(4, cbcStarvedVm.SelectedAlgorithmIndex); // XOR
+                cbcStarvedVm.KeyInput = Convert.ToHexString(key128);
+                cbcStarvedVm.IvInput = Convert.ToHexString(iv16);
+                cbcStarvedVm.TestKeyCommand.Execute(null);
+
+                Assert.False(cbcStarvedVm.HasValidationError);
+                Assert.Equal(0, cbcStarvedVm.SelectedAlgorithmIndex); // Auto-switched to AES-CBC!
+                Assert.Equal("*.bundle", cbcStarvedVm.FileNamePattern);
+                Assert.Equal("-1", cbcStarvedVm.RangeLengthText);
+                Assert.Equal(1, cbcStarvedVm.SelectedPaddingIndex); // PKCS7
+                Assert.Contains("z_pack.bundle", cbcStarvedVm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+
+                // 2b. 5 .assets barriers FIRST + 6th barrier is unaligned full-stream AES-CTR .enc
+                var unalignedNode = BuildValidSerializedHeaderPayload(2048);
+                var unalignedPlain = BuildValidLz4UnityFsBundle("CAB-hetero-unaligned", unalignedNode);
+                while ((unalignedPlain.Length % 16) == 0)
+                {
+                    unalignedNode = BuildValidSerializedHeaderPayload(unalignedNode.Length + 1);
+                    unalignedPlain = BuildValidLz4UnityFsBundle("CAB-hetero-unaligned", unalignedNode);
+                }
+                byte[] unalignedCtrCipher = EncryptAesCtr(unalignedPlain, key128, iv16, counterStart: 0, littleEndian: false, rangeStart: 0, rangeLength: -1);
+                var encPath = Path.Combine(tempRoot, "z_stream.enc");
+                File.WriteAllBytes(encPath, unalignedCtrCipher);
+                Assert.True(DecryptionHelper.InspectFileBarrier(encPath, out var encBarrier));
+
+                var ctrStarvedBarriers = assetBarriers.Append(encBarrier).ToList();
+                var ctrStarvedVm = new DecryptionKeyDialogViewModel(new DecryptionDialogContext(
+                    IsInitialLoadPrompt: true,
+                    ProjectRoot: tempRoot,
+                    ReadableAssetFileCount: 0,
+                    EncryptedFileCount: ctrStarvedBarriers.Count,
+                    CoveragePercent: 0.0,
+                    DetectedBarriers: ctrStarvedBarriers));
+
+                Assert.Equal(4, ctrStarvedVm.SelectedAlgorithmIndex); // XOR
+                ctrStarvedVm.KeyInput = Convert.ToHexString(key128);
+                ctrStarvedVm.IvInput = Convert.ToHexString(iv16);
+                ctrStarvedVm.TestKeyCommand.Execute(null);
+
+                Assert.False(ctrStarvedVm.HasValidationError);
+                Assert.Equal(1, ctrStarvedVm.SelectedAlgorithmIndex); // Auto-switched to AES-CTR!
+                Assert.Equal("*.enc", ctrStarvedVm.FileNamePattern);
+                Assert.Equal("-1", ctrStarvedVm.RangeLengthText);
+                Assert.Contains("z_stream.enc", ctrStarvedVm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                DecryptionHelper.Clear();
+                try { Directory.Delete(tempRoot, recursive: true); } catch { }
+            }
+        }
+
         private sealed class CapturingDecryptionDialogService : IDialogService
         {
             public DecryptionDialogContext? LastDecryptionContext { get; private set; }

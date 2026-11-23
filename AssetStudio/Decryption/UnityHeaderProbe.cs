@@ -500,10 +500,27 @@ namespace AssetStudio
             return key.ToArray();
         }
 
+        public static bool IsNonStreamDiagnosticHint(string? providerHint)
+        {
+            if (string.IsNullOrWhiteSpace(providerHint))
+            {
+                return false;
+            }
+
+            string trimmed = providerHint.Trim();
+            return string.Equals(trimmed, "Il2CppGlobalMetadata", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(trimmed, "CustomCatalogSchema", StringComparison.OrdinalIgnoreCase);
+        }
+
         public static IReadOnlyList<DetectedCipherCandidate> AnalyzeExplicitProviderHint(
             string? providerHint,
             string? reasonHint = null)
         {
+            if (IsNonStreamDiagnosticHint(providerHint))
+            {
+                return Array.Empty<DetectedCipherCandidate>();
+            }
+
             var candidates = new List<DetectedCipherCandidate>();
             TryBuildExplicitHintCandidates(
                 providerHint,
@@ -523,6 +540,11 @@ namespace AssetStudio
             string? providerHint = null,
             string? reasonHint = null)
         {
+            if (IsNonStreamDiagnosticHint(providerHint))
+            {
+                return Array.Empty<DetectedCipherCandidate>();
+            }
+
             var candidates = new List<DetectedCipherCandidate>();
 
             // 1. Deterministic single match: Block 512 "Encryption" magic header at offset 0
