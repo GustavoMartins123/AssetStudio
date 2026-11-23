@@ -331,6 +331,10 @@ public static class ScriptSourceDiscovery
         if (!string.IsNullOrWhiteSpace(customScriptsDirectory) && Directory.Exists(customScriptsDirectory))
         {
             ProbeDumperDirectory(customScriptsDirectory);
+            TryDetectGameAssemblyInDirectory(customScriptsDirectory);
+            TryDetectGameAssemblyInDirectory(Path.Combine(customScriptsDirectory, "lib", "arm64-v8a"));
+            TryDetectGameAssemblyInDirectory(Path.Combine(customScriptsDirectory, "lib", "armeabi-v7a"));
+            TryDetectGameAssemblyInDirectory(Path.Combine(customScriptsDirectory, "lib", "x86_64"));
         }
 
         // 2. Known Il2CppDumper artifacts from ProjectAnalysisReport
@@ -527,7 +531,14 @@ public static class ScriptSourceDiscovery
             {
             }
 
-            // Detect GameAssembly if not already supplied
+            // Prefer the native binary closest to the discovered global-metadata.dat (handles nested builds)
+            if (string.IsNullOrWhiteSpace(result.GameAssemblyPath)
+                && !string.IsNullOrWhiteSpace(result.GlobalMetadataPath))
+            {
+                result.GameAssemblyPath = TryFindGameAssemblyNearMetadata(result.GlobalMetadataPath);
+            }
+
+            // Detect GameAssembly in project root if still not supplied
             TryDetectGameAssemblyInDirectory(fullRoot);
             TryDetectGameAssemblyInDirectory(Path.Combine(fullRoot, "lib", "arm64-v8a"));
             TryDetectGameAssemblyInDirectory(Path.Combine(fullRoot, "lib", "armeabi-v7a"));
@@ -535,7 +546,77 @@ public static class ScriptSourceDiscovery
             TryDetectGameAssemblyInDirectory(Path.Combine(fullRoot, "Contents", "Frameworks"));
         }
 
+        // 6. Probe ancestors of global-metadata.dat when projectRoot was not supplied
+        if (string.IsNullOrWhiteSpace(result.GameAssemblyPath)
+            && !string.IsNullOrWhiteSpace(result.GlobalMetadataPath))
+        {
+            result.GameAssemblyPath = TryFindGameAssemblyNearMetadata(result.GlobalMetadataPath);
+        }
+
         return result;
+    }
+
+    /// <summary>
+    /// Probes the directory containing <c>global-metadata.dat</c> and up to 5 ancestor
+    /// directories (covering standard Windows <c>*_Data/il2cpp_data/Metadata/</c> and Android
+    /// <c>assets/bin/Data/Managed/Metadata/</c> layouts) for a matching native IL2CPP binary.
+    /// </summary>
+    public static string? TryFindGameAssemblyNearMetadata(string? globalMetadataPath)
+    {
+        if (string.IsNullOrWhiteSpace(globalMetadataPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var currentDir = Path.GetDirectoryName(Path.GetFullPath(globalMetadataPath));
+            var candidateNames = new[] { "GameAssembly.dll", "libil2cpp.so", "GameAssembly.so", "GameAssembly.dylib" };
+            var subDirs = new[]
+            {
+                string.Empty,
+                Path.Combine("lib", "arm64-v8a"),
+                Path.Combine("lib", "armeabi-v7a"),
+                Path.Combine("lib", "x86_64"),
+                Path.Combine("Contents", "Frameworks")
+            };
+
+            for (var depth = 0; depth <= 5 && !string.IsNullOrWhiteSpace(currentDir) && Directory.Exists(currentDir); depth++)
+            {
+                foreach (var sub in subDirs)
+                {
+                    var probeDir = string.IsNullOrEmpty(sub) ? currentDir : Path.Combine(currentDir, sub);
+                    if (!Directory.Exists(probeDir))
+                    {
+                        continue;
+                    }
+
+                    foreach (var name in candidateNames)
+                    {
+                        var candidatePath = Path.Combine(probeDir, name);
+                        if (File.Exists(candidatePath))
+                        {
+                            return Path.GetFullPath(candidatePath);
+                        }
+                    }
+                }
+
+                var parent = Path.GetDirectoryName(currentDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (string.IsNullOrWhiteSpace(parent)
+                    || string.Equals(parent, currentDir, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(parent, Path.GetPathRoot(parent), StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                currentDir = parent;
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
     }
 
     /// <summary>

@@ -67,7 +67,8 @@ public sealed class Il2CppMetadataReader
     private readonly record struct MethodLayout(
         int StructSize,
         int ParameterStartOffset,
-        int GenericContainerIndexOffset)
+        int GenericContainerIndexOffset,
+        int MethodIndexOffset = -1)
     {
         public int TokenOffset => StructSize - 12;
         public int FlagsOffset => StructSize - 8;
@@ -77,7 +78,9 @@ public sealed class Il2CppMetadataReader
     private readonly record struct ImageEntry(
         string Name,
         int TypeStart,
-        int TypeCount);
+        int TypeCount,
+        int CustomAttributeStart = -1,
+        int CustomAttributeCount = 0);
 
     private readonly record struct TypeSummary(
         string Name,
@@ -106,12 +109,22 @@ public sealed class Il2CppMetadataReader
         public required TableSlice NestedTypes { get; init; }
         public required TableSlice Interfaces { get; init; }
         public required TableSlice TypeDefinitions { get; init; }
+        public TableSlice AttributeDataOrInfo { get; init; }
+        public TableSlice AttributeDataRangeOrTypes { get; init; }
+        public bool UsesV29CustomAttributeFormat { get; init; }
         public required TypeDefLayout TypeDefLayout { get; init; }
         public required MethodLayout MethodLayout { get; init; }
         public required int FieldStructSize { get; init; }
         public required int ParameterStructSize { get; init; }
         public required int PropertyStructSize { get; init; }
         public required int EventStructSize { get; init; }
+        public required int TotalMethods { get; init; }
+        public int Int32ByvalTypeIndex { get; init; } = -1;
+        public int Int32TypeDefIndex { get; init; } = -1;
+        public int ObjectByvalTypeIndex { get; init; } = -1;
+        public int StringByvalTypeIndex { get; init; } = -1;
+        public int VoidByvalTypeIndex { get; init; } = -1;
+        public int SampleValueTypeByvalTypeIndex { get; init; } = -1;
         public required ImageEntry[] Images { get; init; }
         public required TypeSummary[] Types { get; init; }
         public required Dictionary<string, List<int>> ByFullName { get; init; }
@@ -132,7 +145,13 @@ public sealed class Il2CppMetadataReader
     private readonly object _cacheLock = new();
     private readonly Dictionary<string, MetadataIndex> _indexCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, CachedFailure> _failureCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Il2CppBinaryReader _binaryReader;
     private long _accessCounter;
+
+    public Il2CppMetadataReader(Il2CppBinaryReader? binaryReader = null)
+    {
+        _binaryReader = binaryReader ?? new Il2CppBinaryReader();
+    }
 
     public void ClearCache()
     {
@@ -141,6 +160,7 @@ public sealed class Il2CppMetadataReader
             _indexCache.Clear();
             _failureCache.Clear();
         }
+        _binaryReader.ClearCache();
     }
 
     public Il2CppMetadataLoadOutcome InspectMetadata(string metadataPath, CancellationToken cancellationToken = default)
@@ -160,6 +180,16 @@ public sealed class Il2CppMetadataReader
     public ScriptDecompilationResult? TryExtractType(
         string metadataPath,
         ScriptLookupRequest request,
+        out string? diagnosticMessage,
+        CancellationToken cancellationToken = default)
+    {
+        return TryExtractType(metadataPath, request, request.GameAssemblyPath, out diagnosticMessage, cancellationToken);
+    }
+
+    public ScriptDecompilationResult? TryExtractType(
+        string metadataPath,
+        ScriptLookupRequest request,
+        string? gameAssemblyPath,
         out string? diagnosticMessage,
         CancellationToken cancellationToken = default)
     {
@@ -183,10 +213,31 @@ public sealed class Il2CppMetadataReader
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        Il2CppBinaryIndex? binaryIndex = null;
+        var effectiveBinaryPath = ResolveEffectiveBinaryPath(gameAssemblyPath, request.GameAssemblyPath, metadataPath);
+        if (!string.IsNullOrWhiteSpace(effectiveBinaryPath))
+        {
+            var binaryCtx = new Il2CppBinaryMetadataContext
+            {
+                MetadataVersion = index.Version,
+                TotalTypes = index.Types.Length,
+                TotalMethods = index.TotalMethods,
+                Int32ByvalTypeIndex = index.Int32ByvalTypeIndex,
+                Int32TypeDefIndex = index.Int32TypeDefIndex,
+                ObjectByvalTypeIndex = index.ObjectByvalTypeIndex,
+                StringByvalTypeIndex = index.StringByvalTypeIndex,
+                VoidByvalTypeIndex = index.VoidByvalTypeIndex,
+                SampleValueTypeByvalTypeIndex = index.SampleValueTypeByvalTypeIndex,
+                ImageNames = index.Images.Select(static img => img.Name).ToArray()
+            };
+            binaryIndex = _binaryReader.TryLoad(effectiveBinaryPath, binaryCtx, cancellationToken);
+        }
+
         var fieldTypeOverrides = request.FallbackTypeTree != null
             ? TypeTreeScriptReconstructor.ExtractTopLevelFieldTypes(request.FallbackTypeTree)
             : null;
-        return ReconstructTypeResult(index, typeDefIndex, fieldTypeOverrides, cancellationToken);
+        return ReconstructTypeResult(index, binaryIndex, typeDefIndex, fieldTypeOverrides, cancellationToken);
     }
 
     public ScriptDecompilationResult? TryExtractType(
@@ -194,7 +245,25 @@ public sealed class Il2CppMetadataReader
         ScriptLookupRequest request,
         CancellationToken cancellationToken = default)
     {
-        return TryExtractType(metadataPath, request, out _, cancellationToken);
+        return TryExtractType(metadataPath, request, request.GameAssemblyPath, out _, cancellationToken);
+    }
+
+    private static string? ResolveEffectiveBinaryPath(
+        string? explicitPath,
+        string? requestPath,
+        string metadataPath)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitPath) && File.Exists(explicitPath))
+        {
+            return Path.GetFullPath(explicitPath);
+        }
+
+        if (!string.IsNullOrWhiteSpace(requestPath) && File.Exists(requestPath))
+        {
+            return Path.GetFullPath(requestPath);
+        }
+
+        return ScriptSourceDiscovery.TryFindGameAssemblyNearMetadata(metadataPath);
     }
 
     private (MetadataIndex? Index, Il2CppMetadataLoadOutcome Outcome) GetOrBuildIndex(
@@ -447,6 +516,7 @@ public sealed class Il2CppMetadataReader
                     out var bodyXorKey,
                     out var stringBytes,
                     out var images,
+                    out var imagesPairIndex,
                     out var totalTypes,
                     out var typeDefStructSize,
                     out var typeDefBytes))
@@ -474,11 +544,37 @@ public sealed class Il2CppMetadataReader
                 totalMethods,
                 totalFields);
 
+            // Resolve custom attribute table slices across v24-v31
+            var attrDataOrInfo = new TableSlice(0, 0);
+            var attrRangeOrTypes = new TableSlice(0, 0);
+            var usesV29CustomAttrs = version >= 29;
+            if (version >= 27 && imagesPairIndex == 20 && pairs.Length > 25)
+            {
+                attrDataOrInfo = pairs[24];
+                attrRangeOrTypes = pairs[25];
+            }
+            else if (imagesPairIndex == 21 && pairs.Length > 28)
+            {
+                attrDataOrInfo = pairs[27];
+                attrRangeOrTypes = pairs[28];
+            }
+            else if (imagesPairIndex == 20 && pairs.Length > 27)
+            {
+                attrDataOrInfo = pairs[26];
+                attrRangeOrTypes = pairs[27];
+            }
+
             // Build lightweight lookup index
             var types = new TypeSummary[totalTypes];
             var byFullName = new Dictionary<string, List<int>>(totalTypes, StringComparer.OrdinalIgnoreCase);
             var bySimpleName = new Dictionary<string, List<int>>(totalTypes, StringComparer.OrdinalIgnoreCase);
             var byvalMap = new Dictionary<int, int>(totalTypes);
+            var int32Byval = -1;
+            var int32Td = -1;
+            var objectByval = -1;
+            var stringByval = -1;
+            var voidByval = -1;
+            var sampleValueTypeByval = -1;
 
             // Map TypeDefIndex -> ImageIndex in O(totalTypes)
             var typeToImage = new int[totalTypes];
@@ -505,6 +601,7 @@ public sealed class Il2CppMetadataReader
                 var nsIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff + 4, 4));
                 var byvalIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff + typeDefLayout.ByvalTypeIndexOffset, 4));
                 var declaringIdx = BinaryPrimitives.ReadInt32LittleEndian(typeDefBytes.AsSpan(entryOff + typeDefLayout.DeclaringTypeIndexOffset, 4));
+                var bitfield = BinaryPrimitives.ReadUInt32LittleEndian(typeDefBytes.AsSpan(entryOff + typeDefLayout.BitfieldOffset, 4));
 
                 var name = ReadNullTerminatedUtf8(stringBytes, nameIdx) ?? string.Empty;
                 var ns = ReadNullTerminatedUtf8(stringBytes, nsIdx) ?? string.Empty;
@@ -514,6 +611,35 @@ public sealed class Il2CppMetadataReader
                 if (byvalIdx >= 0 && !byvalMap.ContainsKey(byvalIdx))
                 {
                     byvalMap[byvalIdx] = i;
+                }
+
+                if (byvalIdx >= 0)
+                {
+                    if (sampleValueTypeByval < 0 && (bitfield & 0x1u) != 0 && !string.Equals(name, "Void", StringComparison.Ordinal))
+                    {
+                        sampleValueTypeByval = byvalIdx;
+                    }
+
+                    if (string.Equals(ns, "System", StringComparison.Ordinal))
+                    {
+                        if (int32Byval < 0 && string.Equals(name, "Int32", StringComparison.Ordinal))
+                        {
+                            int32Byval = byvalIdx;
+                            int32Td = i;
+                        }
+                        else if (objectByval < 0 && string.Equals(name, "Object", StringComparison.Ordinal))
+                        {
+                            objectByval = byvalIdx;
+                        }
+                        else if (stringByval < 0 && string.Equals(name, "String", StringComparison.Ordinal))
+                        {
+                            stringByval = byvalIdx;
+                        }
+                        else if (voidByval < 0 && string.Equals(name, "Void", StringComparison.Ordinal))
+                        {
+                            voidByval = byvalIdx;
+                        }
+                    }
                 }
 
                 if (string.IsNullOrEmpty(name) || string.Equals(name, "<Module>", StringComparison.Ordinal))
@@ -567,12 +693,22 @@ public sealed class Il2CppMetadataReader
                 NestedTypes = nestedTypesSlice,
                 Interfaces = interfacesSlice,
                 TypeDefinitions = typeDefsSlice,
+                AttributeDataOrInfo = attrDataOrInfo,
+                AttributeDataRangeOrTypes = attrRangeOrTypes,
+                UsesV29CustomAttributeFormat = usesV29CustomAttrs,
                 TypeDefLayout = typeDefLayout,
                 MethodLayout = methodLayout,
                 FieldStructSize = fieldStructSize,
                 ParameterStructSize = paramStructSize,
                 PropertyStructSize = propertyStructSize,
                 EventStructSize = eventStructSize,
+                TotalMethods = totalMethods,
+                Int32ByvalTypeIndex = int32Byval,
+                Int32TypeDefIndex = int32Td,
+                ObjectByvalTypeIndex = objectByval,
+                StringByvalTypeIndex = stringByval,
+                VoidByvalTypeIndex = voidByval,
+                SampleValueTypeByvalTypeIndex = sampleValueTypeByval,
                 Images = images,
                 Types = types,
                 ByFullName = byFullName,
@@ -621,6 +757,7 @@ public sealed class Il2CppMetadataReader
         out byte[]? bodyXorKey,
         out byte[] stringBytes,
         out ImageEntry[] images,
+        out int imagesPairIndex,
         out int totalTypes,
         out int typeDefStructSize,
         out byte[] typeDefBytes)
@@ -629,6 +766,7 @@ public sealed class Il2CppMetadataReader
         bodyXorKey = null;
         stringBytes = Array.Empty<byte>();
         images = Array.Empty<ImageEntry>();
+        imagesPairIndex = 20;
         totalTypes = 0;
         typeDefStructSize = 0;
         typeDefBytes = Array.Empty<byte>();
@@ -654,6 +792,7 @@ public sealed class Il2CppMetadataReader
                     xorKey: null,
                     out stringBytes,
                     out images,
+                    out imagesPairIndex,
                     out totalTypes,
                     out typeDefStructSize,
                     out typeDefBytes))
@@ -705,6 +844,7 @@ public sealed class Il2CppMetadataReader
                         candidateKey,
                         out stringBytes,
                         out images,
+                        out imagesPairIndex,
                         out totalTypes,
                         out typeDefStructSize,
                         out typeDefBytes))
@@ -758,12 +898,14 @@ public sealed class Il2CppMetadataReader
         byte[]? xorKey,
         out byte[] stringBytes,
         out ImageEntry[] images,
+        out int imagesPairIndex,
         out int totalTypes,
         out int typeDefStructSize,
         out byte[] typeDefBytes)
     {
         stringBytes = Array.Empty<byte>();
         images = Array.Empty<ImageEntry>();
+        imagesPairIndex = 20;
         totalTypes = 0;
         typeDefStructSize = 0;
         typeDefBytes = Array.Empty<byte>();
@@ -783,6 +925,7 @@ public sealed class Il2CppMetadataReader
                 bodyOffsetDelta,
                 xorKey,
                 out images,
+                out imagesPairIndex,
                 out totalTypes,
                 out typeDefStructSize))
         {
@@ -924,10 +1067,12 @@ public sealed class Il2CppMetadataReader
         long bodyOffsetDelta,
         byte[]? xorKey,
         out ImageEntry[] images,
+        out int imagesPairIndex,
         out int totalTypes,
         out int typeDefStructSize)
     {
         images = Array.Empty<ImageEntry>();
+        imagesPairIndex = 20;
         totalTypes = 0;
         typeDefStructSize = 0;
 
@@ -993,8 +1138,16 @@ public sealed class Il2CppMetadataReader
                         break;
                     }
 
+                    var caStart = imgStructSize >= 40 ? BinaryPrimitives.ReadInt32LittleEndian(raw.AsSpan(off + 32, 4)) : -1;
+                    var caCount = imgStructSize >= 40 ? BinaryPrimitives.ReadInt32LittleEndian(raw.AsSpan(off + 36, 4)) : 0;
+                    if (caStart < 0 || caCount <= 0)
+                    {
+                        caStart = -1;
+                        caCount = 0;
+                    }
+
                     runningTypes += typeCount;
-                    parsed[i] = new ImageEntry(name, typeStart, typeCount);
+                    parsed[i] = new ImageEntry(name, typeStart, typeCount, caStart, caCount);
                 }
 
                 if (!valid || runningTypes <= 0 || dllNameHits == 0)
@@ -1014,6 +1167,7 @@ public sealed class Il2CppMetadataReader
                 }
 
                 images = parsed;
+                imagesPairIndex = pairIdx;
                 totalTypes = runningTypes;
                 typeDefStructSize = tdSize;
                 return true;
@@ -1110,15 +1264,20 @@ public sealed class Il2CppMetadataReader
             {
                 if (msz == 36 && (version >= 31 || hasReturnParamTokenAt12))
                 {
-                    return new MethodLayout(36, ParameterStartOffset: 16, GenericContainerIndexOffset: 20);
+                    return new MethodLayout(36, ParameterStartOffset: 16, GenericContainerIndexOffset: 20, MethodIndexOffset: -1);
                 }
 
                 if (msz == 56)
                 {
-                    return new MethodLayout(56, ParameterStartOffset: 12, GenericContainerIndexOffset: 20);
+                    return new MethodLayout(56, ParameterStartOffset: 12, GenericContainerIndexOffset: 20, MethodIndexOffset: 24);
                 }
 
-                return new MethodLayout(msz, ParameterStartOffset: 12, GenericContainerIndexOffset: 16);
+                if (msz == 48)
+                {
+                    return new MethodLayout(48, ParameterStartOffset: 12, GenericContainerIndexOffset: 16, MethodIndexOffset: 20);
+                }
+
+                return new MethodLayout(msz, ParameterStartOffset: 12, GenericContainerIndexOffset: 16, MethodIndexOffset: -1);
             }
         }
 
@@ -1493,8 +1652,139 @@ public sealed class Il2CppMetadataReader
         return string.Join(".", parts);
     }
 
+    private sealed class TypeResolutionContext
+    {
+        private readonly FileStream _stream;
+        private readonly MetadataIndex _index;
+        private readonly Il2CppBinaryIndex? _binary;
+        private readonly Dictionary<int, (string Namespace, IReadOnlyList<string> TypeChain)?> _chainCache = new();
+        private readonly Dictionary<int, string?> _genericParamCache = new();
+
+        public TypeResolutionContext(FileStream stream, MetadataIndex index, Il2CppBinaryIndex? binary)
+        {
+            _stream = stream;
+            _index = index;
+            _binary = binary;
+        }
+
+        public bool TryResolveType(int typeIndex, out Il2CppResolvedType resolved)
+        {
+            if (_binary != null && _binary.TryResolveType(typeIndex, ResolveTypeDefChain, ResolveGenericParamName, out resolved))
+            {
+                return true;
+            }
+
+            if (typeIndex >= 0 && _index.ByvalTypeToTypeDef.TryGetValue(typeIndex, out var tdIdx))
+            {
+                var chain = ResolveTypeDefChain(tdIdx);
+                if (chain != null && chain.Value.TypeChain.Count > 0)
+                {
+                    var joined = string.Join(".", chain.Value.TypeChain);
+                    var fullName = !string.IsNullOrWhiteSpace(chain.Value.Namespace)
+                        ? $"{chain.Value.Namespace}.{joined}"
+                        : joined;
+                    resolved = new Il2CppResolvedType(fullName, 0, IsByRef: false, IsPinned: false);
+                    return true;
+                }
+            }
+
+            resolved = default;
+            return false;
+        }
+
+        public string? ResolveTypeName(int typeIndex, bool includeNamespace)
+        {
+            if (!TryResolveType(typeIndex, out var resolved))
+            {
+                return null;
+            }
+
+            if (includeNamespace)
+            {
+                return resolved.TypeName;
+            }
+
+            var dot = resolved.TypeName.LastIndexOf('.');
+            return dot >= 0 && dot + 1 < resolved.TypeName.Length
+                ? resolved.TypeName.Substring(dot + 1)
+                : resolved.TypeName;
+        }
+
+        private (string Namespace, IReadOnlyList<string> TypeChain)? ResolveTypeDefChain(int typeDefIndex)
+        {
+            if (typeDefIndex < 0 || typeDefIndex >= _index.Types.Length)
+            {
+                return null;
+            }
+
+            if (_chainCache.TryGetValue(typeDefIndex, out var cached))
+            {
+                return cached;
+            }
+
+            var parts = new Stack<string>();
+            var current = typeDefIndex;
+            var outerNamespace = string.Empty;
+            var guard = 0;
+            while (current >= 0 && current < _index.Types.Length && guard++ < 16)
+            {
+                var summary = _index.Types[current];
+                parts.Push(summary.Name);
+                outerNamespace = summary.Namespace;
+                if (summary.DeclaringTypeIndex < 0
+                    || !_index.ByvalTypeToTypeDef.TryGetValue(summary.DeclaringTypeIndex, out var parentTd)
+                    || parentTd == current)
+                {
+                    break;
+                }
+                current = parentTd;
+            }
+
+            var result = (outerNamespace, (IReadOnlyList<string>)parts.ToArray());
+            _chainCache[typeDefIndex] = result;
+            return result;
+        }
+
+        private string? ResolveGenericParamName(int genericParamIndex)
+        {
+            const int gpSize = 16;
+            if (genericParamIndex < 0 || (long)(genericParamIndex + 1) * gpSize > _index.GenericParameters.Size)
+            {
+                return null;
+            }
+
+            if (_genericParamCache.TryGetValue(genericParamIndex, out var cached))
+            {
+                return cached;
+            }
+
+            var buf = ReadBytesAt(
+                _stream,
+                _index.GenericParameters.Offset + _index.BodyOffsetDelta + (long)genericParamIndex * gpSize,
+                gpSize,
+                _index.BodyXorKey);
+            if (buf.Length < gpSize)
+            {
+                _genericParamCache[genericParamIndex] = null;
+                return null;
+            }
+
+            var nameIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(4, 4));
+            var name = ReadStringAt(_stream, _index, nameIdx);
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                var num = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(12, 2));
+                name = $"T{num}";
+            }
+
+            _genericParamCache[genericParamIndex] = name;
+            return name;
+        }
+    }
+
     private static ScriptDecompilationResult ReconstructTypeResult(
         MetadataIndex index,
+        Il2CppBinaryIndex? binaryIndex,
         int typeDefIndex,
         IReadOnlyDictionary<string, string>? fieldTypeOverrides,
         CancellationToken cancellationToken)
@@ -1505,9 +1795,9 @@ public sealed class Il2CppMetadataReader
         var tdBytes = ReadBytesAt(stream, index.TypeDefinitions.Offset + index.BodyOffsetDelta + (long)typeDefIndex * tdLayout.StructSize, tdLayout.StructSize, index.BodyXorKey);
 
         var summary = index.Types[typeDefIndex];
-        var assemblyName = summary.ImageIndex >= 0 && summary.ImageIndex < index.Images.Length
-            ? index.Images[summary.ImageIndex].Name
-            : string.Empty;
+        var hasImage = summary.ImageIndex >= 0 && summary.ImageIndex < index.Images.Length;
+        var imageEntry = hasImage ? index.Images[summary.ImageIndex] : default;
+        var assemblyName = hasImage ? imageEntry.Name : string.Empty;
 
         var parentTypeIndex = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.ParentIndexOffset, 4));
         var elementTypeIndex = BinaryPrimitives.ReadInt32LittleEndian(tdBytes.AsSpan(tdLayout.ElementTypeIndexOffset, 4));
@@ -1532,18 +1822,51 @@ public sealed class Il2CppMetadataReader
         var isInterface = (flags & 0x00000020) != 0;
         var isValueType = (bitfield & 0x1) != 0;
         var isEnum = (bitfield & 0x2) != 0;
+        var hasBinary = binaryIndex != null && (binaryIndex.HasTypes || binaryIndex.HasFieldOffsets || binaryIndex.HasMethodPointers);
 
-        // Read methods first (needed for property/event type & modifier inference)
-        var parsedMethods = ReadMethods(stream, index, methodStart, methodCount, isInterface, cancellationToken);
+        var typeResolver = new TypeResolutionContext(stream, index, binaryIndex);
+
+        // Read methods first (needed for property/event type & modifier inference and RVA alias grouping)
+        var parsedMethods = ReadMethods(
+            stream,
+            index,
+            binaryIndex,
+            typeResolver,
+            imageEntry,
+            assemblyName,
+            methodStart,
+            methodCount,
+            isInterface,
+            cancellationToken);
+        AssignSharedRvaAliases(parsedMethods);
+
         var parsedProperties = ReadProperties(stream, index, propertyStart, propertyCount, parsedMethods);
-        var parsedEvents = ReadEvents(stream, index, eventStart, eventCount, parsedMethods);
-        var parsedFields = ReadFields(stream, index, fieldStart, fieldCount, isEnum, parsedProperties, fieldTypeOverrides);
+        var parsedEvents = ReadEvents(stream, index, typeResolver, eventStart, eventCount, parsedMethods);
+        var parsedFields = ReadFields(
+            stream,
+            index,
+            binaryIndex,
+            typeResolver,
+            imageEntry,
+            typeDefIndex,
+            fieldStart,
+            fieldCount,
+            isEnum,
+            summary.Namespace,
+            parsedProperties,
+            fieldTypeOverrides);
         var typeGenericParams = ReadGenericParameterNames(stream, index, genericContainerIdx);
-        var interfaceNames = ReadInterfaceNames(stream, index, interfacesStart, interfacesCount);
+        var interfaceNames = ReadInterfaceNames(stream, index, typeResolver, interfacesStart, interfacesCount);
         var nestedNames = ReadNestedTypeNames(stream, index, nestedStart, nestedCount);
+        var typeRawAttrs = ReadCustomAttributesForToken(stream, index, typeResolver, imageEntry, typeToken);
+        var typeDisplayAttrs = FormatDisplayAttributes(typeRawAttrs, isNotSerializedFlag: false, isSerializableFlag: (flags & 0x00002000) != 0);
 
-        var parentTypeName = ResolveTypeName(index, parentTypeIndex, includeNamespace: true);
-        var underlyingEnumTypeName = isEnum ? ResolveTypeName(index, elementTypeIndex, includeNamespace: false) : null;
+        var parentTypeName = typeResolver.ResolveTypeName(parentTypeIndex, includeNamespace: true);
+        var underlyingEnumTypeName = isEnum ? typeResolver.ResolveTypeName(elementTypeIndex, includeNamespace: true) : null;
+        if (!string.IsNullOrWhiteSpace(underlyingEnumTypeName))
+        {
+            underlyingEnumTypeName = FormatFriendlyTypeName(underlyingEnumTypeName, summary.Namespace);
+        }
 
         var cleanDisplayName = FormatTypeNameWithGenerics(summary.Name, typeGenericParams);
         var fullTitle = !string.IsNullOrWhiteSpace(summary.Namespace)
@@ -1556,7 +1879,9 @@ public sealed class Il2CppMetadataReader
             sb.AppendLine($"// Assembly: {assemblyName}");
         }
         sb.AppendLine($"// Type: {fullTitle}");
-        sb.AppendLine($"// Source: IL2CPP Metadata v{index.Version}");
+        sb.AppendLine(hasBinary
+            ? $"// Source: IL2CPP Metadata v{index.Version} + Native Binary"
+            : $"// Source: IL2CPP Metadata v{index.Version}");
         sb.AppendLine($"// TypeDefIndex: {typeDefIndex} | Token: 0x{typeToken:X8}");
         sb.AppendLine();
 
@@ -1567,6 +1892,11 @@ public sealed class Il2CppMetadataReader
             sb.AppendLine($"namespace {summary.Namespace}");
             sb.AppendLine("{");
             indent = "    ";
+        }
+
+        foreach (var attr in typeDisplayAttrs)
+        {
+            sb.AppendLine($"{indent}[{attr}]");
         }
 
         // Type declaration line
@@ -1602,6 +1932,7 @@ public sealed class Il2CppMetadataReader
 
         var memberIndent = indent + "    ";
         var wroteSection = false;
+        var methodSymbols = new List<ScriptMethodSymbol>();
 
         if (isEnum)
         {
@@ -1622,12 +1953,35 @@ public sealed class Il2CppMetadataReader
                 sb.AppendLine($"{memberIndent}// Fields ({parsedFields.Count})");
                 foreach (var f in parsedFields)
                 {
-                    var constPrefix = !string.IsNullOrEmpty(f.DefaultValueLiteral) ? "const " : string.Empty;
+                    foreach (var attr in f.DisplayAttributes)
+                    {
+                        sb.AppendLine($"{memberIndent}[{attr}]");
+                    }
+
+                    var modsPrefix = !string.IsNullOrWhiteSpace(f.Modifiers)
+                        ? f.Modifiers + " "
+                        : (f.IsConst ? "const " : string.Empty);
                     var typePart = !string.IsNullOrEmpty(f.ResolvedTypeName)
                         ? FormatFriendlyTypeName(f.ResolvedTypeName, summary.Namespace)
                         : "/* field */";
                     var valuePart = !string.IsNullOrEmpty(f.DefaultValueLiteral) ? $" = {f.DefaultValueLiteral}" : string.Empty;
-                    sb.AppendLine($"{memberIndent}{constPrefix}{typePart} {f.Name}{valuePart}; // Token: 0x{f.Token:X8}");
+
+                    var commentParts = new List<string>(4);
+                    if (!f.IsConst && f.FieldOffset >= 0)
+                    {
+                        commentParts.Add($"Offset: 0x{f.FieldOffset:X}");
+                    }
+                    commentParts.Add($"Token: 0x{f.Token:X8}");
+                    if (f.IsSerializedInTypeTree)
+                    {
+                        commentParts.Add("Serialized (TypeTree)");
+                    }
+                    if (!string.IsNullOrWhiteSpace(f.BackingFieldHint))
+                    {
+                        commentParts.Add(f.BackingFieldHint);
+                    }
+
+                    sb.AppendLine($"{memberIndent}{modsPrefix}{typePart} {f.Name}{valuePart}; // {string.Join(" | ", commentParts)}");
                 }
                 wroteSection = true;
             }
@@ -1649,7 +2003,13 @@ public sealed class Il2CppMetadataReader
                         _ => "{ }"
                     };
                     var mods = string.IsNullOrWhiteSpace(prop.Modifiers) ? string.Empty : prop.Modifiers + " ";
-                    sb.AppendLine($"{memberIndent}{mods}{propType} {prop.Name} {accessors} // Token: 0x{prop.Token:X8}");
+
+                    var propComment = $"Token: 0x{prop.Token:X8}";
+                    if (!string.IsNullOrWhiteSpace(prop.AccessorsAnnotation))
+                    {
+                        propComment += $" | Accessors: {prop.AccessorsAnnotation}";
+                    }
+                    sb.AppendLine($"{memberIndent}{mods}{propType} {prop.Name} {accessors} // {propComment}");
                 }
                 wroteSection = true;
             }
@@ -1674,6 +2034,8 @@ public sealed class Il2CppMetadataReader
                 if (wroteSection) sb.AppendLine();
                 sb.AppendLine($"{memberIndent}// Methods ({parsedMethods.Count})");
                 var ctorName = StripGenericArity(summary.Name);
+                var emittedSymbolRvas = new HashSet<ulong>();
+
                 foreach (var m in parsedMethods)
                 {
                     var paramText = string.Join(", ", m.Parameters.Select(p =>
@@ -1681,30 +2043,72 @@ public sealed class Il2CppMetadataReader
                         var pType = !string.IsNullOrEmpty(p.TypeName)
                             ? FormatFriendlyTypeName(p.TypeName, summary.Namespace)
                             : "/* param */";
+                        var refPrefix = FormatByRefParameterPrefix(p);
                         var pName = string.IsNullOrWhiteSpace(p.Name) ? $"arg{p.Index}" : p.Name;
-                        return $"{pType} {pName}";
+                        return $"{refPrefix}{pType} {pName}";
                     }));
 
+                    string signatureWithoutToken;
                     if (string.Equals(m.Name, ".cctor", StringComparison.Ordinal))
                     {
-                        sb.AppendLine($"{memberIndent}static {ctorName}(); // Token: 0x{m.Token:X8}");
+                        signatureWithoutToken = $"static {ctorName}()";
                     }
                     else if (string.Equals(m.Name, ".ctor", StringComparison.Ordinal))
                     {
                         var mods = string.IsNullOrWhiteSpace(m.Modifiers) ? "public" : m.Modifiers;
-                        sb.AppendLine($"{memberIndent}{mods} {ctorName}({paramText}); // Token: 0x{m.Token:X8}");
+                        signatureWithoutToken = $"{mods} {ctorName}({paramText})";
                     }
                     else
                     {
                         var retType = !string.IsNullOrEmpty(m.ReturnTypeName)
                             ? FormatFriendlyTypeName(m.ReturnTypeName, summary.Namespace)
                             : "/* return */";
+                        if (m.ReturnIsByRef)
+                        {
+                            retType = "ref " + retType;
+                        }
                         var genSuffix = m.GenericParameters.Count > 0
                             ? $"<{string.Join(", ", m.GenericParameters)}>"
                             : string.Empty;
                         var mods = string.IsNullOrWhiteSpace(m.Modifiers) ? string.Empty : m.Modifiers + " ";
-                        sb.AppendLine($"{memberIndent}{mods}{retType} {m.Name}{genSuffix}({paramText}); // Token: 0x{m.Token:X8}");
+                        signatureWithoutToken = $"{mods}{retType} {m.Name}{genSuffix}({paramText})";
                     }
+
+                    if (m.Rva != 0)
+                    {
+                        if (m.IsAlias && !string.IsNullOrWhiteSpace(m.CanonicalAliasOf))
+                        {
+                            sb.AppendLine($"{memberIndent}// RVA: 0x{m.Rva:X8} (alias of {m.CanonicalAliasOf})");
+                        }
+                        else
+                        {
+                            sb.AppendLine($"{memberIndent}// RVA: 0x{m.Rva:X8} | Offset: 0x{m.FileOffset:X8} | VA: 0x{m.Va:X}");
+                            if (m.AliasNames is { Count: > 0 })
+                            {
+                                sb.AppendLine($"{memberIndent}// Aliases ({m.AliasNames.Count}): {string.Join(", ", m.AliasNames)}");
+                            }
+
+                            if (emittedSymbolRvas.Add(m.Rva))
+                            {
+                                var symbolSig = m.AliasNames is { Count: > 0 }
+                                    ? $"{signatureWithoutToken} /* aliases: {string.Join(", ", m.AliasNames)} */"
+                                    : signatureWithoutToken;
+                                methodSymbols.Add(new ScriptMethodSymbol
+                                {
+                                    ClassName = fullTitle,
+                                    MethodName = m.Name,
+                                    FullName = $"{fullTitle}$${m.Name}",
+                                    Signature = symbolSig,
+                                    Address = m.Rva,
+                                    Offset = m.FileOffset,
+                                    VirtualAddress = m.Va,
+                                    Source = "IL2CPP Binary"
+                                });
+                            }
+                        }
+                    }
+
+                    sb.AppendLine($"{memberIndent}{signatureWithoutToken}; // Token: 0x{m.Token:X8}");
                 }
                 wroteSection = true;
             }
@@ -1722,13 +2126,24 @@ public sealed class Il2CppMetadataReader
             sb.AppendLine("}");
         }
 
-        var badge = $"IL2CPP (metadata v{index.Version})";
-        var summaryParts = new List<string> { $"global-metadata.dat (v{index.Version})" };
+        var badge = hasBinary
+            ? $"IL2CPP (metadata v{index.Version} + binary)"
+            : $"IL2CPP (metadata v{index.Version})";
+        var summaryParts = new List<string>
+        {
+            hasBinary
+                ? $"global-metadata.dat (v{index.Version}) + {binaryIndex!.FileName}"
+                : $"global-metadata.dat (v{index.Version})"
+        };
         if (!string.IsNullOrWhiteSpace(assemblyName))
         {
             summaryParts.Add(assemblyName);
         }
         summaryParts.Add($"{fieldCount}F / {propertyCount}P / {methodCount}M");
+        if (methodSymbols.Count > 0)
+        {
+            summaryParts.Add($"{methodSymbols.Count} RVA{(methodSymbols.Count == 1 ? string.Empty : "s")}");
+        }
 
         return new ScriptDecompilationResult
         {
@@ -1743,20 +2158,37 @@ public sealed class Il2CppMetadataReader
             SourceCode = sb.ToString().TrimEnd(),
             SummaryText = string.Join(" • ", summaryParts),
             DiagnosticMessage = string.Empty,
-            TypeDefIndex = typeDefIndex
+            TypeDefIndex = typeDefIndex,
+            MethodSymbols = methodSymbols
         };
     }
 
-    private sealed record ParsedParam(int Index, string Name, string? TypeName);
-
-    private sealed record ParsedMethod(
+    private sealed record ParsedParam(
+        int Index,
         string Name,
-        string Modifiers,
-        string? ReturnTypeName,
-        uint Flags,
-        uint Token,
-        List<string> GenericParameters,
-        List<ParsedParam> Parameters);
+        string? TypeName,
+        ushort Attributes,
+        bool IsByRef,
+        bool IsReadOnly);
+
+    private sealed class ParsedMethod
+    {
+        public required string Name { get; init; }
+        public required string Modifiers { get; init; }
+        public string? ReturnTypeName { get; init; }
+        public bool ReturnIsByRef { get; init; }
+        public uint Flags { get; init; }
+        public uint Token { get; init; }
+        public int MethodIndex { get; init; } = -1;
+        public ulong Rva { get; init; }
+        public ulong FileOffset { get; init; }
+        public ulong Va { get; init; }
+        public required List<string> GenericParameters { get; init; }
+        public required List<ParsedParam> Parameters { get; init; }
+        public bool IsAlias { get; set; }
+        public string? CanonicalAliasOf { get; set; }
+        public List<string>? AliasNames { get; set; }
+    }
 
     private sealed record ParsedProperty(
         string Name,
@@ -1764,7 +2196,11 @@ public sealed class Il2CppMetadataReader
         string? TypeName,
         bool HasGetter,
         bool HasSetter,
-        uint Token);
+        uint Token,
+        string? GetterName,
+        string? SetterName,
+        string? ReadableAccessorName,
+        string? AccessorsAnnotation);
 
     private sealed record ParsedEvent(
         string Name,
@@ -1772,15 +2208,27 @@ public sealed class Il2CppMetadataReader
         string? TypeName,
         uint Token);
 
-    private sealed record ParsedField(
-        string Name,
-        string? ResolvedTypeName,
-        string? DefaultValueLiteral,
-        uint Token);
+    private sealed class ParsedField
+    {
+        public required string Name { get; init; }
+        public string Modifiers { get; init; } = string.Empty;
+        public string? ResolvedTypeName { get; init; }
+        public string? DefaultValueLiteral { get; init; }
+        public uint Token { get; init; }
+        public int FieldOffset { get; init; } = -1;
+        public bool IsConst { get; init; }
+        public bool IsSerializedInTypeTree { get; init; }
+        public required List<string> DisplayAttributes { get; init; }
+        public string? BackingFieldHint { get; set; }
+    }
 
     private static List<ParsedMethod> ReadMethods(
         FileStream stream,
         MetadataIndex index,
+        Il2CppBinaryIndex? binaryIndex,
+        TypeResolutionContext typeResolver,
+        ImageEntry imageEntry,
+        string assemblyName,
         int methodStart,
         int methodCount,
         bool declaringIsInterface,
@@ -1815,13 +2263,26 @@ public sealed class Il2CppMetadataReader
             var returnTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + 8, 4));
             var paramStart = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + ml.ParameterStartOffset, 4));
             var genContainerIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + ml.GenericContainerIndexOffset, 4));
+            var methodIdx = ml.MethodIndexOffset >= 0 && ml.MethodIndexOffset + 4 <= ml.StructSize
+                ? BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(off + ml.MethodIndexOffset, 4))
+                : -1;
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + ml.TokenOffset, 4));
             var flags = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(off + ml.FlagsOffset, 2));
             var paramCount = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(off + ml.ParameterCountOffset, 2));
 
             var methodName = ReadStringAt(stream, index, nameIdx) ?? $"Method_{i}";
-            var returnType = ResolveTypeName(index, returnTypeIdx, includeNamespace: true);
+            var hasRet = typeResolver.TryResolveType(returnTypeIdx, out var resolvedRet);
+            var returnType = hasRet ? resolvedRet.TypeName : null;
+            var returnIsByRef = hasRet && resolvedRet.IsByRef;
             var genParams = ReadGenericParameterNames(stream, index, genContainerIdx);
+
+            ulong rva = 0;
+            ulong fileOffset = 0;
+            ulong va = 0;
+            if (binaryIndex != null)
+            {
+                binaryIndex.TryGetMethodRva(assemblyName, token, methodIdx, out rva, out fileOffset, out va);
+            }
 
             var parameters = new List<ParsedParam>(paramCount);
             if (paramCount > 0 && paramStart >= 0 && paramStart < totalParams && index.ParameterStructSize > 0)
@@ -1836,18 +2297,222 @@ public sealed class Il2CppMetadataReader
                 {
                     var pOff = p * index.ParameterStructSize;
                     var pNameIdx = BinaryPrimitives.ReadInt32LittleEndian(pBuf.AsSpan(pOff, 4));
+                    var pToken = BinaryPrimitives.ReadUInt32LittleEndian(pBuf.AsSpan(pOff + 4, 4));
                     var pTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(pBuf.AsSpan(pOff + index.ParameterStructSize - 4, 4));
                     var pName = ReadStringAt(stream, index, pNameIdx) ?? $"arg{p}";
-                    var pType = ResolveTypeName(index, pTypeIdx, includeNamespace: true);
-                    parameters.Add(new ParsedParam(p, pName, pType));
+                    var hasParamType = typeResolver.TryResolveType(pTypeIdx, out var resolvedParam);
+                    var isByRef = hasParamType && resolvedParam.IsByRef;
+                    var isReadOnly = false;
+                    if (isByRef && pToken != 0)
+                    {
+                        var pAttrs = ReadCustomAttributesForToken(stream, index, typeResolver, imageEntry, pToken);
+                        for (var a = 0; a < pAttrs.Count; a++)
+                        {
+                            if (string.Equals(pAttrs[a], "IsReadOnlyAttribute", StringComparison.Ordinal))
+                            {
+                                isReadOnly = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    parameters.Add(new ParsedParam(
+                        p,
+                        pName,
+                        hasParamType ? resolvedParam.TypeName : null,
+                        hasParamType ? resolvedParam.Attributes : (ushort)0,
+                        isByRef,
+                        isReadOnly));
                 }
             }
 
             var mods = FormatMethodModifiers(flags, declaringIsInterface);
-            results.Add(new ParsedMethod(methodName, mods, returnType, flags, token, genParams, parameters));
+            results.Add(new ParsedMethod
+            {
+                Name = methodName,
+                Modifiers = mods,
+                ReturnTypeName = returnType,
+                ReturnIsByRef = returnIsByRef,
+                Flags = flags,
+                Token = token,
+                MethodIndex = methodIdx,
+                Rva = rva,
+                FileOffset = fileOffset,
+                Va = va,
+                GenericParameters = genParams,
+                Parameters = parameters
+            });
         }
 
         return results;
+    }
+
+    private static void AssignSharedRvaAliases(List<ParsedMethod> methods)
+    {
+        if (methods.Count < 2)
+        {
+            return;
+        }
+
+        var groups = new Dictionary<ulong, List<ParsedMethod>>();
+        for (var i = 0; i < methods.Count; i++)
+        {
+            var m = methods[i];
+            if (m.Rva == 0)
+            {
+                continue;
+            }
+
+            if (!groups.TryGetValue(m.Rva, out var list))
+            {
+                list = new List<ParsedMethod>(2);
+                groups[m.Rva] = list;
+            }
+            list.Add(m);
+        }
+
+        foreach (var group in groups.Values)
+        {
+            if (group.Count <= 1)
+            {
+                continue;
+            }
+
+            var canonical = group[0];
+            var bestScore = ScoreMethodNameReadability(canonical.Name);
+            for (var i = 1; i < group.Count; i++)
+            {
+                var score = ScoreMethodNameReadability(group[i].Name);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    canonical = group[i];
+                }
+            }
+
+            var aliases = new List<string>(group.Count - 1);
+            for (var i = 0; i < group.Count; i++)
+            {
+                var member = group[i];
+                if (ReferenceEquals(member, canonical))
+                {
+                    continue;
+                }
+
+                member.IsAlias = true;
+                member.CanonicalAliasOf = canonical.Name;
+                aliases.Add(member.Name);
+            }
+
+            canonical.AliasNames = aliases;
+        }
+    }
+
+    internal static int ScoreMethodNameReadability(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return -100;
+        }
+
+        if (string.Equals(name, ".ctor", StringComparison.Ordinal)
+            || string.Equals(name, ".cctor", StringComparison.Ordinal))
+        {
+            return 100;
+        }
+
+        var hasAccessorPrefix = false;
+        var core = name;
+        if (name.StartsWith("get_", StringComparison.Ordinal)
+            || name.StartsWith("set_", StringComparison.Ordinal)
+            || name.StartsWith("add_", StringComparison.Ordinal))
+        {
+            hasAccessorPrefix = true;
+            core = name.Substring(4);
+        }
+        else if (name.StartsWith("remove_", StringComparison.Ordinal))
+        {
+            hasAccessorPrefix = true;
+            core = name.Substring(7);
+        }
+
+        var isObfuscated = IsLikelyObfuscatedIdentifier(core);
+        if (hasAccessorPrefix)
+        {
+            return isObfuscated ? 10 : 90;
+        }
+
+        if (isObfuscated)
+        {
+            return -50;
+        }
+
+        if (core is "Awake" or "Start" or "Update" or "FixedUpdate" or "LateUpdate"
+            or "OnEnable" or "OnDisable" or "OnDestroy" or "OnValidate" or "Reset"
+            or "OnApplicationQuit" or "OnTriggerEnter" or "OnCollisionEnter")
+        {
+            return 85;
+        }
+
+        var hasUpper = false;
+        var hasLower = false;
+        for (var i = 0; i < core.Length; i++)
+        {
+            var ch = core[i];
+            if (ch >= 'A' && ch <= 'Z') hasUpper = true;
+            else if (ch >= 'a' && ch <= 'z') hasLower = true;
+        }
+
+        if (hasUpper && hasLower)
+        {
+            return 70;
+        }
+
+        if (hasLower || core.Contains('_'))
+        {
+            return 50;
+        }
+
+        return 40;
+    }
+
+    internal static bool IsLikelyObfuscatedIdentifier(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            return false;
+        }
+
+        var allUpperAscii = name.Length >= 8;
+        for (var i = 0; i < name.Length; i++)
+        {
+            var ch = name[i];
+            if (ch < 0x20 || ch > 0x7E)
+            {
+                return true;
+            }
+            if (ch < 'A' || ch > 'Z')
+            {
+                allUpperAscii = false;
+            }
+        }
+
+        return allUpperAscii;
+    }
+
+    private static string FormatByRefParameterPrefix(ParsedParam param)
+    {
+        if (!param.IsByRef)
+        {
+            return string.Empty;
+        }
+
+        if (param.IsReadOnly)
+        {
+            return "in ";
+        }
+
+        return (param.Attributes & 0x0003) == 0x0002 ? "out " : "ref ";
     }
 
     private static List<ParsedProperty> ReadProperties(
@@ -1891,16 +2556,67 @@ public sealed class Il2CppMetadataReader
                 propType = setter.Parameters[^1].TypeName;
             }
 
+            var getterName = getter?.Name;
+            var setterName = setter?.Name;
+            var getterSuffix = ExtractAccessorSuffix(getterName, "get_");
+            var setterSuffix = ExtractAccessorSuffix(setterName, "set_");
+
+            string? readableAccessorName = null;
+            if (!string.IsNullOrWhiteSpace(getterSuffix) && !IsLikelyObfuscatedIdentifier(getterSuffix))
+            {
+                readableAccessorName = getterSuffix;
+            }
+            else if (!string.IsNullOrWhiteSpace(setterSuffix) && !IsLikelyObfuscatedIdentifier(setterSuffix))
+            {
+                readableAccessorName = setterSuffix;
+            }
+
+            var accessorMismatch = (!string.IsNullOrWhiteSpace(getterSuffix) && !string.Equals(getterSuffix, name, StringComparison.Ordinal))
+                || (!string.IsNullOrWhiteSpace(setterSuffix) && !string.Equals(setterSuffix, name, StringComparison.Ordinal));
+            string? accessorsAnnotation = null;
+            if (accessorMismatch)
+            {
+                var accList = new List<string>(2);
+                if (!string.IsNullOrWhiteSpace(getterName)) accList.Add(getterName);
+                if (!string.IsNullOrWhiteSpace(setterName)) accList.Add(setterName);
+                if (accList.Count > 0)
+                {
+                    accessorsAnnotation = string.Join(", ", accList);
+                }
+            }
+
             var mods = PickPropertyModifiers(getter, setter);
-            results.Add(new ParsedProperty(name, mods, propType, getIdx >= 0, setIdx >= 0, token));
+            results.Add(new ParsedProperty(
+                name,
+                mods,
+                propType,
+                getIdx >= 0,
+                setIdx >= 0,
+                token,
+                getterName,
+                setterName,
+                readableAccessorName,
+                accessorsAnnotation));
         }
 
         return results;
     }
 
+    private static string? ExtractAccessorSuffix(string? accessorName, string prefix)
+    {
+        if (string.IsNullOrWhiteSpace(accessorName) || !accessorName.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var suffix = accessorName.Substring(prefix.Length);
+        return suffix.Length > 0 ? suffix : null;
+    }
+
     private static List<ParsedEvent> ReadEvents(
         FileStream stream,
         MetadataIndex index,
+        TypeResolutionContext typeResolver,
         int eventStart,
         int eventCount,
         List<ParsedMethod> declaringMethods)
@@ -1934,7 +2650,7 @@ public sealed class Il2CppMetadataReader
             var addMethod = addIdx >= 0 && addIdx < declaringMethods.Count ? declaringMethods[addIdx] : null;
             var removeMethod = removeIdx >= 0 && removeIdx < declaringMethods.Count ? declaringMethods[removeIdx] : null;
 
-            var evType = ResolveTypeName(index, typeIdx, includeNamespace: true);
+            var evType = typeResolver.ResolveTypeName(typeIdx, includeNamespace: true);
             if (string.IsNullOrEmpty(evType) && addMethod != null && addMethod.Parameters.Count > 0)
             {
                 evType = addMethod.Parameters[0].TypeName;
@@ -1950,9 +2666,14 @@ public sealed class Il2CppMetadataReader
     private static List<ParsedField> ReadFields(
         FileStream stream,
         MetadataIndex index,
+        Il2CppBinaryIndex? binaryIndex,
+        TypeResolutionContext typeResolver,
+        ImageEntry imageEntry,
+        int typeDefIndex,
         int fieldStart,
         int fieldCount,
         bool isEnum,
+        string currentNamespace,
         List<ParsedProperty> properties,
         IReadOnlyDictionary<string, string>? fieldTypeOverrides)
     {
@@ -1971,6 +2692,7 @@ public sealed class Il2CppMetadataReader
 
         var safeCount = Math.Min(fieldCount, totalFields - fieldStart);
         var buf = ReadBytesAt(stream, index.Fields.Offset + index.BodyOffsetDelta + (long)fieldStart * fsz, safeCount * fsz, index.BodyXorKey);
+        var fieldOffsets = !isEnum ? binaryIndex?.TryGetFieldOffsets(typeDefIndex, safeCount) : null;
 
         Dictionary<string, string>? propTypes = null;
         if (!isEnum && properties.Count > 0)
@@ -1981,6 +2703,10 @@ public sealed class Il2CppMetadataReader
                 if (!string.IsNullOrEmpty(p.TypeName))
                 {
                     propTypes.TryAdd(p.Name, p.TypeName);
+                    if (!string.IsNullOrWhiteSpace(p.ReadableAccessorName))
+                    {
+                        propTypes.TryAdd(p.ReadableAccessorName, p.TypeName);
+                    }
                 }
             }
         }
@@ -1994,12 +2720,14 @@ public sealed class Il2CppMetadataReader
             var token = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off + fsz - 4, 4));
 
             var name = ReadStringAt(stream, index, nameIdx) ?? $"field_{i}";
-            var resolvedType = ResolveTypeName(index, typeIdx, includeNamespace: true);
+            var hasResolved = typeResolver.TryResolveType(typeIdx, out var resolved);
+            var resolvedType = hasResolved ? resolved.TypeName : null;
+            var fieldAttrs = hasResolved ? resolved.Attributes : (ushort)0;
             string? defaultLiteral = null;
 
             if (TryFindFieldDefaultValue(stream, index, globalFieldIndex, out var defTypeIdx, out var defDataIdx))
             {
-                var defTypeName = ResolveTypeName(index, defTypeIdx, includeNamespace: true);
+                var defTypeName = typeResolver.ResolveTypeName(defTypeIdx, includeNamespace: true);
                 if (string.IsNullOrEmpty(resolvedType) && !string.IsNullOrEmpty(defTypeName))
                 {
                     resolvedType = defTypeName;
@@ -2008,32 +2736,511 @@ public sealed class Il2CppMetadataReader
                 defaultLiteral = TryReadDefaultValueLiteral(stream, index, defTypeName, defDataIdx);
             }
 
-            // Enrich unresolved serialized field types using Unity's TypeTree when available
-            if (string.IsNullOrEmpty(resolvedType)
-                && fieldTypeOverrides != null
-                && fieldTypeOverrides.TryGetValue(name, out var typeTreeFieldType)
-                && !string.IsNullOrWhiteSpace(typeTreeFieldType))
+            // Enrich unresolved serialized field types using Unity's TypeTree when available,
+            // and flag serialized TypeTree fields even when binary resolved the type.
+            var isSerializedInTypeTree = false;
+            if (fieldTypeOverrides != null && fieldTypeOverrides.TryGetValue(name, out var typeTreeFieldType))
             {
-                resolvedType = typeTreeFieldType;
+                isSerializedInTypeTree = true;
+                if (string.IsNullOrEmpty(resolvedType) && !string.IsNullOrWhiteSpace(typeTreeFieldType))
+                {
+                    resolvedType = typeTreeFieldType;
+                }
             }
 
             // Infer compiler-generated auto-property backing field type when available
             if (string.IsNullOrEmpty(resolvedType)
                 && propTypes != null
-                && name.StartsWith('<')
-                && name.EndsWith(">k__BackingField", StringComparison.Ordinal))
+                && TryExtractBackingFieldInnerName(name, out var propName)
+                && propTypes.TryGetValue(propName, out var backingType))
             {
-                var propName = name.Substring(1, name.Length - ">k__BackingField".Length - 1);
-                if (propTypes.TryGetValue(propName, out var backingType))
-                {
-                    resolvedType = backingType;
-                }
+                resolvedType = backingType;
             }
 
-            results.Add(new ParsedField(name, resolvedType, defaultLiteral, token));
+            var isConst = (fieldAttrs & 0x0040) != 0 || !string.IsNullOrEmpty(defaultLiteral);
+            var isNotSerializedFlag = (fieldAttrs & 0x0080) != 0;
+            var modifiers = FormatFieldModifiers(fieldAttrs, isConst);
+            var fieldOffset = fieldOffsets != null && i < fieldOffsets.Length ? fieldOffsets[i] : -1;
+
+            IReadOnlyList<string> rawAttrs = !isEnum
+                ? ReadCustomAttributesForToken(stream, index, typeResolver, imageEntry, token)
+                : Array.Empty<string>();
+            var displayAttrs = FormatDisplayAttributes(rawAttrs, isNotSerializedFlag, isSerializableFlag: false);
+
+            results.Add(new ParsedField
+            {
+                Name = name,
+                Modifiers = modifiers,
+                ResolvedTypeName = resolvedType,
+                DefaultValueLiteral = defaultLiteral,
+                Token = token,
+                FieldOffset = fieldOffset,
+                IsConst = isConst,
+                IsSerializedInTypeTree = isSerializedInTypeTree,
+                DisplayAttributes = displayAttrs
+            });
+        }
+
+        if (!isEnum && results.Count > 0 && properties.Count > 0)
+        {
+            CorrelateUnambiguousBackingFields(results, properties, currentNamespace);
         }
 
         return results;
+    }
+
+    private static bool TryExtractBackingFieldInnerName(string fieldName, out string innerName)
+    {
+        const string suffix = ">k__BackingField";
+        if (fieldName.StartsWith('<')
+            && fieldName.EndsWith(suffix, StringComparison.Ordinal)
+            && fieldName.Length > suffix.Length + 1)
+        {
+            innerName = fieldName.Substring(1, fieldName.Length - suffix.Length - 1);
+            return true;
+        }
+
+        innerName = string.Empty;
+        return false;
+    }
+
+    private static void CorrelateUnambiguousBackingFields(
+        List<ParsedField> fields,
+        List<ParsedProperty> properties,
+        string currentNamespace)
+    {
+        var matchedPropIndices = new HashSet<int>();
+        var unmatchedBackingByType = new Dictionary<string, List<ParsedField>>(StringComparer.Ordinal);
+
+        for (var f = 0; f < fields.Count; f++)
+        {
+            var field = fields[f];
+            if (!TryExtractBackingFieldInnerName(field.Name, out var innerName))
+            {
+                continue;
+            }
+
+            var directMatched = false;
+            for (var p = 0; p < properties.Count; p++)
+            {
+                var prop = properties[p];
+                if (string.Equals(innerName, prop.Name, StringComparison.Ordinal)
+                    || (!string.IsNullOrWhiteSpace(prop.ReadableAccessorName)
+                        && string.Equals(innerName, prop.ReadableAccessorName, StringComparison.Ordinal)))
+                {
+                    matchedPropIndices.Add(p);
+                    directMatched = true;
+                    break;
+                }
+            }
+
+            if (directMatched || string.IsNullOrWhiteSpace(field.ResolvedTypeName))
+            {
+                continue;
+            }
+
+            var normType = FormatFriendlyTypeName(field.ResolvedTypeName, currentNamespace);
+            if (!unmatchedBackingByType.TryGetValue(normType, out var list))
+            {
+                list = new List<ParsedField>(1);
+                unmatchedBackingByType[normType] = list;
+            }
+            list.Add(field);
+        }
+
+        if (unmatchedBackingByType.Count == 0)
+        {
+            return;
+        }
+
+        var unmatchedPropsByType = new Dictionary<string, List<ParsedProperty>>(StringComparer.Ordinal);
+        for (var p = 0; p < properties.Count; p++)
+        {
+            if (matchedPropIndices.Contains(p))
+            {
+                continue;
+            }
+
+            var prop = properties[p];
+            if (string.IsNullOrWhiteSpace(prop.TypeName))
+            {
+                continue;
+            }
+
+            var normType = FormatFriendlyTypeName(prop.TypeName, currentNamespace);
+            if (!unmatchedPropsByType.TryGetValue(normType, out var list))
+            {
+                list = new List<ParsedProperty>(1);
+                unmatchedPropsByType[normType] = list;
+            }
+            list.Add(prop);
+        }
+
+        foreach (var (typeKey, backingFields) in unmatchedBackingByType)
+        {
+            if (backingFields.Count != 1
+                || !unmatchedPropsByType.TryGetValue(typeKey, out var matchingProps)
+                || matchingProps.Count != 1)
+            {
+                continue;
+            }
+
+            var prop = matchingProps[0];
+            var label = !string.IsNullOrWhiteSpace(prop.ReadableAccessorName)
+                ? prop.ReadableAccessorName
+                : prop.Name;
+            if (!string.IsNullOrWhiteSpace(label))
+            {
+                backingFields[0].BackingFieldHint = $"Backing field for {label}";
+            }
+        }
+    }
+
+    private static string FormatFieldModifiers(ushort attrs, bool isConst)
+    {
+        var parts = new List<string>(3);
+        var vis = (attrs & 0x0007) switch
+        {
+            6 => "public",
+            1 => "private",
+            4 => "protected",
+            3 => "internal",
+            5 => "protected internal",
+            2 => "private protected",
+            _ => string.Empty
+        };
+
+        if (!string.IsNullOrEmpty(vis))
+        {
+            parts.Add(vis);
+        }
+
+        if (isConst)
+        {
+            parts.Add("const");
+            return string.Join(" ", parts);
+        }
+
+        if ((attrs & 0x0010) != 0)
+        {
+            parts.Add("static");
+        }
+
+        if ((attrs & 0x0020) != 0)
+        {
+            parts.Add("readonly");
+        }
+
+        return string.Join(" ", parts);
+    }
+
+    private static List<string> ReadCustomAttributesForToken(
+        FileStream stream,
+        MetadataIndex index,
+        TypeResolutionContext typeResolver,
+        ImageEntry imageEntry,
+        uint targetToken)
+    {
+        var result = new List<string>();
+        if (targetToken == 0
+            || imageEntry.CustomAttributeStart < 0
+            || imageEntry.CustomAttributeCount <= 0
+            || index.AttributeDataOrInfo.Size <= 0
+            || index.AttributeDataRangeOrTypes.Size <= 0)
+        {
+            return result;
+        }
+
+        try
+        {
+            if (index.UsesV29CustomAttributeFormat)
+            {
+                ReadCustomAttributesV29(stream, index, imageEntry, targetToken, result);
+            }
+            else
+            {
+                ReadCustomAttributesLegacy(stream, index, typeResolver, imageEntry, targetToken, result);
+            }
+        }
+        catch
+        {
+            result.Clear();
+        }
+
+        return result;
+    }
+
+    private static void ReadCustomAttributesV29(
+        FileStream stream,
+        MetadataIndex index,
+        ImageEntry imageEntry,
+        uint targetToken,
+        List<string> results)
+    {
+        const int rangeEntrySize = 8;
+        var rangeSlice = index.AttributeDataRangeOrTypes;
+        var dataSlice = index.AttributeDataOrInfo;
+        var totalRanges = rangeSlice.Size / rangeEntrySize;
+        if (totalRanges <= 0 || imageEntry.CustomAttributeStart >= totalRanges)
+        {
+            return;
+        }
+
+        var lo = imageEntry.CustomAttributeStart;
+        var hi = Math.Min(totalRanges - 1, imageEntry.CustomAttributeStart + imageEntry.CustomAttributeCount - 1);
+        var foundIdx = -1;
+        uint startOffset = 0;
+
+        Span<byte> entry = stackalloc byte[rangeEntrySize];
+        while (lo <= hi)
+        {
+            var mid = lo + ((hi - lo) >> 1);
+            var fileOff = rangeSlice.Offset + index.BodyOffsetDelta + (long)mid * rangeEntrySize;
+            if (fileOff < 0 || fileOff + rangeEntrySize > stream.Length)
+            {
+                return;
+            }
+
+            stream.Position = fileOff;
+            if (stream.Read(entry) != rangeEntrySize)
+            {
+                return;
+            }
+            ApplyXorInPlace(entry, fileOff, index.BodyXorKey);
+
+            var token = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0, 4));
+            if (token == targetToken)
+            {
+                foundIdx = mid;
+                startOffset = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(4, 4));
+                break;
+            }
+
+            if (token < targetToken)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+
+        if (foundIdx < 0 || startOffset >= (uint)dataSlice.Size)
+        {
+            return;
+        }
+
+        uint endOffset = (uint)dataSlice.Size;
+        if (foundIdx + 1 < totalRanges)
+        {
+            var nextFileOff = rangeSlice.Offset + index.BodyOffsetDelta + (long)(foundIdx + 1) * rangeEntrySize;
+            if (nextFileOff >= 0 && nextFileOff + rangeEntrySize <= stream.Length)
+            {
+                stream.Position = nextFileOff;
+                if (stream.Read(entry) == rangeEntrySize)
+                {
+                    ApplyXorInPlace(entry, nextFileOff, index.BodyXorKey);
+                    var nextStart = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(4, 4));
+                    if (nextStart >= startOffset && nextStart <= (uint)dataSlice.Size)
+                    {
+                        endOffset = nextStart;
+                    }
+                }
+            }
+        }
+
+        if (endOffset <= startOffset)
+        {
+            return;
+        }
+
+        var readLen = (int)Math.Min(endOffset - startOffset, 256u);
+        var blob = ReadBytesAt(stream, dataSlice.Offset + index.BodyOffsetDelta + startOffset, readLen, index.BodyXorKey);
+        var pos = 0;
+        if (!TryReadCompressedUInt32(blob, ref pos, out var attrCount)
+            || attrCount == 0
+            || attrCount > 32
+            || pos + (int)attrCount * 4 > blob.Length)
+        {
+            return;
+        }
+
+        var ml = index.MethodLayout;
+        if (ml.StructSize <= 0 || index.TotalMethods <= 0)
+        {
+            return;
+        }
+
+        Span<byte> declBuf = stackalloc byte[4];
+        for (var i = 0; i < (int)attrCount; i++)
+        {
+            var ctorMethodIdx = BinaryPrimitives.ReadInt32LittleEndian(blob.AsSpan(pos + i * 4, 4));
+            if (ctorMethodIdx < 0 || ctorMethodIdx >= index.TotalMethods)
+            {
+                continue;
+            }
+
+            var methodDeclOff = index.Methods.Offset + index.BodyOffsetDelta + (long)ctorMethodIdx * ml.StructSize + 4;
+            if (methodDeclOff < 0 || methodDeclOff + 4 > stream.Length)
+            {
+                continue;
+            }
+
+            stream.Position = methodDeclOff;
+            if (stream.Read(declBuf) != 4)
+            {
+                continue;
+            }
+            ApplyXorInPlace(declBuf, methodDeclOff, index.BodyXorKey);
+
+            var declaringTd = BinaryPrimitives.ReadInt32LittleEndian(declBuf);
+            if (declaringTd >= 0 && declaringTd < index.Types.Length)
+            {
+                var attrName = index.Types[declaringTd].Name;
+                if (!string.IsNullOrWhiteSpace(attrName))
+                {
+                    results.Add(attrName);
+                }
+            }
+        }
+    }
+
+    private static void ReadCustomAttributesLegacy(
+        FileStream stream,
+        MetadataIndex index,
+        TypeResolutionContext typeResolver,
+        ImageEntry imageEntry,
+        uint targetToken,
+        List<string> results)
+    {
+        const int infoEntrySize = 12;
+        var infoSlice = index.AttributeDataOrInfo;
+        var typesSlice = index.AttributeDataRangeOrTypes;
+        var totalEntries = infoSlice.Size / infoEntrySize;
+        var totalAttrTypes = typesSlice.Size / 4;
+        if (totalEntries <= 0 || totalAttrTypes <= 0 || imageEntry.CustomAttributeStart >= totalEntries)
+        {
+            return;
+        }
+
+        var lo = imageEntry.CustomAttributeStart;
+        var hi = Math.Min(totalEntries - 1, imageEntry.CustomAttributeStart + imageEntry.CustomAttributeCount - 1);
+        var attrStart = -1;
+        var attrCount = 0;
+
+        Span<byte> entry = stackalloc byte[infoEntrySize];
+        while (lo <= hi)
+        {
+            var mid = lo + ((hi - lo) >> 1);
+            var fileOff = infoSlice.Offset + index.BodyOffsetDelta + (long)mid * infoEntrySize;
+            if (fileOff < 0 || fileOff + infoEntrySize > stream.Length)
+            {
+                return;
+            }
+
+            stream.Position = fileOff;
+            if (stream.Read(entry) != infoEntrySize)
+            {
+                return;
+            }
+            ApplyXorInPlace(entry, fileOff, index.BodyXorKey);
+
+            var token = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0, 4));
+            if (token == targetToken)
+            {
+                attrStart = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(4, 4));
+                attrCount = BinaryPrimitives.ReadInt32LittleEndian(entry.Slice(8, 4));
+                break;
+            }
+
+            if (token < targetToken)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+
+        if (attrStart < 0 || attrCount <= 0 || attrCount > 32 || attrStart + attrCount > totalAttrTypes)
+        {
+            return;
+        }
+
+        var rawTypes = ReadBytesAt(stream, typesSlice.Offset + index.BodyOffsetDelta + (long)attrStart * 4, attrCount * 4, index.BodyXorKey);
+        for (var i = 0; i < attrCount; i++)
+        {
+            var typeIdx = BinaryPrimitives.ReadInt32LittleEndian(rawTypes.AsSpan(i * 4, 4));
+            var simpleName = typeResolver.ResolveTypeName(typeIdx, includeNamespace: false);
+            if (!string.IsNullOrWhiteSpace(simpleName))
+            {
+                results.Add(simpleName);
+            }
+        }
+    }
+
+    private static List<string> FormatDisplayAttributes(
+        IReadOnlyList<string> rawAttributes,
+        bool isNotSerializedFlag,
+        bool isSerializableFlag)
+    {
+        var formatted = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        void TryAdd(string displayName)
+        {
+            if (formatted.Count < 8 && !string.IsNullOrWhiteSpace(displayName) && seen.Add(displayName))
+            {
+                formatted.Add(displayName);
+            }
+        }
+
+        if (isSerializableFlag)
+        {
+            TryAdd("Serializable");
+        }
+
+        for (var i = 0; i < rawAttributes.Count; i++)
+        {
+            var raw = rawAttributes[i];
+            if (string.IsNullOrWhiteSpace(raw) || IsNoisyCompilerAttribute(raw))
+            {
+                continue;
+            }
+
+            var clean = raw.EndsWith("Attribute", StringComparison.Ordinal) && raw.Length > "Attribute".Length
+                ? raw.Substring(0, raw.Length - "Attribute".Length)
+                : raw;
+            TryAdd(clean);
+        }
+
+        if (isNotSerializedFlag)
+        {
+            TryAdd("NonSerialized");
+        }
+
+        return formatted;
+    }
+
+    private static bool IsNoisyCompilerAttribute(string rawName)
+    {
+        return rawName is "NullableAttribute"
+            or "NullableContextAttribute"
+            or "IsReadOnlyAttribute"
+            or "IteratorStateMachineAttribute"
+            or "AsyncStateMachineAttribute"
+            or "DebuggerHiddenAttribute"
+            or "DebuggerBrowsableAttribute"
+            or "DebuggerStepThroughAttribute"
+            or "ParamArrayAttribute"
+            or "DefaultMemberAttribute"
+            or "ExtensionAttribute"
+            or "RefSafetyRulesAttribute"
+            or "EmbeddedAttribute"
+            or "TupleElementNamesAttribute"
+            or "DynamicAttribute";
     }
 
     private static bool TryFindFieldDefaultValue(
@@ -2234,6 +3441,7 @@ public sealed class Il2CppMetadataReader
     private static List<string> ReadInterfaceNames(
         FileStream stream,
         MetadataIndex index,
+        TypeResolutionContext typeResolver,
         int interfacesStart,
         int interfacesCount)
     {
@@ -2254,7 +3462,7 @@ public sealed class Il2CppMetadataReader
         for (var i = 0; i < safeCount; i++)
         {
             var ifaceTypeIdx = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(i * 4, 4));
-            var name = ResolveTypeName(index, ifaceTypeIdx, includeNamespace: true);
+            var name = typeResolver.ResolveTypeName(ifaceTypeIdx, includeNamespace: true);
             if (!string.IsNullOrWhiteSpace(name))
             {
                 results.Add(name);
@@ -2298,21 +3506,6 @@ public sealed class Il2CppMetadataReader
         }
 
         return results;
-    }
-
-    private static string? ResolveTypeName(MetadataIndex index, int typeIndex, bool includeNamespace)
-    {
-        if (typeIndex < 0 || !index.ByvalTypeToTypeDef.TryGetValue(typeIndex, out var tdIdx))
-        {
-            return null;
-        }
-
-        var summary = index.Types[tdIdx];
-        var fullName = !string.IsNullOrWhiteSpace(summary.Namespace)
-            ? $"{summary.Namespace}.{summary.Name}"
-            : summary.Name;
-
-        return includeNamespace ? fullName : summary.Name;
     }
 
     private static string FormatTypeModifiers(uint flags, bool isInterface, bool isValueType, bool isEnum)
@@ -2444,6 +3637,74 @@ public sealed class Il2CppMetadataReader
 
     private static string FormatFriendlyTypeName(string fullName, string currentNamespace)
     {
+        if (string.IsNullOrWhiteSpace(fullName))
+        {
+            return fullName;
+        }
+
+        // Peel trailing pointer/nullable/array suffixes recursively
+        if (fullName.EndsWith('*') || fullName.EndsWith('?'))
+        {
+            var suffix = fullName[^1];
+            return FormatFriendlyTypeName(fullName.Substring(0, fullName.Length - 1), currentNamespace) + suffix;
+        }
+
+        if (fullName.EndsWith(']'))
+        {
+            var openBracket = fullName.LastIndexOf('[');
+            if (openBracket > 0)
+            {
+                var arrSuffix = fullName.Substring(openBracket);
+                var validArr = true;
+                for (var i = 1; i < arrSuffix.Length - 1; i++)
+                {
+                    if (arrSuffix[i] != ',')
+                    {
+                        validArr = false;
+                        break;
+                    }
+                }
+
+                if (validArr)
+                {
+                    return FormatFriendlyTypeName(fullName.Substring(0, openBracket), currentNamespace) + arrSuffix;
+                }
+            }
+        }
+
+        // Handle generic instantiations recursively, including nested tails like Dictionary<string, int>.Enumerator
+        var openAngle = fullName.IndexOf('<');
+        if (openAngle > 0)
+        {
+            var closeAngle = FindMatchingAngleBracket(fullName, openAngle);
+            if (closeAngle > openAngle)
+            {
+                var basePart = fullName.Substring(0, openAngle);
+                var argsPart = fullName.Substring(openAngle + 1, closeAngle - openAngle - 1);
+                var tailPart = closeAngle + 1 < fullName.Length ? fullName.Substring(closeAngle + 1) : string.Empty;
+
+                var rawArgs = SplitTopLevelGenericArgs(argsPart);
+                var formattedArgs = new string[rawArgs.Count];
+                for (var i = 0; i < rawArgs.Count; i++)
+                {
+                    formattedArgs[i] = FormatFriendlyTypeName(rawArgs[i], currentNamespace);
+                }
+
+                if (string.IsNullOrEmpty(tailPart)
+                    && formattedArgs.Length == 1
+                    && string.Equals(basePart, "System.Nullable", StringComparison.Ordinal))
+                {
+                    return $"{formattedArgs[0]}?";
+                }
+
+                var cleanBase = SimplifyGenericBaseName(basePart, currentNamespace);
+                var formattedTail = !string.IsNullOrEmpty(tailPart) && tailPart.StartsWith('.') && tailPart.Contains('<')
+                    ? "." + FormatFriendlyTypeName(tailPart.Substring(1), currentNamespace)
+                    : tailPart;
+                return $"{cleanBase}<{string.Join(", ", formattedArgs)}>{formattedTail}";
+            }
+        }
+
         return fullName switch
         {
             "System.Void" => "void",
@@ -2462,8 +3723,73 @@ public sealed class Il2CppMetadataReader
             "System.Char" => "char",
             "System.String" => "string",
             "System.Object" => "object",
+            "System.Action" => "Action",
             _ => StripMatchingNamespace(fullName, currentNamespace)
         };
+    }
+
+    private static string SimplifyGenericBaseName(string baseName, string currentNamespace)
+    {
+        const string scgPrefix = "System.Collections.Generic.";
+        if (baseName.StartsWith(scgPrefix, StringComparison.Ordinal))
+        {
+            return baseName.Substring(scgPrefix.Length);
+        }
+
+        if (baseName is "System.Action" or "System.Func" or "System.EventHandler" or "System.Comparison" or "System.Predicate" or "System.Span" or "System.ReadOnlySpan" or "System.Memory" or "System.ReadOnlyMemory")
+        {
+            return baseName.Substring("System.".Length);
+        }
+
+        if (baseName is "System.Threading.Tasks.Task" or "System.Threading.Tasks.ValueTask")
+        {
+            return baseName.Substring("System.Threading.Tasks.".Length);
+        }
+
+        return StripMatchingNamespace(baseName, currentNamespace);
+    }
+
+    private static int FindMatchingAngleBracket(string text, int openIndex)
+    {
+        var depth = 0;
+        for (var i = openIndex; i < text.Length; i++)
+        {
+            if (text[i] == '<') depth++;
+            else if (text[i] == '>')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static List<string> SplitTopLevelGenericArgs(string argsPart)
+    {
+        var result = new List<string>(2);
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < argsPart.Length; i++)
+        {
+            var ch = argsPart[i];
+            if (ch == '<') depth++;
+            else if (ch == '>') depth--;
+            else if (ch == ',' && depth == 0)
+            {
+                result.Add(argsPart.Substring(start, i - start).Trim());
+                start = i + 1;
+            }
+        }
+
+        if (start < argsPart.Length)
+        {
+            result.Add(argsPart.Substring(start).Trim());
+        }
+
+        return result;
     }
 
     private static string StripMatchingNamespace(string fullName, string currentNamespace)

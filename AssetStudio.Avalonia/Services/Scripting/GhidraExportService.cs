@@ -221,17 +221,39 @@ public sealed class GhidraExportService
         else
         {
             writer.WriteStartArray("methods");
-            var seenRva = new HashSet<ulong>();
             if (options.SelectedClassMethods != null)
             {
+                var bestByRva = new Dictionary<ulong, (ScriptMethodSymbol Symbol, int Score, int Order)>();
+                var order = 0;
                 foreach (var method in options.SelectedClassMethods)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (method.Address == 0 || !seenRva.Add(method.Address))
+                    if (method.Address == 0)
                     {
                         continue;
                     }
 
+                    var score = ScoreSymbolReadability(method);
+                    if (!bestByRva.TryGetValue(method.Address, out var existing))
+                    {
+                        bestByRva[method.Address] = (method, score, order++);
+                    }
+                    else if (score > existing.Score)
+                    {
+                        bestByRva[method.Address] = (method, score, existing.Order);
+                    }
+                }
+
+                var ordered = new List<(ScriptMethodSymbol Symbol, int Order)>(bestByRva.Count);
+                foreach (var entry in bestByRva.Values)
+                {
+                    ordered.Add((entry.Symbol, entry.Order));
+                }
+                ordered.Sort(static (a, b) => a.Order.CompareTo(b.Order));
+
+                foreach (var (method, _) in ordered)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var symName = !string.IsNullOrWhiteSpace(method.FullName)
                         ? method.FullName
                         : (!string.IsNullOrWhiteSpace(method.ClassName) ? $"{method.ClassName}$${method.MethodName}" : method.MethodName);
@@ -477,6 +499,18 @@ if __name__ == "__main__":
             sb.AppendLine("project without script.json / dump.cs RVAs). Mono scripts are already decompiled to C#.");
         }
         return sb.ToString();
+    }
+
+    private static int ScoreSymbolReadability(ScriptMethodSymbol symbol)
+    {
+        var methodName = symbol.MethodName;
+        if (string.IsNullOrWhiteSpace(methodName) && !string.IsNullOrWhiteSpace(symbol.FullName))
+        {
+            var sep = symbol.FullName.LastIndexOf("$$", StringComparison.Ordinal);
+            methodName = sep >= 0 ? symbol.FullName.Substring(sep + 2) : symbol.FullName;
+        }
+
+        return Il2CppMetadataReader.ScoreMethodNameReadability(methodName ?? string.Empty);
     }
 
     private static string SanitizeFileName(string name)

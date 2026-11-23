@@ -1335,6 +1335,1147 @@ namespace Demo
             File.WriteAllBytes(path, outMs.ToArray());
         }
 
+        [Fact]
+        public void Il2CppBinaryAndMetadata_Pe64V31_ResolvesAllTypeKindsModifiersOffsetsRvasAliasesAndGhidraExport()
+        {
+            var tempRoot = CreateTempDirectory();
+            try
+            {
+                var gameRoot = Path.Combine(tempRoot, "SyntheticV31Game");
+                var metaDir = Path.Combine(gameRoot, "SyntheticV31Game_Data", "il2cpp_data", "Metadata");
+                Directory.CreateDirectory(metaDir);
+
+                var metadataPath = Path.Combine(metaDir, "global-metadata.dat");
+                var binaryPath = Path.Combine(gameRoot, "GameAssembly.dll");
+                WriteRichSyntheticIl2CppFixture(metadataPath, binaryPath, SyntheticBinaryKind.Pe64V31);
+
+                var typeTree = new TypeTree
+                {
+                    m_Nodes = new List<TypeTreeNode>
+                    {
+                        new("MonoBehaviour", "Base", 0, false),
+                        new("PPtr<GameObject>", "m_GameObject", 1, false),
+                        new("UInt8", "m_Enabled", 1, true),
+                        new("PPtr<MonoScript>", "m_Script", 1, false),
+                        new("string", "m_Name", 1, true),
+                        new("vector", "m_boneHideList", 1, false),
+                        new("Array", "Array", 2, false) { m_TypeFlags = 1 },
+                        new("int", "size", 3, false),
+                        new("string", "data", 3, true)
+                    }
+                };
+
+                using var viewer = new ScriptViewerService();
+                var result = viewer.ResolveScript(new ScriptLookupRequest
+                {
+                    AssemblyName = "Gameplay.Framework.dll",
+                    Namespace = string.Empty,
+                    ClassName = "RigScaleControl`1",
+                    ProjectRoot = gameRoot,
+                    ScriptingBackend = UnityScriptingBackend.Il2Cpp,
+                    FallbackTypeTree = typeTree
+                });
+
+                Assert.True(result.Success, result.DiagnosticMessage);
+                Assert.Equal(ScriptSourceKind.Il2CppGlobalMetadata, result.SourceKind);
+                Assert.Equal("IL2CPP (metadata v31 + binary)", result.BackendBadge);
+                Assert.Contains("// Source: IL2CPP Metadata v31 + Native Binary", result.SourceCode, StringComparison.Ordinal);
+
+                // Zero unresolved placeholders
+                Assert.DoesNotContain("/* field */", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("/* prop */", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("/* param */", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("/* return */", result.SourceCode, StringComparison.Ordinal);
+
+                // Field types, modifiers, offsets, custom attributes, TypeTree & backing-field correlation
+                Assert.Contains("private const int MAX_BONES = 300; // Token: 0x04000001", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("static const", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("[SerializeField]", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public List<string> m_boneHideList; // Offset: 0x20 | Token: 0x04000002 | Serialized (TypeTree)", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private Dictionary<string, int> <HIFGJNOCGMD>k__BackingField; // Offset: 0x28 | Token: 0x04000003 | Backing field for BoneNameList", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private bool[] m_flags; // Offset: 0x30 | Token: 0x04000004", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private static readonly float[,] s_matrix; // Offset: 0x0 | Token: 0x04000005", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("[NonSerialized]", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("protected internal byte* m_rawPtr; // Offset: 0x38 | Token: 0x04000006", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private Dictionary<string, List<int>> m_nestedMap; // Offset: 0x40 | Token: 0x04000007", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private Label.UnitTypeID m_unitId; // Offset: 0x48 | Token: 0x04000008", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private int? m_optCount; // Offset: 0x50 | Token: 0x04000009", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private TState m_state; // Offset: 0x58 | Token: 0x0400000A", result.SourceCode, StringComparison.Ordinal);
+
+                // Property accessor correlation for obfuscated property name
+                Assert.Contains("public Dictionary<string, int> LIGFLDKFOLA { get; set; } // Token: 0x17000001 | Accessors: get_BoneNameList, set_BoneNameList", result.SourceCode, StringComparison.Ordinal);
+
+                // Methods: RVAs, VAR/MVAR, BYREF (out / ref / in), CMOD_OPT stripping, abstract zero-RVA omission
+                Assert.Contains("// RVA: 0x00001020 | Offset: 0x00000420 | VA: 0x180001020", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public Dictionary<string, int> get_BoneNameList();", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public bool TryLookup<TResult>(string key, out int value, ref float scale, in string tag, TResult fallback);", result.SourceCode, StringComparison.Ordinal);
+
+                // Shared-RVA alias canonicalization: set_BoneNameList wins over earlier obfuscated aliases!
+                Assert.Contains("// RVA: 0x00001060 | Offset: 0x00000460 | VA: 0x180001060", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("// Aliases (2): ECLJAGIGDDM, KGPKONNLLPK", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("// RVA: 0x00001060 (alias of set_BoneNameList)", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public void set_BoneNameList(Dictionary<string, int> value);", result.SourceCode, StringComparison.Ordinal);
+
+                // Abstract method with 0 pointer emits NO RVA comment above it
+                var abstractIdx = result.SourceCode.IndexOf("public abstract void AbstractHook();", StringComparison.Ordinal);
+                Assert.True(abstractIdx > 0);
+                var lineBeforeAbstract = result.SourceCode.Substring(Math.Max(0, abstractIdx - 80), Math.Min(80, abstractIdx));
+                Assert.DoesNotContain("RVA: 0x00000000", lineBeforeAbstract, StringComparison.Ordinal);
+
+                // MethodSymbols populated directly without external script.json, canonical readable symbol wins!
+                Assert.NotEmpty(result.MethodSymbols);
+                var sharedSym = Assert.Single(result.MethodSymbols, m => m.Address == 0x1060);
+                Assert.Equal("set_BoneNameList", sharedSym.MethodName);
+                Assert.Equal("RigScaleControl`1$$set_BoneNameList", sharedSym.FullName);
+
+                // GhidraExportService also picks canonical readable symbol even if aliases arrive first
+                var ghidraDir = Path.Combine(tempRoot, "ghidra_out");
+                var exporter = new GhidraExportService();
+                var ghidraRes = exporter.Export(new GhidraExportOptions
+                {
+                    OutputDirectory = ghidraDir,
+                    Scope = GhidraExportScope.SelectedClass,
+                    BinaryName = "GameAssembly.dll",
+                    BackendLabel = result.BackendBadge,
+                    ClassTitle = result.Title,
+                    SelectedClassMethods = new[]
+                    {
+                        new ScriptMethodSymbol { ClassName = "RigScaleControl", MethodName = "ECLJAGIGDDM", FullName = "RigScaleControl$$ECLJAGIGDDM", Address = 0x1060 },
+                        new ScriptMethodSymbol { ClassName = "RigScaleControl", MethodName = "set_BoneNameList", FullName = "RigScaleControl$$set_BoneNameList", Address = 0x1060 }
+                    }
+                });
+                Assert.True(ghidraRes.Success, ghidraRes.ErrorMessage);
+                Assert.Equal(1, ghidraRes.MethodCount);
+                using var doc = JsonDocument.Parse(File.ReadAllText(ghidraRes.SymbolsJsonPath));
+                Assert.Equal("RigScaleControl$$set_BoneNameList", doc.RootElement.GetProperty("methods")[0].GetProperty("name").GetString());
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void Il2CppBinaryAndMetadata_Pe32V24Legacy_AutoDetectsBit30ByrefV24GenericClassAndFlatMethodPointers()
+        {
+            var tempRoot = CreateTempDirectory();
+            try
+            {
+                var metadataPath = Path.Combine(tempRoot, "global-metadata.dat");
+                var binaryPath = Path.Combine(tempRoot, "GameAssembly.dll");
+                WriteRichSyntheticIl2CppFixture(metadataPath, binaryPath, SyntheticBinaryKind.Pe32V24Legacy);
+
+                var reader = new Il2CppMetadataReader();
+                var result = reader.TryExtractType(
+                    metadataPath,
+                    new ScriptLookupRequest
+                    {
+                        AssemblyName = "Gameplay.Framework.dll",
+                        ClassName = "RigScaleControl`1",
+                        GameAssemblyPath = binaryPath
+                    });
+
+                Assert.NotNull(result);
+                Assert.True(result!.Success);
+                Assert.Equal("IL2CPP (metadata v24 + binary)", result.BackendBadge);
+                Assert.Contains("public List<string> m_boneHideList; // Offset: 0x14 | Token: 0x04000002", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private Dictionary<string, int> <HIFGJNOCGMD>k__BackingField; // Offset: 0x18 | Token: 0x04000003", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public bool TryLookup<TResult>(string key, out int value, ref float scale, in string tag, TResult fallback);", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("// RVA: 0x00001020 | Offset: 0x00000420 | VA: 0x10001020", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("// RVA: 0x00001060 | Offset: 0x00000460 | VA: 0x10001060", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains(result.MethodSymbols, m => m.MethodName == "set_BoneNameList" && m.Address == 0x1060);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void Il2CppBinaryAndMetadata_Elf64AArch64WithRelaRelocations_ResolvesTypesOffsetsAndRvas(bool stripSectionHeaders)
+        {
+            var tempRoot = CreateTempDirectory();
+            try
+            {
+                // Android APK-style layout: assets/bin/Data/Managed/Metadata/global-metadata.dat + lib/arm64-v8a/libil2cpp.so
+                var apkRoot = Path.Combine(tempRoot, "AndroidSample");
+                var metaDir = Path.Combine(apkRoot, "assets", "bin", "Data", "Managed", "Metadata");
+                var libDir = Path.Combine(apkRoot, "lib", "arm64-v8a");
+                Directory.CreateDirectory(metaDir);
+                Directory.CreateDirectory(libDir);
+
+                var metadataPath = Path.Combine(metaDir, "global-metadata.dat");
+                var binaryPath = Path.Combine(libDir, "libil2cpp.so");
+                WriteRichSyntheticIl2CppFixture(
+                    metadataPath,
+                    binaryPath,
+                    stripSectionHeaders ? SyntheticBinaryKind.Elf64V31Stripped : SyntheticBinaryKind.Elf64V31);
+
+                // Verify ancestor discovery from global-metadata.dat locates lib/arm64-v8a/libil2cpp.so automatically!
+                var discovered = ScriptSourceDiscovery.Discover(projectRoot: null, globalMetadataPath: metadataPath);
+                Assert.Equal(Path.GetFullPath(binaryPath), discovered.GameAssemblyPath);
+
+                using var viewer = new ScriptViewerService();
+                var result = viewer.ResolveScript(new ScriptLookupRequest
+                {
+                    AssemblyName = "Gameplay.Framework.dll",
+                    ClassName = "RigScaleControl`1",
+                    GlobalMetadataPath = metadataPath,
+                    ScriptingBackend = UnityScriptingBackend.Il2Cpp
+                });
+
+                Assert.True(result.Success, result.DiagnosticMessage);
+                Assert.Equal("IL2CPP (metadata v31 + binary)", result.BackendBadge);
+                Assert.DoesNotContain("/* field */", result.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("/* prop */", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public List<string> m_boneHideList; // Offset: 0x20 | Token: 0x04000002", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("private Dictionary<string, List<int>> m_nestedMap; // Offset: 0x40 | Token: 0x04000007", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("public bool TryLookup<TResult>(string key, out int value, ref float scale, in string tag, TResult fallback);", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("// RVA: 0x00001060 | Offset: 0x00001060 | VA: 0x1060", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains("// Aliases (2): ECLJAGIGDDM, KGPKONNLLPK", result.SourceCode, StringComparison.Ordinal);
+                Assert.Contains(result.MethodSymbols, m => m.MethodName == "set_BoneNameList" && m.Address == 0x1060);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        [Fact]
+        public void Il2CppMetadataReader_FallsBackGracefully_WhenNativeBinaryIsMissingOrCorrupt()
+        {
+            var tempRoot = CreateTempDirectory();
+            try
+            {
+                var metadataPath = Path.Combine(tempRoot, "global-metadata.dat");
+                WriteSyntheticIl2CppMetadata(metadataPath, version: 31);
+
+                var corruptBin = Path.Combine(tempRoot, "GameAssembly.dll");
+                File.WriteAllBytes(corruptBin, Encoding.ASCII.GetBytes("MZ_NOT_A_VALID_PE_OR_ELF_BINARY_BYTES_0123456789ABCDEF0123456789ABCDEF"));
+
+                var reader = new Il2CppMetadataReader();
+                var withCorrupt = reader.TryExtractType(
+                    metadataPath,
+                    new ScriptLookupRequest
+                    {
+                        AssemblyName = "Assembly-CSharp.dll",
+                        Namespace = "Demo.Gameplay",
+                        ClassName = "InventoryBag`1",
+                        GameAssemblyPath = corruptBin
+                    });
+
+                Assert.NotNull(withCorrupt);
+                Assert.True(withCorrupt!.Success);
+                Assert.Equal("IL2CPP (metadata v31)", withCorrupt.BackendBadge);
+                Assert.Contains("// Source: IL2CPP Metadata v31", withCorrupt.SourceCode, StringComparison.Ordinal);
+                Assert.DoesNotContain("+ Native Binary", withCorrupt.SourceCode, StringComparison.Ordinal);
+                Assert.Empty(withCorrupt.MethodSymbols);
+
+                var withMissing = reader.TryExtractType(
+                    metadataPath,
+                    new ScriptLookupRequest
+                    {
+                        AssemblyName = "Assembly-CSharp.dll",
+                        Namespace = "Demo.Gameplay",
+                        ClassName = "InventoryBag`1",
+                        GameAssemblyPath = Path.Combine(tempRoot, "MissingBinary.dll")
+                    });
+
+                Assert.NotNull(withMissing);
+                Assert.True(withMissing!.Success);
+                Assert.Equal("IL2CPP (metadata v31)", withMissing.BackendBadge);
+
+                // Nested build layout: closest GameAssembly.dll to global-metadata.dat wins over stale root binary
+                var nestedRoot = Path.Combine(tempRoot, "MultiBuildRoot");
+                var subBuild = Path.Combine(nestedRoot, "BuildV2");
+                var subMetaDir = Path.Combine(subBuild, "Demo_Data", "il2cpp_data", "Metadata");
+                Directory.CreateDirectory(subMetaDir);
+                WriteMinimalNativePeDll(Path.Combine(nestedRoot, "GameAssembly.dll"));
+                var subBin = Path.Combine(subBuild, "GameAssembly.dll");
+                WriteMinimalNativePeDll(subBin);
+                var subMeta = Path.Combine(subMetaDir, "global-metadata.dat");
+                WriteSyntheticIl2CppMetadata(subMeta, version: 31);
+
+                var nestedDiscovered = ScriptSourceDiscovery.Discover(projectRoot: nestedRoot);
+                Assert.Equal(Path.GetFullPath(subBin), nestedDiscovered.GameAssemblyPath);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
+        private enum SyntheticBinaryKind
+        {
+            Pe64V31,
+            Pe32V24Legacy,
+            Elf64V31,
+            Elf64V31Stripped
+        }
+
+        private static void WriteRichSyntheticIl2CppFixture(string metadataPath, string binaryPath, SyntheticBinaryKind kind)
+        {
+            var isV24 = kind == SyntheticBinaryKind.Pe32V24Legacy;
+            var is64 = kind != SyntheticBinaryKind.Pe32V24Legacy;
+            var isElf = kind is SyntheticBinaryKind.Elf64V31 or SyntheticBinaryKind.Elf64V31Stripped;
+            var stripSh = kind == SyntheticBinaryKind.Elf64V31Stripped;
+            var version = isV24 ? 24 : 31;
+
+            // --- 1. Build synthetic global-metadata.dat ---
+            var stringPool = new MemoryStream();
+            var stringOffsets = new Dictionary<string, int>(StringComparer.Ordinal);
+            int AddStr(string s)
+            {
+                if (stringOffsets.TryGetValue(s, out var existing))
+                {
+                    return existing;
+                }
+                var offset = (int)stringPool.Position;
+                var utf8 = Encoding.UTF8.GetBytes(s);
+                stringPool.Write(utf8, 0, utf8.Length);
+                stringPool.WriteByte(0);
+                stringOffsets[s] = offset;
+                return offset;
+            }
+
+            var sEmpty = AddStr(string.Empty);
+            var sModule = AddStr("<Module>");
+            var sMscorlibDll = AddStr("mscorlib.dll");
+            var sGameDll = AddStr("Gameplay.Framework.dll");
+            var sSystem = AddStr("System");
+            var sScg = AddStr("System.Collections.Generic");
+            var sCompilerSvc = AddStr("System.Runtime.CompilerServices");
+            var sUnityEngine = AddStr("UnityEngine");
+            var sObject = AddStr("Object");
+            var sVoid = AddStr("Void");
+            var sBoolean = AddStr("Boolean");
+            var sByte = AddStr("Byte");
+            var sInt32 = AddStr("Int32");
+            var sSingle = AddStr("Single");
+            var sString = AddStr("String");
+            var sList1 = AddStr("List`1");
+            var sDict2 = AddStr("Dictionary`2");
+            var sNullable1 = AddStr("Nullable`1");
+            var sSerializeField = AddStr("SerializeField");
+            var sIsReadOnlyAttr = AddStr("IsReadOnlyAttribute");
+            var sMonoBehaviour = AddStr("MonoBehaviour");
+            var sLabel = AddStr("Label");
+            var sUnitTypeID = AddStr("UnitTypeID");
+            var sRigCtrl = AddStr("RigScaleControl`1");
+            var sTState = AddStr("TState");
+            var sTResult = AddStr("TResult");
+            var sCtor = AddStr(".ctor");
+
+            var sMaxBones = AddStr("MAX_BONES");
+            var sBoneHideList = AddStr("m_boneHideList");
+            var sBackingDict = AddStr("<HIFGJNOCGMD>k__BackingField");
+            var sFlags = AddStr("m_flags");
+            var sMatrix = AddStr("s_matrix");
+            var sRawPtr = AddStr("m_rawPtr");
+            var sNestedMap = AddStr("m_nestedMap");
+            var sUnitId = AddStr("m_unitId");
+            var sOptCount = AddStr("m_optCount");
+            var sStateField = AddStr("m_state");
+
+            var sObfProp = AddStr("LIGFLDKFOLA");
+            var sGetBoneNameList = AddStr("get_BoneNameList");
+            var sObfAlias1 = AddStr("ECLJAGIGDDM");
+            var sObfAlias2 = AddStr("KGPKONNLLPK");
+            var sSetBoneNameList = AddStr("set_BoneNameList");
+            var sTryLookup = AddStr("TryLookup");
+            var sAbstractHook = AddStr("AbstractHook");
+
+            var sPValue = AddStr("value");
+            var sPKey = AddStr("key");
+            var sPScale = AddStr("scale");
+            var sPTag = AddStr("tag");
+            var sPFallback = AddStr("fallback");
+
+            // TypeDefs (16 total):
+            // 0:<Module>, 1:System.Object, 2:System.Void, 3:System.Boolean, 4:System.Byte,
+            // 5:System.Int32, 6:System.Single, 7:System.String,
+            // 8:System.Collections.Generic.List`1, 9:System.Collections.Generic.Dictionary`2,
+            // 10:System.Nullable`1, 11:UnityEngine.SerializeField, 12:System.Runtime.CompilerServices.IsReadOnlyAttribute,
+            // 13:UnityEngine.MonoBehaviour, 14:Label, 15:Label.UnitTypeID, 16:RigScaleControl`1
+            const int TotalTypes = 17;
+            // Compact byvalTypeIndex = TypeDefIndex (0..16), plus extra complex/field/param type indices 17..35
+            const int TyObject = 1;
+            const int TyVoid = 2;
+            const int TyBool = 3;
+            const int TyByte = 4;
+            const int TyInt32 = 5;
+            const int TySingle = 6;
+            const int TyString = 7;
+            const int TyList1 = 8;
+            const int TyDict2 = 9;
+            const int TyNullable1 = 10;
+            const int TySerializeField = 11;
+            const int TyIsReadOnlyAttr = 12;
+            const int TyMonoBehaviour = 13;
+            const int TyLabel = 14;
+            const int TyUnitTypeID = 15;
+            const int TyRigCtrl = 16;
+
+            // Extra Il2CppType table indices (17..35) resolved ONLY from native binary:
+            const int TyConstPrivateInt = 17;        // I4, attrs=0x8051 (private static literal hasDefault)
+            const int TyPublicListString = 18;       // GENERICINST List<string>, attrs=0x0006 (public)
+            const int TyPrivateDictStrInt = 19;      // GENERICINST Dict<string,int>, attrs=0x0001 (private)
+            const int TyPrivateBoolArray = 20;       // SZARRAY bool[], attrs=0x0001 (private)
+            const int TyPrivStatRoFloat2D = 21;      // ARRAY float[,], attrs=0x0031 (private static readonly)
+            const int TyProtIntNotSerBytePtr = 22;   // PTR byte*, attrs=0x0085 (protected internal NotSerialized)
+            const int TyPrivateNestedDict = 23;      // GENERICINST Dict<string, List<int>>, attrs=0x0001
+            const int TyPrivateUnitTypeID = 24;      // VALUETYPE Label.UnitTypeID, attrs=0x0001
+            const int TyPrivateNullableInt = 25;     // GENERICINST Nullable<int>, attrs=0x0001
+            const int TyPrivateVarTState = 26;       // VAR TState (gp=0), attrs=0x0001
+            const int TyDictStrIntParam = 27;        // GENERICINST Dict<string,int>, attrs=0
+            const int TyOutIntParam = 28;            // I4, byref=1, attrs=0x0002 (Out)
+            const int TyRefFloatParam = 29;          // R4, byref=1, attrs=0x0000
+            const int TyInStringParam = 30;          // STRING, byref=1, attrs=0x0001 (+ IsReadOnlyAttribute on param)
+            const int TyMvarTResult = 31;            // MVAR TResult (gp=1), attrs=0
+            const int TyCmodStringParam = 32;        // CMOD_OPT -> STRING
+            const int TotalBinaryTypes = 33;
+
+            var tdSize = isV24 ? 104 : 88;
+            var methodSize = isV24 ? 56 : 36;
+            var fieldSize = isV24 ? 16 : 12;
+            var paramSize = isV24 ? 16 : 12;
+            var propSize = isV24 ? 24 : 20;
+            var imgSize = 40;
+            var pairCount = isV24 ? 33 : 31;
+            var headerSize = 8 + pairCount * 8;
+
+            // DefaultValueData: 300 for MAX_BONES
+            var defDataMs = new MemoryStream();
+            if (version >= 29)
+            {
+                uint enc = 300u << 1; // 600 = 0x0258 -> 2-byte compressed uint32: 0x82, 0x58
+                defDataMs.WriteByte((byte)(0x80 | (enc >> 8)));
+                defDataMs.WriteByte((byte)(enc & 0xFF));
+            }
+            else
+            {
+                Span<byte> tmp = stackalloc byte[4];
+                BinaryPrimitives.WriteInt32LittleEndian(tmp, 300);
+                defDataMs.Write(tmp);
+            }
+
+            // Fields on RigScaleControl`1 (10 fields):
+            var fieldsMs = new MemoryStream();
+            void WriteField(int nameIdx, int typeIdx, uint token)
+            {
+                var buf = new byte[fieldSize];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), nameIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(4, 4), typeIdx);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(fieldSize - 4, 4), token);
+                fieldsMs.Write(buf);
+            }
+            WriteField(sMaxBones, TyConstPrivateInt, 0x04000001);
+            WriteField(sBoneHideList, TyPublicListString, 0x04000002);
+            WriteField(sBackingDict, TyPrivateDictStrInt, 0x04000003);
+            WriteField(sFlags, TyPrivateBoolArray, 0x04000004);
+            WriteField(sMatrix, TyPrivStatRoFloat2D, 0x04000005);
+            WriteField(sRawPtr, TyProtIntNotSerBytePtr, 0x04000006);
+            WriteField(sNestedMap, TyPrivateNestedDict, 0x04000007);
+            WriteField(sUnitId, TyPrivateUnitTypeID, 0x04000008);
+            WriteField(sOptCount, TyPrivateNullableInt, 0x04000009);
+            WriteField(sStateField, TyPrivateVarTState, 0x0400000A);
+
+            var fdvMs = new MemoryStream();
+            {
+                Span<byte> buf = stackalloc byte[12];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(0, 4), 0); // field 0
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(4, 4), TyInt32);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(8, 4), 0);
+                fdvMs.Write(buf);
+            }
+
+            // Parameters:
+            // [0] value (Dict<string,int>) for ECLJAGIGDDM
+            // [1] value (Dict<string,int>) for KGPKONNLLPK
+            // [2] value (Dict<string,int>) for set_BoneNameList
+            // [3] key (CMOD_OPT->string), [4] value (out int), [5] scale (ref float), [6] tag (in string), [7] fallback (TResult) for TryLookup
+            var paramsMs = new MemoryStream();
+            void WriteParam(int nameIdx, uint token, int typeIdx)
+            {
+                var buf = new byte[paramSize];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), nameIdx);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4, 4), token);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(paramSize - 4, 4), typeIdx);
+                paramsMs.Write(buf);
+            }
+            WriteParam(sPValue, 0x08000001, TyDictStrIntParam);
+            WriteParam(sPValue, 0x08000002, TyDictStrIntParam);
+            WriteParam(sPValue, 0x08000003, TyDictStrIntParam);
+            WriteParam(sPKey, 0x08000004, TyCmodStringParam);
+            WriteParam(sPValue, 0x08000005, TyOutIntParam);
+            WriteParam(sPScale, 0x08000006, TyRefFloatParam);
+            WriteParam(sPTag, 0x08000007, TyInStringParam); // has IsReadOnlyAttribute!
+            WriteParam(sPFallback, 0x08000008, TyMvarTResult);
+
+            // GenericContainers:
+            // [0] owner=TypeDef 16 (RigScaleControl`1), argc=1, isMethod=0, paramStart=0 (TState)
+            // [1] owner=Method 6 (TryLookup), argc=1, isMethod=1, paramStart=1 (TResult)
+            var gcMs = new MemoryStream();
+            void WriteGc(int owner, int argc, int isMethod, int paramStart)
+            {
+                Span<byte> buf = stackalloc byte[16];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(0, 4), owner);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(4, 4), argc);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(8, 4), isMethod);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(12, 4), paramStart);
+                gcMs.Write(buf);
+            }
+            WriteGc(TyRigCtrl, 1, 0, 0);
+            WriteGc(6, 1, 1, 1);
+
+            // GenericParameters:
+            var gpMs = new MemoryStream();
+            void WriteGp(int owner, int nameIdx, ushort num)
+            {
+                Span<byte> buf = stackalloc byte[16];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(0, 4), owner);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.Slice(4, 4), nameIdx);
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.Slice(12, 2), num);
+                gpMs.Write(buf);
+            }
+            WriteGp(0, sTState, 0);
+            WriteGp(1, sTResult, 0);
+
+            // Methods (8 total):
+            // [0] SerializeField..ctor (declaringType = 11, mscorlib)
+            // [1] IsReadOnlyAttribute..ctor (declaringType = 12, mscorlib)
+            // On RigScaleControl`1 (methodStart = 2, count = 6, Gameplay.Framework.dll):
+            // [2] get_BoneNameList() -> Dict<string,int>           token=0x06000001, methodIdx=0, RVA=0x1020
+            // [3] ECLJAGIGDDM(Dict<string,int> value)              token=0x06000002, methodIdx=1, RVA=0x1060 (alias!)
+            // [4] KGPKONNLLPK(Dict<string,int> value)              token=0x06000003, methodIdx=2, RVA=0x1060 (alias!)
+            // [5] set_BoneNameList(Dict<string,int> value)         token=0x06000004, methodIdx=3, RVA=0x1060 (canonical!)
+            // [6] TryLookup<TResult>(string, out int, ref float, in string, TResult) -> bool  token=0x06000005, methodIdx=4, RVA=0x10A0
+            // [7] AbstractHook() -> void                           token=0x06000006, methodIdx=-1, RVA=0x0 (abstract!)
+            var methodsMs = new MemoryStream();
+            void WriteMethod(int nameIdx, int declaringTd, int retType, int paramStart, int genContIdx, int methodIdx, uint token, ushort flags, ushort paramCount)
+            {
+                var buf = new byte[methodSize];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), nameIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(4, 4), declaringTd);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(8, 4), retType);
+                if (methodSize == 36)
+                {
+                    BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(12, 4), 0x08000000);
+                    BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(16, 4), paramStart);
+                    BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(20, 4), genContIdx);
+                }
+                else
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(12, 4), paramStart);
+                    BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(16, 4), -1);
+                    BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(20, 4), genContIdx);
+                    BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(24, 4), methodIdx);
+                }
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(methodSize - 12, 4), token);
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(methodSize - 8, 2), flags);
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(methodSize - 2, 2), paramCount);
+                methodsMs.Write(buf);
+            }
+            WriteMethod(sCtor, TySerializeField, TyVoid, -1, -1, -1, 0x06000001, 0x1886, 0);
+            WriteMethod(sCtor, TyIsReadOnlyAttr, TyVoid, -1, -1, -1, 0x06000002, 0x1886, 0);
+            WriteMethod(sGetBoneNameList, TyRigCtrl, TyDictStrIntParam, -1, -1, 0, 0x06000001, 0x0886, 0);
+            WriteMethod(sObfAlias1, TyRigCtrl, TyVoid, 0, -1, 1, 0x06000002, 0x0086, 1);
+            WriteMethod(sObfAlias2, TyRigCtrl, TyVoid, 1, -1, 2, 0x06000003, 0x0086, 1);
+            WriteMethod(sSetBoneNameList, TyRigCtrl, TyVoid, 2, -1, 3, 0x06000004, 0x0886, 1);
+            WriteMethod(sTryLookup, TyRigCtrl, TyBool, 3, 1, 4, 0x06000005, 0x0086, 5);
+            WriteMethod(sAbstractHook, TyRigCtrl, TyVoid, -1, -1, -1, 0x06000006, 0x05C6, 0); // public abstract (0x400 | 0x100 | 0x80 | 0x40 | 0x6)
+
+            // Property on RigScaleControl`1:
+            // [0] LIGFLDKFOLA { get = local method 0 (get_BoneNameList), set = local method 3 (set_BoneNameList) }
+            var propsMs = new MemoryStream();
+            {
+                var buf = new byte[propSize];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), sObfProp);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(4, 4), 0);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(8, 4), 3);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(propSize - 4, 4), 0x17000001);
+                propsMs.Write(buf);
+            }
+
+            // Custom attributes for Gameplay.Framework.dll:
+            // - field 0x04000002 (m_boneHideList) -> [SerializeField]
+            // - param 0x08000007 (tag) -> [IsReadOnlyAttribute]
+            var attrDataOrInfoMs = new MemoryStream();
+            var attrRangeOrTypesMs = new MemoryStream();
+            if (!isV24)
+            {
+                // v29+ attributeData + attributeDataRange
+                // Entry 0: token=0x04000002, startOffset=0 -> count=1, ctorMethodIdx=0 (SerializeField..ctor)
+                // Entry 1: token=0x08000007, startOffset=5 -> count=1, ctorMethodIdx=1 (IsReadOnlyAttribute..ctor)
+                // Entry 2 (sentinel): token=0, startOffset=10
+                Span<byte> tmp4 = stackalloc byte[4];
+                attrDataOrInfoMs.WriteByte(1);
+                BinaryPrimitives.WriteInt32LittleEndian(tmp4, 0);
+                attrDataOrInfoMs.Write(tmp4);
+                attrDataOrInfoMs.WriteByte(1);
+                BinaryPrimitives.WriteInt32LittleEndian(tmp4, 1);
+                attrDataOrInfoMs.Write(tmp4);
+
+                void WriteRange(uint token, uint startOff)
+                {
+                    Span<byte> r = stackalloc byte[8];
+                    BinaryPrimitives.WriteUInt32LittleEndian(r.Slice(0, 4), token);
+                    BinaryPrimitives.WriteUInt32LittleEndian(r.Slice(4, 4), startOff);
+                    attrRangeOrTypesMs.Write(r);
+                }
+                WriteRange(0x04000002, 0);
+                WriteRange(0x08000007, 5);
+                WriteRange(0, 10);
+            }
+            else
+            {
+                // Legacy v24: attributesInfo (12B: token, start, count) + attributeTypes (int32[])
+                void WriteInfo(uint token, int start, int count)
+                {
+                    Span<byte> r = stackalloc byte[12];
+                    BinaryPrimitives.WriteUInt32LittleEndian(r.Slice(0, 4), token);
+                    BinaryPrimitives.WriteInt32LittleEndian(r.Slice(4, 4), start);
+                    BinaryPrimitives.WriteInt32LittleEndian(r.Slice(8, 4), count);
+                    attrDataOrInfoMs.Write(r);
+                }
+                WriteInfo(0x04000002, 0, 1);
+                WriteInfo(0x08000007, 1, 1);
+
+                Span<byte> tmp4 = stackalloc byte[4];
+                BinaryPrimitives.WriteInt32LittleEndian(tmp4, TySerializeField);
+                attrRangeOrTypesMs.Write(tmp4);
+                BinaryPrimitives.WriteInt32LittleEndian(tmp4, TyIsReadOnlyAttr);
+                attrRangeOrTypesMs.Write(tmp4);
+            }
+
+            // TypeDefinitions (17 total)
+            var tdMs = new MemoryStream();
+            void WriteTd(
+                int nameIdx, int nsIdx, int byvalIdx, int declaringIdx, int parentIdx, int elementIdx, int genContIdx,
+                uint flags, int fStart, int mStart, int pStart,
+                ushort mCount, ushort pCount, ushort fCount, uint bitfield, uint token)
+            {
+                var buf = new byte[tdSize];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), nameIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(4, 4), nsIdx);
+
+                int byvalOff = isV24 ? 12 : 8;
+                int declOff = isV24 ? 20 : 12;
+                int parentOff = declOff + 4;
+                int elemOff = declOff + 8;
+                int gcOff = isV24 ? 40 : 24;
+                int flagsOff = gcOff + 4;
+                int fStartOff = gcOff + 8;
+                int mStartOff = gcOff + 12;
+                int eStartOff = gcOff + 16;
+                int pStartOff = gcOff + 20;
+                int nStartOff = gcOff + 24;
+                int iStartOff = gcOff + 28;
+
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(byvalOff, 4), byvalIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(declOff, 4), declaringIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(parentOff, 4), parentIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(elemOff, 4), elementIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(gcOff, 4), genContIdx);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(flagsOff, 4), flags);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(fStartOff, 4), fStart);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(mStartOff, 4), mStart);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(eStartOff, 4), -1);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(pStartOff, 4), pStart);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(nStartOff, 4), -1);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(iStartOff, 4), -1);
+
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(tdSize - 24, 2), mCount);
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(tdSize - 22, 2), pCount);
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(tdSize - 20, 2), fCount);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(tdSize - 8, 4), bitfield);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(tdSize - 4, 4), token);
+                tdMs.Write(buf);
+            }
+
+            WriteTd(sModule, sEmpty, 0, -1, -1, 0, -1, 0, -1, -1, -1, 0, 0, 0, 0, 0x02000001);
+            WriteTd(sObject, sSystem, TyObject, -1, -1, TyObject, -1, 1, -1, -1, -1, 0, 0, 0, 0, 0x02000002);
+            WriteTd(sVoid, sSystem, TyVoid, -1, TyObject, TyVoid, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x02000003);
+            WriteTd(sBoolean, sSystem, TyBool, -1, TyObject, TyBool, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x02000004);
+            WriteTd(sByte, sSystem, TyByte, -1, TyObject, TyByte, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x02000005);
+            WriteTd(sInt32, sSystem, TyInt32, -1, TyObject, TyInt32, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x02000006);
+            WriteTd(sSingle, sSystem, TySingle, -1, TyObject, TySingle, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x02000007);
+            WriteTd(sString, sSystem, TyString, -1, TyObject, TyString, -1, 0x101, -1, -1, -1, 0, 0, 0, 0, 0x02000008);
+            WriteTd(sList1, sScg, TyList1, -1, TyObject, TyList1, -1, 1, -1, -1, -1, 0, 0, 0, 0, 0x02000009);
+            WriteTd(sDict2, sScg, TyDict2, -1, TyObject, TyDict2, -1, 1, -1, -1, -1, 0, 0, 0, 0, 0x0200000A);
+            WriteTd(sNullable1, sSystem, TyNullable1, -1, TyObject, TyNullable1, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x0200000B);
+            WriteTd(sSerializeField, sUnityEngine, TySerializeField, -1, TyObject, TySerializeField, -1, 1, -1, 0, -1, 1, 0, 0, 0, 0x0200000C);
+            WriteTd(sIsReadOnlyAttr, sCompilerSvc, TyIsReadOnlyAttr, -1, TyObject, TyIsReadOnlyAttr, -1, 1, -1, 1, -1, 1, 0, 0, 0, 0x0200000D);
+            WriteTd(sMonoBehaviour, sUnityEngine, TyMonoBehaviour, -1, TyObject, TyMonoBehaviour, -1, 1, -1, -1, -1, 0, 0, 0, 0, 0x0200000E);
+            WriteTd(sLabel, sEmpty, TyLabel, -1, TyObject, TyLabel, -1, 1, -1, -1, -1, 0, 0, 0, 0, 0x0200000F);
+            WriteTd(sUnitTypeID, sEmpty, TyUnitTypeID, TyLabel, TyObject, TyUnitTypeID, -1, 1, -1, -1, -1, 0, 0, 0, 1, 0x02000010);
+            WriteTd(sRigCtrl, sEmpty, TyRigCtrl, -1, TyMonoBehaviour, TyRigCtrl, 0, 1, 0, 2, 0, 6, 1, 10, 0, 0x02000011);
+
+            // Images: [0] mscorlib.dll (0..14), [1] Gameplay.Framework.dll (14..17, customAttrs [0..2))
+            var imgMs = new MemoryStream();
+            void WriteImg(int nameIdx, int asmIdx, int typeStart, int typeCount, int caStart, int caCount)
+            {
+                var buf = new byte[imgSize];
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), nameIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(4, 4), asmIdx);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(8, 4), typeStart);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(12, 4), typeCount);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(32, 4), caStart);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(36, 4), caCount);
+                imgMs.Write(buf);
+            }
+            WriteImg(sMscorlibDll, 0, 0, 14, -1, 0);
+            WriteImg(sGameDll, 1, 14, 3, 0, 2);
+
+            var sections = new byte[pairCount][];
+            for (var i = 0; i < pairCount; i++) sections[i] = Array.Empty<byte>();
+            sections[2] = stringPool.ToArray();
+            sections[4] = propsMs.ToArray();
+            sections[5] = methodsMs.ToArray();
+            sections[7] = fdvMs.ToArray();
+            sections[8] = defDataMs.ToArray();
+            sections[10] = paramsMs.ToArray();
+            sections[11] = fieldsMs.ToArray();
+            sections[12] = gpMs.ToArray();
+            sections[14] = gcMs.ToArray();
+            sections[19] = tdMs.ToArray();
+            if (isV24)
+            {
+                sections[21] = imgMs.ToArray();
+                sections[27] = attrDataOrInfoMs.ToArray();
+                sections[28] = attrRangeOrTypesMs.ToArray();
+            }
+            else
+            {
+                sections[20] = imgMs.ToArray();
+                sections[24] = attrDataOrInfoMs.ToArray();
+                sections[25] = attrRangeOrTypesMs.ToArray();
+            }
+
+            using (var outMs = new MemoryStream())
+            {
+                var header = new byte[headerSize];
+                BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(0, 4), Il2CppMetadataReader.MetadataSanity);
+                BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(4, 4), version);
+                var cursor = headerSize;
+                for (var i = 0; i < pairCount; i++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(8 + i * 8, 4), cursor);
+                    BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(12 + i * 8, 4), sections[i].Length);
+                    cursor += sections[i].Length;
+                }
+                outMs.Write(header);
+                for (var i = 0; i < pairCount; i++)
+                {
+                    if (sections[i].Length > 0) outMs.Write(sections[i]);
+                }
+                File.WriteAllBytes(metadataPath, outMs.ToArray());
+            }
+
+            // --- 2. Build matching synthetic native binary (PE64, PE32, or ELF64 with RELA) ---
+            var ptrSize = is64 ? 8 : 4;
+            ulong imageBase = isElf ? 0UL : (is64 ? 0x180000000UL : 0x10000000UL);
+            ulong textRva = 0x1000UL;
+            ulong dataRva = 0x2000UL;
+            var dataBuf = new byte[0x4000];
+            var relocs = new List<(ulong TargetVa, ulong ValueVa)>();
+            var dataPos = 0x40;
+
+            int Alloc(int size, int align = 8)
+            {
+                dataPos = (dataPos + align - 1) & ~(align - 1);
+                var start = dataPos;
+                dataPos += size;
+                return start;
+            }
+
+            ulong DataVa(int offset) => imageBase + dataRva + (ulong)offset;
+
+            void WritePtr(int offset, ulong targetVa)
+            {
+                if (isElf && targetVa != 0)
+                {
+                    // Leave on-disk bytes ZERO so tests prove RELA relocation overlay resolves every pointer!
+                    relocs.Add((DataVa(offset), targetVa));
+                    return;
+                }
+
+                if (is64) BinaryPrimitives.WriteUInt64LittleEndian(dataBuf.AsSpan(offset, 8), targetVa);
+                else BinaryPrimitives.WriteUInt32LittleEndian(dataBuf.AsSpan(offset, 4), (uint)targetVa);
+            }
+
+            void WriteCount(int offset, int val)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(dataBuf.AsSpan(offset, 4), val);
+            }
+
+            uint MakeTypeBits(ushort attrs, byte typeEnum, bool byref = false, bool valuetypeFlag = false)
+            {
+                uint bits = attrs | ((uint)typeEnum << 16);
+                if (!isV24)
+                {
+                    if (byref) bits |= 1u << 29;
+                    if (valuetypeFlag) bits |= 1u << 31;
+                }
+                else
+                {
+                    if (byref) bits |= 1u << 30;
+                }
+                return bits;
+            }
+
+            ulong WriteIl2CppType(ulong dataWord, bool dataIsPointer, ushort attrs, byte typeEnum, bool byref = false, bool valuetypeFlag = false)
+            {
+                var off = Alloc(ptrSize + 8, ptrSize);
+                if (dataIsPointer)
+                {
+                    WritePtr(off, dataWord);
+                }
+                else
+                {
+                    if (is64) BinaryPrimitives.WriteUInt64LittleEndian(dataBuf.AsSpan(off, 8), dataWord);
+                    else BinaryPrimitives.WriteUInt32LittleEndian(dataBuf.AsSpan(off, 4), (uint)dataWord);
+                }
+                BinaryPrimitives.WriteUInt32LittleEndian(dataBuf.AsSpan(off + ptrSize, 4), MakeTypeBits(attrs, typeEnum, byref, valuetypeFlag));
+                return DataVa(off);
+            }
+
+            ulong WriteGenericClass(int genericDefTd, params ulong[] argTypeVas)
+            {
+                var argvOff = Alloc(argTypeVas.Length * ptrSize, ptrSize);
+                for (var i = 0; i < argTypeVas.Length; i++)
+                {
+                    WritePtr(argvOff + i * ptrSize, argTypeVas[i]);
+                }
+
+                var instOff = Alloc(2 * ptrSize, ptrSize);
+                WriteCount(instOff, argTypeVas.Length);
+                WritePtr(instOff + ptrSize, DataVa(argvOff));
+
+                var gcOff = Alloc(4 * ptrSize, ptrSize);
+                if (isV24)
+                {
+                    WriteCount(gcOff, genericDefTd);
+                }
+                else
+                {
+                    var defTypeVa = WriteIl2CppType((ulong)genericDefTd, false, 0, genericDefTd == TyNullable1 ? (byte)0x11 : (byte)0x12);
+                    WritePtr(gcOff, defTypeVa);
+                }
+                WritePtr(gcOff + ptrSize, DataVa(instOff));
+                return DataVa(gcOff);
+            }
+
+            // Build all Il2CppType instances (0..32)
+            var typeVas = new ulong[TotalBinaryTypes];
+            typeVas[0] = WriteIl2CppType(0, false, 0, 0x12);
+            typeVas[TyObject] = WriteIl2CppType(TyObject, false, 0, 0x1C);
+            typeVas[TyVoid] = WriteIl2CppType(TyVoid, false, 0, 0x01, valuetypeFlag: true);
+            typeVas[TyBool] = WriteIl2CppType(TyBool, false, 0, 0x02, valuetypeFlag: true);
+            typeVas[TyByte] = WriteIl2CppType(TyByte, false, 0, 0x05, valuetypeFlag: true);
+            typeVas[TyInt32] = WriteIl2CppType(TyInt32, false, 0, 0x08, valuetypeFlag: true); // bit 31 = 1 on v31, 0 on v24!
+            typeVas[TySingle] = WriteIl2CppType(TySingle, false, 0, 0x0C, valuetypeFlag: true);
+            typeVas[TyString] = WriteIl2CppType(TyString, false, 0, 0x0E);
+            typeVas[TyList1] = WriteIl2CppType(TyList1, false, 0, 0x12);
+            typeVas[TyDict2] = WriteIl2CppType(TyDict2, false, 0, 0x12);
+            typeVas[TyNullable1] = WriteIl2CppType(TyNullable1, false, 0, 0x11, valuetypeFlag: true);
+            typeVas[TySerializeField] = WriteIl2CppType(TySerializeField, false, 0, 0x12);
+            typeVas[TyIsReadOnlyAttr] = WriteIl2CppType(TyIsReadOnlyAttr, false, 0, 0x12);
+            typeVas[TyMonoBehaviour] = WriteIl2CppType(TyMonoBehaviour, false, 0, 0x12);
+            typeVas[TyLabel] = WriteIl2CppType(TyLabel, false, 0, 0x12);
+            typeVas[TyUnitTypeID] = WriteIl2CppType(TyUnitTypeID, false, 0, 0x11, valuetypeFlag: true);
+            typeVas[TyRigCtrl] = WriteIl2CppType(TyRigCtrl, false, 0, 0x12);
+
+            var gcListStr = WriteGenericClass(TyList1, typeVas[TyString]);
+            var gcDictStrInt = WriteGenericClass(TyDict2, typeVas[TyString], typeVas[TyInt32]);
+            var gcListInt = WriteGenericClass(TyList1, typeVas[TyInt32]);
+            var typeListInt = WriteIl2CppType(gcListInt, true, 0, 0x15);
+            var gcDictStrListInt = WriteGenericClass(TyDict2, typeVas[TyString], typeListInt);
+            var gcNullableInt = WriteGenericClass(TyNullable1, typeVas[TyInt32]);
+
+            var arrFloat2DOff = Alloc(ptrSize + 8, ptrSize);
+            WritePtr(arrFloat2DOff, typeVas[TySingle]);
+            dataBuf[arrFloat2DOff + ptrSize] = 2; // rank 2 -> float[,]
+
+            typeVas[TyConstPrivateInt] = WriteIl2CppType(TyInt32, false, 0x8051, 0x08, valuetypeFlag: true);
+            typeVas[TyPublicListString] = WriteIl2CppType(gcListStr, true, 0x0006, 0x15);
+            typeVas[TyPrivateDictStrInt] = WriteIl2CppType(gcDictStrInt, true, 0x0001, 0x15);
+            typeVas[TyPrivateBoolArray] = WriteIl2CppType(typeVas[TyBool], true, 0x0001, 0x1D);
+            typeVas[TyPrivStatRoFloat2D] = WriteIl2CppType(DataVa(arrFloat2DOff), true, 0x0031, 0x14);
+            typeVas[TyProtIntNotSerBytePtr] = WriteIl2CppType(typeVas[TyByte], true, 0x0085, 0x0F);
+            typeVas[TyPrivateNestedDict] = WriteIl2CppType(gcDictStrListInt, true, 0x0001, 0x15);
+            typeVas[TyPrivateUnitTypeID] = WriteIl2CppType(TyUnitTypeID, false, 0x0001, 0x11, valuetypeFlag: true);
+            typeVas[TyPrivateNullableInt] = WriteIl2CppType(gcNullableInt, true, 0x0001, 0x15, valuetypeFlag: true);
+            typeVas[TyPrivateVarTState] = WriteIl2CppType(0, false, 0x0001, 0x13);
+            typeVas[TyDictStrIntParam] = WriteIl2CppType(gcDictStrInt, true, 0x0000, 0x15);
+            typeVas[TyOutIntParam] = WriteIl2CppType(TyInt32, false, 0x0002, 0x08, byref: true, valuetypeFlag: true);
+            typeVas[TyRefFloatParam] = WriteIl2CppType(TySingle, false, 0x0000, 0x0C, byref: true, valuetypeFlag: true);
+            typeVas[TyInStringParam] = WriteIl2CppType(TyString, false, 0x0001, 0x0E, byref: true);
+            typeVas[TyMvarTResult] = WriteIl2CppType(1, false, 0x0000, 0x1E);
+            typeVas[TyCmodStringParam] = WriteIl2CppType(typeVas[TyString], true, 0x0000, 0x20);
+
+            var typesTableOff = Alloc(TotalBinaryTypes * ptrSize, ptrSize);
+            for (var i = 0; i < TotalBinaryTypes; i++)
+            {
+                WritePtr(typesTableOff + i * ptrSize, typeVas[i]);
+            }
+
+            // Field offsets for RigScaleControl`1 (TypeDef 16)
+            var rigFieldOffsets = is64
+                ? new[] { 0, 0x20, 0x28, 0x30, 0x0, 0x38, 0x40, 0x48, 0x50, 0x58 }
+                : new[] { 0, 0x14, 0x18, 0x1C, 0x0, 0x20, 0x24, 0x28, 0x2C, 0x30 };
+            var rigFoOff = Alloc(rigFieldOffsets.Length * 4, 4);
+            for (var i = 0; i < rigFieldOffsets.Length; i++)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(dataBuf.AsSpan(rigFoOff + i * 4, 4), rigFieldOffsets[i]);
+            }
+
+            var fieldOffsetsTableOff = Alloc(TotalTypes * ptrSize, ptrSize);
+            WritePtr(fieldOffsetsTableOff + TyRigCtrl * ptrSize, DataVa(rigFoOff));
+
+            var tdSizesTableOff = Alloc(TotalTypes * ptrSize, ptrSize);
+
+            // Il2CppMetadataRegistration (16 words)
+            var metaRegOff = Alloc(16 * ptrSize, ptrSize);
+            WriteCount(metaRegOff + 6 * ptrSize, TotalBinaryTypes);
+            WritePtr(metaRegOff + 7 * ptrSize, DataVa(typesTableOff));
+            WriteCount(metaRegOff + 10 * ptrSize, TotalTypes);
+            WritePtr(metaRegOff + 11 * ptrSize, DataVa(fieldOffsetsTableOff));
+            WriteCount(metaRegOff + 12 * ptrSize, TotalTypes);
+            WritePtr(metaRegOff + 13 * ptrSize, DataVa(tdSizesTableOff));
+
+            // CodeRegistration / CodeGenModules
+            var methodRvas = new ulong[] { 0x1020, 0x1060, 0x1060, 0x1060, 0x10A0, 0 };
+            if (!isV24)
+            {
+                ulong WriteCString(string text)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(text);
+                    var off = Alloc(bytes.Length + 1, 4);
+                    Buffer.BlockCopy(bytes, 0, dataBuf, off, bytes.Length);
+                    dataBuf[off + bytes.Length] = 0;
+                    return DataVa(off);
+                }
+
+                var mscorlibNameVa = WriteCString("mscorlib.dll");
+                var gameDllNameVa = WriteCString("Gameplay.Framework.dll");
+
+                var gameMethodPtrsOff = Alloc(methodRvas.Length * ptrSize, ptrSize);
+                for (var i = 0; i < methodRvas.Length; i++)
+                {
+                    WritePtr(gameMethodPtrsOff + i * ptrSize, methodRvas[i] == 0 ? 0 : imageBase + methodRvas[i]);
+                }
+
+                var mod0Off = Alloc(4 * ptrSize, ptrSize);
+                WritePtr(mod0Off, mscorlibNameVa);
+                WriteCount(mod0Off + ptrSize, 0);
+
+                var mod1Off = Alloc(4 * ptrSize, ptrSize);
+                WritePtr(mod1Off, gameDllNameVa);
+                WriteCount(mod1Off + ptrSize, methodRvas.Length);
+                WritePtr(mod1Off + 2 * ptrSize, DataVa(gameMethodPtrsOff));
+
+                var modsArrayOff = Alloc(2 * ptrSize, ptrSize);
+                WritePtr(modsArrayOff, DataVa(mod0Off));
+                WritePtr(modsArrayOff + ptrSize, DataVa(mod1Off));
+
+                var codeRegTailOff = Alloc(2 * ptrSize, ptrSize);
+                WriteCount(codeRegTailOff, 2);
+                WritePtr(codeRegTailOff + ptrSize, DataVa(modsArrayOff));
+            }
+            else
+            {
+                // Pre-24.2 flat Il2CppCodeRegistration
+                var flatMethodPtrsOff = Alloc(5 * ptrSize, ptrSize);
+                for (var i = 0; i < 5; i++)
+                {
+                    WritePtr(flatMethodPtrsOff + i * ptrSize, imageBase + methodRvas[i]);
+                }
+                var invokersOff = Alloc(2 * ptrSize, ptrSize);
+                WritePtr(invokersOff, imageBase + textRva + 0x200);
+                WritePtr(invokersOff + ptrSize, imageBase + textRva + 0x220);
+
+                var codeRegOff = Alloc(12 * ptrSize, ptrSize);
+                WriteCount(codeRegOff + 0 * ptrSize, 5);
+                WritePtr(codeRegOff + 1 * ptrSize, DataVa(flatMethodPtrsOff));
+                WriteCount(codeRegOff + 6 * ptrSize, 2);
+                WritePtr(codeRegOff + 7 * ptrSize, DataVa(invokersOff));
+            }
+
+            if (!isElf)
+            {
+                WriteSyntheticPeBinary(binaryPath, is64, imageBase, (uint)textRva, (uint)dataRva, dataBuf);
+            }
+            else
+            {
+                WriteSyntheticElf64AArch64Binary(binaryPath, textRva, dataRva, dataBuf, relocs, stripSectionHeaders: stripSh);
+            }
+        }
+
+        private static void WriteSyntheticPeBinary(string path, bool is64, ulong imageBase, uint textRva, uint dataRva, byte[] dataSection)
+        {
+            const uint fileAlign = 0x200;
+            const uint sectionAlign = 0x1000;
+            const uint textFileOff = 0x400;
+            const uint textSize = 0x400;
+            uint dataFileOff = textFileOff + textSize;
+            uint dataSize = (uint)((dataSection.Length + fileAlign - 1) & ~(fileAlign - 1));
+            var totalBytes = new byte[dataFileOff + dataSize];
+
+            // DOS header
+            totalBytes[0] = (byte)'M';
+            totalBytes[1] = (byte)'Z';
+            const int peOffset = 0x80;
+            BinaryPrimitives.WriteInt32LittleEndian(totalBytes.AsSpan(0x3C, 4), peOffset);
+
+            // PE signature
+            totalBytes[peOffset] = (byte)'P';
+            totalBytes[peOffset + 1] = (byte)'E';
+
+            var optHeaderSize = is64 ? (ushort)0xF0 : (ushort)0xE0;
+            BinaryPrimitives.WriteUInt16LittleEndian(totalBytes.AsSpan(peOffset + 4, 2), is64 ? (ushort)0x8664 : (ushort)0x014C);
+            BinaryPrimitives.WriteUInt16LittleEndian(totalBytes.AsSpan(peOffset + 6, 2), 2); // 2 sections (.text, .data)
+            BinaryPrimitives.WriteUInt16LittleEndian(totalBytes.AsSpan(peOffset + 20, 2), optHeaderSize);
+            BinaryPrimitives.WriteUInt16LittleEndian(totalBytes.AsSpan(peOffset + 22, 2), 0x2022);
+
+            var optOff = peOffset + 24;
+            BinaryPrimitives.WriteUInt16LittleEndian(totalBytes.AsSpan(optOff, 2), is64 ? (ushort)0x020B : (ushort)0x010B);
+            if (is64)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(totalBytes.AsSpan(optOff + 24, 8), imageBase);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 108, 4), 16);
+            }
+            else
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 28, 4), (uint)imageBase);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 92, 4), 16);
+            }
+
+            BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 32, 4), sectionAlign);
+            BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 36, 4), fileAlign);
+            var sizeOfImage = dataRva + ((dataSize + sectionAlign - 1) & ~(sectionAlign - 1));
+            BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 56, 4), sizeOfImage);
+            BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(optOff + 60, 4), textFileOff);
+
+            void WriteSectionHeader(int idx, string name, uint virtSize, uint virtAddr, uint rawSize, uint rawPtr, uint chars)
+            {
+                var off = optOff + optHeaderSize + idx * 40;
+                Encoding.ASCII.GetBytes(name).CopyTo(totalBytes, off);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(off + 8, 4), virtSize);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(off + 12, 4), virtAddr);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(off + 16, 4), rawSize);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(off + 20, 4), rawPtr);
+                BinaryPrimitives.WriteUInt32LittleEndian(totalBytes.AsSpan(off + 36, 4), chars);
+            }
+
+            WriteSectionHeader(0, ".text", textSize, textRva, textSize, textFileOff, 0x60000020);
+            WriteSectionHeader(1, ".data", (uint)dataSection.Length, dataRva, dataSize, dataFileOff, 0xC0000040);
+
+            // Populate minimal RET instructions in .text and copy .data payload
+            Array.Fill(totalBytes, (byte)0xC3, (int)textFileOff, (int)textSize);
+            Buffer.BlockCopy(dataSection, 0, totalBytes, (int)dataFileOff, dataSection.Length);
+            File.WriteAllBytes(path, totalBytes);
+        }
+
+        private static void WriteSyntheticElf64AArch64Binary(
+            string path,
+            ulong textVaddr,
+            ulong dataVaddr,
+            byte[] dataSection,
+            List<(ulong TargetVa, ulong ValueVa)> relocs,
+            bool stripSectionHeaders)
+        {
+            // Layout:
+            // 0x0000..0x0FFF: ELF64 header (64B) + 3 Phdrs (3*56B) + .rela.dyn + .dynamic
+            // 0x1000..0x1FFF: PT_LOAD[0] RX (.text)
+            // 0x2000..0x5FFF: PT_LOAD[1] RW (.data.rel.ro + .data)
+            // 0x6000..      : optional Shdrs (when !stripSectionHeaders)
+            const ulong relaOff = 0x200;
+            var relaSize = (ulong)(relocs.Count * 24);
+            var dynOff = (relaOff + relaSize + 15UL) & ~15UL;
+            const ulong dynSize = 4 * 16; // DT_RELA, DT_RELASZ, DT_RELAENT, DT_NULL
+            const ulong textOff = 0x1000;
+            const ulong textSize = 0x1000;
+            const ulong dataOff = 0x2000;
+            var shOff = dataOff + (ulong)dataSection.Length;
+            var totalLen = stripSectionHeaders ? shOff : shOff + 2 * 64;
+            var buf = new byte[totalLen];
+
+            // ELF64 header
+            buf[0] = 0x7F; buf[1] = (byte)'E'; buf[2] = (byte)'L'; buf[3] = (byte)'F';
+            buf[4] = 2; // ELFCLASS64
+            buf[5] = 1; // ELFDATA2LSB
+            buf[6] = 1; // EV_CURRENT
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(16, 2), 3);   // ET_DYN
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(18, 2), 183); // EM_AARCH64
+            BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(20, 4), 1);   // EV_CURRENT
+            BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(32, 8), 64);  // e_phoff
+            BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(40, 8), stripSectionHeaders ? 0UL : shOff);
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(52, 2), 64);  // e_ehsize
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(54, 2), 56);  // e_phentsize
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(56, 2), 3);   // e_phnum (LOAD header+text, LOAD data, DYNAMIC)
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(58, 2), 64);  // e_shentsize
+            BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(60, 2), stripSectionHeaders ? (ushort)0 : (ushort)2);
+
+            void WritePhdr(int idx, uint type, uint flags, ulong offset, ulong vaddr, ulong filesz, ulong memsz)
+            {
+                var off = 64 + idx * 56;
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off, 4), type);
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off + 4, 4), flags);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 8, 8), offset);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 16, 8), vaddr);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 24, 8), vaddr);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 32, 8), filesz);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 40, 8), memsz);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 48, 8), 0x1000);
+            }
+
+            // PT_LOAD[0] RX covers 0x0000..0x2000 (header + .rela.dyn + .dynamic + .text at 0x1000)
+            WritePhdr(0, 1, 5, 0, 0, textOff + textSize, textVaddr + textSize);
+            // PT_LOAD[1] RW covers .data at 0x2000
+            WritePhdr(1, 1, 6, dataOff, dataVaddr, (ulong)dataSection.Length, (ulong)dataSection.Length);
+            // PT_DYNAMIC
+            WritePhdr(2, 2, 6, dynOff, dynOff, dynSize, dynSize);
+
+            // .rela.dyn entries (R_AARCH64_RELATIVE = 1027)
+            for (var i = 0; i < relocs.Count; i++)
+            {
+                var off = (int)relaOff + i * 24;
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off, 8), relocs[i].TargetVa);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 8, 8), 1027UL);
+                BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(off + 16, 8), (long)relocs[i].ValueVa);
+            }
+
+            // .dynamic entries
+            void WriteDyn(int idx, long tag, ulong val)
+            {
+                var off = (int)dynOff + idx * 16;
+                BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(off, 8), tag);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(off + 8, 8), val);
+            }
+            WriteDyn(0, 7, relaOff);  // DT_RELA
+            WriteDyn(1, 8, relaSize); // DT_RELASZ
+            WriteDyn(2, 9, 24);       // DT_RELAENT
+            WriteDyn(3, 0, 0);        // DT_NULL
+
+            Buffer.BlockCopy(dataSection, 0, buf, (int)dataOff, dataSection.Length);
+
+            if (!stripSectionHeaders)
+            {
+                // Section 0 = NULL, Section 1 = SHT_RELA (type 4)
+                var s1 = (int)shOff + 64;
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(s1 + 4, 4), 4);       // SHT_RELA
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(s1 + 16, 8), relaOff);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(s1 + 24, 8), relaOff);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(s1 + 32, 8), relaSize);
+                BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(s1 + 56, 8), 24);
+            }
+
+            File.WriteAllBytes(path, buf);
+        }
+
         private static string CreateTempDirectory()
         {
             var path = Path.Combine(Path.GetTempPath(), "AssetStudio_Phase2Tests_" + Guid.NewGuid().ToString("N"));

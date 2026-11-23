@@ -74,6 +74,7 @@ public sealed class ScriptViewerService : IDisposable
         var dumpCsPath = FirstExistingFile(request.DumpCsPath, discovered.DumpCsPath);
         var scriptJsonPath = FirstExistingFile(request.ScriptJsonPath, discovered.ScriptJsonPath);
         var globalMetadataPath = FirstExistingFile(request.GlobalMetadataPath, discovered.GlobalMetadataPath);
+        var gameAssemblyPath = FirstExistingFile(request.GameAssemblyPath, discovered.GameAssemblyPath);
 
         // 1. Mono managed assemblies first (produces full C# method bodies)
         if (managedDirs.Count > 0)
@@ -117,13 +118,14 @@ public sealed class ScriptViewerService : IDisposable
             }
         }
 
-        // 4. Built-in pure-C# IL2CPP global-metadata.dat reader (automatic, zero external tool required)
+        // 4. Built-in pure-C# IL2CPP global-metadata.dat + native binary reader (automatic, zero external tool required)
         string? metadataDiagnostic = null;
         if (!string.IsNullOrWhiteSpace(globalMetadataPath))
         {
             var metadataResult = _metadataReader.TryExtractType(
                 globalMetadataPath,
                 request,
+                gameAssemblyPath,
                 out metadataDiagnostic,
                 cancellationToken);
             if (metadataResult != null && metadataResult.Success)
