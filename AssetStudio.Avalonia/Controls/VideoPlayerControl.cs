@@ -34,8 +34,11 @@ namespace AssetStudio.Avalonia.Controls
             public int State;
             public volatile bool IsPlayTransitionPending;
             public volatile bool IsPauseTransitionPending;
+            public volatile bool IsStopTransitionPending;
+            public Task? PendingStopTask;
         }
 
+        private readonly VideoPlaybackTimelineTracker _timeline = new();
         private PlayerHandle? _activeHandle;
         private long _playerGeneration;
         private IVideoRenderer? _videoRenderer;
@@ -49,6 +52,7 @@ namespace AssetStudio.Avalonia.Controls
         private bool _autoPlayCached;
         private bool _frameRenderErrorLogged;
         private float _pendingSeekPercent = float.NaN;
+        private long _pendingSeekGeneration;
         private int _seekWorkerRunning;
 
         public static readonly StyledProperty<int> VolumeProperty =
@@ -223,17 +227,27 @@ namespace AssetStudio.Avalonia.Controls
                     return 0L;
                 }
 
-                return (long)(player.Position * (float)player.Length);
+                var fallbackMs = VideoPreviewService.TryGetPlayerPositionMs(player);
+                return _timeline.GetEffectivePositionMs(fallbackMs, Environment.TickCount64);
             }
         }
 
         public long Duration => ActivePlayer?.Length ?? 0L;
+
+        public void SetFallbackDuration(long durationMs)
+        {
+            if (durationMs > 0)
+            {
+                _timeline.SetDurationMs(durationMs);
+            }
+        }
 
         public event EventHandler? PlaybackStarted;
         public event EventHandler<MediaOpenedEventArgs>? MediaOpened;
         public event EventHandler? PlaybackPaused;
         public event EventHandler? PlaybackStopped;
         public event EventHandler? MediaEnded;
+        public event EventHandler<long>? PositionUpdated;
 
         public VideoPlayerControl()
         {
@@ -489,6 +503,7 @@ namespace AssetStudio.Avalonia.Controls
             var handle = Volatile.Read(ref _activeHandle);
             return handle != null
                 && Volatile.Read(ref handle.State) == 1
+                && !handle.IsStopTransitionPending
                 && ReferenceEquals(sender, handle.Player);
         }
 
@@ -581,10 +596,33 @@ namespace AssetStudio.Avalonia.Controls
 
         private void OnPositionChanged(object? sender, PositionChangedEventArgs e)
         {
+            if (!IsSenderActivePlayer(sender) || sender is not FFmpegMediaPlayer player)
+            {
+                return;
+            }
+
+            var lengthMs = player.Length;
+            if (lengthMs > 0)
+            {
+                _timeline.SetDurationMs(lengthMs);
+            }
+
+            double reportedMs = lengthMs > 0
+                ? Math.Max(0.0, e.Position * (double)lengthMs)
+                : VideoPreviewService.TryGetPlayerPositionMs(player);
+
+            if (_timeline.OnPositionChangedFromPlayer(reportedMs, IsPlaying, out var effectiveMs))
+            {
+                PositionUpdated?.Invoke(this, effectiveMs);
+            }
         }
 
         private void OnLengthChanged(object? sender, LengthChangedEventArgs e)
         {
+            if (e.Length > 0 && IsSenderActivePlayer(sender))
+            {
+                _timeline.SetDurationMs(e.Length);
+            }
         }
 
         private void OnFrameReady(object? sender, FrameEventArgs e)
@@ -594,12 +632,22 @@ namespace AssetStudio.Avalonia.Controls
                 var handle = Volatile.Read(ref _activeHandle);
                 if (handle == null
                     || Volatile.Read(ref handle.State) == 2
+                    || handle.IsStopTransitionPending
                     || !ReferenceEquals(sender, handle.Player))
                 {
                     return;
                 }
 
                 _videoRenderer?.RenderFrame(e.Data, e.Width, e.Height, e.Stride);
+
+                if (Volatile.Read(ref handle.State) == 1)
+                {
+                    var fallbackMs = VideoPreviewService.TryGetPlayerPositionMs(handle.Player);
+                    if (_timeline.OnFramePresented(fallbackMs, out var effectiveMs))
+                    {
+                        PositionUpdated?.Invoke(this, effectiveMs);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -641,6 +689,7 @@ namespace AssetStudio.Avalonia.Controls
             _currentMediaPath = null;
             _frameRenderErrorLogged = false;
             Volatile.Write(ref _pendingSeekPercent, float.NaN);
+            _timeline.Reset(0L);
 
             var oldHandle = Interlocked.Exchange(ref _activeHandle, null);
             if (oldHandle != null)
@@ -704,6 +753,7 @@ namespace AssetStudio.Avalonia.Controls
 
             _currentMediaPath = path;
             _hasMediaLoaded = true;
+            _timeline.OnMediaOpened(player.Length);
 
             Dispatcher.UIThread.Post(() =>
             {
@@ -744,13 +794,26 @@ namespace AssetStudio.Avalonia.Controls
 
             handle.IsPauseTransitionPending = false;
             handle.IsPlayTransitionPending = true;
+            var pendingStop = Volatile.Read(ref handle.PendingStopTask);
 
             _ = Task.Run(() =>
             {
                 try
                 {
+                    if (pendingStop != null && !pendingStop.IsCompleted)
+                    {
+                        try
+                        {
+                            pendingStop.Wait(500);
+                        }
+                        catch
+                        {
+                        }
+                    }
+
                     if (Volatile.Read(ref handle.State) == 1)
                     {
+                        handle.IsStopTransitionPending = false;
                         handle.Player.Play();
                     }
                 }
@@ -804,13 +867,27 @@ namespace AssetStudio.Avalonia.Controls
             {
                 handle.IsPlayTransitionPending = false;
                 handle.IsPauseTransitionPending = false;
-                _ = SharedTeardownQueue.EnqueueTeardownAsync(() =>
+                handle.IsStopTransitionPending = true;
+                _timeline.OnMediaOpened(handle.Player.Length);
+                var stopTask = SharedTeardownQueue.EnqueueTeardownAsync(() =>
                 {
-                    if (Volatile.Read(ref handle.State) == 1)
+                    try
                     {
-                        VideoPreviewService.SafeStopPlayer(handle.Player);
+                        if (Volatile.Read(ref handle.State) == 1)
+                        {
+                            VideoPreviewService.SafeStopPlayer(handle.Player);
+                        }
+                    }
+                    finally
+                    {
+                        handle.IsStopTransitionPending = false;
                     }
                 });
+                Volatile.Write(ref handle.PendingStopTask, stopTask);
+            }
+            else
+            {
+                _timeline.Reset(0L);
             }
 
             if (Dispatcher.UIThread.CheckAccess())
@@ -833,6 +910,7 @@ namespace AssetStudio.Avalonia.Controls
             _hasMediaLoaded = false;
             _currentMediaPath = null;
             Volatile.Write(ref _pendingSeekPercent, float.NaN);
+            _timeline.Reset(0L);
             Interlocked.Increment(ref _playerGeneration);
 
             var oldHandle = Interlocked.Exchange(ref _activeHandle, null);
@@ -872,6 +950,17 @@ namespace AssetStudio.Avalonia.Controls
             }
 
             var clamped = Math.Clamp(positionPercent, 0f, 1f);
+            var effectiveDurationMs = handle.Player.Length > 0 ? handle.Player.Length : _timeline.DurationMs;
+            if (effectiveDurationMs > 0)
+            {
+                _timeline.SetDurationMs(effectiveDurationMs);
+            }
+            var targetMs = effectiveDurationMs > 0
+                ? (long)Math.Round(clamped * (double)effectiveDurationMs)
+                : 0L;
+            var seekGen = _timeline.BeginSeek(targetMs);
+
+            Volatile.Write(ref _pendingSeekGeneration, seekGen);
             Volatile.Write(ref _pendingSeekPercent, clamped);
             if (Interlocked.CompareExchange(ref _seekWorkerRunning, 1, 0) != 0)
             {
@@ -890,19 +979,57 @@ namespace AssetStudio.Avalonia.Controls
                             break;
                         }
 
+                        var currentSeekGen = Volatile.Read(ref _pendingSeekGeneration);
                         var currentHandle = Volatile.Read(ref _activeHandle);
                         if (currentHandle == null || Volatile.Read(ref currentHandle.State) != 1)
                         {
                             break;
                         }
 
+                        var pendingStop = Volatile.Read(ref currentHandle.PendingStopTask);
+                        if (pendingStop != null && !pendingStop.IsCompleted)
+                        {
+                            try
+                            {
+                                pendingStop.Wait(500);
+                            }
+                            catch
+                            {
+                            }
+                        }
+
+                        if (Volatile.Read(ref currentHandle.State) != 1)
+                        {
+                            break;
+                        }
+
                         try
                         {
-                            currentHandle.Player.Seek(target);
+                            currentHandle.IsStopTransitionPending = false;
+                            VideoPreviewService.SafeSeekPlayer(currentHandle.Player, target);
+
+                            // Post FIFO seek barrier BEFORE ShowFrameAtCurrentPosition so all stale pre-seek frames
+                            // already queued on the UI dispatcher are drained before the barrier opens, while the
+                            // seeked paused frame (or first post-seek playback frame) arrives after the barrier.
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                _timeline.MarkSeekBarrierReached(currentSeekGen, Environment.TickCount64);
+                            });
+
+                            if (!currentHandle.Player.IsPlaying
+                                && !currentHandle.IsPlayTransitionPending
+                                && Volatile.Read(ref currentHandle.State) == 1)
+                            {
+                                currentHandle.Player.ShowFrameAtCurrentPosition();
+                            }
                         }
                         catch (Exception ex)
                         {
                             Logger.Debug($"Error seeking video player: {ex.Message}");
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                _timeline.MarkSeekBarrierReached(currentSeekGen, Environment.TickCount64);
+                            });
                         }
                     }
                 }

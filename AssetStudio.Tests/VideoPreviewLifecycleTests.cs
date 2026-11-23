@@ -410,6 +410,133 @@ namespace AssetStudio.Tests
             Assert.Empty(avaloniaUsings);
         }
 
+        [Fact]
+        public void VideoPlaybackTimelineTracker_TracksPresentedFrameTimestamp_NotDecodeAheadPosition()
+        {
+            var tracker = new VideoPlaybackTimelineTracker();
+            tracker.OnMediaOpened(durationMs: 6906);
+
+            Assert.Equal(0L, tracker.GetEffectivePositionMs(fallbackPlayerPositionMs: 1030.0, nowTickMs: 1000));
+
+            // FFmpegMediaPlayer.ProcessVideoPacket posts PositionChanged immediately before FrameReady.
+            // Even if the decode thread jumped ahead to 1030ms while dropping frames, the displayed timestamp
+            // must reflect the 100ms frame actually painted on screen.
+            bool shouldEmitOnPos = tracker.OnPositionChangedFromPlayer(positionMs: 100.0, isPlaying: true, out _);
+            Assert.False(shouldEmitOnPos);
+
+            bool shouldEmitOnFrame = tracker.OnFramePresented(fallbackPositionMs: 1030.0, out var presentedMs);
+            Assert.True(shouldEmitOnFrame);
+            Assert.Equal(100L, presentedMs);
+            Assert.Equal(100L, tracker.GetEffectivePositionMs(fallbackPlayerPositionMs: 1030.0, nowTickMs: 1050));
+
+            // Next painted frame at 1200ms immediately updates displayed seconds to 1200ms.
+            Assert.False(tracker.OnPositionChangedFromPlayer(positionMs: 1200.0, isPlaying: true, out _));
+            Assert.True(tracker.OnFramePresented(fallbackPositionMs: 1530.0, out presentedMs));
+            Assert.Equal(1200L, presentedMs);
+            Assert.Equal(1200L, tracker.GetEffectivePositionMs(fallbackPlayerPositionMs: 1530.0, nowTickMs: 1100));
+        }
+
+        [Fact]
+        public void VideoPlaybackTimelineTracker_SeekBarrierIgnoresStalePreSeekFrames_AndCommitsFirstPostSeekFrame()
+        {
+            var tracker = new VideoPlaybackTimelineTracker();
+            tracker.OnMediaOpened(durationMs: 53987);
+
+            // Playing at 5.0s
+            tracker.OnPositionChangedFromPlayer(5000.0, isPlaying: true, out _);
+            tracker.OnFramePresented(5000.0, out _);
+            Assert.Equal(5000L, tracker.GetEffectivePositionMs(5000.0, nowTickMs: 1000));
+
+            // User seeks to 30.0s
+            long seekGen = tracker.BeginSeek(30000L);
+            Assert.True(tracker.HasPendingSeek);
+            Assert.Equal(30000L, tracker.GetEffectivePositionMs(5033.0, nowTickMs: 1020));
+
+            // Stale pre-seek frames already queued on UI dispatcher must NOT snap timeline back to 5.0s
+            Assert.False(tracker.OnPositionChangedFromPlayer(5033.0, isPlaying: true, out _));
+            Assert.False(tracker.OnFramePresented(5033.0, out _));
+            Assert.Equal(30000L, tracker.GetEffectivePositionMs(5066.0, nowTickMs: 1060));
+
+            // Seek completes on worker thread and FIFO barrier runs on UI thread
+            tracker.MarkSeekBarrierReached(seekGen, nowTickMs: 1100);
+            Assert.Equal(30000L, tracker.GetEffectivePositionMs(29900.0, nowTickMs: 1150));
+
+            // First post-seek frame arrives with exact decoded PTS 30.03s -> commits immediately
+            Assert.False(tracker.OnPositionChangedFromPlayer(30030.0, isPlaying: true, out _));
+            Assert.True(tracker.OnFramePresented(30030.0, out var postSeekMs));
+            Assert.Equal(30030L, postSeekMs);
+            Assert.False(tracker.HasPendingSeek);
+            Assert.Equal(30030L, tracker.GetEffectivePositionMs(30030.0, nowTickMs: 1200));
+        }
+
+        [Fact]
+        public void VideoPlaybackTimelineTracker_PausedSeek_HandlesReverseSingleFrameEventOrder()
+        {
+            var tracker = new VideoPlaybackTimelineTracker();
+            tracker.OnMediaOpened(durationMs: 53987);
+
+            // While paused, ProcessSingleFrame emits FrameReady FIRST and PositionChanged SECOND.
+            long seekGen = tracker.BeginSeek(27000L);
+            tracker.MarkSeekBarrierReached(seekGen, nowTickMs: 2000);
+
+            Assert.True(tracker.OnFramePresented(fallbackPositionMs: 27027.0, out var frameMs));
+            Assert.Equal(27027L, frameMs);
+
+            Assert.True(tracker.OnPositionChangedFromPlayer(positionMs: 27027.0, isPlaying: false, out var posMs));
+            Assert.Equal(27027L, posMs);
+            Assert.False(tracker.HasPendingSeek);
+            Assert.Equal(27027L, tracker.GetEffectivePositionMs(27027.0, nowTickMs: 2050));
+        }
+
+        [Fact]
+        public void VideoPlaybackTimelineTracker_ZeroDurationContainer_StillTracksExactPresentedMs()
+        {
+            var tracker = new VideoPlaybackTimelineTracker();
+            tracker.OnMediaOpened(durationMs: 0);
+
+            // Container had AV_NOPTS_VALUE duration (Length == 0), so VideoPlayerControl feeds exact _position ms
+            Assert.False(tracker.OnPositionChangedFromPlayer(positionMs: 4250.4, isPlaying: true, out _));
+            Assert.True(tracker.OnFramePresented(fallbackPositionMs: 4250.4, out var effectiveMs));
+            Assert.Equal(4250L, effectiveMs);
+            Assert.Equal(4250L, tracker.GetEffectivePositionMs(fallbackPlayerPositionMs: 4250.4, nowTickMs: 3000));
+
+            // Seeking near EOF where no further frames arrive commits target after barrier timeout
+            long seekGen = tracker.BeginSeek(6800L);
+            tracker.MarkSeekBarrierReached(seekGen, nowTickMs: 4000);
+            Assert.Equal(6800L, tracker.GetEffectivePositionMs(0.0, nowTickMs: 4500));
+            Assert.Equal(6800L, tracker.GetEffectivePositionMs(0.0, nowTickMs: 4000 + VideoPlaybackTimelineTracker.DefaultSeekBarrierTimeoutMs + 50));
+            Assert.False(tracker.HasPendingSeek);
+        }
+
+        [Fact]
+        public void SafeSeekPlayer_PreservesClockBaseline_OnSmallSeekDuringPlayback()
+        {
+            using var player = new FFmpegMediaPlayer();
+            VideoPreviewService.DisablePlayerDiskLogger(player);
+
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            typeof(FFmpegMediaPlayer).GetField("_isPlaying", flags)!.SetValue(player, true);
+            typeof(FFmpegMediaPlayer).GetField("_isPaused", flags)!.SetValue(player, false);
+            typeof(FFmpegMediaPlayer).GetField("_duration", flags)!.SetValue(player, 60.0);
+            typeof(FFmpegMediaPlayer).GetField("_position", flags)!.SetValue(player, 20.0);
+            typeof(FFmpegMediaPlayer).GetField("_startTime", flags)!.SetValue(player, 15.0);
+            typeof(FFmpegMediaPlayer).GetField("_playbackStartWallTime", flags)!.SetValue(player, 5.0);
+            typeof(FFmpegMediaPlayer).GetField("_totalPauseTime", flags)!.SetValue(player, 2.0);
+
+            // Without a native _formatContext, Seek is a safe no-op, and SafeSeekPlayer still adjusts the clock baseline
+            // for small deltas (<= 1.25s) so audio clearing _needsResync cannot cause runaway fast-forward.
+            VideoPreviewService.SafeSeekPlayer(player, (float)(20.5 / 60.0));
+
+            double newStart = (double)typeof(FFmpegMediaPlayer).GetField("_startTime", flags)!.GetValue(player)!;
+            double newWall = (double)typeof(FFmpegMediaPlayer).GetField("_playbackStartWallTime", flags)!.GetValue(player)!;
+            double newPause = (double)typeof(FFmpegMediaPlayer).GetField("_totalPauseTime", flags)!.GetValue(player)!;
+
+            Assert.InRange(newStart, 15.49, 15.51);
+            Assert.Equal(5.0, newWall);
+            Assert.Equal(2.0, newPause);
+            Assert.InRange(VideoPreviewService.TryGetPlayerPositionMs(player), 19999.0, 20001.0);
+        }
+
         private static void SetPrivateProperty<T>(object target, string propertyName, T value)
         {
             var prop = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);

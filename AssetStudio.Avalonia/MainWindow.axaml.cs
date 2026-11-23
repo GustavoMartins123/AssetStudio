@@ -265,6 +265,7 @@ public partial class MainWindow : Window
         VideoProgressBar.AddHandler(global::Avalonia.Controls.Primitives.Thumb.DragCompletedEvent, VideoProgressBar_DragCompleted);
         InitializeVideoPlayer();
         FfmpegVideoPlayer.MediaEnded += FfmpegVideoPlayer_MediaEnded;
+        FfmpegVideoPlayer.PositionUpdated += FfmpegVideoPlayer_PositionUpdated;
         FfmpegVideoPlayer.IsVisible = true;
 
         try
@@ -2247,6 +2248,7 @@ public partial class MainWindow : Window
             _audioProgressHandlersAttached = false;
         }
         FfmpegVideoPlayer.MediaEnded -= FfmpegVideoPlayer_MediaEnded;
+        FfmpegVideoPlayer.PositionUpdated -= FfmpegVideoPlayer_PositionUpdated;
 
         if (TextureGLPreview != null)
         {

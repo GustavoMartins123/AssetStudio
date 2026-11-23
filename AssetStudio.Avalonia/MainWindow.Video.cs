@@ -39,6 +39,7 @@ public partial class MainWindow
     private long _videoSessionCounter;
     private bool _isUpdatingVideoProgress;
     private bool _isVideoDragging;
+    private bool _videoHasExplicitSeekPosition;
     private bool _staleTempCleanupStarted;
     private long _videoLengthMs;
     private DispatcherTimer? _ffmpegVideoTimer;
@@ -47,7 +48,7 @@ public partial class MainWindow
     {
         _ffmpegVideoTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(100)
+            Interval = TimeSpan.FromMilliseconds(50)
         };
         _ffmpegVideoTimer.Tick += FfmpegVideoTimer_Tick;
 
@@ -187,6 +188,7 @@ public partial class MainWindow
     private void VideoStop()
     {
         Interlocked.Exchange(ref _autoPlayRequestedSessionId, -1);
+        _videoHasExplicitSeekPosition = false;
         CancelVideoPreviewLoad();
 
         try
@@ -241,6 +243,7 @@ public partial class MainWindow
         _currentTempVideoPath = null;
         _currentTempVideoAssetId = null;
         _videoLengthMs = 0;
+        _videoHasExplicitSeekPosition = false;
         MediaPlayback.ResetIfActive(ActiveMediaKind.Video);
         SetVideoStoppedUi();
 
@@ -347,6 +350,7 @@ public partial class MainWindow
         if (codecInfo.EstimatedDurationSeconds > 0)
         {
             _videoLengthMs = (long)Math.Round(codecInfo.EstimatedDurationSeconds * 1000.0);
+            FfmpegVideoPlayer?.SetFallbackDuration(_videoLengthMs);
             MediaPlayback.UpdatePosition(0, codecInfo.EstimatedDurationSeconds);
         }
 
@@ -662,10 +666,15 @@ public partial class MainWindow
 
             Interlocked.Exchange(ref _autoPlayRequestedSessionId, -1);
             FfmpegVideoPlayer.Volume = MediaPlayback.IsMuted ? 0 : MediaPlayback.VideoVolume;
-            if (hasLoadedFile && MediaPlayback.PlaybackState == MediaPlaybackState.Stopped && !MediaPlayback.IsReady)
+            if (hasLoadedFile
+                && MediaPlayback.PlaybackState == MediaPlaybackState.Stopped
+                && !MediaPlayback.IsReady
+                && !_videoHasExplicitSeekPosition
+                && FfmpegVideoPlayer.Position > 0)
             {
                 FfmpegVideoPlayer.Seek(0f);
             }
+            _videoHasExplicitSeekPosition = false;
 
             if (!FfmpegVideoPlayer.IsPlaying)
             {
@@ -785,6 +794,10 @@ public partial class MainWindow
             {
                 _videoLengthMs = durationMs;
             }
+            else if (_videoLengthMs > 0)
+            {
+                FfmpegVideoPlayer.SetFallbackDuration(_videoLengthMs);
+            }
 
             var readyDurationSec = (_videoLengthMs > 0 ? _videoLengthMs : durationMs) / 1000.0;
             var readyMessage = isThumbnailLoad
@@ -868,6 +881,56 @@ public partial class MainWindow
         FfmpegVideoPlayer.Volume = MediaPlayback.IsMuted ? 0 : MediaPlayback.VideoVolume;
     }
 
+    private void SyncVideoPositionUi(long positionMs)
+    {
+        var duration = Math.Max(0, FfmpegVideoPlayer.Duration);
+        if (duration > 0)
+        {
+            _videoLengthMs = duration;
+        }
+        else if (_videoLengthMs > 0)
+        {
+            FfmpegVideoPlayer.SetFallbackDuration(_videoLengthMs);
+        }
+
+        var effectiveDuration = _videoLengthMs > 0 ? _videoLengthMs : duration;
+        var clampedPos = Math.Max(0L, positionMs);
+        if (effectiveDuration > 0 && clampedPos > effectiveDuration)
+        {
+            clampedPos = effectiveDuration;
+        }
+
+        MediaPlayback.UpdatePosition(clampedPos / 1000.0, effectiveDuration / 1000.0);
+
+        if (effectiveDuration > 0)
+        {
+            SetVideoProgressBarPermilleSafe(MediaPlayback.ProgressPermille);
+        }
+    }
+
+    private void FfmpegVideoPlayer_PositionUpdated(object? sender, long positionMs)
+    {
+        if (_isVideoDragging || _currentVideoPreviewSource == null || !MediaPlayback.IsVideoActive)
+        {
+            return;
+        }
+
+        if (MediaPlayback.PlaybackState == MediaPlaybackState.Stopped
+            && !MediaPlayback.IsReady
+            && !_videoHasExplicitSeekPosition)
+        {
+            return;
+        }
+
+        try
+        {
+            SyncVideoPositionUi(positionMs);
+        }
+        catch
+        {
+        }
+    }
+
     private void FfmpegVideoTimer_Tick(object? sender, EventArgs e)
     {
         if (_isVideoDragging)
@@ -877,20 +940,7 @@ public partial class MainWindow
 
         try
         {
-            var duration = Math.Max(0, FfmpegVideoPlayer.Duration);
-            var position = Math.Max(0, FfmpegVideoPlayer.Position);
-            if (duration > 0)
-            {
-                _videoLengthMs = duration;
-            }
-
-            var effectiveDuration = _videoLengthMs > 0 ? _videoLengthMs : duration;
-            MediaPlayback.UpdatePosition(position / 1000.0, effectiveDuration / 1000.0);
-
-            if (effectiveDuration > 0)
-            {
-                SetVideoProgressBarPermilleSafe(MediaPlayback.ProgressPermille);
-            }
+            SyncVideoPositionUi(FfmpegVideoPlayer.Position);
 
             if (!FfmpegVideoPlayer.IsPlaying && MediaPlayback.IsPlaying)
             {
@@ -910,6 +960,7 @@ public partial class MainWindow
             try
             {
                 _ffmpegVideoTimer?.Stop();
+                _videoHasExplicitSeekPosition = false;
 
                 var loopPath = _currentTempVideoPath;
                 var sessionId = Volatile.Read(ref _videoSessionCounter);
@@ -922,10 +973,21 @@ public partial class MainWindow
 
                     if (reopened && sessionId == Volatile.Read(ref _videoSessionCounter))
                     {
+                        var durationMs = Math.Max(0, FfmpegVideoPlayer.Duration);
+                        if (durationMs > 0)
+                        {
+                            _videoLengthMs = durationMs;
+                        }
+                        else if (_videoLengthMs > 0)
+                        {
+                            FfmpegVideoPlayer.SetFallbackDuration(_videoLengthMs);
+                        }
+
                         FfmpegVideoPlayer.Volume = MediaPlayback.IsMuted ? 0 : MediaPlayback.VideoVolume;
                         FfmpegVideoPlayer.Play();
                         _ffmpegVideoTimer?.Start();
-                        MediaPlayback.UpdatePosition(0);
+                        MediaPlayback.UpdatePosition(0, _videoLengthMs / 1000.0);
+                        SetVideoProgressBarPermilleSafe(0);
                         MediaPlayback.SetPlaying();
                         return;
                     }
@@ -964,6 +1026,10 @@ public partial class MainWindow
 
         if (!_isVideoDragging)
         {
+            if (!FfmpegVideoPlayer.IsPlaying)
+            {
+                _videoHasExplicitSeekPosition = true;
+            }
             FfmpegVideoPlayer.Seek((float)ratio);
         }
     }
@@ -987,6 +1053,10 @@ public partial class MainWindow
             MediaPlayback.UpdatePosition((_videoLengthMs * ratio) / 1000.0);
         }
 
+        if (!FfmpegVideoPlayer.IsPlaying)
+        {
+            _videoHasExplicitSeekPosition = true;
+        }
         FfmpegVideoPlayer.Seek((float)ratio);
     }
 

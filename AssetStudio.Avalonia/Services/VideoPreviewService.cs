@@ -59,6 +59,265 @@ namespace AssetStudio.Avalonia.Services
     }
 
     /// <summary>
+    /// Headless, UI-framework-free timeline tracker that keeps displayed video playback seconds locked to
+    /// the frame actually painted on screen, prevents stale pre-seek frames from snapping the scrubber backward,
+    /// handles both FFmpegMediaPlayer event orders (playback: PositionChanged-&gt;FrameReady; paused single-frame:
+    /// FrameReady-&gt;PositionChanged), and works even when a container omits duration metadata.
+    /// </summary>
+    public sealed class VideoPlaybackTimelineTracker
+    {
+        public const long DefaultSeekBarrierTimeoutMs = 1200;
+
+        private readonly object _gate = new();
+        private long _durationMs;
+        private long _presentedPositionMs;
+        private bool _hasPresentedPosition;
+        private long _stagedPlaybackPositionMs = -1;
+        private long _activeSeekGeneration;
+        private long _completedSeekGeneration;
+        private long _pendingSeekTargetMs = -1;
+        private long _pendingSeekBarrierTickMs;
+
+        public long DurationMs
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _durationMs;
+                }
+            }
+        }
+
+        public bool HasPendingSeek
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _pendingSeekTargetMs >= 0;
+                }
+            }
+        }
+
+        public void Reset(long durationMs = 0)
+        {
+            lock (_gate)
+            {
+                _durationMs = Math.Max(0L, durationMs);
+                _presentedPositionMs = 0L;
+                _hasPresentedPosition = false;
+                _stagedPlaybackPositionMs = -1L;
+                _activeSeekGeneration++;
+                _completedSeekGeneration = _activeSeekGeneration;
+                _pendingSeekTargetMs = -1L;
+                _pendingSeekBarrierTickMs = 0L;
+            }
+        }
+
+        public void SetDurationMs(long durationMs)
+        {
+            if (durationMs <= 0)
+            {
+                return;
+            }
+
+            lock (_gate)
+            {
+                _durationMs = durationMs;
+                if (_presentedPositionMs > _durationMs)
+                {
+                    _presentedPositionMs = _durationMs;
+                }
+                if (_pendingSeekTargetMs > _durationMs)
+                {
+                    _pendingSeekTargetMs = _durationMs;
+                }
+            }
+        }
+
+        public void OnMediaOpened(long durationMs)
+        {
+            lock (_gate)
+            {
+                if (durationMs > 0)
+                {
+                    _durationMs = durationMs;
+                }
+                _presentedPositionMs = 0L;
+                _hasPresentedPosition = true;
+                _stagedPlaybackPositionMs = -1L;
+                _activeSeekGeneration++;
+                _completedSeekGeneration = _activeSeekGeneration;
+                _pendingSeekTargetMs = -1L;
+                _pendingSeekBarrierTickMs = 0L;
+            }
+        }
+
+        public long BeginSeek(long targetMs)
+        {
+            lock (_gate)
+            {
+                var clamped = ClampPositionLocked(targetMs);
+                _activeSeekGeneration++;
+                _pendingSeekTargetMs = clamped;
+                _pendingSeekBarrierTickMs = 0L;
+                _stagedPlaybackPositionMs = -1L;
+                return _activeSeekGeneration;
+            }
+        }
+
+        public void MarkSeekBarrierReached(long seekGeneration, long nowTickMs)
+        {
+            lock (_gate)
+            {
+                if (seekGeneration != _activeSeekGeneration)
+                {
+                    return;
+                }
+
+                _completedSeekGeneration = seekGeneration;
+                _pendingSeekBarrierTickMs = nowTickMs;
+            }
+        }
+
+        /// <summary>
+        /// Handles <c>FFmpegMediaPlayer.PositionChanged</c> on the UI thread.
+        /// During active playback (<paramref name="isPlaying"/> == true), <c>ProcessVideoPacket</c> fires
+        /// <c>PositionChanged</c> immediately before <c>FrameReady</c>, so the timestamp is staged until the paired
+        /// frame is actually painted. While paused/stopped (<c>ProcessSingleFrame</c>/<c>StepBackward</c>),
+        /// <c>FrameReady</c> fires before <c>PositionChanged</c>, so the timestamp commits immediately.
+        /// </summary>
+        public bool OnPositionChangedFromPlayer(
+            double positionMs,
+            bool isPlaying,
+            out long effectivePositionMs)
+        {
+            lock (_gate)
+            {
+                if (_activeSeekGeneration != _completedSeekGeneration)
+                {
+                    effectivePositionMs = GetEffectivePositionLocked(positionMs, 0L, allowBarrierTimeout: false);
+                    return false;
+                }
+
+                var normalized = NormalizeMsLocked(positionMs);
+                if (isPlaying)
+                {
+                    _stagedPlaybackPositionMs = normalized;
+                    effectivePositionMs = GetEffectivePositionLocked(positionMs, 0L, allowBarrierTimeout: false);
+                    return false;
+                }
+
+                _presentedPositionMs = normalized;
+                _hasPresentedPosition = true;
+                _stagedPlaybackPositionMs = -1L;
+                _pendingSeekTargetMs = -1L;
+                _pendingSeekBarrierTickMs = 0L;
+                effectivePositionMs = _presentedPositionMs;
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Handles <c>FFmpegMediaPlayer.FrameReady</c> on the UI thread immediately after the frame is painted.
+        /// Commits the staged timestamp (or fallback PTS) unless a seek barrier is still draining stale pre-seek frames.
+        /// </summary>
+        public bool OnFramePresented(
+            double fallbackPositionMs,
+            out long effectivePositionMs)
+        {
+            lock (_gate)
+            {
+                if (_activeSeekGeneration != _completedSeekGeneration)
+                {
+                    _stagedPlaybackPositionMs = -1L;
+                    effectivePositionMs = GetEffectivePositionLocked(fallbackPositionMs, 0L, allowBarrierTimeout: false);
+                    return false;
+                }
+
+                long frameMs;
+                if (_stagedPlaybackPositionMs >= 0)
+                {
+                    frameMs = _stagedPlaybackPositionMs;
+                    _stagedPlaybackPositionMs = -1L;
+                }
+                else
+                {
+                    frameMs = NormalizeMsLocked(fallbackPositionMs);
+                }
+
+                _presentedPositionMs = frameMs;
+                _hasPresentedPosition = true;
+                _pendingSeekTargetMs = -1L;
+                _pendingSeekBarrierTickMs = 0L;
+                effectivePositionMs = _presentedPositionMs;
+                return true;
+            }
+        }
+
+        public long GetEffectivePositionMs(double fallbackPlayerPositionMs, long nowTickMs)
+        {
+            lock (_gate)
+            {
+                return GetEffectivePositionLocked(fallbackPlayerPositionMs, nowTickMs, allowBarrierTimeout: true);
+            }
+        }
+
+        private long GetEffectivePositionLocked(double fallbackPlayerPositionMs, long nowTickMs, bool allowBarrierTimeout)
+        {
+            if (_pendingSeekTargetMs >= 0)
+            {
+                if (_activeSeekGeneration != _completedSeekGeneration)
+                {
+                    return _pendingSeekTargetMs;
+                }
+
+                if (!allowBarrierTimeout
+                    || _pendingSeekBarrierTickMs == 0
+                    || (nowTickMs - _pendingSeekBarrierTickMs) < DefaultSeekBarrierTimeoutMs)
+                {
+                    return _pendingSeekTargetMs;
+                }
+
+                // Seek completed and no new frame arrived within timeout (e.g. sought to EOF); commit seek target.
+                _presentedPositionMs = _pendingSeekTargetMs;
+                _hasPresentedPosition = true;
+                _pendingSeekTargetMs = -1L;
+                _pendingSeekBarrierTickMs = 0L;
+                return _presentedPositionMs;
+            }
+
+            if (_hasPresentedPosition)
+            {
+                return _presentedPositionMs;
+            }
+
+            return NormalizeMsLocked(fallbackPlayerPositionMs);
+        }
+
+        private long NormalizeMsLocked(double rawMs)
+        {
+            if (double.IsNaN(rawMs) || double.IsInfinity(rawMs) || rawMs <= 0.0)
+            {
+                return 0L;
+            }
+
+            return ClampPositionLocked((long)Math.Round(rawMs));
+        }
+
+        private long ClampPositionLocked(long ms)
+        {
+            if (ms <= 0L)
+            {
+                return 0L;
+            }
+
+            return _durationMs > 0L && ms > _durationMs ? _durationMs : ms;
+        }
+    }
+
+    /// <summary>
     /// Dedicated background teardown queue for <see cref="FFmpegMediaPlayer"/> and arbitrary disposable video backends.
     /// Never blocks the UI thread, breaks the 1000ms <c>FFmpegMediaPlayer.Stop()</c> self-deadlock by cancelling and joining
     /// <c>_playbackThread</c> outside <c>player._lock</c>, isolates exceptions, and deletes temp files only after the native
@@ -722,6 +981,18 @@ namespace AssetStudio.Avalonia.Services
             typeof(FFmpegMediaPlayer).GetField("_cancellationTokenSource", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo? PlayerPlaybackThreadField =
             typeof(FFmpegMediaPlayer).GetField("_playbackThread", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo? PlayerLockField =
+            typeof(FFmpegMediaPlayer).GetField("_lock", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo? PlayerPositionField =
+            typeof(FFmpegMediaPlayer).GetField("_position", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo? PlayerDurationField =
+            typeof(FFmpegMediaPlayer).GetField("_duration", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo? PlayerStartTimeField =
+            typeof(FFmpegMediaPlayer).GetField("_startTime", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo? PlayerPlaybackStartWallTimeField =
+            typeof(FFmpegMediaPlayer).GetField("_playbackStartWallTime", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo? PlayerTotalPauseTimeField =
+            typeof(FFmpegMediaPlayer).GetField("_totalPauseTime", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo? PlayerLoggerField =
             typeof(FFmpegMediaPlayer).GetField("_logger", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo? LoggerDisposedField =
@@ -1018,6 +1289,89 @@ namespace AssetStudio.Avalonia.Services
             catch
             {
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Reads <see cref="FFmpegMediaPlayer"/>'s exact double-precision <c>_position</c> in milliseconds.
+        /// Unlike <c>player.Position * player.Length</c>, this avoids float truncation and still reports accurate
+        /// timestamps when a container omits duration metadata (<c>player.Length == 0</c>).
+        /// </summary>
+        public static double TryGetPlayerPositionMs(FFmpegMediaPlayer? player)
+        {
+            if (player == null)
+            {
+                return 0.0;
+            }
+
+            try
+            {
+                if (PlayerPositionField?.GetValue(player) is double posSec
+                    && !double.IsNaN(posSec)
+                    && !double.IsInfinity(posSec)
+                    && posSec >= 0.0)
+                {
+                    return posSec * 1000.0;
+                }
+            }
+            catch
+            {
+            }
+
+            return player.Length > 0 ? Math.Max(0.0, player.Position * (double)player.Length) : 0.0;
+        }
+
+        /// <summary>
+        /// Seeks <see cref="FFmpegMediaPlayer"/> and guards against its small-seek audio resync bug:
+        /// <c>Seek()</c> zeroes <c>_startTime</c> and <c>_playbackStartWallTime</c> expecting <c>ProcessVideoPacket</c>
+        /// to observe <c>_needsResync == true</c>, but <c>ProcessAudioPacket</c> can clear <c>_needsResync</c> first;
+        /// when the seek delta is &lt;= 1s, <c>ProcessVideoPacket</c> then skips its discontinuity reset and paces
+        /// against a zeroed baseline (causing runaway fast-forward). Shifting <c>_startTime</c> by the seek delta while
+        /// keeping <c>_needsResync = true</c> guarantees exact wall-clock pacing regardless of packet arrival order.
+        /// </summary>
+        public static void SafeSeekPlayer(FFmpegMediaPlayer? player, float positionPercent)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            var clamped = Math.Clamp(positionPercent, 0f, 1f);
+            var playerLock = PlayerLockField?.GetValue(player);
+            if (playerLock == null)
+            {
+                player.Seek(clamped);
+                return;
+            }
+
+            lock (playerLock)
+            {
+                bool wasPlaying = player.IsPlaying;
+                double oldPos = PlayerPositionField?.GetValue(player) is double p ? p : 0.0;
+                double duration = PlayerDurationField?.GetValue(player) is double d ? d : 0.0;
+                double oldStart = PlayerStartTimeField?.GetValue(player) is double s ? s : 0.0;
+                double oldWall = PlayerPlaybackStartWallTimeField?.GetValue(player) is double w ? w : 0.0;
+                double oldPause = PlayerTotalPauseTimeField?.GetValue(player) is double pt ? pt : 0.0;
+
+                player.Seek(clamped);
+
+                if (wasPlaying && duration > 0.0 && oldWall > 0.0)
+                {
+                    double targetSec = duration * clamped;
+                    double delta = targetSec - oldPos;
+                    if (Math.Abs(delta) <= 1.25)
+                    {
+                        try
+                        {
+                            PlayerStartTimeField?.SetValue(player, oldStart + delta);
+                            PlayerPlaybackStartWallTimeField?.SetValue(player, oldWall);
+                            PlayerTotalPauseTimeField?.SetValue(player, oldPause);
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
             }
         }
 
