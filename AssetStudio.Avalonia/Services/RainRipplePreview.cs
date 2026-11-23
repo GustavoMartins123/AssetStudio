@@ -8,7 +8,7 @@ using NumericsVector4 = System.Numerics.Vector4;
 
 namespace AssetStudio.Avalonia.Services;
 
-internal static class OthercideRainPreview
+internal static class RainRipplePreview
 {
     private const string RippleTarget = "_RainRippleRT";
     private const string RippleShader = "BoH/Environment/Rain/RainRippleToRT";

@@ -219,6 +219,12 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, float, byte, void>)Slot(_context, 53))(
             _context, depth, clearStencil ? 3u : 1u, value, 0);
 
+    internal void ClearComputeOutput(nint view)
+    {
+        uint* zeros = stackalloc uint[] { 0, 0, 0, 0 };
+        ((delegate* unmanaged[Stdcall]<nint, nint, uint*, void>)Slot(_context, 51))(_context, view, zeros);
+    }
+
     internal void ClearColor(nint surface, float color = 0, float alpha = 0) =>
         ClearColor(surface, new NumericsVector4(color, color, color, alpha));
 
@@ -265,7 +271,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     }
 
     internal void SetPass(nint surface, nint depth, nint blendState, nint depthState, byte stencilReference, nint rasterizerState,
-        int size, nint secondarySurface = 0, int x = 0, int y = 0)
+        int size, nint secondarySurface = 0, int x = 0, int y = 0, int? height = null)
     {
         nint* outputs = stackalloc nint[] { surface, secondarySurface };
         uint outputCount = secondarySurface != 0 ? 2u : surface != 0 ? 1u : 0u;
@@ -274,7 +280,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         ((delegate* unmanaged[Stdcall]<nint, nint, float*, uint, void>)Slot(_context, 35))(_context, blendState, null, uint.MaxValue);
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, void>)Slot(_context, 36))(_context, depthState, stencilReference);
         ((delegate* unmanaged[Stdcall]<nint, nint, void>)Slot(_context, 43))(_context, rasterizerState);
-        var viewport = new Viewport { X = x, Y = y, Width = size, Height = size, MaxDepth = 1 };
+        var viewport = new Viewport { X = x, Y = y, Width = size, Height = height ?? size, MaxDepth = 1 };
         ((delegate* unmanaged[Stdcall]<nint, uint, Viewport*, void>)Slot(_context, 44))(_context, 1, &viewport);
     }
 

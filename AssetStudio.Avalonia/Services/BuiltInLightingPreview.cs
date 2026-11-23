@@ -60,6 +60,8 @@ internal sealed class BuiltInLightingPreview
                 ImageEffectPreview.MainTexture when UsesHdrColor(effect) =>
                     CreateHdrTexture(size),
                 ImageEffectPreview.MainTexture => NewTexture(size, 28) with { Filter = 1 },
+                ScenePostProcessingPreview.HighlightMask when effect == ImageEffectPass.TargetHighlight =>
+                    new(size, size, 1, 49 /* R8G8_UNORM */, 2, false, new byte[size * size * 2], 1, 1, 1, 0),
                 ImageEffectPreview.BokehBlurredColor when effect == ImageEffectPass.Bokeh =>
                     CreateHdrTexture(size),
                 _ => throw new ArgumentException($"Unknown Built-in camera texture '{input}'.", nameof(inputs))
@@ -114,6 +116,7 @@ internal sealed class BuiltInLightingPreview
         var depthNormals = GetPixels(CameraDepthNormals);
         var reflections = MemoryMarshal.Cast<byte, Half>(GetPixels(ScreenSpaceReflectionPreview.CameraReflections));
         var color = GetPixels(ImageEffectPreview.MainTexture);
+        var highlightMask = GetPixels(ScenePostProcessingPreview.HighlightMask);
         var motionVectors = GetPixels(MotionPreview.MotionTexture);
         var unityMotionVectors = MemoryMarshal.Cast<byte, Half>(GetPixels(MotionPreview.UnityMotionTexture));
         bool motionBlur = MotionPreview.IsMotionBlur(_effect);
@@ -146,6 +149,12 @@ internal sealed class BuiltInLightingPreview
                 float depth = hit ? ProjectDepth(point, worldToClip) : 1;
                 bool visible = depth < 1;
                 byte objectId = sphere && visible ? (byte)1 : (byte)0;
+                if (!highlightMask.IsEmpty)
+                {
+                    // The replacement shader stores coverage in R and half the selected object ID in G.
+                    highlightMask[index * 2] = objectId == 1 ? (byte)255 : (byte)0;
+                    highlightMask[index * 2 + 1] = objectId == 1 ? (byte)128 : (byte)0;
+                }
                 if (!depths.IsEmpty)
                 {
                     depths[index] = _reversedDepth ? 1 - depth : depth;

@@ -11,7 +11,7 @@ namespace AssetStudio.Avalonia.Services;
 
 internal sealed record TerrainPreviewMesh(NumericsVector3[] Positions, NumericsVector3[] Normals, NumericsVector2[] Uvs, uint[] Indices);
 
-internal enum TerrainPreviewPass { Surface, Basemap, Normalmap, HeightCopy, AdditionalLayers }
+internal enum TerrainPreviewPass { Surface, Basemap, Normalmap, HeightCopy, AdditionalLayers, LayerChannel }
 
 internal static class TerrainShaderPreview
 {
@@ -26,6 +26,7 @@ internal static class TerrainShaderPreview
         "Hidden/TerrainEngine/Splatmap/Diffuse-AddPass" or "Hidden/TerrainEngine/Splatmap/Standard-AddPass" => TerrainPreviewPass.AdditionalLayers,
         "Hidden/TerrainEngine/GenerateNormalmap" => TerrainPreviewPass.Normalmap,
         "Hidden/TerrainEngine/HeightBlitCopy" => TerrainPreviewPass.HeightCopy,
+        "Hidden/TerrainEngine/TerrainLayerUtils" => TerrainPreviewPass.LayerChannel,
         _ => null
     };
 
@@ -75,6 +76,14 @@ internal static class TerrainShaderPreview
         if (!heightBlit && (layerCount <= 0 || maps.Length <= layerStart / LayersPerPass))
         {
             throw new NotSupportedException($"The terrain has no layer group for its {pass} pass.");
+        }
+        if (pass == TerrainPreviewPass.LayerChannel)
+        {
+            // TerrainPaintUtility selects the first serialized layer from channel R of the first weight map.
+            values["_LayerMask"] = new(1, 0, 0, 0);
+            textures.Add(MainTexture, ShaderPreviewService.ReadTexture(resolveTexture(file, maps[0]),
+                ShaderPreviewTextureDimension.Texture2D));
+            return null;
         }
 
         // Seek from the root because the remainder of the splat database may contain version-specific fields.

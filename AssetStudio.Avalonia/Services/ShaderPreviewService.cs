@@ -19,6 +19,7 @@ public sealed record ShaderPreviewFrame(int Width, int Height, byte[] RgbaPixels
 internal abstract record ShaderPreviewOperation;
 internal sealed record ShaderPreviewRenderTarget(string Name, int Size, int Filter = 1)
 {
+    internal int Height { get; init; } = Size;
     internal int Format { get; init; } = D3D11PreviewDevice.Rgba16Float;
     internal int ArraySize { get; init; } = 1;
     internal int MipLevels { get; init; } = 1;
@@ -67,6 +68,7 @@ internal sealed record ShaderPreviewDispatch(ShaderPreviewComputeKernel Kernel, 
 {
     internal override IEnumerable<ShaderPreviewStage> Stages => [Kernel.Stage];
     internal IReadOnlyDictionary<string, ShaderPreviewRenderTarget>? TextureOutputs { get; init; }
+    internal bool ClearOutputs { get; init; }
 }
 internal sealed record ShaderPreviewCopyMip(ShaderPreviewRenderTarget Source, ShaderPreviewRenderTarget Destination, int Mip) : ShaderPreviewOperation;
 internal sealed record ShaderPreviewPresentSlice(ShaderPreviewRenderTarget Source, int Slice) : ShaderPreviewOperation;
@@ -154,6 +156,14 @@ internal static class ShaderPreviewService
         CancellationToken cancellationToken, IReadOnlyList<ShaderPreviewLight>? lights = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        bool unity2019_3 = shader.version is [2019, 3, ..];
+        bool windowParallax = unity2019_3 && ShaderPreviewReader.ReadName(shader) == EffectPreviewAssets.WindowShader;
+        if (windowParallax && material == null)
+        {
+            // The isolated shader preview uses the serialized shop window material.
+            material = EffectPreviewAssets.Require<Material>(shader, ClassIDType.Material, EffectPreviewAssets.ShopMaterial,
+                resolveAsset, cancellationToken);
+        }
         if (material != null)
         {
             var reference = material.m_Shader;
@@ -171,9 +181,11 @@ internal static class ShaderPreviewService
         }
         var reader = ShaderPreviewReader.Read(shader);
         bool serialized = reader is not LegacyShaderPreview;
-        var cameraPreview = serialized ? SerializedCameraShaderPreview.Find(reader.Name) : null;
+        var sceneEffect = unity2019_3 ? ScenePostProcessingPreview.Find(reader.Name) : null;
+        var volumetricEffect = unity2019_3 ? VolumetricCameraPreview.Find(reader.Name) : null;
+        var cameraPreview = sceneEffect ?? volumetricEffect ?? (serialized ? SerializedCameraShaderPreview.Find(reader.Name) : null);
         var terrainPass = shader.version is [2019, 3, ..] ? TerrainShaderPreview.Find(reader.Name) : null;
-        if (terrainPass is TerrainPreviewPass.Basemap or TerrainPreviewPass.Normalmap or TerrainPreviewPass.HeightCopy)
+        if (terrainPass is TerrainPreviewPass.Basemap or TerrainPreviewPass.Normalmap or TerrainPreviewPass.HeightCopy or TerrainPreviewPass.LayerChannel)
         {
             cameraPreview = new SerializedCameraShaderPreview(reader.Name, [0], false);
         }
@@ -227,7 +239,8 @@ internal static class ShaderPreviewService
             "sphere" or "plane" when reader.Name.StartsWith("Particles/", StringComparison.OrdinalIgnoreCase) ||
                 reader.Name.Contains("/Particles/", StringComparison.OrdinalIgnoreCase) => ShaderPreviewGeometry.Particles,
             "sphere" when reader.Name.Equals("Hidden/FogVolume", StringComparison.Ordinal) => ShaderPreviewGeometry.Volume,
-            "sphere" when subShader.Tags.ContainsKey("WaterMode") || reader.Name.StartsWith("UI/", StringComparison.Ordinal) => ShaderPreviewGeometry.Plane,
+            "sphere" when windowParallax || subShader.Tags.ContainsKey("WaterMode") ||
+                reader.Name.StartsWith("UI/", StringComparison.Ordinal) => ShaderPreviewGeometry.Plane,
             "sphere" => ShaderPreviewGeometry.Sphere,
             "plane" => ShaderPreviewGeometry.Plane,
             "skybox" => ShaderPreviewGeometry.Skybox,
@@ -376,6 +389,16 @@ internal static class ShaderPreviewService
         if (cameraPreview != null)
         {
             operations = [.. cameraPreview.Prepare(operations, values, textures, RenderSize)];
+            if (sceneEffect != null)
+            {
+                operations = [.. ScenePostProcessingPreview.Prepare(shader, reader.Name, operations, values, textures,
+                    resolveAsset, Resolve<Texture>, RenderSize, cancellationToken)];
+            }
+            if (volumetricEffect != null)
+            {
+                operations = [.. VolumetricCameraPreview.Prepare(shader, reader.Name, operations, textures,
+                    RenderSize, cancellationToken)];
+            }
             if (terrainArrays != null)
             {
                 operations = [operations.OfType<ShaderPreviewDraw>().Single() with { VectorArrays = terrainArrays }];
@@ -456,9 +479,9 @@ internal static class ShaderPreviewService
             }
         }
 
-        if (shader.version is [2019, 3, ..] && OthercideRainPreview.Handles(reader.Name))
+        if (unity2019_3 && RainRipplePreview.Handles(reader.Name))
         {
-            OthercideRainPreview.AddRipplePass(shader, material, operations, textures,
+            RainRipplePreview.AddRipplePass(shader, material, operations, textures,
                 loadExternalSources, resolveAsset, cancellationToken);
         }
 
@@ -470,6 +493,7 @@ internal static class ShaderPreviewService
                     .Select(binding => operation.TextureSource(binding.Name))))
             {
                 if (BuiltInLightingPreview.IsSurfaceTexture(name) || name == BuiltInLightingPreview.CameraDepth ||
+                    (imageEffect == ImageEffectPass.TargetHighlight && name == ScenePostProcessingPreview.HighlightMask) ||
                     (imageEffect == ImageEffectPass.Bokeh && name == ImageEffectPreview.BokehBlurredColor) ||
                     (imageEffect == ImageEffectPass.MotionBlur && name == MotionPreview.MotionTexture) ||
                     (MotionPreview.UsesUnityMotionTexture(imageEffect) && name == MotionPreview.UnityMotionTexture) ||
@@ -511,7 +535,8 @@ internal static class ShaderPreviewService
             {
                 if (!renderedTargets.Contains(copy.Source) || copy.Source == copy.Destination ||
                     copy.Source.ArraySize != 1 || copy.Destination.ArraySize != 1 || copy.Source.Format != copy.Destination.Format ||
-                    copy.Destination.Size is <= 0 or > RenderSize ||
+                    copy.Destination.Size is <= 0 or > RenderSize || copy.Destination.Height != copy.Destination.Size ||
+                    copy.Source.Height != copy.Source.Size ||
                     copy.Destination.MipLevels < 2 ||
                     copy.Destination.MipLevels > 1 + System.Numerics.BitOperations.Log2((uint)copy.Destination.Size) ||
                     (uint)copy.Mip >= (uint)copy.Destination.MipLevels || copy.Source.Size != copy.Destination.Size >> copy.Mip)
@@ -533,7 +558,8 @@ internal static class ShaderPreviewService
             if (operation is ShaderPreviewPresentSlice present)
             {
                 var source = present.Source;
-                if (!renderedTargets.Contains(source) || source is not { ArraySize: > 1, MipLevels: 1, Size: RenderSize, Format: D3D11PreviewDevice.Rgba8 } ||
+                if (!renderedTargets.Contains(source) ||
+                    source is not { ArraySize: > 1, MipLevels: 1, Size: RenderSize, Height: RenderSize, Format: D3D11PreviewDevice.Rgba8 } ||
                     (uint)present.Slice >= (uint)source.ArraySize)
                 {
                     throw new InvalidDataException($"Render target slice '{source.Name}[{present.Slice}]' cannot be displayed.");
@@ -551,6 +577,7 @@ internal static class ShaderPreviewService
                         {
                             var target = dispatch.TextureOutputs?.GetValueOrDefault(binding.Name);
                             if (target is not { UnorderedAccess: true, MipLevels: 1 } || target.Size is <= 0 or > RenderSize ||
+                                target.Height != target.Size ||
                                 target.Dimension != binding.Dimension || target.ArraySize is <= 0 or > 2048 ||
                                 dispatch.Inputs?.Values.Contains(target) == true)
                             {
@@ -601,8 +628,9 @@ internal static class ShaderPreviewService
                         pass.State.Stencil == null;
                     if ((!depthIndependent && ((draw.Geometry ?? geometry) != ShaderPreviewGeometry.ScreenQuad || pass.State.ZWrite)) ||
                         pass.State.AlphaToMask ||
-                        output.Size <= 0 || output.Size > maxSize || output.MipLevels != 1 || output.ArraySize is <= 0 or > 2048 ||
-                        (output.ArraySize > 1 && !depthIndependent))
+                        output.Size <= 0 || output.Size > maxSize || output.Height <= 0 || output.Height > maxSize ||
+                        output.MipLevels != 1 || output.ArraySize is <= 0 or > 2048 ||
+                        (output.ArraySize > 1 && (!depthIndependent || output.Height != output.Size)))
                     {
                         throw new NotSupportedException($"Unsupported state for render target '{output.Name}'.");
                     }
@@ -1027,6 +1055,7 @@ internal static class ShaderPreviewService
         MotionPreviewFrame? motion, NumericsMatrix4x4? billboardTransform, ShaderPreviewParameter? unusedVertexParameter)
     {
         var light = draw.Light;
+        bool volumetric = scene.ImageEffect == ImageEffectPass.VolumetricCamera;
         return PackConstants(buffer, ResolveMatrix, ResolveVector, unusedVertexParameter);
 
         NumericsMatrix4x4 ResolveMatrix(string name, int arraySize, int element)
@@ -1037,6 +1066,11 @@ internal static class ShaderPreviewService
                 {
                     // Only cascade zero is active in the preview.
                     return element == 0 ? lighting!.WorldToShadow : default;
+                }
+                if (volumetric && name == "hxVolumeMatrixOld" && arraySize == 10)
+                {
+                    // The directional preview has no local density volumes.
+                    return default;
                 }
                 throw MissingValue(name);
             }
@@ -1063,6 +1097,10 @@ internal static class ShaderPreviewService
                 "_InverseViewMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name => Inverse(view),
                 "_InverseProjectionMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name =>
                     Inverse(BuiltInLightingPreview.DepthProjection(projection, reversedDepth: true)),
+                "InverseProjectionMatrix" when volumetric =>
+                    Inverse(BuiltInLightingPreview.DepthProjection(projection, reversedDepth: true)),
+                "hxCameraToWorld" when volumetric => NumericsMatrix4x4.CreateScale(1, 1, -1) * Inverse(view),
+                "VolumetricMVP" when volumetric => NumericsMatrix4x4.Identity,
                 "_ScreenSpaceProjectionMatrix" when scene.ShaderName == PostProcessingV2ReflectionPreview.Name =>
                     ScreenSpaceReflectionPreview.ProjectToPixel(BuiltInLightingPreview.DepthProjection(projection, reversedDepth: true), size),
                 "_NonJitteredVP" when scene.SerializedShader && motion.HasValue => view * projection,
@@ -1093,7 +1131,7 @@ internal static class ShaderPreviewService
                 return perDraw;
             }
             if (TryVertexLight(name, arraySize, element, scene.Lights, view, out var vertexLight) ||
-                (arraySize == 1 && TryTerrainImposterLight(name, scene.Lights, out vertexLight)))
+                TryTerrainImposterLight(name, arraySize, element, scene.Lights, out vertexLight))
             {
                 return vertexLight;
             }
@@ -1115,7 +1153,7 @@ internal static class ShaderPreviewService
                 string textureName = draw.TextureSource(slot);
                 if (draw.Inputs?.TryGetValue(slot, out var target) == true)
                 {
-                    return new NumericsVector4(1f / target.Size, 1f / target.Size, target.Size, target.Size);
+                    return new NumericsVector4(1f / target.Size, 1f / target.Height, target.Size, target.Height);
                 }
                 if (captures.Contains(textureName))
                 {
@@ -1143,6 +1181,7 @@ internal static class ShaderPreviewService
             return name switch
             {
                 "_WorldSpaceCameraPos" => new NumericsVector4(eye, 1),
+                "CameraFoward" when volumetric => new NumericsVector4(-view.M13, -view.M23, -view.M33, 0),
                 "_CameraWS" when scene.ImageEffect == ImageEffectPass.GlobalFog => new NumericsVector4(eye, 1),
                 "_HeightParams" when scene.ImageEffect == ImageEffectPass.GlobalFog =>
                     new NumericsVector4(1, eye.Y - 1, eye.Y <= 1 ? 1 : 0, 1),
@@ -1158,7 +1197,8 @@ internal static class ShaderPreviewService
                 "_AM_RCP_TOTAL_VELOCITY" when motion.HasValue => new NumericsVector4(1f / (MotionPreview.MaxVelocity - MotionPreview.MinVelocity), 0, 0, 0),
                 "_AM_BONE_TEXEL_SIZE" when scene.ImageEffect == ImageEffectPass.SkinDeformation => BoneTexelSize(),
                 "_AM_BONE_TEXEL_HALFSIZE" when scene.ImageEffect == ImageEffectPass.SkinDeformation => BoneTexelSize() * 0.5f,
-                "_ScreenParams" => new NumericsVector4(size, size, 1f + 1f / size, 1f + 1f / size),
+                "_ScreenParams" => new NumericsVector4(size, draw.Output?.Height ?? size, 1f + 1f / size,
+                    1f + 1f / (draw.Output?.Height ?? size)),
                 "_ClipRange" or "_ClipRange0" or "_ClipRange1" or "_ClipRange2" or "_ClipRange3" => new NumericsVector4(0, 0, 1, 1),
                 "_ClipArgs0" or "_ClipArgs1" or "_ClipArgs2" or "_ClipArgs3" => new NumericsVector4(16, 16, 0, 1),
                 "_ClipSharpness" => new NumericsVector4(16, 16, 0, 0),
@@ -1168,7 +1208,7 @@ internal static class ShaderPreviewService
                 "_UndoOutputSRGB" when scene.ImageEffect == ImageEffectPass.RenderTargetDisplay => NumericsVector4.Zero,
                 "_Phase" when scene.ImageEffect == ImageEffectPass.PostProcessingGrain =>
                     new NumericsVector4(scene.ShaderName == PostProcessingV2Preview.GrainBaker ? time % 10 : time / 20f),
-                // Othercide's BOHColorCorrection sets (1 / gamma, contrast, color-blind shift, brightness).
+                // BOHColorCorrection sets (1 / gamma, contrast, color-blind shift, brightness).
                 "_BOHUserSettingsColors" when scene.SerializedShader => new NumericsVector4(1, 1, 0, 1),
                 "_ProjInfo" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection => ScreenSpaceReflectionPreview.ProjectionInfo(projection, RenderSize),
                 "_PixelsPerMeterAtOneMeter" when scene.ImageEffect == ImageEffectPass.ScreenSpaceReflection =>
@@ -1271,7 +1311,7 @@ internal static class ShaderPreviewService
             {
                 continue;
             }
-            if (parameter.Type is not (0 or 1 or 2) || parameter.ArraySize < 1 || parameter.Offset < 0)
+            if (parameter.Type is not (0 or 1 or 2 or 5) || parameter.ArraySize < 1 || parameter.Offset < 0)
             {
                 throw new NotSupportedException($"Unsupported shader parameter format for '{parameter.Name}'.");
             }
@@ -1315,6 +1355,15 @@ internal static class ShaderPreviewService
                             {
                                 throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires a Boolean.");
                             }
+                            if (parameter.Type == 5)
+                            {
+                                if (!float.IsFinite(integer) || MathF.Truncate(integer) != integer || integer < 0 || integer >= 4294967296f)
+                                {
+                                    throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires an unsigned 32-bit integer.");
+                                }
+                                BinaryPrimitives.WriteUInt32LittleEndian(destination[(component * 4)..], (uint)integer);
+                                continue;
+                            }
                             if (!float.IsFinite(integer) || MathF.Truncate(integer) != integer || integer < int.MinValue || integer >= 2147483648f)
                             {
                                 throw new InvalidDataException($"Shader parameter '{parameter.Name}' requires a 32-bit integer.");
@@ -1344,20 +1393,26 @@ internal static class ShaderPreviewService
             topLeft.Z, topRight.Z, bottomRight.Z, bottomLeft.Z, 0, 0, 0, 0);
     }
 
-    private static bool TryTerrainImposterLight(string name, IReadOnlyList<ShaderPreviewLight> lights, out NumericsVector4 value)
+    private static bool TryTerrainImposterLight(string name, int arraySize, int element,
+        IReadOnlyList<ShaderPreviewLight> lights, out NumericsVector4 value)
     {
         value = default;
         const string directions = "_TerrainTreeLightDirections";
         const string colors = "_TerrainTreeLightColors";
         bool direction = name.StartsWith(directions, StringComparison.Ordinal);
-        if (!(direction || name.StartsWith(colors, StringComparison.Ordinal)) ||
-            !int.TryParse(name.AsSpan((direction ? directions : colors).Length), out int index) || index is < 0 or > 3)
+        if (!direction && !name.StartsWith(colors, StringComparison.Ordinal))
         {
             return false;
         }
-        if (index < lights.Count)
+        var suffix = name.AsSpan((direction ? directions : colors).Length);
+        if (!(arraySize == 4 && suffix.IsEmpty) &&
+            !(arraySize == 1 && int.TryParse(suffix, out element) && element is >= 0 and < 4))
         {
-            value = direction ? new NumericsVector4(lights[index].Direction, 0) : new NumericsVector4(lights[index].Color, 1);
+            return false;
+        }
+        if (element < lights.Count)
+        {
+            value = direction ? new NumericsVector4(lights[element].Direction, 0) : new NumericsVector4(lights[element].Color, 1);
         }
         return true;
     }

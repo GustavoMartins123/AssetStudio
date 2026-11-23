@@ -464,7 +464,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             nint secondaryView = temporal ? GetRenderTarget(TemporalHistory[_historyReadIndex ^ 1]).View : 0;
             _device.SetPass(targetView, depthView, gpu.Blend, gpu.Depth,
                 pass.State.Stencil?.Reference ?? 0, gpu.Rasterizer, size, secondaryView,
-                draw.Viewport?.X ?? 0, draw.Viewport?.Y ?? 0);
+                draw.Viewport?.X ?? 0, draw.Viewport?.Y ?? 0, draw.Output?.Height);
             if (draw.PointPass == ShaderPreviewPointPass.Collect)
             {
                 _device.SetAppendTarget(targetView, depthView, _bokehPoints.AppendView);
@@ -540,6 +540,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 if (output == 0)
                 {
                     throw new InvalidDataException($"No writable resource is bound for '{binding.Name}'.");
+                }
+                if (dispatch.ClearOutputs)
+                {
+                    _device.ClearComputeOutput(output);
                 }
                 _device.SetComputeOutput(output, binding.Slot);
             }
@@ -925,7 +929,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         {
             nint image = _device.CreateTexture(new TextureDesc
             {
-                Width = (uint)target.Size, Height = (uint)target.Size, MipLevels = (uint)target.MipLevels, ArraySize = (uint)target.ArraySize,
+                Width = (uint)target.Size, Height = (uint)target.Height, MipLevels = (uint)target.MipLevels, ArraySize = (uint)target.ArraySize,
                 Format = target.Format,
                 SampleCount = 1, BindFlags = BindShaderResource | BindRenderTarget | (target.UnorderedAccess ? BindUnorderedAccess : 0u)
             });

@@ -8,7 +8,9 @@ namespace AssetStudio.Avalonia.Services;
 
 internal static class TextMeshProShaderPreview
 {
-    internal static bool IsTextShader(string shaderName) => shaderName.StartsWith("TextMeshPro/", StringComparison.Ordinal);
+    internal static bool IsTextShader(string shaderName) =>
+        shaderName.StartsWith("TextMeshPro/", StringComparison.Ordinal) ||
+        shaderName.StartsWith("Soft Mask/TextMeshPro/", StringComparison.Ordinal);
 
     internal static void SetDrawProperties(IDictionary<string, NumericsVector4> values)
     {
