@@ -14,7 +14,7 @@ namespace AssetStudio
     public sealed record ShaderPreviewTextureBinding(string Name, int Slot, int SamplerSlot, ShaderPreviewTextureDimension Dimension);
     public sealed record ShaderPreviewStructuredBufferBinding(string Name, int Slot);
     public sealed record ShaderPreviewSamplerBinding(int Slot, int Filter, int Wrap);
-    public enum ShaderPreviewProgramKind { Pixel, Vertex, Geometry, Compute = 5 }
+    public enum ShaderPreviewProgramKind { Pixel, Vertex, Geometry, Hull, Domain, Compute }
     public sealed record ShaderPreviewStage(byte[] Bytecode, ShaderPreviewBuffer[] Buffers, ShaderPreviewTextureBinding[] Textures)
     {
         public ShaderPreviewStructuredBufferBinding[] StructuredBuffers { get; init; } = [];
@@ -67,12 +67,22 @@ namespace AssetStudio
         string ShaderName, string PassName, string LightMode, IReadOnlyList<string> Keywords, ShaderPreviewState State,
         ShaderPreviewStage Vertex, ShaderPreviewStage Fragment)
     {
+        public ShaderPreviewStage? Hull { get; init; }
+        public ShaderPreviewStage? Domain { get; init; }
         public ShaderPreviewStage? Geometry { get; init; }
         public IEnumerable<ShaderPreviewStage> Stages
         {
             get
             {
                 yield return Vertex;
+                if (Hull != null)
+                {
+                    yield return Hull;
+                }
+                if (Domain != null)
+                {
+                    yield return Domain;
+                }
                 if (Geometry != null)
                 {
                     yield return Geometry;
@@ -179,6 +189,7 @@ namespace AssetStudio
             ShaderPreviewProgramKind.Vertex => pass.VertexIndices,
             ShaderPreviewProgramKind.Pixel => pass.FragmentIndices,
             ShaderPreviewProgramKind.Geometry => pass.GeometryIndices,
+            ShaderPreviewProgramKind.Hull or ShaderPreviewProgramKind.Domain => [],
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         };
 

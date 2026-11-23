@@ -82,7 +82,8 @@ namespace AssetStudio
         private sealed record Variant(SerializedSubProgram Program, string[] Keywords);
 
         private sealed record Pass(string PassName, string Mode, SerializedPass Source, IReadOnlyDictionary<int, string> Names,
-            Variant[] Vertex, Variant[] Pixel, Variant[] Geometry) : ShaderPreviewPassDefinition(PassType.Normal, PassName, Mode, "", [], [])
+            Variant[] Vertex, Variant[] Pixel, Variant[] Geometry, Variant[] Hull, Variant[] Domain) :
+            ShaderPreviewPassDefinition(PassType.Normal, PassName, Mode, "", [], [])
         {
             public override bool HasDirect3D11 => Vertex.Length != 0 && Pixel.Length != 0;
 
@@ -91,6 +92,8 @@ namespace AssetStudio
                 ShaderPreviewProgramKind.Vertex => Vertex,
                 ShaderPreviewProgramKind.Pixel => Pixel,
                 ShaderPreviewProgramKind.Geometry => Geometry,
+                ShaderPreviewProgramKind.Hull => Hull,
+                ShaderPreviewProgramKind.Domain => Domain,
                 _ => throw new ArgumentOutOfRangeException(nameof(kind))
             };
         }
@@ -114,7 +117,8 @@ namespace AssetStudio
             var names = source.m_NameIndices.ToDictionary(pair => pair.Value, pair => pair.Key);
             return new Pass(source.m_State.m_Name, tags.GetValueOrDefault("LightMode", "Always"), source, names,
                 Variants(source.progVertex, ShaderPreviewProgramKind.Vertex), Variants(source.progFragment, ShaderPreviewProgramKind.Pixel),
-                Variants(source.progGeometry, ShaderPreviewProgramKind.Geometry));
+                Variants(source.progGeometry, ShaderPreviewProgramKind.Geometry), Variants(source.progHull, ShaderPreviewProgramKind.Hull),
+                Variants(source.progDomain, ShaderPreviewProgramKind.Domain));
 
             Variant[] Variants(SerializedProgram program, ShaderPreviewProgramKind kind) => program.m_SubPrograms
                 .Where(sub => IsDirect3D11Stage(sub.m_GpuProgramType, kind))
@@ -137,22 +141,26 @@ namespace AssetStudio
             {
                 throw new NotSupportedException($"Pass '{pass.DisplayName}' has no Direct3D 11 vertex/pixel program pair.");
             }
-            if (definition.Source.progHull.m_SubPrograms.Any(program => program.m_GpuProgramType == ShaderGpuProgramType.DX11HullSM50) ||
-                definition.Source.progDomain.m_SubPrograms.Any(program => program.m_GpuProgramType == ShaderGpuProgramType.DX11DomainSM50))
+            if ((definition.Hull.Length == 0) != (definition.Domain.Length == 0))
             {
-                throw new NotSupportedException($"Pass '{pass.DisplayName}' requires Direct3D 11 tessellation stages.");
+                throw new InvalidDataException($"Pass '{pass.DisplayName}' has an incomplete Direct3D 11 hull/domain program pair.");
             }
 
             var vertex = SelectStage(ShaderPreviewProgramKind.Vertex);
             var pixel = SelectStage(ShaderPreviewProgramKind.Pixel);
+            var hull = definition.Hull.Length == 0 ? null : SelectStage(ShaderPreviewProgramKind.Hull);
+            var domain = definition.Domain.Length == 0 ? null : SelectStage(ShaderPreviewProgramKind.Domain);
             var geometry = definition.Geometry.Length != 0 ? SelectStage(ShaderPreviewProgramKind.Geometry) : null;
-            var keywords = vertex.Keywords.Concat(pixel.Keywords).Concat(geometry?.Keywords ?? [])
+            Variant?[] stages = [vertex, hull, domain, geometry, pixel];
+            var keywords = stages.OfType<Variant>().SelectMany(stage => stage.Keywords)
                 .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
             return new LegacyShaderPreviewPass(Name, pass.Name, pass.LightMode, keywords,
                 SerializedShaderPreviewState.Read(definition.Source.m_State, values),
                 ReadStage(vertex, definition.Names), ReadStage(pixel, definition.Names))
             {
-                Geometry = geometry == null ? null : ReadStage(geometry, definition.Names)
+                Geometry = geometry == null ? null : ReadStage(geometry, definition.Names),
+                Hull = hull == null ? null : ReadStage(hull, definition.Names),
+                Domain = domain == null ? null : ReadStage(domain, definition.Names)
             };
 
             Variant SelectStage(ShaderPreviewProgramKind kind)

@@ -35,6 +35,9 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
         "Hidden/ConvertTexture" => new(name, [0], false),
         "Hidden/Compositing" => new(name, [0], true),
         "Hidden/VideoDecode" => new(name, [0], false, ImageEffectPass.VideoDecode),
+        StereoCameraPreview.ReadArraySlice => new(name, [0], true, StereoLayout: ShaderPreviewStereoLayout.TextureArray),
+        StereoCameraPreview.WriteArraySlice => new(name, [0], true),
+        StereoCameraPreview.VideoComposite => new(name, [0], true, StereoLayout: ShaderPreviewStereoLayout.DoubleWide),
         "Hidden/Post FX/Eye Adaptation" => new(name, [2], true, ImageEffectPass.ExposureHistogram, "AUTO_KEY_VALUE"),
         "Hidden/Post FX/Temporal Anti-aliasing" => new(name, [0], true, ImageEffectPass.TemporalAntialiasing),
         "Hidden/Post FX/Screen Space Reflection" => new(name, [0, 1, 2, 3, 5, 6, 8], true, ImageEffectPass.ScreenSpaceReflection),
@@ -61,6 +64,10 @@ internal sealed record SerializedCameraShaderPreview(string ShaderName, int[] Pa
         if (StereoLayout is { } stereo)
         {
             return StereoCameraPreview.PrepareCopy(draws[0], stereo, size);
+        }
+        if (ShaderName == StereoCameraPreview.WriteArraySlice)
+        {
+            return StereoCameraPreview.PrepareArrayWrite(draws[0], size);
         }
         if (ShaderName.StartsWith(PostProcessingV2Preview.Prefix, StringComparison.Ordinal))
         {

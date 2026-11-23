@@ -56,6 +56,7 @@ internal sealed record ShaderPreviewDraw(LegacyShaderPreviewPass Pass, ShaderPre
     internal IReadOnlyDictionary<string, NumericsMatrix4x4>? Matrices { get; init; }
     internal ShaderPreviewGeometry? Geometry { get; init; }
     internal ShaderPreviewViewport? Viewport { get; init; }
+    internal int ProceduralVertexCount { get; init; }
     internal NumericsVector4? VertexColor { get; init; }
     internal ShaderPreviewBillboard? Billboard { get; init; }
     internal ShaderPreviewPointPass PointPass { get; init; }
@@ -66,10 +67,11 @@ internal sealed record ShaderPreviewDispatch(ShaderPreviewComputeKernel Kernel, 
     internal IReadOnlyDictionary<string, ShaderPreviewRenderTarget>? TextureOutputs { get; init; }
 }
 internal sealed record ShaderPreviewCopyMip(ShaderPreviewRenderTarget Source, ShaderPreviewRenderTarget Destination, int Mip) : ShaderPreviewOperation;
+internal sealed record ShaderPreviewPresentSlice(ShaderPreviewRenderTarget Source, int Slice) : ShaderPreviewOperation;
 internal sealed record ShaderPreviewGrab(string TextureName, bool Once) : ShaderPreviewOperation;
 internal readonly record struct ShaderPreviewLight(NumericsVector3 Direction, NumericsVector3 Color);
 internal readonly record struct ShaderPreviewViewport(int X, int Y, int Size);
-internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad, Text, UnitQuad }
+internal enum ShaderPreviewGeometry { Sphere, Plane, Volume, Skybox, Particles, ScreenQuad, Text, UnitQuad, UiElements, Terrain }
 
 internal sealed record ShaderPreviewScene(
     string ShaderName, ShaderPreviewGeometry Geometry, bool IsAnimated, IReadOnlyList<ShaderPreviewOperation> Operations,
@@ -82,6 +84,7 @@ internal sealed record ShaderPreviewScene(
     internal bool SerializedShader { get; init; }
     internal uint DepthBlitSamples { get; init; }
     internal ShaderPreviewStereoLayout? StereoLayout { get; init; }
+    internal TerrainPreviewMesh? TerrainMesh { get; init; }
 }
 
 internal sealed record ShaderPreviewTexture(
@@ -166,9 +169,15 @@ internal static class ShaderPreviewService
         var reader = ShaderPreviewReader.Read(shader);
         bool serialized = reader is not LegacyShaderPreview;
         var cameraPreview = serialized ? SerializedCameraShaderPreview.Find(reader.Name) : null;
+        var terrainPass = shader.version is [2019, 3, ..] ? TerrainShaderPreview.Find(reader.Name) : null;
+        if (terrainPass is TerrainPreviewPass.Basemap or TerrainPreviewPass.Normalmap or TerrainPreviewPass.HeightCopy)
+        {
+            cameraPreview = new SerializedCameraShaderPreview(reader.Name, [0], false);
+        }
         uint depthBlitSamples = cameraPreview?.DepthBlitSamples ?? 0;
         bool textShader = serialized && TextMeshProShaderPreview.IsTextShader(reader.Name);
         bool guiShader = serialized && SerializedGuiShaderPreview.IsGuiDraw(reader.Name);
+        bool uiElements = shader.version is [2019, 3, ..] && reader.Name == SerializedGuiShaderPreview.UiElements;
         var values = new Dictionary<string, NumericsVector4>(reader.Values, StringComparer.Ordinal);
         var textureSlots = new Dictionary<string, UnityTexEnv>(StringComparer.Ordinal);
         if (material != null)
@@ -233,6 +242,22 @@ internal static class ShaderPreviewService
             geometry = ShaderPreviewGeometry.Plane;
             SerializedGuiShaderPreview.SetProperties(reader.Name, values);
         }
+        if (uiElements)
+        {
+            geometry = ShaderPreviewGeometry.UiElements;
+        }
+        var textures = new Dictionary<string, ShaderPreviewTexture>(StringComparer.Ordinal);
+        TerrainPreviewMesh? terrainMesh = null;
+        IReadOnlyDictionary<string, NumericsVector4[]>? terrainArrays = null;
+        if (terrainPass is { } terrain)
+        {
+            terrainMesh = TerrainShaderPreview.Prepare(shader, terrain, values, textures, resolveAsset,
+                Resolve<AssetStudio.Object>, Resolve<Texture>, cancellationToken, out terrainArrays);
+            if (terrainMesh != null)
+            {
+                geometry = ShaderPreviewGeometry.Terrain;
+            }
+        }
         var passes = ExpandPasses(shader, reader, subShader, (owner, reference) => Resolve(owner.assetsFile, reference), cancellationToken)
             .Select(item => (item.Reader, item.Sub, Pass: item.Reader is LegacyShaderPreview legacy ?
                 Unity53ShaderPasses.ReadLightMode(legacy, item.Pass) : item.Pass))
@@ -252,6 +277,10 @@ internal static class ShaderPreviewService
         if (cameraPreview?.SceneKeyword is { } sceneKeyword)
         {
             enabled.Add(sceneKeyword);
+        }
+        if (terrainMesh != null && textures.ContainsKey("_Normal0"))
+        {
+            enabled.Add("_NORMALMAP");
         }
         if (lightingPass == BuiltInLightingPass.CollectShadows)
         {
@@ -332,15 +361,22 @@ internal static class ShaderPreviewService
             throw new NotSupportedException($"'{reader.Name}' has no D3D11 pass for the Built-in preview scene.");
         }
 
-        var textures = new Dictionary<string, ShaderPreviewTexture>(StringComparer.Ordinal);
         if (textShader && material == null)
         {
             textures.Add(ImageEffectPreview.MainTexture, TextMeshProShaderPreview.CreateGlyphAtlas(values));
+        }
+        if (uiElements)
+        {
+            SerializedGuiShaderPreview.PrepareUiElements(values, textures, RenderSize);
         }
         ImageEffectPass? imageEffect = null;
         if (cameraPreview != null)
         {
             operations = [.. cameraPreview.Prepare(operations, values, textures, RenderSize)];
+            if (terrainArrays != null)
+            {
+                operations = [operations.OfType<ShaderPreviewDraw>().Single() with { VectorArrays = terrainArrays }];
+            }
             PostProcessingV2Preview.LoadResources(reader.Name, shader, values, textures, RenderSize,
                 resolveAsset, Resolve<MonoScript>, Resolve<Texture>, cancellationToken);
             if (PostProcessingV2MonitorPreview.Handles(reader.Name))
@@ -372,6 +408,11 @@ internal static class ShaderPreviewService
                 resolveAsset, Resolve<AssetStudio.Object>, Resolve<Texture>, cancellationToken);
             textures.Add(effect.TextureName, effect.Texture);
             operations = [.. effect.Draws];
+            geometry = ShaderPreviewGeometry.ScreenQuad;
+        }
+        else if (operations is [ShaderPreviewDraw update] && CustomRenderTexturePreview.UsesUpdateZones(update))
+        {
+            operations = [CustomRenderTexturePreview.Prepare(update, RenderSize)];
             geometry = ShaderPreviewGeometry.ScreenQuad;
         }
         else if (material == null && reader.Name == TreeBillboardPreview.ShaderName)
@@ -480,6 +521,16 @@ internal static class ShaderPreviewService
                 }
                 continue;
             }
+            if (operation is ShaderPreviewPresentSlice present)
+            {
+                var source = present.Source;
+                if (!renderedTargets.Contains(source) || source is not { ArraySize: > 1, MipLevels: 1, Size: RenderSize, Format: D3D11PreviewDevice.Rgba8 } ||
+                    (uint)present.Slice >= (uint)source.ArraySize)
+                {
+                    throw new InvalidDataException($"Render target slice '{source.Name}[{present.Slice}]' cannot be displayed.");
+                }
+                continue;
+            }
             if (operation is ShaderPreviewDispatch dispatch)
             {
                 try
@@ -540,7 +591,8 @@ internal static class ShaderPreviewService
                         pass.State.Stencil == null;
                     if ((!depthIndependent && ((draw.Geometry ?? geometry) != ShaderPreviewGeometry.ScreenQuad || pass.State.ZWrite)) ||
                         pass.State.AlphaToMask ||
-                        output.Size is <= 0 or > RenderSize || output.MipLevels != 1 || output.ArraySize != 1)
+                        output.Size is <= 0 or > RenderSize || output.MipLevels != 1 || output.ArraySize is <= 0 or > 2048 ||
+                        (output.ArraySize > 1 && !depthIndependent))
                     {
                         throw new NotSupportedException($"Unsupported state for render target '{output.Name}'.");
                     }
@@ -563,7 +615,8 @@ internal static class ShaderPreviewService
             unusedKeywords, lightingPass, imageEffect, cameraTextures)
         {
             NoiseSettings = noiseSettings, SerializedShader = serialized, DepthBlitSamples = depthBlitSamples,
-            StereoLayout = cameraTextures.Contains(ImageEffectPreview.MainTexture) ? cameraPreview?.StereoLayout : null
+            StereoLayout = cameraTextures.Contains(ImageEffectPreview.MainTexture) ? cameraPreview?.StereoLayout : null,
+            TerrainMesh = terrainMesh
         };
 
         T Resolve<T>(SerializedFile source, PPtr<T> reference) where T : AssetStudio.Object =>
@@ -980,7 +1033,8 @@ internal static class ShaderPreviewService
             return draw.Matrices?.TryGetValue(name, out var matrixValue) == true ? matrixValue : name switch
             {
                 "glstate_matrix_mvp" or "unity_MatrixVP" when billboardTransform.HasValue => billboardTransform.Value,
-                "unity_MatrixVP" when scene.SerializedShader && (draw.Geometry ?? scene.Geometry) == ShaderPreviewGeometry.ScreenQuad =>
+                "unity_MatrixVP" when scene.SerializedShader &&
+                    (draw.Geometry ?? scene.Geometry) is ShaderPreviewGeometry.ScreenQuad or ShaderPreviewGeometry.UiElements =>
                     NumericsMatrix4x4.Identity,
                 "glstate_matrix_mvp" when (draw.Geometry ?? scene.Geometry) == ShaderPreviewGeometry.ScreenQuad => NumericsMatrix4x4.Identity,
                 "glstate_matrix_mvp" when motion is { } frame => frame.Model * view * projection,

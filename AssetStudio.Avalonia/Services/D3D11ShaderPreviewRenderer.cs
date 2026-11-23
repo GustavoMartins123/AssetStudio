@@ -16,7 +16,6 @@ namespace AssetStudio.Avalonia.Services;
 internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 {
     private const int FrameSize = ShaderPreviewService.RenderSize;
-    private const int Rgba8 = 28;
     private const uint BokehPointStride = 28;
     private const uint BindVertexBuffer = 1, BindIndexBuffer = 2, BindConstantBuffer = 4,
         BindShaderResource = 8, BindRenderTarget = 32, BindDepthStencil = 64, BindUnorderedAccess = 128;
@@ -26,6 +25,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     private static readonly (Vertex[] Vertices, uint[] Indices) Plane = BuildPlane();
     private static readonly (Vertex[] Vertices, uint[] Indices) UnitQuad = BuildUnitQuad();
+    private static readonly (Vertex[] Vertices, uint[] Indices) UiQuad = BuildUiQuad();
     private static readonly (Vertex[] Vertices, uint[] Indices) TextPlane = BuildTextPlane();
     private static readonly (Vertex[] Vertices, uint[] Indices) ScreenQuad = BuildScreenQuad();
     private static readonly (Vertex[] Vertices, uint[] Indices) FogQuad = BuildScreenQuad(includeCornerIndices: true);
@@ -49,8 +49,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     private readonly int _indexCount;
     private readonly TextureDesc _colorCopy;
     private readonly bool _multisampled, _showBackgroundPattern;
-    private readonly Dictionary<LegacyShaderPreviewPass, (nint Layout, nint Vertex, nint Pixel, nint Geometry,
-        nint Blend, nint Depth, nint Rasterizer, ShaderPreviewParameter? UnusedVertexParameter)> _passes = new();
+    private readonly Dictionary<LegacyShaderPreviewPass, GpuPass> _passes = new();
     private readonly (nint ShaderView, nint AppendView, nint DrawArguments) _bokehPoints;
     private readonly Vertex[]? _motionVertices;
     private ShaderPreviewCamera? _lastMotionCamera;
@@ -183,6 +182,11 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         bool temporal = _scene.ImageEffect == ImageEffectPass.TemporalAntialiasing;
         var jitter = temporal ? TemporalAntialiasingPreview.Jitter(time, FrameSize) : default;
         var renderCamera = reproject ? MotionPreview.CameraAtTime(camera, motionTime) : camera;
+        if (_scene.TerrainMesh != null)
+        {
+            // Pitch the preview camera above the heightfield so its surface is visible on the first frame.
+            renderCamera = renderCamera with { Pitch = Math.Clamp(renderCamera.Pitch + 0.60f, -1.50f, 1.50f) };
+        }
         var (view, eye) = CameraView(renderCamera, _scene.Geometry == ShaderPreviewGeometry.Skybox);
         MotionPreviewFrame? motion = null;
         if (MotionPreview.UsesHistory(_scene.ImageEffect))
@@ -263,7 +267,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         }
         else
         {
-            _device.ClearFrame(_targetView, _depth, FrameSize, _showBackgroundPattern, background: _animatedEffect == null ? 0.18f : 0f);
+            _device.ClearFrame(_targetView, _depth, FrameSize, _showBackgroundPattern, background: _animatedEffect == null ? 0.18f : 0f,
+                depthValue: _scene.Geometry == ShaderPreviewGeometry.UiElements ? 0f : 1f);
         }
         var capturedNames = new HashSet<string>(StringComparer.Ordinal);
         var renderedTargets = new HashSet<ShaderPreviewRenderTarget>();
@@ -299,9 +304,19 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     throw new InvalidDataException($"Mip source '{mipCopy.Source.Name}' has not been rendered.");
                 }
                 _device.ClearBindings();
-                _device.CopyMip(GetRenderTarget(mipCopy.Source).Texture.Image, GetRenderTarget(mipCopy.Destination).Texture.Image,
+                _device.CopySubresource(GetRenderTarget(mipCopy.Source).Texture.Image, 0, GetRenderTarget(mipCopy.Destination).Texture.Image,
                     (uint)mipCopy.Mip);
                 renderedTargets.Add(mipCopy.Destination);
+                continue;
+            }
+            if (operation is ShaderPreviewPresentSlice present)
+            {
+                if (_multisampled || _target == 0 || !renderedTargets.Contains(present.Source))
+                {
+                    throw new InvalidDataException($"The preview cannot display '{present.Source.Name}[{present.Slice}]'.");
+                }
+                _device.ClearBindings();
+                _device.CopySubresource(GetRenderTarget(present.Source).Texture.Image, (uint)present.Slice, _target, 0);
                 continue;
             }
             if (operation is ShaderPreviewDispatch dispatch)
@@ -388,6 +403,10 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             {
                 ValidateStage(pass.Vertex, ShaderPreviewProgramKind.Vertex, draw);
                 ValidateStage(pass.Fragment, ShaderPreviewProgramKind.Pixel, draw);
+                if (draw.Output?.ArraySize > 1)
+                {
+                    RequireArrayOutput(pass.Vertex);
+                }
                 nint geometry = 0;
                 if (pass.Geometry is { } stage)
                 {
@@ -398,17 +417,24 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                     ValidateStage(stage, ShaderPreviewProgramKind.Geometry, draw);
                     geometry = _device.CreateShader(stage.Bytecode, ShaderPreviewProgramKind.Geometry);
                 }
-                bool usesSecondaryUv = (draw.Geometry ?? _scene.Geometry) == ShaderPreviewGeometry.Text ||
+                var geometryType = draw.Geometry ?? _scene.Geometry;
+                bool usesSecondaryUv = geometryType == ShaderPreviewGeometry.Text ||
                     _scene.SerializedShader && _scene.LightingPass == BuiltInLightingPass.CollectShadows;
-                gpu = (CreateInputLayout(_device, pass.Vertex.Bytecode, usesSecondaryUv),
+                gpu = new GpuPass(CreateInputLayout(_device, pass.Vertex.Bytecode, usesSecondaryUv, geometryType == ShaderPreviewGeometry.UiElements),
                     _device.CreateShader(pass.Vertex.Bytecode, ShaderPreviewProgramKind.Vertex),
-                    _device.CreateShader(pass.Fragment.Bytecode, ShaderPreviewProgramKind.Pixel), geometry, CreateBlend(_device, pass.State),
+                    _device.CreateShader(pass.Fragment.Bytecode, ShaderPreviewProgramKind.Pixel), geometry,
+                    CreateTessellationStage(pass.Hull, ShaderPreviewProgramKind.Hull, draw),
+                    CreateTessellationStage(pass.Domain, ShaderPreviewProgramKind.Domain, draw), CreateBlend(_device, pass.State),
                     CreateDepth(_device, pass.State), _device.CreateRasterizerState(new RasterizerDesc
                     {
                         FillMode = 3, CullMode = (int)pass.State.Cull, FrontCounterClockwise = 1,
                         DepthClipEnable = pass.State.ZClip ? 1 : 0, DepthBias = pass.State.OffsetUnits, SlopeScaledDepthBias = pass.State.OffsetFactor,
                         MultisampleEnable = _multisampled || _scene.DepthBlitSamples > 1 ? 1 : 0
                     }), FindUnusedVertexTransform(pass));
+                if (draw.ProceduralVertexCount != 0 && (gpu.Layout != 0 || gpu.Hull != 0 || gpu.Geometry != 0))
+                {
+                    throw new NotSupportedException("The procedural preview draw requires a vertex-ID triangle list.");
+                }
                 _passes.Add(pass, gpu);
             }
             if (_scene.DepthBlitSamples != 0)
@@ -443,17 +469,36 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             {
                 _device.SetAppendTarget(targetView, depthView, _bokehPoints.AppendView);
             }
-            int indexCount = BindDrawGeometry(draw, gpu.Layout, billboardColor);
+            int indexCount = 0;
+            if (draw.ProceduralVertexCount > 0)
+            {
+                _device.SetTopology(TriangleList);
+            }
+            else
+            {
+                indexCount = BindDrawGeometry(draw, gpu.Layout, billboardColor, gpu.Hull == 0 ? TriangleList : TrianglePatchList);
+            }
             _device.SetShader(gpu.Vertex, ShaderPreviewProgramKind.Vertex);
             _device.SetShader(gpu.Pixel, ShaderPreviewProgramKind.Pixel);
             BindStage(pass.Vertex, draw, size, ShaderPreviewProgramKind.Vertex, billboardTransform, gpu.UnusedVertexParameter);
             BindStage(pass.Fragment, draw, size, ShaderPreviewProgramKind.Pixel, billboardTransform);
+            if (pass.Hull is { } hull && pass.Domain is { } domain)
+            {
+                _device.SetShader(gpu.Hull, ShaderPreviewProgramKind.Hull);
+                _device.SetShader(gpu.Domain, ShaderPreviewProgramKind.Domain);
+                BindStage(hull, draw, size, ShaderPreviewProgramKind.Hull, billboardTransform);
+                BindStage(domain, draw, size, ShaderPreviewProgramKind.Domain, billboardTransform);
+            }
             if (draw.PointPass == ShaderPreviewPointPass.Draw)
             {
                 var geometry = pass.Geometry ?? throw new InvalidDataException("The bokeh draw has no geometry shader.");
                 _device.SetShader(gpu.Geometry, ShaderPreviewProgramKind.Geometry);
                 BindStage(geometry, draw, size, ShaderPreviewProgramKind.Geometry, billboardTransform);
                 _device.DrawPoints(_bokehPoints.DrawArguments, _bokehPoints.AppendView);
+            }
+            else if (draw.ProceduralVertexCount > 0)
+            {
+                _device.DrawVertices(draw.ProceduralVertexCount);
             }
             else if (draw.SkyboxSide >= 0)
             {
@@ -674,6 +719,9 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         ShaderPreviewGeometry.Particles => (new Vertex[ParticleCount * 4], ParticleIndices),
         ShaderPreviewGeometry.Plane => Plane,
         ShaderPreviewGeometry.UnitQuad => UnitQuad,
+        ShaderPreviewGeometry.UiElements => UiQuad,
+        ShaderPreviewGeometry.Terrain => BuildTerrainMesh(_scene.TerrainMesh ??
+            throw new InvalidDataException("The terrain preview has no heightfield mesh.")),
         ShaderPreviewGeometry.Text => TextPlane,
         ShaderPreviewGeometry.ScreenQuad => _scene.ImageEffect == ImageEffectPass.GlobalFog ? FogQuad : ScreenQuad,
         ShaderPreviewGeometry.Skybox or ShaderPreviewGeometry.Volume => Skybox,
@@ -681,7 +729,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         _ => throw new ArgumentOutOfRangeException(nameof(geometry))
     };
 
-    private int BindDrawGeometry(ShaderPreviewDraw draw, nint layout, NumericsVector4 billboardColor)
+    private int BindDrawGeometry(ShaderPreviewDraw draw, nint layout, NumericsVector4 billboardColor, uint topology = TriangleList)
     {
         var mesh = (Vertices: _vertexBuffer, Indices: _indexBuffer, Count: _indexCount);
         if (draw.Billboard.HasValue)
@@ -719,7 +767,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 }
             }
         }
-        _device.SetGeometry(layout, mesh.Vertices, mesh.Indices, (uint)sizeof(Vertex));
+        _device.SetGeometry(layout, mesh.Vertices, mesh.Indices, (uint)sizeof(Vertex), topology);
         return mesh.Count;
     }
 
@@ -757,7 +805,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     private static ShaderPreviewParameter? FindUnusedVertexTransform(LegacyShaderPreviewPass pass)
     {
-        if (pass.Geometry != null || pass.Fragment.Textures.Length != 0 || pass.Fragment.Buffers.Length != 0 ||
+        if (pass.Geometry != null || pass.Hull != null || pass.Fragment.Textures.Length != 0 || pass.Fragment.Buffers.Length != 0 ||
             pass.State is not { Blend: true, Source: ShaderPreviewBlend.Zero, Destination: ShaderPreviewBlend.One })
         {
             return null;
@@ -882,7 +930,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
                 SampleCount = 1, BindFlags = BindShaderResource | BindRenderTarget | (target.UnorderedAccess ? BindUnorderedAccess : 0u)
             });
             var texture = new GpuTexture(image, _device.CreateShaderView(image), CreateSampler(_device, target.Filter, 1, 1, 0));
-            resource = (texture, target.ArraySize == 1 ? _device.CreateRenderView(image) : 0,
+            resource = (texture, _device.CreateRenderView(image),
                 target.UnorderedAccess ? _device.CreateUnorderedTextureView(image) : 0);
             _renderTargets.Add(target, resource);
         }
@@ -926,6 +974,9 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     }
 
     private readonly record struct GpuTexture(nint Image, nint View, nint Sampler);
+
+    private readonly record struct GpuPass(nint Layout, nint Vertex, nint Pixel, nint Geometry, nint Hull, nint Domain,
+        nint Blend, nint Depth, nint Rasterizer, ShaderPreviewParameter? UnusedVertexParameter);
 
     private static GpuTexture UploadTexture(D3D11PreviewDevice device, ShaderPreviewTexture texture, string name, bool mutable = false)
     {
@@ -1087,11 +1138,56 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         }
     }
 
+    private nint CreateTessellationStage(ShaderPreviewStage? stage, ShaderPreviewProgramKind kind, ShaderPreviewDraw draw)
+    {
+        if (stage == null)
+        {
+            return 0;
+        }
+        ValidateStage(stage, kind, draw);
+        var program = FindChunk(stage.Bytecode, "SHDR"u8, "SHEX"u8);
+        const uint declareInputControlPoints = 147, declareOutputControlPoints = 148, declareDomain = 149;
+        const uint triangleDomain = 2;
+        uint input = 0, output = 0, domain = 0;
+        for (int offset = 8; offset < program.Length;)
+        {
+            uint token = ReadUInt(program, offset);
+            uint value = (token >> 11) & 0x3f;
+            switch (token & 0x7ff)
+            {
+                case declareInputControlPoints: input = value; break;
+                case declareOutputControlPoints: output = value; break;
+                case declareDomain: domain = value; break;
+            }
+            offset += (int)InstructionWords(program, offset, token) * 4;
+        }
+        if (input != 3 || domain != triangleDomain || (kind == ShaderPreviewProgramKind.Hull && output != 3))
+        {
+            throw new NotSupportedException("The preview supports tessellation of triangle patches with three control points.");
+        }
+        return _device.CreateShader(stage.Bytecode, kind);
+    }
+
+    private void RequireArrayOutput(ShaderPreviewStage vertex)
+    {
+        var signature = FindChunk(vertex.Bytecode, "OSGN"u8);
+        int count = ReadSignatureCount(signature);
+        for (int i = 0; i < count; i++)
+        {
+            if (ReadSemantic(signature, 8 + i * 24).Equals("SV_RenderTargetArrayIndex", StringComparison.OrdinalIgnoreCase))
+            {
+                _device.RequireVertexRenderTargetArrayIndex();
+                return;
+            }
+        }
+        throw new NotSupportedException("The vertex shader does not select a render target array slice.");
+    }
+
     private void ValidateResources(ReadOnlySpan<byte> program, ShaderPreviewStage stage, ShaderPreviewProgramKind kind,
         ShaderPreviewProgramOperation operation)
     {
         // Unity can strip RDEF. Compare the actual SM4/5 resource declarations with Unity's metadata.
-        const uint customData = 53, declareTexture = 88, declareBuffer = 89, declareSampler = 90;
+        const uint declareTexture = 88, declareBuffer = 89, declareSampler = 90;
         var draw = operation as ShaderPreviewDraw;
         var dispatch = operation as ShaderPreviewDispatch;
         var declaredOutputs = dispatch == null ? null : new HashSet<uint>();
@@ -1101,11 +1197,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         {
             uint token = ReadUInt(program, offset);
             uint opcode = token & 0x7ff;
-            uint words = opcode == customData ? ReadUInt(program, offset + 4) : (token >> 24) & 0x7f;
-            if (words == 0 || words > (program.Length - offset) / 4 || (opcode == customData && words < 2))
-            {
-                throw new InvalidDataException("Invalid DXBC instruction length.");
-            }
+            uint words = InstructionWords(program, offset, token);
             if (opcode is declareTexture or declareBuffer or declareSampler)
             {
                 uint expectedWords = opcode == declareSampler ? 3u : 4u;
@@ -1213,6 +1305,18 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             operation.ComputeBuffers?.TryGetValue(name, out var buffer) == true && buffer.Stride == stride;
     }
 
+    private static uint InstructionWords(ReadOnlySpan<byte> program, int offset, uint token)
+    {
+        const uint customData = 53;
+        bool custom = (token & 0x7ff) == customData;
+        uint words = custom ? ReadUInt(program, offset + 4) : (token >> 24) & 0x7f;
+        if (words == 0 || words > (program.Length - offset) / 4 || (custom && words < 2))
+        {
+            throw new InvalidDataException("Invalid DXBC instruction length.");
+        }
+        return words;
+    }
+
     private static uint ResourceDimension(ShaderPreviewTextureDimension dimension) => dimension switch
     {
         ShaderPreviewTextureDimension.Texture2D => 3,
@@ -1222,7 +1326,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
         _ => throw new InvalidDataException($"Unsupported DXBC texture dimension '{dimension}'.")
     };
 
-    private static nint CreateInputLayout(D3D11PreviewDevice device, byte[] bytecode, bool usesSecondaryUv)
+    private static nint CreateInputLayout(D3D11PreviewDevice device, byte[] bytecode, bool usesSecondaryUv, bool uiElements)
     {
         var signature = FindChunk(bytecode, "ISGN"u8);
         int count = ReadSignatureCount(signature);
@@ -1248,6 +1352,7 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
             uint offset = name.ToUpperInvariant() switch
             {
                 "POSITION" => 0, "NORMAL" => 16, "TANGENT" => 32, "COLOR" => 48,
+                "TEXCOORD" when uiElements => 64 + semanticIndex * 16,
                 "TEXCOORD" => usesSecondaryUv && semanticIndex == 1 ? 80u : 64u,
                 _ => throw new NotSupportedException($"Unsupported DXBC vertex attribute '{name}'.")
             };
@@ -1332,7 +1437,8 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct Vertex(NumericsVector4 Position, NumericsVector4 Normal, NumericsVector4 Tangent,
-        NumericsVector4 Color, NumericsVector4 Uv, NumericsVector4 Uv1 = default);
+        NumericsVector4 Color, NumericsVector4 Uv, NumericsVector4 Uv1 = default, NumericsVector4 Uv2 = default,
+        NumericsVector4 Uv3 = default);
 
     private static (Vertex[], uint[]) BuildPlane() =>
         ([PlaneVertex(-1, -1, 0, 0), PlaneVertex(1, -1, 1, 0), PlaneVertex(1, 1, 1, 1), PlaneVertex(-1, 1, 0, 1)],
@@ -1342,6 +1448,33 @@ internal sealed unsafe class D3D11ShaderPreviewRenderer : IDisposable
     {
         Position = vertex.Position with { X = (vertex.Position.X + 1) * 0.5f, Y = (vertex.Position.Y + 1) * 0.5f }
     }), Plane.Indices);
+
+    private static (Vertex[], uint[]) BuildUiQuad()
+    {
+        // UIElements stores page coordinates in vertex bytes and uses this depth for regular shapes.
+        const float row = 4f / 255, column = 1f / 255;
+        var vertices = Array.ConvertAll(Plane.Vertices, vertex => vertex with
+        {
+            Position = new NumericsVector4(vertex.Position.X * 0.75f, vertex.Position.Y * 0.60f, 0.995f, 1),
+            Uv1 = new NumericsVector4(0, 0, 0, row),
+            Uv3 = new NumericsVector4(column, row, 0, 0)
+        });
+        // The 2D UI projection flips the winding, so an unclipped draw uses the back stencil state.
+        return (vertices, [0, 2, 1, 0, 3, 2]);
+    }
+
+    private static (Vertex[], uint[]) BuildTerrainMesh(TerrainPreviewMesh mesh)
+    {
+        var vertices = new Vertex[mesh.Positions.Length];
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            var normal = mesh.Normals[i];
+            var tangent = NumericsVector3.Normalize(new NumericsVector3(normal.Y, -normal.X, 0));
+            vertices[i] = new Vertex(new NumericsVector4(mesh.Positions[i], 1), new NumericsVector4(normal, 0),
+                new NumericsVector4(tangent, -1), NumericsVector4.One, new NumericsVector4(mesh.Uvs[i], 0, 0));
+        }
+        return (vertices, mesh.Indices);
+    }
 
     private static (Vertex[], uint[]) BuildTextPlane() => (Array.ConvertAll(Plane.Vertices, vertex => vertex with
     {

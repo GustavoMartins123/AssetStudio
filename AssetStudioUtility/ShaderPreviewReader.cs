@@ -37,6 +37,8 @@ namespace AssetStudio
 
         public IEnumerable<string> GetKeywords(ShaderPreviewPassDefinition pass) =>
             GetVariantKeywords(pass, ShaderPreviewProgramKind.Vertex)
+                .Concat(GetVariantKeywords(pass, ShaderPreviewProgramKind.Hull))
+                .Concat(GetVariantKeywords(pass, ShaderPreviewProgramKind.Domain))
                 .Concat(GetVariantKeywords(pass, ShaderPreviewProgramKind.Pixel))
                 .Concat(GetVariantKeywords(pass, ShaderPreviewProgramKind.Geometry)).SelectMany(keywords => keywords);
 
@@ -53,17 +55,19 @@ namespace AssetStudio
             ShaderPreviewProgramKind.Vertex => type is ShaderGpuProgramType.DX11VertexSM40 or ShaderGpuProgramType.DX11VertexSM50,
             ShaderPreviewProgramKind.Pixel => type is ShaderGpuProgramType.DX11PixelSM40 or ShaderGpuProgramType.DX11PixelSM50,
             ShaderPreviewProgramKind.Geometry => type is ShaderGpuProgramType.DX11GeometrySM40 or ShaderGpuProgramType.DX11GeometrySM50,
+            ShaderPreviewProgramKind.Hull => type == ShaderGpuProgramType.DX11HullSM50,
+            ShaderPreviewProgramKind.Domain => type == ShaderGpuProgramType.DX11DomainSM50,
             _ => throw new ArgumentOutOfRangeException(nameof(stage))
         };
 
         internal static ShaderPreviewSamplerBinding ReadInlineSampler(uint encoded, int slot)
         {
-            // Unity encodes sampler_LinearClamp as filter Linear and Clamp on all three axes.
-            if (encoded != 0x55 || slot is < 0 or >= 16)
+            // Point and Linear with Clamp on all three axes.
+            if (encoded is not (0x54 or 0x55) || slot is < 0 or >= 16)
             {
                 throw new NotSupportedException($"Unsupported inline sampler 0x{encoded:X} at slot {slot}.");
             }
-            return new ShaderPreviewSamplerBinding(slot, Filter: 1, Wrap: 1);
+            return new ShaderPreviewSamplerBinding(slot, Filter: (int)(encoded & 1), Wrap: 1);
         }
 
         protected static T[] MatchVariants<T>(IReadOnlyList<T> programs, Func<T, string[]> keywords,

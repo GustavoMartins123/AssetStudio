@@ -7,7 +7,8 @@ namespace AssetStudio.Avalonia.Services;
 
 internal sealed unsafe class D3D11PreviewDevice : IDisposable
 {
-    internal const int Rgba16Float = 10, R32Typeless = 39, D32Float = 40, R32Float = 41, R16Float = 54, R8Unorm = 61;
+    internal const int Rgba16Float = 10, Rgba8 = 28, R32Typeless = 39, D32Float = 40, R32Float = 41, R16Float = 54, R8Unorm = 61;
+    internal const uint TriangleList = 4, TrianglePatchList = 35;
 
     // Slots are from the Windows SDK definitions of ID3D11Device and ID3D11DeviceContext.
     private readonly nint _device;
@@ -176,6 +177,8 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
             ShaderPreviewProgramKind.Vertex => 12,
             ShaderPreviewProgramKind.Geometry => 13,
             ShaderPreviewProgramKind.Pixel => 15,
+            ShaderPreviewProgramKind.Hull => 16,
+            ShaderPreviewProgramKind.Domain => 17,
             ShaderPreviewProgramKind.Compute => 18,
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         });
@@ -201,10 +204,10 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     internal void ClearBindings() =>
         ((delegate* unmanaged[Stdcall]<nint, void>)Slot(_context, 110))(_context);
 
-    internal void ClearFrame(nint surface, nint depth, int size, bool showBackgroundPattern, float background = 0.18f)
+    internal void ClearFrame(nint surface, nint depth, int size, bool showBackgroundPattern, float background = 0.18f, float depthValue = 1f)
     {
         ClearColor(surface, background, 1f);
-        ClearDepth(depth, 1f, clearStencil: true);
+        ClearDepth(depth, depthValue, clearStencil: true);
         if (showBackgroundPattern)
         {
             ClearBackgroundTiles(surface, size);
@@ -271,15 +274,18 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         ((delegate* unmanaged[Stdcall]<nint, uint, Viewport*, void>)Slot(_context, 44))(_context, 1, &viewport);
     }
 
-    internal void SetGeometry(nint layout, nint vertices, nint indices, uint stride)
+    internal void SetGeometry(nint layout, nint vertices, nint indices, uint stride, uint topology)
     {
         ((delegate* unmanaged[Stdcall]<nint, nint, void>)Slot(_context, 17))(_context, layout);
         uint offset = 0;
         ((delegate* unmanaged[Stdcall]<nint, uint, uint, nint*, uint*, uint*, void>)Slot(_context, 18))(
             _context, 0, 1, &vertices, &stride, &offset);
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, uint, void>)Slot(_context, 19))(_context, indices, 42 /* R32_UINT */, 0);
-        ((delegate* unmanaged[Stdcall]<nint, uint, void>)Slot(_context, 24))(_context, 4 /* triangle list */);
+        SetTopology(topology);
     }
+
+    internal void SetTopology(uint topology) =>
+        ((delegate* unmanaged[Stdcall]<nint, uint, void>)Slot(_context, 24))(_context, topology);
 
     internal void SetShader(nint shader, ShaderPreviewProgramKind kind) =>
         ((delegate* unmanaged[Stdcall]<nint, nint, nint*, uint, void>)Slot(_context, kind switch
@@ -287,6 +293,8 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
             ShaderPreviewProgramKind.Vertex => 11,
             ShaderPreviewProgramKind.Geometry => 23,
             ShaderPreviewProgramKind.Pixel => 9,
+            ShaderPreviewProgramKind.Hull => 60,
+            ShaderPreviewProgramKind.Domain => 64,
             ShaderPreviewProgramKind.Compute => 69,
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         }))(_context, shader, null, 0);
@@ -296,6 +304,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         {
             ShaderPreviewProgramKind.Vertex => 7, ShaderPreviewProgramKind.Geometry => 22,
             ShaderPreviewProgramKind.Pixel => 16, ShaderPreviewProgramKind.Compute => 71,
+            ShaderPreviewProgramKind.Hull => 62, ShaderPreviewProgramKind.Domain => 66,
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         });
     internal void SetTexture(nint view, int slot, ShaderPreviewProgramKind kind) =>
@@ -303,6 +312,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         {
             ShaderPreviewProgramKind.Vertex => 25, ShaderPreviewProgramKind.Geometry => 31,
             ShaderPreviewProgramKind.Pixel => 8, ShaderPreviewProgramKind.Compute => 67,
+            ShaderPreviewProgramKind.Hull => 59, ShaderPreviewProgramKind.Domain => 63,
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         });
     internal void SetSampler(nint sampler, int slot, ShaderPreviewProgramKind kind) =>
@@ -310,6 +320,7 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         {
             ShaderPreviewProgramKind.Vertex => 26, ShaderPreviewProgramKind.Geometry => 32,
             ShaderPreviewProgramKind.Pixel => 10, ShaderPreviewProgramKind.Compute => 70,
+            ShaderPreviewProgramKind.Hull => 61, ShaderPreviewProgramKind.Domain => 65,
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         });
 
@@ -340,6 +351,9 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
     internal void Draw(int indexCount, int startIndex = 0) =>
         ((delegate* unmanaged[Stdcall]<nint, uint, uint, int, void>)Slot(_context, 12))(_context, (uint)indexCount, (uint)startIndex, 0);
 
+    internal void DrawVertices(int count) =>
+        ((delegate* unmanaged[Stdcall]<nint, uint, uint, void>)Slot(_context, 13))(_context, (uint)count, 0);
+
     internal void RequireMultisampling(int format, uint samples)
     {
         uint levels = 0;
@@ -364,9 +378,20 @@ internal sealed unsafe class D3D11PreviewDevice : IDisposable
         }
     }
 
-    internal void CopyMip(nint source, nint destination, uint mip) =>
+    internal void CopySubresource(nint source, uint sourceIndex, nint destination, uint destinationIndex) =>
         ((delegate* unmanaged[Stdcall]<nint, nint, uint, uint, uint, uint, nint, uint, void*, void>)Slot(_context, 46))(
-            _context, destination, mip, 0, 0, 0, source, 0, null);
+            _context, destination, destinationIndex, 0, 0, 0, source, sourceIndex, null);
+
+    internal void RequireVertexRenderTargetArrayIndex()
+    {
+        const uint options3 = 15; // D3D11_FEATURE_D3D11_OPTIONS3
+        uint supported = 0;
+        var check = (delegate* unmanaged[Stdcall]<nint, uint, void*, uint, int>)Slot(_device, 33);
+        if (check(_device, options3, &supported, sizeof(uint)) < 0 || supported == 0)
+        {
+            throw new NotSupportedException("This Direct3D 11 device cannot select a render target array slice from a vertex shader.");
+        }
+    }
 
     internal byte[] ReadPixels(nint source, nint staging, int format, int size)
     {

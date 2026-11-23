@@ -155,6 +155,7 @@ public sealed class ShaderPreviewViewModel : ViewModelBase, IDisposable
                         ShaderPreviewGrab grab => $"GrabPass · {grab.TextureName}",
                         ShaderPreviewDispatch dispatch => $"Compute · {dispatch.Kernel.ShaderName}/{dispatch.Kernel.Name}",
                         ShaderPreviewCopyMip copy => $"Copy mip {copy.Mip} · {copy.Destination.Name}",
+                        ShaderPreviewPresentSlice present => $"Display slice {present.Slice} · {present.Source.Name}",
                         _ => throw new InvalidOperationException("Unknown shader preview operation.")
                     }));
                     if (scene.UnusedMaterialKeywords.Count > 0)
