@@ -62,6 +62,11 @@ namespace AssetStudio
 
         private ImageFormat imageFormat;
         private Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver;
+        // Optional project-aware resolvers used by full scene export so lazy cross-bundle Mesh / Material PPtrs
+        // resolve through the exact same ProjectIndex + SQLite semantic pipeline used by Export Model.
+        private Func<Renderer, Mesh?>? meshResolver;
+        private Func<Renderer, Mesh, int, Material?>? materialResolver;
+        private bool skipEmptyMeshes;
         private Avatar? avatar;
         private bool hasRootFrame;
         private string? animatorRootPath;
@@ -164,6 +169,12 @@ namespace AssetStudio
         /// cached vertex/index buffers and carry stable <see cref="ImportedMesh.GeometryKey"/> and
         /// <see cref="ImportedMesh.TargetFrame"/> bindings so duplicate sibling GameObject names never collide.
         /// </summary>
+        /// <param name="meshResolver">Optional fallback used when a renderer's Mesh PPtr cannot be resolved in memory
+        /// (e.g. lazy cross-bundle references resolved through a project index).</param>
+        /// <param name="materialResolver">Optional resolver for a renderer material slot (renderer, mesh, slot index).
+        /// When it returns null the in-memory PPtr lookup is used.</param>
+        /// <param name="skipDisabledRenderers">Skip renderers whose <see cref="Renderer.m_Enabled"/> flag is false
+        /// (hidden proxies, LOD/shadow/debug renderers) while still keeping their Transform nodes.</param>
         public static ModelConverter CreateForScene(
             string sceneName,
             IReadOnlyList<GameObject> rootGameObjects,
@@ -172,11 +183,19 @@ namespace AssetStudio
             bool includeAnimations = false,
             Func<Material, string, PPtr<Texture>?, Texture2D?>? textureResolver = null,
             Action<int, int, string>? progressCallback = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            Func<Renderer, Mesh?>? meshResolver = null,
+            Func<Renderer, Mesh, int, Material?>? materialResolver = null,
+            bool skipDisabledRenderers = true)
         {
             ArgumentNullException.ThrowIfNull(rootGameObjects);
 
-            var converter = new ModelConverter(imageFormat, textureResolver);
+            var converter = new ModelConverter(imageFormat, textureResolver)
+            {
+                meshResolver = meshResolver,
+                materialResolver = materialResolver,
+                skipEmptyMeshes = true
+            };
             var safeSceneName = string.IsNullOrWhiteSpace(sceneName) ? "Scene" : sceneName.Trim();
             converter.SetRootFrame(CreateFrame(safeSceneName, Vector3.Zero, new Quaternion(0, 0, 0, 1), Vector3.One));
 
@@ -189,6 +208,10 @@ namespace AssetStudio
                 {
                     continue;
                 }
+
+                // Lazily materialized GameObjects (Lazy Mode) are not linked to their components by the
+                // eager ProcessAssets pass, so link Transform / MeshFilter / Renderer components for the whole subtree.
+                HydrateGameObjectHierarchy(go);
 
                 if (includeAnimations && go.m_Animator != null)
                 {
@@ -221,7 +244,7 @@ namespace AssetStudio
                 var tr = go.m_Transform;
                 if (tr != null)
                 {
-                    converter.ConvertMeshRendererForScene(tr, visitedRenderers, includeInactive, includeAnimations, cancellationToken);
+                    converter.ConvertMeshRendererForScene(tr, visitedRenderers, includeInactive, includeAnimations, skipDisabledRenderers, cancellationToken);
                 }
 
                 if ((i & 31) == 0 || i == totalRoots - 1)
@@ -286,9 +309,9 @@ namespace AssetStudio
 
                 if (!childPtr.TryGet(out var child))
                 {
-                    foreach (var sf in trans.assetsFile.assetsManager.assetsFileList)
+                    foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
                     {
-                        if (sf.ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
                         {
                             child = foundChild;
                             break;
@@ -308,6 +331,7 @@ namespace AssetStudio
             HashSet<Transform> visited,
             bool includeInactive,
             bool includeAnimations,
+            bool skipDisabledRenderers,
             CancellationToken cancellationToken)
         {
             if (m_Transform == null || !visited.Add(m_Transform))
@@ -324,12 +348,14 @@ namespace AssetStudio
                     return;
                 }
 
-                if (m_GameObject.m_MeshRenderer != null)
+                if (m_GameObject.m_MeshRenderer != null
+                    && (!skipDisabledRenderers || m_GameObject.m_MeshRenderer.m_Enabled))
                 {
                     ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
                 }
 
-                if (m_GameObject.m_SkinnedMeshRenderer != null)
+                if (m_GameObject.m_SkinnedMeshRenderer != null
+                    && (!skipDisabledRenderers || m_GameObject.m_SkinnedMeshRenderer.m_Enabled))
                 {
                     ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
                 }
@@ -345,9 +371,9 @@ namespace AssetStudio
                         }
                         if (!animationPtr.TryGet(out var animationClip))
                         {
-                            foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                            foreach (var sf in SnapshotAssetsFiles(m_Transform.assetsFile?.assetsManager))
                             {
-                                if (sf.ObjectsDic.TryGetValue(animationPtr.m_PathID, out var obj) && obj is AnimationClip foundClip)
+                                if (sf.TryGetObject(animationPtr.m_PathID, out var obj) && obj is AnimationClip foundClip)
                                 {
                                     animationClip = foundClip;
                                     break;
@@ -382,9 +408,9 @@ namespace AssetStudio
 
                 if (!childPtr.TryGet(out var child))
                 {
-                    foreach (var sf in m_Transform.assetsFile.assetsManager.assetsFileList)
+                    foreach (var sf in SnapshotAssetsFiles(m_Transform.assetsFile?.assetsManager))
                     {
-                        if (sf.ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
+                        if (sf.TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundChild)
                         {
                             child = foundChild;
                             break;
@@ -394,8 +420,21 @@ namespace AssetStudio
 
                 if (child != null)
                 {
-                    ConvertMeshRendererForScene(child, visited, includeInactive, includeAnimations, cancellationToken);
+                    ConvertMeshRendererForScene(child, visited, includeInactive, includeAnimations, skipDisabledRenderers, cancellationToken);
                 }
+            }
+        }
+
+        private static SerializedFile[] SnapshotAssetsFiles(AssetsManager? manager)
+        {
+            if (manager == null)
+            {
+                return Array.Empty<SerializedFile>();
+            }
+
+            lock (manager.loadLock)
+            {
+                return manager.assetsFileList.ToArray();
             }
         }
 
@@ -412,15 +451,12 @@ namespace AssetStudio
                 return true;
             }
 
-            if (trans.assetsFile?.assetsManager?.assetsFileList != null)
+            foreach (var sf in SnapshotAssetsFiles(trans.assetsFile?.assetsManager))
             {
-                foreach (var sf in trans.assetsFile.assetsManager.assetsFileList)
+                if (sf.TryGetObject(trans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
                 {
-                    if (sf.ObjectsDic.TryGetValue(trans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
-                    {
-                        gameObject = foundGo;
-                        return true;
-                    }
+                    gameObject = foundGo;
+                    return true;
                 }
             }
 
@@ -910,16 +946,21 @@ namespace AssetStudio
 
         private void ConvertMeshRenderer(Renderer meshR)
         {
-            var mesh = GetMesh(meshR);
+            var mesh = GetMesh(meshR) ?? TryResolveMeshWithResolver(meshR);
             if (mesh == null)
                 return;
             mesh.EnsureProcessed();
+            if (skipEmptyMeshes && (mesh.m_VertexCount <= 0 || mesh.m_Vertices == null || mesh.m_Vertices.Length == 0))
+            {
+                Logger.Info($"Skipping empty 0-vertex mesh '{mesh.m_Name}' (PathID: {mesh.m_PathID}).");
+                return;
+            }
             var iMesh = new ImportedMesh();
             if (!meshR.m_GameObject.TryGet(out var m_GameObject2))
             {
-                foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                foreach (var sf in SnapshotAssetsFiles(meshR.assetsFile?.assetsManager))
                 {
-                    if (sf.ObjectsDic.TryGetValue(meshR.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                    if (sf.TryGetObject(meshR.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
                     {
                         m_GameObject2 = foundGo;
                         break;
@@ -974,7 +1015,7 @@ namespace AssetStudio
 
                 for (int i = 0; i < cachedStatic.Submeshes.Count; i++)
                 {
-                    Material? mat = ResolveRendererSubmeshMaterial(meshR, i, firstSubMesh);
+                    Material? mat = ResolveRendererSubmeshMaterial(meshR, mesh, i, firstSubMesh);
                     ImportedMaterial iMat = ConvertMaterial(mat);
                     iMesh.SubmeshList.Add(new ImportedSubmesh
                     {
@@ -1008,7 +1049,7 @@ namespace AssetStudio
                 }
                 var submesh = mesh.m_SubMeshes[i];
                 var iSubmesh = new ImportedSubmesh();
-                Material? mat = ResolveRendererSubmeshMaterial(meshR, i, firstSubMesh);
+                Material? mat = ResolveRendererSubmeshMaterial(meshR, mesh, i, firstSubMesh);
                 ImportedMaterial iMat = ConvertMaterial(mat);
                 iSubmesh.Material = iMat.Name;
                 iSubmesh.BaseVertex = checked((int)(mesh.m_SubMeshes[i].firstVertex + mesh.m_SubMeshes[i].baseVertex));
@@ -1267,6 +1308,12 @@ namespace AssetStudio
             // so shared parent/sibling frame transforms are NEVER mutated.
             if (combine)
             {
+                // Static-batched renderers reference only a small submesh range of the shared combined mesh;
+                // keep only the vertices this renderer actually uses instead of duplicating the whole batch per node.
+                if (meshR is not SkinnedMeshRenderer)
+                {
+                    CompactUnreferencedVertices(iMesh);
+                }
                 UnbakeStaticBatchedMeshToLocalSpace(iMesh);
             }
             else if (canUseStaticGeometryCache)
@@ -1293,26 +1340,145 @@ namespace AssetStudio
             MeshList.Add(iMesh);
         }
 
-        private static Material? ResolveRendererSubmeshMaterial(Renderer meshR, int submeshIndex, int firstSubMesh)
+        private Mesh? TryResolveMeshWithResolver(Renderer meshR)
         {
-            if (submeshIndex - firstSubMesh >= 0 && submeshIndex - firstSubMesh < meshR.m_Materials.Length)
+            if (meshResolver == null)
             {
-                var matPPtr = meshR.m_Materials[submeshIndex - firstSubMesh];
+                return null;
+            }
+
+            try
+            {
+                return meshResolver(meshR);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Logger.Warning($"Mesh resolver failed for renderer PathID={meshR.m_PathID}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private Material? ResolveRendererSubmeshMaterial(Renderer meshR, Mesh mesh, int submeshIndex, int firstSubMesh)
+        {
+            var slotIndex = submeshIndex - firstSubMesh;
+            if (materialResolver != null && slotIndex >= 0)
+            {
+                try
+                {
+                    var resolved = materialResolver(meshR, mesh, slotIndex);
+                    if (resolved != null)
+                    {
+                        return resolved;
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Logger.Warning($"Material resolver failed for renderer PathID={meshR.m_PathID}, slot {slotIndex}: {ex.Message}");
+                }
+            }
+
+            return ResolveRendererSubmeshMaterialInMemory(meshR, submeshIndex, firstSubMesh);
+        }
+
+        /// <summary>
+        /// Removes vertices that no submesh face references and remaps face indices (BaseVertex becomes 0).
+        /// Used for static-batched renderers whose submesh range only touches a slice of a shared combined mesh.
+        /// Returns the number of vertices removed.
+        /// </summary>
+        public static int CompactUnreferencedVertices(ImportedMesh iMesh)
+        {
+            ArgumentNullException.ThrowIfNull(iMesh);
+            var vertices = iMesh.VertexList;
+            if (vertices == null || vertices.Count == 0 || iMesh.SubmeshList == null || iMesh.SubmeshList.Count == 0)
+            {
+                return 0;
+            }
+
+            var remap = new int[vertices.Count];
+            Array.Fill(remap, -1);
+            var compacted = new List<ImportedVertex>();
+            foreach (var submesh in iMesh.SubmeshList)
+            {
+                if (submesh?.FaceList == null)
+                {
+                    continue;
+                }
+
+                foreach (var face in submesh.FaceList)
+                {
+                    var indices = face?.VertexIndices;
+                    if (indices == null)
+                    {
+                        continue;
+                    }
+
+                    for (int k = 0; k < indices.Length; k++)
+                    {
+                        var absolute = indices[k] + submesh.BaseVertex;
+                        if (absolute < 0 || absolute >= vertices.Count)
+                        {
+                            // Out-of-range indices cannot be remapped safely; keep the mesh untouched.
+                            return 0;
+                        }
+                    }
+                }
+            }
+
+            foreach (var submesh in iMesh.SubmeshList)
+            {
+                if (submesh?.FaceList == null)
+                {
+                    continue;
+                }
+
+                var baseVertex = submesh.BaseVertex;
+                foreach (var face in submesh.FaceList)
+                {
+                    var indices = face?.VertexIndices;
+                    if (indices == null)
+                    {
+                        continue;
+                    }
+
+                    for (int k = 0; k < indices.Length; k++)
+                    {
+                        var absolute = indices[k] + baseVertex;
+                        var mapped = remap[absolute];
+                        if (mapped < 0)
+                        {
+                            mapped = compacted.Count;
+                            remap[absolute] = mapped;
+                            compacted.Add(vertices[absolute]);
+                        }
+                        indices[k] = mapped;
+                    }
+                }
+                submesh.BaseVertex = 0;
+            }
+
+            var removed = vertices.Count - compacted.Count;
+            iMesh.VertexList = compacted;
+            return removed;
+        }
+
+        private static Material? ResolveRendererSubmeshMaterialInMemory(Renderer meshR, int submeshIndex, int firstSubMesh)
+        {
+            var slotIndex = submeshIndex - firstSubMesh;
+            if (meshR.m_Materials != null && slotIndex >= 0 && slotIndex < meshR.m_Materials.Length)
+            {
+                var matPPtr = meshR.m_Materials[slotIndex];
                 if (matPPtr != null && !matPPtr.IsNull)
                 {
                     if (!matPPtr.TryGet(out var m_Material))
                     {
                         Logger.Warning($"Material TryGet failed for submesh {submeshIndex}: FileID={matPPtr.m_FileID}, PathID={matPPtr.m_PathID}. Searching all loaded files...");
-                        if (meshR.assetsFile?.assetsManager?.assetsFileList != null)
+                        foreach (var sf in SnapshotAssetsFiles(meshR.assetsFile?.assetsManager))
                         {
-                            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                            if (sf.TryGetObject(matPPtr.m_PathID, out var obj) && obj is Material foundMat)
                             {
-                                if (sf.ObjectsDic.TryGetValue(matPPtr.m_PathID, out var obj) && obj is Material foundMat)
-                                {
-                                    m_Material = foundMat;
-                                    Logger.Info($"Found material '{foundMat.m_Name}' by PathID fallback in file '{sf.fileName}'.");
-                                    break;
-                                }
+                                m_Material = foundMat;
+                                Logger.Info($"Found material '{foundMat.m_Name}' by PathID fallback in file '{sf.fileName}'.");
+                                break;
                             }
                         }
                     }
@@ -1323,7 +1489,7 @@ namespace AssetStudio
                 return null;
             }
 
-            Logger.Warning($"No material slot for submesh {submeshIndex}: index {submeshIndex - firstSubMesh} >= m_Materials.Length {meshR.m_Materials.Length}.");
+            Logger.Warning($"No material slot for submesh {submeshIndex}: index {slotIndex} >= m_Materials.Length {meshR.m_Materials?.Length ?? 0}.");
             return null;
         }
 
@@ -1334,7 +1500,7 @@ namespace AssetStudio
                 return;
             }
 
-            var meshFrame = FindFrameForMesh(RootFrame, iMesh.Path);
+            var meshFrame = iMesh.TargetFrame ?? FindFrameForMesh(RootFrame, iMesh.Path);
             if (meshFrame == null)
             {
                 return;
@@ -1441,9 +1607,9 @@ namespace AssetStudio
                 return true;
             if (bonePtr.IsNull)
                 return false;
-            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+            foreach (var sf in SnapshotAssetsFiles(meshR.assetsFile?.assetsManager))
             {
-                if (sf.ObjectsDic.TryGetValue(bonePtr.m_PathID, out var obj) && obj is Transform foundTransform)
+                if (sf.TryGetObject(bonePtr.m_PathID, out var obj) && obj is Transform foundTransform)
                 {
                     transform = foundTransform;
                     return true;
@@ -1460,9 +1626,9 @@ namespace AssetStudio
                 {
                     if (sMesh.m_Mesh != null && !sMesh.m_Mesh.IsNull)
                     {
-                        foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                        foreach (var sf in SnapshotAssetsFiles(meshR.assetsFile?.assetsManager))
                         {
-                            if (sf.ObjectsDic.TryGetValue(sMesh.m_Mesh.m_PathID, out var obj) && obj is Mesh foundMesh)
+                            if (sf.TryGetObject(sMesh.m_Mesh.m_PathID, out var obj) && obj is Mesh foundMesh)
                             {
                                 m_Mesh = foundMesh;
                                 Logger.Info($"Found mesh '{foundMesh.m_Name}' by PathID fallback in file '{sf.fileName}'.");
@@ -1477,9 +1643,9 @@ namespace AssetStudio
             {
                 if (!meshR.m_GameObject.TryGet(out var m_GameObject))
                 {
-                    foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                    foreach (var sf in SnapshotAssetsFiles(meshR.assetsFile?.assetsManager))
                     {
-                        if (sf.ObjectsDic.TryGetValue(meshR.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                        if (sf.TryGetObject(meshR.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
                         {
                             m_GameObject = foundGo;
                             break;
@@ -1492,9 +1658,9 @@ namespace AssetStudio
                     {
                         if (m_GameObject.m_MeshFilter.m_Mesh != null && !m_GameObject.m_MeshFilter.m_Mesh.IsNull)
                         {
-                            foreach (var sf in meshR.assetsFile.assetsManager.assetsFileList)
+                            foreach (var sf in SnapshotAssetsFiles(meshR.assetsFile?.assetsManager))
                             {
-                                if (sf.ObjectsDic.TryGetValue(m_GameObject.m_MeshFilter.m_Mesh.m_PathID, out var obj) && obj is Mesh foundMesh)
+                                if (sf.TryGetObject(m_GameObject.m_MeshFilter.m_Mesh.m_PathID, out var obj) && obj is Mesh foundMesh)
                                 {
                                     m_Mesh = foundMesh;
                                     Logger.Info($"Found mesh '{foundMesh.m_Name}' by PathID fallback in file '{sf.fileName}'.");
@@ -1673,7 +1839,7 @@ namespace AssetStudio
                 var effectiveTexEnvs = CollectEffectiveMaterialTexEnvs(mat);
                 ImportedMaterialTexture? fallbackDiffuseCandidate = null;
                 var diffusePriorities = new Dictionary<ImportedMaterialTexture, int>();
-                foreach (var texEnv in effectiveTexEnvs)
+                foreach (var (ownerMat, texEnv) in effectiveTexEnvs)
                 {
                     if (texEnv.Value == null)
                     {
@@ -1683,11 +1849,19 @@ namespace AssetStudio
                     Texture2D? m_Texture2D = null;
                     if (activeResolver != null)
                     {
-                        m_Texture2D = activeResolver(mat, texEnv.Key, textureRef);
+                        m_Texture2D = activeResolver(ownerMat, texEnv.Key, textureRef);
+                        if (m_Texture2D == null && !ReferenceEquals(ownerMat, mat))
+                        {
+                            m_Texture2D = activeResolver(mat, texEnv.Key, textureRef);
+                        }
                     }
                     if (m_Texture2D == null && textureRef != null && !textureRef.IsNull) //TODO other Texture
                     {
-                        TryFindTextureInMaterialScope(mat, textureRef, out m_Texture2D);
+                        if (!TryFindTextureInMaterialScope(ownerMat, textureRef, out m_Texture2D)
+                            && !ReferenceEquals(ownerMat, mat))
+                        {
+                            TryFindTextureInMaterialScope(mat, textureRef, out m_Texture2D);
+                        }
                     }
 
                     if (m_Texture2D == null)
@@ -1790,9 +1964,9 @@ namespace AssetStudio
             return iMat;
         }
 
-        private static List<KeyValuePair<string, UnityTexEnv>> CollectEffectiveMaterialTexEnvs(Material mat)
+        private static List<(Material Owner, KeyValuePair<string, UnityTexEnv> Entry)> CollectEffectiveMaterialTexEnvs(Material mat)
         {
-            var result = new List<KeyValuePair<string, UnityTexEnv>>();
+            var result = new List<(Material Owner, KeyValuePair<string, UnityTexEnv> Entry)>();
             var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var visitedMats = new HashSet<Material>();
             Material? current = mat;
@@ -1812,7 +1986,7 @@ namespace AssetStudio
                         }
                         if (seenKeys.Add(kv.Key))
                         {
-                            result.Add(kv);
+                            result.Add((current, kv));
                         }
                     }
                 }
@@ -3861,10 +4035,10 @@ namespace AssetStudio
                         Component? comp = null;
                         if (!compPtr.TryGet(out comp) && go.assetsFile?.assetsManager != null)
                         {
-                            var files = go.assetsFile.assetsManager.assetsFileList;
-                            for (int f = 0; f < files.Count; f++)
+                            var files = SnapshotAssetsFiles(go.assetsFile.assetsManager);
+                            for (int f = 0; f < files.Length; f++)
                             {
-                                if (files[f].ObjectsDic.TryGetValue(compPtr.m_PathID, out var obj) && obj is Component foundComp)
+                                if (files[f].TryGetObject(compPtr.m_PathID, out var obj) && obj is Component foundComp)
                                 {
                                     comp = foundComp;
                                     break;
@@ -3913,10 +4087,10 @@ namespace AssetStudio
 
                         if (!childPtr.TryGet(out var childTrans) && go.assetsFile?.assetsManager != null)
                         {
-                            var files = go.assetsFile.assetsManager.assetsFileList;
-                            for (int f = 0; f < files.Count; f++)
+                            var files = SnapshotAssetsFiles(go.assetsFile.assetsManager);
+                            for (int f = 0; f < files.Length; f++)
                             {
-                                if (files[f].ObjectsDic.TryGetValue(childPtr.m_PathID, out var obj) && obj is Transform foundTrans)
+                                if (files[f].TryGetObject(childPtr.m_PathID, out var obj) && obj is Transform foundTrans)
                                 {
                                     childTrans = foundTrans;
                                     break;
@@ -3931,10 +4105,10 @@ namespace AssetStudio
 
                         if (!childTrans.m_GameObject.TryGet(out var childGo) && childTrans.assetsFile?.assetsManager != null)
                         {
-                            var files = childTrans.assetsFile.assetsManager.assetsFileList;
-                            for (int f = 0; f < files.Count; f++)
+                            var files = SnapshotAssetsFiles(childTrans.assetsFile.assetsManager);
+                            for (int f = 0; f < files.Length; f++)
                             {
-                                if (files[f].ObjectsDic.TryGetValue(childTrans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
+                                if (files[f].TryGetObject(childTrans.m_GameObject.m_PathID, out var obj) && obj is GameObject foundGo)
                                 {
                                     childGo = foundGo;
                                     break;

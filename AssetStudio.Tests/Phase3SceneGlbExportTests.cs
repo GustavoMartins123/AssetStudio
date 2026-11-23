@@ -3,6 +3,8 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -328,6 +330,640 @@ namespace AssetStudio.Tests
             childA.AddChild(childB);
             Assert.Same(sceneRoot, SceneGlbExportService.FindSceneRootNode(childB));
             Assert.Same(sceneRoot, SceneGlbExportService.FindSceneRootNode(sceneRoot));
+        }
+
+        [Fact]
+        public void SceneGlbExportService_LazyCrossBundleMeshesMaterialsAndTextures_MatchExportModelWithInstancing()
+        {
+            var tempDir = CreateTempDirectory();
+            try
+            {
+                using var sceneManager = new AssetsManager();
+                var sceneFile = CreateSyntheticSerializedFile(sceneManager, "CAB-scene-001");
+
+                // Simulate external bundles that are NOT loaded in sceneManager.assetsFileList (Lazy Mode!)
+                using var meshBundleManager = new AssetsManager();
+                var meshBundleFile = CreateSyntheticSerializedFile(meshBundleManager, "CAB-meshes-002");
+                var externalMesh = CreateSyntheticTwoSubmeshMesh(meshBundleFile, pathId: 5001, name: "SM_ShopBuilding");
+
+                using var matBundleManager = new AssetsManager();
+                var matBundleFile = CreateSyntheticSerializedFile(matBundleManager, "CAB-materials-003");
+                using var texBundleManager = new AssetsManager();
+                var texBundleFile = CreateSyntheticSerializedFile(texBundleManager, "CAB-textures-004");
+
+                var roofTex = CreateSyntheticRgbaTexture(texBundleFile, pathId: 7001, name: "T_ShopRoof_D", 140, 60, 180, 255);
+                var starTex = CreateSyntheticRgbaTexture(texBundleFile, pathId: 7002, name: "T_ShopStar_Cutout", 255, 220, 40, 255);
+
+                var roofMat = CreateSyntheticMaterial(
+                    matBundleFile,
+                    pathId: 6001,
+                    name: "Mat_ShopRoof",
+                    texEnvs: new[]
+                    {
+                        new KeyValuePair<string, UnityTexEnv>("_BaseMap", CreateTexEnv(matBundleFile, fileId: 1, pathId: 7001))
+                    });
+
+                var starMat = CreateSyntheticMaterial(
+                    matBundleFile,
+                    pathId: 6002,
+                    name: "Mat_ShopStarCutout",
+                    texEnvs: new[]
+                    {
+                        new KeyValuePair<string, UnityTexEnv>("_BaseMap", CreateTexEnv(matBundleFile, fileId: 1, pathId: 7002))
+                    },
+                    floats: new[]
+                    {
+                        new KeyValuePair<string, float>("_AlphaClip", 1f),
+                        new KeyValuePair<string, float>("_Cutoff", 0.5f)
+                    });
+
+                // Build an UNHYDRATED Lazy Mode scene hierarchy (GameObject.m_Transform / m_MeshRenderer / m_MeshFilter are null;
+                // only m_Components PPtrs exist — exact state of Lazy Mode before eager ProcessAssets!)
+                var rootGo = CreateSyntheticGameObject(sceneFile, 100, "ShopRoot", isActive: true);
+                var rootTr = CreateSyntheticTransform(sceneFile, 101, rootGo, father: null, position: Vector3.Zero);
+
+                var shopA = CreateSyntheticGameObject(sceneFile, 200, "ShopBuilding", isActive: true);
+                var shopATr = CreateSyntheticTransform(sceneFile, 201, shopA, father: rootTr, position: new Vector3(0, 0, 0));
+                var shopAMf = CreateSyntheticMeshFilter(sceneFile, 202, shopA, meshFileId: 1, meshPathId: 5001);
+                var shopAMr = CreateSyntheticMeshRenderer(
+                    sceneFile,
+                    203,
+                    shopA,
+                    enabled: true,
+                    materials: new[]
+                    {
+                        CreatePPtr<Material>(sceneFile, fileId: 2, pathId: 6001),
+                        CreatePPtr<Material>(sceneFile, fileId: 2, pathId: 6002)
+                    });
+                AttachComponentsOnly(shopA, shopATr, shopAMf, shopAMr);
+
+                // Second sibling with the EXACT SAME name referencing the same external mesh + materials -> tests instancing!
+                var shopB = CreateSyntheticGameObject(sceneFile, 300, "ShopBuilding", isActive: true);
+                var shopBTr = CreateSyntheticTransform(sceneFile, 301, shopB, father: rootTr, position: new Vector3(12f, 0f, -4f));
+                var shopBMf = CreateSyntheticMeshFilter(sceneFile, 302, shopB, meshFileId: 1, meshPathId: 5001);
+                var shopBMr = CreateSyntheticMeshRenderer(
+                    sceneFile,
+                    303,
+                    shopB,
+                    enabled: true,
+                    materials: new[]
+                    {
+                        CreatePPtr<Material>(sceneFile, fileId: 2, pathId: 6001),
+                        CreatePPtr<Material>(sceneFile, fileId: 2, pathId: 6002)
+                    });
+                AttachComponentsOnly(shopB, shopBTr, shopBMf, shopBMr);
+
+                rootTr.m_Children = new[]
+                {
+                    CreatePPtr<Transform>(sceneFile, 0, shopATr.m_PathID),
+                    CreatePPtr<Transform>(sceneFile, 0, shopBTr.m_PathID)
+                };
+                AttachComponentsOnly(rootGo, rootTr);
+
+                // Collect roots from the unhydrated SerializedFile
+                var roots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(
+                    new[] { sceneFile },
+                    out var usedInactiveFallback);
+                Assert.False(usedInactiveFallback);
+                Assert.Single(roots);
+                Assert.Same(rootGo, roots[0]);
+
+                int meshResolverCalls = 0;
+                int materialResolverCalls = 0;
+                var outGlb = Path.Combine(tempDir, "lazy_shop_parity.glb");
+                var service = new SceneGlbExportService();
+                var result = service.ExportScene(
+                    roots,
+                    new SceneGlbExportOptions
+                    {
+                        OutputPath = outGlb,
+                        SceneName = "CAB-scene-001",
+                        IncludeInactive = false,
+                        SkipDisabledRenderers = true,
+                        EnableInstancing = true
+                    },
+                    textureResolver: (mat, prop, texRef) =>
+                    {
+                        if (texRef != null && texRef.m_PathID == 7001) return roofTex;
+                        if (texRef != null && texRef.m_PathID == 7002) return starTex;
+                        return null;
+                    },
+                    meshResolver: r =>
+                    {
+                        meshResolverCalls++;
+                        return externalMesh;
+                    },
+                    materialResolver: (r, mesh, slot) =>
+                    {
+                        materialResolverCalls++;
+                        return slot == 0 ? roofMat : (slot == 1 ? starMat : null);
+                    });
+
+                Assert.True(result.Success, result.ErrorMessage);
+                Assert.True(File.Exists(outGlb));
+                Assert.True(meshResolverCalls >= 2);
+                Assert.True(materialResolverCalls >= 4);
+
+                // Full parity: 2 materials, 2 textures, 0 fallback gray materials, AND glTF 2.0 instancing preserved!
+                Assert.Equal(2, result.Stats.MaterialsCount);
+                Assert.Equal(2, result.Stats.TexturesCount);
+                Assert.Equal(2, result.Stats.TotalMeshInstances);
+                Assert.Equal(1, result.Stats.UniqueGltfMeshes);
+                Assert.Equal(1, result.Stats.UniqueGeometryBuffers);
+                Assert.Equal(1, result.Stats.ReusedMeshCount);
+
+                using var doc = ParseGlbJson(outGlb);
+                var materials = doc.RootElement.GetProperty("materials").EnumerateArray().ToList();
+                Assert.Equal(2, materials.Count);
+
+                var gltfRoof = materials.Single(m => m.GetProperty("name").GetString() == "Mat_ShopRoof");
+                var gltfStar = materials.Single(m => m.GetProperty("name").GetString() == "Mat_ShopStarCutout");
+
+                Assert.True(gltfRoof.GetProperty("pbrMetallicRoughness").TryGetProperty("baseColorTexture", out _));
+                Assert.True(gltfStar.GetProperty("pbrMetallicRoughness").TryGetProperty("baseColorTexture", out _));
+                Assert.Equal("MASK", gltfStar.GetProperty("alphaMode").GetString());
+                Assert.Equal(0.5f, gltfStar.GetProperty("alphaCutoff").GetSingle(), 3);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempDir);
+            }
+        }
+
+        [Fact]
+        public void ModelConverter_CreateForScene_FiltersInactiveObjectsAndDisabledRenderers_AndFallsBackWhenAllInactive()
+        {
+            using var am = new AssetsManager();
+            var sf = CreateSyntheticSerializedFile(am, "CAB-filter-scene");
+            var mesh = CreateSyntheticTwoSubmeshMesh(sf, 4001, "SM_Prop");
+            var mat = CreateSyntheticMaterial(sf, 4002, "Mat_Prop", Array.Empty<KeyValuePair<string, UnityTexEnv>>());
+
+            var rootGo = CreateSyntheticGameObject(sf, 10, "SceneRoot", isActive: true);
+            var rootTr = CreateSyntheticTransform(sf, 11, rootGo, null, Vector3.Zero);
+
+            var visibleGo = CreateSyntheticGameObject(sf, 20, "VisibleProp", isActive: true);
+            var visibleTr = CreateSyntheticTransform(sf, 21, visibleGo, rootTr, new Vector3(1, 0, 0));
+            var visibleMf = CreateSyntheticMeshFilter(sf, 22, visibleGo, 0, mesh.m_PathID);
+            var visibleMr = CreateSyntheticMeshRenderer(sf, 23, visibleGo, enabled: true, new[] { CreatePPtr<Material>(sf, 0, mat.m_PathID), CreatePPtr<Material>(sf, 0, mat.m_PathID) });
+            AttachComponentsOnly(visibleGo, visibleTr, visibleMf, visibleMr);
+
+            var disabledRendererGo = CreateSyntheticGameObject(sf, 30, "DisabledShadowProxy", isActive: true);
+            var disabledTr = CreateSyntheticTransform(sf, 31, disabledRendererGo, rootTr, new Vector3(2, 0, 0));
+            var disabledMf = CreateSyntheticMeshFilter(sf, 32, disabledRendererGo, 0, mesh.m_PathID);
+            var disabledMr = CreateSyntheticMeshRenderer(sf, 33, disabledRendererGo, enabled: false, new[] { CreatePPtr<Material>(sf, 0, mat.m_PathID), CreatePPtr<Material>(sf, 0, mat.m_PathID) });
+            AttachComponentsOnly(disabledRendererGo, disabledTr, disabledMf, disabledMr);
+
+            var inactiveGo = CreateSyntheticGameObject(sf, 40, "InactiveLodProxy", isActive: false);
+            var inactiveTr = CreateSyntheticTransform(sf, 41, inactiveGo, rootTr, new Vector3(3, 0, 0));
+            var inactiveMf = CreateSyntheticMeshFilter(sf, 42, inactiveGo, 0, mesh.m_PathID);
+            var inactiveMr = CreateSyntheticMeshRenderer(sf, 43, inactiveGo, enabled: true, new[] { CreatePPtr<Material>(sf, 0, mat.m_PathID), CreatePPtr<Material>(sf, 0, mat.m_PathID) });
+            AttachComponentsOnly(inactiveGo, inactiveTr, inactiveMf, inactiveMr);
+
+            rootTr.m_Children = new[]
+            {
+                CreatePPtr<Transform>(sf, 0, visibleTr.m_PathID),
+                CreatePPtr<Transform>(sf, 0, disabledTr.m_PathID),
+                CreatePPtr<Transform>(sf, 0, inactiveTr.m_PathID)
+            };
+            AttachComponentsOnly(rootGo, rootTr);
+
+            // Default clean scene export: IncludeInactive = false, SkipDisabledRenderers = true
+            var cleanConvert = ModelConverter.CreateForScene(
+                "FilterScene",
+                new[] { rootGo },
+                includeInactive: false,
+                skipDisabledRenderers: true);
+
+            Assert.Single(cleanConvert.MeshList);
+            Assert.Equal("VisibleProp", cleanConvert.MeshList[0].TargetFrame?.Name);
+            // Disabled renderer's Transform node is still preserved (only its hidden MeshRenderer is skipped),
+            // whereas the inactive subtree is excluded completely.
+            Assert.NotNull(cleanConvert.RootFrame.FindFrameByPath("FilterScene/SceneRoot/DisabledShadowProxy"));
+            Assert.Null(cleanConvert.RootFrame.FindFrameByPath("FilterScene/SceneRoot/InactiveLodProxy"));
+
+            // With includeInactive: true and skipDisabledRenderers: false -> all 3 renderers are exported
+            var fullConvert = ModelConverter.CreateForScene(
+                "FilterScene",
+                new[] { rootGo },
+                includeInactive: true,
+                skipDisabledRenderers: false);
+            Assert.Equal(3, fullConvert.MeshList.Count);
+
+            // All-inactive prefab SerializedFile must fall back cleanly instead of returning 0 roots
+            using var prefabAm = new AssetsManager();
+            var prefabSf = CreateSyntheticSerializedFile(prefabAm, "CAB-inactive-prefab");
+            var inactiveRootGo = CreateSyntheticGameObject(prefabSf, 100, "InactivePrefabRoot", isActive: false);
+            var inactiveRootTr = CreateSyntheticTransform(prefabSf, 101, inactiveRootGo, null, Vector3.Zero);
+            AttachComponentsOnly(inactiveRootGo, inactiveRootTr);
+
+            var fallbackRoots = SceneGlbExportService.CollectRootGameObjectsWithInactiveFallback(
+                new[] { prefabSf },
+                out var usedInactiveFallback);
+            Assert.True(usedInactiveFallback);
+            Assert.Single(fallbackRoots);
+            Assert.Same(inactiveRootGo, fallbackRoots[0]);
+        }
+
+        [Fact]
+        public void ModelConverter_CreateForScene_StaticBatchedRenderers_CompactVerticesAndUnbakePerTargetFrame()
+        {
+            using var am = new AssetsManager();
+            var sf = CreateSyntheticSerializedFile(am, "CAB-static-batch");
+
+            // Combined static-batch mesh with 6 vertices:
+            // - Submesh 0 (verts 0..2) baked in world space at Unity X = 10 -> Imported X = -10
+            // - Submesh 1 (verts 3..5) baked in world space at Unity X = -5 -> Imported X = +5
+            var combinedMesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            combinedMesh.assetsFile = sf;
+            combinedMesh.m_PathID = 8001;
+            combinedMesh.m_Name = "Combined Mesh (root: scene)";
+            combinedMesh.m_VertexCount = 6;
+            combinedMesh.m_Vertices = new[]
+            {
+                10f, 0f, 0f,  11f, 0f, 0f,  10f, 1f, 0f,
+                -5f, 0f, 0f,  -4f, 0f, 0f,  -5f, 1f, 0f
+            };
+            combinedMesh.m_Normals = new[]
+            {
+                0f, 0f, 1f,  0f, 0f, 1f,  0f, 0f, 1f,
+                0f, 0f, 1f,  0f, 0f, 1f,  0f, 0f, 1f
+            };
+            combinedMesh.m_UV0 = new[]
+            {
+                0f, 0f,  1f, 0f,  0f, 1f,
+                0f, 0f,  1f, 0f,  0f, 1f
+            };
+            combinedMesh.m_Indices = new List<uint> { 0, 1, 2, 3, 4, 5 };
+
+            var sub0 = (SubMesh)RuntimeHelpers.GetUninitializedObject(typeof(SubMesh));
+            sub0.indexCount = 3;
+            sub0.firstVertex = 0;
+            sub0.vertexCount = 3;
+            sub0.baseVertex = 0;
+
+            var sub1 = (SubMesh)RuntimeHelpers.GetUninitializedObject(typeof(SubMesh));
+            sub1.indexCount = 3;
+            sub1.firstVertex = 3;
+            sub1.vertexCount = 3;
+            sub1.baseVertex = 0;
+
+            combinedMesh.m_SubMeshes = new[] { sub0, sub1 };
+            MarkMeshProcessed(combinedMesh);
+            sf.AddObject(combinedMesh);
+
+            var matA = CreateSyntheticMaterial(sf, 8101, "Mat_PropA", Array.Empty<KeyValuePair<string, UnityTexEnv>>());
+            var matB = CreateSyntheticMaterial(sf, 8102, "Mat_PropB", Array.Empty<KeyValuePair<string, UnityTexEnv>>());
+
+            var rootGo = CreateSyntheticGameObject(sf, 1, "BatchRoot", isActive: true);
+            var rootTr = CreateSyntheticTransform(sf, 2, rootGo, null, Vector3.Zero);
+
+            // Give BOTH sibling renderers the exact same GameObject name to verify TargetFrame-based unbaking!
+            var propA = CreateSyntheticGameObject(sf, 10, "BatchedProp", isActive: true);
+            var propATr = CreateSyntheticTransform(sf, 11, propA, rootTr, new Vector3(10f, 0f, 0f));
+            var propAMf = CreateSyntheticMeshFilter(sf, 12, propA, 0, combinedMesh.m_PathID);
+            var propAMr = CreateSyntheticMeshRenderer(sf, 13, propA, enabled: true, new[] { CreatePPtr<Material>(sf, 0, matA.m_PathID) });
+            propAMr.m_StaticBatchInfo = CreateStaticBatchInfo(firstSubMesh: 0, subMeshCount: 1);
+            AttachComponentsOnly(propA, propATr, propAMf, propAMr);
+
+            var propB = CreateSyntheticGameObject(sf, 20, "BatchedProp", isActive: true);
+            var propBTr = CreateSyntheticTransform(sf, 21, propB, rootTr, new Vector3(-5f, 0f, 0f));
+            var propBMf = CreateSyntheticMeshFilter(sf, 22, propB, 0, combinedMesh.m_PathID);
+            var propBMr = CreateSyntheticMeshRenderer(sf, 23, propB, enabled: true, new[] { CreatePPtr<Material>(sf, 0, matB.m_PathID) });
+            propBMr.m_StaticBatchInfo = CreateStaticBatchInfo(firstSubMesh: 1, subMeshCount: 1);
+            AttachComponentsOnly(propB, propBTr, propBMf, propBMr);
+
+            rootTr.m_Children = new[]
+            {
+                CreatePPtr<Transform>(sf, 0, propATr.m_PathID),
+                CreatePPtr<Transform>(sf, 0, propBTr.m_PathID)
+            };
+            AttachComponentsOnly(rootGo, rootTr);
+
+            var convert = ModelConverter.CreateForScene(
+                "StaticBatchScene",
+                new[] { rootGo },
+                includeInactive: false,
+                skipDisabledRenderers: true,
+                materialResolver: (r, _, slot) => slot == 0 ? (ReferenceEquals(r, propAMr) ? matA : matB) : null);
+
+            Assert.Equal(2, convert.MeshList.Count);
+
+            // Each static-batched renderer must have ONLY its own 3 compacted vertices (not all 6!)
+            // and must be unbaked into local space (origin ~ (0,0,0)) using its own exact TargetFrame!
+            foreach (var iMesh in convert.MeshList)
+            {
+                Assert.Equal(3, iMesh.VertexList.Count);
+                Assert.Single(iMesh.SubmeshList);
+                Assert.Equal(0, iMesh.SubmeshList[0].BaseVertex);
+                Assert.All(iMesh.VertexList, v => Assert.InRange(v.Vertex.X, -1.01f, 0.01f));
+            }
+
+            Assert.Equal("Mat_PropA", convert.MeshList[0].SubmeshList[0].Material);
+            Assert.Equal("Mat_PropB", convert.MeshList[1].SubmeshList[0].Material);
+        }
+
+        [Fact]
+        public void ModelConverter_CreateForScene_MaterialVariantResolvesParentMaterialTexturesUsingParentOwner()
+        {
+            using var am = new AssetsManager();
+            var parentFile = CreateSyntheticSerializedFile(am, "CAB-parent-mat");
+            var childFile = CreateSyntheticSerializedFile(am, "CAB-child-mat");
+            var sceneFile = CreateSyntheticSerializedFile(am, "CAB-variant-scene");
+
+            var parentTex = CreateSyntheticRgbaTexture(parentFile, 9001, "T_ParentBase", 80, 180, 90, 255);
+            var parentMat = CreateSyntheticMaterial(
+                parentFile,
+                9002,
+                "Mat_Parent",
+                new[]
+                {
+                    new KeyValuePair<string, UnityTexEnv>("_MainTex", CreateTexEnv(parentFile, fileId: 0, pathId: 9001))
+                });
+
+            var childVariantMat = CreateSyntheticMaterial(
+                childFile,
+                9003,
+                "Mat_ChildVariant",
+                Array.Empty<KeyValuePair<string, UnityTexEnv>>());
+            childVariantMat.m_Parent = CreatePPtr<Material>(childFile, fileId: 0, pathId: parentMat.m_PathID);
+            childVariantMat.m_Parent.Set(parentMat);
+
+            var mesh = CreateSyntheticTwoSubmeshMesh(sceneFile, 9010, "SM_VariantBox");
+            var go = CreateSyntheticGameObject(sceneFile, 9020, "VariantNode", isActive: true);
+            var tr = CreateSyntheticTransform(sceneFile, 9021, go, null, Vector3.Zero);
+            var mf = CreateSyntheticMeshFilter(sceneFile, 9022, go, 0, mesh.m_PathID);
+            var mr = CreateSyntheticMeshRenderer(sceneFile, 9023, go, enabled: true, new[]
+            {
+                CreatePPtr<Material>(sceneFile, 0, childVariantMat.m_PathID),
+                CreatePPtr<Material>(sceneFile, 0, childVariantMat.m_PathID)
+            });
+            AttachComponentsOnly(go, tr, mf, mr);
+
+            Material? observedResolverOwner = null;
+            var convert = ModelConverter.CreateForScene(
+                "VariantScene",
+                new[] { go },
+                textureResolver: (ownerMat, prop, texRef) =>
+                {
+                    if (texRef != null && texRef.m_PathID == 9001)
+                    {
+                        observedResolverOwner = ownerMat;
+                        return ReferenceEquals(ownerMat, parentMat) ? parentTex : null;
+                    }
+                    return null;
+                },
+                materialResolver: (_, _, _) => childVariantMat);
+
+            Assert.Same(parentMat, observedResolverOwner);
+            Assert.Single(convert.TextureList);
+            Assert.Contains(convert.MaterialList, m => m.Name == "Mat_ChildVariant" && m.Textures.Count == 1);
+        }
+
+        [Fact]
+        public void ModelConverter_CreateForScene_SkipsZeroVertexEmptyMeshes_AndSelectMaterialForSlotHandlesBounds()
+        {
+            using var am = new AssetsManager();
+            var sf = CreateSyntheticSerializedFile(am, "CAB-empty-mesh");
+
+            var emptyMesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            emptyMesh.assetsFile = sf;
+            emptyMesh.m_PathID = 9501;
+            emptyMesh.m_Name = "SM_EmptyPlaceholder";
+            emptyMesh.m_VertexCount = 0;
+            emptyMesh.m_Vertices = Array.Empty<float>();
+            emptyMesh.m_Indices = new List<uint>();
+            emptyMesh.m_SubMeshes = Array.Empty<SubMesh>();
+            MarkMeshProcessed(emptyMesh);
+            sf.AddObject(emptyMesh);
+
+            var go = CreateSyntheticGameObject(sf, 9510, "EmptyMeshNode", isActive: true);
+            var tr = CreateSyntheticTransform(sf, 9511, go, null, Vector3.Zero);
+            var mf = CreateSyntheticMeshFilter(sf, 9512, go, 0, emptyMesh.m_PathID);
+            var mr = CreateSyntheticMeshRenderer(sf, 9513, go, enabled: true, Array.Empty<PPtr<Material>>());
+            AttachComponentsOnly(go, tr, mf, mr);
+
+            var convert = ModelConverter.CreateForScene("EmptyMeshScene", new[] { go });
+            Assert.Empty(convert.MeshList);
+            Assert.NotNull(convert.RootFrame.FindFrameByPath("EmptyMeshScene/EmptyMeshNode"));
+
+            var mat = CreateSyntheticMaterial(sf, 9520, "Mat_Slot", Array.Empty<KeyValuePair<string, UnityTexEnv>>());
+            Assert.Null(SceneGlbExportService.SelectMaterialForSlot(null, 0));
+            Assert.Null(SceneGlbExportService.SelectMaterialForSlot(new Material?[] { mat }, -1));
+            Assert.Null(SceneGlbExportService.SelectMaterialForSlot(new Material?[] { mat }, 1));
+            Assert.Same(mat, SceneGlbExportService.SelectMaterialForSlot(new Material?[] { mat }, 0));
+        }
+
+        private static SerializedFile CreateSyntheticSerializedFile(AssetsManager manager, string fileName)
+        {
+            var sf = (SerializedFile)RuntimeHelpers.GetUninitializedObject(typeof(SerializedFile));
+            sf.assetsManager = manager;
+            sf.fileName = fileName;
+            sf.fullName = fileName;
+            sf.originalPath = fileName;
+            sf.reader = new FileReader(fileName, new MemoryStream(Array.Empty<byte>()));
+            sf.version = new[] { 2022, 3, 56, 1 };
+            sf.Objects = new List<AssetStudio.Object>();
+            sf.ObjectsDic = new Dictionary<long, AssetStudio.Object>();
+            sf.m_Objects = new List<ObjectInfo>();
+            sf.m_Externals = new List<FileIdentifier>();
+            typeof(SerializedFile)
+                .GetField("objectCollectionLock", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(sf, new object());
+            lock (manager.loadLock)
+            {
+                manager.assetsFileList.Add(sf);
+            }
+            return sf;
+        }
+
+        private static PPtr<T> CreatePPtr<T>(SerializedFile sf, int fileId, long pathId) where T : AssetStudio.Object
+        {
+            return new PPtr<T>(fileId, pathId, sf);
+        }
+
+        private static UnityTexEnv CreateTexEnv(SerializedFile sf, int fileId, long pathId)
+        {
+            var env = (UnityTexEnv)RuntimeHelpers.GetUninitializedObject(typeof(UnityTexEnv));
+            env.m_Texture = CreatePPtr<Texture>(sf, fileId, pathId);
+            env.m_Scale = new Vector2(1f, 1f);
+            env.m_Offset = Vector2.Zero;
+            return env;
+        }
+
+        private static StaticBatchInfo CreateStaticBatchInfo(ushort firstSubMesh, ushort subMeshCount)
+        {
+            var info = (StaticBatchInfo)RuntimeHelpers.GetUninitializedObject(typeof(StaticBatchInfo));
+            info.firstSubMesh = firstSubMesh;
+            info.subMeshCount = subMeshCount;
+            return info;
+        }
+
+        private static GameObject CreateSyntheticGameObject(SerializedFile sf, long pathId, string name, bool isActive)
+        {
+            var go = (GameObject)RuntimeHelpers.GetUninitializedObject(typeof(GameObject));
+            go.assetsFile = sf;
+            go.m_PathID = pathId;
+            go.m_Name = name;
+            go.m_IsActive = isActive;
+            go.m_Components = Array.Empty<PPtr<Component>>();
+            sf.AddObject(go);
+            return go;
+        }
+
+        private static Transform CreateSyntheticTransform(
+            SerializedFile sf,
+            long pathId,
+            GameObject owner,
+            Transform? father,
+            Vector3 position)
+        {
+            var tr = (Transform)RuntimeHelpers.GetUninitializedObject(typeof(Transform));
+            tr.assetsFile = sf;
+            tr.m_PathID = pathId;
+            tr.m_GameObject = CreatePPtr<GameObject>(sf, 0, owner.m_PathID);
+            tr.m_LocalPosition = position;
+            tr.m_LocalRotation = new Quaternion(0f, 0f, 0f, 1f);
+            tr.m_LocalScale = new Vector3(1f, 1f, 1f);
+            tr.m_Children = Array.Empty<PPtr<Transform>>();
+            tr.m_Father = father != null
+                ? CreatePPtr<Transform>(sf, 0, father.m_PathID)
+                : CreatePPtr<Transform>(sf, 0, 0);
+            sf.AddObject(tr);
+            return tr;
+        }
+
+        private static MeshFilter CreateSyntheticMeshFilter(
+            SerializedFile sf,
+            long pathId,
+            GameObject owner,
+            int meshFileId,
+            long meshPathId)
+        {
+            var mf = (MeshFilter)RuntimeHelpers.GetUninitializedObject(typeof(MeshFilter));
+            mf.assetsFile = sf;
+            mf.m_PathID = pathId;
+            mf.m_GameObject = CreatePPtr<GameObject>(sf, 0, owner.m_PathID);
+            mf.m_Mesh = CreatePPtr<Mesh>(sf, meshFileId, meshPathId);
+            sf.AddObject(mf);
+            return mf;
+        }
+
+        private static MeshRenderer CreateSyntheticMeshRenderer(
+            SerializedFile sf,
+            long pathId,
+            GameObject owner,
+            bool enabled,
+            PPtr<Material>[] materials)
+        {
+            var mr = (MeshRenderer)RuntimeHelpers.GetUninitializedObject(typeof(MeshRenderer));
+            mr.assetsFile = sf;
+            mr.m_PathID = pathId;
+            mr.m_GameObject = CreatePPtr<GameObject>(sf, 0, owner.m_PathID);
+            mr.m_Enabled = enabled;
+            mr.m_Materials = materials;
+            sf.AddObject(mr);
+            return mr;
+        }
+
+        private static void AttachComponentsOnly(GameObject go, params Component[] components)
+        {
+            go.m_Components = components
+                .Select(c => CreatePPtr<Component>(go.assetsFile, 0, c.m_PathID))
+                .ToArray();
+        }
+
+        private static Mesh CreateSyntheticTwoSubmeshMesh(SerializedFile sf, long pathId, string name)
+        {
+            var mesh = (Mesh)RuntimeHelpers.GetUninitializedObject(typeof(Mesh));
+            mesh.assetsFile = sf;
+            mesh.m_PathID = pathId;
+            mesh.m_Name = name;
+            mesh.m_VertexCount = 3;
+            mesh.m_Vertices = new[] { 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f };
+            mesh.m_Normals = new[] { 0f, 0f, 1f, 0f, 0f, 1f, 0f, 0f, 1f };
+            mesh.m_UV0 = new[] { 0f, 0f, 1f, 0f, 0f, 1f };
+            mesh.m_Indices = new List<uint> { 0, 1, 2, 0, 1, 2 };
+
+            var sub0 = (SubMesh)RuntimeHelpers.GetUninitializedObject(typeof(SubMesh));
+            sub0.indexCount = 3;
+            sub0.firstVertex = 0;
+            sub0.vertexCount = 3;
+            sub0.baseVertex = 0;
+
+            var sub1 = (SubMesh)RuntimeHelpers.GetUninitializedObject(typeof(SubMesh));
+            sub1.indexCount = 3;
+            sub1.firstVertex = 0;
+            sub1.vertexCount = 3;
+            sub1.baseVertex = 0;
+
+            mesh.m_SubMeshes = new[] { sub0, sub1 };
+            MarkMeshProcessed(mesh);
+            sf.AddObject(mesh);
+            return mesh;
+        }
+
+        private static void MarkMeshProcessed(Mesh mesh)
+        {
+            typeof(Mesh).GetField("m_DataProcessed", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(mesh, true);
+            typeof(Mesh).GetField("m_ProcessLock", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(mesh, new object());
+        }
+
+        private static Material CreateSyntheticMaterial(
+            SerializedFile sf,
+            long pathId,
+            string name,
+            KeyValuePair<string, UnityTexEnv>[] texEnvs,
+            KeyValuePair<string, float>[]? floats = null)
+        {
+            var mat = (Material)RuntimeHelpers.GetUninitializedObject(typeof(Material));
+            mat.assetsFile = sf;
+            mat.m_PathID = pathId;
+            mat.m_Name = name;
+            mat.m_SavedProperties = new UnityPropertySheet
+            {
+                m_TexEnvs = texEnvs,
+                m_Floats = floats ?? Array.Empty<KeyValuePair<string, float>>(),
+                m_Colors = new[] { new KeyValuePair<string, Color>("_BaseColor", new Color(1f, 1f, 1f, 1f)) }
+            };
+            sf.AddObject(mat);
+            return mat;
+        }
+
+        private static Texture2D CreateSyntheticRgbaTexture(
+            SerializedFile sf,
+            long pathId,
+            string name,
+            byte r,
+            byte g,
+            byte b,
+            byte a)
+        {
+            var tex = (Texture2D)RuntimeHelpers.GetUninitializedObject(typeof(Texture2D));
+            tex.assetsFile = sf;
+            tex.m_PathID = pathId;
+            tex.m_Name = name;
+            tex.m_Width = 4;
+            tex.m_Height = 4;
+            tex.m_TextureFormat = TextureFormat.RGBA32;
+            tex.m_MipCount = 1;
+            tex.version = sf.version;
+            var pixels = new byte[4 * 4 * 4];
+            for (int i = 0; i < pixels.Length; i += 4)
+            {
+                pixels[i + 0] = r;
+                pixels[i + 1] = g;
+                pixels[i + 2] = b;
+                pixels[i + 3] = a;
+            }
+
+            var rr = (ResourceReader)RuntimeHelpers.GetUninitializedObject(typeof(ResourceReader));
+            typeof(ResourceReader).GetField("needSearch", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(rr, false);
+            typeof(ResourceReader).GetField("reader", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(rr, new EndianBinaryReader(new MemoryStream(pixels)));
+            typeof(ResourceReader).GetField("offset", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(rr, 0L);
+            typeof(ResourceReader).GetField("size", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(rr, (long)pixels.Length);
+            tex.image_data = rr;
+            sf.AddObject(tex);
+            return tex;
         }
 
         private static SyntheticSceneImported BuildSyntheticInstancedForestScene(
