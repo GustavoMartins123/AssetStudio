@@ -244,9 +244,12 @@ namespace AssetStudio.Tests
                         Assert.True(cache.SaveIndexCache(projectDir, signature, scanResult, "2022.3.20f1", nextHandles));
                     }
 
-                    // Plant a dummy .idx.tmp file to verify DeleteIndexCache cleans it up as well
+                    // Plant legacy .idx.tmp and unique .idx.<pid>.<guid>.tmp files to verify DeleteIndexCache cleans all of them
+                    var uniqueTempIdxPath = MmapProjectIndexSidecar.CreateUniqueTempSidecarPath(idxPath);
                     File.WriteAllBytes(tempIdxPath, new byte[] { 1, 2, 3 });
+                    File.WriteAllBytes(uniqueTempIdxPath, new byte[] { 4, 5, 6 });
                     Assert.True(File.Exists(tempIdxPath));
+                    Assert.True(File.Exists(uniqueTempIdxPath));
 
                     cache.DeleteIndexCache(projectDir);
 
@@ -255,6 +258,7 @@ namespace AssetStudio.Tests
                     Assert.False(File.Exists(dbPath + "-shm"));
                     Assert.False(File.Exists(idxPath));
                     Assert.False(File.Exists(tempIdxPath));
+                    Assert.False(File.Exists(uniqueTempIdxPath));
                 }
             }
             finally

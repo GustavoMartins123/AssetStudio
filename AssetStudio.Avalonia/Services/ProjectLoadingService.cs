@@ -757,8 +757,12 @@ namespace AssetStudio.Avalonia.Services
 
         public static string GetFolderCacheKey(string folderPath)
         {
-            var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
-            return Convert.ToHexStringLower(hashBytes);
+            return SQLiteProjectIndexCache.GetFolderCacheKey(folderPath);
+        }
+
+        internal static string GetFolderCacheKey(string folderPath, bool caseSensitive)
+        {
+            return SQLiteProjectIndexCache.GetFolderCacheKey(folderPath, caseSensitive);
         }
 
         public static string GetDecompressedBundleScopeKey(string folderPath)
@@ -1218,21 +1222,35 @@ namespace AssetStudio.Avalonia.Services
 
         public static bool IsPathInsideDirectory(string root, string path)
         {
-            var rootFullPath = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return IsPathInsideDirectory(root, path, caseSensitive: OperatingSystem.IsLinux());
+        }
+
+        internal static bool IsPathInsideDirectory(string root, string path, bool caseSensitive)
+        {
+            var rootFullPath = SQLiteProjectIndexCache.TrimTrailingDirectorySeparatorsPreservingRoot(Path.GetFullPath(root));
+            if (!rootFullPath.EndsWith(Path.DirectorySeparatorChar) && !rootFullPath.EndsWith(Path.AltDirectorySeparatorChar))
+            {
+                rootFullPath += Path.DirectorySeparatorChar;
+            }
+
             var targetFullPath = Path.GetFullPath(path);
-            return targetFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase);
+            var comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            return targetFullPath.StartsWith(rootFullPath, comparison);
         }
 
         public static void DeleteDirectoryInsideRoot(string root, string targetDirectory)
         {
-            var rootFullPath = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            var targetFullPath = Path.GetFullPath(targetDirectory);
+            DeleteDirectoryInsideRoot(root, targetDirectory, caseSensitive: OperatingSystem.IsLinux());
+        }
 
-            if (!targetFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase))
+        internal static void DeleteDirectoryInsideRoot(string root, string targetDirectory, bool caseSensitive)
+        {
+            if (!IsPathInsideDirectory(root, targetDirectory, caseSensitive))
             {
                 throw new InvalidOperationException("Refusing to delete a cache directory outside the AssetStudio cache root.");
             }
 
+            var targetFullPath = Path.GetFullPath(targetDirectory);
             if (Directory.Exists(targetFullPath))
             {
                 Directory.Delete(targetFullPath, recursive: true);
@@ -1301,7 +1319,8 @@ namespace AssetStudio.Avalonia.Services
             ProjectScanResult scanResult,
             bool preserveSemanticRelations = false,
             Action<int, int, string>? progress = null,
-            Action<IndexingProgressUpdate, int>? showProgressPanel = null)
+            Action<IndexingProgressUpdate, int>? showProgressPanel = null,
+            IEnumerable<AssetHandle>? handlesOverride = null)
         {
             if (sqliteCache == null || assetsManager == null || scanResult == null)
             {
@@ -1312,7 +1331,7 @@ namespace AssetStudio.Avalonia.Services
             {
                 var signature = sqliteCache.GetFolderSignature(scanResult);
                 var unityVersion = assetsManager.SpecifyUnityVersion;
-                var handles = assetsManager.ProjectIndex.GetHandles();
+                var handles = handlesOverride ?? assetsManager.ProjectIndex.GetHandles();
                 PublishDatabaseWriteProgress(
                     sqliteCache,
                     folderPath,
@@ -1321,7 +1340,7 @@ namespace AssetStudio.Avalonia.Services
                     0,
                     1,
                     "Waiting for SQLite writer",
-                    persist: true,
+                    persist: false,
                     showProgressPanel);
 
                 void ReportSaveProgress(int processed, int total, string stage)
@@ -1339,7 +1358,16 @@ namespace AssetStudio.Avalonia.Services
                         showProgressPanel);
                 }
 
-                var saved = sqliteCache.SaveIndexCache(folderPath, signature, scanResult, unityVersion, handles, preserveSemanticRelations, ReportSaveProgress);
+                // PERF-05: Fold the terminal "completed" state into the same ACID SQLite commit transaction.
+                var saved = sqliteCache.SaveIndexCache(
+                    folderPath,
+                    signature,
+                    scanResult,
+                    unityVersion,
+                    handles,
+                    preserveSemanticRelations,
+                    ReportSaveProgress,
+                    markIndexingCompleted: true);
 
                 if (saved)
                 {
@@ -1351,7 +1379,7 @@ namespace AssetStudio.Avalonia.Services
                         1,
                         1,
                         "SQLite index cache saved",
-                        persist: true,
+                        persist: false,
                         showProgressPanel);
                 }
                 else
@@ -1463,6 +1491,15 @@ namespace AssetStudio.Avalonia.Services
 
             try
             {
+                // PERF-11: Guard semantic commit against mid-index scan/signature drift.
+                var expectedSignature = sqliteCache.GetFolderSignature(scanResult);
+                if (!string.Equals(stagingSession.ProjectSignature, expectedSignature, StringComparison.Ordinal))
+                {
+                    Logger.Warning($"Aborting semantic staging commit for '{folderPath}': staging signature '{stagingSession.ProjectSignature}' does not match current scan signature '{expectedSignature}'.");
+                    stagingSession.Abort();
+                    return false;
+                }
+
                 PublishDatabaseWriteProgress(
                     sqliteCache,
                     folderPath,
@@ -1823,6 +1860,41 @@ namespace AssetStudio.Avalonia.Services
             mergeAction(folderPath);
             var enumerated = enumerateFunc(folderPath);
             return ImportHelper.ProcessingSplitFiles(enumerated).ToList();
+        }
+
+        /// <summary>
+        /// PERF-03 selective cold-index planner: when an existing v16 cache has unchanged bundles,
+        /// hydrates unchanged handles directly from SQLite into <paramref name="targetIndex"/> and returns
+        /// ONLY added/modified files to parse. Falls back to full <see cref="ResolveColdIndexFiles"/> otherwise.
+        /// </summary>
+        internal static List<string> ResolveSelectiveColdIndexFiles(
+            SQLiteProjectIndexCache sqliteCache,
+            string folderPath,
+            ProjectScanResult? scanResult,
+            ProjectIndex targetIndex,
+            out SQLiteProjectIndexCache.IncrementalProjectDeltaPlan? deltaPlan,
+            out List<SourceFileMetadata>? unchangedSourceFiles)
+        {
+            deltaPlan = null;
+            unchangedSourceFiles = null;
+
+            if (sqliteCache != null
+                && scanResult != null
+                && scanResult.Files.Count > 0
+                && !string.IsNullOrWhiteSpace(folderPath)
+                && targetIndex != null)
+            {
+                var plan = sqliteCache.PlanIncrementalDelta(folderPath, scanResult);
+                if (plan.CanApplyIncremental
+                    && sqliteCache.TryLoadUnchangedAssetsForIncrementalUpdate(folderPath, plan, targetIndex, out var loadedSources))
+                {
+                    deltaPlan = plan;
+                    unchangedSourceFiles = loadedSources;
+                    return plan.FilesToReindex.ToList();
+                }
+            }
+
+            return ResolveColdIndexFiles(folderPath, scanResult);
         }
 
         // --- Preloading Orchestration ---

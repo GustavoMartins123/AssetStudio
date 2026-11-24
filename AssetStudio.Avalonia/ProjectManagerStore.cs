@@ -1226,7 +1226,8 @@ public sealed class ProjectManagerStore
         {
             var root = EnsureTrailingSeparator(Path.GetFullPath(rootDirectory));
             var target = Path.GetFullPath(targetDirectory);
-            if (target.StartsWith(root, StringComparison.OrdinalIgnoreCase) && Directory.Exists(target))
+            var comparison = OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            if (target.StartsWith(root, comparison) && Directory.Exists(target))
             {
                 Directory.Delete(target, recursive: true);
             }
@@ -1248,8 +1249,7 @@ public sealed class ProjectManagerStore
 
     private static string GetFolderCacheKey(string folderPath)
     {
-        var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(folderPath)));
-        return Convert.ToHexStringLower(hashBytes);
+        return SQLiteProjectIndexCache.GetFolderCacheKey(folderPath);
     }
 
     private string? FindIconInDirectory(string directory, bool recursive, int maxFiles)

@@ -428,16 +428,56 @@ namespace AssetStudio.Avalonia
             string unityVersion,
             IEnumerable<AssetHandle> handles,
             bool preserveSemanticRelations = false,
-            Action<int, int, string>? progress = null)
+            Action<int, int, string>? progress = null,
+            bool markIndexingCompleted = false)
+        {
+            return SaveIndexCacheCore(
+                folderPath,
+                signature,
+                scanResult,
+                unityVersion,
+                handles,
+                preserveSemanticRelations,
+                progress,
+                markIndexingCompleted,
+                beforeSidecarValidateHook: null);
+        }
+
+        internal bool SaveIndexCacheCore(
+            string folderPath,
+            string signature,
+            ProjectScanResult scanResult,
+            string unityVersion,
+            IEnumerable<AssetHandle> handles,
+            bool preserveSemanticRelations,
+            Action<int, int, string>? progress,
+            bool markIndexingCompleted,
+            Action<string>? beforeSidecarValidateHook)
         {
             EnsureInitialized(folderPath);
             var dbPath = GetDbPath(folderPath);
+            var idxPath = MmapProjectIndexSidecar.GetSidecarPath(dbPath);
+            var stagedIdxPath = string.Empty;
             try
             {
                 var handleList = handles?.ToList() ?? new List<AssetHandle>();
-                // v13 writes every handle exactly once (unified Assets table) plus one row per source file.
+                // v16 writes every handle once (unified Assets table) plus source file fingerprint metadata.
                 var totalWork = Math.Max(1, handleList.Count + Math.Max(1, scanResult.TotalFiles));
                 var reporter = new ThrottledProgressReporter(totalWork, progress);
+
+                reporter.Report("Staging mmap .idx sidecar", force: true);
+                var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
+                    idxPath,
+                    signature,
+                    SemanticSchemaVersion,
+                    handleList,
+                    _caseSensitivePaths,
+                    out stagedIdxPath,
+                    beforeSidecarValidateHook);
+                if (!stagedOk)
+                {
+                    Logger.Warning($"Pre-commit mmap .idx sidecar staging failed for '{folderPath}'; stale sidecar will be removed.");
+                }
 
                 reporter.Report("Waiting for SQLite writer", force: true);
                 lock (WriteGate)
@@ -447,38 +487,136 @@ namespace AssetStudio.Avalonia
                     {
                         InvalidateProjectIdCacheForDb(dbPath);
                         long committedProjectId;
+                        var scanLookup = BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
 
-                        SetSynchronousMode(conn, "OFF");
-                        try
+                        using (var transaction = conn.BeginTransaction())
                         {
-                            using (var transaction = conn.BeginTransaction())
+                            reporter.Report("Preparing SQLite project row", force: true);
+                            var projectId = EnsureProject(
+                                conn,
+                                transaction,
+                                folderPath,
+                                signature,
+                                scanResult,
+                                _caseSensitivePaths,
+                                out var signatureChanged,
+                                unityVersion);
+
+                            var existingSources = LoadStoredSourceFiles(conn, transaction, projectId);
+                            var canApplyIncremental = signatureChanged
+                                && existingSources.Count > 0
+                                && scanResult.Files.Count > 0
+                                && HasV16SourceFileMetadata(existingSources);
+
+                            if (canApplyIncremental)
                             {
-                                reporter.Report("Preparing SQLite project row", force: true);
-                                var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, unityVersion);
+                                reporter.Report("Computing incremental bundle delta", force: true);
+                                PartitionStoredSourcesForDelta(
+                                    folderPath,
+                                    existingSources,
+                                    scanLookup,
+                                    _caseSensitivePaths,
+                                    out var unchangedSourceIds,
+                                    out var dirtySourceIds,
+                                    out var dirtyRatio);
+
+                                if (unchangedSourceIds.Count > 0)
+                                {
+                                    var requiresFullSemanticClear = !preserveSemanticRelations && dirtyRatio > 0.25;
+                                    DeleteDirtySourceRowsAndAffectedData(
+                                        conn,
+                                        transaction,
+                                        projectId,
+                                        dirtySourceIds,
+                                        preserveSemanticRelations,
+                                        requiresFullSemanticClear);
+
+                                    // Keep unchanged SourceFiles (preserving SourceFiles.Id) and unchanged Assets;
+                                    // upsert incoming handles for modified/added files and prune any removed handles.
+                                    UpsertSourceFilesAndAssetsIncremental(
+                                        conn,
+                                        transaction,
+                                        projectId,
+                                        folderPath,
+                                        scanLookup,
+                                        existingSources,
+                                        unchangedSourceIds,
+                                        handleList,
+                                        _caseSensitivePaths,
+                                        reporter.Advance);
+                                }
+                                else
+                                {
+                                    DeleteDirtySourceRowsAndAffectedData(
+                                        conn,
+                                        transaction,
+                                        projectId,
+                                        dirtySourceIds,
+                                        preserveSemanticRelations,
+                                        requiresFullSemanticClear: !preserveSemanticRelations);
+                                    ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
+                                    InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, handleList, _caseSensitivePaths, reporter.Advance);
+                                }
+                            }
+                            else
+                            {
+                                if (signatureChanged && existingSources.Count > 0)
+                                {
+                                    var allExistingSourceIds = existingSources.Select(static s => s.Id).ToList();
+                                    DeleteDirtyPreviewCacheEntries(conn, transaction, projectId, allExistingSourceIds);
+                                }
+
                                 reporter.Report("Clearing previous index rows", force: true);
                                 ClearIndexTablesForProject(conn, transaction, projectId, preserveSemanticRelations);
 
                                 // Single write pass into the unified clustered Assets table (no secondary indexes to rebuild).
-                                InsertSourceFilesAndAssets(conn, transaction, projectId, handleList, reporter.Advance);
-
-                                reporter.Report("Committing SQLite transaction", force: true);
-                                transaction.Commit();
-                                committedProjectId = projectId;
+                                InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, handleList, _caseSensitivePaths, reporter.Advance);
                             }
-                        }
-                        finally
-                        {
-                            SetSynchronousMode(conn, "NORMAL");
+
+                            if (markIndexingCompleted)
+                            {
+                                var completedFiles = Math.Max(1, scanResult.TotalFiles);
+                                SaveProjectIndexingState(
+                                    conn,
+                                    transaction,
+                                    projectId,
+                                    "completed",
+                                    completedFiles,
+                                    completedFiles,
+                                    "SQLite index cache saved",
+                                    completed: true);
+                            }
+
+                            // Remove any prior .idx right before SQLite commit so a crash between commit and
+                            // sidecar rename can never leave a stale .idx paired with updated DB rows.
+                            MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+
+                            reporter.Report("Committing SQLite transaction", force: true);
+                            transaction.Commit();
+                            committedProjectId = projectId;
                         }
 
                         CacheProjectId(dbPath, folderPath, signature, committedProjectId);
                         NotifyDatabaseMutated(dbPath);
-                        reporter.Report("Writing mmap .idx sidecar cache", force: true);
-                        MmapProjectIndexSidecar.TryWriteSidecar(
-                            MmapProjectIndexSidecar.GetSidecarPath(dbPath),
-                            signature,
-                            SemanticSchemaVersion,
-                            handleList);
+                        reporter.Report("Publishing mmap .idx sidecar cache", force: true);
+                        if (stagedOk)
+                        {
+                            if (!MmapProjectIndexSidecar.TryPublishStagedSidecar(stagedIdxPath, idxPath))
+                            {
+                                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                                Logger.Warning($"Failed to publish verified mmap .idx sidecar for '{folderPath}'; deleted stale sidecar.");
+                            }
+                            else
+                            {
+                                stagedIdxPath = string.Empty;
+                            }
+                        }
+                        else
+                        {
+                            MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                        }
+
+                        MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
                         reporter.Report("Analyzing SQLite statistics", force: true);
                         TryAnalyzeDatabase(conn, "index cache");
                         reporter.Report("Checkpointing SQLite WAL", force: true);
@@ -492,8 +630,404 @@ namespace AssetStudio.Avalonia
             }
             catch (Exception ex)
             {
+                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
                 Logger.Warning($"Failed to save SQLite index cache: {ex.Message}");
                 return false;
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(stagedIdxPath))
+                {
+                    MmapProjectIndexSidecar.TryDeleteFileQuietly(stagedIdxPath);
+                }
+
+                MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+            }
+        }
+
+        internal sealed class StoredSourceFileEntry
+        {
+            public long Id { get; init; }
+            public string SerializedFileName { get; init; } = string.Empty;
+            public string OriginalPath { get; init; } = string.Empty;
+            public string RelativePath { get; init; } = string.Empty;
+            public long FileSize { get; init; }
+            public long LastWriteUtcTicks { get; init; }
+            public ulong ContentSampleHash { get; init; }
+            public ProjectFileKind FileKind { get; init; }
+        }
+
+        internal sealed class IncrementalProjectDeltaPlan
+        {
+            public long ProjectId { get; init; }
+            public string PreviousSignature { get; init; } = string.Empty;
+            public bool CanApplyIncremental { get; init; }
+            public bool RequiresFullSemanticRebuild { get; init; }
+            public List<long> UnchangedSourceFileIds { get; } = new();
+            public List<long> DirtySourceFileIds { get; } = new();
+            public List<string> UnchangedFilePaths { get; } = new();
+            public List<string> FilesToReindex { get; } = new();
+            public List<string> DeletedFilePaths { get; } = new();
+        }
+
+        internal IncrementalProjectDeltaPlan PlanIncrementalDelta(string folderPath, ProjectScanResult newScanResult)
+        {
+            ArgumentNullException.ThrowIfNull(newScanResult);
+            if (string.IsNullOrWhiteSpace(folderPath) || newScanResult.Files.Count == 0)
+            {
+                return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+            }
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            if (!File.Exists(dbPath))
+            {
+                return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+            }
+
+            try
+            {
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
+                {
+                    var projectId = FindLatestProjectId(conn, null, folderPath, _caseSensitivePaths);
+                    if (projectId == null)
+                    {
+                        return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+                    }
+
+                    var status = LoadProjectIndexingStatus(conn, projectId.Value);
+                    if (IsIncompleteIndexCacheStatus(status))
+                    {
+                        return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+                    }
+
+                    string prevSig;
+                    using (var sigCmd = conn.CreateCommand())
+                    {
+                        sigCmd.CommandText = "SELECT SignatureHash FROM Projects WHERE Id = @id LIMIT 1;";
+                        sigCmd.Parameters.AddWithValue("@id", projectId.Value);
+                        prevSig = sigCmd.ExecuteScalar()?.ToString() ?? string.Empty;
+                    }
+
+                    var storedSources = LoadStoredSourceFiles(conn, null, projectId.Value);
+                    if (storedSources.Count == 0 || !HasV16SourceFileMetadata(storedSources))
+                    {
+                        return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+                    }
+
+                    var scanLookup = BuildScanFileLookup(folderPath, newScanResult, _caseSensitivePaths);
+                    PartitionStoredSourcesForDelta(
+                        folderPath,
+                        storedSources,
+                        scanLookup,
+                        _caseSensitivePaths,
+                        out var unchangedIds,
+                        out var dirtyIds,
+                        out var dirtyRatio);
+
+                    var plan = new IncrementalProjectDeltaPlan
+                    {
+                        ProjectId = projectId.Value,
+                        PreviousSignature = prevSig,
+                        CanApplyIncremental = unchangedIds.Count > 0,
+                        RequiresFullSemanticRebuild = dirtyRatio > 0.25
+                    };
+                    plan.UnchangedSourceFileIds.AddRange(unchangedIds);
+                    plan.DirtySourceFileIds.AddRange(dirtyIds);
+
+                    var seenUnchangedPaths = new HashSet<string>(_pathComparer);
+                    var seenStoredRelPaths = new HashSet<string>(_pathComparer);
+                    var seenReindexPaths = new HashSet<string>(_pathComparer);
+                    var seenDeletedPaths = new HashSet<string>(_pathComparer);
+
+                    foreach (var src in storedSources)
+                    {
+                        var relKey = ResolveStoredSourceRelativeKey(folderPath, src, _caseSensitivePaths);
+                        seenStoredRelPaths.Add(relKey);
+
+                        if (unchangedIds.Contains(src.Id))
+                        {
+                            if (!string.IsNullOrWhiteSpace(src.OriginalPath) && seenUnchangedPaths.Add(src.OriginalPath))
+                            {
+                                plan.UnchangedFilePaths.Add(src.OriginalPath);
+                            }
+                        }
+                        else if (scanLookup.ByRelativeKey.TryGetValue(relKey, out var currentFile))
+                        {
+                            if (seenReindexPaths.Add(currentFile.File.Path))
+                            {
+                                plan.FilesToReindex.Add(currentFile.File.Path);
+                            }
+                        }
+                        else if (!string.IsNullOrWhiteSpace(src.OriginalPath) && seenDeletedPaths.Add(src.OriginalPath))
+                        {
+                            plan.DeletedFilePaths.Add(src.OriginalPath);
+                        }
+                    }
+
+                    foreach (var file in newScanResult.Files)
+                    {
+                        var relKey = NormalizeRelativeManifestPath(scanLookup.RootFullPath, file.Path, _caseSensitivePaths);
+                        if (!seenStoredRelPaths.Contains(relKey)
+                            && (file.Kind == ProjectFileKind.UnityBundle || file.Kind == ProjectFileKind.SerializedFile)
+                            && seenReindexPaths.Add(file.Path))
+                        {
+                            plan.FilesToReindex.Add(file.Path);
+                        }
+                    }
+
+                    return plan;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to plan incremental index delta: {ex.Message}");
+                return new IncrementalProjectDeltaPlan { CanApplyIncremental = false };
+            }
+        }
+
+        internal bool TryLoadUnchangedAssetsForIncrementalUpdate(
+            string folderPath,
+            IncrementalProjectDeltaPlan plan,
+            ProjectIndex targetIndex,
+            out List<SourceFileMetadata>? unchangedSourceFiles)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+            ArgumentNullException.ThrowIfNull(targetIndex);
+            unchangedSourceFiles = null;
+
+            if (!plan.CanApplyIncremental || plan.UnchangedSourceFileIds.Count == 0)
+            {
+                return false;
+            }
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            try
+            {
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
+                {
+                    var unchangedSet = new HashSet<long>(plan.UnchangedSourceFileIds);
+                    var allSources = new List<SourceFileMetadata>();
+                    var origins = LoadSourceFileOriginsForProject(conn, plan.ProjectId, allSources);
+                    var filteredSources = new List<SourceFileMetadata>(unchangedSet.Count);
+                    var unchangedOrigins = new Dictionary<long, AssetHandleOrigin>(unchangedSet.Count);
+                    foreach (var id in unchangedSet)
+                    {
+                        if (origins.TryGetValue(id, out var origin))
+                        {
+                            unchangedOrigins[id] = origin;
+                            filteredSources.Add(new SourceFileMetadata(origin.SerializedFileName, origin.OriginalPath));
+                        }
+                    }
+
+                    using var cmd = conn.CreateCommand();
+                    cmd.CommandText = @"
+                        SELECT UniqueID, Name, Type, Container, SourceFileId, PathID, ByteStart, ByteSize
+                        FROM Assets
+                        WHERE ProjectId = @projectId";
+                    cmd.Parameters.AddWithValue("@projectId", plan.ProjectId);
+
+                    var loaded = 0;
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        if (reader.IsDBNull(4))
+                        {
+                            continue;
+                        }
+
+                        var srcId = reader.GetInt64(4);
+                        if (!unchangedOrigins.TryGetValue(srcId, out var origin))
+                        {
+                            continue;
+                        }
+
+                        var uniqueId = reader.GetString(0);
+                        var name = reader.GetString(1);
+                        var type = (ClassIDType)reader.GetInt32(2);
+                        var container = reader.IsDBNull(3) ? string.Empty : reader.GetString(3);
+                        var pathId = reader.GetInt64(5);
+                        var byteStart = reader.GetInt64(6);
+                        var byteSize = reader.GetInt64(7);
+
+                        string? customUniqueId = uniqueId;
+                        if (!ReferenceEquals(origin, AssetHandleOrigin.Empty)
+                            && !string.IsNullOrEmpty(uniqueId)
+                            && IsCanonicalUniqueIdForOrigin(uniqueId.AsSpan(), origin.UniqueIdPrefix.AsSpan(), pathId))
+                        {
+                            customUniqueId = null;
+                        }
+
+                        targetIndex.AddRecord(
+                            serializedFileName: origin.SerializedFileName,
+                            originalPath: origin.OriginalPath,
+                            pathId: pathId,
+                            name: name,
+                            type: type,
+                            container: container,
+                            byteStart: byteStart,
+                            byteSize: byteSize,
+                            sourceHash: origin.SourceHash,
+                            unityVersion: origin.UnityVersion,
+                            customUniqueId: customUniqueId);
+                        loaded++;
+                    }
+
+                    unchangedSourceFiles = filteredSources;
+                    return loaded > 0;
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                targetIndex.Clear();
+                unchangedSourceFiles = null;
+                Logger.Warning($"Failed to load unchanged assets for incremental update: {ex.Message}");
+                return false;
+            }
+        }
+
+        internal bool SaveIncrementalIndexDelta(
+            string folderPath,
+            string newSignature,
+            ProjectScanResult scanResult,
+            string unityVersion,
+            IncrementalProjectDeltaPlan deltaPlan,
+            IReadOnlyCollection<AssetHandle> updatedHandles,
+            IReadOnlyCollection<AssetHandle>? allMergedHandles = null,
+            bool markIndexingCompleted = false,
+            Action<int, int, string>? progress = null)
+        {
+            ArgumentNullException.ThrowIfNull(deltaPlan);
+            ArgumentNullException.ThrowIfNull(scanResult);
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            var idxPath = MmapProjectIndexSidecar.GetSidecarPath(dbPath);
+            var stagedIdxPath = string.Empty;
+            try
+            {
+                var deltaHandlesList = updatedHandles?.ToList() ?? new List<AssetHandle>();
+                var totalWork = Math.Max(1, deltaHandlesList.Count + deltaPlan.DirtySourceFileIds.Count + 2);
+                var reporter = new ThrottledProgressReporter(totalWork, progress);
+
+                lock (WriteGate)
+                {
+                    using var conn = CreateConnectionByDbPath(dbPath);
+                    InvalidateProjectIdCacheForDb(dbPath);
+                    var scanLookup = BuildScanFileLookup(folderPath, scanResult, _caseSensitivePaths);
+                    long committedProjectId;
+
+                    using (var transaction = conn.BeginTransaction())
+                    {
+                        var projectId = EnsureProject(
+                            conn,
+                            transaction,
+                            folderPath,
+                            newSignature,
+                            scanResult,
+                            _caseSensitivePaths,
+                            out _,
+                            unityVersion);
+
+                        DeleteDirtySourceRowsAndAffectedData(
+                            conn,
+                            transaction,
+                            projectId,
+                            deltaPlan.DirtySourceFileIds,
+                            preserveSemanticRelations: false,
+                            requiresFullSemanticClear: deltaPlan.RequiresFullSemanticRebuild);
+
+                        if (deltaHandlesList.Count > 0)
+                        {
+                            InsertSourceFilesAndAssets(
+                                conn,
+                                transaction,
+                                projectId,
+                                folderPath,
+                                scanLookup,
+                                deltaHandlesList,
+                                _caseSensitivePaths,
+                                reporter.Advance);
+                        }
+
+                        if (markIndexingCompleted)
+                        {
+                            var completedFiles = Math.Max(1, scanResult.TotalFiles);
+                            SaveProjectIndexingState(
+                                conn,
+                                transaction,
+                                projectId,
+                                "completed",
+                                completedFiles,
+                                completedFiles,
+                                "Incremental SQLite index cache saved",
+                                completed: true);
+                        }
+
+                        MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                        transaction.Commit();
+                        committedProjectId = projectId;
+                    }
+
+                    CacheProjectId(dbPath, folderPath, newSignature, committedProjectId);
+                    NotifyDatabaseMutated(dbPath);
+
+                    var mergedHandlesForSidecar = allMergedHandles ?? LoadAssetHandlesForProject(conn, committedProjectId, out _);
+                    var stagedOk = MmapProjectIndexSidecar.TryStageSidecar(
+                        idxPath,
+                        newSignature,
+                        SemanticSchemaVersion,
+                        mergedHandlesForSidecar,
+                        _caseSensitivePaths,
+                        out stagedIdxPath);
+
+                    if (stagedOk && MmapProjectIndexSidecar.TryPublishStagedSidecar(stagedIdxPath, idxPath))
+                    {
+                        stagedIdxPath = string.Empty;
+                    }
+                    else
+                    {
+                        MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                        Logger.Warning($"Failed to publish incremental mmap .idx sidecar for '{folderPath}'; deleted stale sidecar.");
+                    }
+
+                    MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
+                    TryAnalyzeDatabase(conn, "incremental index cache");
+                    TryCheckpointWal(conn, "incremental index cache");
+                    reporter.MarkCompleted("Incremental SQLite index cache saved");
+                    reporter.Report("Incremental SQLite index cache saved", force: true);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                MmapProjectIndexSidecar.TryDeleteFileQuietly(idxPath);
+                Logger.Warning($"Failed to save incremental SQLite index delta: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(stagedIdxPath))
+                {
+                    MmapProjectIndexSidecar.TryDeleteFileQuietly(stagedIdxPath);
+                }
+
+                MmapProjectIndexSidecar.CleanupOrphanedTempSidecars(idxPath);
             }
         }
 
@@ -530,22 +1064,34 @@ namespace AssetStudio.Avalonia
             string folderPath,
             string signature,
             ProjectScanResult scanResult,
+            bool caseSensitivePaths,
+            out bool signatureChanged,
             string? unityVersion = null)
         {
-            var existingProjectId = FindProjectId(conn, transaction, folderPath, signature);
+            var folderPathKey = NormalizeFolderPathKey(folderPath, caseSensitivePaths);
+            var sigVersion = signature.StartsWith("v2:", StringComparison.Ordinal) ? 2 : 1;
+
+            var existingProjectId = FindProjectId(conn, transaction, folderPath, signature, caseSensitivePaths);
             if (existingProjectId != null)
             {
+                signatureChanged = false;
                 using var updateCmd = conn.CreateCommand();
                 updateCmd.Transaction = transaction;
                 updateCmd.CommandText = @"
                     UPDATE Projects
-                    SET TotalFiles = @totalFiles,
+                    SET FolderPath = @folderPath,
+                        FolderPathKey = @folderPathKey,
+                        SignatureVersion = @signatureVersion,
+                        TotalFiles = @totalFiles,
                         TotalBytes = @totalBytes,
                         UnityBundleCount = @unityBundles,
                         UnityVersion = @unityVersion,
                         LastIndexed = CURRENT_TIMESTAMP
                     WHERE Id = @projectId";
                 updateCmd.Parameters.AddWithValue("@projectId", existingProjectId.Value);
+                updateCmd.Parameters.AddWithValue("@folderPath", folderPath);
+                updateCmd.Parameters.AddWithValue("@folderPathKey", folderPathKey);
+                updateCmd.Parameters.AddWithValue("@signatureVersion", sigVersion);
                 updateCmd.Parameters.AddWithValue("@totalFiles", scanResult.TotalFiles);
                 updateCmd.Parameters.AddWithValue("@totalBytes", scanResult.TotalBytes);
                 updateCmd.Parameters.AddWithValue("@unityBundles", scanResult.UnityBundleCount);
@@ -554,28 +1100,64 @@ namespace AssetStudio.Avalonia
                 return existingProjectId.Value;
             }
 
-            using (var deleteOldCmd = conn.CreateCommand())
+            // PERF-03: Preserve the existing Projects row (and its ProjectId + valid PreviewCacheEntries)
+            // in-place on signature mismatch instead of cascading DELETE FROM Projects.
+            var previousProjectId = FindLatestProjectId(conn, transaction, folderPath, caseSensitivePaths);
+            if (previousProjectId != null)
             {
-                var path1 = folderPath;
-                var path2 = path1.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                deleteOldCmd.Transaction = transaction;
-                deleteOldCmd.CommandText = @"
-                    DELETE FROM Projects
-                    WHERE FolderPath = @path1 COLLATE NOCASE
-                       OR FolderPath = @path2 COLLATE NOCASE";
-                deleteOldCmd.Parameters.AddWithValue("@path1", path1);
-                deleteOldCmd.Parameters.AddWithValue("@path2", path2);
-                deleteOldCmd.ExecuteNonQuery();
+                signatureChanged = true;
+
+                // Clean up any duplicate legacy rows for the same FolderPathKey while preserving previousProjectId.
+                using (var dedupCmd = conn.CreateCommand())
+                {
+                    dedupCmd.Transaction = transaction;
+                    dedupCmd.CommandText = @"
+                        DELETE FROM Projects
+                        WHERE FolderPathKey = @folderPathKey
+                          AND Id <> @keepId";
+                    dedupCmd.Parameters.AddWithValue("@folderPathKey", folderPathKey);
+                    dedupCmd.Parameters.AddWithValue("@keepId", previousProjectId.Value);
+                    dedupCmd.ExecuteNonQuery();
+                }
+
+                using var updateInPlaceCmd = conn.CreateCommand();
+                updateInPlaceCmd.Transaction = transaction;
+                updateInPlaceCmd.CommandText = @"
+                    UPDATE Projects
+                    SET FolderPath = @folderPath,
+                        FolderPathKey = @folderPathKey,
+                        SignatureHash = @signature,
+                        SignatureVersion = @signatureVersion,
+                        TotalFiles = @totalFiles,
+                        TotalBytes = @totalBytes,
+                        UnityBundleCount = @unityBundles,
+                        UnityVersion = COALESCE(NULLIF(@unityVersion, ''), UnityVersion),
+                        LastIndexed = CURRENT_TIMESTAMP
+                    WHERE Id = @projectId";
+                updateInPlaceCmd.Parameters.AddWithValue("@projectId", previousProjectId.Value);
+                updateInPlaceCmd.Parameters.AddWithValue("@folderPath", folderPath);
+                updateInPlaceCmd.Parameters.AddWithValue("@folderPathKey", folderPathKey);
+                updateInPlaceCmd.Parameters.AddWithValue("@signature", signature);
+                updateInPlaceCmd.Parameters.AddWithValue("@signatureVersion", sigVersion);
+                updateInPlaceCmd.Parameters.AddWithValue("@totalFiles", scanResult.TotalFiles);
+                updateInPlaceCmd.Parameters.AddWithValue("@totalBytes", scanResult.TotalBytes);
+                updateInPlaceCmd.Parameters.AddWithValue("@unityBundles", scanResult.UnityBundleCount);
+                updateInPlaceCmd.Parameters.AddWithValue("@unityVersion", unityVersion ?? string.Empty);
+                updateInPlaceCmd.ExecuteNonQuery();
+                return previousProjectId.Value;
             }
 
+            signatureChanged = false;
             using var insertCmd = conn.CreateCommand();
             insertCmd.Transaction = transaction;
             insertCmd.CommandText = @"
-                INSERT INTO Projects (FolderPath, SignatureHash, TotalFiles, TotalBytes, UnityBundleCount, UnityVersion)
-                VALUES (@path, @signature, @totalFiles, @totalBytes, @unityBundles, @unityVersion);
+                INSERT INTO Projects (FolderPath, FolderPathKey, SignatureHash, SignatureVersion, TotalFiles, TotalBytes, UnityBundleCount, UnityVersion)
+                VALUES (@path, @folderPathKey, @signature, @signatureVersion, @totalFiles, @totalBytes, @unityBundles, @unityVersion);
                 SELECT last_insert_rowid();";
             insertCmd.Parameters.AddWithValue("@path", folderPath);
+            insertCmd.Parameters.AddWithValue("@folderPathKey", folderPathKey);
             insertCmd.Parameters.AddWithValue("@signature", signature);
+            insertCmd.Parameters.AddWithValue("@signatureVersion", sigVersion);
             insertCmd.Parameters.AddWithValue("@totalFiles", scanResult.TotalFiles);
             insertCmd.Parameters.AddWithValue("@totalBytes", scanResult.TotalBytes);
             insertCmd.Parameters.AddWithValue("@unityBundles", scanResult.UnityBundleCount);
@@ -592,11 +1174,15 @@ namespace AssetStudio.Avalonia
             var tables = preserveSemanticRelations
                 ? new[]
                 {
+                    "Scenes",
+                    "SourceFileExternals",
                     "Assets",
                     "SourceFiles"
                 }
                 : new[]
                 {
+                    "Scenes",
+                    "SourceFileExternals",
                     "AnimationClipTargets",
                     "CompositeAssetParts",
                     "CompositeAssets",
@@ -622,11 +1208,525 @@ namespace AssetStudio.Avalonia
             }
         }
 
+        private readonly struct ScanFileLookup
+        {
+            public ScanFileLookup(
+                string rootFullPath,
+                Dictionary<string, (ScannedFileInfo File, string RelativePath)> byFullKey,
+                Dictionary<string, (ScannedFileInfo File, string RelativePath)> byRelativeKey)
+            {
+                RootFullPath = rootFullPath;
+                ByFullKey = byFullKey;
+                ByRelativeKey = byRelativeKey;
+            }
+
+            public string RootFullPath { get; }
+            public Dictionary<string, (ScannedFileInfo File, string RelativePath)> ByFullKey { get; }
+            public Dictionary<string, (ScannedFileInfo File, string RelativePath)> ByRelativeKey { get; }
+        }
+
+        private static ScanFileLookup BuildScanFileLookup(string folderPath, ProjectScanResult scanResult, bool caseSensitivePaths)
+        {
+            var comparer = caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var rootSource = !string.IsNullOrWhiteSpace(scanResult.RootPath) ? scanResult.RootPath : folderPath;
+            var rootFull = string.IsNullOrWhiteSpace(rootSource)
+                ? string.Empty
+                : TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(rootSource));
+
+            var byFullKey = new Dictionary<string, (ScannedFileInfo, string)>(scanResult.Files.Count, comparer);
+            var byRelativeKey = new Dictionary<string, (ScannedFileInfo, string)>(scanResult.Files.Count, comparer);
+
+            for (var i = 0; i < scanResult.Files.Count; i++)
+            {
+                var file = scanResult.Files[i];
+                if (string.IsNullOrWhiteSpace(file.Path))
+                {
+                    continue;
+                }
+
+                var relNormalized = NormalizeRelativeManifestPath(rootFull, file.Path, caseSensitive: true);
+                var relLookupKey = NormalizeRelativeManifestPath(rootFull, file.Path, caseSensitivePaths);
+                var fullKey = NormalizeFolderPathKey(file.Path, caseSensitivePaths);
+                byFullKey[fullKey] = (file, relNormalized);
+                byRelativeKey[relLookupKey] = (file, relNormalized);
+            }
+
+            return new ScanFileLookup(rootFull, byFullKey, byRelativeKey);
+        }
+
+        private static bool TryResolveScanFileMetadata(
+            ScanFileLookup lookup,
+            string originalPath,
+            bool caseSensitivePaths,
+            out ScannedFileInfo fileInfo,
+            out string relativePath)
+        {
+            if (!string.IsNullOrWhiteSpace(originalPath))
+            {
+                var fullKey = NormalizeFolderPathKey(originalPath, caseSensitivePaths);
+                if (lookup.ByFullKey.TryGetValue(fullKey, out var entry))
+                {
+                    fileInfo = entry.File;
+                    relativePath = entry.RelativePath;
+                    return true;
+                }
+
+                var relKey = NormalizeRelativeManifestPath(lookup.RootFullPath, originalPath, caseSensitivePaths);
+                if (lookup.ByRelativeKey.TryGetValue(relKey, out entry))
+                {
+                    fileInfo = entry.File;
+                    relativePath = entry.RelativePath;
+                    return true;
+                }
+            }
+
+            fileInfo = null!;
+            relativePath = string.IsNullOrWhiteSpace(originalPath)
+                ? string.Empty
+                : NormalizeRelativeManifestPath(lookup.RootFullPath, originalPath, caseSensitive: true);
+            return false;
+        }
+
+        private static List<StoredSourceFileEntry> LoadStoredSourceFiles(
+            SqliteConnection conn,
+            SqliteTransaction? transaction,
+            long projectId)
+        {
+            var result = new List<StoredSourceFileEntry>();
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                SELECT Id, SerializedFileName, OriginalPath, RelativePath, FileSize, LastWriteUtcTicks, ContentSampleHash, FileKind
+                FROM SourceFiles
+                WHERE ProjectId = @projectId";
+            cmd.Parameters.AddWithValue("@projectId", projectId);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                result.Add(new StoredSourceFileEntry
+                {
+                    Id = reader.GetInt64(0),
+                    SerializedFileName = reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                    OriginalPath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+                    RelativePath = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                    FileSize = reader.IsDBNull(4) ? 0L : reader.GetInt64(4),
+                    LastWriteUtcTicks = reader.IsDBNull(5) ? 0L : reader.GetInt64(5),
+                    ContentSampleHash = reader.IsDBNull(6) ? 0UL : unchecked((ulong)reader.GetInt64(6)),
+                    FileKind = reader.IsDBNull(7) ? ProjectFileKind.Other : (ProjectFileKind)reader.GetInt32(7)
+                });
+            }
+
+            return result;
+        }
+
+        private static bool HasV16SourceFileMetadata(IReadOnlyList<StoredSourceFileEntry> storedSources)
+        {
+            for (var i = 0; i < storedSources.Count; i++)
+            {
+                var s = storedSources[i];
+                if (!string.IsNullOrEmpty(s.RelativePath) || s.FileSize > 0 || s.LastWriteUtcTicks > 0 || s.ContentSampleHash != 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string ResolveStoredSourceRelativeKey(string folderPath, StoredSourceFileEntry source, bool caseSensitivePaths)
+        {
+            if (!string.IsNullOrWhiteSpace(source.RelativePath))
+            {
+                var rel = source.RelativePath.Replace('\\', '/');
+                return caseSensitivePaths ? rel : rel.ToUpperInvariant();
+            }
+
+            var rootFull = string.IsNullOrWhiteSpace(folderPath)
+                ? string.Empty
+                : TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(folderPath));
+            return NormalizeRelativeManifestPath(rootFull, source.OriginalPath, caseSensitivePaths);
+        }
+
+        private static void PartitionStoredSourcesForDelta(
+            string folderPath,
+            IReadOnlyList<StoredSourceFileEntry> storedSources,
+            ScanFileLookup scanLookup,
+            bool caseSensitivePaths,
+            out HashSet<long> unchangedSourceIds,
+            out List<long> dirtySourceIds,
+            out double dirtyRatio)
+        {
+            unchangedSourceIds = new HashSet<long>();
+            dirtySourceIds = new List<long>();
+            var comparer = caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var matchedScanRelKeys = new HashSet<string>(comparer);
+
+            for (var i = 0; i < storedSources.Count; i++)
+            {
+                var src = storedSources[i];
+                var relKey = ResolveStoredSourceRelativeKey(folderPath, src, caseSensitivePaths);
+                var hasMetadata = !string.IsNullOrEmpty(src.RelativePath) || src.FileSize > 0 || src.LastWriteUtcTicks > 0 || src.ContentSampleHash != 0;
+
+                if (hasMetadata
+                    && scanLookup.ByRelativeKey.TryGetValue(relKey, out var current)
+                    && current.File.Size == src.FileSize
+                    && current.File.LastWriteTimeUtcTicks == src.LastWriteUtcTicks
+                    && current.File.ContentSampleHash == src.ContentSampleHash
+                    && current.File.Kind == src.FileKind)
+                {
+                    unchangedSourceIds.Add(src.Id);
+                    matchedScanRelKeys.Add(relKey);
+                }
+                else
+                {
+                    dirtySourceIds.Add(src.Id);
+                    if (scanLookup.ByRelativeKey.ContainsKey(relKey))
+                    {
+                        matchedScanRelKeys.Add(relKey);
+                    }
+                }
+            }
+
+            var addedAssetFiles = 0;
+            foreach (var kvp in scanLookup.ByRelativeKey)
+            {
+                if (!matchedScanRelKeys.Contains(kvp.Key)
+                    && (kvp.Value.File.Kind == ProjectFileKind.UnityBundle || kvp.Value.File.Kind == ProjectFileKind.SerializedFile))
+                {
+                    addedAssetFiles++;
+                }
+            }
+
+            var denominator = Math.Max(1, storedSources.Count);
+            dirtyRatio = (double)(dirtySourceIds.Count + addedAssetFiles) / denominator;
+        }
+
+        private static void DeleteDirtyPreviewCacheEntries(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<long> dirtySourceIds)
+        {
+            if (dirtySourceIds.Count == 0)
+            {
+                return;
+            }
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                CREATE TEMP TABLE IF NOT EXISTS _delta_dirty_preview_sources (Id INTEGER PRIMARY KEY);
+                DELETE FROM temp._delta_dirty_preview_sources;";
+            cmd.ExecuteNonQuery();
+
+            using (var insertCmd = conn.CreateCommand())
+            {
+                insertCmd.Transaction = transaction;
+                insertCmd.CommandText = "INSERT OR IGNORE INTO temp._delta_dirty_preview_sources (Id) VALUES (@id);";
+                var pId = insertCmd.Parameters.Add("@id", SqliteType.Integer);
+                foreach (var id in dirtySourceIds)
+                {
+                    pId.Value = id;
+                    insertCmd.ExecuteNonQuery();
+                }
+            }
+
+            using (var delCmd = conn.CreateCommand())
+            {
+                delCmd.Transaction = transaction;
+                delCmd.CommandText = @"
+                    DELETE FROM PreviewCacheEntries
+                    WHERE ProjectId = @projectId
+                      AND AssetUniqueID IN (
+                          SELECT UniqueID
+                          FROM Assets
+                          WHERE ProjectId = @projectId
+                            AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_preview_sources)
+                      );
+                    DROP TABLE IF EXISTS temp._delta_dirty_preview_sources;";
+                delCmd.Parameters.AddWithValue("@projectId", projectId);
+                delCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void DeleteDirtySourceRowsAndAffectedData(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            IReadOnlyCollection<long> dirtySourceIds,
+            bool preserveSemanticRelations,
+            bool requiresFullSemanticClear)
+        {
+            if (dirtySourceIds.Count == 0 && !requiresFullSemanticClear)
+            {
+                return;
+            }
+
+            using (var setupCmd = conn.CreateCommand())
+            {
+                setupCmd.Transaction = transaction;
+                setupCmd.CommandText = @"
+                    CREATE TEMP TABLE IF NOT EXISTS _delta_dirty_sources (Id INTEGER PRIMARY KEY);
+                    CREATE TEMP TABLE IF NOT EXISTS _delta_semantic_sources (Id INTEGER PRIMARY KEY);
+                    CREATE TEMP TABLE IF NOT EXISTS _delta_dirty_assets (UniqueID TEXT PRIMARY KEY) WITHOUT ROWID;
+                    CREATE TEMP TABLE IF NOT EXISTS _delta_semantic_assets (UniqueID TEXT PRIMARY KEY) WITHOUT ROWID;
+                    DELETE FROM temp._delta_dirty_sources;
+                    DELETE FROM temp._delta_semantic_sources;
+                    DELETE FROM temp._delta_dirty_assets;
+                    DELETE FROM temp._delta_semantic_assets;";
+                setupCmd.ExecuteNonQuery();
+            }
+
+            try
+            {
+                if (dirtySourceIds.Count > 0)
+                {
+                    using (var insertSrcCmd = conn.CreateCommand())
+                    {
+                        insertSrcCmd.Transaction = transaction;
+                        insertSrcCmd.CommandText = "INSERT OR IGNORE INTO temp._delta_dirty_sources (Id) VALUES (@id);";
+                        var pId = insertSrcCmd.Parameters.Add("@id", SqliteType.Integer);
+                        foreach (var id in dirtySourceIds)
+                        {
+                            pId.Value = id;
+                            insertSrcCmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    using (var collectCmd = conn.CreateCommand())
+                    {
+                        collectCmd.Transaction = transaction;
+                        collectCmd.CommandText = @"
+                            INSERT OR IGNORE INTO temp._delta_dirty_assets (UniqueID)
+                            SELECT UniqueID
+                            FROM Assets
+                            WHERE ProjectId = @projectId
+                              AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);
+
+                            INSERT OR IGNORE INTO temp._delta_semantic_sources (Id)
+                            SELECT Id FROM temp._delta_dirty_sources;
+
+                            -- Include unchanged SourceFiles that reference any dirty source file via m_Externals.
+                            INSERT OR IGNORE INTO temp._delta_semantic_sources (Id)
+                            SELECT DISTINCT ext.SourceFileId
+                            FROM SourceFileExternals ext
+                            JOIN SourceFiles dirty
+                              ON dirty.ProjectId = @projectId
+                             AND dirty.Id IN (SELECT Id FROM temp._delta_dirty_sources)
+                            WHERE ext.ProjectId = @projectId
+                              AND (
+                                  (ext.ExternalFileName <> '' AND ext.ExternalFileName = dirty.SerializedFileName)
+                                  OR (ext.ExternalPathName <> '' AND (ext.ExternalPathName = dirty.OriginalPath OR ext.ExternalPathName = dirty.RelativePath))
+                              );
+
+                            INSERT OR IGNORE INTO temp._delta_semantic_assets (UniqueID)
+                            SELECT UniqueID
+                            FROM Assets
+                            WHERE ProjectId = @projectId
+                              AND SourceFileId IN (SELECT Id FROM temp._delta_semantic_sources);";
+                        collectCmd.Parameters.AddWithValue("@projectId", projectId);
+                        collectCmd.ExecuteNonQuery();
+                    }
+
+                    // 1. Delete dirty PreviewCacheEntries (preserving valid entries for unchanged bundles!)
+                    // 2. Delete dirty SourceFileExternals and Scenes
+                    using (var delDirectCmd = conn.CreateCommand())
+                    {
+                        delDirectCmd.Transaction = transaction;
+                        delDirectCmd.CommandText = @"
+                            DELETE FROM PreviewCacheEntries
+                            WHERE ProjectId = @projectId
+                              AND AssetUniqueID IN (SELECT UniqueID FROM temp._delta_dirty_assets);
+
+                            DELETE FROM SourceFileExternals
+                            WHERE ProjectId = @projectId
+                              AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);
+
+                            DELETE FROM Scenes
+                            WHERE ProjectId = @projectId
+                              AND EntrySourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);";
+                        delDirectCmd.Parameters.AddWithValue("@projectId", projectId);
+                        delDirectCmd.ExecuteNonQuery();
+                    }
+                }
+
+                // 3. Clean semantic tables (either full clear when >25% dirty, or targeted dirty+dependent edges)
+                if (!preserveSemanticRelations)
+                {
+                    if (requiresFullSemanticClear)
+                    {
+                        var semanticTables = new[]
+                        {
+                            "AnimationClipTargets",
+                            "CompositeAssetParts",
+                            "CompositeAssets",
+                            "MeshMaterialResolvedCache",
+                            "MaterialCache",
+                            "MaterialTextures",
+                            "MeshMaterials",
+                            "MeshRenderers",
+                            "ModelGroupMeshes",
+                            "ModelGroups",
+                            "AssetEdges"
+                        };
+                        foreach (var table in semanticTables)
+                        {
+                            using var clearSemCmd = conn.CreateCommand();
+                            clearSemCmd.Transaction = transaction;
+                            clearSemCmd.CommandText = $"DELETE FROM {table} WHERE ProjectId = @projectId;";
+                            clearSemCmd.Parameters.AddWithValue("@projectId", projectId);
+                            clearSemCmd.ExecuteNonQuery();
+                        }
+                    }
+                    else if (dirtySourceIds.Count > 0)
+                    {
+                        using var delSemCmd = conn.CreateCommand();
+                        delSemCmd.Transaction = transaction;
+                        delSemCmd.CommandText = @"
+                            DELETE FROM AssetEdges
+                            WHERE ProjectId = @projectId
+                              AND (SourceAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR TargetAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM MeshRenderers
+                            WHERE ProjectId = @projectId
+                              AND (MeshAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR RendererAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM MeshMaterials
+                            WHERE ProjectId = @projectId
+                              AND (MeshAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR MaterialAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR RendererAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM MaterialTextures
+                            WHERE ProjectId = @projectId
+                              AND (MaterialAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR TextureAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM MaterialCache
+                            WHERE ProjectId = @projectId
+                              AND (MaterialAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR MainTextureAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM MeshMaterialResolvedCache
+                            WHERE ProjectId = @projectId
+                              AND (MeshAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR MaterialAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM CompositeAssetParts
+                            WHERE ProjectId = @projectId
+                              AND (CompositeAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR MeshAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM CompositeAssets
+                            WHERE ProjectId = @projectId
+                              AND (CompositeAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR RootGameObjectAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM ModelGroupMeshes
+                            WHERE ProjectId = @projectId
+                              AND (GroupAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR MeshAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM ModelGroups
+                            WHERE ProjectId = @projectId
+                              AND (GroupAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR RootGameObjectAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));
+
+                            DELETE FROM AnimationClipTargets
+                            WHERE ProjectId = @projectId
+                              AND (ClipAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR AvatarAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets)
+                                OR MeshAssetUniqueID IN (SELECT UniqueID FROM temp._delta_semantic_assets));";
+                        delSemCmd.Parameters.AddWithValue("@projectId", projectId);
+                        delSemCmd.ExecuteNonQuery();
+                    }
+                }
+
+                // 4. Delete dirty Assets and dirty SourceFiles
+                if (dirtySourceIds.Count > 0)
+                {
+                    using var delAssetsCmd = conn.CreateCommand();
+                    delAssetsCmd.Transaction = transaction;
+                    delAssetsCmd.CommandText = @"
+                        DELETE FROM Assets
+                        WHERE ProjectId = @projectId
+                          AND SourceFileId IN (SELECT Id FROM temp._delta_dirty_sources);
+
+                        DELETE FROM SourceFiles
+                        WHERE ProjectId = @projectId
+                          AND Id IN (SELECT Id FROM temp._delta_dirty_sources);";
+                    delAssetsCmd.Parameters.AddWithValue("@projectId", projectId);
+                    delAssetsCmd.ExecuteNonQuery();
+                }
+            }
+            finally
+            {
+                using var dropCmd = conn.CreateCommand();
+                dropCmd.Transaction = transaction;
+                dropCmd.CommandText = @"
+                    DROP TABLE IF EXISTS temp._delta_semantic_assets;
+                    DROP TABLE IF EXISTS temp._delta_dirty_assets;
+                    DROP TABLE IF EXISTS temp._delta_semantic_sources;
+                    DROP TABLE IF EXISTS temp._delta_dirty_sources;";
+                dropCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void UpsertSourceFilesAndAssetsIncremental(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long projectId,
+            string folderPath,
+            ScanFileLookup scanLookup,
+            IReadOnlyList<StoredSourceFileEntry> existingSources,
+            HashSet<long> unchangedSourceIds,
+            IReadOnlyCollection<AssetHandle> handles,
+            bool caseSensitivePaths,
+            Action<string>? advanceProgress)
+        {
+            var comparer = caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var unchangedSourceKeys = new HashSet<string>(comparer);
+            foreach (var src in existingSources)
+            {
+                if (unchangedSourceIds.Contains(src.Id))
+                {
+                    unchangedSourceKeys.Add(GetSourceFileKey(src.SerializedFileName, src.OriginalPath));
+                }
+            }
+
+            // Only insert/upsert handles whose source file is added or modified; unchanged SourceFiles and
+            // Assets stay untouched in SQLite preserving their exact row IDs and pages.
+            var deltaHandles = new List<AssetHandle>();
+            foreach (var h in handles)
+            {
+                if (h == null)
+                {
+                    continue;
+                }
+
+                var key = GetSourceFileKey(h.SerializedFileName ?? string.Empty, h.OriginalPath ?? string.Empty);
+                if (!unchangedSourceKeys.Contains(key))
+                {
+                    deltaHandles.Add(h);
+                }
+            }
+
+            if (deltaHandles.Count > 0)
+            {
+                InsertSourceFilesAndAssets(conn, transaction, projectId, folderPath, scanLookup, deltaHandles, caseSensitivePaths, advanceProgress);
+            }
+        }
+
         private static void InsertSourceFilesAndAssets(
             SqliteConnection conn,
             SqliteTransaction transaction,
             long projectId,
+            string folderPath,
+            ScanFileLookup scanLookup,
             IReadOnlyCollection<AssetHandle> handles,
+            bool caseSensitivePaths,
             Action<string>? advanceProgress = null)
         {
             if (handles.Count == 0)
@@ -634,7 +1734,8 @@ namespace AssetStudio.Avalonia
                 return;
             }
 
-            var sourceFileIds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            var pathComparer = caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var sourceFileIds = new Dictionary<string, long>(pathComparer);
             var sourceGroups = handles
                 .GroupBy(h => new
                 {
@@ -648,15 +1749,31 @@ namespace AssetStudio.Avalonia
             {
                 upsertSourceCmd.Transaction = transaction;
                 upsertSourceCmd.CommandText = @"
-                    INSERT INTO SourceFiles (ProjectId, SerializedFileName, OriginalPath, UnityVersion, ObjectCount)
-                    VALUES (@projectId, @serializedFileName, @originalPath, '', @objectCount)
+                    INSERT INTO SourceFiles (
+                        ProjectId, SerializedFileName, OriginalPath, UnityVersion, ObjectCount,
+                        RelativePath, FileSize, LastWriteUtcTicks, ContentSampleHash, FileKind)
+                    VALUES (
+                        @projectId, @serializedFileName, @originalPath, '', @objectCount,
+                        @relativePath, @fileSize, @lastWriteUtcTicks, @contentSampleHash, @fileKind)
                     ON CONFLICT(ProjectId, SerializedFileName, OriginalPath)
-                    DO UPDATE SET ObjectCount = excluded.ObjectCount, LastSeen = CURRENT_TIMESTAMP
+                    DO UPDATE SET
+                        ObjectCount = excluded.ObjectCount,
+                        LastSeen = CURRENT_TIMESTAMP,
+                        RelativePath = excluded.RelativePath,
+                        FileSize = excluded.FileSize,
+                        LastWriteUtcTicks = excluded.LastWriteUtcTicks,
+                        ContentSampleHash = excluded.ContentSampleHash,
+                        FileKind = excluded.FileKind
                     RETURNING Id";
                 var pSrcProjectId = upsertSourceCmd.Parameters.Add("@projectId", SqliteType.Integer);
                 var pSerializedFileName = upsertSourceCmd.Parameters.Add("@serializedFileName", SqliteType.Text);
                 var pOriginalPath = upsertSourceCmd.Parameters.Add("@originalPath", SqliteType.Text);
                 var pObjectCount = upsertSourceCmd.Parameters.Add("@objectCount", SqliteType.Integer);
+                var pRelativePath = upsertSourceCmd.Parameters.Add("@relativePath", SqliteType.Text);
+                var pFileSize = upsertSourceCmd.Parameters.Add("@fileSize", SqliteType.Integer);
+                var pLastWriteTicks = upsertSourceCmd.Parameters.Add("@lastWriteUtcTicks", SqliteType.Integer);
+                var pSampleHash = upsertSourceCmd.Parameters.Add("@contentSampleHash", SqliteType.Integer);
+                var pFileKind = upsertSourceCmd.Parameters.Add("@fileKind", SqliteType.Integer);
                 pSrcProjectId.Value = projectId;
 
                 foreach (var group in sourceGroups)
@@ -664,6 +1781,24 @@ namespace AssetStudio.Avalonia
                     pSerializedFileName.Value = group.Key.SerializedFileName;
                     pOriginalPath.Value = group.Key.OriginalPath;
                     pObjectCount.Value = group.Count();
+
+                    if (TryResolveScanFileMetadata(scanLookup, group.Key.OriginalPath, caseSensitivePaths, out var scanned, out var relPath))
+                    {
+                        pRelativePath.Value = relPath;
+                        pFileSize.Value = scanned.Size;
+                        pLastWriteTicks.Value = scanned.LastWriteTimeUtcTicks;
+                        pSampleHash.Value = unchecked((long)scanned.ContentSampleHash);
+                        pFileKind.Value = (int)scanned.Kind;
+                    }
+                    else
+                    {
+                        pRelativePath.Value = relPath;
+                        pFileSize.Value = 0L;
+                        pLastWriteTicks.Value = 0L;
+                        pSampleHash.Value = 0L;
+                        pFileKind.Value = (int)ProjectFileKind.Other;
+                    }
+
                     var id = upsertSourceCmd.ExecuteScalar();
                     if (id != null && id != DBNull.Value)
                     {

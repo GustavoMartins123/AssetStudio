@@ -219,12 +219,26 @@ namespace AssetStudio.Tests
             Assert.Equal(
                 AssetHandle.BuildSourceHash("level0", nested),
                 AssetHandle.BuildSourceHash("level0", withDotDot));
-            if (OperatingSystem.IsWindows())
+            if (OperatingSystem.IsLinux())
+            {
+                Assert.NotEqual(
+                    AssetHandle.BuildSourceHash("level0", nested.ToLowerInvariant()),
+                    AssetHandle.BuildSourceHash("level0", nested.ToUpperInvariant()));
+            }
+            else
             {
                 Assert.Equal(
                     AssetHandle.BuildSourceHash("level0", nested.ToLowerInvariant()),
                     AssetHandle.BuildSourceHash("level0", nested.ToUpperInvariant()));
             }
+
+            // Explicit cross-platform check for Linux case-sensitivity vs Windows case-folding.
+            Assert.NotEqual(
+                AssetHandle.BuildSourceHash("level0", Path.Combine(tempRoot, "a.bundle"), caseSensitive: true),
+                AssetHandle.BuildSourceHash("level0", Path.Combine(tempRoot, "A.bundle"), caseSensitive: true));
+            Assert.Equal(
+                AssetHandle.BuildSourceHash("level0", Path.Combine(tempRoot, "a.bundle"), caseSensitive: false),
+                AssetHandle.BuildSourceHash("level0", Path.Combine(tempRoot, "A.bundle"), caseSensitive: false));
 
             AssetHandle.ClearSourceHashCache();
             Assert.Equal(
@@ -484,6 +498,7 @@ namespace AssetStudio.Tests
 
         private static string ReferenceBuildSourceHash(string serializedFileName, string? originalPath)
         {
+            var caseSensitive = OperatingSystem.IsLinux();
             string normalizedPath;
             if (string.IsNullOrWhiteSpace(originalPath))
             {
@@ -494,12 +509,19 @@ namespace AssetStudio.Tests
                 try
                 {
                     normalizedPath = Path.GetFullPath(originalPath)
-                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                        .ToUpperInvariant();
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (!caseSensitive)
+                    {
+                        normalizedPath = normalizedPath.ToUpperInvariant();
+                    }
                 }
                 catch
                 {
-                    normalizedPath = originalPath.Replace('\\', '/').Trim().ToUpperInvariant();
+                    normalizedPath = originalPath.Replace('\\', '/').Trim();
+                    if (!caseSensitive)
+                    {
+                        normalizedPath = normalizedPath.ToUpperInvariant();
+                    }
                 }
             }
 

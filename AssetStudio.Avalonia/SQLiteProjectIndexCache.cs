@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -23,12 +24,14 @@ namespace AssetStudio.Avalonia
         private static readonly ConcurrentDictionary<string, long> s_dbWriteGenerations =
             new(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
         private readonly string _cacheDir;
-        private readonly HashSet<string> _initializedDbs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly bool _caseSensitivePaths;
+        private readonly StringComparer _pathComparer;
+        private readonly StringComparison _pathComparison;
+        private readonly HashSet<string> _initializedDbs;
         private readonly object _initLock = new object();
         private readonly ConcurrentDictionary<string, long> _projectIdCache = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, CachedSemanticCacheStatus> _semanticStatusCache = new(StringComparer.Ordinal);
-        private readonly ConcurrentDictionary<string, ReadConnectionPoolBucket> _readConnectionPools =
-            new(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, ReadConnectionPoolBucket> _readConnectionPools;
         private readonly object _bgWriteLock = new object();
         private readonly Queue<PendingLazySemanticWrite> _pendingLazySemanticWrites = new();
         private readonly Dictionary<string, PendingLazySemanticWrite> _pendingLazySemanticWritesByKey = new(StringComparer.Ordinal);
@@ -47,7 +50,7 @@ namespace AssetStudio.Avalonia
         {
         }
 
-        internal SQLiteProjectIndexCache(string cacheDirectory)
+        internal SQLiteProjectIndexCache(string cacheDirectory, bool? caseSensitivePaths = null)
         {
             if (string.IsNullOrWhiteSpace(cacheDirectory))
             {
@@ -55,25 +58,153 @@ namespace AssetStudio.Avalonia
             }
 
             _cacheDir = cacheDirectory;
+            _caseSensitivePaths = caseSensitivePaths ?? OperatingSystem.IsLinux();
+            _pathComparer = _caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            _pathComparison = _caseSensitivePaths ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            _initializedDbs = new HashSet<string>(_pathComparer);
+            _readConnectionPools = new ConcurrentDictionary<string, ReadConnectionPoolBucket>(_pathComparer);
             Directory.CreateDirectory(_cacheDir);
         }
 
+        internal bool CaseSensitivePaths => _caseSensitivePaths;
         internal long PhysicalReadConnectionsOpened => Interlocked.Read(ref _physicalReadConnectionsOpened);
         internal long ReadPoolHits => Interlocked.Read(ref _readPoolHits);
 
         public string GetFolderSignature(ProjectScanResult scanResult)
         {
-            if (scanResult.EncryptedFileCount > 0)
+            return ComputeFolderSignature(scanResult, _caseSensitivePaths);
+        }
+
+        internal static string ComputeFolderSignature(ProjectScanResult scanResult, bool caseSensitive)
+        {
+            ArgumentNullException.ThrowIfNull(scanResult);
+
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            AppendSignatureUtf8(hasher, "manifest-v2\0");
+            AppendSignatureUtf8(hasher, "C|");
+            AppendSignatureUtf8(hasher, scanResult.TotalFiles.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.TotalBytes.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.UnityBundleCount.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.SerializedFileCount.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.ResourceFileCount.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.EncryptedFileCount.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.OtherFileCount.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "|");
+            AppendSignatureUtf8(hasher, scanResult.ErrorCount.ToString(CultureInfo.InvariantCulture));
+            AppendSignatureUtf8(hasher, "\0D|");
+            AppendSignatureUtf8(hasher, scanResult.DecryptionContextDigest ?? string.Empty);
+            AppendSignatureUtf8(hasher, "\0");
+
+            if (scanResult.Files.Count > 0)
             {
-                return $"{scanResult.TotalFiles}_{scanResult.TotalBytes}_{scanResult.UnityBundleCount}_e{scanResult.EncryptedFileCount}";
+                var rootFull = string.IsNullOrWhiteSpace(scanResult.RootPath)
+                    ? string.Empty
+                    : TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(scanResult.RootPath));
+
+                var entries = new List<(string RelativePath, long Size, int Kind, long LastWriteTicks, ulong SampleHash, string AppliedProvider)>(scanResult.Files.Count);
+                for (var i = 0; i < scanResult.Files.Count; i++)
+                {
+                    var file = scanResult.Files[i];
+                    var relPath = NormalizeRelativeManifestPath(rootFull, file.Path, caseSensitive);
+                    entries.Add((
+                        relPath,
+                        file.Size,
+                        (int)file.Kind,
+                        file.LastWriteTimeUtcTicks,
+                        file.ContentSampleHash,
+                        file.AppliedDecryptionProvider ?? string.Empty));
+                }
+
+                entries.Sort(static (a, b) =>
+                {
+                    var cmp = string.CompareOrdinal(a.RelativePath, b.RelativePath);
+                    if (cmp != 0) return cmp;
+                    cmp = a.Size.CompareTo(b.Size);
+                    if (cmp != 0) return cmp;
+                    cmp = a.Kind.CompareTo(b.Kind);
+                    if (cmp != 0) return cmp;
+                    cmp = a.LastWriteTicks.CompareTo(b.LastWriteTicks);
+                    if (cmp != 0) return cmp;
+                    cmp = a.SampleHash.CompareTo(b.SampleHash);
+                    if (cmp != 0) return cmp;
+                    return string.CompareOrdinal(a.AppliedProvider, b.AppliedProvider);
+                });
+
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    var e = entries[i];
+                    AppendSignatureUtf8(hasher, "F|");
+                    AppendSignatureUtf8(hasher, e.RelativePath);
+                    AppendSignatureUtf8(hasher, "|");
+                    AppendSignatureUtf8(hasher, e.Size.ToString(CultureInfo.InvariantCulture));
+                    AppendSignatureUtf8(hasher, "|");
+                    AppendSignatureUtf8(hasher, e.Kind.ToString(CultureInfo.InvariantCulture));
+                    AppendSignatureUtf8(hasher, "|");
+                    AppendSignatureUtf8(hasher, e.LastWriteTicks.ToString(CultureInfo.InvariantCulture));
+                    AppendSignatureUtf8(hasher, "|");
+                    AppendSignatureUtf8(hasher, e.SampleHash.ToString("x16", CultureInfo.InvariantCulture));
+                    AppendSignatureUtf8(hasher, "|");
+                    AppendSignatureUtf8(hasher, e.AppliedProvider);
+                    AppendSignatureUtf8(hasher, "\0");
+                }
             }
 
-            return $"{scanResult.TotalFiles}_{scanResult.TotalBytes}_{scanResult.UnityBundleCount}";
+            var hex = Convert.ToHexStringLower(hasher.GetHashAndReset());
+            if (scanResult.EncryptedFileCount > 0)
+            {
+                return $"v2:{hex}_e{scanResult.EncryptedFileCount}";
+            }
+
+            return $"v2:{hex}";
+        }
+
+        private static void AppendSignatureUtf8(IncrementalHash hasher, string text)
+        {
+            if (text.Length == 0)
+            {
+                return;
+            }
+
+            hasher.AppendData(Encoding.UTF8.GetBytes(text));
+        }
+
+        internal static string NormalizeRelativeManifestPath(string rootFullPath, string? filePath, bool caseSensitive)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                return string.Empty;
+            }
+
+            string relative;
+            if (!string.IsNullOrWhiteSpace(rootFullPath))
+            {
+                try
+                {
+                    relative = Path.GetRelativePath(rootFullPath, GetFullPathOrOriginal(filePath));
+                }
+                catch
+                {
+                    relative = filePath;
+                }
+            }
+            else
+            {
+                relative = filePath;
+            }
+
+            var normalized = relative.Replace('\\', '/');
+            return caseSensitive ? normalized : normalized.ToUpperInvariant();
         }
 
         internal string GetDbPath(string folderPath)
         {
-            var folderKey = GetFolderCacheKey(folderPath);
+            var folderKey = GetFolderCacheKey(folderPath, _caseSensitivePaths);
             return Path.Combine(_cacheDir, $"project_index_{folderKey}.db");
         }
 
@@ -144,17 +275,43 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static string GetFolderCacheKey(string folderPath)
+        internal static string GetFolderCacheKey(string folderPath)
+        {
+            return GetFolderCacheKey(folderPath, OperatingSystem.IsLinux());
+        }
+
+        internal static string GetFolderCacheKey(string folderPath, bool caseSensitive)
         {
             if (string.IsNullOrWhiteSpace(folderPath))
             {
                 return string.Empty;
             }
 
-            var normalized = GetFullPathOrOriginal(folderPath)
-                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var normalized = NormalizeFolderPathKey(folderPath, caseSensitive);
             var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(normalized));
             return Convert.ToHexStringLower(hashBytes);
+        }
+
+        internal static string TrimTrailingDirectorySeparatorsPreservingRoot(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return string.Empty;
+            }
+
+            var trimmed = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return trimmed.Length == 0 ? path.Substring(0, 1) : trimmed;
+        }
+
+        internal static string NormalizeFolderPathKey(string folderPath, bool caseSensitive)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+            {
+                return string.Empty;
+            }
+
+            var normalized = TrimTrailingDirectorySeparatorsPreservingRoot(GetFullPathOrOriginal(folderPath));
+            return caseSensitive ? normalized : normalized.ToUpperInvariant();
         }
 
         private static string GetFullPathOrOriginal(string path)
@@ -169,16 +326,15 @@ namespace AssetStudio.Avalonia
             }
         }
 
-        private static string NormalizeProjectPathForCache(string folderPath)
+        private string NormalizeProjectPathForCache(string folderPath)
         {
-            return (folderPath ?? string.Empty)
-                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                .ToUpperInvariant();
+            return NormalizeFolderPathKey(folderPath, _caseSensitivePaths);
         }
 
-        private static string BuildProjectIdCacheKey(string dbPath, string folderPath, string signature)
+        private string BuildProjectIdCacheKey(string dbPath, string folderPath, string signature)
         {
-            return $"{dbPath}\u001f{NormalizeProjectPathForCache(folderPath)}\u001f{signature}";
+            var normalizedDb = _caseSensitivePaths ? dbPath : dbPath.ToUpperInvariant();
+            return $"{normalizedDb}\u001f{NormalizeProjectPathForCache(folderPath)}\u001f{signature}";
         }
 
         internal bool TryGetCachedProjectId(string folderPath, string signature, out long projectId)
@@ -199,10 +355,11 @@ namespace AssetStudio.Avalonia
 
         private void InvalidateProjectIdCacheForDb(string dbPath)
         {
-            var prefix = dbPath + "\u001f";
+            var normalizedDb = _caseSensitivePaths ? dbPath : dbPath.ToUpperInvariant();
+            var prefix = normalizedDb + "\u001f";
             foreach (var key in _projectIdCache.Keys)
             {
-                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                if (key.StartsWith(prefix, _pathComparison))
                 {
                     _projectIdCache.TryRemove(key, out _);
                 }
@@ -213,10 +370,11 @@ namespace AssetStudio.Avalonia
 
         private void InvalidateSemanticStatusCacheForDb(string dbPath)
         {
-            var prefix = dbPath + "\u001f";
+            var normalizedDb = _caseSensitivePaths ? dbPath : dbPath.ToUpperInvariant();
+            var prefix = normalizedDb + "\u001f";
             foreach (var key in _semanticStatusCache.Keys)
             {
-                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                if (key.StartsWith(prefix, _pathComparison))
                 {
                     _semanticStatusCache.TryRemove(key, out _);
                 }
@@ -330,7 +488,7 @@ namespace AssetStudio.Avalonia
             }
 
             fromCache = false;
-            var projectId = FindProjectId(conn, transaction, folderPath, signature);
+            var projectId = FindProjectId(conn, transaction, folderPath, signature, _caseSensitivePaths);
             if (projectId.HasValue)
             {
                 _projectIdCache[cacheKey] = projectId.Value;
@@ -347,7 +505,7 @@ namespace AssetStudio.Avalonia
             string signature)
         {
             var cacheKey = BuildProjectIdCacheKey(dbPath, folderPath, signature);
-            var projectId = FindProjectId(conn, transaction, folderPath, signature);
+            var projectId = FindProjectId(conn, transaction, folderPath, signature, _caseSensitivePaths);
             if (projectId.HasValue)
             {
                 _projectIdCache[cacheKey] = projectId.Value;
@@ -802,7 +960,7 @@ namespace AssetStudio.Avalonia
                             pragma.ExecuteNonQuery();
                         }
 
-                        if (TryUpgradeOrRebuildSchema(conn))
+                        if (TryUpgradeOrRebuildSchema(conn, _caseSensitivePaths))
                         {
                             InvalidateProjectIdCacheForDb(dbPath);
                             NotifyDatabaseMutated(dbPath);
@@ -810,7 +968,7 @@ namespace AssetStudio.Avalonia
                             MmapProjectIndexSidecar.DeleteSidecarFiles(dbPath);
                         }
 
-                        CreateSchema(conn);
+                        CreateSchema(conn, _caseSensitivePaths);
                         TryOptimizeDatabase(conn, "database initialization");
                     }
                 }
@@ -916,17 +1074,21 @@ namespace AssetStudio.Avalonia
 
         private static long? FindProjectId(SqliteConnection conn, SqliteTransaction? transaction, string folderPath, string signature)
         {
-            var path1 = folderPath;
-            var path2 = path1.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return FindProjectId(conn, transaction, folderPath, signature, OperatingSystem.IsLinux());
+        }
+
+        private static long? FindProjectId(SqliteConnection conn, SqliteTransaction? transaction, string folderPath, string signature, bool caseSensitivePaths)
+        {
+            var folderPathKey = NormalizeFolderPathKey(folderPath, caseSensitivePaths);
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 SELECT Id FROM Projects
-                WHERE (FolderPath = @path1 COLLATE NOCASE OR FolderPath = @path2 COLLATE NOCASE)
+                WHERE FolderPathKey = @folderPathKey
                   AND SignatureHash = @signature
+                ORDER BY LastIndexed DESC, Id DESC
                 LIMIT 1";
-            cmd.Parameters.AddWithValue("@path1", path1);
-            cmd.Parameters.AddWithValue("@path2", path2);
+            cmd.Parameters.AddWithValue("@folderPathKey", folderPathKey);
             cmd.Parameters.AddWithValue("@signature", signature);
             var id = cmd.ExecuteScalar();
             return id == null ? null : Convert.ToInt64(id);
@@ -934,17 +1096,21 @@ namespace AssetStudio.Avalonia
 
         private static long? FindLatestProjectId(SqliteConnection conn, SqliteTransaction? transaction, string folderPath)
         {
+            return FindLatestProjectId(conn, transaction, folderPath, OperatingSystem.IsLinux());
+        }
+
+        private static long? FindLatestProjectId(SqliteConnection conn, SqliteTransaction? transaction, string folderPath, bool caseSensitivePaths)
+        {
+            var folderPathKey = NormalizeFolderPathKey(folderPath, caseSensitivePaths);
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = @"
                 SELECT Id
                 FROM Projects
-                WHERE FolderPath = @path COLLATE NOCASE
-                   OR FolderPath = @trimmedPath COLLATE NOCASE
+                WHERE FolderPathKey = @folderPathKey
                 ORDER BY LastIndexed DESC, Id DESC
                 LIMIT 1";
-            cmd.Parameters.AddWithValue("@path", folderPath);
-            cmd.Parameters.AddWithValue("@trimmedPath", folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            cmd.Parameters.AddWithValue("@folderPathKey", folderPathKey);
             var id = cmd.ExecuteScalar();
             return id == null ? null : Convert.ToInt64(id);
         }

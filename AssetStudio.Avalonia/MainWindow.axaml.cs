@@ -1121,6 +1121,13 @@ public partial class MainWindow : Window
                             ViewModel.LoadingProgress = ComputeEffectiveLoadingProgress(100);
                             StatusStripUpdate($"Loaded from cache. Showing {VisibleAssetCount:N0} assets.{FormatPartialCoverageSuffix()}");
 
+                            if (currentScanResult == null
+                                || !string.Equals(_sqliteCache.GetFolderSignature(currentScanResult), signature, StringComparison.Ordinal))
+                            {
+                                Logger.Warning($"Skipping lazy connection build for '{folderPath}': scan signature changed after warm cache load.");
+                                return;
+                            }
+
                             await BuildLazyConnectionsIfNeededAsync(paths);
                             if (sessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
                             {
@@ -1233,6 +1240,7 @@ public partial class MainWindow : Window
         ShowIndexingProgressPanel("running", 0, files.Count, files.Count, 0, string.Empty, string.Empty, null);
 
         var indexingSessionId = lazyIndexingSessionId;
+        string? committedIndexSignature = null;
         var activeFilters = filterTypeAll.IsChecked != true
             ? GetFilterTypeItems()
                 .Where(x => x.IsChecked == true && x.Tag is ClassIDType)
@@ -1294,7 +1302,18 @@ public partial class MainWindow : Window
                 {
                     return;
                 }
+
+                // PERF-11: Never stamp stale t0 scan signature if files mutated before cache save.
+                var revalidation = ProjectScanner.RevalidateFolder(folderPath, scanResult);
+                if (!revalidation.IsUnchanged)
+                {
+                    Logger.Warning($"Skipping index cache save for '{folderPath}': folder mutated before commit.");
+                    return;
+                }
+
+                currentScanResult = scanResult;
                 SaveIndexCache(folderPath, scanResult);
+                Volatile.Write(ref committedIndexSignature, _sqliteCache.GetFolderSignature(scanResult));
             },
             update =>
             {
@@ -1327,6 +1346,20 @@ public partial class MainWindow : Window
 
                         if (!wasCancelled)
                         {
+                            // PERF-11: Semantic commit guard — only build/commit semantic relations when the
+                            // index cache was validly committed under the current scan signature.
+                            var expectedSig = Volatile.Read(ref committedIndexSignature);
+                            var hasDirectoryTarget = paths.Length == 1 && Directory.Exists(paths[0]);
+                            if (hasDirectoryTarget
+                                && (string.IsNullOrEmpty(expectedSig)
+                                    || currentScanResult == null
+                                    || !string.Equals(_sqliteCache.GetFolderSignature(currentScanResult), expectedSig, StringComparison.Ordinal)
+                                    || !_sqliteCache.HasCompletedIndexForSignature(paths[0], expectedSig)))
+                            {
+                                Logger.Warning($"Skipping lazy connection build for '{paths[0]}': index cache was not committed cleanly for the current folder signature.");
+                                return;
+                            }
+
                             await BuildLazyConnectionsIfNeededAsync(paths, force: true);
                             if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
                             {
@@ -1415,7 +1448,33 @@ public partial class MainWindow : Window
                     }
                 });
             },
-            handleFlushBatchSize: AssetLoadingService.DefaultHandleFlushBatchSize);
+            handleFlushBatchSize: AssetLoadingService.DefaultHandleFlushBatchSize,
+            saveReconciledCacheCallback: (folderPath, validatedScanResult, reconciledHandles) =>
+            {
+                if (indexingSessionId != lazyIndexingSessionId || IsWindowClosingOrClosed || _isReturningToProjectManager)
+                {
+                    return;
+                }
+
+                var revalidation = ProjectScanner.RevalidateFolder(folderPath, validatedScanResult);
+                if (!revalidation.IsUnchanged)
+                {
+                    Logger.Warning($"Skipping reconciled index cache save for '{folderPath}': folder mutated again right before commit.");
+                    return;
+                }
+
+                currentScanResult = validatedScanResult;
+                ProjectLoadingService.SaveIndexCache(
+                    _sqliteCache,
+                    assetsManager,
+                    folderPath,
+                    validatedScanResult,
+                    preserveSemanticRelations: false,
+                    progress: null,
+                    showProgressPanel: ShowIndexingProgressPanel,
+                    handlesOverride: reconciledHandles);
+                Volatile.Write(ref committedIndexSignature, _sqliteCache.GetFolderSignature(validatedScanResult));
+            });
     }
 
     private int AppendNewLazyAssetsFromProjectIndex(int? maxHandlesToDrain = null)

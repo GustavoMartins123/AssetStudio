@@ -8,12 +8,14 @@ namespace AssetStudio.Avalonia
     public partial class SQLiteProjectIndexCache
     {
         /// <summary>
-        /// v15: adds persistent reusable <c>MaterialCache</c>, <c>MeshMaterialResolvedCache</c>,
-        /// <c>CompositeAssets</c>, and <c>CompositeAssetParts</c> tables (all WITHOUT ROWID),
-        /// extends <c>MaterialTextures</c> with scale/offset/source metadata, and adds
-        /// <c>idx_model_groups_animator</c> to eliminate full-table scans during Commit().
+        /// v16: adds deterministic manifest v2 fingerprinting (<c>Projects.FolderPathKey</c>,
+        /// <c>Projects.SignatureVersion</c>), non-NOCASE <c>idx_projects_lookup</c> for Linux
+        /// case-sensitivity, incremental bundle fingerprint metadata on <c>SourceFiles</c>
+        /// (<c>RelativePath</c>, <c>FileSize</c>, <c>LastWriteUtcTicks</c>, <c>ContentSampleHash</c>,
+        /// <c>FileKind</c>), and unified scene/external dependency tables (<c>SourceFileExternals</c>,
+        /// <c>Scenes</c>, both WITHOUT ROWID).
         /// </summary>
-        internal const int SemanticSchemaVersion = 15;
+        internal const int SemanticSchemaVersion = 16;
 
         private const string AssetHandlesCompatibilityViewSql = @"
             CREATE VIEW IF NOT EXISTS AssetHandles AS
@@ -34,7 +36,7 @@ namespace AssetStudio.Avalonia
               ON SourceFiles.ProjectId = Assets.ProjectId
              AND SourceFiles.Id = Assets.SourceFileId;";
 
-        private static bool TryUpgradeOrRebuildSchema(SqliteConnection conn)
+        private static bool TryUpgradeOrRebuildSchema(SqliteConnection conn, bool caseSensitivePaths)
         {
             var existingVersion = GetExistingSchemaVersion(conn);
             if (existingVersion == null || existingVersion == SemanticSchemaVersion)
@@ -42,25 +44,32 @@ namespace AssetStudio.Avalonia
                 return false;
             }
 
-            if ((existingVersion == 11 || existingVersion == 12 || existingVersion == 13 || existingVersion == 14)
+            if ((existingVersion == 11 || existingVersion == 12 || existingVersion == 13 || existingVersion == 14 || existingVersion == 15)
                 && CanPreserveV11ProjectsAndPreviewCache(conn))
             {
-                if (existingVersion == 14 && CanPreserveV12UnifiedAssets(conn))
+                if (existingVersion == 15 && CanPreserveV12UnifiedAssets(conn))
                 {
-                    // v14 -> v15 in-place upgrade preserves Projects/SourceFiles/Assets/PreviewCacheEntries
-                    // and all v14 semantic tables + valid structure_completed/connections_completed state,
-                    // while backfilling MaterialCache, MeshMaterialResolvedCache, and CompositeAssets in SQL (<1s).
+                    // v15 -> v16 in-place upgrade preserves Projects/SourceFiles/Assets/PreviewCacheEntries
+                    // and all v15 semantic tables + valid indexing status, adding v16 fingerprint & scene schema.
+                    UpgradeV15ToV16InPlace(conn, caseSensitivePaths);
+                }
+                else if (existingVersion == 14 && CanPreserveV12UnifiedAssets(conn))
+                {
+                    // v14 -> v15 -> v16 in-place upgrade preserves everything including PreviewCacheEntries.
                     UpgradeV14ToV15InPlace(conn);
+                    UpgradeV15ToV16InPlace(conn, caseSensitivePaths);
                 }
                 else if ((existingVersion == 12 || existingVersion == 13) && CanPreserveV12UnifiedAssets(conn))
                 {
                     // v12/v13 Assets already holds every handle column (paths via SourceFiles): keep the
-                    // whole index cache and preview cache in place and add v14/v15 semantic relation tables.
+                    // whole index cache and preview cache in place and add v14/v15/v16 tables & columns.
                     UpgradeV12OrV13ToV15InPlace(conn);
+                    UpgradeV15ToV16InPlace(conn, caseSensitivePaths);
                 }
                 else
                 {
                     DropLegacyIndexTables(conn);
+                    EnsureV16ProjectsColumnsAndIndex(conn, transaction: null, caseSensitivePaths);
                 }
 
                 return true;
@@ -250,6 +259,164 @@ namespace AssetStudio.Avalonia
             }
 
             transaction.Commit();
+        }
+
+        private static void UpgradeV15ToV16InPlace(SqliteConnection conn, bool caseSensitivePaths)
+        {
+            using var transaction = conn.BeginTransaction();
+            EnsureV16ProjectsColumnsAndIndex(conn, transaction, caseSensitivePaths);
+            EnsureV16SourceFilesColumns(conn, transaction);
+            EnsureV16SceneTablesAndIndexes(conn, transaction);
+            transaction.Commit();
+        }
+
+        private static void EnsureV16ProjectsColumnsAndIndex(SqliteConnection conn, SqliteTransaction? transaction, bool caseSensitivePaths)
+        {
+            var projectColumns = GetTableColumnNames(conn, "Projects", transaction);
+            if (projectColumns.Count == 0)
+            {
+                return;
+            }
+
+            if (!projectColumns.Contains("FolderPathKey"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.Transaction = transaction;
+                alterCmd.CommandText = "ALTER TABLE Projects ADD COLUMN FolderPathKey TEXT NOT NULL DEFAULT '';";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!projectColumns.Contains("SignatureVersion"))
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.Transaction = transaction;
+                alterCmd.CommandText = "ALTER TABLE Projects ADD COLUMN SignatureVersion INTEGER NOT NULL DEFAULT 1;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            // Backfill FolderPathKey and SignatureVersion for any migrated rows missing them.
+            var rowsToBackfill = new List<(long Id, string FolderPath, string SignatureHash)>();
+            using (var selectCmd = conn.CreateCommand())
+            {
+                selectCmd.Transaction = transaction;
+                selectCmd.CommandText = "SELECT Id, FolderPath, SignatureHash FROM Projects WHERE FolderPathKey = '';";
+                using var reader = selectCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    rowsToBackfill.Add((
+                        reader.GetInt64(0),
+                        reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                        reader.IsDBNull(2) ? string.Empty : reader.GetString(2)));
+                }
+            }
+
+            if (rowsToBackfill.Count > 0)
+            {
+                using var updateCmd = conn.CreateCommand();
+                updateCmd.Transaction = transaction;
+                updateCmd.CommandText = @"
+                    UPDATE Projects
+                    SET FolderPathKey = @folderPathKey,
+                        SignatureVersion = @sigVersion
+                    WHERE Id = @id;";
+                var pKey = updateCmd.Parameters.Add("@folderPathKey", SqliteType.Text);
+                var pSigVer = updateCmd.Parameters.Add("@sigVersion", SqliteType.Integer);
+                var pId = updateCmd.Parameters.Add("@id", SqliteType.Integer);
+
+                foreach (var (id, folderPath, signatureHash) in rowsToBackfill)
+                {
+                    pKey.Value = NormalizeFolderPathKey(folderPath, caseSensitivePaths);
+                    pSigVer.Value = signatureHash.StartsWith("v2:", StringComparison.Ordinal) ? 2 : 1;
+                    pId.Value = id;
+                    updateCmd.ExecuteNonQuery();
+                }
+            }
+
+            // Recreate idx_projects_lookup without COLLATE NOCASE if it is missing or still uses legacy FolderPath/NOCASE.
+            string? existingIndexSql;
+            using (var idxCmd = conn.CreateCommand())
+            {
+                idxCmd.Transaction = transaction;
+                idxCmd.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projects_lookup' LIMIT 1;";
+                existingIndexSql = idxCmd.ExecuteScalar()?.ToString();
+            }
+
+            var needsRecreate = string.IsNullOrWhiteSpace(existingIndexSql)
+                || existingIndexSql.IndexOf("NOCASE", StringComparison.OrdinalIgnoreCase) >= 0
+                || existingIndexSql.IndexOf("FolderPathKey", StringComparison.OrdinalIgnoreCase) < 0;
+
+            if (needsRecreate)
+            {
+                using var recreateCmd = conn.CreateCommand();
+                recreateCmd.Transaction = transaction;
+                recreateCmd.CommandText = @"
+                    DROP INDEX IF EXISTS idx_projects_lookup;
+                    CREATE INDEX IF NOT EXISTS idx_projects_lookup ON Projects(FolderPathKey, SignatureHash, LastIndexed DESC);";
+                recreateCmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void EnsureV16SourceFilesColumns(SqliteConnection conn, SqliteTransaction? transaction)
+        {
+            var sfColumns = GetTableColumnNames(conn, "SourceFiles", transaction);
+            if (sfColumns.Count == 0)
+            {
+                return;
+            }
+
+            var additions = new (string Name, string Ddl)[]
+            {
+                ("RelativePath", "ALTER TABLE SourceFiles ADD COLUMN RelativePath TEXT NOT NULL DEFAULT '';"),
+                ("FileSize", "ALTER TABLE SourceFiles ADD COLUMN FileSize INTEGER NOT NULL DEFAULT 0;"),
+                ("LastWriteUtcTicks", "ALTER TABLE SourceFiles ADD COLUMN LastWriteUtcTicks INTEGER NOT NULL DEFAULT 0;"),
+                ("ContentSampleHash", "ALTER TABLE SourceFiles ADD COLUMN ContentSampleHash INTEGER NOT NULL DEFAULT 0;"),
+                ("FileKind", "ALTER TABLE SourceFiles ADD COLUMN FileKind INTEGER NOT NULL DEFAULT 0;")
+            };
+
+            foreach (var (name, ddl) in additions)
+            {
+                if (!sfColumns.Contains(name))
+                {
+                    using var alterCmd = conn.CreateCommand();
+                    alterCmd.Transaction = transaction;
+                    alterCmd.CommandText = ddl;
+                    alterCmd.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private static void EnsureV16SceneTablesAndIndexes(SqliteConnection conn, SqliteTransaction? transaction)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+                CREATE TABLE IF NOT EXISTS SourceFileExternals (
+                    ProjectId INTEGER NOT NULL,
+                    SourceFileId INTEGER NOT NULL,
+                    ExternalIndex INTEGER NOT NULL,
+                    ExternalFileName TEXT NOT NULL DEFAULT '',
+                    ExternalPathName TEXT NOT NULL DEFAULT '',
+                    ExternalGuid TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (ProjectId, SourceFileId, ExternalIndex),
+                    FOREIGN KEY (ProjectId) REFERENCES Projects(Id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS Scenes (
+                    ProjectId INTEGER NOT NULL,
+                    SceneId INTEGER NOT NULL,
+                    Name TEXT NOT NULL DEFAULT '',
+                    ScenePath TEXT NOT NULL DEFAULT '',
+                    BuildIndex INTEGER NOT NULL DEFAULT -1,
+                    EntrySourceFileId INTEGER NOT NULL DEFAULT 0,
+                    ContainerKey TEXT NOT NULL DEFAULT '',
+                    SourceKind TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (ProjectId, SceneId),
+                    FOREIGN KEY (ProjectId) REFERENCES Projects(Id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+
+                CREATE INDEX IF NOT EXISTS idx_source_externals_lookup ON SourceFileExternals(ProjectId, SourceFileId);
+                CREATE INDEX IF NOT EXISTS idx_scenes_project_build ON Scenes(ProjectId, BuildIndex, Name);";
+            cmd.ExecuteNonQuery();
         }
 
         private static void EnsureMaterialTexturesV15Columns(SqliteConnection conn, SqliteTransaction? transaction)
@@ -688,6 +855,8 @@ namespace AssetStudio.Avalonia
                 PRAGMA foreign_keys = OFF;
                 DROP TABLE IF EXISTS IndexingReadFiles;
                 DROP TABLE IF EXISTS ProjectIndexingState;
+                DROP TABLE IF EXISTS Scenes;
+                DROP TABLE IF EXISTS SourceFileExternals;
                 DROP TABLE IF EXISTS AnimationClipTargets;
                 DROP TABLE IF EXISTS CompositeAssetParts;
                 DROP TABLE IF EXISTS CompositeAssets;
@@ -715,6 +884,8 @@ namespace AssetStudio.Avalonia
                     PRAGMA foreign_keys = OFF;
                     DROP TABLE IF EXISTS IndexingReadFiles;
                     DROP TABLE IF EXISTS ProjectIndexingState;
+                    DROP TABLE IF EXISTS Scenes;
+                    DROP TABLE IF EXISTS SourceFileExternals;
                     DROP TABLE IF EXISTS PreviewCacheEntries;
                     DROP TABLE IF EXISTS AnimationClipTargets;
                     DROP TABLE IF EXISTS CompositeAssetParts;
@@ -762,7 +933,7 @@ namespace AssetStudio.Avalonia
             dropCmd.ExecuteNonQuery();
         }
 
-        private static void CreateSchema(SqliteConnection conn)
+        private static void CreateSchema(SqliteConnection conn, bool caseSensitivePaths)
         {
             using (var cmd = conn.CreateCommand())
             {
@@ -770,7 +941,9 @@ namespace AssetStudio.Avalonia
                             CREATE TABLE IF NOT EXISTS Projects (
                                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 FolderPath TEXT NOT NULL,
+                                FolderPathKey TEXT NOT NULL DEFAULT '',
                                 SignatureHash TEXT NOT NULL,
+                                SignatureVersion INTEGER NOT NULL DEFAULT 2,
                                 TotalFiles INTEGER NOT NULL,
                                 TotalBytes INTEGER NOT NULL,
                                 UnityBundleCount INTEGER NOT NULL,
@@ -778,7 +951,6 @@ namespace AssetStudio.Avalonia
                                 UnityVersion TEXT
                             );
 
-                            CREATE INDEX IF NOT EXISTS idx_projects_lookup ON Projects(FolderPath COLLATE NOCASE, SignatureHash, LastIndexed DESC);
                             DROP INDEX IF EXISTS idx_projects_path;
                             DROP INDEX IF EXISTS idx_handles_project;
                             DROP INDEX IF EXISTS idx_handles_unique;
@@ -790,7 +962,12 @@ namespace AssetStudio.Avalonia
                                 OriginalPath TEXT NOT NULL DEFAULT '',
                                 UnityVersion TEXT NOT NULL DEFAULT '',
                                 ObjectCount INTEGER NOT NULL DEFAULT 0,
-                                LastSeen DATETIME DEFAULT CURRENT_TIMESTAMP
+                                LastSeen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                RelativePath TEXT NOT NULL DEFAULT '',
+                                FileSize INTEGER NOT NULL DEFAULT 0,
+                                LastWriteUtcTicks INTEGER NOT NULL DEFAULT 0,
+                                ContentSampleHash INTEGER NOT NULL DEFAULT 0,
+                                FileKind INTEGER NOT NULL DEFAULT 0
                             );
 
                             CREATE TABLE IF NOT EXISTS Assets (
@@ -1061,6 +1238,9 @@ namespace AssetStudio.Avalonia
             }
 
             EnsureMaterialTexturesV15Columns(conn, transaction: null);
+            EnsureV16ProjectsColumnsAndIndex(conn, transaction: null, caseSensitivePaths);
+            EnsureV16SourceFilesColumns(conn, transaction: null);
+            EnsureV16SceneTablesAndIndexes(conn, transaction: null);
             EnsurePreviewCacheSchemaUpgrades(conn);
         }
 

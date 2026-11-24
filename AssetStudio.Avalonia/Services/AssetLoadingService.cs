@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Buffers;
@@ -13,6 +14,10 @@ namespace AssetStudio.Avalonia.Services
     {
         public const int DefaultHandleFlushBatchSize = 5000;
         public const int DefaultProgressCheckpointBatchSize = 40;
+        public const int MaxMidIndexRevalidationRetries = 2;
+
+        private static readonly StringComparer PathKeyComparer =
+            OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
 
         private CancellationTokenSource? _indexingCts;
         private Task? _indexingTask;
@@ -23,7 +28,7 @@ namespace AssetStudio.Avalonia.Services
         private int _priorityPendingCursor;
         private int _regularPendingCursor;
         private int _remainingPendingCount;
-        private Dictionary<string, List<int>> _pendingIndicesByPath = new(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, List<int>> _pendingIndicesByPath = new(PathKeyComparer);
         private System.Diagnostics.Stopwatch? _uiThrottleStopwatch;
         private Action<IndexingProgressUpdate>? _indexingProgressCallback;
         private readonly object _indexingStateLock = new();
@@ -84,14 +89,14 @@ namespace AssetStudio.Avalonia.Services
                     _priorityPendingCursor = 0;
                     _regularPendingCursor = 0;
                     _remainingPendingCount = 0;
-                    _pendingIndicesByPath = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+                    _pendingIndicesByPath = new Dictionary<string, List<int>>(PathKeyComparer);
                     return;
                 }
 
                 var count = files.Count;
                 var array = new string[count];
                 var consumed = new bool[count];
-                var map = new Dictionary<string, List<int>>(count, StringComparer.OrdinalIgnoreCase);
+                var map = new Dictionary<string, List<int>>(count, PathKeyComparer);
 
                 for (int i = 0; i < count; i++)
                 {
@@ -303,7 +308,8 @@ namespace AssetStudio.Avalonia.Services
             Action<IndexingProgressUpdate> onIndexingProgressChanged,
             Action<bool, int, int> onFinished,
             Action<IReadOnlyList<AssetHandle>>? onHandleBatchReady = null,
-            int handleFlushBatchSize = DefaultHandleFlushBatchSize)
+            int handleFlushBatchSize = DefaultHandleFlushBatchSize,
+            Action<string, ProjectScanResult, IReadOnlyList<AssetHandle>?>? saveReconciledCacheCallback = null)
         {
             if (_indexingCts != null)
             {
@@ -331,6 +337,11 @@ namespace AssetStudio.Avalonia.Services
             }
             EmitIndexingProgress("running");
 
+            // PERF-11: Snapshot baseline (Length, LastWriteTimeUtc.Ticks) at t0 so workers detect
+            // live file mutations during progressive indexing.
+            var baselineStatsByPath = BuildBaselineFileStats(currentScanResult);
+            var inFlightMutatedPaths = new ConcurrentDictionary<string, byte>(PathKeyComparer);
+
             _indexingTask = Task.Run(async () =>
             {
                 int checkpointBatchSize = DefaultProgressCheckpointBatchSize;
@@ -345,8 +356,7 @@ namespace AssetStudio.Avalonia.Services
                 // Pre-merge split assets per distinct directory once upfront so continuous workers never scan directories per file.
                 try
                 {
-                    var dirComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-                    var distinctDirs = new HashSet<string>(dirComparer);
+                    var distinctDirs = new HashSet<string>(PathKeyComparer);
                     for (int i = 0; i < files.Count; i++)
                     {
                         var f = files[i];
@@ -535,7 +545,19 @@ namespace AssetStudio.Avalonia.Services
 
                             try
                             {
+                                var preStats = CaptureLiveFileStat(file);
+                                if (IsLiveStatMutatedAgainstBaseline(file, preStats, baselineStatsByPath))
+                                {
+                                    inFlightMutatedPaths[NormalizePendingPathKey(file)] = 0;
+                                }
+
                                 await assetsManager.IndexSingleFileInWorkerAsync(file);
+
+                                var postStats = CaptureLiveFileStat(file);
+                                if (preStats != postStats || IsLiveStatMutatedAgainstBaseline(file, postStats, baselineStatsByPath))
+                                {
+                                    inFlightMutatedPaths[NormalizePendingPathKey(file)] = 0;
+                                }
                             }
                             catch (Exception ex)
                             {
@@ -592,7 +614,32 @@ namespace AssetStudio.Avalonia.Services
                 {
                     try
                     {
-                        saveCacheCallback(paths[0], currentScanResult);
+                        var reconciliation = await ReconcileMidIndexMutationsAsync(
+                            assetsManager,
+                            paths[0],
+                            currentScanResult,
+                            inFlightMutatedPaths.Keys.ToList(),
+                            token);
+
+                        if (reconciliation.CanCommit)
+                        {
+                            if (saveReconciledCacheCallback != null)
+                            {
+                                saveReconciledCacheCallback(paths[0], reconciliation.ValidatedScanResult, reconciliation.ReconciledHandles);
+                            }
+                            else if (reconciliation.ReconciledHandles == null)
+                            {
+                                saveCacheCallback(paths[0], reconciliation.ValidatedScanResult);
+                            }
+                            else
+                            {
+                                Logger.Warning($"Mid-index mutation reconciled for '{paths[0]}', but caller did not supply a reconciled cache callback; skipping stale t0 cache stamp.");
+                            }
+                        }
+                        else
+                        {
+                            Logger.Warning($"Skipping warm index cache commit for '{paths[0]}': {reconciliation.AbortReason}");
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -680,6 +727,215 @@ namespace AssetStudio.Avalonia.Services
             {
                 Logger.Warning($"Failed to flush indexed handle batch ({batch.Count:N0} handles): {ex.Message}");
             }
+        }
+
+        internal readonly struct MidIndexReconciliationResult
+        {
+            public MidIndexReconciliationResult(
+                bool canCommit,
+                ProjectScanResult validatedScanResult,
+                IReadOnlyList<AssetHandle>? reconciledHandles,
+                int retryCount,
+                string abortReason)
+            {
+                CanCommit = canCommit;
+                ValidatedScanResult = validatedScanResult;
+                ReconciledHandles = reconciledHandles;
+                RetryCount = retryCount;
+                AbortReason = abortReason;
+            }
+
+            public bool CanCommit { get; }
+            public ProjectScanResult ValidatedScanResult { get; }
+            public IReadOnlyList<AssetHandle>? ReconciledHandles { get; }
+            public int RetryCount { get; }
+            public string AbortReason { get; }
+        }
+
+        internal static async Task<MidIndexReconciliationResult> ReconcileMidIndexMutationsAsync(
+            AssetsManager assetsManager,
+            string folderPath,
+            ProjectScanResult baselineScan,
+            IReadOnlyCollection<string>? inFlightDirtyPaths,
+            CancellationToken cancellationToken,
+            int maxRetries = MaxMidIndexRevalidationRetries)
+        {
+            var effectiveScan = baselineScan;
+            var knownDirty = inFlightDirtyPaths;
+            List<AssetHandle>? workingHandles = null;
+            var retries = 0;
+
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var revalidation = ProjectScanner.RevalidateFolder(
+                    folderPath,
+                    effectiveScan,
+                    knownDirtyPaths: knownDirty,
+                    cancellationToken: cancellationToken);
+
+                if (revalidation.IsUnchanged)
+                {
+                    return new MidIndexReconciliationResult(
+                        canCommit: true,
+                        validatedScanResult: effectiveScan,
+                        reconciledHandles: workingHandles,
+                        retryCount: retries,
+                        abortReason: string.Empty);
+                }
+
+                if (revalidation.DecryptionContextChanged)
+                {
+                    return new MidIndexReconciliationResult(
+                        canCommit: false,
+                        validatedScanResult: revalidation.CurrentScanResult,
+                        reconciledHandles: null,
+                        retryCount: retries,
+                        abortReason: "Active decryption context changed mid-index.");
+                }
+
+                if (retries >= maxRetries)
+                {
+                    return new MidIndexReconciliationResult(
+                        canCommit: false,
+                        validatedScanResult: revalidation.CurrentScanResult,
+                        reconciledHandles: null,
+                        retryCount: retries,
+                        abortReason: $"Files continued mutating mid-index after {maxRetries} revalidation retries ({revalidation.AddedFiles.Count} added, {revalidation.ModifiedFiles.Count} modified, {revalidation.DeletedFiles.Count} deleted).");
+                }
+
+                retries++;
+                Logger.Warning(
+                    $"Mid-index mutation detected in '{folderPath}' ({revalidation.AddedFiles.Count} added, {revalidation.ModifiedFiles.Count} modified, {revalidation.DeletedFiles.Count} deleted); " +
+                    $"re-indexing changed files before cache commit (retry {retries}/{maxRetries}).");
+
+                var baseHandles = workingHandles ?? assetsManager.ProjectIndex.GetHandles().ToList();
+                var dropPaths = new HashSet<string>(PathKeyComparer);
+                foreach (var p in revalidation.ModifiedFiles)
+                {
+                    dropPaths.Add(NormalizePendingPathKey(p));
+                }
+                foreach (var p in revalidation.DeletedFiles)
+                {
+                    dropPaths.Add(NormalizePendingPathKey(p));
+                }
+
+                var filtered = new List<AssetHandle>(baseHandles.Count);
+                for (var i = 0; i < baseHandles.Count; i++)
+                {
+                    var h = baseHandles[i];
+                    var key = NormalizePendingPathKey(h.OriginalPath);
+                    if (!dropPaths.Contains(key))
+                    {
+                        filtered.Add(h);
+                    }
+                }
+
+                var filesToReindex = new List<string>(revalidation.AddedFiles.Count + revalidation.ModifiedFiles.Count);
+                filesToReindex.AddRange(revalidation.AddedFiles);
+                filesToReindex.AddRange(revalidation.ModifiedFiles);
+
+                if (filesToReindex.Count > 0)
+                {
+                    var scratchManager = new AssetsManager
+                    {
+                        LazyLoading = true,
+                        SpecifyUnityVersion = assetsManager.SpecifyUnityVersion
+                    };
+                    try
+                    {
+                        foreach (var changedFile in filesToReindex)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (!File.Exists(changedFile))
+                            {
+                                continue;
+                            }
+
+                            try
+                            {
+                                await scratchManager.IndexSingleFileInWorkerAsync(changedFile);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Warning($"Error re-indexing mutated file '{changedFile}': {ex.Message}");
+                            }
+                        }
+
+                        filtered.AddRange(scratchManager.ProjectIndex.GetHandles());
+                    }
+                    finally
+                    {
+                        scratchManager.Clear();
+                    }
+                }
+
+                workingHandles = filtered;
+                effectiveScan = revalidation.CurrentScanResult;
+                knownDirty = null;
+            }
+        }
+
+        private static Dictionary<string, (long Size, long LastWriteUtcTicks)>? BuildBaselineFileStats(ProjectScanResult? scanResult)
+        {
+            if (scanResult == null || scanResult.Files.Count == 0)
+            {
+                return null;
+            }
+
+            var map = new Dictionary<string, (long Size, long LastWriteUtcTicks)>(scanResult.Files.Count, PathKeyComparer);
+            for (var i = 0; i < scanResult.Files.Count; i++)
+            {
+                var f = scanResult.Files[i];
+                if (!string.IsNullOrWhiteSpace(f.Path))
+                {
+                    map[NormalizePendingPathKey(f.Path)] = (f.Size, f.LastWriteTimeUtcTicks);
+                }
+            }
+
+            return map;
+        }
+
+        private static (bool Exists, long Size, long LastWriteUtcTicks) CaptureLiveFileStat(string filePath)
+        {
+            try
+            {
+                var info = new FileInfo(filePath);
+                if (!info.Exists)
+                {
+                    return (false, 0L, 0L);
+                }
+
+                return (true, info.Length, info.LastWriteTimeUtc.Ticks);
+            }
+            catch
+            {
+                return (false, 0L, 0L);
+            }
+        }
+
+        private static bool IsLiveStatMutatedAgainstBaseline(
+            string filePath,
+            (bool Exists, long Size, long LastWriteUtcTicks) liveStat,
+            Dictionary<string, (long Size, long LastWriteUtcTicks)>? baselineStatsByPath)
+        {
+            if (baselineStatsByPath == null)
+            {
+                return false;
+            }
+
+            if (!liveStat.Exists)
+            {
+                return true;
+            }
+
+            var key = NormalizePendingPathKey(filePath);
+            if (!baselineStatsByPath.TryGetValue(key, out var baseline))
+            {
+                return true;
+            }
+
+            return liveStat.Size != baseline.Size || liveStat.LastWriteUtcTicks != baseline.LastWriteUtcTicks;
         }
 
         public void PauseIndexing()

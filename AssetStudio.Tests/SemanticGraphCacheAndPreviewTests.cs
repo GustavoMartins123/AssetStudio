@@ -79,7 +79,7 @@ namespace AssetStudio.Tests
                 // Verify schema version bumped to 15 and new v15 tables + columns + index exist.
                 using (var conn = cache.CreateReadConnection(projectDir))
                 {
-                    Assert.Equal("15", ExecuteScalarString(conn, "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;"));
+                    Assert.Equal("16", ExecuteScalarString(conn, "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;"));
                     Assert.Equal(0L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM AnimationClipTargets WHERE AvatarAssetUniqueID = '' AND MeshAssetUniqueID = '' AND ModelGroupId = '';"));
                     Assert.Equal(1L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM AnimationClipTargets;"));
                     Assert.True(ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_model_groups_animator';") == 1);
@@ -885,7 +885,7 @@ namespace AssetStudio.Tests
                 string chargebeamId;
                 using (var conn = cache.CreateReadConnection(folderPath))
                 {
-                    Assert.Equal("15", ExecuteScalarString(conn, "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;"));
+                    Assert.Equal("16", ExecuteScalarString(conn, "SELECT Value FROM CacheSchema WHERE Key = 'SemanticSchemaVersion' LIMIT 1;"));
                     matCacheCount = ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM MaterialCache;");
                     meshResolvedCount = ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM MeshMaterialResolvedCache;");
                     compositeCount = ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM CompositeAssets;");

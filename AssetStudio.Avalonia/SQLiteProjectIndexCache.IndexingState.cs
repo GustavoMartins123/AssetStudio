@@ -27,7 +27,7 @@ namespace AssetStudio.Avalonia
                     using var conn = CreateConnectionByDbPath(dbPath);
                     InvalidateProjectIdCacheForDb(dbPath);
                     using var transaction = conn.BeginTransaction();
-                    var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult);
+                    var projectId = EnsureProject(conn, transaction, folderPath, signature, scanResult, _caseSensitivePaths, out _);
 
                     if (update.ProcessedFiles == 0
                         && update.NewlyReadFiles.Count == 0
@@ -166,7 +166,7 @@ namespace AssetStudio.Avalonia
                 var conn = lease.Connection;
                 try
                 {
-                    var projectId = FindLatestProjectId(conn, null, folderPath);
+                    var projectId = FindLatestProjectId(conn, null, folderPath, _caseSensitivePaths);
                     if (projectId == null)
                     {
                         return null;
@@ -462,6 +462,42 @@ namespace AssetStudio.Avalonia
             cmd.Parameters.AddWithValue("@lastReadFile", lastReadFile);
             cmd.Parameters.AddWithValue("@completedAt", completed ? DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss") : DBNull.Value);
             cmd.ExecuteNonQuery();
+        }
+
+        internal bool HasCompletedIndexForSignature(string folderPath, string signature)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath) || string.IsNullOrWhiteSpace(signature))
+            {
+                return false;
+            }
+
+            EnsureInitialized(folderPath);
+            var dbPath = GetDbPath(folderPath);
+            try
+            {
+                using var lease = RentReadConnection(dbPath);
+                var conn = lease.Connection;
+                try
+                {
+                    var projectId = FindProjectId(conn, null, folderPath, signature, _caseSensitivePaths);
+                    if (projectId == null)
+                    {
+                        return false;
+                    }
+
+                    var status = LoadProjectIndexingStatusFast(conn, null, projectId.Value);
+                    return !IsIncompleteIndexCacheStatus(status);
+                }
+                catch
+                {
+                    lease.MarkUnhealthy();
+                    throw;
+                }
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool IsTerminalIndexingStatus(string? status)

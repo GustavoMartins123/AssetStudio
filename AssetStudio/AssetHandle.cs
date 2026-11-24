@@ -714,9 +714,23 @@ namespace AssetStudio
 
         public static string BuildSourceHash(string serializedFileName, string? originalPath)
         {
+            return BuildSourceHashCore(serializedFileName, originalPath, caseSensitive: OperatingSystem.IsLinux(), useCache: true);
+        }
+
+        public static string BuildSourceHash(string serializedFileName, string? originalPath, bool caseSensitive)
+        {
+            return BuildSourceHashCore(
+                serializedFileName,
+                originalPath,
+                caseSensitive: caseSensitive,
+                useCache: caseSensitive == OperatingSystem.IsLinux());
+        }
+
+        private static string BuildSourceHashCore(string serializedFileName, string? originalPath, bool caseSensitive, bool useCache)
+        {
             var rawPath = originalPath ?? string.Empty;
             var rawName = serializedFileName ?? string.Empty;
-            var cacheable = string.IsNullOrWhiteSpace(rawPath) || Path.IsPathFullyQualified(rawPath);
+            var cacheable = useCache && (string.IsNullOrWhiteSpace(rawPath) || Path.IsPathFullyQualified(rawPath));
             if (cacheable && RawSourceHashCache.TryGetValue((rawPath, rawName), out var cached))
             {
                 return cached;
@@ -725,17 +739,20 @@ namespace AssetStudio
             string hash;
             if (string.IsNullOrWhiteSpace(originalPath))
             {
-                hash = SourceHashCache.GetOrAdd(rawName, static k => ComputeSourceHash(k.AsSpan()));
+                hash = useCache
+                    ? SourceHashCache.GetOrAdd(rawName, static k => ComputeSourceHash(k.AsSpan()))
+                    : ComputeSourceHash(rawName.AsSpan());
             }
             else if (TryGetNormalizedPathSpan(originalPath, out var normalizedFull))
             {
                 if (normalizedFull.IsEmpty)
                 {
-                    hash = SourceHashCache.GetOrAdd(rawName, static k => ComputeSourceHash(k.AsSpan()));
+                    hash = useCache
+                        ? SourceHashCache.GetOrAdd(rawName, static k => ComputeSourceHash(k.AsSpan()))
+                        : ComputeSourceHash(rawName.AsSpan());
                 }
                 else
                 {
-                    var lookup = SourceHashCache.GetAlternateLookup<ReadOnlySpan<char>>();
                     var keyLen = normalizedFull.Length + 1 + rawName.Length;
                     char[]? rentedChars = null;
                     Span<char> keyBuf = keyLen <= 512
@@ -743,25 +760,45 @@ namespace AssetStudio
                         : (rentedChars = ArrayPool<char>.Shared.Rent(keyLen));
                     try
                     {
-                        var written = normalizedFull.ToUpperInvariant(keyBuf);
+                        int written;
+                        if (caseSensitive)
+                        {
+                            normalizedFull.CopyTo(keyBuf);
+                            written = normalizedFull.Length;
+                        }
+                        else
+                        {
+                            written = normalizedFull.ToUpperInvariant(keyBuf);
+                        }
+
                         if (written == normalizedFull.Length)
                         {
                             keyBuf[written] = '\u001f';
                             rawName.AsSpan().CopyTo(keyBuf.Slice(written + 1));
                             var keySpan = keyBuf.Slice(0, written + 1 + rawName.Length);
-                            if (!lookup.TryGetValue(keySpan, out hash!))
+                            if (useCache)
+                            {
+                                var lookup = SourceHashCache.GetAlternateLookup<ReadOnlySpan<char>>();
+                                if (!lookup.TryGetValue(keySpan, out hash!))
+                                {
+                                    hash = ComputeSourceHash(keySpan);
+                                    if (!lookup.TryAdd(keySpan, hash) && lookup.TryGetValue(keySpan, out var existing))
+                                    {
+                                        hash = existing;
+                                    }
+                                }
+                            }
+                            else
                             {
                                 hash = ComputeSourceHash(keySpan);
-                                if (!lookup.TryAdd(keySpan, hash) && lookup.TryGetValue(keySpan, out var existing))
-                                {
-                                    hash = existing;
-                                }
                             }
                         }
                         else
                         {
-                            var key = $"{NormalizeSourcePath(originalPath)}\u001f{rawName}";
-                            hash = SourceHashCache.GetOrAdd(key, static k => ComputeSourceHash(k.AsSpan()));
+                            var key = $"{NormalizeSourcePath(originalPath, caseSensitive)}\u001f{rawName}";
+                            hash = useCache
+                                ? SourceHashCache.GetOrAdd(key, static k => ComputeSourceHash(k.AsSpan()))
+                                : ComputeSourceHash(key.AsSpan());
                         }
                     }
                     finally
@@ -775,11 +812,13 @@ namespace AssetStudio
             }
             else
             {
-                var normalizedPath = NormalizeSourcePath(originalPath);
+                var normalizedPath = NormalizeSourcePath(originalPath, caseSensitive);
                 var key = string.IsNullOrEmpty(normalizedPath)
                     ? rawName
                     : $"{normalizedPath}\u001f{rawName}";
-                hash = SourceHashCache.GetOrAdd(key, static k => ComputeSourceHash(k.AsSpan()));
+                hash = useCache
+                    ? SourceHashCache.GetOrAdd(key, static k => ComputeSourceHash(k.AsSpan()))
+                    : ComputeSourceHash(key.AsSpan());
             }
 
             if (cacheable)
@@ -841,7 +880,7 @@ namespace AssetStudio
             }
         }
 
-        private static string NormalizeSourcePath(string? path)
+        private static string NormalizeSourcePath(string? path, bool caseSensitive)
         {
             if (string.IsNullOrWhiteSpace(path))
             {
@@ -850,13 +889,14 @@ namespace AssetStudio
 
             try
             {
-                return Path.GetFullPath(path)
-                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                    .ToUpperInvariant();
+                var normalized = Path.GetFullPath(path)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                return caseSensitive ? normalized : normalized.ToUpperInvariant();
             }
             catch
             {
-                return path!.Replace('\\', '/').Trim().ToUpperInvariant();
+                var normalized = path!.Replace('\\', '/').Trim();
+                return caseSensitive ? normalized : normalized.ToUpperInvariant();
             }
         }
 

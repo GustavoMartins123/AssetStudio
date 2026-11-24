@@ -1,10 +1,8 @@
 using System;
-using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
-using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -633,12 +631,6 @@ namespace AssetStudio.Avalonia
         public static readonly int SourceRecordSize = Unsafe.SizeOf<CompactSourceFileRecord>();
         public static readonly int AssetRecordSize = Unsafe.SizeOf<CompactAssetRecord>();
 
-        private const ulong Prime64_1 = 11400714785074694791UL;
-        private const ulong Prime64_2 = 14029467366897019727UL;
-        private const ulong Prime64_3 = 1609587929392839161UL;
-        private const ulong Prime64_4 = 9650029242287828579UL;
-        private const ulong Prime64_5 = 2870177450012600261UL;
-
         public static string GetSidecarPath(string dbPath)
         {
             if (string.IsNullOrWhiteSpace(dbPath))
@@ -654,6 +646,11 @@ namespace AssetStudio.Avalonia
             return idxPath + ".tmp";
         }
 
+        public static string CreateUniqueTempSidecarPath(string idxPath)
+        {
+            return $"{idxPath}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+        }
+
         public static void DeleteSidecarFiles(string dbPath)
         {
             if (string.IsNullOrWhiteSpace(dbPath))
@@ -663,12 +660,39 @@ namespace AssetStudio.Avalonia
 
             var idxPath = GetSidecarPath(dbPath);
             TryDeleteFileQuietly(idxPath);
-            TryDeleteFileQuietly(GetTempSidecarPath(idxPath));
+            CleanupOrphanedTempSidecars(idxPath);
             TryDeleteFileQuietly(dbPath + ".idx");
-            TryDeleteFileQuietly(dbPath + ".idx.tmp");
+            CleanupOrphanedTempSidecars(dbPath + ".idx");
         }
 
-        private static void TryDeleteFileQuietly(string path)
+        public static void CleanupOrphanedTempSidecars(string idxPath)
+        {
+            if (string.IsNullOrWhiteSpace(idxPath))
+            {
+                return;
+            }
+
+            TryDeleteFileQuietly(GetTempSidecarPath(idxPath));
+            try
+            {
+                var dir = Path.GetDirectoryName(idxPath);
+                var baseName = Path.GetFileName(idxPath);
+                if (string.IsNullOrWhiteSpace(dir) || string.IsNullOrWhiteSpace(baseName) || !Directory.Exists(dir))
+                {
+                    return;
+                }
+
+                foreach (var orphan in Directory.EnumerateFiles(dir, baseName + ".*.tmp", SearchOption.TopDirectoryOnly))
+                {
+                    TryDeleteFileQuietly(orphan);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        internal static void TryDeleteFileQuietly(string path)
         {
             try
             {
@@ -688,12 +712,56 @@ namespace AssetStudio.Avalonia
             int schemaVersion,
             IReadOnlyCollection<AssetHandle> handles)
         {
+            return TryWriteSidecar(
+                idxPath,
+                signatureHash,
+                schemaVersion,
+                handles,
+                caseSensitivePaths: OperatingSystem.IsLinux(),
+                beforeValidateHook: null);
+        }
+
+        internal static bool TryWriteSidecar(
+            string idxPath,
+            string signatureHash,
+            int schemaVersion,
+            IReadOnlyCollection<AssetHandle> handles,
+            bool caseSensitivePaths,
+            Action<string>? beforeValidateHook = null)
+        {
+            if (!TryStageSidecar(idxPath, signatureHash, schemaVersion, handles, caseSensitivePaths, out var tempPath, beforeValidateHook))
+            {
+                CleanupOrphanedTempSidecars(idxPath);
+                return false;
+            }
+
+            try
+            {
+                return TryPublishStagedSidecar(tempPath, idxPath);
+            }
+            finally
+            {
+                TryDeleteFileQuietly(tempPath);
+                CleanupOrphanedTempSidecars(idxPath);
+            }
+        }
+
+        internal static bool TryStageSidecar(
+            string idxPath,
+            string signatureHash,
+            int schemaVersion,
+            IReadOnlyCollection<AssetHandle> handles,
+            bool caseSensitivePaths,
+            out string stagedTempPath,
+            Action<string>? beforeValidateHook = null)
+        {
+            stagedTempPath = string.Empty;
             if (string.IsNullOrWhiteSpace(idxPath))
             {
                 return false;
             }
 
-            var tempPath = GetTempSidecarPath(idxPath);
+            var tempPath = CreateUniqueTempSidecarPath(idxPath);
             try
             {
                 var dir = Path.GetDirectoryName(idxPath);
@@ -705,8 +773,8 @@ namespace AssetStudio.Avalonia
                 // Order by UniqueID (Ordinal) and collapse duplicate UniqueIDs to match SQLite PRIMARY KEY (ProjectId, UniqueID)
                 var orderedHandles = NormalizeAndDeduplicateHandles(handles);
 
-                // Intern source files using the same case-insensitive key as SQLite InsertSourceFilesAndAssets
-                var sourceIndexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                // Intern source files using OS-aware path comparison (case-sensitive on Linux).
+                var sourceIndexByKey = new Dictionary<string, int>(caseSensitivePaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
                 var sourceEntries = new List<(string SerializedFileName, string OriginalPath)>();
                 for (var i = 0; i < orderedHandles.Count; i++)
                 {
@@ -840,20 +908,76 @@ namespace AssetStudio.Avalonia
                 using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 65536))
                 {
                     fs.Write(fileSpan);
-                    fs.Flush(flushToDisk: false);
+                    fs.Flush(flushToDisk: true);
                 }
 
-                File.Move(tempPath, idxPath, overwrite: true);
+                beforeValidateHook?.Invoke(tempPath);
+
+                if (!ValidateFileImage(tempPath, signatureHash ?? string.Empty, schemaVersion, out _))
+                {
+                    Logger.Warning($"Staged mmap .idx sidecar failed pre-publish validation: '{tempPath}'");
+                    TryDeleteFileQuietly(tempPath);
+                    return false;
+                }
+
+                stagedTempPath = tempPath;
                 return true;
             }
             catch (Exception ex)
             {
-                Logger.Warning($"Failed to write mmap .idx sidecar '{idxPath}': {ex.Message}");
+                Logger.Warning($"Failed to stage mmap .idx sidecar '{idxPath}': {ex.Message}");
+                TryDeleteFileQuietly(tempPath);
                 return false;
             }
-            finally
+        }
+
+        internal static bool TryPublishStagedSidecar(string stagedTempPath, string idxPath)
+        {
+            if (string.IsNullOrWhiteSpace(stagedTempPath) || string.IsNullOrWhiteSpace(idxPath) || !File.Exists(stagedTempPath))
             {
-                TryDeleteFileQuietly(tempPath);
+                return false;
+            }
+
+            try
+            {
+                File.Move(stagedTempPath, idxPath, overwrite: true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Failed to publish mmap .idx sidecar '{idxPath}': {ex.Message}");
+                TryDeleteFileQuietly(stagedTempPath);
+                return false;
+            }
+        }
+
+        public static bool ValidateFileImage(
+            string filePath,
+            string expectedSignature,
+            int expectedSchemaVersion,
+            out MmapIndexHeader header)
+        {
+            header = default;
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            {
+                return false;
+            }
+
+            try
+            {
+                var info = new FileInfo(filePath);
+                if (info.Length < HeaderSize || info.Length > int.MaxValue)
+                {
+                    return false;
+                }
+
+                var bytes = File.ReadAllBytes(filePath);
+                return ValidateFileImage(bytes, expectedSignature ?? string.Empty, expectedSchemaVersion, out header);
+            }
+            catch
+            {
+                header = default;
+                return false;
             }
         }
 
@@ -1125,91 +1249,7 @@ namespace AssetStudio.Avalonia
 
         public static ulong ComputeXxHash64(ReadOnlySpan<byte> data, ulong seed = 0)
         {
-            var length = data.Length;
-            var offset = 0;
-            ulong h64;
-
-            if (length >= 32)
-            {
-                ulong v1 = seed + Prime64_1 + Prime64_2;
-                ulong v2 = seed + Prime64_2;
-                ulong v3 = seed + 0UL;
-                ulong v4 = seed - Prime64_1;
-
-                var limit = length - 32;
-                do
-                {
-                    v1 = Round(v1, BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset, 8)));
-                    v2 = Round(v2, BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset + 8, 8)));
-                    v3 = Round(v3, BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset + 16, 8)));
-                    v4 = Round(v4, BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset + 24, 8)));
-                    offset += 32;
-                }
-                while (offset <= limit);
-
-                h64 = BitOperations.RotateLeft(v1, 1)
-                    + BitOperations.RotateLeft(v2, 7)
-                    + BitOperations.RotateLeft(v3, 12)
-                    + BitOperations.RotateLeft(v4, 18);
-
-                h64 = MergeRound(h64, v1);
-                h64 = MergeRound(h64, v2);
-                h64 = MergeRound(h64, v3);
-                h64 = MergeRound(h64, v4);
-            }
-            else
-            {
-                h64 = seed + Prime64_5;
-            }
-
-            h64 += (ulong)length;
-
-            while (offset + 8 <= length)
-            {
-                ulong k1 = Round(0UL, BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset, 8)));
-                h64 ^= k1;
-                h64 = (BitOperations.RotateLeft(h64, 27) * Prime64_1) + Prime64_4;
-                offset += 8;
-            }
-
-            if (offset + 4 <= length)
-            {
-                h64 ^= BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4)) * Prime64_1;
-                h64 = (BitOperations.RotateLeft(h64, 23) * Prime64_2) + Prime64_3;
-                offset += 4;
-            }
-
-            while (offset < length)
-            {
-                h64 ^= data[offset] * Prime64_5;
-                h64 = BitOperations.RotateLeft(h64, 11) * Prime64_1;
-                offset++;
-            }
-
-            h64 ^= h64 >> 33;
-            h64 *= Prime64_2;
-            h64 ^= h64 >> 29;
-            h64 *= Prime64_3;
-            h64 ^= h64 >> 32;
-            return h64;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static ulong Round(ulong acc, ulong input)
-        {
-            acc += input * Prime64_2;
-            acc = BitOperations.RotateLeft(acc, 31);
-            acc *= Prime64_1;
-            return acc;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static ulong MergeRound(ulong acc, ulong val)
-        {
-            val = Round(0UL, val);
-            acc ^= val;
-            acc = (acc * Prime64_1) + Prime64_4;
-            return acc;
+            return XxHash64.Compute(data, seed);
         }
 
         private static List<AssetHandle> NormalizeAndDeduplicateHandles(IReadOnlyCollection<AssetHandle> handles)

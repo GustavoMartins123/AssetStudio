@@ -16,22 +16,43 @@ namespace AssetStudio.Tests
             var tempRoot = CreateTempDirectory("sqlite_unified_schema");
             try
             {
-                Assert.Equal(15, SQLiteProjectIndexCache.SemanticSchemaVersion);
+                Assert.Equal(16, SQLiteProjectIndexCache.SemanticSchemaVersion);
 
                 var (cache, projectDir, _, _, _) = CreateSampleProject(tempRoot);
-                cache.EnsureInitialized(projectDir);
+                using (cache)
+                {
+                    cache.EnsureInitialized(projectDir);
 
-                using var conn = cache.CreateReadConnection(projectDir);
-                Assert.Equal("15", ReadSchemaVersion(conn));
-                Assert.Null(GetSchemaObjectType(conn, "AssetHandles", "table"));
-                Assert.Equal("view", GetSchemaObjectType(conn, "AssetHandles", "view"));
-                Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Assets"), StringComparison.OrdinalIgnoreCase);
-                Assert.DoesNotContain("idx_handles_lookup", GetUserIndexNames(conn));
+                    using var conn = cache.CreateReadConnection(projectDir);
+                    Assert.Equal("16", ReadSchemaVersion(conn));
+                    Assert.Null(GetSchemaObjectType(conn, "AssetHandles", "table"));
+                    Assert.Equal("view", GetSchemaObjectType(conn, "AssetHandles", "view"));
+                    Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Assets"), StringComparison.OrdinalIgnoreCase);
+                    Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "SourceFileExternals"), StringComparison.OrdinalIgnoreCase);
+                    Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Scenes"), StringComparison.OrdinalIgnoreCase);
+                    Assert.DoesNotContain("idx_handles_lookup", GetUserIndexNames(conn));
 
-                var previewColumns = GetColumnNames(conn, "PreviewCacheEntries");
-                Assert.Contains("PayloadBlob", previewColumns);
-                Assert.Contains("PayloadCompression", previewColumns);
-                Assert.Contains("UncompressedByteSize", previewColumns);
+                    var indexes = GetUserIndexNames(conn);
+                    Assert.Contains("idx_projects_lookup", indexes);
+                    Assert.Contains("idx_source_externals_lookup", indexes);
+                    Assert.Contains("idx_scenes_project_build", indexes);
+
+                    var projectColumns = GetColumnNames(conn, "Projects");
+                    Assert.Contains("FolderPathKey", projectColumns);
+                    Assert.Contains("SignatureVersion", projectColumns);
+
+                    var sourceFileColumns = GetColumnNames(conn, "SourceFiles");
+                    Assert.Contains("RelativePath", sourceFileColumns);
+                    Assert.Contains("FileSize", sourceFileColumns);
+                    Assert.Contains("LastWriteUtcTicks", sourceFileColumns);
+                    Assert.Contains("ContentSampleHash", sourceFileColumns);
+                    Assert.Contains("FileKind", sourceFileColumns);
+
+                    var previewColumns = GetColumnNames(conn, "PreviewCacheEntries");
+                    Assert.Contains("PayloadBlob", previewColumns);
+                    Assert.Contains("PayloadCompression", previewColumns);
+                    Assert.Contains("UncompressedByteSize", previewColumns);
+                }
             }
             finally
             {
@@ -341,6 +362,178 @@ namespace AssetStudio.Tests
             }
         }
 
+        [Fact]
+        public void LegacySchemaV15Database_UpgradesInPlaceToV16PreservingAssetsPreviewAndIndexingState()
+        {
+            var tempRoot = CreateTempDirectory("sqlite_v15_to_v16");
+            try
+            {
+                var (bootstrapCache, projectDir, _, _, sourcePath) = CreateSampleProject(tempRoot);
+                string dbPath;
+                using (bootstrapCache)
+                {
+                    dbPath = bootstrapCache.GetDbPath(projectDir);
+                }
+
+                var legacySig = "1_64_0";
+                var meshId = AssetHandle.BuildUniqueID("level0", sourcePath, 501);
+                Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+                using (var seedConn = new SqliteConnection($"Data Source={dbPath}"))
+                {
+                    seedConn.Open();
+                    using var cmd = seedConn.CreateCommand();
+                    cmd.CommandText = @"
+                        CREATE TABLE CacheSchema (Key TEXT PRIMARY KEY, Value TEXT NOT NULL);
+                        INSERT INTO CacheSchema (Key, Value) VALUES ('SemanticSchemaVersion', '15');
+
+                        CREATE TABLE Projects (
+                            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            FolderPath TEXT NOT NULL,
+                            SignatureHash TEXT NOT NULL,
+                            TotalFiles INTEGER NOT NULL,
+                            TotalBytes INTEGER NOT NULL,
+                            UnityBundleCount INTEGER NOT NULL,
+                            LastIndexed DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            UnityVersion TEXT
+                        );
+                        CREATE INDEX idx_projects_lookup ON Projects(FolderPath COLLATE NOCASE, SignatureHash, LastIndexed DESC);
+                        INSERT INTO Projects (FolderPath, SignatureHash, TotalFiles, TotalBytes, UnityBundleCount, UnityVersion)
+                        VALUES (@folder, @sig, 1, 64, 0, '2022.3.10f1');
+
+                        CREATE TABLE SourceFiles (
+                            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                            SerializedFileName TEXT NOT NULL,
+                            OriginalPath TEXT NOT NULL DEFAULT '',
+                            UnityVersion TEXT NOT NULL DEFAULT '',
+                            ObjectCount INTEGER NOT NULL DEFAULT 0,
+                            LastSeen DATETIME DEFAULT CURRENT_TIMESTAMP
+                        );
+                        CREATE UNIQUE INDEX idx_source_files_unique ON SourceFiles(ProjectId, SerializedFileName, OriginalPath);
+                        INSERT INTO SourceFiles (ProjectId, SerializedFileName, OriginalPath, UnityVersion, ObjectCount)
+                        VALUES (1, 'level0', @sourcePath, '2022.3.10f1', 1);
+
+                        CREATE TABLE Assets (
+                            ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                            UniqueID TEXT NOT NULL,
+                            SourceFileId INTEGER REFERENCES SourceFiles(Id) ON DELETE SET NULL,
+                            Name TEXT NOT NULL,
+                            Type INTEGER NOT NULL,
+                            Container TEXT NOT NULL DEFAULT '',
+                            PathID INTEGER NOT NULL,
+                            ByteStart INTEGER NOT NULL,
+                            ByteSize INTEGER NOT NULL,
+                            PRIMARY KEY (ProjectId, UniqueID)
+                        ) WITHOUT ROWID;
+                        INSERT INTO Assets (ProjectId, UniqueID, SourceFileId, Name, Type, Container, PathID, ByteStart, ByteSize)
+                        VALUES (1, @meshId, 1, 'V15HeroMesh', @meshType, 'assets/v15.prefab', 501, 1024, 2048);
+
+                        CREATE TABLE ProjectIndexingState (
+                            ProjectId INTEGER PRIMARY KEY REFERENCES Projects(Id) ON DELETE CASCADE,
+                            Status TEXT NOT NULL DEFAULT 'not_started',
+                            TotalFiles INTEGER NOT NULL DEFAULT 0,
+                            ProcessedFiles INTEGER NOT NULL DEFAULT 0,
+                            PendingFiles INTEGER NOT NULL DEFAULT 0,
+                            PercentComplete REAL NOT NULL DEFAULT 0,
+                            CurrentFile TEXT NOT NULL DEFAULT '',
+                            LastReadFile TEXT NOT NULL DEFAULT '',
+                            StartedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            CompletedAt DATETIME
+                        );
+                        INSERT INTO ProjectIndexingState (ProjectId, Status, TotalFiles, ProcessedFiles, PendingFiles, PercentComplete)
+                        VALUES (1, 'completed', 1, 1, 0, 100.0);
+
+                        CREATE TABLE PreviewCacheEntries (
+                            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                            AssetUniqueID TEXT NOT NULL,
+                            PreviewKind TEXT NOT NULL,
+                            AlgorithmVersion INTEGER NOT NULL,
+                            Parameters TEXT NOT NULL DEFAULT '',
+                            PayloadHash TEXT NOT NULL,
+                            PayloadPath TEXT,
+                            ByteSize INTEGER NOT NULL DEFAULT 0,
+                            CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            LastAccessed DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            UpdatedUtc TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.0000000Z',
+                            LastAccessedUtc TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.0000000Z',
+                            PayloadBlob BLOB,
+                            PayloadCompression INTEGER NOT NULL DEFAULT 0,
+                            UncompressedByteSize INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE UNIQUE INDEX idx_preview_cache_unique ON PreviewCacheEntries(ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters);
+                        INSERT INTO PreviewCacheEntries (ProjectId, AssetUniqueID, PreviewKind, AlgorithmVersion, Parameters, PayloadHash, PayloadPath, ByteSize)
+                        VALUES (1, @meshId, 'png', 1, '256', 'v15_preview_hash', '/tmp/v15.png', 256);";
+                    cmd.Parameters.AddWithValue("@folder", projectDir);
+                    cmd.Parameters.AddWithValue("@sig", legacySig);
+                    cmd.Parameters.AddWithValue("@sourcePath", sourcePath);
+                    cmd.Parameters.AddWithValue("@meshId", meshId);
+                    cmd.Parameters.AddWithValue("@meshType", (int)ClassIDType.Mesh);
+                    cmd.ExecuteNonQuery();
+                }
+
+                SqliteConnection.ClearAllPools();
+
+                using var upgradedCache = new SQLiteProjectIndexCache(Path.GetDirectoryName(dbPath)!);
+                var loaded = upgradedCache.LoadIndexCache(projectDir, legacySig);
+                Assert.NotNull(loaded);
+                Assert.Equal("V15HeroMesh", Assert.Single(loaded!).Name);
+
+                var preservedPreview = upgradedCache.LoadPreviewCacheEntry(projectDir, legacySig, meshId, "png", 1, "256");
+                Assert.NotNull(preservedPreview);
+                Assert.Equal("v15_preview_hash", preservedPreview!.PayloadHash);
+
+                var state = upgradedCache.LoadIndexingState(projectDir, legacySig);
+                Assert.NotNull(state);
+                Assert.Equal("completed", state!.Status);
+
+                using var conn = upgradedCache.CreateConnection(projectDir);
+                Assert.Equal("16", ReadSchemaVersion(conn));
+                Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "SourceFileExternals"), StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Scenes"), StringComparison.OrdinalIgnoreCase);
+
+                using (var idxSqlCmd = conn.CreateCommand())
+                {
+                    idxSqlCmd.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projects_lookup' LIMIT 1;";
+                    var idxSql = idxSqlCmd.ExecuteScalar()?.ToString() ?? string.Empty;
+                    Assert.Contains("FolderPathKey", idxSql, StringComparison.OrdinalIgnoreCase);
+                    Assert.DoesNotContain("NOCASE", idxSql, StringComparison.OrdinalIgnoreCase);
+                }
+
+                // Verify foreign key enforcement + cascade on new v16 tables (PRAGMA foreign_keys = ON).
+                using (var fkInsertCmd = conn.CreateCommand())
+                {
+                    fkInsertCmd.CommandText = @"
+                        INSERT INTO SourceFileExternals (ProjectId, SourceFileId, ExternalIndex, ExternalFileName, ExternalPathName, ExternalGuid)
+                        VALUES (1, 1, 0, 'sharedassets0.assets', 'archive:/shared/sharedassets0.assets', 'guid001');
+                        INSERT INTO Scenes (ProjectId, SceneId, Name, ScenePath, BuildIndex, EntrySourceFileId, ContainerKey, SourceKind)
+                        VALUES (1, 1, 'MainMenu', 'Assets/Scenes/MainMenu.unity', 0, 1, 'assets/scenes/mainmenu.unity', 'BuildSettings');";
+                    fkInsertCmd.ExecuteNonQuery();
+                }
+
+                Assert.Equal(1L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM SourceFileExternals;"));
+                Assert.Equal(1L, ExecuteScalarInt64(conn, "SELECT COUNT(*) FROM Scenes;"));
+
+                // Verify EXPLAIN QUERY PLAN for FolderPathKey lookup uses idx_projects_lookup with zero SCANs.
+                AssertSearchOnly(conn, "Projects.FolderPathKey lookup", @"
+                    SELECT Id FROM Projects
+                    WHERE FolderPathKey = @folderPathKey
+                      AND SignatureHash = @sig
+                    ORDER BY LastIndexed DESC, Id DESC
+                    LIMIT 1", cmd =>
+                {
+                    cmd.Parameters.AddWithValue("@folderPathKey", SQLiteProjectIndexCache.NormalizeFolderPathKey(projectDir, upgradedCache.CaseSensitivePaths));
+                    cmd.Parameters.AddWithValue("@sig", legacySig);
+                });
+            }
+            finally
+            {
+                SqliteConnection.ClearAllPools();
+                TryDeleteDirectory(tempRoot);
+            }
+        }
+
         private static void AssertPreviewPreservedAndSchemaIsV13(SQLiteProjectIndexCache cache, string projectDir, string signature)
         {
             var preservedPreview = cache.LoadPreviewCacheEntry(projectDir, signature, "preserved_preview", "png", 1, "256");
@@ -348,7 +541,7 @@ namespace AssetStudio.Tests
             Assert.Equal("hash123", preservedPreview!.PayloadHash);
 
             using var conn = cache.CreateReadConnection(projectDir);
-            Assert.Equal("15", ReadSchemaVersion(conn));
+            Assert.Equal("16", ReadSchemaVersion(conn));
             Assert.Null(GetSchemaObjectType(conn, "AssetHandles", "table"));
             Assert.Equal("view", GetSchemaObjectType(conn, "AssetHandles", "view"));
             Assert.Contains("WITHOUT ROWID", GetTableDdl(conn, "Assets"), StringComparison.OrdinalIgnoreCase);

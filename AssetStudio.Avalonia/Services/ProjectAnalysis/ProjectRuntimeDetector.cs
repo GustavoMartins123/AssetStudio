@@ -127,7 +127,7 @@ public sealed class ProjectRuntimeDetector
             ProjectHash = ComputeProjectHash(fullRoot)
         };
 
-        var signatureFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var signatureFiles = new HashSet<string>(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
         var dataDirectories = DiscoverDataDirectories(fullRoot);
 
         // 1. Detect GameAssembly / libil2cpp
@@ -231,6 +231,11 @@ public sealed class ProjectRuntimeDetector
 
     public static string ComputeSignature(string projectRoot, IEnumerable<string> artifactFilePaths)
     {
+        return ComputeSignature(projectRoot, artifactFilePaths, caseSensitive: OperatingSystem.IsLinux());
+    }
+
+    internal static string ComputeSignature(string projectRoot, IEnumerable<string> artifactFilePaths, bool caseSensitive)
+    {
         var fullRoot = Path.GetFullPath(projectRoot);
         var entries = new List<(string Key, long Length, long LastWriteTicks)>();
 
@@ -251,7 +256,11 @@ public sealed class ProjectRuntimeDetector
 
                 var info = new FileInfo(fullPath);
                 var relative = Path.GetRelativePath(fullRoot, fullPath);
-                var normalizedKey = relative.Replace('\\', '/').ToLowerInvariant();
+                var normalizedKey = relative.Replace('\\', '/');
+                if (!caseSensitive)
+                {
+                    normalizedKey = normalizedKey.ToLowerInvariant();
+                }
                 entries.Add((normalizedKey, info.Length, info.LastWriteTimeUtc.Ticks));
             }
             catch
@@ -924,8 +933,13 @@ public sealed class ProjectRuntimeDetector
 
     private static string NormalizeFullPathForKey(string path)
     {
-        var full = Path.GetFullPath(path)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        return OperatingSystem.IsWindows() ? full.ToLowerInvariant() : full;
+        var full = Path.GetFullPath(path);
+        var trimmed = full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (trimmed.Length == 0 && full.Length > 0)
+        {
+            trimmed = full.Substring(0, 1);
+        }
+
+        return OperatingSystem.IsLinux() ? trimmed : trimmed.ToLowerInvariant();
     }
 }

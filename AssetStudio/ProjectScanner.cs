@@ -2,8 +2,11 @@ using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -20,8 +23,30 @@ namespace AssetStudio
 
     public sealed class ScannedFileInfo
     {
+        public ScannedFileInfo()
+        {
+        }
+
+        public ScannedFileInfo(
+            string path,
+            long size,
+            ProjectFileKind kind,
+            long lastWriteTimeUtcTicks = 0,
+            ulong contentSampleHash = 0,
+            string? appliedDecryptionProvider = null)
+        {
+            Path = path ?? string.Empty;
+            Size = size;
+            Kind = kind;
+            LastWriteTimeUtcTicks = lastWriteTimeUtcTicks;
+            ContentSampleHash = contentSampleHash;
+            AppliedDecryptionProvider = appliedDecryptionProvider;
+        }
+
         public string Path { get; internal set; } = string.Empty;
         public long Size { get; internal set; }
+        public long LastWriteTimeUtcTicks { get; internal set; }
+        public ulong ContentSampleHash { get; internal set; }
         public ProjectFileKind Kind { get; internal set; }
         public string? BundleSignature { get; internal set; }
         public uint BundleVersion { get; internal set; }
@@ -29,6 +54,16 @@ namespace AssetStudio
         public string? AddressablesGroup { get; internal set; }
         public string? AppliedDecryptionProvider { get; internal set; }
         public StreamEncryptionBarrier? EncryptionBarrier { get; internal set; }
+    }
+
+    public sealed class ProjectRevalidationResult
+    {
+        public bool IsUnchanged { get; internal set; }
+        public bool DecryptionContextChanged { get; internal set; }
+        public List<string> AddedFiles { get; } = new List<string>();
+        public List<string> ModifiedFiles { get; } = new List<string>();
+        public List<string> DeletedFiles { get; } = new List<string>();
+        public ProjectScanResult CurrentScanResult { get; internal set; } = new ProjectScanResult();
     }
 
     public struct ScanProgress
@@ -43,6 +78,50 @@ namespace AssetStudio
 
     public sealed class ProjectScanResult
     {
+        public ProjectScanResult()
+        {
+        }
+
+        public ProjectScanResult(string rootPath, IEnumerable<ScannedFileInfo> files, string? decryptionContextDigest = null)
+        {
+            RootPath = rootPath ?? string.Empty;
+            DecryptionContextDigest = decryptionContextDigest;
+            if (files == null)
+            {
+                return;
+            }
+
+            foreach (var file in files)
+            {
+                if (file == null)
+                {
+                    continue;
+                }
+
+                Files.Add(file);
+                TotalFiles++;
+                TotalBytes += file.Size;
+                switch (file.Kind)
+                {
+                    case ProjectFileKind.UnityBundle:
+                        UnityBundleCount++;
+                        break;
+                    case ProjectFileKind.SerializedFile:
+                        SerializedFileCount++;
+                        break;
+                    case ProjectFileKind.ResourceFile:
+                        ResourceFileCount++;
+                        break;
+                    case ProjectFileKind.Encrypted:
+                        EncryptedFileCount++;
+                        break;
+                    default:
+                        OtherFileCount++;
+                        break;
+                }
+            }
+        }
+
         public string RootPath { get; internal set; } = string.Empty;
         public int TotalFiles { get; internal set; }
         public long TotalBytes { get; internal set; }
@@ -55,6 +134,7 @@ namespace AssetStudio
         public List<string> SampleUnityBundles { get; } = new List<string>();
         public List<StreamEncryptionBarrier> EncryptionBarriers { get; } = new List<StreamEncryptionBarrier>();
         public List<ScannedFileInfo> Files { get; } = new List<ScannedFileInfo>();
+        public string? DecryptionContextDigest { get; internal set; }
 
         /// <summary>
         /// Number of Unity asset container files (bundles + serialized files) that can be read.
@@ -193,6 +273,8 @@ namespace AssetStudio
                 var fileInfo = new ScannedFileInfo { Path = file };
                 bool isError = false;
                 long length = 0;
+                long lastWriteUtcTicks = 0;
+                ulong contentSampleHash = 0;
                 ProjectFileKind kind = ProjectFileKind.Other;
                 string? bundleSig = null;
                 uint bundleVer = 0;
@@ -204,9 +286,11 @@ namespace AssetStudio
                 {
                     var info = new FileInfo(file);
                     length = info.Length;
+                    lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
 
                     var detection = DetectFileKindExtended(file, length);
                     kind = detection.Kind;
+                    contentSampleHash = detection.ContentSampleHash;
                     bundleSig = detection.BundleSignature;
                     bundleVer = detection.BundleVersion;
                     bundleUnityVer = detection.BundleUnityVersion;
@@ -223,6 +307,8 @@ namespace AssetStudio
                 }
 
                 fileInfo.Size = length;
+                fileInfo.LastWriteTimeUtcTicks = lastWriteUtcTicks;
+                fileInfo.ContentSampleHash = contentSampleHash;
                 fileInfo.Kind = kind;
                 fileInfo.BundleSignature = bundleSig;
                 fileInfo.BundleVersion = bundleVer;
@@ -303,7 +389,8 @@ namespace AssetStudio
             result.Files.AddRange(filesBag);
             result.SampleUnityBundles.AddRange(sampleBundles.Take(MaxSamples));
             result.EncryptionBarriers.AddRange(
-                encryptionBarriers.OrderBy(static b => b.FilePath, StringComparer.OrdinalIgnoreCase));
+                encryptionBarriers.OrderBy(static b => b.FilePath, OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase));
+            result.DecryptionContextDigest = ComputeDecryptionContextDigest();
 
             result.EstimatedMemoryBytes = (long)(bundleBytesOnDisk * MemoryMultiplier);
             result.AvailableMemoryBytes = GetAvailableMemoryBytes();
@@ -320,6 +407,439 @@ namespace AssetStudio
             });
 
             return result;
+        }
+
+        /// <summary>
+        /// Fast O(N) folder revalidation against a prior <see cref="ProjectScanResult"/> snapshot (PERF-11).
+        /// Checks file additions, deletions, (Length, LastWriteTimeUtc.Ticks) drift, known in-flight dirty paths,
+        /// racy-clean recent writes (bounded &lt;= 12 KiB xxHash64 sample), and active decryption context changes.
+        /// Re-probes only added or modified files when constructing <see cref="ProjectRevalidationResult.CurrentScanResult"/>.
+        /// </summary>
+        public static ProjectRevalidationResult RevalidateFolder(
+            string path,
+            ProjectScanResult baselineScan,
+            IReadOnlyCollection<string>? knownDirtyPaths = null,
+            bool verifyAllContentSamples = false,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(baselineScan);
+
+            var revalidation = new ProjectRevalidationResult();
+            var currentDecryptionDigest = ComputeDecryptionContextDigest();
+            var decryptionChanged = !string.Equals(
+                baselineScan.DecryptionContextDigest ?? string.Empty,
+                currentDecryptionDigest ?? string.Empty,
+                StringComparison.Ordinal);
+            revalidation.DecryptionContextChanged = decryptionChanged;
+
+            if (decryptionChanged)
+            {
+                var fresh = ScanFolder(path, cancellationToken);
+                revalidation.IsUnchanged = false;
+                revalidation.CurrentScanResult = fresh;
+                foreach (var f in fresh.Files)
+                {
+                    revalidation.ModifiedFiles.Add(f.Path);
+                }
+                return revalidation;
+            }
+
+            var pathComparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+            var baselineByKey = new Dictionary<string, ScannedFileInfo>(baselineScan.Files.Count, pathComparer);
+            foreach (var item in baselineScan.Files)
+            {
+                if (!string.IsNullOrWhiteSpace(item.Path))
+                {
+                    baselineByKey[NormalizePathKey(item.Path)] = item;
+                }
+            }
+
+            HashSet<string>? dirtyKeySet = null;
+            if (knownDirtyPaths != null && knownDirtyPaths.Count > 0)
+            {
+                dirtyKeySet = new HashSet<string>(pathComparer);
+                foreach (var dirtyPath in knownDirtyPaths)
+                {
+                    if (!string.IsNullOrWhiteSpace(dirtyPath))
+                    {
+                        dirtyKeySet.Add(NormalizePathKey(dirtyPath));
+                    }
+                }
+            }
+
+            var currentFiles = ImportHelper.GetFilesSafe(path, "*.*", true);
+            var seenBaselineKeys = new HashSet<string>(pathComparer);
+            var unchangedFiles = new List<ScannedFileInfo>(currentFiles.Length);
+            var filesToReprobe = new List<string>();
+            var nowUtcTicks = DateTime.UtcNow.Ticks;
+            var racyCleanWindowTicks = TimeSpan.FromSeconds(2).Ticks;
+
+            foreach (var file in currentFiles)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var key = NormalizePathKey(file);
+
+                if (!baselineByKey.TryGetValue(key, out var baselineFile))
+                {
+                    revalidation.AddedFiles.Add(file);
+                    filesToReprobe.Add(file);
+                    continue;
+                }
+
+                seenBaselineKeys.Add(key);
+
+                if (dirtyKeySet != null && dirtyKeySet.Contains(key))
+                {
+                    revalidation.ModifiedFiles.Add(file);
+                    filesToReprobe.Add(file);
+                    continue;
+                }
+
+                bool changed = false;
+                try
+                {
+                    var info = new FileInfo(file);
+                    var currentLen = info.Length;
+                    var currentMtimeTicks = info.LastWriteTimeUtc.Ticks;
+                    if (currentLen != baselineFile.Size || currentMtimeTicks != baselineFile.LastWriteTimeUtcTicks)
+                    {
+                        changed = true;
+                    }
+                    else if (verifyAllContentSamples || Math.Abs(nowUtcTicks - currentMtimeTicks) <= racyCleanWindowTicks)
+                    {
+                        var liveSampleHash = XxHash64.ComputeFileSampleHash(file, currentLen, out _);
+                        if (liveSampleHash != baselineFile.ContentSampleHash)
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+                catch (IOException)
+                {
+                    changed = true;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    changed = true;
+                }
+
+                if (changed)
+                {
+                    revalidation.ModifiedFiles.Add(file);
+                    filesToReprobe.Add(file);
+                }
+                else
+                {
+                    unchangedFiles.Add(baselineFile);
+                }
+            }
+
+            foreach (var kvp in baselineByKey)
+            {
+                if (!seenBaselineKeys.Contains(kvp.Key))
+                {
+                    revalidation.DeletedFiles.Add(kvp.Value.Path);
+                }
+            }
+
+            if (revalidation.AddedFiles.Count == 0
+                && revalidation.ModifiedFiles.Count == 0
+                && revalidation.DeletedFiles.Count == 0)
+            {
+                revalidation.IsUnchanged = true;
+                revalidation.CurrentScanResult = baselineScan;
+                return revalidation;
+            }
+
+            revalidation.IsUnchanged = false;
+            var updated = new ProjectScanResult
+            {
+                RootPath = Path.GetFullPath(path),
+                DecryptionContextDigest = currentDecryptionDigest
+            };
+
+            var reprobedBag = new ConcurrentBag<(ScannedFileInfo Info, bool IsError)>();
+            if (filesToReprobe.Count > 0)
+            {
+                var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                {
+                    CancellationToken = cancellationToken,
+                    MaxDegreeOfParallelism = AssetsManager.GetConfiguredThreadCount("ASSETSTUDIO_SCAN_THREADS", 0.6)
+                };
+
+                System.Threading.Tasks.Parallel.ForEach(filesToReprobe, parallelOptions, file =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var scanned = ProbeSingleFile(file, out var isError);
+                    reprobedBag.Add((scanned, isError));
+                });
+            }
+
+            long totalBytes = 0;
+            long bundleBytesOnDisk = 0;
+            int unityBundleCount = 0;
+            int serializedFileCount = 0;
+            int resourceFileCount = 0;
+            int encryptedFileCount = 0;
+            int otherFileCount = 0;
+            int errorCount = 0;
+            var barriers = new List<StreamEncryptionBarrier>();
+
+            void AccumulateFile(ScannedFileInfo fi, bool isError)
+            {
+                updated.Files.Add(fi);
+                if (isError)
+                {
+                    errorCount++;
+                    return;
+                }
+
+                totalBytes += fi.Size;
+                switch (fi.Kind)
+                {
+                    case ProjectFileKind.UnityBundle:
+                        unityBundleCount++;
+                        bundleBytesOnDisk += fi.Size;
+                        if (updated.SampleUnityBundles.Count < MaxSamples)
+                        {
+                            updated.SampleUnityBundles.Add(fi.Path);
+                        }
+                        break;
+                    case ProjectFileKind.SerializedFile:
+                        serializedFileCount++;
+                        break;
+                    case ProjectFileKind.ResourceFile:
+                        resourceFileCount++;
+                        break;
+                    case ProjectFileKind.Encrypted:
+                        encryptedFileCount++;
+                        if (fi.EncryptionBarrier.HasValue && barriers.Count < 200)
+                        {
+                            barriers.Add(fi.EncryptionBarrier.Value);
+                        }
+                        break;
+                    default:
+                        otherFileCount++;
+                        break;
+                }
+            }
+
+            foreach (var unchanged in unchangedFiles)
+            {
+                AccumulateFile(unchanged, isError: false);
+            }
+
+            foreach (var (reprobed, isError) in reprobedBag)
+            {
+                AccumulateFile(reprobed, isError);
+            }
+
+            updated.TotalFiles = updated.Files.Count;
+            updated.TotalBytes = totalBytes;
+            updated.UnityBundleCount = unityBundleCount;
+            updated.SerializedFileCount = serializedFileCount;
+            updated.ResourceFileCount = resourceFileCount;
+            updated.EncryptedFileCount = encryptedFileCount;
+            updated.OtherFileCount = otherFileCount;
+            updated.ErrorCount = errorCount;
+            updated.EncryptionBarriers.AddRange(barriers.OrderBy(static b => b.FilePath, pathComparer));
+            updated.EstimatedMemoryBytes = (long)(bundleBytesOnDisk * MemoryMultiplier);
+            updated.AvailableMemoryBytes = GetAvailableMemoryBytes();
+            updated.IsMemoryRisky = updated.AvailableMemoryBytes > 0
+                                 && updated.EstimatedMemoryBytes > updated.AvailableMemoryBytes;
+
+            revalidation.CurrentScanResult = updated;
+            return revalidation;
+        }
+
+        private static ScannedFileInfo ProbeSingleFile(string file, out bool isError)
+        {
+            var fileInfo = new ScannedFileInfo { Path = file };
+            isError = false;
+            long length = 0;
+            long lastWriteUtcTicks = 0;
+            ulong contentSampleHash = 0;
+            ProjectFileKind kind = ProjectFileKind.Other;
+            string? bundleSig = null;
+            uint bundleVer = 0;
+            string? bundleUnityVer = null;
+            string? appliedProvider = null;
+            StreamEncryptionBarrier? barrier = null;
+
+            try
+            {
+                var info = new FileInfo(file);
+                length = info.Length;
+                lastWriteUtcTicks = info.LastWriteTimeUtc.Ticks;
+
+                var detection = DetectFileKindExtended(file, length);
+                kind = detection.Kind;
+                contentSampleHash = detection.ContentSampleHash;
+                bundleSig = detection.BundleSignature;
+                bundleVer = detection.BundleVersion;
+                bundleUnityVer = detection.BundleUnityVersion;
+                appliedProvider = detection.AppliedDecryptionProvider;
+                barrier = detection.EncryptionBarrier;
+            }
+            catch (IOException)
+            {
+                isError = true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                isError = true;
+            }
+
+            fileInfo.Size = length;
+            fileInfo.LastWriteTimeUtcTicks = lastWriteUtcTicks;
+            fileInfo.ContentSampleHash = contentSampleHash;
+            fileInfo.Kind = kind;
+            fileInfo.BundleSignature = bundleSig;
+            fileInfo.BundleVersion = bundleVer;
+            fileInfo.BundleUnityVersion = bundleUnityVer;
+            fileInfo.AddressablesGroup = InferAddressablesGroup(file);
+            fileInfo.AppliedDecryptionProvider = appliedProvider;
+            fileInfo.EncryptionBarrier = barrier;
+            return fileInfo;
+        }
+
+        private static string NormalizePathKey(string path)
+        {
+            try
+            {
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return path;
+            }
+        }
+
+        public static string? ComputeDecryptionContextDigest()
+        {
+            var profiles = DecryptionHelper.GetRegisteredProfiles();
+            var customProviders = DecryptionHelper.GetCustomProviders();
+
+            List<DecryptionProfile>? enabledProfiles = null;
+            for (var i = 0; i < profiles.Count; i++)
+            {
+                if (profiles[i].Enabled)
+                {
+                    enabledProfiles ??= new List<DecryptionProfile>();
+                    enabledProfiles.Add(profiles[i]);
+                }
+            }
+
+            if ((enabledProfiles == null || enabledProfiles.Count == 0) && customProviders.Count == 0)
+            {
+                return null;
+            }
+
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            AppendUtf8(hasher, "decryption-ctx-v1\0");
+
+            if (enabledProfiles != null && enabledProfiles.Count > 0)
+            {
+                enabledProfiles.Sort(static (a, b) => string.CompareOrdinal(a.Id ?? string.Empty, b.Id ?? string.Empty));
+                foreach (var p in enabledProfiles)
+                {
+                    AppendUtf8(hasher, "P|");
+                    AppendUtf8(hasher, p.Id ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.Algorithm ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.FileNamePattern ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.PathPattern ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.MagicHex ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.MagicOffset.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.MinFileSize.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.SizeMultiple.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.SkipBytes.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.XorKeyHex ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.KeyHex ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.KeyUtf8 ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.IvHex ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.NonceHex ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.IvUtf8 ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.IvFromStreamPrefix ? "1" : "0");
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.IvFromFileNameHash ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.UseFileNameAsSalt ? "1" : "0");
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.UseFileNameWithoutExtension ? "1" : "0");
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.Padding ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.CounterStart.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.CounterLittleEndian ? "1" : "0");
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.KeyDerivation ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.SaltHex ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.SaltUtf8 ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.KdfIterations.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.DerivedKeyLength.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.RangeStart.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.RangeLength.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.CatalogPath ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.Block512Token ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, p.BlockSizeBits.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "\0");
+                }
+            }
+
+            if (customProviders.Count > 0)
+            {
+                var orderedProviders = customProviders
+                    .OrderBy(static p => p.Id ?? string.Empty, StringComparer.Ordinal)
+                    .ThenBy(static p => p.Priority);
+                foreach (var provider in orderedProviders)
+                {
+                    AppendUtf8(hasher, "C|");
+                    AppendUtf8(hasher, provider.Id ?? string.Empty);
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, provider.Priority.ToString(CultureInfo.InvariantCulture));
+                    AppendUtf8(hasher, "|");
+                    AppendUtf8(hasher, provider.GetType().FullName ?? string.Empty);
+                    AppendUtf8(hasher, "\0");
+                }
+            }
+
+            return Convert.ToHexStringLower(hasher.GetHashAndReset());
+        }
+
+        private static void AppendUtf8(IncrementalHash hasher, string text)
+        {
+            if (text.Length == 0)
+            {
+                return;
+            }
+
+            var bytes = Encoding.UTF8.GetBytes(text);
+            hasher.AppendData(bytes);
         }
 
         private static long GetAvailableMemoryBytes()
@@ -363,6 +883,7 @@ namespace AssetStudio
         private struct FileDetectionResult
         {
             public ProjectFileKind Kind;
+            public ulong ContentSampleHash;
             public string? BundleSignature;
             public uint BundleVersion;
             public string? BundleUnityVersion;
@@ -374,17 +895,41 @@ namespace AssetStudio
         {
             var result = new FileDetectionResult { Kind = ProjectFileKind.Other };
 
-            if (fileSize < 4)
+            if (fileSize <= 0)
+            {
+                result.ContentSampleHash = XxHash64.ComputeFileSampleHash(path, 0, out _);
+                var zeroExt = Path.GetExtension(path);
+                if (zeroExt.Equals(".resS", StringComparison.OrdinalIgnoreCase)
+                    || zeroExt.Equals(".resource", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Kind = ProjectFileKind.ResourceFile;
+                }
                 return result;
+            }
 
             var headerSize = (int)Math.Min(UnityHeaderProbe.DefaultProbeBufferSize, fileSize);
             var header = ArrayPool<byte>.Shared.Rent(headerSize);
             try
             {
                 using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                int read = stream.Read(header, 0, headerSize);
-
+                int read = XxHash64.ReadUpTo(stream, header, headerSize);
                 var span = header.AsSpan(0, read);
+
+                // Compute bounded <= 12 KiB content sample hash (reusing already-read head window)
+                // before any early return so every scanned file gets a deterministic sample hash.
+                result.ContentSampleHash = XxHash64.ComputeBoundedSampleHash(stream, fileSize, span);
+
+                if (fileSize < 4)
+                {
+                    var tinyExt = Path.GetExtension(path);
+                    if (tinyExt.Equals(".resS", StringComparison.OrdinalIgnoreCase)
+                        || tinyExt.Equals(".resource", StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Kind = ProjectFileKind.ResourceFile;
+                    }
+                    return result;
+                }
+
                 if (UnityHeaderProbe.TryParseUnityBundleHeader(span, 0, fileSize, out var sig, out var ver, out var unityVer, out _))
                 {
                     result.Kind = ProjectFileKind.UnityBundle;
@@ -456,7 +1001,7 @@ namespace AssetStudio
                     result.EncryptionBarrier = new StreamEncryptionBarrier(
                         providerId: "Block512MissingCatalog",
                         filePath: path,
-                        reason: $"Block 512 'Encryption' container header detected (prefix: {prefixHex}), but no matching Addressables catalog entry was found to derive the decryption token.",
+                        reason: $"Custom chained ChaCha12/8/4 512B-block stream XOR ('Encryption' 26B header) detected without a matching catalog (prefix: {prefixHex}), so the decryption token could not be derived.",
                         confidence: 0.98,
                         headerPrefixHex: prefixHex,
                         candidateAlgorithms: candidates);
